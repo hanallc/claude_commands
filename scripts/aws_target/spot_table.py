@@ -10,12 +10,13 @@ from statistics import median
 from typing import Literal
 
 from scripts.aws_target import ledger, run_cost
-from scripts.aws_target.aws_target import SnapshotFailure, gate_sizes, gpu_price_sizes, largest_gate_vcpus, read_snapshot, snapshot_failures
+from scripts.aws_target.aws_target import SnapshotFailure, gpu_price_sizes, hours_check_scope, largest_gate_vcpus, read_snapshot, snapshot_failures
+from scripts.aws_target.quota_requests import RegionalQuotaRequests, snapshot_quota_requests
 from scripts.lib import conf
 
 
-# Where a table puts its regions: one region in each row (the first column), or in each column after the first.
-RegionAxis = Literal['rows', 'columns']
+# A region is the first cell of a row, a column header, or the second cell after the type.
+RegionAxis = Literal['rows', 'columns', 'type-region-rows']
 # The run table columns that the page shows in its price tables, so the page leaves them out of the run tables.
 SPOT_HEADER = 'Spot USD/h'
 ESTIMATE_HEADER = 'estimate'
@@ -29,10 +30,30 @@ class Table:
     right: frozenset[int]
     rows: tuple[tuple[str, ...], ...]
     region_axis: RegionAxis
-    # The number of each cell, row by row, for the page's color scale; None for a cell without a number.
+    # The number of each cell, row by row. Use None for a cell without a number.
     values: tuple[tuple[Decimal | None, ...], ...] = ()
     # The (row, column) cells of a type that the region does not sell; they read NOT_SOLD.
     not_sold: frozenset[tuple[int, int]] = frozenset()
+
+
+@dataclass(frozen=True)
+class MachineHoursRow:
+    size: str
+    region: str
+    check: run_cost.HoursCheck
+
+
+@dataclass(frozen=True)
+class HoursComparison:
+    rows: tuple[MachineHoursRow, ...]
+    checked_regions: frozenset[str]
+    max_gap_ratio: Decimal
+
+
+@dataclass(frozen=True)
+class HoursComparisonUnavailable:
+    reason: str
+    checked_regions: frozenset[str] = frozenset()
 
 
 NOT_SOLD = '—'
@@ -96,7 +117,7 @@ class RunCosts:
     tables: tuple[Table, ...]
     # The gate estimate of each standard type, with one row per region.
     gate_prices: Table
-    # Every estimate of a placement candidate, cheapest first; equal estimates keep the table order.
+    # Estimates for deployed types, cheapest first. Equal estimates keep the table order.
     estimates: tuple[Cheapest, ...]
     refused: Table
     launched: Table
@@ -107,7 +128,7 @@ class RunCosts:
 
     def summary_of(self, cheapest: Cheapest | None) -> str:
         if cheapest is None:
-            return f'Cheapest {self.scope.noun}: no estimate; the snapshot has no price or the ledger has no runs'
+            return f'Cheapest {self.scope.noun}: no eligible type with a current price and run evidence.'
         return f'Cheapest {self.scope.noun}: {cheapest.size} in {cheapest.region}, {cheapest.usd:.4f} USD (estimate)'
 
 
@@ -117,10 +138,11 @@ class SpotTables:
     # The standard types, then the GPU types.
     prices: tuple[Table, ...]
     quotas: tuple[Table, ...]
-    # One entry for each scope in run_cost.SCOPES, in that order.
+    # One entry for each scope in run_cost.scopes(), in that order.
     runs: tuple[RunCosts, ...]
-    hours: Table
-    hours_note: str
+    hours: HoursComparison | HoursComparisonUnavailable
+    gpu_quota_needed: int
+    quota_requests: tuple[RegionalQuotaRequests, ...]
 
     @property
     def snapshot_rows(self) -> tuple[tuple[str, str], ...]:
@@ -132,12 +154,14 @@ class SpotTables:
         return tuple((read.region, f'{read.region}: {read.detail}') for read in self.regions)
 
 
-def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None) -> SpotTables:
+def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None,
+                gate_pricing: run_cost.GatePricingInputs | None = None) -> SpotTables:
     """Read prices, quotas, run costs, billed hours, and the reason for each unavailable value."""
     values = conf.read_or_repository('cloud_gate')
     configuration = conf.read(settings_path) if settings_path else conf.read_or_repository('aws_target')
     regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
-    standard = tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'))))
+    gate_types = values.words('instance_types')
+    standard = tuple(dict.fromkeys((*gate_types, *values.words('price_compare_instance_types'))))
     gpu = tuple(size for size in gpu_price_sizes(values) if size not in standard)
     document = read_snapshot(directory)
     readings = {ledger.text(row, 'region'): row for row in ledger.rows(document, 'regions')} if 'regions' in document else {}
@@ -148,27 +172,29 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None)
         price = conf.decimal(ledger.text(row, 'usd_per_hour'))
         minimum[key] = min(minimum.get(key, price), price)
     reads: list[RegionRead] = []
+    max_age = configuration.whole('price_max_age_seconds')
     for region in regions:
         reading = readings.get(region)
         failure = failures.get(region)
         age = now - ledger.instant(reading, 'read_at') if reading else None
-        stale = age is not None and (age < 0 or age > configuration.whole('price_max_age_seconds'))
+        stale = age is not None and (age < 0 or age > max_age)
         reads.append(RegionRead(region, age, stale, failure, now - failure.at if failure else 0))
     notes = {read.region: read.note for read in reads}
     not_sold = frozenset((region, size) for region in regions for size in (*standard, *gpu)
                          if (region, size) not in minimum and not notes[region])
     days = configuration.whole('run_cost_days')
     home = configuration.text('region')
-    hours, hours_note = billed_hours(directory, now, regions, gate_sizes(values), days, home,
-                                     configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
+    inputs = gate_pricing if gate_pricing is not None else run_cost.read_gate_pricing_inputs(
+        directory, now, values, configuration)
+    hours = billed_hours(directory, now, hours_check_scope(values), days, home,
+                         configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
     return SpotTables(
         tuple(reads),
         (price_table(standard, regions, minimum, notes, not_sold), price_table(gpu, regions, minimum, notes, not_sold)),
         (quota_table('Standard quota', 'standard_vcpus', standard, regions, readings, notes),
          quota_table('G and VT quota', 'gpu_vcpus', gpu, regions, readings, notes)),
-        run_costs(directory, now, standard, frozenset(values.words('instance_types')), regions, minimum, not_sold,
-                  days, home),
-        hours, hours_note)
+        run_costs(directory, now, standard, regions, minimum, values, configuration, inputs),
+        hours, values.whole('gpu_spot_quota_request_vcpus'), snapshot_quota_requests(document, regions))
 
 
 def price_table(sizes: tuple[str, ...], regions: tuple[str, ...], minimum: Mapping[tuple[str, str], Decimal],
@@ -198,52 +224,53 @@ def quota_table(label: str, field: str, sizes: tuple[str, ...], regions: tuple[s
 
     The quotas come from the same read as the prices, so the snapshot age shows only with the prices."""
     fits = tuple((size, largest_gate_vcpus((size,))) for size in sizes)
-    rows: list[tuple[str, ...]] = []
-    for region in regions:
-        reading = readings.get(region)
-        note = notes[region]
-        rows.append((region, f'{conf.decimal(ledger.text(reading, field)).normalize():f} vCPUs' if reading else note,
-                     *(f'{int(conf.decimal(ledger.text(reading, field)) // vcpus)} boxes'
-                       if reading and vcpus else note or 'unknown vCPU count' for _size, vcpus in fits)))
+    applied = {region: conf.decimal(ledger.text(readings[region], field)) for region in regions if region in readings}
+    rows = tuple((region, f'{value.normalize():f} vCPUs' if (value := applied.get(region)) is not None else notes[region],
+                  *(f'{int(value // vcpus)} boxes' if value is not None and vcpus
+                    else notes[region] or 'unknown vCPU count' for _size, vcpus in fits))
+                 for region in regions)
+    values = tuple((None, applied.get(region), *(None for _size in sizes)) for region in regions)
     return Table('', ('region', label, *(f'{size} ({vcpus or "?"} vCPUs)' for size, vcpus in fits)),
-                 frozenset(range(1, 2 + len(fits))), tuple(rows), 'rows')
+                 frozenset(range(1, 2 + len(fits))), rows, 'rows', values)
 
 
-def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: frozenset[str],
-              regions: tuple[str, ...], minimum: Mapping[tuple[str, str], Decimal], not_sold: frozenset[tuple[str, str]],
-              days: int, home: str) -> tuple[RunCosts, ...]:
+def run_costs(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[str, ...],
+              minimum: Mapping[tuple[str, str], Decimal], values: conf.ConfigRead,
+              policy: conf.ConfigRead, gate_pricing: run_cost.GatePricingInputs) -> tuple[RunCosts, ...]:
     """Build the run tables and gate estimates for standard types in each scope."""
+    days = policy.whole('run_cost_days')
+    home = policy.text('region')
     end = datetime.fromtimestamp(now, UTC)
     start = end - timedelta(days=days)
     book = ledger.CostLedger(directory)
-    rows = book.launches()
-    runs = run_cost.runs_from_rows(rows, start, end, home).runs
-    evidence = run_cost.run_evidence(rows, start, end, home)
+    history = run_cost.read_gate_run_history(book, start, end, home)
     bills = run_cost.spot_bills(book, start, end)
     paid_hourly = run_cost.paid_per_hour(bills)
-    allocations = run_cost.billed_allocations(bills, runs)
-    values = conf.read_or_repository('cloud_gate')
-    wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
-    unmeasured = run_cost.region_numbers(values, 'unmeasured_region_extra_seconds')
-    default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
+    allocations = run_cost.billed_allocations(bills, history.runs)
+    gate_minimum: dict[tuple[str, str], Decimal] = {}
+    for variant, price in gate_pricing.prices.items():
+        key = variant.region, variant.instance_type
+        gate_minimum[key] = min(gate_minimum.get(key, price), price)
+    max_gate_minutes = values.whole('max_gate_minutes')
     counts = ('type', *regions)
     scopes: list[RunCosts] = []
-    for scope in run_cost.SCOPES:
-        explanation = (f'USD per {scope.noun}, last {days} days. Estimate: lowest zone Spot price x median box '
-                       + f'time (boot included), plus refusal wait at {wait_cost} USD/min '
-                       + f'({evidence.refusal_wait_s:.0f} s each). Paid: the AWS bill for the type and region, '
+    for scope in run_cost.scopes():
+        pricing = run_cost.GateRunPricing.from_config(values, gate_pricing.evidence, home, scope.modes)
+        explanation = (f'USD per {scope.noun}, last {days} days. The estimate uses the lowest deployed zone Spot price '
+                       + 'and the median box time, including boot. It adds transfer charges outside the home region. '
+                       + f'Refusal wait ({gate_pricing.evidence.refusal_wait_s:.0f} s each) and extra regional wait cost '
+                       + f'{pricing.wait_usd_per_minute} USD/min. Paid: the AWS bill for the type and region, '
                        + 'split between runs by box time. Runs elsewhere: the type has no runs in the region, '
                        + 'so the time comes from the other regions. Runs same vCPUs: the type has no runs, '
                        + 'so the time comes from the types with its vCPU count.')
         estimates: list[Cheapest] = []
         grid: dict[tuple[str, str], Decimal] = {}
-        for size in sizes:
-            for region in regions:
-                price = minimum.get((region, size))
-                seconds, _source = evidence.box_seconds(size, region, scope.modes)
-                if price is not None and seconds:
-                    grid[region, size] = evidence.expected_usd(price, size, region, scope.modes, wait_cost, default_seconds,
-                                                               unmeasured_extra_s=unmeasured.get(region, Decimal(0)))
+        slow = run_cost.slow_gate_types(gate_pricing.deployed, gate_pricing.evidence, scope.modes, max_gate_minutes)
+        for (region, size), price in gate_minimum.items():
+            if (size, region) not in slow:
+                estimate = pricing.estimate(price, size, region)
+                if isinstance(estimate.median_minutes, Decimal):
+                    grid[region, size] = estimate.usd_per_run
         headers = ('region', SPOT_HEADER, f'{scope.noun} (minutes)', 'runs', ESTIMATE_HEADER, 'paid USD/h', 'paid USD/run',
                    'paid runs')
         tables: list[Table] = []
@@ -255,17 +282,16 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
             launched_cells: list[str] = []
             for region in regions:
                 price = minimum.get((region, size))
-                seconds, source = evidence.box_seconds(size, region, scope.modes)
+                seconds, source = history.evidence.box_seconds(size, region, scope.modes)
                 estimate = grid.get((region, size))
-                # Placement picks only the instance_types, so only they can be the cheapest.
-                if estimate is not None and size in candidates:
+                if estimate is not None:
                     estimates.append(Cheapest(estimate, size, region))
-                here = [run for run in runs if (run.instance_type, run.region) == (size, region)]
+                here = [run for run in history.runs if (run.instance_type, run.region) == (size, region)]
                 scoped = [run for run in here if run.mode in scope.modes]
                 # Allocations split each bill between both kinds, so only the share of the scope's kinds counts here.
                 billed = run_cost.billed_runs(scoped, allocations)
                 paid = paid_hourly.get((size, region))
-                _refusals, refused, launched = evidence.refusals_per_launch(size, region, scope.modes)
+                _refusals, refused, launched = history.evidence.refusals_per_launch(size, region, scope.modes)
                 refused_cells.append(str(refused))
                 launched_cells.append(str(launched))
                 table.append((region, f'{price:.4f}' if price is not None else 'no price', run_minutes(seconds),
@@ -279,10 +305,14 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
         right = frozenset(range(1, len(counts)))
 
         def estimate_cell(region: str, size: str) -> str:
+            if (size, region) in slow:
+                return 'too slow'
+            if (region, size) not in gate_minimum:
+                return 'no current gate price'
             estimate = grid.get((region, size))
-            return f'{estimate:.4f}' if estimate is not None else NOT_SOLD
+            return f'{estimate:.4f}' if estimate is not None else 'no runs'
 
-        gate_prices = region_type_table(sizes, regions, grid, estimate_cell, not_sold)
+        gate_prices = region_type_table(sizes, regions, grid, estimate_cell, frozenset())
         scopes.append(RunCosts(scope, explanation, tuple(tables), gate_prices, tuple(sorted(estimates, key=lambda entry: entry.usd)),
                                Table(f'Refused {scope.noun} requests (capacity and quota)', counts, right,
                                      tuple(refused_rows), 'columns'),
@@ -302,32 +332,24 @@ def paid_run_cell(billed: list[run_cost.FinishedGateRun], due: int, allocations:
     return f'{run_cost.billed_cost_per_run(billed, allocations):.4f}' + (f' ({due} bill due)' if due else '')
 
 
-def billed_hours(directory: Path, now: int, regions: tuple[str, ...], sizes: tuple[str, ...], days: int, home: str,
-                 builder: str, max_ratio: Decimal) -> tuple[Table, str]:
-    """The billed Spot hours against the recorded box hours of each type and region, and the note under them."""
-    title = 'Billed hours / box hours'
+def billed_hours(directory: Path, now: int, scope: run_cost.SpotHoursScope, days: int, home: str,
+                 builder: str, max_ratio: Decimal) -> HoursComparison | HoursComparisonUnavailable:
+    """Read the hours of each type and region in the comparison window."""
     end = datetime.fromtimestamp(now, UTC)
+    start = end - timedelta(days=days)
+    book = ledger.CostLedger(directory)
     try:
-        checks = run_cost.hours_checks(ledger.CostLedger(directory), end - timedelta(days=days), end, home, builder, sizes,
-                                       max_ratio)
+        checks = run_cost.hours_checks(book, start, end, home, builder, scope, max_ratio)
+        checked_regions = frozenset(region for _size, region in checks)
+        size_order = {size: index for index, size in enumerate(scope.sizes)}
+        active = sorted((key for key, check in checks.items() if check.billed_hours or check.box_hours),
+                        key=lambda key: (size_order[key[0]], key[1]))
+        if not active:
+            reason = ('There are no machine hours to compare.' if run_cost.billed_readings(book, start, end)
+                      else f'No AWS bill is available yet for the last {days} days.')
+            return HoursComparisonUnavailable(reason, checked_regions)
     except ledger.LedgerUnavailable:
-        return Table(title, ('type', *regions), frozenset(), (), 'columns'), 'No billed hours: the cost ledger is not readable.'
-    # A region that is no longer a candidate keeps its column while it has hours in the window.
-    columns = (*regions, *sorted({region for _size, region in checks} - set(regions)))
-    rows = tuple((size, *(hours_cell(checks.get((size, region))) for region in columns))
-                 for size in sizes if any(key[0] == size for key in checks))
-    note = (f'AWS billed Spot hours / recorded box hours, last {days} days, on the days with a bill. '
-            + f'The gap in parentheses is the difference over the box hours. Over: the gap is above {max_ratio:.0%}. '
-            + 'Not billed: no day has a bill yet.')
-    return Table(title, ('type', *columns), frozenset(range(1, len(columns) + 1)), rows, 'columns'), note
-
-
-def hours_cell(check: run_cost.HoursCheck | None) -> str:
-    """For example 9.2/8.8 (4%); 'over' marks a gap above the limit."""
-    if check is None:
-        return '—'
-    if check.billed_hours is None:
-        return 'not billed'
-    gap = f' ({check.hours_gap_ratio:.0%})' if check.hours_gap_ratio is not None else ''
-    return f'{check.billed_hours:.1f}/{check.box_hours:.1f}{gap}' + (' over' if check.hours_gap_over else '')
+        return HoursComparisonUnavailable('Our records are unreadable.')
+    rows = tuple(MachineHoursRow(size, region, checks[size, region]) for size, region in active)
+    return HoursComparison(rows, checked_regions, max_ratio)
 

@@ -22,7 +22,7 @@ from scripts.accounts import accounts
 from scripts.agents import worker_lifecycle
 from scripts.lib import conf, models_registry, nix_env
 from scripts.lib.transcripts import open_transcript
-from scripts.message import session_send, sessions
+from scripts.message import send_result, session_send, sessions
 from scripts.production import staff, worker_admission
 from scripts.usage import agents_log
 
@@ -275,7 +275,7 @@ def _deliver(turn: ClaudeTurn, native_id: str, environment: Mapping[str, str]) -
                             env=environment, text=True, stdout=subprocess.PIPE, check=False)
     if result.returncode:
         raise _LaunchFailed(2)
-    if not result.stdout.startswith(("SENT:", "SKIPPED:")):
+    if not send_result.delivered_or_kept(result.returncode, result.stdout, accept_skipped=True):
         print(f"claude_worker: opening prompt was not delivered: {result.stdout.strip()}", file=sys.stderr)
         raise _LaunchFailed(2)
 
@@ -293,7 +293,7 @@ def open_worker(turn: ClaudeTurn, *,
             binary = _validate(turn, environment)
             allowed = worker_admission.admit(turn.name, turn.run, reference=turn.staff_id)
             request = worker_admission.assignment_id(turn.prompt)
-            register_seconds = conf.read("direct").whole("CLAUDE_WORKER_REGISTER_WAIT_SECS")
+            register_seconds = conf.read("direct").whole("claude_worker_register_wait_secs")
 
             def start(handoff: worker_admission.FamilyHandoff) -> str:
                 nonlocal created, prepared
@@ -405,7 +405,7 @@ def wait_for_turn(turn: ClaudeTurn, delivered: Delivered) -> int:
     """Read native state and logs until the delivered turn finishes."""
     with _environment(replace(turn, env=delivered.launch_environment or turn.env)) as environment:
         binary = _binary(environment)
-        seconds = float(environment.get("UNIT_WORKER_POLL_SECS") or conf.read("direct").text("CLAUDE_WORKER_POLL_SECS"))
+        seconds = float(environment.get("UNIT_WORKER_POLL_SECS") or conf.read("direct").text("claude_worker_poll_secs"))
         identity = delivered.native_id[:8]
         seen_busy = False
         while True:

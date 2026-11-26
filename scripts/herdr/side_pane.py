@@ -177,14 +177,14 @@ def open(label: str, policy: worker_panes.LaunchPolicy, *, question: str = "", c
     if isinstance(current, StoppedSidePane):
         destination = herdr.ExistingPane(current.pane, current.terminal)
     else:
-        ratio = config.number("WORKER_SPLIT_RATIO")
+        ratio = config.number("worker_split_ratio")
         destination = herdr.SplitPane(caller.pane, "right", ratio, label)
     arguments = worker_panes.launch_arguments(policy, "", cwd)
     if policy.settings.kind == "claude":
         arguments.extend(["-n", label])
     launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
         arguments, herdr.NoOpeningPrompt(),
-        int(config.number("PANE_AGENT_START_SECONDS") * 1000), agent=label)
+        int(config.number("pane_agent_start_seconds") * 1000), agent=label)
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return _note(client, launched.pane, launched.outcome.reason)
     fresh = client.panes()
@@ -194,7 +194,7 @@ def open(label: str, policy: worker_panes.LaunchPolicy, *, question: str = "", c
         text = f"{question}\n{caller.reply_command}" if isinstance(delivery, worker_panes.ReplyToCaller) else question
         client.prompt_terminal(result.pane, result.terminal, text)
         if policy.settings.kind == "codex":
-            deadline = monotonic() + config.number("PANE_AGENT_START_SECONDS")
+            deadline = monotonic() + config.number("pane_agent_start_seconds")
             while True:
                 try:
                     _ = client.native_pane_process(result.pane, "codex", max(0, deadline - monotonic()))

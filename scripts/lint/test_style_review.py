@@ -16,11 +16,12 @@ from typing import cast, override
 from scripts.agents import worker_lifecycle
 from scripts.agents.worker_lifecycle import LockFileDescriptor, NO_LOCK_DEADLINE
 from scripts.message import sessions
+from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from unittest import mock
 
 from scripts.lint import style_review as style
-from scripts.lib.git_test_support import commit_repository
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -46,15 +47,26 @@ class PreparationTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = self.root / "lint.conf"
+        _ = config.write_text("style_review=on\n")
+        _ = (self.root / "build_folders.conf").write_text(f"roots.build={self.root / 'build'}\n" + """\
+# whole: 1..
+names.suffix_length=11
+names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
+patterns.legacy-unique={purpose}{suffix}
+# range: 0.001..60
+locks.probe_wait_seconds=0.25
+# range: 0.001..1
+locks.probe_retry_seconds=0.005
+""")
+        environment = {**fixture_git_environment(self.root), "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(self.root)}
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.output = self.root / "input"
         _ = subprocess.run(["git", "init", "-q", str(self.repo)], check=True, capture_output=True)
         _ = (self.repo / "note.txt").write_text("old\n")
         _ = self.commit("baseline")
-        config = self.root / "lint.conf"
-        _ = config.write_text("style_review=on\n")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent)})))
 
     def commit(self, message: str) -> str:
         return commit_repository(self.repo, message)
@@ -66,7 +78,11 @@ class PreparationTests(unittest.TestCase):
         return style.start(self.repo, "HEAD", self.root / "phase", prompt, name)
 
     def test_live_dispatch_refuses_a_second_style_owner_without_changing_artifacts(self) -> None:
+        held = build_folders.held_build_folder_descriptors()
         first = self.style_start()
+        self.assertEqual(build_folders.held_build_folder_descriptors(), held)
+        self.assertTrue(first.name.startswith("dispatch-1-"))
+        self.assertEqual(len(first.name.removeprefix("dispatch-1-")), 11)
         before = file_snapshot(first.parent.parent)
         with self.assertRaisesRegex(style.StyleReviewBusy, "in flight: dispatch-1"):
             _ = self.style_start("dispatch-101")
@@ -76,6 +92,25 @@ class PreparationTests(unittest.TestCase):
         style.finish(first, result, 0)
         second = self.style_start("dispatch-101")
         self.assertNotEqual(first, second)
+
+    def test_setup_keeps_the_inherited_git_repository_unchanged(self) -> None:
+        git_dir = self.repo / ".git"
+        head = style.git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        index = (git_dir / "index").read_bytes()
+        shallow = self.root / "shallow"
+        _ = shallow.write_bytes(head + b"\n")
+        inherited = {"GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(self.repo), "GIT_SHALLOW_FILE": str(shallow)}
+        fixture = PreparationTests("runTest")
+        with mock.patch.dict(os.environ, inherited):
+            try:
+                fixture.setUp()
+                self.assertTrue(inherited.keys().isdisjoint(os.environ))
+                root = style.git(fixture.repo, "rev-parse", "--show-toplevel")
+                self.assertEqual(root.stdout.decode().strip(), str(fixture.repo.resolve()))
+            finally:
+                fixture.doCleanups()
+        self.assertEqual(style.git(self.repo, "rev-parse", "HEAD").stdout.strip(), head)
+        self.assertEqual((git_dir / "index").read_bytes(), index)
 
     def test_dead_owner_retry_keeps_its_state_when_old_capture_arrives(self) -> None:
         first = self.style_start()

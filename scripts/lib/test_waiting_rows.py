@@ -21,6 +21,10 @@ from scripts.lib import conf, live_settings, main_publish, main_sync, waiting_ro
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import pending_rows
+from scripts.agents import remote
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.test_production_doc import enrolled_document
 
 SETTINGS = "# whole: 1..\namount=2\n# whole: 1..\nlimit=5\n"
 REGISTRY = "[assignments]\ndirect=codex\nreview=gpt-a:high\n"
@@ -37,10 +41,11 @@ class WaitingRowsTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="waiting-rows-")))
         environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         environment.update(HOME=str(self.root), XDG_STATE_HOME=str(self.root / "state"),
-                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
                            GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="Rows Test", GIT_AUTHOR_EMAIL="rows@example.invalid",
                            GIT_COMMITTER_NAME="Rows Test", GIT_COMMITTER_EMAIL="rows@example.invalid")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         origin = self.root / "origin.git"
         self.run_git(self.root, "init", "-q", "--bare", "-b", "main", str(origin))
         self.checkout, self.peer = self.root / "checkout", self.root / "peer"
@@ -86,6 +91,28 @@ class WaitingRowsTests(unittest.TestCase):
     def peer_order(self, stem: str, key: str, order: int) -> None:
         _ = (self.peer / waiting_rows.ORDER_PATH).write_text(json.dumps({stem: {key: order}}) + "\n")
         self.run_git(self.peer, "add", waiting_rows.ORDER_PATH)
+
+    def test_a_checkout_move_keeps_an_ignored_live_log_on_incoming_conflict(self) -> None:
+        integration = self.root / "integration"
+        self.run_git(self.checkout, "worktree", "add", "-qb", "integration", str(integration))
+        doc = self.checkout / "fixture-production-live.md"
+        enrolled_document(doc, self.checkout, integration, "integration", log="live.log")
+        log = self.checkout / "live.log"
+        _ = log.write_text("live log\n")
+        _ = (self.checkout / ".git/info/exclude").write_text("/live.log\n")
+        _ = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc(remote.local_machine(), doc))
+        _ = (self.peer / "live.log").write_text("incoming log\n")
+        self.run_git(self.peer, "add", "live.log")
+        self.run_git(self.peer, "commit", "-qm", "Incoming log")
+        self.run_git(self.peer, "push", "-q", "origin", "main")
+        self.run_git(self.checkout, "fetch", "-q", "origin")
+        head = self.output("rev-parse", "HEAD")
+        index = (self.checkout / ".git/index").read_bytes()
+        with self.assertRaisesRegex(OSError, "conflicts with incoming live.log"):
+            waiting_rows.move_to(self.checkout, "origin/main", fast_forward=True)
+        self.assertEqual(self.output("rev-parse", "HEAD"), head)
+        self.assertEqual((self.checkout / ".git/index").read_bytes(), index)
+        self.assertEqual(log.read_bytes(), b"live log\n")
 
     def test_replace_value_preserves_only_whitespace_comments(self) -> None:
         for original, expected in (
@@ -160,6 +187,125 @@ class WaitingRowsTests(unittest.TestCase):
         self.assertEqual((self.checkout / relative).read_text(), SETTINGS)
         with waiting_rows.locked_journal(journal) as pending:
             self.assertEqual(pending.accepted["example"]["amount"], waiting_rows.AcceptedOrder(2))
+
+    def test_a_newer_published_order_supersedes_an_old_save(self) -> None:
+        _ = (self.peer / waiting_rows.ORDER_PATH).write_text(json.dumps({
+            "example": {"AMOUNT": 5, "amount": 1},
+        }))
+        self.run_git(self.peer, "add", waiting_rows.ORDER_PATH)
+        target = self.peer_change("config/example.conf", "amount=2", "amount=4")
+        waiting_rows.move_to(self.checkout, target)
+        journal = waiting_rows.journal_path()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        _ = journal.write_text(json.dumps({
+            "last_order": 4,
+            "register": {"example": {"AMOUNT": {"order": 3, "value": "3"},
+                                     "LIMIT": {"order": 4}, "limit": {"order": 2}}},
+            "changes": [
+                {"stem": "example", "key": "AMOUNT", "value": "3",
+                 "message": "tune(example): Save amount", "save_order": 3},
+                {"stem": "example", "key": "amount", "value": "1",
+                 "message": "tune(example): Older Save", "save_order": 1},
+            ],
+        }))
+        with waiting_rows.locked_journal(journal) as pending:
+            self.assertEqual(pending.order("example", "limit"), 4)
+            self.assertEqual([(change.key, change.save_order) for change in pending.changes], [("amount", 3)])
+            self.assertNotIn('"AMOUNT"', journal.read_text())
+            self.assertNotIn('"LIMIT"', journal.read_text())
+        self.edit("config/example.conf", "amount=4\n", "amount=4\nAMOUNT=3\n")
+        with mock.patch.object(live_settings, "pull_mac", return_value="mac: pulled"):
+            self.assertEqual(live_settings.publish(self.checkout, wait=True),
+                             ["main: amount=3 has a newer live value; no commit", "main: origin has it", "mac: pulled"])
+        self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
+        self.assertEqual((self.checkout / "config/example.conf").read_text(), SETTINGS.replace("amount=2", "amount=4"))
+
+    def test_an_old_gate_save_uses_the_current_file_and_order(self) -> None:
+        config = self.checkout / "config"
+        gate = config / "gate.conf"
+        legacy_gate = config / "merge_gate.conf"
+        original = "gate_time_limit_factor=2\nother=4\n"
+        _ = gate.write_text(original)
+        legacy_gate.symlink_to("gate.conf")
+        orders = self.checkout / waiting_rows.ORDER_PATH
+        journal = waiting_rows.journal_path()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        for published_order, expected in ((2, "3"), (5, "2")):
+            with self.subTest(published_order=published_order):
+                _ = gate.write_text(original)
+                _ = orders.write_text(json.dumps({"gate": {"gate_time_limit_factor": published_order}}))
+                self.run_git(self.checkout, "add", "config/gate.conf", "config/merge_gate.conf", waiting_rows.ORDER_PATH)
+                self.run_git(self.checkout, "commit", "-qm", f"Published order {published_order}")
+                _ = journal.write_text(json.dumps({
+                    "last_order": 3,
+                    "register": {"merge_gate": {"GATE_TIME_LIMIT_FACTOR": {"order": 3, "value": "3"}}},
+                    "changes": [{"stem": "merge_gate", "key": "GATE_TIME_LIMIT_FACTOR", "value": "3",
+                                 "message": "tune(gate): Save time limit", "save_order": 3}],
+                }))
+                legacy_gate.unlink()
+                _ = legacy_gate.write_text(original.replace("gate_time_limit_factor=2", "GATE_TIME_LIMIT_FACTOR=3 # local note"))
+                waiting_rows.restore_live(self.checkout)
+                self.assertTrue(legacy_gate.is_symlink())
+                self.assertEqual(legacy_gate.readlink(), Path("gate.conf"))
+                self.assertEqual(gate.read_text(), original.replace("factor=2", f"factor={expected} # local note"))
+                with waiting_rows.locked_journal(journal) as pending:
+                    self.assertEqual(pending.order("gate", "gate_time_limit_factor"), max(3, published_order))
+                    self.assertEqual(pending.changes[0].stem, "gate")
+                    self.assertEqual(pending.changes[0].key, "gate_time_limit_factor")
+                    self.assertNotIn("merge_gate", pending.accepted)
+
+    def test_publication_recovers_the_legacy_row_appended_during_the_rename(self) -> None:
+        relative = "config/example.conf"
+        path = self.checkout / relative
+        before = self.peer_change(relative, "amount=2", "AMOUNT=2")
+        waiting_rows.move_to(self.checkout, before)
+        journal = waiting_rows.journal_path()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        _ = journal.write_text(json.dumps({
+            "last_order": 3, "register": {"example": {"AMOUNT": {"order": 3, "value": "3"}}},
+            "changes": [{"stem": "example", "key": "AMOUNT", "value": "3",
+                         "message": "tune(example): Save amount", "save_order": 3}],
+        }))
+        self.edit(relative, "AMOUNT=2", "AMOUNT=3 # local note")
+        target = self.peer_change(relative, "AMOUNT=2", "amount=2")
+        def old_setting_name(stem: str, key: str) -> tuple[str, str]:
+            return stem, key
+
+        # Use the old name handling while the mover installs the rename.
+        with mock.patch.object(waiting_rows, "migrated_setting_name", old_setting_name):
+            waiting_rows.move_to(self.checkout, target)
+        self.assertEqual(path.read_text(), SETTINGS + "AMOUNT=3 # local note\n")
+        self.edit(relative, "limit=5", "limit=8")
+        with mock.patch.object(live_settings, "pull_mac", return_value="mac: pulled"):
+            self.assertEqual(live_settings.publish(self.checkout, wait=True), ["main: pushed", "mac: pulled"])
+        self.assertEqual(path.read_text(), SETTINGS.replace("amount=2", "amount=3 # local note").replace("limit=5", "limit=8"))
+        self.assertEqual(self.output("show", f"origin/main:{relative}"), SETTINGS.replace("amount=2", "amount=3 # local note"))
+        with pending_rows() as changes:
+            self.assertEqual(changes, [])
+
+    def test_two_legacy_saves_publish_with_the_first_rows_comment(self) -> None:
+        relative = "config/example.conf"
+        path = self.checkout / relative
+        _ = path.write_text(SETTINGS + "AMOUNT=3 # local note\nLIMIT=8\n")
+        journal = waiting_rows.journal_path()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        changes = [
+            {"stem": "example", "key": "AMOUNT", "value": "3", "save_order": 3, "message": "tune(example): Save amount"},
+            {"stem": "example", "key": "LIMIT", "value": "8", "save_order": 4, "message": "tune(example): Save limit"},
+        ]
+        _ = journal.write_text(json.dumps({"last_order": 4, "register": {}, "changes": changes}))
+
+        with mock.patch.object(live_settings, "pull_mac", return_value="mac: pulled"):
+            self.assertEqual(live_settings.publish(self.checkout, wait=True), ["main: pushed", "mac: pulled"])
+
+        first = SETTINGS.replace("amount=2", "amount=3 # local note")
+        both = first.replace("limit=5", "limit=8")
+        self.assertEqual(self.output("show", f"origin/main^:{relative}"), first)
+        self.assertEqual(self.output("show", f"origin/main:{relative}"), both)
+        self.assertEqual(path.read_text(), both)
+        self.assertEqual(self.output("status", "--porcelain"), "")
+        with pending_rows() as pending:
+            self.assertEqual(pending, [])
 
     def test_a_staged_setting_refuses_before_the_plan_is_written(self) -> None:
         relative = "config/example.conf"
@@ -434,7 +580,10 @@ from scripts.lib import waiting_rows
 git = waiting_rows.git
 write = waiting_rows.write_text_atomic
 step = sys.argv[2]
+marker_writes = 0
 def stop_at_git(checkout, *args, **kwargs):
+    if args[:3] == ("read-tree", "-m", "-u") and not kwargs.get("environment") and step == "give":
+        os.kill(os.getpid(), signal.SIGKILL)
     if args[0] == "update-ref" and step == "read-tree":
         os.kill(os.getpid(), signal.SIGKILL)
     result = git(checkout, *args, **kwargs)
@@ -443,9 +592,12 @@ def stop_at_git(checkout, *args, **kwargs):
     return result
 
 def stop_at_write(path, text, **kwargs):
+    global marker_writes
     write(path, text, **kwargs)
-    if path.name == "waiting-rows.move" and step == "marker":
-        os.kill(os.getpid(), signal.SIGKILL)
+    if path.name == "waiting-rows.move":
+        marker_writes += 1
+        if step == "marker" or (step == "before-give" and marker_writes == 2):
+            os.kill(os.getpid(), signal.SIGKILL)
 
 waiting_rows.git = stop_at_git
 waiting_rows.write_text_atomic = stop_at_write
@@ -552,6 +704,212 @@ waiting_rows.move_to(Path.cwd(), sys.argv[1], fast_forward=True)
         waiting_rows.move_to(self.checkout, target)
         self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
         self.assertEqual(file.read_text(), SETTINGS.replace("amount=2", "amount=3").replace("limit=5", "limit=7"))
+        self.assertFalse(waiting_rows.move_marker(self.checkout).exists())
+
+    def test_recovery_keeps_a_setting_staged_after_the_marker_write(self) -> None:
+        relative = "config/example.conf"
+        file = self.checkout / relative
+        head = self.output("rev-parse", "HEAD").strip()
+        target = self.peer_change(relative, "amount=2", "amount=3")
+        before = SETTINGS.replace("limit=5", "limit=6")
+        _ = file.write_text(before)
+        stopped = self.stop_move(target, "marker")
+        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
+        marker = waiting_rows.move_marker(self.checkout)
+        self.assertTrue(marker.exists())
+        staged = SETTINGS.replace("limit=5", "limit=8")
+        _ = file.write_text(staged)
+        self.run_git(self.checkout, "add", "--", relative)
+        _ = file.write_text(before)
+
+        waiting_rows.restore_live(self.checkout)
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.output("rev-parse", "HEAD").strip(), head)
+        self.assertEqual(file.read_text(), before)
+        self.assertEqual(self.output("show", f":{relative}"), staged)
+
+    def test_recovery_keeps_a_nonoverlapping_staged_edit_after_git_changes_the_index(self) -> None:
+        relative = "config/example.conf"
+        file = self.checkout / relative
+        head = self.output("rev-parse", "HEAD").strip()
+        target = self.peer_change(relative, "amount=2", "amount=3")
+        before = SETTINGS.replace("limit=5", "limit=6")
+        _ = file.write_text(before)
+        stopped = self.stop_move(target, "read-tree")
+        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
+        self.assertEqual(self.output("show", f":{relative}"), SETTINGS.replace("amount=2", "amount=3"))
+        staged = SETTINGS.replace("limit=5", "limit=8")
+        _ = file.write_text(staged)
+        self.run_git(self.checkout, "add", "--", relative)
+        _ = file.write_text(before)
+
+        waiting_rows.restore_live(self.checkout)
+
+        self.assertEqual(self.output("rev-parse", "HEAD").strip(), head)
+        self.assertFalse(waiting_rows.move_marker(self.checkout).exists())
+        self.assertEqual(file.read_text(), before)
+        self.assertEqual(self.output("show", f":{relative}"), staged)
+
+    def test_recovery_reports_an_overlapping_staged_edit_and_keeps_both_texts(self) -> None:
+        relative = "config/example.conf"
+        file = self.checkout / relative
+        head = self.output("rev-parse", "HEAD").strip()
+        target = self.peer_change(relative, "amount=2", "amount=3")
+        before = SETTINGS.replace("limit=5", "limit=6")
+        _ = file.write_text(before)
+        stopped = self.stop_move(target, "read-tree")
+        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
+        marker = waiting_rows.move_marker(self.checkout)
+        plan = marker.read_bytes()
+        staged = before.replace("amount=2", "amount=8")
+        _ = file.write_text(staged)
+        self.run_git(self.checkout, "add", "--", relative)
+        _ = file.write_text(before)
+        errors = io.StringIO()
+
+        with chdir(self.checkout), redirect_stderr(errors):
+            self.assertEqual(waiting_rows.main(["fast-forward", target]), 1)
+
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"waiting_rows: {relative}: staged edit overlaps the interrupted move. "
+            + f"Inspect it with git diff --cached -- {relative}",
+        ])
+        self.assertEqual(self.output("rev-parse", "HEAD").strip(), head)
+        self.assertEqual(marker.read_bytes(), plan)
+        self.assertEqual(file.read_text(), before)
+        self.assertEqual(self.output("show", f":{relative}"), staged)
+
+    def test_recovery_keeps_a_matching_index_entry_without_a_recorded_write(self) -> None:
+        relative = "config/example.conf"
+        path = self.checkout / relative
+        head = self.output("rev-parse", "HEAD")
+        target = self.peer_change(relative, "amount=2", "amount=3")
+        before = SETTINGS.replace("limit=5", "limit=6")
+        _ = path.write_text(before)
+        stopped = self.stop_move(target, "before-give")
+        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
+        marker = waiting_rows.move_marker(self.checkout)
+        plan = marker.read_bytes()
+        staged = SETTINGS.replace("amount=2", "amount=3")
+        _ = path.write_text(staged)
+        self.run_git(self.checkout, "add", "--", relative)
+        _ = path.write_text(before)
+        errors = io.StringIO()
+
+        with chdir(self.checkout), redirect_stderr(errors):
+            self.assertEqual(waiting_rows.main(["fast-forward", target]), 1)
+
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"waiting_rows: {relative}: the move did not record the index write. "
+            + f"Inspect it with git diff --cached -- {relative}",
+        ])
+        self.assertEqual(marker.read_bytes(), plan)
+        self.assertEqual(self.output("rev-parse", "HEAD"), head)
+        self.assertEqual(self.output("show", f":{relative}"), staged)
+        self.assertEqual(path.read_text(), before)
+
+    def test_recovery_reverses_only_the_recorded_hunk_in_a_staged_file(self) -> None:
+        relative = "config/example.conf"
+        path = self.checkout / relative
+        head = self.output("rev-parse", "HEAD")
+        target = self.peer_change(relative, "amount=2", "amount=3")
+        before = SETTINGS.replace("limit=5", "limit=6")
+        _ = path.write_text(before)
+        stopped = self.stop_move(target, "give")
+        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
+        given = SETTINGS.replace("amount=2", "amount=3")
+        self.assertEqual(self.output("show", f":{relative}"), given)
+        _ = path.write_text(given.replace("limit=5", "limit=8"))
+        self.run_git(self.checkout, "add", "--", relative)
+        _ = path.write_text(before)
+
+        waiting_rows.restore_live(self.checkout)
+
+        self.assertEqual(self.output("rev-parse", "HEAD"), head)
+        self.assertEqual(self.output("show", f":{relative}"), SETTINGS.replace("limit=5", "limit=8"))
+        self.assertEqual(path.read_text(), before)
+        self.assertFalse(waiting_rows.move_marker(self.checkout).exists())
+
+    def test_recovery_keeps_an_unstaged_edit_that_matches_the_planned_file(self) -> None:
+        relative = "config/example.conf"
+        path = self.checkout / relative
+        head = self.output("rev-parse", "HEAD")
+        target = self.peer_change(relative, "amount=2", "amount=3")
+        before = SETTINGS.replace("limit=5", "limit=6")
+        _ = path.write_text(before)
+        stopped = self.stop_move(target, "give")
+        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
+        self.assertEqual(path.read_text(), before)
+        marker = waiting_rows.move_marker(self.checkout)
+        plan = marker.read_bytes()
+        staged = self.output("show", f":{relative}")
+        edited = before.replace("amount=2", "amount=3")
+        _ = path.write_text(edited)
+        errors = io.StringIO()
+
+        with chdir(self.checkout), redirect_stderr(errors):
+            self.assertEqual(waiting_rows.main(["fast-forward", target]), 1)
+
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"waiting_rows: {relative} changed after the move started. Inspect it with git diff HEAD -- {relative}",
+        ])
+        self.assertEqual(self.output("rev-parse", "HEAD"), head)
+        self.assertEqual(marker.read_bytes(), plan)
+        self.assertEqual(self.output("show", f":{relative}"), staged)
+        self.assertEqual(path.read_text(), edited)
+
+    def test_recovery_reports_the_command_when_an_overlap_is_also_in_the_worktree(self) -> None:
+        relative = "config/example.conf"
+        path = self.checkout / relative
+        head = self.output("rev-parse", "HEAD")
+        target = self.peer_change(relative, "amount=2", "amount=3")
+        before = SETTINGS.replace("limit=5", "limit=6")
+        _ = path.write_text(before)
+        stopped = self.stop_move(target, "read-tree")
+        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
+        marker = waiting_rows.move_marker(self.checkout)
+        plan = marker.read_bytes()
+        edited = before.replace("amount=2", "amount=8")
+        _ = path.write_text(edited)
+        self.run_git(self.checkout, "add", "--", relative)
+        errors = io.StringIO()
+
+        with chdir(self.checkout), redirect_stderr(errors):
+            self.assertEqual(waiting_rows.main(["fast-forward", target]), 1)
+
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"waiting_rows: {relative}: staged edit overlaps the interrupted move. "
+            + f"Inspect it with git diff --cached -- {relative}",
+        ])
+        self.assertEqual(self.output("rev-parse", "HEAD"), head)
+        self.assertEqual(marker.read_bytes(), plan)
+        self.assertEqual(self.output("show", f":{relative}"), edited)
+        self.assertEqual(path.read_text(), edited)
+
+    def test_a_retry_reaches_the_target_with_the_separate_edit_still_staged(self) -> None:
+        relative = "config/example.conf"
+        path = self.checkout / relative
+        head = self.output("rev-parse", "HEAD")
+        target = self.peer_change(relative, "amount=2", "amount=3")
+        stopped = self.stop_move(target, "marker")
+        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
+        staged = SETTINGS.replace("limit=5", "limit=8")
+        _ = path.write_text(staged)
+        self.run_git(self.checkout, "add", "--", relative)
+        _ = path.write_text(SETTINGS)
+
+        waiting_rows.restore_live(self.checkout)
+
+        self.assertEqual(self.output("rev-parse", "HEAD"), head)
+        self.assertEqual(self.output("show", f":{relative}"), staged)
+        self.assertFalse(waiting_rows.move_marker(self.checkout).exists())
+
+        waiting_rows.move_to(self.checkout, target, fast_forward=True)
+
+        self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
+        self.assertEqual(self.output("show", f":{relative}"), staged.replace("amount=2", "amount=3"))
+        self.assertEqual(path.read_text(), SETTINGS.replace("amount=2", "amount=3"))
         self.assertFalse(waiting_rows.move_marker(self.checkout).exists())
 
     def test_a_save_validates_the_key_after_move_recovery(self) -> None:

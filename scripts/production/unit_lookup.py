@@ -11,6 +11,7 @@ except FileNotFoundError:
     pass
 
 import json
+import re
 import socket
 import struct
 import subprocess
@@ -61,6 +62,7 @@ from scripts.production.session_staff import (
     LabeledProductions as LabeledProductions,
     ProvedLiveUnit as ProvedLiveUnit,
     ProvedAbsentUnit as ProvedAbsentUnit,
+    NonAgentPaneHolders as NonAgentPaneHolders,
     UnknownUnit as UnknownUnit,
     UnitOwner as UnitOwner,
     production_members as production_members,
@@ -325,7 +327,7 @@ def read_run_states(*, record: staff.StaffSnapshot | None = None) -> RunStates:
         row = unit_runs.run_owner(first, record)
         if isinstance(row, unit_runs.RunOwnerUnrecorded) or isinstance(row.worktree, staff.WorktreeUnfilled):
             continue
-        worktree = str(row.worktree.path)
+        worktree = str(row.worktree.path.resolve())
         started = first.get("run_started_at")
         at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
         if worktree not in newest or at > newest[worktree].at:
@@ -337,7 +339,7 @@ def read_run_states(*, record: staff.StaffSnapshot | None = None) -> RunStates:
         if isinstance(row.run, staff.OpenRun) and not isinstance(row.worktree, staff.WorktreeUnfilled):
             if unit_runs.run_is_open(row.run.path):
                 path = directory / f"{row.run.path.name}.jsonl"
-                records[str(row.worktree.path)] = RunRecord(path, UnitState.RUNNING)
+                records[str(row.worktree.path.resolve())] = RunRecord(path, UnitState.RUNNING)
     return RunStates(records)
 
 
@@ -630,6 +632,33 @@ def _unproved_pane(place: HerdrPlace, processes: list[herdr.HerdrProcess], claud
                           session_staff.UnprovedPaneIdentity(frozenset(candidates)))
 
 
+@dataclass(frozen=True)
+class _RegisteredClaudeWithoutArgv(ObservedProcess):
+    """The foreground PID lacks argv and agrees with the pane and registry."""
+
+    conversation: str
+
+
+def _holder_reason(blocking: Mapping[int, str], observed: Mapping[int, herdr.HerdrProcess], shell_pid: int) -> str:
+    from scripts.herdr import herdr
+
+    relations = {
+        herdr.PaneShellAncestry.DESCENDANT: "inside the shell tree",
+        herdr.PaneShellAncestry.OUTSIDE: "outside the shell tree",
+        herdr.PaneShellAncestry.UNKNOWN: "shell tree position unknown",
+    }
+    details: list[str] = []
+    for pid, command in sorted(blocking.items()):
+        holder = observed.get(pid)
+        ancestry = (holder.ancestry.relative_to_shell(pid, shell_pid) if holder is not None
+                    else herdr.PaneShellAncestry.UNKNOWN)
+        if (not re.fullmatch(r"[\w.+-]+", command, re.ASCII)
+                or re.search(r"[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}", command, re.IGNORECASE | re.ASCII)):
+            command = "unknown command"
+        details.append(f"{command} ({relations[ancestry]})")
+    return "no foreground agent. Blocking processes are " + ", ".join(details)
+
+
 def _herdr_labeled(registry: dict[HerdrPlace, dict[int, list[SessionRecord]]], evidence: ClaudeRegistryEvidence,
                    processes: list[herdr.HerdrProcess]) -> Iterable[PaneObservation]:
     """Join each pane's proved owner to its current conversation."""
@@ -671,9 +700,29 @@ def _herdr_labeled(registry: dict[HerdrPlace, dict[int, list[SessionRecord]]], e
             info = herdr.json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
                                      "unit pane process info")
             owner = herdr.pane_foreground(place, info)
-            if isinstance(owner, herdr.ObservedEmpty):
-                if problem or claudes or any(process.pid != owner.shell_pid for process in holders):
-                    yield _unproved_pane(place, holders, claudes, problem or "no foreground agent", pane)
+            if isinstance(owner, (herdr.ObservedEmpty, herdr.PaneWithNonAgentForeground, herdr.PaneShellNotProvedIdle)):
+                foreground = ({process.pid: process.command for process in owner.processes}
+                              if isinstance(owner, herdr.PaneWithNonAgentForeground) else {})
+                possible_holders = [process for process in holders if process.pid in foreground
+                                    or not process.ancestry.is_detached_from_shell(process.pid, owner.shell_pid)]
+                blocking = {process.pid: process.command for process in possible_holders if process.pid != owner.shell_pid}
+                blocking.update(foreground)
+                reason = problem or "no foreground agent"
+                if blocking and not problem:
+                    reason = _holder_reason(blocking, {process.pid: process for process in possible_holders}, owner.shell_pid)
+                if isinstance(owner, herdr.PaneShellNotProvedIdle):
+                    yield _unproved_pane(place, holders, claudes, reason, pane, registry_problem=problem)
+                    continue
+                holders = possible_holders
+                if problem or claudes or blocking:
+                    agent_holds_pane = any(process.pid in blocking and (process.runs_agent
+                                           or process.command in {"claude", "codex"}) for process in holders)
+                    label = _unproved_pane(place, holders, claudes, reason, pane)
+                    if blocking and not (problem or claudes or agent_holds_pane):
+                        label = replace(label, claude=session_staff.PaneHeldByNonAgents(reason))
+                    yield label
+                elif isinstance(owner, herdr.PaneWithNonAgentForeground):
+                    yield _unproved_pane(place, holders, claudes, owner.reason, pane)
                 elif holders and (identity := holders[0].marks.get("CLAUDE_CODE_SESSION_ID")):
                     shell = holders[0]
                     yield LabeledSession("", ClaudeNotRunning(), place, ObservedProcess(shell.pid, shell.command),
@@ -685,7 +734,16 @@ def _herdr_labeled(registry: dict[HerdrPlace, dict[int, list[SessionRecord]]], e
                     yield LabeledSession("", ClaudeNotRunning(), place, empty=owner)
                 continue
             if isinstance(owner, herdr.UnknownPaneOwner):
-                raise herdr_types.HerdrFailure(owner.reason)
+                label = _unproved_pane(place, holders, claudes, problem or owner.reason, pane, registry_problem=problem)
+                if isinstance(owner, herdr.ClaudePaneWithoutArgv) and not problem and place in panes:
+                    registered = claudes.get(owner.pid, ())
+                    if len(registered) == 1:
+                        conversation = registered[0]["sessionId"]
+                        report = herdr.checked_pane_session(pane)
+                        if isinstance(report, herdr.NoReportedAgentSession) or report.session_id == conversation:
+                            label = replace(label, process=_RegisteredClaudeWithoutArgv(owner.pid, "claude", conversation))
+                yield label
+                continue
             native = herdr.read_foreground_pane_owner(owner, pane)
             identity = LiveSession(native.current_identity)
             if isinstance(owner, herdr.ProvedClaudeForeground):
@@ -807,6 +865,14 @@ def observed_session_labels(*, record: staff.StaffSnapshot | None = None,
         raise OSError(str(error)) from error
 
 
+@dataclass(frozen=True)
+class ClaudeArgvUnavailable(UnknownUnit):
+    """The exact conversation's pane reports a Claude PID without argv."""
+
+    pid: int
+    place: HerdrPlace
+
+
 def checked_conversation(identity: str, *, record: staff.StaffSnapshot | None = None,
                          registry: sessions.RegistryRead | None = None, probe_address: bool = True) -> UnitOwner:
     """Check the exact conversation with fresh pane evidence."""
@@ -820,7 +886,19 @@ def checked_conversation(identity: str, *, record: staff.StaffSnapshot | None = 
                 observed = observed_session_labels(record=record, registry=registry, probe_address=probe_address)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return UnknownUnit(str(error))
-    return observed.checked_conversation(identity)
+    checked = observed.checked_conversation(identity)
+    if (not isinstance(checked, UnknownUnit) or identity in observed.registry_owners
+            or observed.unreadable_pane_lists or observed.registry_failures):
+        return checked
+    candidates = [pane for pane in observed.labels
+                  if pane.identity == LiveSession(identity)
+                  or isinstance(pane.identity, session_staff.UnprovedPaneIdentity) and identity in pane.identity.candidates]
+    if len(candidates) == 1:
+        pane = candidates[0]
+        if (isinstance(pane.process, _RegisteredClaudeWithoutArgv) and pane.process.conversation == identity
+                and isinstance(pane.claude, ClaudeUnknown)):
+            return ClaudeArgvUnavailable(pane.claude.reason, pane.process.pid, pane.place)
+    return checked
 
 
 def every_labeled_session(*, record: staff.StaffSnapshot | None = None,

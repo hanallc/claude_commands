@@ -22,7 +22,7 @@ Its columns are `Unit | Director | Machine | Progress | Phase | ETA Next | ETA P
 - `Director` is the census status of the director's session; its values remain `busy`, `idle`, or the recorded session state.
 - `Machine` appears only when a unit uses another machine.
 - `Progress` shows one square per plan phase. The `Progress:` legend follows the table.
-- `Phase` names each open phase on its own row. With no open phase, it shows done and total phases.
+- `Phase` shows each open phase and its elapsed time. With no open phase, it shows done and total phases.
 - `ETA Next` is the stated ETA of the phase, with any delay.
 - `ETA Plan` appears only while a plan runs.
 The table omits a column whose cells are all `—`.
@@ -157,7 +157,7 @@ A process with an identity but no staff row produces no line and cannot use a un
 A process without an identity reports an unreadable thread when its pane holds staff.
 One staff candidate retains its pane placement with unknown status.
 Morty produces no anomaly when its native ID is on the producer staff row named `morty`.
-The command sends one message with all anomaly lines to `UNIT_ANOMALIES_TO` in `config/production.conf` (`sdlc`).
+The command sends one message with all anomaly lines to `unit_anomalies_to` in `config/production.conf` (`sdlc`).
 The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
 A failed send adds one anomaly line. It changes neither the table nor the exit code.
 

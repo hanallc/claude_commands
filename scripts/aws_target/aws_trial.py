@@ -35,7 +35,8 @@ from scripts.aws_target import ledger, cloud_gate
 from scripts.aws_target.s3_presign import SigningKey as SigningKey, presign as presign
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
-from scripts.lib import conf
+from scripts.lib import conf, origin_deletion
+from scripts.build_queue import snapshot_codec
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.process_group import send_process_group
 from scripts.lib import cancellation
@@ -91,7 +92,7 @@ def checked_git(repo: Path, *arguments: str) -> str:
 
 
 def network_git(repo: Path, *arguments: str) -> str:
-    """Bound network Git calls and stop their process groups on cancellation."""
+    """Bound network Git calls and stop unreaped Git groups on failure."""
     command = ['git', '-C', str(repo), *arguments]
     timeout = cloud_gate.settings().number('git_network_timeout_s')
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -99,11 +100,13 @@ def network_git(repo: Path, *arguments: str) -> str:
         try:
             output, errors = process.communicate(timeout=timeout)
         except BaseException:
-            try:
-                send_process_group(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            _ = process.communicate()
+            if process.returncode is None:
+                with cancellation.defer_cleanup_signals():
+                    try:
+                        send_process_group(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    _ = process.wait()
             raise
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
@@ -146,11 +149,14 @@ def delete_trial_branches(repo: Path, clone_url: str, prefix: str, expires: int,
         fields = line.split()
         if len(fields) != 2 or not fields[1].startswith(namespace):
             continue
-        branch = fields[1]
-        try:
-            _ = checked_git(repo, 'push', clone_url, '--delete', branch)
-        except (OSError, ValueError, subprocess.SubprocessError):
-            print(f'paired trial: could not delete branch {branch.removeprefix("refs/heads/")}', file=sys.stderr)
+        delete_trial_ref(repo, clone_url, fields[1], fields[0])
+
+
+def delete_trial_ref(repo: Path, clone_url: str, ref: str, commit: str) -> None:
+    result = origin_deletion.delete(repo, clone_url, ref, commit,
+                                    timeout=cloud_gate.settings().number('git_network_timeout_s'))
+    if isinstance(result, origin_deletion.Kept):
+        print(f'paired trial: kept {ref}: {result.reason}', file=sys.stderr)
 
 
 def sweep_trial_branches(repo: Path, clone_url: str, prefix: str, now: int) -> None:
@@ -165,7 +171,7 @@ def sweep_trial_branches(repo: Path, clone_url: str, prefix: str, now: int) -> N
             name = fields[1].removeprefix(namespace)
             match = re.fullmatch(r'([0-9]{1,12})-([0-9a-f]{32})-(base|changed)', name)
             if match and int(match[1]) < now:
-                _ = checked_git(repo, 'push', clone_url, '--delete', fields[1])
+                delete_trial_ref(repo, clone_url, fields[1], fields[0])
     except (OSError, ValueError, subprocess.SubprocessError):
         print(f'paired trial: could not sweep old branches for {prefix}', file=sys.stderr)
 
@@ -175,7 +181,8 @@ def module_request(trial: PairedTrialRequest, module: str, attempt: str, expires
             'commit': trial.changed.commit, 'tree': trial.changed.tree, 'head': trial.changed.commit,
             'origin': trial.clone_url, 'clone_url': trial.clone_url, 'mode': 'targeted-test',
             'module': module, 'modules': ['scripts/' + module], 'rounds': trial.rounds, 'source_key': '',
-            'expires': expires, 'module_time_limit_s': cloud_gate.settings().number('module_time_limit_s'),
+            'expires': expires, 'gate_job': snapshot_codec.snapshot_value(PAIRED_TRIAL_JOB),
+            'module_time_limit_s': cloud_gate.settings().number('module_time_limit_s'),
             'delivery_s': cloud_gate.settings().number('termination_timeout_s') + 2 * cloud_gate.settings().number('api_timeout_s')}
 
 
@@ -267,8 +274,7 @@ def cleanup_trial(folder: Path, worker: cloud_gate.GateWorker) -> bool:
 
 def sweep_trial_resources(folder: Path, worker: cloud_gate.GateWorker) -> None:
     """Clean expired trials before a new trial reserves boxes."""
-    unresolved = {row.attempt for row in worker.book.read_snapshot().gate_reservations
-                  if not isinstance(row.state, (ledger.GateAbsent, ledger.GateTerminated)) and worker.cleanup_due(row)}
+    unresolved = {row.attempt for row in worker.book.read_snapshot().gate_reservations if worker.cleanup_due(row)}
     for previous in sorted(folder.parent.iterdir()):
         if previous == folder or not previous.is_dir():
             continue
@@ -310,7 +316,11 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
                 folder, worker.sidecar, PAIRED_TRIAL_JOB, group=group) as slot:
             try:
                 connection.send('ready')
-                if connection.recv() != 'launch':
+                try:
+                    decision = connection.recv()
+                except EOFError:
+                    return
+                if decision != 'launch':
                     return
                 if (folder / 'outcome.json').exists():
                     return
@@ -328,6 +338,14 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
         cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': str(error)})
     finally:
         connection.close()
+
+
+def _start_paired_module(folder: Path, directory: Path, settings_path: Path, connection: LaunchBarrier, *,
+                         group: CloudGroup, coordinator_ends: tuple[LaunchBarrier, ...]) -> None:
+    # Only the coordinator keeps these ends so its exit sends EOF to each worker.
+    for end in coordinator_ends:
+        end.close()
+    paired_module(folder, directory, settings_path, connection, group=group)
 
 
 def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
@@ -390,11 +408,17 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         for request in requests:
             attempt = ledger.text(request, 'attempt')
             parent, child = context.Pipe()
-            process = context.Process(target=paired_module,
+            coordinator_ends = tuple(connection for _, connection in children) + (parent,)
+            process = context.Process(target=_start_paired_module,
                 args=(folder / attempt, directory, settings_path, child),
-                kwargs={'group': CloudGroup(folder.name, len(requests), started_at, Owner(pid, start))})
-            process.start()
-            child.close()
+                kwargs={'group': CloudGroup(folder.name, len(requests), started_at, Owner(pid, start)),
+                        'coordinator_ends': coordinator_ends})
+            try:
+                with child:
+                    process.start()
+            except BaseException:
+                parent.close()
+                raise
             children.append((process, parent))
             descriptor = parent.fileno()
             workers[descriptor] = (attempt, parent)

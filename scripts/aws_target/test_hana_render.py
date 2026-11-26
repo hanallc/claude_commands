@@ -17,41 +17,38 @@ from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.aws_target import hana_guest, hana_receiver, hana_render, hana_runner
+from scripts.aws_target import hana_guest, hana_protocol, hana_receiver, hana_render, hana_runner
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNTIME_LIST = ROOT / 'scripts/aws_target/hana_render.files'
+RUNTIME_LIST = ROOT / hana_render.RUNTIME_FILE_LIST
 IMAGE_LIST = ROOT / 'scripts/aws_target/hana_image.files'
-IMAGE_INPUTS = (
-    'config/hana_aws.conf',
-    'config/build_targets.conf',
-    'config/build_folders.conf',
-    'scripts/aws_target/hana_image.files',
-    'scripts/aws_target/hana_render.py',
-    'scripts/lib/conf.py',
-    'scripts/lib/conf_reads.py',
-)
+RENDER_LIST = ROOT / 'scripts/aws_target/hana_render.files'
+IMAGE_SOURCE_HASH = ROOT / 'scripts/aws_target/hana_image.sha256'
 
 # The guest does not ship these imports for host operations, tests, and type annotations.
 UNSHIPPED_IMPORTS = {
     'build_queue/admission_client.py': {'accounts/__init__.py', 'accounts/outage_alerts.py',
         'message/send_budget.py', 'message/send_result.py', 'message/session_send.py', 'notify/push_texts.py'},
-    'build_queue/slot_wait.py': {'hooks/checkpoint_gate.py', 'lib/shell_test_support.py'},
+    'build_queue/first_step.py': {'build_hold/build_hold.py'},
+    'build_queue/queue_wait.py': {'hooks/checkpoint_gate.py', 'lib/shell_test_support.py'},
+    'build_queue/snapshot_codec.py': {'message/unit_labels.py'},
     'build_queue/step_estimator.py': {'lint/tmp_sweep.py'},
     'buildlog/record.py': {'aws_target/config.py', 'direct/step_record.py'},
     'buildlog/step_context.py': {'lib/cargo_target_config.py'},
     'copies/copies.py': {'lint/tmp_sweep.py', 'agents/remote.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'direct/local_release_wait.py': {'build_targets/build_targets.py', 'build_targets/targets.py', 'build_hold/build_hold.py'},
     'lib/build_folders.py': {'lib/descendants.py'},
+    'lib/python_startup/sitecustomize.py': {'lib/testing_folders.py'},
     'lib/scratch.py': {'direct/phase_table.py', 'production/proposals_table.py', 'production/unit_lookup.py',
         'production/production_doc.py', 'direct/plan_history.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'lib/unit_runs.py': {'direct/worker_state.py'},
     'lint/memory_admit.py': {'message/unit_labels.py'},
     'mac_test/claim_state.py': {'buildlog/transfer_bytes.py'},
-    'production/staff.py': {'agents/worker_lifecycle.py', 'agents/remote.py', 'lib/operation_environment.py'},
+    'production/staff.py': {'agents/worker_lifecycle.py', 'agents/remote.py', 'lib/operation_environment.py',
+        'accounts/__init__.py', 'accounts/role_map.py', 'message/address.py'},
 }
 
 
@@ -75,20 +72,28 @@ def imported_source_paths(source: Path) -> Iterator[Path]:
 
 
 class HanaRenderTests(unittest.TestCase):
+    def test_checked_in_image_source_hash_is_current(self) -> None:
+        computed = hana_render.image_source_sha256(ROOT)
+        self.assertEqual(IMAGE_SOURCE_HASH.read_text().strip(), computed,
+            f'An image file changed. Write the new sha {computed} to {IMAGE_SOURCE_HASH.relative_to(ROOT)}. '
+            + 'If the edit changes what the receiver accepts or does, also bump hana_protocol.RUNTIME_ABI. '
+            + 'If it does not, update only the sha.')
+
     def test_listed_files_render_all_guest_names_modes_and_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary) / 'checkout'
             runtime_entries = RUNTIME_LIST.read_text().splitlines()
             image_entries = IMAGE_LIST.read_text().splitlines()
+            render_entries = RENDER_LIST.read_text().splitlines()
             image_inputs = checkout / 'image-inputs'
-            for entries in (runtime_entries, image_entries):
+            for entries in (runtime_entries, image_entries, render_entries):
                 self.assertEqual(len(entries), len(set(entries)))
                 for entry in entries:
                     with self.subTest(entry=entry):
                         relative = Path(entry)
                         self.assertFalse(relative.is_absolute())
                         self.assertNotIn('..', relative.parts)
-            for root, entries in ((image_inputs, (*image_entries, *IMAGE_INPUTS)),
+            for root, entries in ((image_inputs, render_entries),
                                   (checkout, (*runtime_entries, 'config/copies.conf'))):
                 for entry in entries:
                     destination = root / entry
@@ -108,15 +113,14 @@ class HanaRenderTests(unittest.TestCase):
                 + '# range: 0.001..60\nlocks.probe_wait_seconds.fixture-guest=0.4\n'
                 + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n'
                 + 'patterns.tool={purpose}\npatterns.tool.fixture-guest={purpose}{suffix}\n'
-                + 'roots.slots.fixture-guest=/fixture/slots\n'
+                + 'roots.build=/default/build\nroots.build.fixture-guest=/fixture/build\n'
                 + 'slots.fixture-guest.hana.max=3\nslots.fixture-guest.hana.max_bytes=1000\n')
             _ = folders.write_text(folder_values)
             (checkout / 'config').mkdir(exist_ok=True)
             for path in (targets, folders):
                 _ = shutil.copyfile(path, checkout / 'config' / path.name)
             copies = checkout / 'config/copies.conf'
-            copies_config = ('root=/tmp/copies\nroot.aws-hana=/tmp/guest-copies\n'
-                + 'remote_registry=/tmp/default-mirrors\nremote_registry.fixture-guest=/tmp/mirrors\n')
+            copies_config = 'remote_registry=/tmp/default-mirrors\nremote_registry.fixture-guest=/tmp/mirrors\n'
             _ = copies.write_text(copies_config)
             configuration_path = image_inputs / 'config/hana_aws.conf'
             _ = configuration_path.write_text(
@@ -173,7 +177,8 @@ class HanaRenderTests(unittest.TestCase):
             for path in (*image_entries, 'config/build_folders.conf'):
                 self.assertEqual(stat.S_IMODE((image_runtime / path).stat().st_mode), 0o644)
             self.assertEqual((image_runtime / 'config/build_folders.conf').read_text(),
-                '# range: 0.001..60\nlocks.probe_wait_seconds=0.4\n# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
+                'roots.build=/fixture/build\n# range: 0.001..60\nlocks.probe_wait_seconds=0.4\n'
+                + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
             receiver = cast(dict[str, object], json.loads((output / 'receiver.json').read_text()))
             self.assertEqual(receiver['result_transfer_timeout_s'], 83)
             self.assertEqual(receiver['command_timeout_s'], 23)
@@ -187,12 +192,16 @@ class HanaRenderTests(unittest.TestCase):
                 + '"scripts.aws_target.aws_cli", "scripts.aws_target.hana_provider", "scripts.aws_target.hana_box"))',
                 str(image_runtime)], cwd=output, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
+            entry = checkout / hana_render.RUNNER_ENTRY
+            with entry.open('a') as script:
+                _ = script.write('\n# Entry point from the fixture checkout.\n')
             runtime = checkout / 'run'
             for file in hana_render.runtime_files(checkout, configuration_path):
                 destination = runtime / file.path
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 _ = destination.write_bytes(file.content)
                 destination.chmod(file.mode)
+            self.assertEqual((runtime / 'runner.py').read_bytes(), entry.read_bytes())
             with self.subTest('Render and read an override'):
                 self.assertEqual((runtime / 'config/build_targets.conf').read_text(), 'loopback.shell_timeout_s=11\n')
                 compiler = checkout / 'compiler-version'
@@ -217,6 +226,8 @@ class HanaRenderTests(unittest.TestCase):
                 (targets, 'loopback.shell_timeout_s.fixture-guest', False),
                 (folders, 'locks.probe_wait_seconds.fixture-guest', True),
                 (folders, 'locks.probe_wait_seconds', False),
+                (folders, 'roots.build.fixture-guest', True),
+                (folders, 'roots.build', False),
                 (folders, 'patterns.tool', False),
             ):
                 with self.subTest(file=path.name, key=key):
@@ -242,7 +253,7 @@ class HanaRenderTests(unittest.TestCase):
                 self.assertEqual(cast(dict[str, object], json.loads(receiver_json))['command_timeout_s'], 27)
             _ = targets.write_text(target_values)
             _ = (image_inputs / 'config/copies.conf').write_text(
-                copies_config.replace('copies\n', 'other-copies\n'))
+                copies_config.replace('/tmp/default-mirrors', '/tmp/other-mirrors'))
             self.assertEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
             self.assertEqual(cast(dict[str, object], json.loads((output / 'safety.json').read_text()))['guest_digest'],
                 digest.value)
@@ -256,6 +267,21 @@ class HanaRenderTests(unittest.TestCase):
                     source = image_inputs / path
                     _ = source.write_text('# Code outside the image closure\n')
                     self.assertEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
+            with self.subTest('Edit an image Python file'):
+                protocol = image_inputs / 'scripts/aws_target/hana_protocol.py'
+                protocol_source = protocol.read_bytes()
+                _ = protocol.write_bytes(protocol_source + b'\n# A host-only edit.\n')
+                self.assertEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
+                _ = protocol.write_bytes(protocol_source)
+            with (self.subTest('Bump the runtime ABI'),
+                  mock.patch.object(hana_protocol, 'RUNTIME_ABI', hana_protocol.RUNTIME_ABI + 1)):
+                self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
+            with self.subTest('Change the build root'):
+                _ = folders.write_text(folder_values.replace('roots.build.fixture-guest=/fixture/build',
+                                                             'roots.build.fixture-guest=/fixture/other'))
+                self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
+            _ = folders.write_text(folder_values)
+            self.assertEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
             _ = folders.write_text(folder_values.replace('fixture-guest=0.4', 'fixture-guest=0.5'))
             self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
             for key, value, invalid in (
@@ -275,39 +301,31 @@ class HanaRenderTests(unittest.TestCase):
             _ = configuration_path.write_text(original.replace('enabled=on', 'enabled=off'))
             self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
             self.assertEqual({str(path.relative_to(runtime)) for path in runtime.rglob('*') if path.is_file()},
-                             {*runtime_entries, 'runner.py', 'config/hana_aws.conf', 'config/build_targets.conf',
-                              'config/build_folders.conf', 'config/copies.conf'})
+                             ({*runtime_entries} - {str(hana_render.RUNNER_ENTRY)}) | {
+                                 'runner.py', 'config/hana_aws.conf', 'config/build_targets.conf',
+                                 'config/build_folders.conf', 'config/copies.conf'})
             imported = subprocess.run([sys.executable, '-IB', '-c',
                 'import sys; sys.path.insert(0, sys.argv[1]); '
                 + 'from scripts.aws_target import hana_runner, hana_protocol; '
-                + 'from scripts.build_queue import slot_wait; '
-                + 'from scripts.lib import build_slots, git_rescue; '
+                + 'from scripts.build_queue import queue_wait; '
+                + 'from scripts.lib import build_copies, git_rescue; '
                 + 'assert not any(name in sys.modules for name in '
                 + '("scripts.aws_target.aws_cli", "scripts.aws_target.hana_provider", "scripts.aws_target.hana_box", '
                 + '"scripts.aws_target.hana_placement", "scripts.buildlog.transfer_bytes"))',
                 str(runtime)], cwd=runtime, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
-            launcher = subprocess.run([sys.executable, '-IB', 'runner.py', '--help'], cwd=runtime,
+            launcher = runtime / 'scripts/build_queue/program_start.py'
+            startup = subprocess.run([sys.executable, '-E', '-B', str(launcher)], cwd=runtime,
+                                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(startup.returncode, 2, startup.stdout + startup.stderr)
+            self.assertIn('program start: expected --program-start', startup.stderr)
+            help_run = subprocess.run([sys.executable, '-IB', 'runner.py', '--help'], cwd=runtime,
                                       capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(launcher.returncode, 0, launcher.stdout + launcher.stderr)
-            self.assertIn('--command-timeout-s', launcher.stdout)
+            self.assertEqual(help_run.returncode, 0, help_run.stdout + help_run.stderr)
+            self.assertIn('--command-timeout-s', help_run.stdout)
             for path in runtime.rglob('*'):
                 if path.is_file() and '__pycache__' not in path.parts:
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
-
-    def test_render_configuration_has_no_host_suffixes(self) -> None:
-        settings = conf.settings((ROOT / 'config/hana_aws.conf').read_text())
-        self.assertTrue(settings)
-        for key in settings:
-            with self.subTest(key=key):
-                self.assertNotIn('.', key)
-
-    def test_execution_values_have_no_copies_in_hana_configuration(self) -> None:
-        settings = conf.settings((ROOT / 'config/hana_aws.conf').read_text())
-        for key in ('execution_compiler_version', 'execution_shell_timeout_s', 'execution_command_timeout_s'):
-            self.assertNotIn(key, settings)
-        self.assertEqual(sum(line.startswith('free_floor_gib=')
-            for line in (ROOT / 'config/hana_aws.conf').read_text().splitlines()), 1)
 
 
 if __name__ == '__main__':

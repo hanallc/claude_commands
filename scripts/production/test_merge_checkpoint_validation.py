@@ -30,6 +30,27 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_direct_push_to_the_remote_default_branch_requires_test_review(self) -> None:
+        production = read_new_production(self.doc, "example")
+        branch = production.merge_branch
+        _ = self.git("symbolic-ref", "HEAD", f"refs/heads/{branch}", cwd=self.origin)
+        _ = self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        path = "test_guard.py"
+        self.write(self.checkout, path, "def test_move():\n    assert 1\n")
+        _ = self.git("add", path)
+        _ = self.git("commit", "-m", "Add a test")
+        _ = self.git("push", "origin", branch)
+        base = self.git("rev-parse", "HEAD")
+        self.write(self.checkout, path, "def test_move():\n    assert 2\n")
+        _ = self.git("commit", "-am", "Change the test")
+        tip = self.git("rev-parse", "HEAD")
+        with mock.patch.dict(os.environ, self.env), self.assertRaises(checkpoint_gate.Stop) as result:
+            _ = merge_checkpoint.push_git(production, tip)
+        self.assertEqual((result.exception.step, result.exception.state), ("push", "held"))
+        self.assertIn("no review is on record", result.exception.detail)
+        self.assertIn(f"--base {base} --commit {tip}", result.exception.detail)
+        self.assertEqual(self.git("rev-parse", f"refs/heads/{branch}", cwd=self.origin), base)
+
     def test_conflict_holds_with_no_merge_left_behind(self) -> None:
         self.write(self.checkout, "src/alpha.txt", "main side\n")
         _ = self.git("add", "src/alpha.txt")
@@ -372,6 +393,8 @@ with (state / "refreshed-test-locks").open("a") as output:
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         self.assertEqual(self.events("verify.sh"), [])
     def test_two_backticked_known_flakes_each_count_green_alone(self) -> None:
+        self.write(self.unit, "crates/alpha/Cargo.toml",
+                   '[workspace]\nresolver = "2"\nmembers = ["crate-a", "crate-b"]\n')
         for package in ("crate-a", "crate-b"):
             self.write(self.unit, f"crates/alpha/{package}/Cargo.toml",
                        f'[package]\nname = "{package}"\nversion = "0.1.0"\n')
@@ -387,7 +410,10 @@ with (state / "refreshed-test-locks").open("a") as output:
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         self.assertIn("known flake crate-a", self.log.read_text(encoding="utf-8"))
         self.assertIn("known flake crate-b", self.log.read_text(encoding="utf-8"))
-        self.assertEqual(len(self.events("verify.sh")), 4)
+        self.assertEqual(self.events("verify.sh"), [
+            ["test", "crate-a", "+", "test", "crate-b"], ["test", "crate-b"],
+            ["test", "crate-a"], ["test", "crate-b"],
+        ])
     def test_known_flaky_tests_rerun_alone_and_an_unlisted_failure_stays_red(self) -> None:
         """cargo-liner-style: a whole verify.sh merge test where two known flaky tests failed."""
         reader = "shim_registration::reader_scenarios::reader_attributes_compiler_cache"

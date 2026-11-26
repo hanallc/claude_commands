@@ -102,7 +102,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 
 - Channel fetch, pin read, trial subprocess runner, clock, free space, hold check, cargo check and text sender are keyword parameters of `check_release()`. Standing checkout preparation uses the shared copies API and its configuration.
 - Tests never touch the real build log, the real state file, hana, the network, `~/.local/state/build-hold/` or the user's config. `point_root_at()` points `BUILDLOG_DIR` at a temporary root; `LINT_CONFIG`, `HOME`, hana and `tempfile.gettempdir` are patched. Real Git prepares a private source repository and its standing checkout; trial build commands are fake. A real `sh -c 'sleep 60 &'` checks the group kill.
-- hana is only read: `git show` and `git rev-parse`. All building happens in `~/worktrees/gates/hana/toolchain-trial-gate` (or its second checkout), through copies.py; the target stays for the next trial.
+- The release check reads the Hana source with `git show` and `git rev-parse`. `copies.standing` gives the trial the numbered copy `<roots.build>/hana/toolchain-trial/<N>`. The copy retains `target/` for reuse.
 - One text per stable version. The trial and `text_sent` carry across days while the version is unchanged. A newer stable resets both. A pin that goes away keeps both, so a returning pin neither re-trials nor re-texts.
 - A failed trial is not retried. Only a `waiting` trial runs, and a killed step leaves the trial `waiting`.
 - A trial never starts outside 02:00–05:00 local, during a build hold, while the user runs cargo, rustc or cargo-nextest, or below floor plus headroom.

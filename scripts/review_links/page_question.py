@@ -32,12 +32,10 @@ class QuestionStore(Protocol):
 
 
 def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
-        words: str, status: change_page.DeliveryStatus, *,
-        resend_unknown: bool = False, resend_request: str = "") -> change_page.MessageDelivery:
+        words: str, status: change_page.DeliveryStatus) -> change_page.MessageDelivery:
     """Save and claim the question before the server answers the browser."""
-    if not resend_request:
-        words = words.strip()
-    if not words.strip():
+    words = words.strip()
+    if not words:
         raise question_record.AnswerRefused("Enter a question first.")
     with status.locked():
         item = target.item
@@ -46,41 +44,41 @@ def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
                          if question.answer is None and question.words == words), None)
         new_question = question is None
         if question is None:
-            if resend_request:
-                raise question_record.AnswerRefused("This item has no open question with that id.")
             number = max((int(question.question_id[1:]) for question in questions), default=0) + 1
-            question = question_record.Question(f"Q{number}", datetime.now(UTC).isoformat(), words)
+            question = question_record.Question(f"Q{number}", datetime.now(UTC).isoformat(), words,
+                                                recipient=target.initial_recipient)
         saved = target.saved(question)
         page = saved.page()
         path = status.path(page, saved.source.row)
-        requests = (resend_request,) if resend_request else ()
         prepared = QuestionAttempt(saved.source, saved.recipient, saved.message, 1, QuestionSendState.PREPARED,
-                                   secrets.token_hex(32), resend_requests=requests)
+                                   secrets.token_hex(32))
         view = change_page.question_delivery_view(status, saved)
         previous = view.attempt
         record = previous if isinstance(previous, QuestionAttempt) else prepared
-        repeated_resend = isinstance(previous, QuestionAttempt) and resend_request in previous.resend_requests
-        if repeated_resend and view.state in (QuestionSendState.FAILED, QuestionSendState.UNKNOWN):
+        if isinstance(view, change_page.QuestionDeliveryFailed):
             return change_page.question_envelope(page, record)
         if isinstance(view, change_page.ResendBlocked):
-            if view.state is QuestionSendState.UNKNOWN and (resend_request or new_question):
+            if view.state is QuestionSendState.UNKNOWN and new_question:
                 raise question_record.AnswerRefused(view.reason)
+            if isinstance(previous, QuestionAttempt):
+                status.defer_question(path)
             return change_page.question_envelope(page, record)
         if isinstance(view, change_page.QuestionDeliveryAccepted):
             return change_page.question_envelope(page, record)
-        if not new_question and view.state is QuestionSendState.UNKNOWN and not resend_unknown:
+        if not new_question and view.state is QuestionSendState.UNKNOWN:
             return change_page.question_envelope(page, record)
         if isinstance(previous, QuestionAttempt):
+            same_list_slot = (target.initial_recipient is not question_record.DefaultQuestionRecipient.PAGE
+                              and saved.source.matches_attempt(replace(previous.source, words=words)))
             unsaved_draft = (new_question and previous.state is QuestionSendState.PREPARED
-                             and not previous.earlier_unconfirmed and previous.message_id == prepared.message_id)
+                             and not previous.earlier_unconfirmed
+                             and (previous.message_id == prepared.message_id or same_list_slot))
             if new_question and not unsaved_draft and not saved.matches(previous):
                 raise question_record.AnswerRefused("The question does not match its delivery record.")
-            if unsaved_draft or view.state in (QuestionSendState.FAILED, QuestionSendState.UNKNOWN) or (
-                    resend_request and not repeated_resend):
+            if unsaved_draft or view.state in (QuestionSendState.FAILED, QuestionSendState.UNKNOWN):
                 retry = replace(prepared, revision=record.revision + 1,
                                 earlier_unconfirmed=record.earlier_unconfirmed or (
-                                    not unsaved_draft and view.state is QuestionSendState.UNKNOWN),
-                                resend_requests=(*record.resend_requests, *requests))
+                                    not unsaved_draft and view.state is QuestionSendState.UNKNOWN))
                 change_page.advance_question_attempt(path, record, retry)
                 record = retry
         else:
@@ -90,7 +88,7 @@ def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
             store.add(item, question)
             if question not in store.questions(item):
                 raise question_record.AnswerRefused("The saved question does not match this delivery.")
-        return change_page.claim_question(status, change_page.ready_question(path, record, saved))
+        return change_page.ready_and_claim_question(status, path, record, saved)
 
 
 def answer(store: QuestionStore, item: str, question_id: str, text: str) -> Answered | AnswerRefused:
@@ -107,13 +105,15 @@ def answer(store: QuestionStore, item: str, question_id: str, text: str) -> Answ
         store.set_answer(item, question_id, response)
     except question_record.AnswerRefused as error:
         return AnswerRefused(str(error))
-    return Answered(question_record.Question(question.question_id, question.asked_at, question.words, response))
+    return Answered(replace(question, answer=response))
 
 
-def open_question_html(question: question_record.Question, *, asked_time_html: str = "") -> str:
+def open_question_html(question: question_record.Question, *, asked_time_html: str = "", failed: bool = False) -> str:
+    waiting = "" if failed else " — waiting for an answer"
     return (f'<section class="page-question" data-question="{html.escape(question.question_id, quote=True)}">'
-            + f'<h3>Question {html.escape(question.question_id)} — waiting for an answer</h3>'
-            + asked_time_html + f'<p>{html.escape(question.words)}</p></section>')
+            + f'<h3>Question {html.escape(question.question_id)}{waiting}</h3>'
+            + asked_time_html + f'<p>{html.escape(question.words)}</p>'
+            + change_page.question_failure_html(failed) + '</section>')
 
 
 def answered_question_html(question: question_record.Question, answer: question_record.Answer, *,

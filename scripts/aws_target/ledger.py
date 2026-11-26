@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time as day_time, timedelta
 from decimal import Decimal
 from enum import Enum
 import fcntl
+from hashlib import sha256
 import json
 from math import ceil, inf
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -20,10 +22,12 @@ from uuid import uuid4
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, sync_folder, write_text_atomic
 from scripts.lib import conf
-from scripts.aws_target import hana_result
-from scripts.message import session_send
+from scripts.lib.file_lock import LockResult, exclusive
+from scripts.build_queue import placement, snapshot_codec
+from scripts.aws_target import hana_result, remote
+from scripts.message import send_result, session_send
 from scripts.aws_target.config import (
     LimitSettingEvidence, MeasurementUnavailable, SpendingConfigurationUnavailable, SpendingSettings, money, read_settings,
 )
@@ -31,6 +35,27 @@ from scripts.aws_target.config import (
 InstanceState = Literal["pending", "running", "stopping", "stopped", "shutting-down", "terminated", "unknown"]
 SpendingPurpose = Literal["deployment", "start", "admission"]
 ChargeKind = Literal["instance", "fixed", "explorer", "reconciliation"]
+
+LEDGER_VERSION = 2
+
+
+@dataclass(frozen=True)
+class RunEndUnconfirmed:
+    """No record confirms that the run exposure ended."""
+
+
+@dataclass(frozen=True)
+class RunEndConfirmed:
+    at: int
+
+
+@dataclass(frozen=True)
+class RunExposure:
+    at: int
+    end: RunEndUnconfirmed | RunEndConfirmed
+
+    def priced_end(self, now: int, *, open_until: int) -> int:
+        return min(now, self.end.at) if isinstance(self.end, RunEndConfirmed) else open_until
 
 
 @dataclass(frozen=True)
@@ -65,6 +90,10 @@ class ComputeRequest:
     request_id: str = field(default_factory=lambda: uuid4().hex)
     resolution: ComputeUnconfirmed | ComputeInstanceConfirmed | ComputeResourcesAbsent = ComputeUnconfirmed()
 
+    def run_exposure(self) -> RunExposure:
+        end = RunEndUnconfirmed() if isinstance(self.resolution, ComputeUnconfirmed) else RunEndConfirmed(self.resolution.at)
+        return RunExposure(self.at, end)
+
 
 @dataclass(frozen=True)
 class GateLaunchPending:
@@ -85,6 +114,10 @@ class GateAbsent:
 class GateTerminated:
     at: int
     instance_id: str
+    additional_instances: tuple[str, ...] = ()
+
+    def confirms(self, instances: tuple[str, ...]) -> bool:
+        return {self.instance_id, *self.additional_instances} == set(instances)
 
 
 @dataclass(frozen=True)
@@ -117,6 +150,42 @@ class GateWorkerOwner:
 
 
 @dataclass(frozen=True)
+class NoGateCleanupOwnerCheck:
+    """The update is independent of a cleanup selection."""
+
+
+NO_GATE_CLEANUP_OWNER_CHECK = NoGateCleanupOwnerCheck()
+
+
+@dataclass(frozen=True)
+class GateCleanupNotStarted:
+    """Cleanup has not reserved the booking for termination."""
+
+
+GATE_CLEANUP_NOT_STARTED = GateCleanupNotStarted()
+
+
+@dataclass(frozen=True)
+class GateCleanupTargets:
+    region: str
+    instances: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GateResultNotReceived:
+    """Use the termination confirmation time until a valid final result arrives."""
+
+
+GATE_RESULT_NOT_RECEIVED = GateResultNotReceived()
+
+
+@dataclass(frozen=True)
+class GateCleanupPending:
+    targets: GateCleanupTargets
+    result_seen_at: int | GateResultNotReceived = GATE_RESULT_NOT_RECEIVED
+
+
+@dataclass(frozen=True)
 class NoGateTrial:
     pass
 
@@ -144,11 +213,162 @@ class GateReservation:
     mode: str = ''
     trial: GateTrialBudget | NoGateTrial = NoGateTrial()
     root_gib: int = 0
+    placement_claim: str = ''
+    cleanup: GateCleanupNotStarted | GateCleanupPending = GATE_CLEANUP_NOT_STARTED
+
+
+def gate_booking(values: conf.ConfigRead, attempt: str, now: int, expires: int) -> GateReservation:
+    """Use the same booking terms for placement and the worker."""
+    return GateReservation(attempt, now, expires, money(str(values.number('spot_max_usd_per_hour'))),
+        money(str(values.number('attempt_allowance_usd'))), instance_type=values.words('instance_types')[0])
 
 
 def gate_is_open(reservation: GateReservation) -> bool:
     """Keep pending and running reservations open until AWS confirms closure."""
     return isinstance(reservation.state, (GateLaunchPending, GateRunning))
+
+
+def gate_dispatch_binding_path(sidecar: Path) -> Path:
+    """Locate the queue's AWS binding beside the placement progress file."""
+    return sidecar.with_name(sidecar.name + '.aws-dispatch.json')
+
+
+@dataclass(frozen=True)
+class GateDispatchBinding:
+    """Identify the queue journal and AWS accounting directory for one claim."""
+    claim: placement.ProviderClaimReference
+    journal: Path
+    directory: Path
+    registry: Path
+    account_settings: Path
+
+    def publish(self, path: Path) -> None:
+        content = json.dumps(snapshot_codec.snapshot_value(self)) + '\n'
+        try:
+            saved = self.read(path)
+        except FileNotFoundError:
+            if create_text_atomic(path, content):
+                return
+            saved = self.read(path)
+        if saved == self:
+            return
+        if (saved.claim.episode != self.claim.episode or saved.claim.attempt == self.claim.attempt
+                or saved.journal.parent != self.journal.parent
+                or not GateDispatchJournal(saved.journal).previous_dispatch_closed(saved)):
+            raise LedgerUnavailable('The AWS placement binding differs from the queue assignment')
+        write_text_atomic(path, content)
+
+    @staticmethod
+    def read(path: Path) -> GateDispatchBinding:
+        return cast(GateDispatchBinding, snapshot_codec.parse_snapshot_value(
+            cast(object, json.loads(path.read_text())), GateDispatchBinding))
+
+
+GateDispatchSettlement = Literal["no launch", "launch ended"]
+
+
+@dataclass(frozen=True)
+class GateDispatchRecord:
+    """Bind the service folders to the exact queue claim and caller."""
+    binding: GateDispatchBinding
+    holder: placement.ClaimHolderIdentity
+    state: Literal["prelaunch"] | GateDispatchSettlement = "prelaunch"
+    folders: tuple[Path, ...] = ()
+
+
+def _gate_dispatch_text(record: GateDispatchRecord) -> str:
+    return json.dumps(snapshot_codec.snapshot_value(record), sort_keys=True) + '\n'
+
+
+@dataclass(frozen=True)
+class GateDispatchJournal:
+    """Use the path the queue assigned to this gate."""
+    path: Path
+
+    def read(self) -> GateDispatchRecord:
+        return cast(GateDispatchRecord, snapshot_codec.parse_snapshot_value(
+            cast(object, json.loads(self.path.read_text())), GateDispatchRecord))
+
+    def begin(self, binding: GateDispatchBinding, holder: placement.ClaimHolderIdentity) -> None:
+        """Persist the caller before it requests launch permission."""
+        fresh = GateDispatchRecord(binding, holder)
+        if not create_text_atomic(self.path, _gate_dispatch_text(fresh)):
+            saved = self.require_open(binding.claim, holder)
+            if saved.binding != binding:
+                raise LedgerUnavailable('The AWS journal names a different binding')
+            sync_folder(self.path.parent)
+
+    def require_open(self, claim: placement.ProviderClaimReference,
+                     holder: placement.ClaimHolderIdentity) -> GateDispatchRecord:
+        record = self.read()
+        if (record.binding.claim, record.holder) != (claim, holder):
+            raise LedgerUnavailable('The AWS journal names a different claim or caller')
+        if record.state != "prelaunch":
+            raise LedgerUnavailable('The AWS dispatch is closed')
+        return record
+
+    def lock(self, *, wait: bool = True) -> AbstractContextManager[LockResult]:
+        return exclusive(self.path.with_suffix('.lock'), wait=wait)
+
+    def register(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity,
+                 folder: Path) -> None:
+        """Persist a service folder before the service can start."""
+        with self.lock():
+            record = self.require_open(claim, holder)
+            if folder not in record.folders:
+                write_text_atomic(self.path, _gate_dispatch_text(replace(record, folders=(*record.folders, folder))))
+
+    def previous_dispatch_closed(self, binding: GateDispatchBinding) -> bool:
+        record = self.read()
+        if record.binding != binding:
+            raise LedgerUnavailable('The saved AWS request names a different dispatch')
+        if record.state == "prelaunch":
+            return False
+        sync_folder(self.path.parent)
+        return True
+
+    def settle(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity) -> GateDispatchSettlement | placement.DispatchPathPending:
+        """Use only local evidence to close a dispatch and fence its workers."""
+        try:
+            with self.lock(wait=False) as access:
+                if access is LockResult.BUSY:
+                    return placement.DispatchPathPending('The AWS worker holds the dispatch lock')
+                record = self.read()
+                if (record.binding.claim, record.holder) != (claim, holder):
+                    raise LedgerUnavailable('The AWS journal names a different claim or caller')
+                if record.state != "prelaunch":
+                    sync_folder(self.path.parent)
+                    return record.state
+                state: GateDispatchSettlement = "no launch"
+                if record.folders:
+                    book = CostLedger(record.binding.directory)
+                    reservations = ({row.attempt: row for row in book.read_snapshot().gate_reservations}
+                                    if book.path.exists() else {})
+                    for folder in record.folders:
+                        reservation = reservations.get(folder.name)
+                        try:
+                            launch = mapping(cast(object, json.loads((folder / 'launch.json').read_text())))
+                        except FileNotFoundError:
+                            launch = {}
+                        if reservation is not None and gate_is_open(reservation):
+                            if not isinstance(reservation.state, GateLaunchPending) or 'arguments' in launch or 'instance' in launch:
+                                return placement.DispatchPathPending(f'AWS launch {folder.name} remains open')
+                            request = mapping(cast(object, json.loads((folder / 'request.json').read_text())))
+                            if request.get('attempt') != folder.name:
+                                raise LedgerUnavailable('The AWS service folder names a different attempt')
+                            book.resolve_gate(folder.name, GateAbsent(int(time.time())))
+                        if reservation is not None and isinstance(reservation.state, GateTerminated):
+                            state = "launch ended"
+                        if 'instance' in launch:
+                            state = "launch ended"
+                        if reservation is None and ('arguments' in launch or 'instance' in launch):
+                            return placement.DispatchPathPending(f'AWS launch {folder.name} has no confirmed end')
+                    if book.path.exists():
+                        sync_folder(book.directory)
+                write_text_atomic(self.path, _gate_dispatch_text(replace(record, state=state)))
+                return state
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            return placement.DispatchPathPending(f'Local AWS dispatch evidence is unavailable. {error}')
 
 
 @dataclass(frozen=True)
@@ -170,6 +390,7 @@ class HanaComputeExposure:
     state: HanaExposureOpen | HanaExposureClosed = HanaExposureOpen()
     instance_type: str = ''
     region: str = field(kw_only=True)
+    observed_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -195,6 +416,7 @@ class HanaStorageExposure:
 @dataclass(frozen=True)
 class GateReserved:
     reservation: GateReservation
+    created: bool = True
 
 
 @dataclass(frozen=True)
@@ -456,9 +678,8 @@ def write_spot_prices(directory: Path, prices: Sequence[RegionalSpotPrice]) -> N
     write_text_atomic(directory / 'spot-prices.json', json.dumps(document, sort_keys=True) + '\n')
 
 
-def recent_gate_launches(directory: Path, since: float) -> tuple[dict[str, object], ...]:
-    """Read backwards in 64 KiB blocks until the first row before the window."""
-    selected: list[dict[str, object]] = []
+def gate_launches_newest_first(directory: Path) -> Iterator[tuple[float, dict[str, object]]]:
+    """Read backwards in 64 KiB blocks. Skip a damaged row. The caller stops the read when it has the rows it needs."""
     try:
         with (directory / 'cloud-gate-launches.jsonl').open('rb') as stream:
             position = stream.seek(0, 2)
@@ -477,12 +698,24 @@ def recent_gate_launches(directory: Path, since: float) -> tuple[dict[str, objec
                         at = float(str(row['time']))
                     except (ValueError, KeyError, TypeError, UnicodeError):
                         continue
-                    if at < since:
-                        return tuple(selected)
-                    selected.append(row)
+                    yield at, row
     except FileNotFoundError:
-        pass
+        return
+
+
+def recent_gate_launches(directory: Path, since: float) -> tuple[dict[str, object], ...]:
+    """Read newest first until the first row before the window."""
+    selected: list[dict[str, object]] = []
+    for at, row in gate_launches_newest_first(directory):
+        if at < since:
+            break
+        selected.append(row)
     return tuple(selected)
+
+
+def all_gate_launches(directory: Path) -> tuple[dict[str, object], ...]:
+    """Read every row newest first."""
+    return tuple(row for _, row in gate_launches_newest_first(directory))
 
 
 @dataclass(frozen=True)
@@ -543,6 +776,13 @@ class ChargeRead:
 
 
 @dataclass(frozen=True)
+class CompleteDayAmount:
+    start: int
+    end: int
+    usd: Decimal
+
+
+@dataclass(frozen=True)
 class ChargedInterval:
     start: int
     end: int
@@ -578,6 +818,25 @@ class CostEstimate:
 @dataclass(frozen=True)
 class CostEvidenceUnavailable:
     reason: str
+
+
+@dataclass(frozen=True)
+class AccruedDay:
+    day: date
+    cost: Decimal
+    state: Literal['estimate', 'billed_not_final', 'billed_final']
+    aws_amount_so_far: Decimal | None
+    query_fees: Decimal
+    rounding_adjustment: Decimal = Decimal(0)
+
+
+@dataclass(frozen=True)
+class AccruedCost:
+    cost: Decimal
+    limit_count: Decimal | CostEvidenceUnavailable
+    reserves: Decimal
+    headroom: Decimal
+    days: tuple[AccruedDay, ...]
 
 
 @dataclass(frozen=True)
@@ -676,6 +935,54 @@ class LedgerEvidence:
     hana_lifecycle_fence: HanaLifecycleFence | HanaLifecycleUnfenced = HanaLifecycleUnfenced()
     hana_attempts: list[hana_result.HanaAttemptCharge] = field(default_factory=list)
     gate_quota_refusals: list[GateQuotaRefusal] = field(default_factory=list)
+    unstarted_hana_generations: frozenset[int] = frozenset()
+
+    def builder_observations(self) -> list[InstanceObservation]:
+        return sorted((row for row in self.observations if row.state != 'unknown'), key=lambda row: row.at)
+
+    def builder_run_exposures(self, max_observation_age: int) -> Iterator[RunExposure]:
+        observations = self.builder_observations()
+        if not observations:
+            first = min((row.at for row in self.inventories if not row.builder_removed), default=None)
+            if first is not None:
+                yield RunExposure(first, RunEndUnconfirmed())
+            return
+        first = min((row.at for row in self.inventories), default=observations[0].at)
+        started = first if first < observations[0].at else None
+        for index, row in enumerate(observations):
+            if row.state not in ('stopped', 'terminated'):
+                if started is None:
+                    started = row.at
+                continue
+            if started is not None:
+                yield RunExposure(started, RunEndConfirmed(row.at))
+                started = None
+            if row.state == 'stopped':
+                stale_at = row.at + max_observation_age
+                if index + 1 == len(observations) or stale_at < observations[index + 1].at:
+                    started = stale_at
+        if started is not None:
+            yield RunExposure(started, RunEndUnconfirmed())
+
+    def gate_run_exposures(self) -> Iterator[tuple[GateReservation, RunExposure]]:
+        for row in self.gate_reservations:
+            if isinstance(row.state, GateAbsent):
+                continue
+            end = RunEndConfirmed(row.state.at) if isinstance(row.state, GateTerminated) else RunEndUnconfirmed()
+            yield row, RunExposure(row.at, end)
+
+    def hana_run_exposures(self) -> Iterator[tuple[HanaComputeExposure, RunExposure]]:
+        for row in self.hana_compute:
+            if hana_compute_counts(self, row):
+                end = RunEndConfirmed(row.state.at) if isinstance(row.state, HanaExposureClosed) else RunEndUnconfirmed()
+                yield row, RunExposure(row.at, end)
+
+    def run_exposures(self, max_observation_age: int) -> Iterator[RunExposure]:
+        """Read every exposure that can run, with its confirmed end if present."""
+        yield from self.builder_run_exposures(max_observation_age)
+        yield from (row.run_exposure() for row in self.compute_requests)
+        yield from (exposure for _, exposure in self.gate_run_exposures())
+        yield from (exposure for _, exposure in self.hana_run_exposures())
 
     def live_gate_vcpus(self, now: float) -> dict[SpotQuotaPool, int]:
         counts: dict[SpotQuotaPool, int] = {}
@@ -698,6 +1005,55 @@ class ObservationRejected(ValueError):
 
 class LedgerUnavailable(ValueError):
     """Evidence cannot establish a safe spending decision."""
+
+
+class GateCleanupSuperseded(LedgerUnavailable):
+    """The booking closed or changed owner after cleanup selected it."""
+
+
+class GateCleanupInProgress(LedgerUnavailable):
+    """The booking is reserved for cleanup."""
+
+
+def require_gate_cleanup_owner(state: LedgerEvidence, attempt: str,
+                               owner: GateWorkerOwner | GateOwnerUnknown) -> GateReservation:
+    """Check the cleanup selection while the ledger lock is held."""
+    booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+    if booking is None or not gate_is_open(booking):
+        raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the booking is no longer open')
+    if booking.owner != owner:
+        raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the booking owner changed')
+    return booking
+
+
+@dataclass
+class GateCleanupTransaction:
+    """Stage cleanup for the selected bookings under the ledger lock."""
+
+    _state: LedgerEvidence
+    has_pending_cleanup: bool = field(default=False, init=False)
+
+    def mark(
+        self, attempt: str, owner: GateWorkerOwner | GateOwnerUnknown,
+        targets: GateCleanupTargets, *, result_seen_at: int | GateResultNotReceived = GATE_RESULT_NOT_RECEIVED,
+    ) -> GateCleanupPending | GateTerminated:
+        """Stage pending cleanup or return an exact confirmed end."""
+        state = self._state
+        booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+        if (booking is not None and isinstance(booking.state, GateTerminated)
+                and booking.region == targets.region and booking.state.confirms(targets.instances)):
+            return booking.state
+        booking = require_gate_cleanup_owner(state, attempt, owner)
+        if isinstance(booking.cleanup, GateCleanupPending) and booking.cleanup.targets != targets:
+            raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
+        self.has_pending_cleanup = True
+        if isinstance(booking.cleanup, GateCleanupPending):
+            if isinstance(booking.cleanup.result_seen_at, int) or isinstance(result_seen_at, GateResultNotReceived):
+                return booking.cleanup
+        pending = GateCleanupPending(targets, result_seen_at)
+        state.gate_reservations[state.gate_reservations.index(booking)] = replace(
+            booking, region=targets.region, cleanup=pending)
+        return pending
 
 
 def mapping(value: object) -> dict[str, object]:
@@ -728,7 +1084,7 @@ def rows(row: dict[str, object], key: str) -> tuple[dict[str, object], ...]:
 
 
 def _decode(row: dict[str, object]) -> LedgerEvidence:
-    if row.get("version") != 1:
+    if row.get("version") not in (1, LEDGER_VERSION):
         raise LedgerUnavailable("unsupported ledger version")
     observations: list[InstanceObservation] = []
     for record in rows(row, "observations"):
@@ -776,7 +1132,8 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
         evidence.hana_compute.append(HanaComputeExposure(
             instant(record, 'at'), instant(record, 'expires'), instant(record, 'generation'),
             money(text(record, 'usd_per_hour')), _hana_exposure_state(record),
-            text(record, 'instance_type') if 'instance_type' in record else '', region=text(record, 'region')))
+            text(record, 'instance_type') if 'instance_type' in record else '', region=text(record, 'region'),
+            observed_active=record.get('observed_active') is True or 'accepted_at' in record))
     for record in rows(row, 'hana_storage') if 'hana_storage' in row else ():
         evidence.hana_storage.append(HanaStorageExposure(
             instant(record, 'at'), money(text(record, 'usd_per_month')), _hana_exposure_state(record)))
@@ -812,9 +1169,19 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
         elif kind == 'absent':
             gate_state = GateAbsent(instant(status, 'at'))
         elif kind == 'terminated':
-            gate_state = GateTerminated(instant(status, 'at'), text(status, 'instance_id'))
+            additional = (tuple(text(row, 'id') for row in rows(status, 'additional_instances'))
+                          if 'additional_instances' in status else ())
+            gate_state = GateTerminated(instant(status, 'at'), text(status, 'instance_id'), additional)
         else:
             raise LedgerUnavailable('unknown gate reservation state')
+        cleanup = GATE_CLEANUP_NOT_STARTED
+        if 'cleanup' in item:
+            saved = mapping(item['cleanup'])
+            instances = tuple(text(instance, 'id') for instance in rows(saved, 'instances'))
+            if not isinstance(gate_state, (GateRunning, GateLaunchPending)) or not instances:
+                raise LedgerUnavailable('Invalid gate cleanup state')
+            result_seen_at = instant(saved, 'result_seen_at') if 'result_seen_at' in saved else GATE_RESULT_NOT_RECEIVED
+            cleanup = GateCleanupPending(GateCleanupTargets(text(saved, 'region'), instances), result_seen_at)
         evidence.gate_reservations.append(GateReservation(
             text(item, 'attempt'), instant(item, 'at'), instant(item, 'expires'),
             money(text(item, 'usd_per_hour')), money(text(item, 'allowance_usd')), gate_state,
@@ -830,7 +1197,8 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
                             text(mapping(item['owner']), 'folder')) if item.get('owner') else GateOwnerUnknown(),
             str(item.get('mode', '')),
             GateTrialBudget(text(mapping(item['trial']), 'trial_id'), money(text(mapping(item['trial']), 'limit_usd')))
-            if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0)))))
+            if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0))),
+            text(item, 'placement_claim') if 'placement_claim' in item else '', cleanup))
     if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
         raise LedgerUnavailable('duplicate gate attempt')
     if 'gate_quota_refusals' in row:
@@ -875,7 +1243,7 @@ def _hana_state_record(state: HanaExposureOpen | HanaExposureClosed) -> dict[str
 
 def _encode(state: LedgerEvidence) -> dict[str, object]:
     return {
-        "version": 1,
+        "version": LEDGER_VERSION,
         **({'hana_lifecycle_fence': {'at': state.hana_lifecycle_fence.at,
                                     'generation': state.hana_lifecycle_fence.generation}}
            if isinstance(state.hana_lifecycle_fence, HanaLifecycleFence) else {}),
@@ -883,6 +1251,7 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
             {'at': r.at, 'expires': r.expires, 'generation': r.generation,
              'usd_per_hour': str(r.usd_per_hour), 'state': _hana_state_record(r.state),
              'region': r.region,
+             **({'observed_active': True} if r.observed_active else {}),
              **({'instance_type': r.instance_type} if r.instance_type else {})} for r in state.hana_compute],
         'hana_attempts': [hana_result.encode_attempt_charge(r) for r in state.hana_attempts],
         'hana_storage': [
@@ -914,6 +1283,12 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
             {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
              'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type, 'region': r.region,
              'mode': r.mode, 'root_gib': r.root_gib,
+             **({'placement_claim': r.placement_claim} if r.placement_claim else {}),
+             **({'cleanup': {
+                 'region': r.cleanup.targets.region,
+                 'instances': [{'id': value} for value in r.cleanup.targets.instances],
+                 **({'result_seen_at': r.cleanup.result_seen_at} if isinstance(r.cleanup.result_seen_at, int) else {})}}
+                if isinstance(r.cleanup, GateCleanupPending) else {}),
              'trial': {'trial_id': r.trial.trial_id, 'limit_usd': str(r.trial.limit_usd)}
                       if isinstance(r.trial, GateTrialBudget) else None,
              'owner': {'pid': r.owner.pid, 'start': r.owner.start, 'folder': r.owner.folder}
@@ -926,7 +1301,9 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
              {'kind': 'pending'} if isinstance(r.state, GateLaunchPending) else
              {'kind': 'running', 'instance_id': r.state.instance_id} if isinstance(r.state, GateRunning) else
              {'kind': 'absent', 'at': r.state.at} if isinstance(r.state, GateAbsent) else
-             {'kind': 'terminated', 'at': r.state.at, 'instance_id': r.state.instance_id}}
+             {'kind': 'terminated', 'at': r.state.at, 'instance_id': r.state.instance_id,
+              **({'additional_instances': [{'id': value} for value in r.state.additional_instances]}
+                 if r.state.additional_instances else {})}}
             for r in state.gate_reservations],
         "compute_requests": [
             {'at': r.at, 'stack': r.stack, 'region': r.region, 'spot_max_usd_per_hour': str(r.spot_max_usd_per_hour),
@@ -962,6 +1339,11 @@ def _month_seconds(at: int, zone: ZoneInfo) -> int:
     return int(following.timestamp()) - int(first.timestamp())
 
 
+def _month_bounds(day: date, zone: ZoneInfo) -> tuple[int, int]:
+    start, _ = period_bounds(day.replace(day=1), zone)
+    return start, start + _month_seconds(start, zone)
+
+
 def _overlap(charge: ChargedInterval, start: int, end: int) -> Decimal:
     if charge.start == charge.end:
         return charge.usd if start <= charge.start < end else Decimal(0)
@@ -978,7 +1360,7 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
     if not state.inventories:
         raise LedgerUnavailable("a priced resource inventory is required before spending")
     inventories = sorted(state.inventories, key=lambda item: item.at)
-    observations = sorted((r for r in state.observations if r.state != "unknown"), key=lambda item: item.at)
+    observations = state.builder_observations()
     prices = sorted(state.prices, key=lambda item: item.at)
     if any(r.at > pricing_end for r in (*inventories, *observations, *prices)) or (require_fresh and any(
             r.at > now for r in state.reconciliations)):
@@ -1046,7 +1428,7 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
         if request.at > pricing_end:
             raise LedgerUnavailable('compute request evidence is from the future')
         start = max(request.at, window_start)
-        end = pricing_end if isinstance(request.resolution, ComputeUnconfirmed) else min(pricing_end, request.resolution.at)
+        end = request.run_exposure().priced_end(pricing_end, open_until=pricing_end)
         if start >= end:
             continue
         rate = max(settings.fallback_usd_per_hour, request.spot_max_usd_per_hour)
@@ -1125,7 +1507,8 @@ def costs_from_evidence(state: LedgerEvidence, settings: SpendingSettings, now: 
         compute_requests=[r for r in state.compute_requests if r.at <= pricing_end],
         gate_reservations=[r for r in state.gate_reservations if r.at <= pricing_end],
         hana_compute=[r for r in state.hana_compute if r.at <= pricing_end],
-        hana_storage=[r for r in state.hana_storage if r.at <= pricing_end])
+        hana_storage=[r for r in state.hana_storage if r.at <= pricing_end],
+        unstarted_hana_generations=state.unstarted_hana_generations)
     return _charges(snapshot, settings, now, current_window=current_window, require_fresh=False,
                     window=window, pricing_end=pricing_end)
 
@@ -1135,8 +1518,33 @@ def period_cost(intervals: Sequence[ChargedInterval] | Iterator[ChargedInterval]
     return sum((_overlap(charge, start, end) for charge in intervals), Decimal(0))
 
 
+def _complete_day_adjustments(complete_days: Sequence[CompleteDayAmount], intervals: Sequence[ChargedInterval],
+                              gate_reservations: Sequence[GateReservation], start: int,
+                              end: int) -> tuple[tuple[int, Decimal], ...]:
+    covered = tuple(day for day in complete_days if start <= day.start and day.end <= end)
+    if not covered:
+        return ()
+    open_gates = tuple(row for row in gate_reservations if gate_is_open(row))
+    preserved = {'gate storage and transfer:' + row.attempt + ' (' + gate_allowance(row).source + ')'
+                 for row in open_gates}
+    preserved.update('gate:' + row.attempt for row in open_gates)
+    usage = tuple(row for row in intervals if row.kind != 'explorer' and row.source not in preserved)
+    return tuple((day.start, day.usd - period_cost(usage, day.start, day.end)) for day in covered)
+
+
+def complete_day_adjustment(complete_days: Sequence[CompleteDayAmount], intervals: Sequence[ChargedInterval],
+                            gate_reservations: Sequence[GateReservation], start: int, end: int) -> Decimal:
+    """Replace old usage with the AWS amount for each complete UTC day in the window."""
+    adjustments = _complete_day_adjustments(complete_days, intervals, gate_reservations, start, end)
+    return sum((usd for _, usd in adjustments), Decimal(0))
+
+
 def read_charge(path: Path) -> ChargeRead:
-    row = mapping(cast(object, json.loads(path.read_text())))
+    return _decode_charge(cast(object, json.loads(path.read_text())))
+
+
+def _decode_charge(record: object) -> ChargeRead:
+    row = mapping(record)
     reading = ChargeRead(text(row, 'day'), instant(row, 'at'), instant(row, 'period_start'),
                          instant(row, 'period_end'), conf.decimal(text(row, 'actual_usd')),
                          money(text(row, 'estimated_usd')), money(text(row, 'query_usd')),
@@ -1149,6 +1557,155 @@ def read_charge(path: Path) -> ChargeRead:
     return reading
 
 
+class _DuplicateChargeField(LedgerUnavailable):
+    pass
+
+
+def unique_charge_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    for key, value in pairs:
+        if key in fields:
+            raise _DuplicateChargeField('duplicate charge field')
+        fields[key] = value
+    return fields
+
+
+@dataclass(frozen=True)
+class _ChargeAmountRead:
+    at: int
+    actual_usd: Decimal
+
+
+@dataclass(frozen=True)
+class _ChargeReadHistory:
+    latest: ChargeRead
+    amounts: tuple[_ChargeAmountRead, ...]
+
+
+@dataclass(frozen=True)
+class ChargeNotSettled:
+    """No sequence of reads has established a settled amount."""
+
+
+@dataclass(frozen=True)
+class SettledChargeUnchanged:
+    settled_usd: Decimal
+
+
+@dataclass(frozen=True)
+class SettledChargeChanged:
+    settled_usd: Decimal
+    newest_usd: Decimal
+
+    @property
+    def difference_usd(self) -> Decimal:
+        return self.newest_usd - self.settled_usd
+
+    def display_line(self, day: str) -> str:
+        return (f'{day} changed from USD {self.settled_usd:.2f} to USD {self.newest_usd:.2f}'
+                + f' ({self.difference_usd:+.2f}).')
+
+
+ChargeSettlement = ChargeNotSettled | SettledChargeUnchanged | SettledChargeChanged
+
+
+@dataclass(frozen=True)
+class WatchedChargeDay:
+    day: str
+    checked_at: int
+    settlement: ChargeSettlement
+
+
+@dataclass(frozen=True)
+class _UnsentSettledChange:
+    day: str
+    change: SettledChargeChanged
+
+
+def _first_settled_read(history: _ChargeReadHistory, settings: SpendingSettings) -> _ChargeAmountRead | ChargeNotSettled:
+    """Find the first read that completes a sequence of equal counted amounts."""
+    amount = history.latest.actual_usd
+    count = 0
+    next_at = history.latest.period_end
+    for read in history.amounts:
+        if read.at < history.latest.period_end:
+            continue
+        if read.actual_usd != amount:
+            amount = read.actual_usd
+            count = 0
+            next_at = read.at
+        if read.at >= next_at:
+            count += 1
+            if count == settings.cost_explorer_unchanged_reads:
+                return read
+            next_at = read.at + settings.cost_explorer_interval_seconds
+    return ChargeNotSettled()
+
+
+def _charge_settlement(history: _ChargeReadHistory, settings: SpendingSettings) -> ChargeSettlement:
+    """Compare the newest amount with the first settled amount."""
+    settled = _first_settled_read(history, settings)
+    if isinstance(settled, ChargeNotSettled):
+        return settled
+    if history.latest.actual_usd == settled.actual_usd:
+        return SettledChargeUnchanged(settled.actual_usd)
+    return SettledChargeChanged(settled.actual_usd, history.latest.actual_usd)
+
+
+def _decode_charge_history(record: dict[str, object], latest: ChargeRead) -> _ChargeReadHistory:
+    last = _ChargeAmountRead(latest.at, latest.actual_usd)
+    amounts = tuple(_ChargeAmountRead(instant(item, 'at'), conf.decimal(text(item, 'actual_usd')))
+                    for item in rows(record, 'amount_reads')) if 'amount_reads' in record else (last,)
+    if not amounts or amounts[-1] != last or any(a.at >= b.at for a, b in zip(amounts, amounts[1:])):
+        raise LedgerUnavailable('invalid charge amount history')
+    return _ChargeReadHistory(latest, amounts)
+
+
+def read_strict_charge(path: Path) -> ChargeRead:
+    return _decode_charge(_strict_charge_record(path.read_text()))
+
+
+def _strict_charge_record(document: str) -> dict[str, object]:
+    return mapping(cast(object, json.loads(document, object_pairs_hook=unique_charge_fields)))
+
+
+def matches_utc_charge_day(name: str, reading: ChargeRead, day: date) -> bool:
+    """Check that the file name, label and bounds match the full UTC day."""
+    label = day.isoformat()
+    return (name == label + '.json' and reading.day == label
+            and (reading.period_start, reading.period_end) == period_bounds(day, ZoneInfo('UTC')))
+
+
+def _bill_day_reads(readings: Iterable[tuple[str, _ChargeReadHistory]], now: int) -> Iterator[_ChargeReadHistory]:
+    for name, history in readings:
+        reading = history.latest
+        try:
+            matches = matches_utc_charge_day(name, reading, date.fromisoformat(reading.day))
+        except (OSError, ValueError, ArithmeticError):
+            continue
+        if (matches and reading.at <= now
+                and reading.account_bill and reading.actual_usd >= Decimal('.01')):
+            yield history
+
+
+def _bill_is_complete(history: _ChargeReadHistory, settings: SpendingSettings, now: int) -> bool:
+    reading = history.latest
+    first = charge_period_day(now) - timedelta(days=settings.cost_explorer_lookback_days - 1)
+    if date.fromisoformat(reading.day) < first:
+        return True
+    count = settings.cost_explorer_unchanged_reads
+    next_at = reading.at
+    for amount in reversed(history.amounts):
+        if amount.at < reading.period_end or amount.actual_usd != reading.actual_usd:
+            break
+        if amount.at <= next_at:
+            count -= 1
+            if count == 0:
+                return True
+            next_at = amount.at - settings.cost_explorer_interval_seconds
+    return False
+
+
 def charge_record(reading: ChargeRead) -> dict[str, object]:
     return {'day': reading.day, 'at': reading.at, 'period_start': reading.period_start,
             'period_end': reading.period_end, 'actual_usd': str(reading.actual_usd),
@@ -1156,6 +1713,69 @@ def charge_record(reading: ChargeRead) -> dict[str, object]:
             **({'usage_types': [{'usage_type': item.usage_type, 'usd': str(item.usd),
                                 'quantity': str(item.quantity), 'unit': item.unit} for item in reading.usage_types],
                 'provisional': reading.provisional, 'excludes_credits': True} if reading.account_bill else {})}
+
+
+def _save_charge_read(path: Path, reading: ChargeRead, settings: SpendingSettings) -> ChargeRead:
+    document = charge_record(reading)
+    _ = _decode_charge(document)
+    if not reading.account_bill or not matches_utc_charge_day(path.name, reading, date.fromisoformat(reading.day)):
+        raise LedgerUnavailable('invalid completed account charge')
+
+    earlier: tuple[_ChargeAmountRead, ...] = ()
+    newest = reading
+    log_change = False
+    try:
+        record = _strict_charge_record(path.read_text())
+        previous = _decode_charge_history(record, _decode_charge(record))
+        saved = previous.latest
+        if not saved.account_bill or not matches_utc_charge_day(path.name, saved, date.fromisoformat(saved.day)):
+            raise LedgerUnavailable('invalid saved account charge')
+    except (FileNotFoundError, ValueError, ArithmeticError):
+        pass
+    else:
+        earlier = previous.amounts
+        # Concurrent refreshes can record one USD 0.01 fee for two Cost Explorer reads.
+        if any(amount.at == reading.at for amount in earlier):
+            return saved
+        if saved.at > reading.at:
+            document = record
+            newest = saved
+        else:
+            log_change = (saved.actual_usd >= Decimal('.01') and saved.actual_usd != reading.actual_usd
+                          and _bill_is_complete(previous, settings, reading.at))
+            if 'settled_change_notices_sent' in record:
+                document['settled_change_notices_sent'] = record['settled_change_notices_sent']
+
+    amounts = tuple(sorted((*earlier, _ChargeAmountRead(reading.at, reading.actual_usd)), key=lambda amount: amount.at))
+    document['amount_reads'] = [{'at': amount.at, 'actual_usd': str(amount.actual_usd)} for amount in amounts]
+    write_text_atomic(path, json.dumps(document, sort_keys=True) + '\n')
+    if log_change and (newest.actual_usd < Decimal('.01')
+                       or not _bill_is_complete(_ChargeReadHistory(newest, amounts), settings, reading.at)):
+        print(f'aws_target: {newest.day} UTC bill no longer settled: '
+              + f'USD {amounts[-2].actual_usd} changed to USD {newest.actual_usd}', file=sys.stderr)
+    return newest
+
+
+def _sent_settled_changes(record: dict[str, object]) -> set[Decimal]:
+    if 'settled_change_notices_sent' not in record:
+        return set()
+    return {conf.decimal(text(row, 'actual_usd')) for row in rows(record, 'settled_change_notices_sent')}
+
+
+def send_settled_changes(settings: SpendingSettings, changes: Sequence[_UnsentSettledChange]) -> bool:
+    """Send one keyed notice for the current changes."""
+    identities = tuple((notice.day, notice.change.newest_usd.as_integer_ratio()) for notice in changes)
+    key = 'aws-settled-changes:' + sha256(repr(identities).encode()).hexdigest()
+    repeat_minutes = (datetime.max - datetime.min) // timedelta(minutes=1) + 1
+    message = '\n'.join(notice.change.display_line(notice.day) for notice in changes)
+    try:
+        result = subprocess.run(session_send.send_argv(
+            '--to', settings.cost_explorer_change_recipient, '--from', 'aws-settled-watch',
+            '--key', key, '--repeat-minutes', str(repeat_minutes), '--text', message),
+            capture_output=True, text=True, timeout=settings.notification_timeout_s, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and result.stdout.startswith(('SENT:', 'SKIPPED:'))
 
 
 SPEND_GROUPS = ('gate compute at 32 CPU', 'compute at 16 CPU', 'storage', 'public IPv4', 'data transfer', 'other',
@@ -1199,6 +1819,31 @@ def spend_group(usage_type: str) -> str:
     if any(name in lowered for name in ('datatransfer', 'dataxfer', 'aws-out-bytes', 'aws-in-bytes', 'regional-bytes')):
         return 'data transfer'
     return 'other'
+
+
+def _run_related_usage(usage_type: str) -> bool:
+    usage = usage_type.lower()
+    return spend_group(usage_type) == 'data transfer' or any(marker in usage for marker in (
+        'spotusage:', 'boxusage:', 'publicipv4:inuseaddress', 'requests-tier', 'costexplorer-apirequest',
+    ))
+
+
+def _carried_bill_groups(bill: ChargeRead, *, idle: bool) -> tuple[SpendGroupCost, ...]:
+    """Carry saved usage amounts and retain unknown usage."""
+    groups: dict[str, Decimal] = dict.fromkeys(SPEND_GROUPS, Decimal(0))
+    for row in bill.usage_types:
+        if 'SpotUsage:' not in row.usage_type and not (idle and _run_related_usage(row.usage_type)):
+            groups[spend_group(row.usage_type)] += row.usd
+    groups['other'] += bill.actual_usd - sum((row.usd for row in bill.usage_types), Decimal(0))
+    return tuple(SpendGroupCost(group, usd) for group, usd in groups.items())
+
+
+def _uses_idle_bill_carry(day: str, start: int, end: int, prior_bill: ChargeRead,
+                          saved_days: set[str], exposures: Sequence[RunExposure]) -> bool:
+    if day <= prior_bill.day or day in saved_days:
+        return False
+    return all(isinstance(row.end, RunEndConfirmed) and row.end.at < start
+               for row in exposures if row.at < end)
 
 
 def is_billed_day(reading: ChargeRead) -> bool:
@@ -1411,16 +2056,21 @@ def trial_gate_cost(reservation: GateReservation, minimum_seconds: int) -> Decim
 def gate_compute_intervals(state: LedgerEvidence, now: int, minimum_seconds: int, *,
                            reserve: bool = False) -> tuple[ChargedInterval, ...]:
     intervals: list[ChargedInterval] = []
-    for reservation in state.gate_reservations:
-        if isinstance(reservation.state, GateAbsent) or (reservation.at > now and not reserve):
+    for reservation, exposure in state.gate_run_exposures():
+        if reservation.at > now and not reserve:
             continue
-        end = min(now, reservation.state.at) if isinstance(reservation.state, GateTerminated) else (
-            max(now, reservation.expires) if reserve else now)
+        end = exposure.priced_end(now, open_until=max(now, reservation.expires) if reserve else now)
         rate = reservation.rate if reservation.rate.source != 'not priced' else BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour')
         rates = dict(reservation.day_rates)
         intervals.extend(day_compute_intervals(reservation.at, end, minimum_seconds, lambda day: rates.get(day, rate),
                                               source='gate:' + reservation.attempt))
     return tuple(intervals)
+
+
+def hana_compute_counts(state: LedgerEvidence, exposure: HanaComputeExposure) -> bool:
+    """Skip a closed exposure only when the journal proves a start refusal."""
+    return (isinstance(exposure.state, HanaExposureOpen) or exposure.observed_active
+            or exposure.generation not in state.unstarted_hana_generations)
 
 
 def hana_intervals(state: LedgerEvidence, now: int, minimum_seconds: int, *,
@@ -1429,8 +2079,8 @@ def hana_intervals(state: LedgerEvidence, now: int, minimum_seconds: int, *,
     intervals: list[ChargedInterval] = []
     zone = ZoneInfo('UTC')
     horizon = max([now, *(r.expires for r in state.hana_compute if isinstance(r.state, HanaExposureOpen))])
-    for row in state.hana_compute:
-        end = min(now, row.state.at) if isinstance(row.state, HanaExposureClosed) else max(now, row.expires) if reserve else now
+    for row, exposure in state.hana_run_exposures():
+        end = exposure.priced_end(now, open_until=max(now, row.expires) if reserve else now)
         if row.at > end:
             continue
         rates = _bill_rates(readings, row.instance_type, now, row.region) if row.instance_type else _BillRates((), ())
@@ -1502,6 +2152,8 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
     hana_storage = [r for r in state.hana_storage if latest is None or reserve or r.at >= latest.period_end]
     hana = hana_intervals(replace(state, hana_storage=hana_storage), now,
         settings.box_minimum_seconds, reserve=reserve, readings=hana_readings)
+    saved_days = {r.day for r in readings if r.account_bill and r.period_end <= now}
+    exposures = tuple(state.run_exposures(settings.observation_max_age_seconds)) if latest is not None else ()
     hana_by_region = {(kind, region): hana_intervals(replace(state, hana_storage=[],
         hana_compute=[r for r in state.hana_compute if (r.instance_type, r.region) == (kind, region)]), now,
         settings.box_minimum_seconds, reserve=reserve, readings=hana_readings)
@@ -1549,10 +2201,9 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
         else:
             source = 'estimated from the newest bill' if latest is not None else 'estimated from configured prices'
             if latest is not None:
-                for row in latest.usage_types:
-                    if 'SpotUsage:' not in row.usage_type:
-                        groups[spend_group(row.usage_type)] += row.usd
-                groups['other'] += latest.actual_usd - sum((row.usd for row in latest.usage_types), Decimal(0))
+                idle = _uses_idle_bill_carry(key, start, end, latest, saved_days, exposures)
+                for group in _carried_bill_groups(latest, idle=idle):
+                    groups[group.group] += group.usd
                 include(ChargedInterval(start, end, sum(groups.values(), Decimal(0)), 'newest bill non-compute', 'fixed'))
             else:
                 groups['storage'] += period_cost(tuple(row for row in base.intervals if row.kind != 'explorer'
@@ -1585,6 +2236,40 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
         days.append(DailySpend(key, source, tuple(SpendGroupCost(group, usd) for group, usd in groups.items()),
                               runs, query_usd, tuple(intervals), provisional_bill=bill is not None and bill.provisional))
     return tuple(days)
+
+
+def _add_idle_bill_carry(state: LedgerEvidence, costs: CostEstimate, settings: SpendingSettings,
+                         readings: Sequence[ChargeRead],
+                         latest: ChargeRead) -> CostEstimate:
+    """Use the idle day estimate and keep any higher established charges."""
+    carry = sum((row.usd for row in _carried_bill_groups(latest, idle=True)), Decimal(0))
+    if carry <= 0:
+        return costs
+    saved_days = {row.day for row in readings if row.account_bill and row.period_end <= costs.at}
+    exposures = tuple(state.run_exposures(settings.observation_max_age_seconds))
+    known_costs = tuple(row for row in costs.intervals if row.kind != 'explorer')
+    utc = ZoneInfo('UTC')
+    zone = settings.accounting_zone
+    month_start, _ = _month_bounds(datetime.fromtimestamp(costs.at, zone).date(), zone)
+    extra: list[ChargedInterval] = []
+    utc_month_start, _ = period_bounds(datetime.fromtimestamp(month_start, utc).date(), utc)
+    for day_start, _ in _days(max(latest.period_end, utc_month_start), costs.at + 1, utc):
+        day = datetime.fromtimestamp(day_start, utc).date().isoformat()
+        day_end = day_start + 86400
+        if day_end <= month_start or not _uses_idle_bill_carry(
+                day, day_start, day_end, latest, saved_days, exposures):
+            continue
+        for start, end in _days(max(day_start, month_start), day_end, zone):
+            if start > costs.at:
+                break
+            expected = carry * Decimal(end - start) / Decimal(86400)
+            difference = expected - period_cost(known_costs, start, end)
+            if difference > 0:
+                extra.append(ChargedInterval(start, end, difference, 'carried resource usage from AWS bill', 'reconciliation'))
+    daily, monthly = spending_periods(extra, zone)
+    return replace(costs, daily=replace(costs.daily, usd=costs.daily.usd + daily.get(costs.daily.day, Decimal(0))),
+                   monthly=replace(costs.monthly, usd=costs.monthly.usd + monthly.get(costs.monthly.month, Decimal(0))),
+                   intervals=(*costs.intervals, *extra))
 
 
 def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, costs: CostEstimate) -> tuple[Decimal, Decimal]:
@@ -1633,6 +2318,99 @@ def gate_future_costs(state: LedgerEvidence, settings: SpendingSettings, now: in
     return daily.get(day, Decimal(0)), monthly.get(day[:7], Decimal(0))
 
 
+@dataclass(frozen=True)
+class _LimitAmount:
+    adjusted_usage: Decimal
+    adjustment: Decimal
+    reserves: Decimal
+    headroom: Decimal
+
+    @property
+    def before_headroom(self) -> Decimal:
+        return self.adjusted_usage + self.reserves
+
+    @property
+    def limit_count(self) -> Decimal:
+        return self.before_headroom + self.headroom
+
+
+def _limit_amount(old_usage: Decimal, adjustment: Decimal, reserves: Decimal, headroom: Decimal) -> _LimitAmount:
+    return _LimitAmount(old_usage + adjustment, adjustment, reserves, headroom)
+
+
+@dataclass(frozen=True)
+class _GuardAccrual:
+    amount: _LimitAmount
+    bounds: tuple[int, int]
+    day_adjustments: tuple[tuple[int, Decimal], ...]
+
+
+def _require_instance_observation(state: LedgerEvidence) -> None:
+    if not any(row.state != 'unknown' for row in state.observations):
+        raise LedgerUnavailable('instance state evidence is missing')
+
+
+def _guard_limit_amounts(state: LedgerEvidence, settings: SpendingSettings, costs: CostEstimate,
+                         complete_days: Sequence[CompleteDayAmount]) -> tuple[_GuardAccrual, _GuardAccrual]:
+    now = costs.at
+    daily_fixed, monthly_fixed = _reserved_fixed_costs(state, settings, costs)
+    gate_daily, gate_monthly = gate_future_costs(state, settings, now)
+    reserved, reserved_months = spending_periods(
+        hana_intervals(state, now, settings.box_minimum_seconds, reserve=True), settings.accounting_zone)
+    accrued, accrued_months = spending_periods(
+        hana_intervals(state, now, settings.box_minimum_seconds), settings.accounting_zone)
+    daily_fixed += gate_daily + max(Decimal(0), reserved.get(costs.daily.day, Decimal(0))
+                                   - accrued.get(costs.daily.day, Decimal(0)))
+    monthly_fixed += gate_monthly + max(Decimal(0), reserved_months.get(costs.monthly.month, Decimal(0))
+                                       - accrued_months.get(costs.monthly.month, Decimal(0)))
+    zone = settings.accounting_zone
+    day = datetime.fromtimestamp(now, zone).date()
+
+    def for_window(old_usage: Decimal, reserves: Decimal, bounds: tuple[int, int]) -> _GuardAccrual:
+        adjustments = _complete_day_adjustments(complete_days, costs.intervals, state.gate_reservations, *bounds)
+        adjustment = sum((usd for _, usd in adjustments), Decimal(0))
+        amount = _limit_amount(old_usage, adjustment, reserves, settings.limit_reserve_usd)
+        return _GuardAccrual(amount, bounds, adjustments)
+
+    return (for_window(costs.daily.usd, daily_fixed, period_bounds(day, zone)),
+            for_window(costs.monthly.usd, monthly_fixed, _month_bounds(day, zone)))
+
+
+def _accrued_days(cost: Decimal, accrual: _GuardAccrual, estimates: CostEstimate,
+                  aws_amounts_so_far: Mapping[date, Decimal], final_days: set[date]) -> tuple[AccruedDay, ...]:
+    utc = ZoneInfo('UTC')
+    start, end = accrual.bounds
+    amounts = {datetime.fromtimestamp(left, utc).date(): Decimal(0)
+               for left, _ in _days(start, min(end, estimates.at + 1), utc)}
+    fees: dict[date, Decimal] = {}
+    for row in estimates.intervals:
+        if not start <= row.start < end:
+            continue
+        spans = ((row.start, row.end),) if row.start == row.end else _days(row.start, row.end, utc)
+        for left, right in spans:
+            day = datetime.fromtimestamp(left, utc).date()
+            usd = row.usd if (left, right) == (row.start, row.end) else _overlap(row, left, right)
+            amounts[day] = amounts.get(day, Decimal(0)) + usd
+            if row.kind == 'explorer':
+                fees[day] = fees.get(day, Decimal(0)) + usd
+
+    billed_days = {datetime.fromtimestamp(at, utc).date(): usd for at, usd in accrual.day_adjustments}
+    for day, adjustment in billed_days.items():
+        amounts[day] = amounts.get(day, Decimal(0)) + adjustment
+    days: list[AccruedDay] = []
+    for day, usd in sorted(amounts.items()):
+        state: Literal['estimate', 'billed_not_final', 'billed_final'] = 'estimate'
+        if day in billed_days:
+            state = 'billed_final' if day in final_days else 'billed_not_final'
+        days.append(AccruedDay(day, usd, state, aws_amounts_so_far.get(day), fees.get(day, Decimal(0))))
+    if days:
+        # Assign the Decimal rounding difference from grouping to the last day.
+        last = days[-1]
+        last_cost = cost - sum((day.cost for day in days[:-1]), Decimal(0))
+        days[-1] = replace(last, cost=last_cost, rounding_adjustment=last_cost - last.cost)
+    return tuple(days)
+
+
 def send_limit_event(event: LimitEvent) -> bool:
     """Use the existing message interface after persisting the event identity."""
     # Keep the key active across every date that the message interface can represent.
@@ -1643,7 +2421,7 @@ def send_limit_event(event: LimitEvent) -> bool:
                              f"The AWS spending guard refused new work. The {event.period} limit for {period_key} applies. "
                              + f"Drain the target. Estimate ${event.estimate_usd}. Limit ${event.limit_usd}."),
                             capture_output=True, text=True, timeout=event.timeout_s, check=False)
-    return result.returncode == 0 and result.stdout.startswith(("SENT:", "SKIPPED:"))
+    return send_result.delivered_or_kept(result.returncode, result.stdout, accept_skipped=True)
 
 
 def decision_record(decision: SpendingDecision) -> dict[str, object]:
@@ -1684,13 +2462,22 @@ class CostLedger:
     def _read(self) -> LedgerEvidence:
         """Read atomically published evidence without creating files or acquiring locks."""
         try:
-            return _decode(mapping(cast(object, json.loads(self.path.read_text()))))
+            state = _decode(mapping(cast(object, json.loads(self.path.read_text()))))
+            if any(isinstance(row.state, HanaExposureClosed) and not row.observed_active for row in state.hana_compute):
+                journal = remote.read_hana_start_journal(self.directory)
+                state.unstarted_hana_generations = journal.unstarted_exposures([row.generation for row in state.hana_compute])
+            return state
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
             raise LedgerUnavailable(f"ledger evidence is unavailable: {error}") from error
 
     def read_snapshot(self) -> LedgerEvidence:
         """Read the published evidence without creating coordination files."""
         return self._read()
+
+    def gate_claim_reservations(self, claim_id: str) -> tuple[GateReservation, ...]:
+        """Read the reservations for a placement claim without the account lock."""
+        state = _decode(mapping(cast(object, json.loads(self.path.read_text()))))
+        return tuple(row for row in state.gate_reservations if row.placement_claim == claim_id or row.attempt == claim_id)
 
     def record_hana_attempt(self, charge: hana_result.HanaAttemptCharge) -> None:
         """Link transfer and query evidence without adding another dollar total."""
@@ -1726,6 +2513,34 @@ class CostLedger:
 
     def read_bills(self) -> tuple[ChargeRead, ...]:
         return tuple(read_charge(path) for path in self.bill_paths())
+
+    def _strict_charge_reads(self) -> Iterator[tuple[str, _ChargeReadHistory]]:
+        for path in self.bill_paths():
+            try:
+                record = _strict_charge_record(path.read_text())
+                history = _decode_charge_history(record, _decode_charge(record))
+            except (OSError, ValueError, ArithmeticError):
+                continue
+            yield path.name, history
+
+    def read_complete_day_amounts(self, settings: SpendingSettings, now: int) -> tuple[CompleteDayAmount, ...]:
+        """Read amounts that qualify to replace a full UTC day."""
+        return tuple(CompleteDayAmount(history.latest.period_start, history.latest.period_end, history.latest.actual_usd)
+                     for history in _bill_day_reads(self._strict_charge_reads(), now)
+                     if _bill_is_complete(history, settings, now))
+
+    def read_charge_watch(self, settings: SpendingSettings, now: int) -> tuple[WatchedChargeDay, ...]:
+        """Read the settlement status of every recorded account bill day."""
+        watched: list[WatchedChargeDay] = []
+        for name, history in self._strict_charge_reads():
+            latest = history.latest
+            try:
+                day = date.fromisoformat(latest.day)
+                if latest.account_bill and latest.at <= now and matches_utc_charge_day(name, latest, day):
+                    watched.append(WatchedChargeDay(latest.day, latest.at, _charge_settlement(history, settings)))
+            except (ValueError, ArithmeticError):
+                continue
+        return tuple(watched)
 
     def launches(self) -> tuple[dict[str, object], ...]:
         path = self.launch_history_path
@@ -1787,6 +2602,66 @@ class CostLedger:
                 and datetime.fromtimestamp(r.at, ZoneInfo('UTC')).date().isoformat() == day.day
                 for r in state.gate_reservations)) for day in days)
 
+    def accrued_cost(self, settings_path: Path, now: int, *,
+                     window: Literal['day', 'month']) -> AccruedCost:
+        """Return the admission guard's limit_count, equal to cost plus reserves and headroom."""
+        state = self.read_snapshot()
+        settings = read_settings(settings_path)
+        pricing_reads: list[ChargeRead] = []
+        strict_reads: list[tuple[str, _ChargeReadHistory]] = []
+        final_bill_names: set[str] = set()
+        unavailable: CostEvidenceUnavailable | None = None
+        for path in self.bill_paths():
+            try:
+                document = path.read_text()
+                try:
+                    record = _strict_charge_record(document)
+                    read = _decode_charge(record)
+                except _DuplicateChargeField:
+                    read = _decode_charge(cast(object, json.loads(document)))
+                else:
+                    try:
+                        history = _decode_charge_history(record, read)
+                    except (ValueError, ArithmeticError):
+                        pass
+                    else:
+                        strict_reads.append((path.name, history))
+                        if record.get('provisional') is False:
+                            final_bill_names.add(path.name)
+                pricing_reads.append(read)
+            except (OSError, ValueError, ArithmeticError) as error:
+                unavailable = unavailable or CostEvidenceUnavailable(str(error))
+
+        complete_days: list[CompleteDayAmount] = []
+        aws_amounts_so_far: dict[date, Decimal] = {}
+        final_days: set[date] = set()
+        for history in _bill_day_reads(strict_reads, now):
+            read = history.latest
+            day = date.fromisoformat(read.day)
+            if _bill_is_complete(history, settings, now):
+                complete_days.append(CompleteDayAmount(read.period_start, read.period_end, read.actual_usd))
+                if read.day + '.json' in final_bill_names:
+                    final_days.add(day)
+            else:
+                aws_amounts_so_far[day] = read.actual_usd
+
+        try:
+            estimates = self._guard_estimate(state, settings, now, pricing_reads)
+        except (OSError, ValueError, ArithmeticError) as error:
+            unavailable = unavailable or CostEvidenceUnavailable(str(error))
+            estimates = costs_from_evidence(state, settings, now)
+        try:
+            _require_instance_observation(state)
+        except LedgerUnavailable as error:
+            unavailable = unavailable or CostEvidenceUnavailable(str(error))
+        daily, monthly = _guard_limit_amounts(state, settings, estimates, complete_days)
+        accrual = daily if window == 'day' else monthly
+        amount = accrual.amount
+        cost = amount.adjusted_usage
+        limit_count = amount.limit_count if unavailable is None else unavailable
+        days = _accrued_days(cost, accrual, estimates, aws_amounts_so_far, final_days)
+        return AccruedCost(cost, limit_count, amount.reserves, amount.headroom, days)
+
     def reserve_gate(self, settings_path: Path, request: GateReservation) -> GateReserved | GateCapReached | GateAttemptEnded:
         """Reserve gate costs under the shared Rust accounting lock."""
         with self._locked() as state:
@@ -1794,7 +2669,7 @@ class CostLedger:
                 if previous.attempt == request.attempt:
                     if isinstance(previous.state, (GateAbsent, GateTerminated)):
                         return GateAttemptEnded()
-                    return GateReserved(previous)
+                    return GateReserved(previous, created=False)
             settings = read_settings(settings_path)
             if isinstance(request.trial, GateTrialBudget):
                 if request.mode != 'gpu-size-trial' or not request.trial.trial_id or request.trial.limit_usd <= 0:
@@ -1811,15 +2686,34 @@ class CostLedger:
                 total = sum((trial_gate_cost(row, settings.box_minimum_seconds) for row in scoped), Decimal(0))
                 if total + trial_gate_cost(request, settings.box_minimum_seconds) > limit:
                     return GateCapReached('gpu_size_trial_limit_usd')
-            costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
-            state.gate_reservations.append(request)
-            reason = self.reservation_cap(state, settings, request.at, costs)
-            if reason:
-                state.gate_reservations = [r for r in state.gate_reservations if r.attempt != request.attempt]
-                self._save(state)
-                return GateCapReached(reason)
+            reason = self._book_gate(state, settings, request)
             self._save(state)
+            if reason:
+                return GateCapReached(reason)
             return GateReserved(state.gate_reservations[-1])
+
+    def gate_booking_refusal(self, snapshot: LedgerEvidence, settings_path: Path, request: GateReservation) -> str:
+        """Project the booking against local account evidence without changing the ledger."""
+        return self._book_gate(snapshot, read_settings(settings_path), request)
+
+    def _book_gate(self, state: LedgerEvidence, settings: SpendingSettings, request: GateReservation) -> str:
+        costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
+        state.gate_reservations.append(request)
+        reason = self.reservation_cap(state, settings, request.at, costs)
+        if reason:
+            _ = state.gate_reservations.pop()
+        return reason
+
+    def recheck_gate_booking(self, settings_path: Path, attempt: str, now: int) -> str:
+        """Check the pending booking against the current account bill."""
+        with self._locked() as state:
+            booking = self._launchable_gate(state, attempt)
+            if not isinstance(booking.state, GateLaunchPending) or booking.expires <= now:
+                raise LedgerUnavailable('The gate booking cannot launch a box')
+            settings = read_settings(settings_path)
+            prior = replace(state, gate_reservations=[row for row in state.gate_reservations if row is not booking])
+            costs = _charges(prior, settings, now, current_window=True, require_fresh=False)
+            return self.reservation_cap(state, settings, now, costs)
 
     @contextmanager
     def locked_snapshot(self) -> Generator[LedgerEvidence]:
@@ -1833,6 +2727,21 @@ class CostLedger:
         with self._locked() as state:
             yield state
             self._save(state)
+
+    @contextmanager
+    def gate_cleanup_transaction(self) -> Generator[GateCleanupTransaction]:
+        """Sync pending cleanup before the caller can request termination."""
+        with self._locked() as state:
+            previous = state.gate_reservations.copy()
+            cleanup = GateCleanupTransaction(state)
+            yield cleanup
+            if state.gate_reservations != previous:
+                self._save(state)
+            elif cleanup.has_pending_cleanup:
+                # A failed directory sync can leave the pending record visible.
+                with self.path.open('rb') as stream:
+                    os.fsync(stream.fileno())
+                sync_folder(self.path.parent)
 
     def spending_decision(self, state: LedgerEvidence, settings_path: Path, now: int) -> SpendingDecision:
         """Validate account evidence and apply the shared bill cap to a proposed reservation."""
@@ -1853,38 +2762,64 @@ class CostLedger:
         """Refresh prices and apply the account bill cap to the proposed reservations."""
         readings = self.read_bills()
         self._price_gates(state, readings, now)
-        return self._reservation_cap(state, settings, now, costs, readings)
+        complete_days = self.read_complete_day_amounts(settings, now)
+        return self._reservation_cap(state, settings, now, costs, readings, complete_days)
 
     def _reservation_cap(self, state: LedgerEvidence, settings: SpendingSettings, now: int,
-                         costs: CostEstimate, readings: Sequence[ChargeRead]) -> str:
+                         costs: CostEstimate, readings: Sequence[ChargeRead],
+                         complete_days: Sequence[CompleteDayAmount]) -> str:
         """Apply the account bill cap to the priced resource reservations."""
         days = gate_spend_days(state, settings, readings, now, reserve=True)
         fixed_daily, fixed_monthly = _reserved_fixed_costs(state, settings, costs)
         if any(is_billed_day(r) and r.period_end <= now for r in readings):
             fixed_daily = fixed_monthly = Decimal(0)
         today = datetime.fromtimestamp(now, settings.accounting_zone).date().isoformat()
-        daily, monthly = spending_periods(tuple(charge for day in days for charge in day.intervals), settings.accounting_zone)
+        intervals = tuple(charge for day in days for charge in day.intervals)
+        zone = settings.accounting_zone
+        daily, monthly = spending_periods(intervals, zone)
         reason = ''
         for day, amount in daily.items():
-            if day >= today and amount + fixed_daily + settings.limit_reserve_usd >= settings.daily_limit_usd:
-                reason = 'daily_limit'
-        if not reason and any(amount + fixed_monthly + settings.limit_reserve_usd >= settings.monthly_limit_usd
-                              for month, amount in monthly.items() if month >= today[:7]):
+            if day >= today:
+                bounds = period_bounds(date.fromisoformat(day), zone)
+                adjustment = complete_day_adjustment(complete_days, intervals, state.gate_reservations, *bounds)
+                count = _limit_amount(amount, adjustment, fixed_daily, settings.limit_reserve_usd).limit_count
+                if count >= settings.daily_limit_usd:
+                    reason = 'daily_limit'
+        if not reason and any(_limit_amount(
+                amount, complete_day_adjustment(complete_days, intervals, state.gate_reservations,
+                                                *_month_bounds(date.fromisoformat(month + '-01'), zone)),
+                fixed_monthly, settings.limit_reserve_usd).limit_count >= settings.monthly_limit_usd
+                for month, amount in monthly.items() if month >= today[:7]):
             reason = 'monthly_limit'
         return reason
+
+    def require_gate_launchable(self, attempt: str) -> None:
+        """Refuse a saved launch while cleanup owns the booking."""
+        _ = self._launchable_gate(self.read_snapshot(), attempt)
+
+    @staticmethod
+    def _launchable_gate(state: LedgerEvidence, attempt: str) -> GateReservation:
+        booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+        if booking is None or not gate_is_open(booking):
+            raise LedgerUnavailable('The gate booking is no longer open')
+        if isinstance(booking.cleanup, GateCleanupPending):
+            raise GateCleanupInProgress('The gate booking is in cleanup')
+        return booking
 
     def gate_region(self, attempt: str, region: str) -> None:
         """Retain the region before AWS can accept a launch."""
         with self._locked() as state:
-            state.gate_reservations = [replace(row, region=region) if row.attempt == attempt else row
-                                       for row in state.gate_reservations]
+            booking = self._launchable_gate(state, attempt)
+            state.gate_reservations[state.gate_reservations.index(booking)] = replace(booking, region=region)
             self._save(state)
 
-    def gate_owner(self, attempt: str, owner: GateWorkerOwner) -> None:
+    def gate_owner(self, attempt: str, owner: GateWorkerOwner, *, now: float = 0) -> None:
         """Save the worker identity before an attempt can launch a box."""
         with self._locked() as state:
-            state.gate_reservations = [replace(row, owner=owner) if row.attempt == attempt else row
-                                       for row in state.gate_reservations]
+            booking = self._launchable_gate(state, attempt)
+            if booking.placement_claim and booking.expires <= now:
+                raise LedgerUnavailable('The gate booking cannot take a worker')
+            state.gate_reservations[state.gate_reservations.index(booking)] = replace(booking, owner=owner)
             self._save(state)
 
     def record_gate_quota_refusal(self, pool: SpotQuotaPool, now: float) -> None:
@@ -1894,11 +2829,31 @@ class CostLedger:
             state.gate_quota_refusals.append(GateQuotaRefusal(pool, state.live_gate_vcpus(now).get(pool, 0), int(now)))
             self._save(state)
 
-    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
+    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '',
+                     expected_owner: GateWorkerOwner | GateOwnerUnknown | NoGateCleanupOwnerCheck = NO_GATE_CLEANUP_OWNER_CHECK,
+                     cleanup: GateCleanupTargets | GateCleanupNotStarted = GATE_CLEANUP_NOT_STARTED) -> None:
         """Preserve confirmed termination against every later outcome."""
         with self._locked() as state:
-            if any(row.attempt == attempt and isinstance(row.state, GateTerminated) for row in state.gate_reservations):
+            if isinstance(expected_owner, NoGateCleanupOwnerCheck):
+                booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+            else:
+                booking = require_gate_cleanup_owner(state, attempt, expected_owner)
+            if booking is not None and isinstance(booking.state, GateTerminated):
+                if isinstance(cleanup, GateCleanupTargets) and (booking.region != cleanup.region
+                        or not booking.state.confirms(cleanup.instances)):
+                    raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
                 return
+            if isinstance(cleanup, GateCleanupTargets):
+                if (booking is None or not isinstance(booking.cleanup, GateCleanupPending)
+                        or booking.cleanup.targets != cleanup or not isinstance(outcome, GateTerminated)
+                        or outcome.instance_id not in cleanup.instances):
+                    raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
+                if isinstance(booking.cleanup.result_seen_at, int):
+                    outcome = replace(outcome, at=booking.cleanup.result_seen_at)
+                outcome = replace(outcome, additional_instances=tuple(
+                    sorted(set(cleanup.instances) - {outcome.instance_id})))
+            elif booking is not None and isinstance(booking.cleanup, GateCleanupPending):
+                raise GateCleanupInProgress('The gate booking is in cleanup')
             now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at
             cooldown = inf
             if state.gate_quota_refusals:
@@ -1910,7 +2865,8 @@ class CostLedger:
             if isinstance(outcome, GateRunning):
                 # Clear expired marks before this launch increases the count.
                 state.clear_ended_quota_refusals(now, cooldown)
-            state.gate_reservations = [replace(row, state=outcome, instance_type=instance_type or row.instance_type)
+            state.gate_reservations = [replace(row, state=outcome, instance_type=instance_type or row.instance_type,
+                                               cleanup=GATE_CLEANUP_NOT_STARTED)
                                        if row.attempt == attempt else row for row in state.gate_reservations]
             state.clear_ended_quota_refusals(now, cooldown)
             self._price_gates(state, self.read_bills(), now)
@@ -2021,7 +2977,8 @@ class CostLedger:
         settings = read_settings(configuration)
         day = charge_period_day(now)
         start, end = period_bounds(day, ZoneInfo('UTC'))
-        start -= (settings.cost_explorer_lookback_days - 1) * 86400
+        lookback_day = (day - timedelta(days=settings.cost_explorer_lookback_days - 1)).isoformat()
+        start -= (settings.cost_explorer_watch_days - 1) * 86400
         with self._locked() as state:
             newest = max((self.directory / 'charges').glob('*.json'), default=None)
             if newest is not None:
@@ -2043,20 +3000,76 @@ class CostLedger:
                     if complete and now < previous.at + settings.cost_explorer_interval_seconds:
                         return previous
             readings = fetch(start, end)
-            saved: list[ChargeRead] = []
-            for reading in readings:
-                estimated = Decimal(0)
-                if state.inventories and any(inventory.at <= reading.period_end for inventory in state.inventories):
-                    costs = costs_from_evidence(state, settings, reading.period_end,
-                                                window=datetime.fromtimestamp(reading.period_start, settings.accounting_zone).date())
-                    estimated = period_cost(costs.intervals, reading.period_start, reading.period_end)
-                reading = replace(reading, at=now, estimated_usd=estimated)
-                path = self.directory / 'charges' / f'{reading.day}.json'
-                write_text_atomic(path, json.dumps(charge_record(reading), sort_keys=True) + '\n')
-                saved.append(reading)
-            for reading in saved:
+            estimate_state = replace(state)
+            saved_recent = [self._save_account_charge(estimate_state, settings, now, reading)
+                            for reading in readings if reading.day >= lookback_day]
+            for reading in saved_recent:
                 self._reconcile_charge(state, reading)
-            return saved[-1]
+            saved_older: list[ChargeRead] = []
+            for reading in readings:
+                if reading.day >= lookback_day:
+                    continue
+                try:
+                    saved = self._save_account_charge(estimate_state, settings, now, reading)
+                    self._reconcile_charge(state, saved)
+                    saved_older.append(saved)
+                except (OSError, ValueError, ArithmeticError) as error:
+                    print(f'aws_target: cannot save watched bill for {reading.day}: {error!r}', file=sys.stderr)
+        self._notify_settled_changes(settings, now)
+        saved_days = saved_recent or saved_older
+        return saved_days[-1] if saved_days else MeasurementUnavailable('No account bills were saved')
+
+    def _save_account_charge(self, state: LedgerEvidence, settings: SpendingSettings, now: int,
+                             reading: ChargeRead) -> ChargeRead:
+        estimated = Decimal(0)
+        if state.inventories and any(inventory.at <= reading.period_end for inventory in state.inventories):
+            costs = costs_from_evidence(state, settings, reading.period_end,
+                                        window=datetime.fromtimestamp(reading.period_start, settings.accounting_zone).date())
+            estimated = period_cost(costs.intervals, reading.period_start, reading.period_end)
+        path = self.directory / 'charges' / f'{reading.day}.json'
+        return _save_charge_read(path, replace(reading, at=now, estimated_usd=estimated), settings)
+
+    def _notify_settled_changes(self, settings: SpendingSettings, now: int) -> None:
+        """Send one notice for all unsent changes to current amounts."""
+        pending: list[_UnsentSettledChange] = []
+        for path in self.bill_paths():
+            try:
+                record = _strict_charge_record(path.read_text())
+                history = _decode_charge_history(record, _decode_charge(record))
+                latest = history.latest
+                if (not latest.account_bill or latest.at > now
+                        or not matches_utc_charge_day(path.name, latest, date.fromisoformat(latest.day))):
+                    continue
+                change = _charge_settlement(history, settings)
+                if isinstance(change, SettledChargeChanged) and change.newest_usd not in _sent_settled_changes(record):
+                    pending.append(_UnsentSettledChange(latest.day, change))
+            except (OSError, ValueError, ArithmeticError):
+                continue
+        if not pending:
+            return
+        if not send_settled_changes(settings, pending):
+            print('aws_target: settled amount notices remain pending for '
+                  + ', '.join(notice.day for notice in pending), file=sys.stderr)
+            return
+        try:
+            with self._locked():
+                for notice in pending:
+                    self._record_sent_settled_change(notice)
+        except (OSError, ValueError, ArithmeticError) as error:
+            print(f'aws_target: cannot record settled amount notices: {error!r}', file=sys.stderr)
+
+    def _record_sent_settled_change(self, notice: _UnsentSettledChange) -> None:
+        path = self.directory / 'charges' / f'{notice.day}.json'
+        try:
+            record = _strict_charge_record(path.read_text())
+            confirmed = _sent_settled_changes(record)
+            if notice.change.newest_usd in confirmed:
+                return
+            record['settled_change_notices_sent'] = [
+                {'actual_usd': str(value)} for value in sorted(confirmed | {notice.change.newest_usd})]
+            write_text_atomic(path, json.dumps(record, sort_keys=True) + '\n')
+        except (OSError, ValueError, ArithmeticError) as error:
+            print(f'aws_target: cannot record settled amount notice for {notice.day}: {error!r}', file=sys.stderr)
 
     def _save_estimate(self, state: LedgerEvidence, costs: CostEstimate) -> None:
         established = {r: r for r in costs.established_reconciliations}
@@ -2083,6 +3096,16 @@ class CostLedger:
             return PermissionUnavailable(decision.at, 'current decision has no durable publication')
         return decode_permission(decision_record(decision))
 
+    def _guard_estimate(self, state: LedgerEvidence, settings: SpendingSettings, now: int,
+                        readings: Sequence[ChargeRead]) -> CostEstimate:
+        self._price_gates(state, readings, now)
+        costs = _charges(state, settings, now, current_window=True)
+        latest = max((row for row in readings if is_billed_day(row) and row.period_end <= now),
+                     key=lambda row: row.day, default=None)
+        if latest is None or not latest.usage_types:
+            return costs
+        return _add_idle_bill_carry(state, costs, settings, readings, latest)
+
     def _decide(self, state: LedgerEvidence, settings_path: Path,
                 purpose: SpendingPurpose, now: int, *, placement_preview: bool = False) -> SpendingDecision:
         evidence = GuardEvidence(purpose, (), CostEvidenceUnavailable("costs have not been validated"))
@@ -2090,36 +3113,31 @@ class CostLedger:
             settings = read_settings(settings_path)
             evidence = GuardEvidence(purpose, settings.limits, evidence.costs, settings)
             readings = self.read_bills()
-            self._price_gates(state, readings, now)
-            costs = _charges(state, settings, now, current_window=True)
+            costs = self._guard_estimate(state, settings, now, readings)
             evidence = GuardEvidence(purpose, settings.limits, costs, settings)
-            if purpose != "deployment" and not any(r.state != "unknown" for r in state.observations):
-                raise LedgerUnavailable("instance state evidence is missing")
-            daily_fixed, monthly_fixed = _reserved_fixed_costs(state, settings, costs)
-            gate_daily, gate_monthly = gate_future_costs(state, settings, now)
-            reserved, reserved_months = spending_periods(
-                hana_intervals(state, now, settings.box_minimum_seconds, reserve=True), settings.accounting_zone)
-            accrued, accrued_months = spending_periods(
-                hana_intervals(state, now, settings.box_minimum_seconds), settings.accounting_zone)
-            daily_fixed += gate_daily + max(Decimal(0), reserved.get(costs.daily.day, Decimal(0))
-                                           - accrued.get(costs.daily.day, Decimal(0)))
-            monthly_fixed += gate_monthly + max(Decimal(0), reserved_months.get(costs.monthly.month, Decimal(0))
-                                               - accrued_months.get(costs.monthly.month, Decimal(0)))
-            evidence = GuardEvidence(purpose, settings.limits, costs, settings, daily_fixed, monthly_fixed)
+            if purpose != "deployment":
+                _require_instance_observation(state)
+            complete_days = self.read_complete_day_amounts(settings, now)
+            daily_accrual, monthly_accrual = _guard_limit_amounts(state, settings, costs, complete_days)
+            daily, monthly = daily_accrual.amount, monthly_accrual.amount
+            if daily.adjustment or monthly.adjustment:
+                costs = replace(costs, daily=replace(costs.daily, usd=daily.adjusted_usage),
+                                monthly=replace(costs.monthly, usd=monthly.adjusted_usage))
+            evidence = GuardEvidence(purpose, settings.limits, costs, settings, daily.reserves, monthly.reserves)
             reason = ""
-            for period, key, total, limit in (
-                ("daily", costs.daily.day, costs.daily.usd + daily_fixed, settings.daily_limit_usd),
-                ("monthly", costs.monthly.month, costs.monthly.usd + monthly_fixed, settings.monthly_limit_usd),
+            for period, key, amount, limit in (
+                ("daily", costs.daily.day, daily, settings.daily_limit_usd),
+                ("monthly", costs.monthly.month, monthly, settings.monthly_limit_usd),
             ):
-                if total + settings.limit_reserve_usd < limit:
+                if amount.limit_count < limit:
                     continue
                 reason = reason or f"{period}_limit"
                 event_id = f"{period}:{key}"
                 if not any(event.event_id == event_id for event in state.events):
-                    state.events.append(LimitEvent(event_id, now, period, total, limit,
+                    state.events.append(LimitEvent(event_id, now, period, amount.before_headroom, limit,
                                                    settings.notification_recipient, settings.notification_timeout_s))
             if not reason and placement_preview:
-                reason = self._reservation_cap(state, settings, now, costs, readings)
+                reason = self._reservation_cap(state, settings, now, costs, readings, complete_days)
             return SpendingRefused(now, reason, evidence) if reason else SpendingAllowed(now, evidence)
         except SpendingConfigurationUnavailable as error:
             return SpendingUnavailable(now, str(error), GuardEvidence(purpose, error.limits, evidence.costs))

@@ -49,8 +49,10 @@ The guards run `copies/copy_guard.py` and `pre-tool-use-build-hold-guard.sh`.
 The `compaction-marker` handler runs `pre-compact-marker.py --family codex` at `PreCompact`, with matcher `*`.
 It records the input `session_id` before manual or automatic compaction.
 The installer lists this event as `preCompact` and records its trust separately.
-The `compaction-clear-turn` handler runs `compaction-marker-clear.sh` at `UserPromptSubmit`.
-The shell command starts no Python process when the marker folder has no `*.json` file.
+The `compaction-clear-turn` handler runs at `UserPromptSubmit`.
+For a worker with `UNIT_TEAM_ROLE` set and `STAFF_ID` unset, the shell skips Python if there is no compaction marker.
+Otherwise, the handler runs `goal_card.py` to clear the marker and supply prompt context.
+Launcher failures stay silent.
 The `compaction-clear-end` handler runs `compaction-marker-clear.py` at `PostCompact`.
 Both handlers delete only the input session's marker through the shared clear function.
 Codex 0.167.0 lists these events as `userPromptSubmit` and `postCompact`.
@@ -153,13 +155,30 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
 
 ### Showrunner settings and stall watcher
 
-- `config/showrunners.json` (git-ignored; `SHOWRUNNERS_CONFIG` redirects it) holds five settings: `threshold_percent` 2, `repeat_minutes` 30, `stall_minutes` 5, `faults_to` `natedev` and `always` `["natedev"]`. `quota_alert.py` sends to `always`, then to each running showrunner by its name now, each name once.
+- `config/showrunners.conf` defines `threshold_percent`, `stall_minutes`, `faults_to`, and `always`.
+  `quota_alert.py` sends Claude five-hour notices, Claude no-room notices, and blocked account move notices to running showrunners and `always` recipients.
 
 - `scripts/production/stall_watch.py` runs each minute as the run-only notifier instance `stall-watch`. Per tick, under a non-blocking `flock` on `~/.local/state/stall-watch/lock` (a held lock exits 0 at once): for each running showrunner (`registered_showrunners()` with a `socket`), for each unit that `unit_lookup.labeled_sessions(<showrunner name>)` finds with a `LiveClaude`, take its pane and that Claude's pid, session id and socket, and track a stretch. A showrunner that is not running has no one to report to, so its units are not watched.
 
 - Every unit with a live Claude is watched.
   - A stretch is `Stretch(pane_hash, since, bump_sent, tell_sent, reported_status)` in `~/.local/state/stall-watch/<sha256(showrunner staff name NUL unit id)>.json`. The hash covers `session_pane.read_place(place, 400, joined=True)` on the unit's herdr pane. A changed pane resets it unless something was sent; transcript activity (the session's `.jsonl` and its `subagents/` files) moves `since` forward before a report is sent.
-  - **Permission prompt (2026-10-18).** Before the turn-end check, `session_pane.agent_status(place)` reads herdr's `agent list` state for the unit's pane. `blocked` means a trust, permission or question prompt waits on the user, so no bump can move it: the idle stretch starts again, nothing goes to the unit or the showrunner, and `<stretch>.prompt.json` keeps `{since, alerted}`. After `PROMPT_ALERT_SECONDS` (60) the user gets one phone alert, the registered text `stall_watch.permission_prompt` (`push_texts.user_send_argv`, need `blocked`), with the unit, the machine, the time and `prompt_request(pane)`. Its body is "{unit} asks to {request}. It has waited since {since}." and then the lines "Yes: it does that and goes on." and "No: it does not, and asks you what to do instead." (2026-10-23). Read from the screen, the request is "edit panes.py" from "Do you want to make this edit to panes.py?", "run a shell command to <description>" from a Bash prompt, else the question's own words. A failed send is sent again on the next tick. A prompt that shows Claude Code's auto-mode banner (`AUTO_DENY_BANNER`, a line that starts "⚠ Claude Code will automatically deny this request in M:SS") gets no alert and drops its `<stretch>.prompt.json`, since Claude Code denies it by itself when the countdown ends; `prompt_request` skips that line, so the description stays the real one (2026-10-19). With one-minute ticks the alert arrives one to two minutes after the prompt shows. An unreadable herdr state counts as not blocked, ends no prompt, and is reported on stderr.
+  - **Permission prompt (2026-10-18).** Before the turn-end check, `session_pane.agent_status(place)` reads the state of the unit's herdr pane.
+    A `blocked` state indicates a trust, permission, or question prompt.
+    The idle stretch starts again and sends no bump or report.
+    The `<stretch>.prompt.json` file keeps `{since, alerted}`.
+    After `prompt_alert_seconds` (60 by default), the user gets one phone alert through `stall_watch.permission_prompt`.
+    The Session line names the unit.
+    The Action line gives the machine and tab where the user can answer.
+    The body says "It asks to {request}."
+    When `prompt_request(pane)` reads the screen, an edit prompt can give "edit panes.py".
+    A Bash prompt can give "run a shell command to <description>".
+    Other prompts give the question's words.
+    The next tick retries a failed send.
+    If the prompt shows `AUTO_DENY_BANNER`, the watcher treats the prompt as ended.
+    Claude Code denies that prompt when its countdown ends.
+    `prompt_request` skips the banner when it reads the request.
+    With one-minute ticks, the default alert arrives one to two minutes after the prompt appears.
+    If the herdr state is unreadable, the watcher reports the error on stderr and keeps the prompt state.
   - **Retire the alert when its prompt is gone (2026-10-23).** The alert is an emergency push: Pushover repeats it every 300 s for 3 h until the user taps Acknowledge, so on 2026-10-23 an alert sent at 09:04 AST went on after the user answered the prompt at 09:22. It is sent with the per-unit key `stall-watch:prompt:<showrunner name>:<unit>` (`prompt_key`), which pushover.py tags it with. When the prompt is gone after its alert went out (`alerted` true), `end_prompt` marks `<stretch>.prompt.json` `retiring` and queues `send.py retire --to user --from stall-watch --key <key>` (`push_texts.user_retire_argv`) in the `send_all` batch, kind `retire`, under the same 90 s deadline. The prompt is gone when the unit is no longer blocked, when its prompt shows the auto-deny banner, when its run is no longer running (`forget`), and when its Claude is not running. A different pending call while the unit stays blocked also retires the old alert first, since both alerts have the one key; the new prompt can alert after the retire, independently of case creation. Exit 0 ("cancelled" or "nothing to cancel") removes the prompt state or, if its case is still pending, atomically moves the saved snapshot to `<report hash>.case.json` in the same state directory for case retries. Exit 3, a timeout or a failure to start keeps it with `retiring` true and prints to stderr: the next tick sends the retire again and no new alert, also when the unit is blocked again. A prompt that never alerted sends no retire; its state is removed. The alert's rca.py case keeps the wait's start, the sender `stall-watch` and this key (`prompt_report`), so `rca.py fixed` retires the alert too.
   - **Request and wait start from the transcript (2026-10-21).** `pending_tool(session_id)` reads the newest tool call with no `tool_result` yet, from the end of the session's transcript and of each helper (subagent) transcript, `projects/*/<session id>/subagents/agent-*.jsonl`, since a helper's prompt shows in the session's pane (2026-10-23). `prompt_request(pane, pending)` words it: a Bash call is "run <command>", with whitespace collapsed to single spaces and each path with a folder shown as its file name, cut at `COMMAND_LENGTH` (90: 89 characters and "…"), as send.py cuts a refused command (2026-10-23). The description is never used, since the user decides on the command that runs. Edit, MultiEdit, NotebookEdit and Write are "edit <file>" or "write <file>". Without a pending call the screen is read: the Bash prompt's description is its sentence line plus its wrapped lowercase lines, and the warning paragraph is never the description. When that prompt shows Claude Code's warning "<path>, which is outside the allowed working directories", the request names what the command does to that file instead ("delete its saved tool output b1e4yc8b9.txt, which is outside its allowed folders"; `rm`, `cp`, `mv` give delete, copy, move, any other program "use"; a file in the `tool-results` folder is "its saved tool output"). `<stretch>.prompt.json` also keeps the call's id as `tool`: the wait starts at the call's transcript time, not at herdr's first `blocked` reading, and a different call is a new prompt with its own alert. On 2026-10-21 herdr reported cargo-liner-style-types idle from its 10:54 prompt until 16:21 (herdr owns that), so the alert said "since 16:21" and cut the request at 200 characters.
   - Staff supplies the unit's identity, parent, current session, and retirement state.
@@ -181,7 +200,7 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
   Without either launcher, the notifier logs `run launcher unavailable: <name>; waiting after tick` and runs the job after it releases the tick lock.
   The job claims its slot and replaces `<instance>/run.log` with its command output.
   A `zselect` watchdog sends TERM at the timeout.
-  The job appends `run timeout` or `run exit <rc>` to `fire.log`.
+  The job appends `run result timeout` or `run result exit <rc>` to `fire.log`. Exit `0` records success.
   Other jobs run inside the tick.
 
 ### Production launch and wrap records
@@ -267,7 +286,8 @@ Run files keep staff references instead of copied native identities.
 
 - `settings.json` order: the `Edit|MultiEdit|Write` group keeps basedpyright first with the fn-length hook after it. An edit to either group keeps every entry.
 
-- `config/showrunners.json` holds settings only and no script writes it; readers call `load_settings` or `load_settings_from(CONFIG)` on the live checkout's machine-local file. The file stays untracked (`.gitignore` names it).
+- `load_settings` reads `showrunners.conf` from the live configuration folder.
+  Set `SHOWRUNNERS_CONFIG` to select a different file.
 
 - Stalled detection belongs to the stall watcher, not `unit_status.sh`. Idleness rests on the pane hash plus transcript and `subagents/` mtimes, never on status-file text.
 

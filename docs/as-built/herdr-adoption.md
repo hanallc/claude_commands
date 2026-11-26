@@ -4,7 +4,7 @@
 
 Every showrunner, unit director, and standalone Claude session uses a tab in the shared herdr session, `agents`, on both machines.
 Each production has one workspace.
-Each producer uses its own tab in `PRODUCER_WORKSPACE`, normally `producers`, for either family.
+Each producer uses its own tab in `producer_workspace`, normally `producers`, for either family.
 Other standalone sessions use a workspace with their tab name.
 A unit uses its fixed parent row's production workspace.
 No launcher starts a separate herdr session.
@@ -211,6 +211,12 @@ Waiting notices add `; runs <run ids>` to the first line.
 The run ids include received results that still await a worker reply.
 An empty turn reply writes no reply file and adds no `; reply <path>` text.
 Run events retain the last worker reply while a result awaits a reply.
+Delivery records a drop for different known pass IDs before it selects a route or sends pane input.
+Delivery defers a linked result if the pass read fails during a new delivery attempt.
+Without the worker lock, the pass can change between the final read and pane input.
+The receipt ignores known results from other passes and keeps the current pass's matching DONE.
+Receipt recovery can miss results delivered before this change from a different run directory.
+A reply to an earlier pass's result delivered before this change can replace DONE if the reply repeats the current DONE marker.
 `reap_orphans` retries a pending completion only after its supervisor is gone.
 A live run reports `waiting on runs`, including when an earlier result awaits a reply.
 A turn without DONE sends one `no DONE` notice when no pending work explains it.
@@ -287,7 +293,7 @@ An existing unit resumes its recorded plan without requiring a Production header
 Its requested directory must match the worktree in its staff row.
 A different recorded plan refuses reuse.
 
-A restore uses the script prompt envelope and the transcript's last assistant model unless `--model` overrides it.
+A restore uses the script prompt envelope. It uses the model and effort from the latest real assistant turn. An explicit `--model` overrides the model. The pane launch supplies the fallback model. The director role supplies any missing model or effort.
 A new unit waits for Remote Control readiness.
 The launcher prints the unit's attach hint after launch.
 `AgentNotReady` and other failures exit 1; a refusal exits 2.
@@ -315,7 +321,7 @@ The selection includes producers from both families.
 `agents restart` resumes missing rows from that list through `restart.start_row`.
 Start reads the current conversation and folder from staff.
 It uses `herdr.row_workspace` for the destination.
-Producers use `PRODUCER_WORKSPACE`; units use their parent showrunner's workspace.
+Producers use `producer_workspace`; units use their parent showrunner's workspace.
 Other sessions use their own name or the shared session name.
 Worker rows use `worker.restore` and the shared worker launch policy.
 An idle worker remains closed until assignment.
@@ -324,13 +330,13 @@ A failed start retains the row on the restart list.
 Restart sends no work prompt.
 
 Restart starts a session in its own pane, as `docs/as-built/shutdown-and-restart.md` describes.
-It waits within `OWN_PANE_SHELL_SECONDS` for that pane to reach the shell.
+It waits within `own_pane_shell_seconds` for that pane to reach the shell.
 When the wait ends first, the start is refused with one line, and the row stays on the restart list.
 A new tab opens only for a session with no own pane; a restart never splits a pane beside a worker.
-For the pane in the saved launch record, restart also waits within `START_SECONDS` for an exiting agent.
+For the pane in the saved launch record, restart also waits within `start_seconds` for an exiting agent.
 It reuses that pane when fresh reads prove a shell with no native agent.
 The existing resume-check loop closes the old shell through the restore path when its agent exits.
-The loop uses `RESUME_CHECK_SECONDS` and `RESUME_CHECK_INTERVAL_SECONDS`.
+The loop uses `resume_check_seconds` and `resume_check_interval_seconds`.
 A caller without shared resume checks runs the same cleanup loop before `start_row` returns.
 Failed destination cleanup uses the destination session.
 Source cleanup uses the source session and its original terminal.
@@ -406,7 +412,7 @@ The block removes the temporary home when the tests end:
 - Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
 - The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
-- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. A Codex worker prompt delivery returns the launcher only after its transcript records the prompt, within `WORKER_SETTLE_SECONDS`; without that proof the launcher returns 8. A Claude delivery returns before its transcript must contain the prompt. A matching transcript prompt prevents replay. A matching final transcript reply proves completion. With a matching transcript prompt, the hook can use its own DONE reply before the final transcript record appears. A live detached run still holds completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
+- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. A Codex worker prompt delivery returns the launcher only after its transcript records the prompt, within `worker_settle_seconds`; without that proof the launcher returns 8. A Claude delivery returns before its transcript must contain the prompt. A matching transcript prompt prevents replay. A matching final transcript reply proves completion. With a matching transcript prompt, the hook can use its own DONE reply before the final transcript record appears. A live detached run still holds completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
 The turn hook closes a completed pane at once after DONE.

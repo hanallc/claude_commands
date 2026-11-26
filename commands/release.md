@@ -1118,9 +1118,12 @@ git commit -m "fix: <original commit message from fix commit>"
 
 ## Rollback Instructions
 
-If something goes wrong after pushing but before publishing:
+For a failure after the push and before publishing, verify the release commit before rollback.
 
 ```bash
+# Read the approved release commit before tag deletion.
+EXPECTED_COMMIT=$(git rev-parse --verify "refs/tags/v${VERSION}^{commit}") || exit 1
+
 # Delete local tag
 git tag -d "v${VERSION}"
 
@@ -1129,11 +1132,14 @@ git push origin ":refs/tags/v${VERSION}"
 
 # Delete release branch
 git branch -D release-${VERSION}
-git push origin :release-${VERSION}
+~/.claude/scripts/lib/py ~/.claude/scripts/lib/origin_deletion.py \
+  "$PWD" origin "refs/heads/release-${VERSION}" "$EXPECTED_COMMIT"
 
 # Return to main
 git checkout main
 ```
+
+Report the origin branch operation's result.
 
 **Single-package releases** use the package-scoped names instead: tag `${PACKAGE}-v${VERSION}` and branch `release-${PACKAGE}-${VERSION}`. Substitute those in the commands above.
 

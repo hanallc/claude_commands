@@ -5,7 +5,6 @@ from collections.abc import Callable, Generator
 import json
 import os
 import select
-import shutil
 import shlex
 import signal
 import socket
@@ -21,7 +20,8 @@ from scripts.direct import assign_claude_test_support as support
 from scripts.lib.test_models_registry import RegistryReadProbe
 from scripts.lib import models_registry, process_group, process_start, unit_runs
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.direct import worker_state
+from scripts.direct import phase_reservation, worker_state
+from scripts.direct.test_phase_reservation import make_fixture_worktree
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.cli_fixture import process_boundary
@@ -173,7 +173,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
     def test_an_invalid_registry_wait_records_a_failed_pass_and_status(self) -> None:
         session = self.start_phase("invalid-registry-wait")
         _ = self.config_file.write_text(self.config_file.read_text().replace(
-            "CLAUDE_WORKER_REGISTER_WAIT_SECS=30", "CLAUDE_WORKER_REGISTER_WAIT_SECS=invalid"))
+            "claude_worker_register_wait_secs=30", "claude_worker_register_wait_secs=invalid"))
         result = self.worker_launch(session)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         finished, = self.launch_records(session, "pass_finished")
@@ -226,43 +226,21 @@ exec python3 -c ''' + shlex.quote(GROUP_STOP_READY) + "\n")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.root / "worker-models-path").read_text(), str(custom.resolve()))
 
-    def test_a_failed_claude_launch_ends_its_run_and_keeps_its_worker_row(self) -> None:
+    def test_a_failed_claude_launch_keeps_its_run_and_worker_row(self) -> None:
         session = self.start_phase("failed-worker")
         environment = self.launch_environment(session)
-        environment.update({
-            "SCRATCH_ROOT": str(self.root / "scratch"),
-            "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
-            "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
-            "DESIGN_ROLES_STATE": str(self.root / "designs"),
-        })
-        # This backend has no native worker panes to remove.
-        _ = (self.assign_script.parent / "remove_workers.py").write_text("")
-        copies = self.root / "scripts/copies"
-        copies.mkdir(exist_ok=True)
-        _ = shutil.copy2(support.DIRECT_DIR.parent / "copies/copies.py", copies / "copies.py")
-        environment["COPIES_CONFIG"] = str(support.DIRECT_DIR.parents[1] / "config/copies.conf")
         with patch.dict(os.environ, environment):
             row = staff.local_snapshot().by_current_session(environment["CODEX_THREAD_ID"])
             assert row is not None
             _ = staff.set_run(row.id, staff.OpenRun(session))
-        registry = Path(environment["NOTIFIER_SESSIONS_DIR"])
-        registry.mkdir(parents=True)
-        from scripts.message import sessions
-        _ = (registry / "director.json").write_text(json.dumps({
-            "sessionId": environment["CODEX_THREAD_ID"], "pid": os.getpid(),
-            "name": "fixture director", "procStart": sessions.process_start(os.getpid()),
-            "updatedAt": 1, "messagingSocketPath": "",
-        }))
         sender = self.root / "opening-send.py"
         _ = sender.write_text(sender.read_text().replace("print('SENT: fixture')", "raise SystemExit(2)"))
         result = self.run_assignment(self.assign_command(session), environment)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         with patch.dict(os.environ, environment):
-            self.assertIsNone(unit_runs.open_run(environment["CODEX_THREAD_ID"]), result.stdout + result.stderr)
-        state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
-        self.assertEqual(state["status"], "error")
-        self.assertEqual([event["status"] for event in self.launch_records(session, "run_finished")], ["error"])
-        self.assertIn("run ended", result.stderr)
+            self.assertEqual(unit_runs.open_run(environment["CODEX_THREAD_ID"]), session, result.stdout + result.stderr)
+        self.assertEqual(self.launch_records(session, "run_finished"), [])
+        self.assertEqual([event["status"] for event in self.launch_records(session, "pass_finished")], ["error"])
         worker = self.recorded_worker(session)
         self.assertEqual(worker.parent, staff.ReportsTo(staff.native_id(self.staff_parent)))
         self.assertTrue(worker.current_session)
@@ -393,6 +371,23 @@ exec python3 -c ''' + shlex.quote(GROUP_STOP_READY) + "\n")
         state = (session / "phases/3/delegated_phase_reservation_state.json").read_text()
         self.assertIn('"r1"', state)
         self.assertEqual((session / "dispatch_events.txt").read_text().splitlines(), ["claim", "open"])
+
+    def test_phase_claim_retry_opens_claude_in_the_recorded_checkout(self) -> None:
+        session = self.start_phase("retry-claimed-checkout")
+        environment = self.environment()
+        with patch.dict(os.environ, environment, clear=True):
+            claimed = make_fixture_worktree(self.working_dir, "fixture", "p3")
+            result = subprocess.run(
+                [sys.executable, phase_reservation.__file__, "claim", "--session-dir", str(session),
+                 "--phase", "3", "--repo", str(claimed)], capture_output=True, text=True,
+                timeout=TEST_HANG_GUARD_SECS,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        directory = phase_reservation.phase_directory(session, "3")
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text().strip(), str(claimed))
+        retried = self.run_assignment(self.assign_command(session, "--phase", "3"), environment)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual((self.root / "launch_cwd.txt").read_text(), str(claimed))
 
     def test_refused_phase_claim_prevents_the_claude_worker_open(self) -> None:
         session = self.start_phase("claim-refused")

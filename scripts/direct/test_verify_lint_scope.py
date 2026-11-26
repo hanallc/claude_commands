@@ -6,20 +6,35 @@ import unittest
 
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB as CARGO_STUB
+from scripts.lib import conf
+
+
+def assert_clippy_calls(fixture: support.VerifyLintScopeFixture, *, fix_passes: int = 1) -> None:
+    judgment = ["--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"]
+    expected = [judgment]
+    if fix_passes:
+        jobs = conf.read(fixture.config).whole("clippy_fix_jobs")
+        fix = ["--jobs", str(jobs), "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
+        expected.extend([fix] * fix_passes)
+        expected.append(judgment)
+    fixture.assertEqual(fixture.calls("clippy"), expected)
 
 
 class VerifyLintScopeTests(support.VerifyLintScopeFixture):
-    def test_cache_reads_each_tool_version_once_per_run_and_rejects_a_changed_version(self) -> None:
+    def test_cache_reads_build_info_again_only_for_publication(self) -> None:
         _ = self.enable_cache()
         events = self.root / "version-events"
         self.environment["TEST_VERSION_EVENTS"] = str(events)
-        for version, recorded in (("before", False), ("before", True), ("after", False)):
-            with self.subTest(version=version, recorded=recorded):
+        for build_id, recorded in (("before", False), ("before", True), ("after", False)):
+            with self.subTest(build_id=build_id, recorded=recorded):
                 events.unlink(missing_ok=True)
-                self.environment["TEST_VERSION_MEND"] = version
+                support.write_fixture_cargo_mend(self.root / "bin/cargo-mend", build_id)
                 result = self.verify("lint", "sample")
                 self.assertEqual("(recorded)" in result.stdout, recorded)
-                self.assertEqual(events.read_text().splitlines(), ["TAPLO", "MEND", "RUSTFMT", "CLIPPY"])
+                expected = ["MEND", "TAPLO", "RUSTFMT", "CLIPPY"]
+                if not recorded:
+                    expected.append("MEND")
+                self.assertEqual(events.read_text().splitlines(), expected)
                 self.assertEqual(self.clippy_ran(), not recorded)
 
     def test_uncached_lint_reads_only_the_formatter_availability_version(self) -> None:
@@ -44,7 +59,7 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         self.environment["TEST_CLIPPY_STATUSES"] = "[101, 0]"
         _ = self.verify("lint", "sample")
         self.assert_workspace_taplo_check()
-        self.assert_fix_and_judgment_calls()
+        assert_clippy_calls(self)
         self.assertEqual(self.calls("mend"), [["--all-targets", "--workspace", "--fix"]])
         self.assertEqual(self.calls("+nightly"), [
             ["fmt", "--version"], ["fmt", "-p", "sample"],

@@ -97,7 +97,7 @@ class HanaExecutionTests(unittest.TestCase):
         self.key = result.HanaAttemptKey('fixture-episode', 'fixture-attempt',
             execution_identity.assigned_claim_id('fixture-episode', 'fixture-attempt'), hana.HanaHostGeneration('deployment', 'start', 'boot'))
         self.source_key = execution_identity.SourceKeyKnown('verify-source')
-        scope = RepositoryScope('hana', 'github.com/natepiano/hana', 1)
+        scope = RepositoryScope('hana', 'github.com/hanallc/hana')
         self.assignment = placement.PlacementAssignment(self.key.episode, self.key.attempt,
             placement.PlacementDestination('ssh', 'configured-target', 'fixture-host', scope, 1),
             self.source_key, placement.SubmittingOwner('local', 10, 'coordinator-start'), NoOwningSession(), 900)
@@ -129,21 +129,26 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertTrue(execution.execution_path(self.root, self.key.claim_id).exists())
         return wire.FirstAuthorization(request.assignment, request.claim)
 
-    def dispatch(self, *, consume: Callable[[wire.ConsumePermission], wire.FirstAuthorization | wire.DispatchStatus] | None = None,
+    def send_dispatch(self, *, consume: Callable[[wire.ConsumePermission], wire.FirstAuthorization | wire.DispatchStatus],
+                      upload_source: Callable[[], None]
+                      ) -> execution.HanaDispatchState | execution_identity.HanaCommandAdmissionRefused:
+        return execution.dispatch_execution(self.root, self.request, self.adopted, self.objects,
+            upload_source=upload_source, consume=consume, current_permission=lambda: self.permission,
+            current_source_key=lambda: self.source_key)
+
+    def dispatch(self, *, consume: Callable[[wire.ConsumePermission], wire.FirstAuthorization] | None = None,
                  upload_source: Callable[[], None] | None = None
                  ) -> execution.HanaDispatchState:
-        state = execution.dispatch_execution(self.root, self.request, self.adopted, self.objects,
-            upload_source=(lambda: None) if upload_source is None else upload_source,
-            consume=self.consume if consume is None else consume, current_permission=lambda: self.permission,
-            current_source_key=lambda: self.source_key)
+        state = self.send_dispatch(consume=self.consume if consume is None else consume,
+                                   upload_source=(lambda: None) if upload_source is None else upload_source)
         assert not isinstance(state, execution_identity.HanaCommandAdmissionRefused)
         return state
 
-    def release(self) -> bool:
+    def release(self) -> hana.HanaClaimRelease:
         self.releases += 1
         self.assertTrue(execution.execution_command_settled(self.root, self.key.claim_id))
         self.assertTrue(execution.claim_dispatch_pending(self.root, self.reference))
-        return True
+        return hana.HanaClaimReleased()
 
     def settle(self, *, cancelled: bool = False, reason: str = 'The remote attempt ended') -> execution.HanaSettlement:
         current = 1000.0
@@ -227,12 +232,30 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertIsInstance(self.settle(), execution.HanaSettled)
         self.assertFalse(execution.claim_dispatch_pending(self.root, self.reference))
 
+    def test_execution_journal_keeps_the_guest_result_timing(self) -> None:
+        self.assertIsInstance(self.dispatch(), execution.DispatchSent)
+        timing: hana_protocol.HanaCommandTiming = {
+            'unit_exited_at': 1011, 'unit_exit_observed_at': 1011.25,
+            'lease_free_at': 1011.5, 'upload_started_at': 1012,
+        }
+        observation = replace(self.objects.observe_execution(self.key), terminated=True, lease_free=True,
+                              observed_at=1013, timing=timing)
+        reply = hana_protocol.decode_observation(hana_protocol.encode_observation(observation))
+        with mock.patch.object(self.objects, 'observe_execution', return_value=reply):
+            self.assertEqual(execution.observe_execution(self.root, self.request, self.objects), observation.evidence)
+        path = execution.execution_path(self.root, self.key.claim_id)
+        row = result.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual(result.object_fields(row['observation'])['timing'], timing)
+        self.assertEqual(execution.read_dispatch_observation(self.root, self.request), observation)
+
     def test_lost_authorization_starts_zero_commands_and_closes_only_the_original_dispatch(self) -> None:
         def lost(request: wire.ConsumePermission) -> wire.FirstAuthorization:
             _ = self.consume(request)
             raise wire.AdmissionUnavailable('The first authorization reply was lost')
-        _ = self.dispatch(consume=lost)
-        _ = self.dispatch()
+        self.assertEqual(self.send_dispatch(consume=lost, upload_source=lambda: None),
+            execution_identity.HanaCommandAdmissionRefused('Hana authorization failed: The first authorization reply was lost'))
+        self.assertEqual(self.send_dispatch(consume=self.consume, upload_source=lambda: None),
+            execution_identity.HanaCommandAdmissionRefused('The saved Hana dispatch ended before a publication attempt'))
         self.assertEqual(self.authorizations, 1)
         self.assertEqual(self.objects.envelopes, [])
         settled = self.settle()
@@ -240,21 +263,71 @@ class HanaExecutionTests(unittest.TestCase):
         assert isinstance(settled, execution.HanaSettled)
         self.assertIsInstance(settled.outcome, placement.PrelaunchRefused)
 
-    def test_status_only_permission_never_launches(self) -> None:
+    def test_prepublication_refusal_never_launches(self) -> None:
         root = self.root
-        for source_changed in (False, True):
-            with self.subTest(source_changed=source_changed), tempfile.TemporaryDirectory(dir=root) as folder:
+        journal_failure = 'The Hana dispatch journal is unavailable: fixture journal write failed'
+        cases = (
+            ('status only', 'The admission service returned status without a first authorization', 1, 0),
+            ('consume refused', 'adoption evidence is unavailable: the Hana claim record is missing', 1, 0),
+            ('authorization mismatch', 'The Hana authorization differs from the adopted assignment or claim', 1, 0),
+            ('changed source', 'The live source key no longer matches before Hana authorization', 0, 0),
+            ('unconfirmed holder', 'The Hana claim has no confirmed holder', 0, 0),
+            ('permit mismatch', 'The Hana command permission differs from the adopted claim', 1, 0),
+            ('source changed during upload', 'The live source key no longer matches after Hana upload', 1, 1),
+            ('prepared write', journal_failure, 0, 0),
+            ('sent write', journal_failure, 0, 0),
+            ('publication mark', journal_failure, 1, 1),
+        )
+        save = cast(Callable[[Path, str, dict[str, object]], None], getattr(execution, '_save_journal'))
+        for case, reason, consumes, uploads in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir=root) as folder:
                 self.root = Path(folder)
-                if source_changed:
-                    self.source_key = execution_identity.SourceKeyKnown('edited')
-                status = wire.DispatchStatus(self.assignment, placement.CurrentAssignment(), placement.PermissionConsumed(1000))
-                consume = mock.Mock(return_value=status)
+                self.source_key = self.request.source_key
+                adopted = self.adopted
+                permission = self.permission
+                authorization: wire.DispatchStatus | wire.FirstAuthorization = wire.FirstAuthorization(self.assignment, self.reference)
+                changed_source = execution_identity.SourceKeyKnown('edited')
                 upload = mock.Mock()
-                _ = self.dispatch(consume=consume, upload_source=upload)
-                self.assertEqual(consume.call_count, 0 if source_changed else 1)
-                upload.assert_not_called()
+                if case == 'status only':
+                    authorization = wire.DispatchStatus(self.assignment, placement.CurrentAssignment(), placement.PermissionConsumed(1000))
+                elif case == 'consume refused':
+                    authorization = wire.DispatchStatus(self.assignment, placement.CurrentAssignment(),
+                        placement.PermissionAvailable(), reason)
+                elif case == 'authorization mismatch':
+                    authorization = wire.FirstAuthorization(self.assignment, replace(self.reference, claim_id='another-claim'))
+                elif case == 'changed source':
+                    self.source_key = changed_source
+                elif case == 'unconfirmed holder':
+                    claim = replace(adopted.reserved.claim, holder=placement.ClaimHolderUnconfirmed('unknown'))
+                    adopted = replace(adopted, reserved=replace(adopted.reserved, claim=claim))
+                elif case == 'permit mismatch':
+                    permission = replace(permission, execution='another-claim')
+                elif case == 'source changed during upload':
+                    def change_source() -> None:
+                        self.source_key = changed_source
+                    upload.side_effect = change_source
+                consume = mock.Mock(return_value=authorization)
+
+                def save_with_failure(directory: Path, execution_id: str, row: dict[str, object]) -> None:
+                    stage = 'publication mark' if row['publication_attempted'] else f"{row['phase']} write"
+                    if case == stage:
+                        raise OSError('fixture journal write failed')
+                    save(directory, execution_id, row)
+
+                with mock.patch.object(execution, '_save_journal', side_effect=save_with_failure):
+                    self.assertEqual(execution.dispatch_execution(self.root, self.request, adopted, self.objects,
+                        upload_source=upload, consume=consume, current_permission=lambda: permission,
+                        current_source_key=lambda: self.source_key), execution_identity.HanaCommandAdmissionRefused(reason))
+                self.assertEqual(consume.call_count, consumes)
+                if uploads == 0:
+                    upload.assert_not_called()
+                else:
+                    upload.assert_called_once()
                 self.assertEqual(self.objects.envelopes, [])
-                self.assertIsInstance(self.settle(), execution.HanaSettled)
+                if case == 'prepared write':
+                    self.assertFalse(execution.execution_path(self.root, self.key.claim_id).exists())
+                else:
+                    self.assertIsInstance(self.settle(), execution.HanaSettled)
 
     def test_dispatch_uses_the_permit_renewed_during_source_upload(self) -> None:
         renewed = replace(self.permission, generation=4, expires=1900)
@@ -274,6 +347,27 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertIsInstance(self.settle(), execution.HanaSettled)
         self.assertFalse(self.objects.accept())
         self.assertFalse(self.objects.accepted)
+
+    def test_fence_settlement_saves_the_upload_start_time_in_the_execution_journal(self) -> None:
+        _ = self.dispatch()
+        observe = self.objects.observe_execution
+        initial = replace(observe(self.key), timing={'unit_exited_at': 997})
+        with mock.patch.object(self.objects, 'observe_execution', return_value=initial):
+            _ = execution.observe_execution(self.root, self.request, self.objects)
+        timing: hana_protocol.HanaCommandTiming = {'upload_started_at': 998}
+
+        def observe_fence(key: result.HanaAttemptKey, *,
+                          timeout_s: float | None = None) -> hana_protocol.HanaCommandObservation:
+            observation = observe(key, timeout_s=timeout_s)
+            self.assertTrue(observation.fenced)
+            return replace(observation, timing=timing)
+
+        with mock.patch.object(self.objects, 'observe_execution', side_effect=observe_fence):
+            self.assertIsInstance(self.settle(), execution.HanaSettled)
+        saved = execution.read_dispatch_observation(self.root, self.request)
+        assert isinstance(saved, hana_protocol.HanaCommandObservation)
+        self.assertTrue(saved.fenced)
+        self.assertEqual(saved.timing, {'unit_exited_at': 997, 'upload_started_at': 998})
 
     def test_failed_fence_missing_observation_or_held_lease_retains_cleanup(self) -> None:
         _ = self.dispatch()
@@ -351,7 +445,8 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertIsInstance(settled, execution.HanaSettled)
         assert isinstance(settled, execution.HanaSettled)
         self.assertEqual(settled.outcome, placement.AttemptCompleted(1))
-        self.assertEqual(execution.accept_result(self.root, self.request, content, 'fixture-host', lambda: self.source_key), accepted)
+        self.assertEqual(execution.accept_result(self.root, self.request, content, 'fixture-host',
+            lambda: execution_identity.SourceKeyKnown('edited')), accepted)
 
     def test_edited_replaced_and_fenced_results_never_become_accepted(self) -> None:
         _ = self.dispatch()
@@ -400,7 +495,8 @@ class HanaExecutionTests(unittest.TestCase):
             self.source_key = execution_identity.SourceKeyKnown('edited')
             return authorized
         upload = mock.Mock()
-        _ = self.dispatch(consume=changed, upload_source=upload)
+        self.assertEqual(self.send_dispatch(consume=changed, upload_source=upload),
+            execution_identity.HanaCommandAdmissionRefused('The live source key no longer matches before Hana upload'))
         upload.assert_not_called()
         self.assertEqual(self.objects.envelopes, [])
         self.assertIsInstance(self.settle(), execution.HanaSettled)
@@ -429,10 +525,10 @@ class HanaExecutionTests(unittest.TestCase):
                 self.root = Path(folder)
                 releases: list[bool] = []
 
-                def release() -> bool:
+                def release() -> hana.HanaClaimRelease:
                     released = bool(releases)
                     releases.append(released)
-                    return released
+                    return hana.HanaClaimReleased() if released else hana.HanaClaimReleaseRefused('The Hana claim is busy')
 
                 if published:
                     _ = self.dispatch()

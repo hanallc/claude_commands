@@ -39,6 +39,7 @@ class AwsReportTests(MeasurementFixture):
             + "# range: 0..5\nvault.lock_retry_delay_s=3\n")
         self.state: Path = self.root / ".local/state/build-targets/aws"
         self.seed_cost()
+        _ = write_config_fixture(self.root / "build_steps.conf", "names.gate=gate\n")
         mac_settings = self.root / "mac_test.conf"
         source = mac_settings.read_text().splitlines()
         _ = mac_settings.write_text("\n".join(
@@ -218,10 +219,10 @@ class AwsReportTests(MeasurementFixture):
         _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(reading)))
         events: list[dict[str, object]] = []
         for attempt, mode, at, box_s, gate_s in (
-            ('merge-bill', 'merge-gate', MIDNIGHT - 3600, 120, 60),
-            ('target-bill', 'targeted-test', MIDNIGHT - 3600, 60, 30),
-            ('merge-today', 'merge-gate', NOW, 90, 45),
-            ('target-today', 'targeted-test', NOW, 30, 15),
+            ('merge-bill', 'gate', MIDNIGHT - 3600, 120, 60),
+            ('target-bill', 'test-affected', MIDNIGHT - 3600, 60, 30),
+            ('merge-today', 'gate', NOW, 90, 45),
+            ('target-today', 'test-affected', NOW, 30, 15),
         ):
             row: dict[str, object] = {'attempt': attempt, 'instance_type': 'm7a.8xlarge', 'mode': mode}
             events.extend(({**row, 'time': at - box_s, 'result': 'launched'},
@@ -315,10 +316,12 @@ class AwsReportTests(MeasurementFixture):
                 {'time': at, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'finished', 'gate_s': gate_s}))
         launches.extend((
             {'time': NOW, 'instance_type': 'legacy.8xlarge', 'result': 'finished', 'gate_s': 10},
-            {'time': NOW, 'attempt': 'orphan', 'instance_type': 'orphan.8xlarge', 'mode': 'merge-gate', 'result': 'finished', 'gate_s': 30},
+            {'time': NOW, 'attempt': 'orphan', 'instance_type': 'orphan.8xlarge', 'mode': 'gate', 'result': 'finished', 'gate_s': 30},
             {'time': NOW - 60, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'result': 'launched'},
             {'time': NOW, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'mode': 'targeted-test', 'result': 'finished', 'gate_s': 30},
             {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'test-affected', 'result': 'refused',
+             'error_code': 'InsufficientSpotCapacity', 'region': 'us-east-2'},
+            {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'targeted-test', 'result': 'refused',
              'error_code': 'InsufficientSpotCapacity', 'region': 'us-east-2'}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in reversed(launches)))
         charges = self.state / 'charges'
@@ -334,7 +337,7 @@ class AwsReportTests(MeasurementFixture):
             _ = (charges / f'{day}.json').write_text(json.dumps(ledger.charge_record(reading)))
         output = self.render()
         # The runs launched in us-east-2, so the USW2 bill goes to no run.
-        self.assertIn('| Machine type | Merge gates | Targeted tests | All runs |', output)
+        self.assertIn('| Machine type | Gates | Targeted tests | All runs |', output)
         self.assertIn('| m7a.8xlarge | $0.0667 per run (2) | $0.1333 per run (1) | $0.1000 per run (3) |', output)
         self.assertIn('| c7a.8xlarge | $0.6750 per run (1) | $0.2250 per run (2) | $0.4500 per run (3) |', output)
         self.assertIn('| All types | $0.3708 per run (3) | $0.1792 per run (3) | $0.2750 per run (6) |', output)
@@ -351,10 +354,12 @@ class AwsReportTests(MeasurementFixture):
         start = datetime.fromtimestamp(MIDNIGHT - 86400, UTC)
         end = datetime.fromtimestamp(NOW + 1, UTC)
         evidence = run_cost.run_evidence(launches, start, end, 'us-east-2')
+        box_seconds, _ = evidence.box_seconds('m7a.8xlarge', 'us-east-2', ('gate',))
+        self.assertEqual(box_seconds, [Decimal(100), Decimal(600)])
         box_seconds, _ = evidence.box_seconds('m7a.8xlarge', 'us-east-2', ('merge-gate', 'gate'))
         self.assertEqual(box_seconds, [Decimal(100), Decimal(600)])
         self.assertEqual(evidence.refusals_per_launch('m7a.8xlarge', 'us-east-2', ('test-affected',))[1:], (0, 1))
-        self.assertEqual(evidence.refusals_per_launch('refused.8xlarge', 'us-east-2', ('targeted-test',))[1:], (1, 0))
+        self.assertEqual(evidence.refusals_per_launch('refused.8xlarge', 'us-east-2', ('test-affected',))[1:], (2, 0))
 
     def test_billed_allocations_include_new_modes_and_skip_zero_box_time(self) -> None:
         region = 'us-east-2'
@@ -380,11 +385,11 @@ class AwsReportTests(MeasurementFixture):
         events: list[dict[str, object]] = [
             {'time': NOW, 'attempt': 'fixture-attempt', 'mode': 'test-affected', 'result': 'fallback',
              'reason': 'The checkout changed after the test selection\nfixture traceback'},
-            {'time': NOW - 1, 'attempt': '', 'mode': 'merge-gate', 'result': 'fallback',
+            {'time': NOW - 1, 'attempt': '', 'mode': 'gate', 'result': 'fallback',
              'reason': 'image or stack is absent'},
-            {'time': MIDNIGHT - 86401, 'attempt': 'old', 'mode': 'merge-gate', 'result': 'fallback',
+            {'time': MIDNIGHT - 86401, 'attempt': 'old', 'mode': 'gate', 'result': 'fallback',
              'reason': 'fixture old reason'},
-            {'time': MIDNIGHT + 86400, 'attempt': 'future', 'mode': 'merge-gate', 'result': 'fallback',
+            {'time': MIDNIGHT + 86400, 'attempt': 'future', 'mode': 'gate', 'result': 'fallback',
              'reason': 'fixture future reason'},
         ]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
@@ -394,7 +399,7 @@ class AwsReportTests(MeasurementFixture):
         self.assertEqual(len(lines), 2)
         at = datetime.fromtimestamp(NOW, UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
         self.assertEqual(lines[0], '- Cloud gate uses natedev: The checkout changed after the test selection '
-                         + f'({at}, targeted-test).')
+                         + f'({at}, test-affected).')
         self.assertIn('image or stack is absent', lines[1])
         for hidden in ('fixture traceback', 'fixture old reason', 'fixture future reason'):
             self.assertNotIn(hidden, output)
@@ -402,7 +407,7 @@ class AwsReportTests(MeasurementFixture):
     def test_gate_fallback_line_handles_missing_and_long_reasons(self) -> None:
         events: list[dict[str, object]] = [
             {'time': NOW, 'attempt': '', 'result': 'fallback'},
-            {'time': NOW - 1, 'attempt': '', 'mode': 'merge-gate', 'result': 'fallback',
+            {'time': NOW - 1, 'attempt': '', 'mode': 'gate', 'result': 'fallback',
              'reason': 'fixture ' * 100},
         ]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
@@ -416,8 +421,8 @@ class AwsReportTests(MeasurementFixture):
 
     def test_gate_type_comparison_shows_unbilled_and_empty_cells_for_one_type(self) -> None:
         launches = [
-            {'time': NOW - 120, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'targeted-test', 'result': 'launched'},
-            {'time': NOW, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'targeted-test', 'result': 'finished', 'gate_s': 60}]
+            {'time': NOW - 120, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'test-affected', 'result': 'launched'},
+            {'time': NOW, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'test-affected', 'result': 'finished', 'gate_s': 60}]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in launches))
         comparison = aws_report.gate_type_report(self.state, DAY, 14)
         lines = comparison.tables
@@ -430,14 +435,14 @@ class AwsReportTests(MeasurementFixture):
         with read_only_evidence(self, self.root):
             comparison = aws_report.gate_type_report(self.state, DAY, 14)
         lines = comparison.tables
-        self.assertIn('| Machine type | Merge gates | Targeted tests | All runs |', lines)
+        self.assertIn('| Machine type | Gates | Targeted tests | All runs |', lines)
         self.assertIn('| All shown days | 0 | — | — | 0 | — | — | — |', lines)
         self.assertIn('UTC 2026-01-02 through 2026-01-15 (14 days)', comparison.source)
 
     def test_gate_type_comparison_with_malformed_evidence_preserves_the_report(self) -> None:
         self.write_records(self.local_step('comparison-evidence', 60, 10))
         launched = {'time': NOW - 60, 'attempt': 'missing-time', 'instance_type': 'm7a.8xlarge',
-                    'mode': 'merge-gate', 'result': 'launched'}
+                    'mode': 'gate', 'result': 'launched'}
         finished = {**launched, 'time': NOW, 'result': 'finished'}
         missing_time = json.dumps(launched) + '\n' + json.dumps(finished) + '\n'
         for filename, content, reason in (
@@ -539,6 +544,16 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn("latest failure none", mac)
         self.assertNotIn("AWS report data synchronized at", output)
         self.assertNotIn("AWS report data never synchronized", output)
+
+    def test_natedev_day_report_names_no_peer_for_the_mac_linux_guest(self) -> None:
+        path = self.root / 'build_targets.conf'
+        _ = path.write_text(path.read_text().replace('targets=natedev,mac', 'targets=natedev,mac,mac-linux')
+            + 'kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n')
+        _ = (self.root / 'mac_linux.conf').write_text('ssh.hops=mac linux-guest\nguest.user=gate-runner\n')
+        self.exchange("mac", ok=True, at=NOW - 60)
+        output = self.render()
+        self.assertIn("current", self.peer_line(output, "mac"))
+        self.assertNotIn("mac-linux (", output)
 
     def test_mac_failure_does_not_mark_the_aws_exchange_as_failed(self) -> None:
         self.add_spare_peer()

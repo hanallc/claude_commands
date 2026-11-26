@@ -4,7 +4,6 @@ from __future__ import annotations
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import replace
-import subprocess
 import threading
 import json
 import os
@@ -16,14 +15,21 @@ import unittest
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-from scripts.aws_target import aws_page
+from scripts.console_text.test_support import accepting_console_text
+from scripts.agents.remote import local_machine
+from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import memory_feed
 from scripts.disks import disks_page
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib.process_group import run_process_group
+from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_browser, change_page, console, for_you, investigations_page, review_link
+from scripts.review_links import (
+    change_browser, change_page, console, for_you, investigations_page, page_frame, record_table, review_link,
+    review_submissions,
+)
+from scripts.review_links.browser_test_support import firefox_probe_results
 
 
 class ConsoleMarkup(HTMLParser):
@@ -47,12 +53,13 @@ class ConsoleTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="console-test-")))
         self.configuration = self.root / "config"
         self.configuration.mkdir()
         for stem in ("console", "review_links", "change_review"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
-                                self.configuration / f"{stem}.conf")
+            _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
+                                         self.configuration / f"{stem}.conf")
         _ = write_config_fixture(self.configuration / "console.conf",
             "page.accounts.label=Accounts\npage.accounts.title=Accounts\npage.accounts.icon=users\n"
             + "page.accounts.url=python:scripts.review_links.accounts_page:page_url\n"
@@ -74,9 +81,120 @@ class ConsoleTests(unittest.TestCase):
             "REVIEW_LINKS_HOST": "127.0.0.1", "STAFF_FILE": str(self.root / "staff.json"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state")})))
 
+    def test_aws_machines_stays_next_to_aws_when_the_page_is_unavailable(self) -> None:
+        self.assertIn("server", console.ICON_NAMES)
+        self.assertTrue((page_frame.ICONS / "server.svg").is_file())
+        self.assertIn('class="lucide lucide-server"', console.icon_svg("server"))
+        with patch.object(machines_page, "output_folder", return_value=self.root / "snapshots/aws"):
+            pages = console.read_pages()
+        aws = next(index for index, page in enumerate(pages) if page.identity == "aws")
+        self.assertEqual(pages[aws + 1].identity, "aws_machines")
+        self.assertIsInstance(pages[aws + 1].destination, console.UnavailablePage)
+        source = console.render(pages, console.UnavailablePage()).decode()
+        self.assertIn('data-page="aws_machines" data-url="" data-title="AWS Machines" aria-label="AWS Machines — Not available"', source)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the owner dialog.")
+    def test_unavailable_aws_machines_opens_new_item_for_builds(self) -> None:
+        production = self.root / "builds.md"
+        _ = production.write_text("# Builds\n> **Status: PRODUCTION — running.**\n")
+        builds = staff.StaffRow(staff.StaffId("builds-staff"), "showrunner", "builds", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("builds-session"),
+                                doc=staff.LiveDoc(local_machine(), production))
+        production = self.root / "sdlc.md"
+        _ = production.write_text("# SDLC\n> **Status: PRODUCTION — running.**\n")
+        sdlc = staff.StaffRow(staff.StaffId("sdlc-staff"), "showrunner", "sdlc", staff.STAFF_ROOT,
+                              current_session=staff.StaffId("sdlc-session"),
+                              doc=staff.LiveDoc(local_machine(), production))
+        morty = staff.StaffRow(staff.StaffId("morty-staff"), "producer", "morty", staff.STAFF_ROOT,
+                               current_session=staff.StaffId("morty-session"))
+        dwight = staff.StaffRow(staff.StaffId("dwight-staff"), "producer", "dwight", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("dwight-session"))
+        aws = staff.StaffRow(staff.StaffId("aws-staff"), "unit", "aws", staff.ReportsTo(builds.id),
+                             current_session=staff.StaffId("aws-session"),
+                             unit_type=staff.UnitDetails("direct"))
+        _ = write_config_fixture(self.configuration / "console.conf",
+                                 f"page.aws_machines.owner={aws.id}\npage.list.owner={morty.id}\n")
+        pages = (console.ConsolePage("aws_machines", "AWS Machines", "server", "AWS Machines", console.UnavailablePage()),
+                 console.ConsolePage("list", "List", "list-checks", "The List", console.UnavailablePage()))
+        members = staff.StaffSnapshot((aws, builds, sdlc, morty, dwight))
+        with patch.object(staff, "local_snapshot", return_value=members):
+            source = console.render(pages, console.UnavailablePage())
+        settings = conf.read_or_repository("console")
+        options: dict[str, object] = {}
+        for page in pages:
+            owner = review_submissions.page_owner(page.identity, settings, members)
+            assert isinstance(owner, staff.StaffRow)
+            options[page.identity] = {"token": "fixture", "page_owner": owner.id,
+                                      "recipients": review_submissions.recipient_options(members, owner=owner)}
+        probe = b"""<script>
+(async()=>{
+ const failures=[], check=(ok,message)=>{if(!ok) failures.push(message);};
+ const realFetch=window.fetch.bind(window), requests=[], captures=[];
+ const pageOptions=__PAGE_OPTIONS__;
+ window.fetch=async (input, options)=>{
+  const route=new URL(input, location.href);
+  if(route.pathname==='/console/review/new-item' && route.search) {
+   requests.push(route.search);
+   return Response.json(pageOptions[route.searchParams.get('page')]);
+  }
+  if(route.pathname==='/console/review/new-item' && options?.method==='POST') {
+   captures.push(options.body);
+  }
+  return Response.json({}, {status:400});
+ };
+ try {
+  const pane=document.querySelector('#page-unavailable');
+  const control=pane.querySelector('[data-page-owner="aws_machines"]');
+  const button=control.querySelector('[data-owner-new]');
+  check(!pane.hidden && pane.textContent.includes('Not available'), 'The unavailable notice is visible.');
+  check(control.getClientRects().length && control.querySelector('.page-owner-name').textContent==='aws',
+        'The unavailable page shows its configured owner.');
+  check(button.getAttribute('aria-label')==='New item for builds', 'The button names the configured route.');
+  const dialog=document.querySelector('#review-new-item'), recipients=dialog.querySelector('[data-recipients]');
+  const loaded=()=>new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{if(recipients.firstChild){observer.disconnect();resolve();}});
+   observer.observe(recipients,{childList:true});
+  });
+  const awsOptions=loaded();
+  button.click();
+  check(dialog.open, 'The owner button opens the shared dialog.');
+  await awsOptions;
+  check(requests.join()==='?page=aws_machines' && recipients.querySelector('input:checked')?.value==='builds-staff',
+        'The dialog requests the AWS Machines owner and selects builds.');
+  const choices=()=>[...recipients.querySelectorAll('[data-button-face]')].map(chip=>chip.textContent).sort().join();
+  check(choices()==='builds,dwight,morty,sdlc', 'The dialog offers every producer and showrunner.');
+  const screenshot=dialog.querySelector('[name=include_page]');
+  check(!screenshot.getClientRects().length && !screenshot.checked,
+        'The unavailable page offers no screenshot.');
+  check(dialog.querySelector('[data-capture-slot]').hidden && captures.length===0,
+        'The unavailable page starts no capture.');
+  recipients.querySelector('input[value=dwight-staff]').closest('label').click();
+  check(recipients.querySelector('input:checked')?.value==='dwight-staff',
+        'A producer chip changes the selected recipient.');
+  dialog.querySelector('[data-close]').click();
+  document.querySelector('[data-page=list]').click();
+  const listOwner=pane.querySelector('[data-page-owner=list]');
+  check(!control.getClientRects().length && listOwner.getClientRects().length,
+        'The owner changes with the selected unavailable page.');
+  const listOptions=loaded();
+  listOwner.querySelector('[data-owner-new]').click();
+  await listOptions;
+  check(requests.join()==='?page=aws_machines,?page=list' &&
+        recipients.querySelector('input:checked')?.value==='morty-staff',
+        'The List dialog selects its owner.');
+  check(choices()==='builds,dwight,morty,sdlc', 'The List dialog offers the same recipients.');
+ } catch(error) {failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>""".replace(b"__PAGE_OPTIONS__", json.dumps(options).encode())
+        self.assertEqual(firefox_probe_results(source.replace(b"</body>", probe + b"</body>")), [[]])
+
     def test_publication_reuses_the_changes_link_and_inlines_only_local_icons(self) -> None:
+        output = self.root / "snapshots/aws"
+        output.mkdir(parents=True)
+        _ = (output / machines_page.PAGE_NAME).write_text("<title>AWS Machines</title>", encoding="utf-8")
         with (patch.object(memory_feed, "page_url", return_value="/builds/memory_live.html", create=True),
               patch.object(aws_page, "page_url", return_value="/aws/aws_prices.html"),
+              patch.object(machines_page, "output_folder", return_value=output),
               patch.object(disks_page, "page_url", return_value="/disks/disks.html")):
             source = console.render(console.read_pages(), console.read_rebuilds()).decode()
         self.assertEqual(change_page.console_url(), f"http://127.0.0.1:{conf.read('review_links').whole('server_port')}/console/")
@@ -84,12 +202,13 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
         markup = ConsoleMarkup()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["accounts", "aws", "builds", "disks", "images", "list", "review"])
+        self.assertEqual(markup.pages, ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list", "studio",
+                                        "review", "placement_disk"])
         self.assertEqual(markup.sources, [])
         # Each page has its own icon and a hidden new mark; the menu button has one more mark.
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 23)
-        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 8)
-        self.assertEqual(source.count('<span class="new-mark" hidden>'), 7)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 29)
+        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 11)
+        self.assertEqual(source.count('<span class="new-mark" hidden>'), 10)
         self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
         self.assertIn('data-news="/console/news"', source)
         self.assertIn("showNews();\n    loadNews();\n    if (navigate && phone.matches) collapse(true);", source)
@@ -106,13 +225,13 @@ class ConsoleTests(unittest.TestCase):
         retry = conf.read("review_links").number("frame_retry_seconds")
         self.assertIn(f'data-frame-retry-seconds="{retry}"', source)
         self.assertIn("try { loaded = frame.contentWindow.location.origin === location.origin; } catch (_) {}", source)
-        self.assertIn("setTimeout(() => { frame.src = place; }, Number(shell.dataset.frameRetrySeconds) * 1000);", source)
         self.assertIn('<a class="rebuild-link" id="rebuild-link" href="?page=rebuilds" data-page="rebuilds"', source)
         self.assertIn("const pages = [...entries, rebuildLink];", source)
         self.assertIn("if (shown) shown.replaceWith(shown.ownerDocument.importNode(parsed, true));", source)
         self.assertIn("open: current === rebuildLink ? '' : current.dataset.page", source)
         self.assertNotIn("<iframe", source)
         self.assertIn(".frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}", source)
+
         self.assertIn("const placeKey = identity => 'at.' + identity;", source)
         self.assertIn("target.pathname === new URL(base, location.href).pathname", source)
         self.assertIn("event.data !== 'console-place'", source)
@@ -124,6 +243,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('class="lucide lucide-refresh-cw"', source)
         self.assertIn("/builds/memory_live.html", source)
         self.assertIn("/aws/aws_prices.html", source)
+        self.assertIn('data-url="/aws/machines.html" data-title="AWS Machines"', source)
         self.assertIn('class="lucide lucide-cloud"', source)
         self.assertNotIn("Workspace", source)
         self.assertNotIn("sidebar-footer", source)
@@ -135,9 +255,44 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('aria-label="Open navigation"', source)
         self.assertIn('class="lucide lucide-menu"', source)
         self.assertIn('.sidebar .brand,.collapsed .sidebar{display:none}', source)
+        self.assertEqual(source.count(f'@media {console.PHONE_QUERY}'), 2)
+        self.assertIn(f"matchMedia('{console.PHONE_QUERY}')", source)
         self.assertNotIn('page-header', source)
         self.assertIn('.workspace{flex:1;width:100%}', source)
         self.assertIn("mobileToggle.setAttribute('aria-expanded', String(!value))", source)
+
+    def test_repository_config_names_staff_for_every_console_page(self) -> None:
+        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        settings = conf.read(path).values()
+        pages = {key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")}
+        self.assertEqual(pages | {"rebuilds"}, page_frame.OWNER_PAGES)
+        for page in page_frame.OWNER_PAGES:
+            with self.subTest(page=page):
+                self.assertRegex(settings[f"page.{page}.owner"], r"^[a-f0-9-]{36}$")
+        self.assertEqual(settings["owner.default"], settings["page.review.owner"])
+
+    def test_repository_config_puts_the_placement_disk_tab_last_with_the_torus_icon(self) -> None:
+        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        settings = conf.read(path).values()
+        pages = [key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")]
+        self.assertEqual(pages[-1], "placement_disk")
+        self.assertEqual(settings["page.placement_disk.icon"], "torus")
+        self.assertIn("torus", console.ICON_NAMES)
+        self.assertTrue((page_frame.ICONS / "torus.svg").is_file())
+        self.assertIn('class="lucide lucide-torus"', console.icon_svg("torus"))
+
+    def test_repository_config_puts_the_studio_after_the_list_with_the_list_owner(self) -> None:
+        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        settings = conf.read(path).values()
+        pages = [key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")]
+        self.assertEqual(pages[pages.index("list") + 1], "studio")
+        self.assertEqual((settings["page.studio.label"], settings["page.studio.title"]), ("Studio", "The Studio"))
+        self.assertEqual(settings["page.studio.url"], "python:scripts.review_links.studio_page:page_url")
+        self.assertEqual(settings["page.studio.owner"], settings["page.list.owner"])
+        self.assertNotIn("status.studio.age_limit_seconds", settings)
+        self.assertIn(settings["page.studio.icon"], console.ICON_NAMES)
+        self.assertTrue((page_frame.ICONS / "clapperboard.svg").is_file())
+        self.assertIn('class="lucide lucide-clapperboard"', console.icon_svg("clapperboard"))
 
     def test_builds_url_resolves_from_its_public_function(self) -> None:
         folder = self.root / "snapshots/builds"
@@ -146,7 +301,7 @@ class ConsoleTests(unittest.TestCase):
         _ = page.write_text("<!doctype html><title>Builds</title><h1>Builds</h1>")
         _ = (self.configuration / "memory_feed.conf").write_text(f"output_folder={folder}\n")
         pages = console.read_pages()
-        self.assertEqual(pages[2].destination, console.AvailablePage("/builds/memory_live.html"))
+        self.assertEqual(pages[3].destination, console.AvailablePage("/builds/memory_live.html"))
         self.assertIn('data-url="/builds/memory_live.html" data-title="Builds"', console.render(pages, console.UnavailablePage()).decode())
         self.assertEqual(page.read_text(), "<!doctype html><title>Builds</title><h1>Builds</h1>")
 
@@ -156,13 +311,16 @@ class ConsoleTests(unittest.TestCase):
         _ = (self.configuration / "console.conf").write_text("\n\n".join(reversed(blocks)))
         with patch.object(memory_feed, "page_url", side_effect=FileNotFoundError("fixture page absent"), create=True):
             pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["review", "list", "images", "disks", "builds", "aws", "accounts"])
-        self.assertIsInstance(pages[2].destination, console.AvailablePage)
-        self.assertIsInstance(pages[4].destination, console.UnavailablePage)
+        self.assertEqual([page.identity for page in pages], ["placement_disk", "review", "studio", "list", "images", "disks",
+                                                             "builds", "aws_machines", "aws", "accounts"])
+        self.assertIsInstance(pages[4].destination, console.AvailablePage)
+        self.assertIsInstance(pages[6].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages, console.UnavailablePage()).decode()
+        self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         markup.feed(source)
-        self.assertEqual(markup.pages, ["review", "list", "images", "disks", "builds", "aws", "accounts"])
+        self.assertEqual(markup.pages, ["placement_disk", "review", "studio", "list", "images", "disks", "builds", "aws_machines",
+                                        "aws", "accounts"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
         self.assertIn('aria-label="Builds — Not available"', source)
         self.assertNotIn("fixture page absent", source)
@@ -174,9 +332,10 @@ class ConsoleTests(unittest.TestCase):
             "python:scripts.build_queue.memory_feed:fixture_page_url_absent")
         _ = configuration.write_text(source)
         pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "builds", "disks", "images", "list", "review"])
-        self.assertIsInstance(pages[2].destination, console.UnavailablePage)
-        self.assertIsInstance(pages[-1].destination, console.AvailablePage)
+        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list",
+                                                             "studio", "review", "placement_disk"])
+        self.assertIsInstance(pages[3].destination, console.UnavailablePage)
+        self.assertIsInstance(pages[-2].destination, console.AvailablePage)
         self.assertIn('aria-label="Builds — Not available"', console.render(pages, console.read_rebuilds()).decode())
 
     def test_url_functions_cannot_put_an_external_page_in_the_frame(self) -> None:
@@ -186,7 +345,7 @@ class ConsoleTests(unittest.TestCase):
                      "http://127.0.0.1:1/page", f"https://127.0.0.1:{port}/page"):
             with self.subTest(path=path), patch.object(memory_feed, "page_url", return_value=path, create=True):
                 pages = console.read_pages()
-                self.assertIsInstance(pages[2].destination, console.UnavailablePage)
+                self.assertIsInstance(pages[3].destination, console.UnavailablePage)
 
     def news_pages(self, changes: set[str], questions: set[str]) -> tuple[console.ConsolePage, ...]:
         return (console.ConsolePage("changes", "Changes", "list-checks", "Changes", console.AvailablePage("/console/review.html"),
@@ -338,7 +497,7 @@ try{
  check(panel.getBoundingClientRect().right<=innerWidth && panel.getBoundingClientRect().left>=0,'the panel fits the viewport');
  check(document.documentElement.scrollWidth===innerWidth,'the shell has no horizontal overflow');
  const copy=panel.querySelector('[data-copy-code]');copy.focus();copy.click();await flush();
- check(copied==='rebuild' && copy.getAttribute('aria-label')==='Copied','Copy writes the command');
+ check(copied==='rebuild' && !copy.querySelector('[data-copied-icon]').hasAttribute('hidden'),'Copy writes the command and shows a check');
  const code=panel.querySelector('code'),selection=getSelection(),range=document.createRange();
  range.selectNodeContents(code);selection.removeAllRanges();selection.addRange(range);
  mode='good';dispatchEvent(new Event('focus'));await flush();
@@ -347,7 +506,7 @@ try{
  check(document.activeElement===copy && selection.toString()==='rebuild' && code.textContent==='rebuild','changed entries wait for the focused selection');
  selection.removeAllRanges();trigger.focus();await flush();
  check(panel.querySelector('code').textContent==='rebuild --new','released commands receive the pending refresh');
- const note=panel.querySelector('.panel-note');
+ const note=panel.querySelector('[data-for-you-summary]');
  const crossCode=panel.querySelector('code');
  selection.setBaseAndExtent(note.firstChild,0,crossCode.firstChild,crossCode.textContent.length);
  const selected=selection.toString();
@@ -368,7 +527,7 @@ try{
    selection.anchorNode===start && selection.focusNode===end,result+' preserves the panel count and command selection');
   selection.removeAllRanges();await flush();
   check(heading.textContent===count && panel.querySelectorAll('article').length===0 &&
-   note.textContent===(result==='zero'?'No actions required.':'The action count is unavailable.'),
+   panel.querySelector('.panel-note:not([hidden])').textContent===(result==='zero'?'No actions required.':'The action count is unavailable.'),
    result+' updates the panel after selection ends');
  }
  mode='good';dispatchEvent(new Event('focus'));await flush();
@@ -406,6 +565,13 @@ try{
  check(reads===queued+2 && trigger.dataset.state==='quiet','completion queues one read after a read in progress');
  mode='good';dispatchEvent(new Event('focus'));await flush();
  const collapsed=shell.classList.contains('collapsed');
+ const escapeInFrame=()=>new frame.contentWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true});
+ const frameSearch=frame.contentDocument.querySelector('[data-filter-words]');
+ frameSearch.value='auto';
+ frameSearch.focus();
+ frameSearch.dispatchEvent(escapeInFrame());
+ check(!panel.hidden && frameSearch.value==='' && frame.contentDocument.activeElement===frameSearch,
+  'Escape clears the List filter and keeps For you open.');
  const frameButton=frame.contentDocument.querySelector('button');
  frameButton.focus();
  check(document.activeElement===frame && frame.contentDocument.activeElement===frameButton,'focus enters the page frame');
@@ -432,16 +598,24 @@ try{
  mode='good';dispatchEvent(new Event('focus'));await flush();
  const link=panel.querySelector('[data-for-you-card]');
  check(new URL(link.href).searchParams.get('at.list')==='/page?filter=mine','the card href keeps the saved List location');
- link.click();await flush();
+ link.click();
+ const reviewFrame=document.querySelector('[data-console-page=review]');
+ await new Promise(resolve=>reviewFrame.addEventListener('load',resolve,{once:true}));
  const url=new URL(location.href),place=new URL(url.searchParams.get('at.review'),location.origin);
  check(url.searchParams.get('page')==='review' && place.searchParams.get('type')==='for-you' &&
  place.searchParams.get('item')==='rebuild/natedev','a card opens Review with the reserved parameters and key');
  check(panel.hidden,'a card closes the panel');
  check(url.searchParams.get('at.list')==='/page?filter=mine' && url.searchParams.get('extra')==='kept',
   'opening a card preserves unrelated console parameters');
+ const original=reviewFrame.contentDocument;
  trigger.click();await flush();
- panel.querySelector('footer a').click();await flush();
+ const reloaded=new Promise(resolve=>reviewFrame.addEventListener('load',resolve,{once:true}));
+ panel.querySelector('footer a').click();
+ await reloaded;
  const footerURL=new URL(location.href),footerPlace=new URL(footerURL.searchParams.get('at.review'),location.origin);
+ const child=new URL(reviewFrame.contentWindow.location.href);
+ check(reviewFrame.contentDocument!==original && child.search===footerPlace.search,
+  'The footer reloads the fixture at the recorded query.');
  check(footerURL.searchParams.get('at.list')==='/page?filter=mine' && footerURL.searchParams.get('extra')==='kept' &&
   footerPlace.searchParams.get('type')==='for-you' && !footerPlace.searchParams.has('item'),
   'opening the footer preserves unrelated parameters and clears the card key');
@@ -466,7 +640,8 @@ try{
   const fixture=document.createElement('iframe');
   fixture.style.cssText='position:fixed;left:0;top:0;width:716px;height:800px;border:0';
   const bookmark='/console/?page=investigations&at.investigations='+
-   encodeURIComponent('/console/investigations.html?show=all#showrunner=builds&q=shard');
+   encodeURIComponent('/console/investigations.html?show=all&sort=Age&dir=asc'+
+    '#state=open&showrunner=builds&q=shard&sort=Owner&dir=desc');
   fixture.src=bookmark;
   await new Promise(resolve=>{fixture.addEventListener('load',resolve,{once:true});document.body.append(fixture);});
   const layout=fixture.contentDocument;
@@ -476,6 +651,8 @@ try{
   check(opened.searchParams.get('page')==='review' && filters.get('type')==='investigations' &&
    filters.get('show')==='all' && filters.get('source-owner')==='builds' && filters.get('q')==='shard',
    'the legacy Console bookmark opens the combined filter and preserves its filters');
+  check(filters.get('sort')==='Owner' && filters.get('dir')==='desc',
+   'The legacy tab uses the sort and direction from the fragment.');
   const sidebar=layout.querySelector('.shell'),toggle=layout.querySelector('#nav-toggle');
   const box=layout.querySelector('#action-popover');
   const button=layout.querySelector('.for-you-slot button');
@@ -495,12 +672,35 @@ try{
   layout.dispatchEvent(new fixture.contentWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
   check(box.hidden && layout.activeElement===mobile,'Escape restores focus to the visible button after resizing');
   fixture.remove();
+
+  const listLoaded=()=>new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const loaded=listLoaded();
+  frame.src='/page?filter=mine&restart=1#q=auto';
+  await loaded;
+  const list=frame.contentWindow;
+  const cleared=new Promise(resolve=>list.addEventListener('hashchange',resolve,{once:true}));
+  list.location.hash='q=';
+  await cleared;
+  const saved=new URL(location.href).searchParams.get('at.list');
+  check(saved==='/page?filter=mine&restart=1#q=','The console saves the cleared List address.');
+  const failedLoad=listLoaded();
+  frame.src='data:text/html,Unavailable';
+  await failedLoad;
+  await listLoaded();
+  check(list.location.pathname+list.location.search+list.location.hash===saved,
+   'The frame retry opens the last saved List address with the words cleared.');
  }
 }catch(error){failures.push(String(error));}
 await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
     layout = source.replace('</head>', setup + '</head>')
     page = layout.replace('</body>', probe + '<img hidden src="/complete"></body>').encode()
+    list_fixture = (
+        '<!doctype html><title>List fixture</title><button>Fixture control</button>'
+        + record_table.words_box('list-search', 'Filter by words')
+        + '<script>' + record_table.SCRIPT
+        + "filterControl.bind(document.querySelector('[data-filter-words]'),()=>{});</script>"
+    ).encode()
     results: list[list[str]] = []
     complete = threading.Event()
 
@@ -515,6 +715,8 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 _ = self.wfile.write(layout.encode())
             elif self.path.startswith('/?'):
                 _ = self.wfile.write(page)
+            elif self.path.startswith('/page?'):
+                _ = self.wfile.write(list_fixture)
             else:
                 _ = self.wfile.write(b'<!doctype html><title>Fixture</title><button>Fixture control</button>')
 
@@ -535,10 +737,10 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             profile = Path(temporary) / 'profile'
             profile.mkdir()
             _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme",1);')
-            result = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+            result = run_process_group(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                                      '--window-size', f'{width},800', '--screenshot', str(Path(temporary) / 'page.png'),
                                      f'http://127.0.0.1:{server.server_port}/?page=list&at.list=%2Fpage%3Ffilter%3Dmine&extra=kept'],
-                                    capture_output=True, text=True, timeout=40)
+                                    timeout=40)
             case.assertEqual(result.returncode, 0, result.stderr)
         finally:
             server.shutdown()

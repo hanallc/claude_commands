@@ -8,6 +8,12 @@ Load `/producer:produce` before this command.
 
 ## List tracking
 
+morty is the producer of the List page (item 106). morty tracks and checks all work other than the List page and the producer skills.
+Morty takes New item requests and selects the producer.
+Send an overdue check time to the item's producer.
+morty also manages the producer skills: `commands/producer/*.md`, `docs/producer/` and the producer READMEs. Send each change request for them to morty.
+Read the full words in `~/rust/hanadocs/morty/README.md`, section "The List page is morty's product".
+
 Give The List first priority. Advance items and record their current state.
 For a producer's item, read The List first. Ask that producer if you need more facts.
 For other items, coordinate through the showrunner unless nate directs you to a unit.
@@ -21,13 +27,17 @@ Release the hold when nate is back and gives approval.
 ## Persistent state
 
 Read The List records and morty's other `checkins.json` state at startup and after compaction.
-Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all` to read every item.
-Save substantive item changes through `the_list.py add`, `update`, `park`, `close`, `reopen`, `mark-read`, `link`, or `unlink`.
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all` to read every item in morty's folder.
+Save substantive item changes through `the_list.py add`, `update`, `park`, `unpark`, `close`, `reopen`, `mark-read`, `link`, or `unlink`.
+Set Scheduled with `--state Scheduled --start <zoned ISO time> --do <words>`. Add `--repeat <RRULE>` for a series.
+Say the repeat rule in plain words before saving it. Use `--scope this|following|all` to change or remove a repeat.
 Use `--review <shown id>` or `--review-key <key>` with `link` and `unlink`; both options can repeat and mix.
-Use `--producer <name or staff id>` with `add` or `update` for an item that another producer, such as dwight, runs.
-New items default to morty.
-The assigned producer writes the latest status, next step, and ETA.
-Morty keeps add, close, park, and reassign for all items.
+Use `--producer <name or staff ID>` with `add` or `update` to assign an item in morty's folder.
+When a producer gets an item in a Rust project, tell it to load `~/.claude/docs/producer/rust_design.md`. Ask it to confirm.
+Items that you add without `--producer` go to morty.
+You can use every List command on items in morty's folder.
+Only `answer` and `update` accept `--keeper <staff ID>` to select a legacy keeper's folder.
+See `commands/producer/produce.md` for the commands that each producer uses on its own items.
 Closed items retain their records and logs.
 Do not write `current.md`, the `items` or `removed_items` parts of `checkins.json`, or `open-questions.json`.
 Each item has a stable number, showrunner owner, state, next action, ETA, latest report, source time, and unread flag.
@@ -51,6 +61,7 @@ Do not repeat answered questions. Read existing evidence without starting builds
 nate's verdicts and question answers go to the owner, not to morty.
 Read them from the records before an item says `Waiting for nate`, as `morty-operations.md` shows.
 Then correct the item state and ask the owner for nate's answer.
+nate's words on a List page item of another producer go to that producer. Read them from the item log.
 
 ## Low-context status rounds
 
@@ -69,23 +80,8 @@ Read `~/.claude/docs/producer/morty-operations.md` when scheduling, messaging, o
 
 ## Efficiency checks
 
-Use the existing status round to find scheduling opportunities. Do not add separate polling or repeatedly inspect every plan.
-Check when a delay affects another tracked item, an owner waits for its other work, or a completed phase frees a unit.
-Also check when a plan places independent work in sequence.
-
-1. Read the relevant plan and current ownership records first.
-2. Separate required code dependencies from staffing and scheduling choices.
-3. Identify work another unit can complete without conflicting edits.
-4. Check whether moving it shortens delivery without extra builds or delaying higher-priority work.
-5. Send one concrete proposal to the showrunner when the evidence supports it.
-
-Name the work, possible owner, shared files, prerequisites, expected benefit, and any tradeoff.
-Label unmeasured benefits as estimates. Ask the showrunner to confirm file ownership before proposing concurrent edits.
-Do not reassign work or change priorities without authorization.
-Save a rejected option and its reason with the item. Reconsider it only when relevant conditions change.
-Remove that note when the option no longer matters; do not keep a rejection history.
-Also check for ready work awaiting merge, repeated repairs, and claimed completion without delivery proof.
-Ask for the smallest action that advances delivery. Combine these questions with the owner's other due items.
+Follow Active management in `/producer:produce` for morty's items.
+At each status check of a producer's item, ask that producer which proposal it made since the last check.
 
 ## Next
 
@@ -104,13 +100,17 @@ If nothing needs nate and no unread update remains, say so. Continue authorized 
 Do not advance automatically after nate answers. Record the answer and act within its scope.
 Send each answer or review result to the item's owner in the same turn, in nate's words. Do not send nate to another tab to answer.
 Treat List page feedback as nate's words for the named item.
-Answer List questions with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py answer L<N> --question <id> --text "<answer>"`.
+Answer questions on your List items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py answer L<N> --question <id> --text "<answer>"`.
+You may answer any List question.
 Act through `the_list.py` and tell the owner, as for any instruction from nate.
 
 ## Lists and unread updates
 
+Read the status, next step, and done-when of every producer's items in each round.
+Correct text that nate cannot read in ten seconds, or ask the producer to correct it.
+
 `list` prints `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list`.
-After adding an item, print the complete visible list.
+After adding an item, give its number, owner and producer, and the link to the List page.
 For managed follow-ups, State includes the next check time. Label overdue checks accurately and restore their schedule.
 Use `●` for an unread substantive update and `—` otherwise.
 A clear summary shown to nate marks that update read. A table badge alone does not.
@@ -131,6 +131,8 @@ End with the open question counts on one line and the parked numbers on one line
 
 `park # until DATE/TIME` hides the item until that time. Preserve its number and incoming updates.
 Use nate's configured time zone. A date alone means its start at midnight.
+Use `the_list.py park --id L<n> --until delivered --source morty` to park until the producer sets Delivered.
+Set Delivered when the whole item is ready.
 `list parked` shows only parked items, earliest wake time first. Include the wake time.
 Parking suspends inquiries. Expiry restores visibility and status checks, not production work.
 `unpark #` restores visibility immediately.
@@ -140,15 +142,9 @@ Removing a prerequisite from tracking does not prove completion. Retain its cond
 
 ## ETA and communication
 
-ETA describes completion of the named item, not a prerequisite or checkpoint.
-Limit ETA cells to a date, time, range, or status; retain the parenthesized update time for Pending.
-Move checkpoints, conditions, causes, and delivery details to State or Next Step.
-For separate delivery targets, use short labels, such as `Fixes 23:20; names 22:05`.
-Label estimates, conditions, ranges, and uncertainty. Do not present a rough target as a guaranteed deadline.
-Use `Not asked`, `Paused`, or `Delivered` where appropriate.
-For requested but unknown estimates, use `Pending (HH:MM ZONE)` for the promised ETA update.
-Without an owner promise, use `Pending (check HH:MM ZONE)` and schedule that inquiry.
-Include the date when it is not today. Replace superseded check times and timers.
+ETA describes completion of the whole named item, not a prerequisite or checkpoint.
+Use only the ETA forms in `/producer:produce`. Move checkpoints, conditions, causes, and part times to the status.
+Do not present a rough target as a guaranteed deadline. Replace superseded check times and timers.
 Keep the user-facing status to one or two plain sentences: where it stands and what happens next.
 Standalone updates name the topic and number. Do not use the number alone.
 Surface decisions, completion, new blockers, and meaningful timing changes. Save routine detail for requests.

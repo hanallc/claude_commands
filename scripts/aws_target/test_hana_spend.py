@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+import io
 import json
 import subprocess
 from typing import cast, override
@@ -61,6 +63,15 @@ class HanaSpendTests(CostFixture):
                 text_setting(configuration, 'fallback_instance_types', value)
                 with self.assertRaisesRegex(ValueError, 'distinct types and no empty items'):
                     _ = hana_spend.read_settings(conf.read(configuration))
+
+    def test_an_invalid_switch_counts_as_off(self) -> None:
+        configuration = self.root / 'hana_aws.conf'
+        committed = configuration.read_text()
+        self.assertEqual(committed.count('enabled=on'), 1)
+        _ = configuration.write_text(committed.replace('enabled=on', 'enabled=of'))
+        with (mock.patch.object(conf, '_committed_files', return_value=iter((committed,))),
+              redirect_stderr(io.StringIO())):
+            self.assertFalse(hana_spend.read_settings(conf.read(configuration)).enabled)
 
     def test_hana_budget_refuses_start_and_saves_no_exposure(self) -> None:
         self.controller.settings = replace(self.workload, daily_budget_usd=self.workload.storage_usd_per_month / 60)
@@ -125,6 +136,22 @@ class HanaSpendTests(CostFixture):
         self.assertEqual(first.exposure.region, self.workload.region)
         self.assertEqual(renewed.exposure.region, first.exposure.region)
         self.assertEqual(renewed.exposure.instance_type, first.exposure.instance_type)
+
+    def test_observed_hana_keeps_its_exposure_after_renewal_and_refusal(self) -> None:
+        first = self.issued(self.start)
+        self.controller.reconcile(self.start, 'running', generation=first.exposure.generation)
+        renewed = self.issued(self.start + 1, generation=first.exposure.generation)
+        journal = self.state / 'hana' / 'provider'
+        journal.mkdir(parents=True)
+        _ = (journal / 'renewed-start.json').write_text(json.dumps({
+            'action': 'start', 'generation': renewed.exposure.generation, 'dispatched': True,
+            'start_refusal_code': 'Blocked',
+        }))
+        stop = self.start + 120
+        self.controller.reconcile(stop, 'stopped', generation=renewed.exposure.generation)
+        state = self.book.read_snapshot()
+        interval, = (row for row in ledger.hana_intervals(state, stop, 60) if row.kind == 'instance')
+        self.assertEqual((interval.start, interval.end), (self.start, stop))
 
     def test_unconfirmed_stop_retains_full_exposure_after_expiry(self) -> None:
         issued = self.issued(self.start)

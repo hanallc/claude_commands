@@ -11,18 +11,21 @@ import json
 import os
 import shlex
 import tempfile
+import time
 import unittest
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from uuid import uuid4
 
 from scripts.production import broadcast
 from scripts.message import codex_daemon
 from scripts.message import process_table
 from scripts.message import roster
+from scripts.message import sessions
 from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()
@@ -44,6 +47,10 @@ while len(list(root.glob("started-*"))) < int(os.environ["TOGETHER"]) and time.m
 if to == os.environ.get("REFUSED") or len(list(root.glob("started-*"))) < int(os.environ["TOGETHER"]):
     print("QUEUED: relay timed out after 40 s")
     raise SystemExit(1)
+if to in os.environ.get("KEPT_FOR", "").split():
+    print(f"KEPT: {to} is in a review; delivered at its end")
+else:
+    print("SENT: delivered")
 """.replace("__TEST_HANG_GUARD_SECS__", str(TEST_HANG_GUARD_SECS))
 
 
@@ -85,7 +92,7 @@ class BroadcastTests(unittest.TestCase):
         (self.root / "peer-log").mkdir()
         peer_driver = binaries / "ssh"
         _ = peer_driver.write_text(
-            f"#!{Path(__file__).resolve().parents[1] / 'lib/py'}\n"
+            f"#!/usr/bin/env {Path(__file__).resolve().parents[1] / 'lib/py'}\n"
             + "import json, os, shlex, sys\n"
             + "from pathlib import Path\n"
             + "with open(os.environ['SSH_RECORD'], 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
@@ -102,7 +109,7 @@ class BroadcastTests(unittest.TestCase):
             + "names.load_names = lambda: fixture_names()\n"
             + "broadcast.SEND = Path(os.environ.get('BROADCAST_SEND') or os.environ['SAFE_PEER_SEND'])\n"
             + "roster.machine_name = lambda: 'mac'\n"
-            + "roster.roster = lambda environment, scope: roster.RosterSnapshot.decode(os.environ['SSH_SNAPSHOT']).result\n"
+            + "roster.roster = lambda environment, scope, **kwargs: roster.RosterSnapshot.decode(os.environ['SSH_SNAPSHOT']).result\n"
             + "raise SystemExit(broadcast.main(arguments[index + 1:]))\n",
             encoding="utf-8",
         )
@@ -152,7 +159,11 @@ class BroadcastTests(unittest.TestCase):
             codex_daemon, "loaded_sessions", side_effect=AssertionError("use the fake roster"),
         ))
 
-    def fixture_roster(self, environment: Mapping[str, str], scope: roster.RosterScope) -> roster.Roster:
+    def fixture_roster(
+        self, environment: Mapping[str, str], scope: roster.RosterScope, *,
+        membership: staff.StaffSnapshot | None = None,
+    ) -> roster.Roster:
+        _ = membership
         local = roster.Roster(self.rows, self.problems, self.warnings)
         if isinstance(scope, roster.AllMachines):
             peer = roster.peer_roster(environment)
@@ -161,7 +172,9 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual(scope, roster.ThisMachine())
         return local
 
-    def run_main(self, *arguments: str, here: bool = True, **environment: str) -> tuple[int, str, str]:
+    def run_main(
+        self, *arguments: str, here: bool = True, roster_reads: int = 1, **environment: str,
+    ) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
         os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(
             roster.Roster(self.peer_rows, self.peer_problems, self.peer_warnings)).encode()
@@ -173,7 +186,10 @@ class BroadcastTests(unittest.TestCase):
               redirect_stdout(output), redirect_stderr(errors)):
             result = broadcast.main([*(["--here"] if here else []), "--from", "natedev", *arguments])
         if result != 2:
-            read_roster.assert_called_once()
+            if roster_reads == 1:
+                read_roster.assert_called_once()
+            else:
+                self.assertEqual(read_roster.call_count, roster_reads)
             read_identity.assert_called_once()
         return result, output.getvalue(), errors.getvalue()
 
@@ -193,13 +209,96 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual(len(addresses), len(set(addresses)), "an address was sent twice")
         return {command[1]: command[6] for command in commands}
 
+    def producer_staff_file(self, members: Mapping[str, str]) -> str:
+        record = staff.StaffSnapshot(tuple(
+            staff.StaffRow(staff.native_id(str(uuid4())), "producer", name, staff.StaffRoot(),
+                           current_session=staff.native_id(session))
+            for name, session in members.items()
+        ))
+        path = self.root / "staff.json"
+        _ = path.write_text(record.encode(), encoding="utf-8")
+        return str(path)
+
+    def test_producers_reach_both_machines_by_current_staff_session(self) -> None:
+        sender, local, peer, offline = (str(uuid4()) for _ in range(4))
+        self.rows.extend([
+            entry("natedev", f"session:{sender}"),
+            entry("local", f"session:{local}"),
+            entry("peer", "session:unregistered"),
+        ])
+        peer_row = replace(entry("peer", f"codex:{peer}", kind="codex", thread=roster.CodexThread(peer)),
+                           machine="mac")
+        self.peer_rows = [peer_row, peer_row]
+        staff_file = self.producer_staff_file({
+            "natedev": sender, "local": local, "peer": peer, "offline": offline,
+        })
+        message = "From the user (via natedev): Keep these words."
+        result, output, errors = self.run_main("--producers", message, here=False,
+                                              STAFF_FILE=staff_file, CLAUDE_CODE_SESSION_ID=sender)
+        self.assertEqual((result, errors), (0, ""), output)
+        expected = f"{message}\n\nSent directly to producers on fixture and mac; do not pass it on."
+        self.assertEqual(self.sent_texts(), {f"session:{local}": expected})
+        self.assertEqual([(command[1], command[-1]) for command in self.peer_sends()], [(f"codex:{peer}", expected)])
+        self.assertRegex(output.splitlines()[-2], r"^2 sent in \d+ s$")
+
+    def test_producer_broadcast_uses_one_staff_snapshot(self) -> None:
+        session = staff.native_id(str(uuid4()))
+        address = f"session:{session}"
+        member = staff.StaffRow(staff.native_id(str(uuid4())), "producer", "local", staff.StaffRoot(),
+                                current_session=session)
+        membership = staff.StaffSnapshot((member,))
+        unreadable = staff.StaffUnreadable("cannot read the staff fixture")
+        local = roster.Roster([entry(member.name, address)], [])
+        for first_read in (unreadable, membership):
+            with self.subTest(first_read=first_read):
+                output, errors = io.StringIO(), io.StringIO()
+                with (patch.object(staff, "initial_snapshot", side_effect=[first_read, membership]) as read,
+                      patch.object(roster, "_local_roster", return_value=local) as build,
+                      redirect_stdout(output), redirect_stderr(errors)):
+                    result = broadcast.main(["--here", "--from", "natedev", "--producers", "Review update."])
+                read.assert_called_once_with()
+                self.assertNotIn("producers - none on this machine", output.getvalue())
+                if isinstance(first_read, staff.StaffUnreadable):
+                    self.assertEqual(result, 1, output.getvalue())
+                    self.assertIn(f"producers - NOT sent: staff membership: {unreadable}", output.getvalue())
+                    build.assert_not_called()
+                    self.assertEqual(self.sends(), [])
+                else:
+                    self.assertEqual((result, errors.getvalue()), (0, ""), output.getvalue())
+                    build.assert_called_once()
+                    supplied = cast(staff.StaffSnapshot, build.call_args.kwargs["membership"])
+                    self.assertIs(supplied, membership)
+                    self.assertEqual([command[1] for command in self.sends()], [address])
+
+    def test_producer_with_open_review_reports_held_on_the_peer(self) -> None:
+        peer = str(uuid4())
+        self.peer_rows = [replace(entry("registry name", f"session:{peer}"), machine="mac")]
+        staff_file = self.producer_staff_file({"reviewing": peer})
+        result, output, errors = self.run_main("--producers", "Review update.", here=False,
+                                              STAFF_FILE=staff_file, KEPT_FOR=f"session:{peer}")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertIn(f"mac: reviewing [session:{peer}] - held: in a review", output)
+        self.assertEqual([command[1] for command in self.peer_sends()], [f"session:{peer}"])
+        self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
+
     def test_all_reaches_every_role_at_once_and_never_the_sender(self) -> None:
+        worker = self.rows[4]
+        self.rows.extend([
+            replace(worker, name="closed worker", status="closed",
+                    reach=roster.CannotReceiveMessages("closed"), thread=roster.CodexThread("thread-closed"),
+                    worker_closure=roster.WorkerClosure.CONFIRMED),
+            replace(worker, name="stopped worker", status="stopped; pane w1:p2",
+                    reach=roster.CannotReceiveMessages("stopped; pane w1:p2"),
+                    thread=roster.CodexThread("thread-stopped")),
+        ])
         result, output, errors = self.run_main("--all", "From the user: stop builds.", TOGETHER="5")
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(set(self.sent_texts()), {
             "session:id-hana", "session:id-trunk", "session:id-ups",
             "worker:run-a/fps-impl", "codex:thread-window",
         })
+        self.assertNotIn("closed worker", output)
+        self.assertIn("stopped worker cannot take messages (stopped; pane w1:p2)", output)
         self.assertRegex(output.splitlines()[-2], r"^5 sent in \d+ s$")
         for text in self.sent_texts().values():
             self.assertTrue(text.startswith("From the user: stop builds.\n\n"))
@@ -280,6 +379,15 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual(len(self.sends()), 5)
         self.assertEqual(errors.splitlines(), ["broadcast: roster: sessions/broken.json: invalid JSON"])
 
+    def test_kept_messages_report_storage_without_increasing_the_sent_count(self) -> None:
+        self.peer_rows = [replace(entry("Mac Claude", "session:mac-claude"), machine="mac")]
+        result, output, errors = self.run_main("--all", "Review update.", here=False,
+                                              KEPT_FOR="session:id-hana session:mac-claude")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertRegex(output, r"\[session:id-hana\] - kept: in a review")
+        self.assertIn("mac: session:mac-claude - kept: in a review", output)
+        self.assertRegex(output.splitlines()[-2], r"^4 sent in \d+ s$")
+
     def test_showrunners_with_no_members_say_none_and_send_nothing(self) -> None:
         self.rows = [row for row in self.rows if row.role != "showrunner"]
         result, output, errors = self.run_main("--showrunners", "stop")
@@ -309,12 +417,18 @@ class BroadcastTests(unittest.TestCase):
         self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
 
     def test_a_unit_with_no_workers_says_none_for_its_scoped_group(self) -> None:
-        self.rows = [row for row in self.rows if row.role != "worker"]
-        result, output, errors = self.run_main("--of", "trunk", "--workers", "finish")
-        self.assertEqual((result, errors), (0, ""), output)
-        self.assertEqual(self.sends(), [])
-        self.assertEqual(output.splitlines()[:-2], ["workers of trunk - none on this machine"])
-        self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
+        worker = self.rows[4]
+        nonworkers = [row for row in self.rows if row.role != "worker"]
+        closed = replace(worker, status="closed", reach=roster.CannotReceiveMessages("closed"),
+                         worker_closure=roster.WorkerClosure.CONFIRMED)
+        for case, workers in (("no workers", ()), ("only closed workers", (closed,))):
+            with self.subTest(case=case):
+                self.rows = [*nonworkers, *workers]
+                result, output, errors = self.run_main("--of", "trunk", "--workers", "finish")
+                self.assertEqual((result, errors), (0, ""), output)
+                self.assertEqual(self.sends(), [])
+                self.assertEqual(output.splitlines()[:-2], ["workers of trunk - none on this machine"])
+                self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
 
     def test_empty_groups_are_named_once_in_command_line_order(self) -> None:
         self.rows = []
@@ -645,6 +759,32 @@ class BroadcastTests(unittest.TestCase):
             {"worker:run-a/impl": "A text", "worker:run-b/impl": "B text"},
         )
 
+    def test_broadcast_replays_showrunner_and_director_texts_in_one_ssh_call(self) -> None:
+        self.peer_rows = [
+            replace(entry("peer runner", "session:peer-runner", role="showrunner"), machine="mac"),
+            replace(entry("peer director", "session:peer-director", role="unit director"), machine="mac"),
+        ]
+        os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(roster.Roster(self.peer_rows, [])).encode()
+        with (patch.object(staff, "runtime_id", return_value="id-natedev"),
+              patch.object(roster, "roster", side_effect=self.fixture_roster) as read,
+              redirect_stdout(io.StringIO()) as output):
+            deliveries = broadcast.broadcast("natedev", {
+                broadcast.Showrunners(): "Runner update",
+                broadcast.UnitDirectors(): "Director update",
+            })
+            self.assertTrue(broadcast.report(deliveries))
+
+        read.assert_called_once_with(os.environ, roster.ThisMachine(), membership=None)
+        self.assertCountEqual([command[1] for command in self.sends()], ["session:id-hana", "session:id-trunk"])
+        calls = self.ssh_calls()
+        self.assertEqual(len(calls), 1)
+        remote = shlex.split(calls[0][-1])
+        self.assertEqual(remote[remote.index("--here"):],
+                         ["--here", "--from", "natedev", "--showrunners", "Runner update",
+                          "--all-units", "Director update"])
+        self.assertIn("mac: showrunner [session:peer-runner] - sent", output.getvalue())
+        self.assertIn("mac: unit director [session:peer-director] - sent", output.getvalue())
+
     def test_here_never_runs_ssh_and_every_recipient_send_stays_here(self) -> None:
         result, output, errors = self.run_main("--all", "stop")
         self.assertEqual((result, errors), (0, ""), output)
@@ -833,6 +973,66 @@ class BroadcastTests(unittest.TestCase):
                     self.assertTrue(all("roster.py" in call[-1] for call in case.ssh_calls()))
                 finally:
                     case.doCleanups()
+
+    def test_production_sends_when_unreadable_records_clear_on_the_second_read(self) -> None:
+        self.problems = [roster.UnreadableSessionRecordProblem("Claude session records: cannot read /local/1.json")]
+        self.peer_problems = [roster.UnreadableSessionRecordProblem("Claude session records: cannot read /peer/2.json")]
+        self.peer_rows = [replace(self.rows[2], machine="mac", name="fps",
+                                  session=roster.ClaudeSession("peer-fps"),
+                                  reach=roster.Messageable("session:peer-fps"))]
+        recovered = entry("recovered", "session:recovered", role="unit director",
+                          showrunner=self.rows[2].showrunner, director=roster.DirectsUnit("recovered"))
+        retry_policy = replace(sessions.retry_policy(), registry_delay_seconds=0.37)
+
+        def clear_unreadable_records(_seconds: float) -> None:
+            self.problems.clear()
+            self.rows = [*self.rows, recovered]
+            os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(roster.Roster(self.peer_rows, [])).encode()
+
+        retry_delay = Mock(side_effect=clear_unreadable_records)
+        with (patch.object(sessions, "retry_policy", return_value=retry_policy),
+              patch.object(broadcast, "time", wraps=time, sleep=retry_delay)):
+            result, output, errors = self.run_main("--production", "hana", "--units", "rule",
+                                                   here=False, roster_reads=2)
+
+        retry_delay.assert_called_once_with(retry_policy.registry_delay_seconds)
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertCountEqual([command[1] for command in self.sends()], ["session:id-trunk", "session:recovered"])
+        self.assertEqual([command[1] for command in self.peer_sends()], ["session:peer-fps"])
+        self.assertEqual(sum("roster.py" in call[-1] for call in self.ssh_calls()), 2)
+
+    def test_production_sends_nothing_when_a_record_stays_unreadable(self) -> None:
+        problem = roster.UnreadableSessionRecordProblem("Claude session records: cannot read /peer/2.json")
+        self.peer_problems = [problem]
+
+        retry_delay = Mock(return_value=None)
+        with patch.object(broadcast, "time", wraps=time, sleep=retry_delay):
+            result, output, errors = self.run_main("--production", "hana", "--units", "rule",
+                                                   here=False, roster_reads=2)
+
+        retry_delay.assert_called_once_with(sessions.retry_policy().registry_delay_seconds)
+        self.assertEqual(result, 1, output + errors)
+        self.assertIn(f"NOT sent: mac: {problem}", output)
+        self.assertEqual(self.sends() + self.peer_sends(), [])
+        self.assertEqual(len(self.ssh_calls()), 2)
+        self.assertTrue(all("roster.py" in call[-1] for call in self.ssh_calls()))
+
+    def test_production_sends_nothing_without_a_retry_for_other_problems(self) -> None:
+        self.problems = [roster.UnreadableSessionRecordProblem("Claude session records: cannot read /local/1.json")]
+        self.peer_problems = ["Claude session records: cannot read /peer/2.json"]
+
+        retry_delay = Mock(return_value=None)
+        with patch.object(broadcast, "time", wraps=time, sleep=retry_delay):
+            result, output, errors = self.run_main("--all", "all", "--production", "hana", "--units", "rule",
+                                                   here=False)
+
+        retry_delay.assert_not_called()
+        self.assertEqual(result, 1, output + errors)
+        self.assertIn("NOT sent:", output)
+        self.assertIn(f"mac: {self.peer_problems[0]}", errors)
+        self.assertEqual(self.sends() + self.peer_sends(), [])
+        self.assertEqual(len(self.ssh_calls()), 1)
+        self.assertIn("roster.py", self.ssh_calls()[0][-1])
 
     def test_refusal_advice_reports_worker_and_socketless_states_without_failure(self) -> None:
         self.rows = [

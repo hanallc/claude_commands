@@ -192,8 +192,8 @@ lock_guard() {
 
 wait_lock_guard() {
   local attempt status attempts delay_ms delay
-  attempts="$(conf_value direct TOKEN_GUARD_ATTEMPTS)" || return 2
-  delay_ms="$(conf_value direct TOKEN_GUARD_DELAY_MS)" || return 2
+  attempts="$(conf_value direct token_guard_attempts)" || return 2
+  delay_ms="$(conf_value direct token_guard_delay_ms)" || return 2
   printf -v delay '%d.%03d' "$(( delay_ms / 1000 ))" "$(( delay_ms % 1000 ))"
   for ((attempt=0; attempt<attempts; attempt++)); do
     if lock_guard "$1"; then

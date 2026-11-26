@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum, auto
@@ -11,14 +11,32 @@ from pathlib import Path
 import os
 import re
 from typing import Literal
-from scripts.build_targets.execution_transport import ExecutionTransport, HanaControlTransport, SshCommandTransport
+from scripts.build_targets.execution_transport import (
+    ExecutionTransport, HanaControlTransport, HanaGpuNextestTransport, SshCommandTransport,
+)
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-from scripts.lib import conf
+from scripts.lib import atomic_file, conf
 
 
 Platform = Literal["linux", "macos"]
+
+# One wait for every machine that the queue sends a run to (build_targets.conf).
+UNREACHABLE_WAIT_KEY = "unreachable_wait_seconds"
+MAX_UNREACHABLE_WAIT_SECONDS = 86400
+
+
+def _unreachable_wait(value: str) -> int:
+    seconds = conf.positive_whole(value)
+    if seconds > MAX_UNREACHABLE_WAIT_SECONDS:
+        raise ValueError(f"expected at most {MAX_UNREACHABLE_WAIT_SECONDS} seconds")
+    return seconds
+
+
+def unreachable_wait_seconds(registry: conf.ConfigRead) -> int:
+    """Read how long a machine may send nothing before its run ends as unreachable."""
+    return registry.value(UNREACHABLE_WAIT_KEY, _unreachable_wait, recover_invalid=False)
 
 
 @dataclass(frozen=True)
@@ -37,6 +55,16 @@ class SshTarget:
 
 
 Target = LocalTarget | SshTarget
+
+
+@dataclass(frozen=True)
+class ScalerTarget:
+    """The registry names the scaler and its settings file."""
+    name: str
+    settings: Path
+
+
+RegisteredTarget = Target | ScalerTarget
 
 
 @dataclass(frozen=True)
@@ -114,7 +142,7 @@ class LiveConfiguration(Enum):
 class CommandConfiguration:
     """Configuration reads retained only during one short command."""
 
-    targets: dict[Path, tuple[Target, ...]] = field(default_factory=dict)
+    configurations: dict[Path, conf.ConfigRead] = field(default_factory=dict)
 
 
 COMMAND_CONFIGURATION: ContextVar[LiveConfiguration | CommandConfiguration] = ContextVar(
@@ -131,37 +159,6 @@ def command_configuration() -> Generator[None]:
         COMMAND_CONFIGURATION.reset(token)
 
 
-class MissingSlotCapacity(Enum):
-    REQUIRE_CONFIGURED = auto()
-    SINGLE_SLOT = auto()
-
-
-def slot_capacity(values: Mapping[str, str] | conf.ConfigRead, repository: str, *,
-                  missing: MissingSlotCapacity) -> int:
-    """Read the repository capacity before the target default."""
-    key = f"slots.{repository}"
-    if isinstance(values, conf.ConfigRead):
-        scoped = values.value(key, positive_slot_capacity, default=MissingSlotCapacity.REQUIRE_CONFIGURED)
-        if isinstance(scoped, int):
-            return scoped
-        if missing is MissingSlotCapacity.SINGLE_SLOT:
-            return values.value("slots", positive_slot_capacity, default=1)
-        return values.value("slots", positive_slot_capacity)
-    value = values.get(key, values.get("slots", ""))
-    if key not in values and "slots" not in values and missing is MissingSlotCapacity.SINGLE_SLOT:
-        return 1
-    try:
-        return positive_slot_capacity(value)
-    except ValueError as error:
-        raise ConfigError(f"{key}: {error}") from error
-
-
-def positive_slot_capacity(value: str) -> int:
-    if not value.isascii() or not value.isdecimal() or int(value) < 1:
-        raise ValueError("expected a positive integer")
-    return int(value)
-
-
 def require_target_name(target: str) -> None:
     if target in (".", "..") or Path(target).name != target:
         raise ConfigError(f"invalid target name: {target}")
@@ -171,15 +168,42 @@ def ssh_target_state_directory(target: str) -> Path:
     """Return the state path without requiring target registration."""
     require_target_name(target)
     if target != "mac":
-        configured_root = os.environ.get("BUILD_TARGETS_STATE_DIR")
-        root = Path(configured_root).expanduser() if configured_root else Path.home() / ".local/state/build-targets"
-        return root / target
+        return build_targets_state_root() / target
     configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
     return Path(configured).expanduser()
 
 
+def build_targets_state_root() -> Path:
+    """Return the shared state root for SSH build targets."""
+    configured = os.environ.get("BUILD_TARGETS_STATE_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".local/state/build-targets"
+
+
+def provision_mac_linux_state_root(root: Path) -> None:
+    """Create the root and sync each directory entry up to home or the filesystem root."""
+    root = root.absolute()
+    home = Path.home().absolute()
+    boundary = home if root.is_relative_to(home) else Path(root.anchor)
+    folders = (root, *root.parents)
+    for folder in reversed(folders[:folders.index(boundary)]):
+        if folder.is_symlink():
+            raise OSError(f"The Mac Linux state root path {folder} is a symbolic link. Use a real directory")
+    for folder in reversed(folders):
+        if not folder.is_dir():
+            folder.mkdir(exist_ok=True)
+    for folder in folders:
+        if folder == boundary:
+            break
+        atomic_file.sync_folder(folder.parent)
+
+
+def mac_linux_end_proof_journal() -> Path:
+    """Return the journal for guest launch and end proof."""
+    return ssh_target_state_directory("mac-linux") / "end-proofs.jsonl"
+
+
 def uses_legacy_mac_layout(platform: Platform) -> bool:
-    """Mac targets retain one mirror and claim per source repository name."""
+    """Mac targets retain one mirror per source repository name."""
     return platform == "macos"
 
 
@@ -195,9 +219,9 @@ def _target_names(value: str) -> tuple[str, ...]:
     return names
 
 
-def _target_kind(value: str) -> Literal["local", "ssh"]:
-    if value not in ("local", "ssh"):
-        raise ValueError(f"expected local or ssh, got {value!r}")
+def _target_kind(value: str) -> Literal["local", "ssh", "scaler"]:
+    if value not in ("local", "ssh", "scaler"):
+        raise ValueError(f"expected local, ssh or scaler, got {value!r}")
     return value
 
 
@@ -227,52 +251,69 @@ def _registry_value[Value](config: conf.ConfigRead, key: str, convert: Callable[
         raise ConfigError(f"{key}: {error} in {config.source}") from error
 
 
-def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> Target:
+def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> RegisteredTarget:
     if purpose is RegistryRead.PLACEMENT:
         require_target_name(name)
     kind = _registry_value(config, f"kind.{name}", _target_kind, purpose)
-    platform = _registry_value(config, f"platform.{name}", _target_platform, purpose)
     if kind == "local":
-        return LocalTarget(name, platform)
+        return LocalTarget(name, _registry_value(config, f"platform.{name}", _target_platform, purpose))
     key = f"settings.{name}"
     settings = _registry_value(config, key, lambda value: _settings_path(value, config.source), purpose)
     if purpose is RegistryRead.REQUIRE_SETTINGS_FILES and not settings.is_file():
         raise ConfigError(f"{key}: settings file does not exist: {settings}")
+    if kind == "scaler":
+        return ScalerTarget(name, settings)
     if name == "aws" or settings.name == "aws_target.conf":
         raise ConfigError("The permanent AWS builder was removed; use cloud gates")
-    return SshTarget(name, platform, settings)
+    return SshTarget(name, _registry_value(config, f"platform.{name}", _target_platform, purpose), settings)
 
 
-def read_targets(path: Path | None = None, *, selected: str = "",
+def pinned_target_names(configuration: conf.ConfigRead) -> tuple[str, ...]:
+    """Read the names that a caller can select explicitly."""
+    pinned = configuration.value("pinned_targets", str, default="", allow_blank=True)
+    return tuple(name for item in pinned.split(",") if (name := item.strip()))
+
+
+def read_targets(path: Path | None = None, *, selected: str = "", target_name: str = "",
                  purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES,
                  configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
                  ) -> tuple[Target, ...]:
-    registry = conf.path("build_targets") if path is None else path
-    current = COMMAND_CONFIGURATION.get()
-    complete = purpose is RegistryRead.REQUIRE_SETTINGS_FILES and not selected
-    use_cache = isinstance(configuration, conf.UseConfiguredValue)
-    if use_cache and isinstance(current, CommandConfiguration) and registry in current.targets:
-        registered = current.targets[registry]
-        if selected:
-            return tuple(target for target in registered if target.name == selected)
-        if complete:
-            return registered
+    """Read the targets that local and SSH commands can use."""
+    return tuple(target for target in read_registered_targets(path, selected=selected, target_name=target_name,
+        purpose=purpose, configuration=configuration) if not isinstance(target, ScalerTarget))
+
+
+def read_registered_targets(path: Path | None = None, *, selected: str = "", target_name: str = "",
+                            purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES,
+                            configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                            ) -> tuple[RegisteredTarget, ...]:
+    """Read the local, SSH, and scaler entries in the target registry."""
+    if selected and target_name and selected != target_name:
+        raise ConfigError("expected one selected target")
+    selected = selected or target_name
     if isinstance(configuration, conf.UseConfiguredValue):
-        configuration = conf.read(registry)
+        registry = conf.path("build_targets") if path is None else path
+        current = COMMAND_CONFIGURATION.get()
+        if isinstance(current, CommandConfiguration):
+            if registry not in current.configurations:
+                current.configurations[registry] = conf.read(registry)
+            configuration = current.configurations[registry]
+        else:
+            configuration = conf.read(registry)
     names = _registry_value(configuration, "targets", _target_names, purpose)
-    targets: list[Target] = []
-    for name in names:
+    pinned = bool(selected and selected not in names and selected in pinned_target_names(configuration))
+    targets: list[RegisteredTarget] = []
+    for name in (selected,) if pinned else names:
         if selected and name != selected:
             continue
         try:
-            targets.append(_read_target(configuration, name, purpose))
+            target = _read_target(configuration, name, purpose)
+            if not (pinned and isinstance(target, ScalerTarget)):
+                targets.append(target)
         except ConfigError:
             if selected or purpose is RegistryRead.REQUIRE_SETTINGS_FILES:
                 raise
-    result = tuple(targets)
-    if complete and use_cache and isinstance(current, CommandConfiguration):
-        current.targets[registry] = result
-    return result
+    return tuple(targets)
 
 
 def configured_ssh_target(target: str) -> SshTarget:
@@ -280,6 +321,8 @@ def configured_ssh_target(target: str) -> SshTarget:
     for configured in read_targets(selected=target, purpose=RegistryRead.PLACEMENT):
         if configured.name == target and isinstance(configured, SshTarget):
             require_target_name(target)
+            if target == "hana-gpu" and not configured.settings.is_file():
+                raise ConfigError(f"settings.{target}: settings file does not exist: {configured.settings}")
             return configured
     raise ConfigError(f"unknown SSH target: {target}")
 
@@ -289,9 +332,11 @@ def read_execution_transport(target: SshTarget, *,
                              ) -> ExecutionTransport:
     """Select the transport before reading connection settings."""
     def transport_kind(value: str) -> str:
-        if value != "ssh" and (value != "hana-control" or target.platform != "linux"):
-            raise ValueError("expected ssh or Linux hana-control")
-        return value
+        if value == "ssh" or (target.platform == "linux" and value == "hana-control"):
+            return value
+        if value == "hana-gpu" and target.platform == "linux" and target.name == "hana-gpu":
+            return value
+        raise ValueError("expected ssh, Linux hana-control, or the Linux hana-gpu target")
 
     def reporting_host(value: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
@@ -299,7 +344,11 @@ def read_execution_transport(target: SshTarget, *,
         return value
 
     settings = conf.read(target.settings) if isinstance(configuration, conf.UseConfiguredValue) else configuration
-    if settings.value("execution_transport", transport_kind, default="ssh") == "ssh":
+    transport = settings.value("execution_transport", transport_kind, default="ssh",
+                               recover_invalid=target.name != "hana-gpu")
+    if transport == "hana-gpu":
+        return HanaGpuNextestTransport(target.settings, target.name)
+    if transport == "ssh":
         return SshCommandTransport(target.settings)
     return HanaControlTransport(target.settings, settings.value("host", reporting_host))
 
@@ -307,10 +356,10 @@ def read_execution_transport(target: SshTarget, *,
 def command_target_name(given: str | None) -> str:
     """Resolve a positional target for clear, drain, or release."""
     configuration = conf.read_or_repository("build_targets")
-    configured = read_targets(configuration.source)
     selected = given if given is not None else configuration.text("default_target")
+    configured = read_targets(selected="" if selected == "all" else selected, configuration=configuration)
     names = {target.name for target in configured}
     names.update(key.removeprefix("sync.hosts.") for key in configuration.values() if key.startswith("sync.hosts."))
     if selected != "all" and selected not in names:
-        raise ConfigError(f"unknown target {selected}; configured targets: {', '.join(target.name for target in configured)}")
+        raise ConfigError(f"unknown target {selected}")
     return selected

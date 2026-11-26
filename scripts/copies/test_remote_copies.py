@@ -3,12 +3,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
+from dataclasses import replace
 import fcntl
 import io
 import json
 import os
 import select
+import shlex
 import shutil
 from pathlib import Path
 import signal
@@ -24,18 +26,19 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
-from scripts.lib import conf, file_lock
+from scripts.lib import conf, file_lock, scratch
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.mac_test import floor_claims
+from scripts.mac_test import floor_claims, mac_gate
 from scripts.lint import tmp_sweep
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS
 
 
 def expected_remote_lease_columns(state: str, session: str, holder_pid: str) -> tuple[str, str, str]:
@@ -57,7 +60,7 @@ class RemoteCopiesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
-        private = private_slot_config(self.root, repository="repository", maximum=2)
+        private = private_copy_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.source = ImmutableGitSeed.create(self.root, "main", "Copy Tests", "copy@example.invalid",
                                              {"Cargo.toml": "[workspace]\n", "source.txt": "committed\n", "stable.txt": "stable\n"}).checkout
@@ -83,6 +86,110 @@ class RemoteCopiesTests(unittest.TestCase):
         owner = fixture_member("unit", name="mirror-owner", parent=parent.id)
         holder = fixture_worker("live-holder", owner.id)
         return owner, holder
+
+    def test_mac_gate_reconciles_only_selected_mirrors_without_removal_markers(self) -> None:
+        shim = Path.home() / ".claude/scripts/lib/py"
+        shim.parent.mkdir(parents=True)
+        shim.symlink_to(sys.executable)
+        def gate_path(label: str) -> str:
+            return f"gate-mac-gate-{label}-mac-gate-ab12"
+
+        present = gate_path("present")
+        (self.root / present).mkdir()
+        dangling = self.root / gate_path("dangling")
+        dangling.symlink_to(self.root / "missing link target")
+        dangling_path = str(dangling) + "/"
+        gone = str(self.root / gate_path("gone"))
+        custom_gone = str(self.root / "checkout from a custom scratch pattern")
+        held, deferred, replacement, late_held, other_host, authority, removal, cargo = (
+            gate_path(label) for label in ("held", "deferred", "replacement", "late_held", "other_host",
+                                            "authority", "removal", "cargo"))
+        ordinary = "gate-ordinary-mac-gate-ab12"
+        taskless = gate_path("unrelated")
+        names = (present, dangling_path, gone, held, deferred, replacement, late_held, other_host,
+                 authority, removal, cargo, custom_gone, ordinary, taskless)
+        mirrors = {name: replace(self.remote(path=name), task="gate:mac-gate-fixture") for name in names}
+        for name in (ordinary, taskless):
+            mirrors[name] = self.remote(path=name)
+        mirrors[other_host] = replace(mirrors[other_host], host="another-host")
+        for marker in (floor_claims.removal_authority_path(self.root / authority),
+                       scratch.removal_mark(self.root / removal),
+                       scratch.cargo_removal_mark(self.root / cargo)):
+            marker.touch()
+        records = {name: copies.remote_record_path(mirror) for name, mirror in mirrors.items()}
+        with mock.patch.object(copies, "remove_deferred_mirrors"):
+            for mirror in mirrors.values():
+                copies.register_remote(mirror)
+        fields = cast(dict[str, object], json.loads(records[deferred].read_text()))
+        fields["removal"] = "deferred"
+        write_text_atomic(records[deferred], json.dumps(fields))
+        self.assertNotIn("task", cast(dict[str, object], json.loads(records[taskless].read_text())))
+
+        run = subprocess.run
+        current = gate_path("current")
+        (self.root / current).mkdir()
+        trigger = replace(self.remote(path=current), task="gate:mac-gate-current")
+        probed = (current, present, dangling_path, gone, replacement, late_held, authority, removal, cargo, custom_gone)
+        mirrors[current] = trigger
+        with ExitStack() as locks, mock.patch.object(copies, "remove_deferred_mirrors") as remove_deferred:
+            def ssh(command: list[str], *, capture_output: bool, text: bool,
+                    timeout: float) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(command[0], "ssh")
+                self.assertEqual(command[-2], trigger.host)
+                self.assertTrue(text and capture_output)
+                self.assertEqual(timeout, 5)
+                remove_deferred.assert_called_once_with(trigger.host)
+                self.assertEqual(set(shlex.split(command[-1])[3:]), set(probed))
+                for name in probed:
+                    lease = copies.remote_lease_path(mirrors[name])
+                    with file_lock.exclusive(lease, wait=False) as state:
+                        self.assertIs(state, file_lock.LockResult.ACQUIRED)
+                fields = cast(dict[str, object], json.loads(records[replacement].read_text()))
+                fields["last_use"] = 2
+                write_text_atomic(records[replacement], json.dumps(fields))
+                late_lease = copies.remote_lease_path(mirrors[late_held])
+                self.assertIs(locks.enter_context(file_lock.exclusive(late_lease, wait=False)),
+                              file_lock.LockResult.ACQUIRED)
+                return run(["/bin/sh", "-c", command[-1]], capture_output=capture_output, text=True, timeout=timeout)
+
+            held_lock = copies.remote_lease_path(mirrors[held])
+            self.assertIs(locks.enter_context(file_lock.exclusive(held_lock, wait=False)),
+                          file_lock.LockResult.ACQUIRED)
+            with mock.patch.object(subprocess, "run", side_effect=ssh) as probe:
+                copies.register_remote(trigger)
+                probe.assert_not_called()
+                copies.reconcile_remote_mirrors(trigger.host, mac_gate.is_mac_gate_checkout)
+                probe.assert_called_once()
+        for name, record in records.items():
+            self.assertEqual(record.exists(), name not in (gone, custom_gone), name)
+        self.assertTrue(copies.remote_record_path(trigger).exists())
+        self.assertTrue((self.root / present).is_dir())
+        self.assertTrue(dangling.is_symlink())
+
+        for failure in (subprocess.CompletedProcess(["ssh"], 255, "", "fixture disconnect"),
+                        subprocess.TimeoutExpired("ssh", 5)):
+            def failed_ssh(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                self.assertNotIn(ordinary, shlex.split(command[-1])[3:])
+                self.assertNotIn(taskless, shlex.split(command[-1])[3:])
+                if isinstance(failure, subprocess.TimeoutExpired):
+                    raise failure
+                return failure
+
+            with (self.subTest(failure=failure), redirect_stderr(io.StringIO()) as errors,
+                  mock.patch.object(subprocess, "run", side_effect=failed_ssh) as probe):
+                copies.reconcile_remote_mirrors(trigger.host, mac_gate.is_mac_gate_checkout)
+                probe.assert_called_once()
+                lines = errors.getvalue().splitlines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertTrue(lines[0].startswith("anomaly:"))
+                self.assertTrue(all(record.exists() for name, record in records.items() if name not in (gone, custom_gone)))
+                self.assertTrue(copies.remote_record_path(trigger).exists())
+
+    def test_remote_mirror_record_rejects_non_string_task(self) -> None:
+        row = {"kind": "remote-mirror", "owner": "alpha", "repo": "repository",
+               "host": "host", "path": "mirror/repository", "session": "holder-session", "task": 1}
+        with self.assertRaisesRegex(ValueError, "invalid remote mirror task"):
+            _ = copies.decode_remote_mirror(json.dumps(row))
 
     def test_list_reports_remote_only_held_idle_and_missing_lease_records(self) -> None:
         owner, holder = self.list_members()
@@ -320,7 +427,7 @@ class RemoteCopiesTests(unittest.TestCase):
         )
         for cause, status, remote_output, detail in cases:
             with self.subTest(cause=cause), mock.patch.dict(os.environ, {**copies_environment(self.root / cause),
-                    **private_slot_config(self.root / cause, repository="repository").environment}):
+                    **private_copy_config(self.root / cause).environment}):
                 mirrors = [self.remote(path=f"mirror/{cause}-{index}") for index in range(2)]
                 for mirror in mirrors:
                     copies.register_remote(mirror)
@@ -352,7 +459,7 @@ class RemoteCopiesTests(unittest.TestCase):
             root = self.root / action
             root.mkdir()
             with self.subTest(action=action), local_remote_transport(root), \
-                    mock.patch.dict(os.environ, private_slot_config(root, repository="repository").environment), \
+                    mock.patch.dict(os.environ, private_copy_config(root).environment), \
                     warm_claim_servers(), ExitStack() as contexts:
                 mirror = self.remote(path=str(root / "mirror"))
                 self.assertEqual(publish_mirror(mirror), 0)
@@ -477,6 +584,128 @@ class RemoteCopiesTests(unittest.TestCase):
         finally:
             os.kill(pid, signal.SIGKILL)
 
+    def mirror_receiver(self, session: str, *command: str) -> list[str]:
+        script = Path(copies.__file__).resolve()
+        return [sys.executable, str(script), "mirror-receive", "--path", str(self.mirror), "--owner", "alpha",
+                "--repository", "repository", "--session", session, "--", *command]
+
+    def test_cut_receiver_ends_its_children_and_releases_the_lease(self) -> None:
+        program = """\
+import os, signal
+assert not os.isatty(0)
+child = os.fork()
+if child:
+    print(os.getpid(), child, flush=True)
+signal.pause()
+"""
+        unrelated = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
+        receiver: subprocess.Popen[str] = subprocess.Popen(self.mirror_receiver("cut-session", sys.executable, "-c", program),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        children: tuple[int, ...] = ()
+        try:
+            assert receiver.stdin is not None and receiver.stdout is not None
+            self.assertTrue(select.select([receiver.stdout], [], [], 10)[0], "The receiver did not start")
+            children = tuple(map(int, cast(str, receiver.stdout.readline()).split()))
+            self.assertEqual(len(children), 2)
+            self.assertEqual(os.getsid(unrelated.pid), os.getsid(receiver.pid))
+            with self.assertRaisesRegex(copies.CopyError, "cut-session"):
+                with copies.local_mirror_lease(self.mirror, "busy-check"):
+                    self.fail("The active receiver lost its lease")
+
+            receiver.stdin.close()
+            try:
+                status = receiver.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.fail("The receiver stayed alive after the channel closed")
+            self.assertNotEqual(status, 0)
+            self.assertTrue(select.select([receiver.stdout], [], [], 5)[0], "A child kept the channel open")
+            self.assertEqual(receiver.stdout.read(1), "")
+            children = ()
+            self.assertIsNone(unrelated.poll())
+
+            with subprocess.Popen(self.mirror_receiver("next-session", sys.executable, "-c", "pass"), stdin=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) as next_receiver:
+                try:
+                    self.assertEqual(next_receiver.wait(timeout=5), 0)
+                finally:
+                    if next_receiver.poll() is None:
+                        next_receiver.kill()
+        finally:
+            if receiver.poll() is None:
+                receiver.kill()
+            _ = receiver.wait(timeout=5)
+            for pid in reversed(children):
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+            for stream in (receiver.stdin, receiver.stdout, receiver.stderr):
+                if stream is not None:
+                    stream.close()
+            if unrelated.poll() is None:
+                unrelated.kill()
+            _ = unrelated.wait(timeout=5)
+
+    @unittest.skipUnless(sys.platform == "linux", "The test uses pidfds to confirm process exit")
+    def test_cut_receiver_ends_its_child_after_the_leader_exits(self) -> None:
+        program = """\
+import os, signal
+child = os.fork()
+if child:
+    print(os.getpid(), child, flush=True)
+    assert os.read(0, 1) == b"x"
+    os._exit(23)
+signal.pause()
+"""
+
+        def stop_child(descriptor: int) -> None:
+            with suppress(ProcessLookupError):
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+
+        command = self.mirror_receiver("cut-session", sys.executable, "-c", program)
+        with (subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as receiver,
+              ExitStack() as descriptors):
+            try:
+                assert receiver.stdin is not None and receiver.stdout is not None
+                self.assertTrue(select.select([receiver.stdout], [], [], 10)[0], "The receiver did not start")
+                leader, child = map(int, cast(str, receiver.stdout.readline()).split())
+                child_exit = os.pidfd_open(child)
+                _ = descriptors.callback(os.close, child_exit)
+                _ = descriptors.callback(stop_child, child_exit)
+                leader_exit = os.pidfd_open(leader)
+                _ = descriptors.callback(os.close, leader_exit)
+                _ = receiver.stdin.write("x")
+                receiver.stdin.flush()
+                self.assertTrue(select.select([leader_exit], [], [], 5)[0], "The leader did not exit")
+                with self.assertRaisesRegex(copies.CopyError, "cut-session"):
+                    with copies.local_mirror_lease(self.mirror, "busy-check"):
+                        self.fail("The active child lost its lease")
+                self.assertEqual(os.getpgid(leader), leader, "The receiver reaped the leader")
+
+                receiver.stdin.close()
+                self.assertEqual(receiver.wait(timeout=5), 23)
+                self.assertTrue(select.select([child_exit], [], [], 5)[0], "The child survived the channel cut")
+                with copies.local_mirror_lease(self.mirror, "after-cut"):
+                    pass
+            finally:
+                if receiver.poll() is None:
+                    receiver.kill()
+
+    def test_normal_remote_rsync_releases_the_receiver_lease(self) -> None:
+        mirror = self.remote(path=str(self.mirror))
+        exclude = self.root / "excludes"
+        exclude.touch()
+        ssh = self.root / "ssh"
+        _ = ssh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$*"\n')
+        ssh.chmod(0o700)
+        command = copies.remote_rsync(self.source, mirror, exclude, [])
+        command[command.index("-e") + 1] = shlex.quote(str(ssh))
+        receiver = shlex.join(self.mirror_receiver(mirror.session, "rsync"))
+        command = [f"--rsync-path={receiver}" if word.startswith("--rsync-path=") else word for word in command]
+        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.mirror / "source.txt").read_text(), "committed\n")
+        with copies.local_mirror_lease(self.mirror, "after-transfer"):
+            self.assertTrue((self.mirror / ".copy-record.json").exists())
+
     def test_surviving_process_without_an_inherited_descriptor_keeps_metadata(self) -> None:
         copies.probe_remote_folder(str(self.mirror))
         child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"], cwd=self.mirror)
@@ -537,9 +766,13 @@ class RemoteCopiesTests(unittest.TestCase):
                     self.assertIs(state, file_lock.LockResult.BUSY)
             real_write(path, content)
 
-        with mock.patch.object(floor_claims, "read_claims", side_effect=claims), \
-                mock.patch.object(copies, "write_text_atomic", side_effect=record):
+        with (mock.patch.object(floor_claims, "read_claims", side_effect=claims),
+              mock.patch.object(copies, "write_text_atomic", side_effect=record),
+              mock.patch.object(copies, "local_mirror_lease", wraps=copies.local_mirror_lease) as lease):
             self.assertEqual(copies.mirror_run(args), 0)
+        lease.assert_called_once_with(self.mirror, "receiver-session", create_tree=False)
+        with copies.local_mirror_lease(self.mirror, "after-transfer"):
+            pass
         metadata = self.mirror / ".copy-record.json"
         self.assertIn('"owner": "alpha"', metadata.read_text())
         self.assertTrue((self.mirror / ".mac-test-mirror").exists())
@@ -553,7 +786,7 @@ class RemoteCopiesTests(unittest.TestCase):
                 return_value=target_config.SshTarget(name, platform, self.root / "settings")):
                 request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                                 target=name, owner="alpha", holder_session="session")
-                config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1), 1, 1, 1, "1", {})
+                config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS), 1, 1, 1, "1", {})
                 mirror = offload.request_mirror(config, request, eligibility.KnownRepository("repository"))
                 self.assertEqual(mirror.owner, "alpha")
                 self.assertEqual(mirror.repository, copies.SelectedRepository("repository"))
@@ -613,14 +846,16 @@ class RemoteCopiesTests(unittest.TestCase):
         self.mirror.mkdir(parents=True)
         with self.open_file_process(self.root / "outside/output") as child:
             copies.mark_mirror(self.mirror, "alpha", "repository", "group-session", process_group=os.getpgid(child.pid))
-            cwd = Path("/proc") / str(child.pid) / "cwd"
+            cwd = f"/proc/{child.pid}/cwd"
+            cwd_paths = (cwd, os.fsencode(cwd))
             readlink = os.readlink
 
-            def unreadable_readlink(path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-                                    *, dir_fd: int | None = None) -> str:
-                if os.fsdecode(path) == str(cwd):
+            def unreadable_readlink[PathText: (str, bytes)](
+                path: PathText | os.PathLike[PathText], *, dir_fd: int | None = None,
+            ) -> PathText:
+                if os.fspath(path) in cwd_paths:
                     raise PermissionError(str(path))
-                return readlink(os.fsdecode(path), dir_fd=dir_fd)
+                return readlink(path, dir_fd=dir_fd)
 
             with mock.patch.object(os, "readlink", unreadable_readlink):
                 with self.assertRaisesRegex(copies.CopyError, "busy.*group-session"):
@@ -696,7 +931,7 @@ class RemoteCopiesTests(unittest.TestCase):
         _ = python.write_text(f"#!{sys.executable}\n" + f"""import sys
 from pathlib import Path
 from scripts.copies import copies
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.mac_test import floor_claims
 log = Path({str(log)!r})
 with log.open('a') as output:

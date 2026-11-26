@@ -14,7 +14,7 @@ import unittest
 from scripts.direct import review_launcher_test_support as support
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
-from scripts.direct.local_release_wait import IntervalReleasePolling
+from scripts.lib.release_waiter import IntervalReleasePolling
 from pathlib import Path
 from typing import cast
 import json
@@ -270,10 +270,13 @@ exec bash "''' + str(agent_exec) + '''" "$@"
         _ = self.prompt_file.write_text("Phase 3 — Retry handling\nReview the diff.\n")
         stub = self.root / "scripts" / "agents" / "agent_exec.sh"
         with stub.open("a") as output:
-            _ = output.write('printf "%s|%s" "$UNIT_RUN_DIR" "$UNIT_TEAM_ROLE" > "$UNIT_RUN_DIR/wait-context"\n')
+            _ = output.write('printf "%s|%s|%s" "$UNIT_RUN_DIR" "$UNIT_TEAM_ROLE" "$UNIT_PHASE_ID" '
+                             + '> "$UNIT_RUN_DIR/wait-context"\n')
         result = self.checked_review(session, "--phase", "3")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((session / "wait-context").read_text(), f"{session}|")
+        slot = (session / "phases/3/review_slot").read_text().strip()
+        self.assertTrue(slot)
+        self.assertEqual((session / "wait-context").read_text(), f"{session}|{slot}|3")
 
     def test_interpreter_cache_reuses_the_resolved_python_without_a_version_probe(self) -> None:
         launcher = self.root / "scripts" / "lib" / "py"

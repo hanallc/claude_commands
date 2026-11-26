@@ -11,6 +11,7 @@ import time
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import hana_guest, ledger, remote
+from scripts.aws_target.config import AwsOn, aws_switch
 from scripts.lib import conf
 
 
@@ -44,28 +45,39 @@ def _positive_amount(value: str) -> Decimal:
     return amount
 
 
-def _read_start_settings(configuration: conf.ConfigRead, *, enabled: bool, permit_max_seconds: int
-                         ) -> StartPermitSettings:
-    instance_type = configuration.text('instance_type')
-
+def read_fallback_instance_types(configuration: conf.ConfigRead, instance_type: str) -> tuple[str, ...]:
     def fallback_types(value: str) -> tuple[str, ...]:
         types = tuple(item.strip() for item in value.split(','))
         if not all(types) or len(set((instance_type, *types))) != 1 + len(types):
             raise ValueError('expected distinct types and no empty items')
         return types
 
+    return configuration.value('fallback_instance_types', fallback_types)
+
+
+def _read_start_settings(configuration: conf.ConfigRead, *, enabled: bool, permit_max_seconds: int
+                         ) -> StartPermitSettings:
+    instance_type = configuration.text('instance_type')
     return StartPermitSettings(enabled, configuration.text('region'), instance_type,
-        configuration.value('fallback_instance_types', fallback_types),
+        read_fallback_instance_types(configuration, instance_type),
         configuration.value('spot_max_usd_per_hour', _positive_amount),
         configuration.value('root_gib', conf.positive_whole), configuration.value('data_gib', conf.positive_whole),
         configuration.value('daily_budget_usd', _positive_amount),
         configuration.value('gp3_usd_per_gib_month', _positive_amount), permit_max_seconds)
 
 
+def _hana_on(configuration: conf.ConfigRead) -> bool:
+    """Read the Hana switch through aws_switch: an unattended reader counts an invalid value as off.
+
+    On natedev, the enabled value that hana_guest.read_settings gives is not used."""
+    return isinstance(aws_switch(configuration), AwsOn)
+
+
 def read_settings(configuration: conf.ConfigRead) -> PermitSettings:
     """Read spending and guest safety limits before execution."""
     safety = hana_guest.read_settings(configuration)
-    start = _read_start_settings(configuration, enabled=safety.enabled, permit_max_seconds=safety.permit_max_seconds)
+    start = _read_start_settings(configuration, enabled=_hana_on(configuration),
+                                 permit_max_seconds=safety.permit_max_seconds)
     return PermitSettings(start.enabled, start.region, start.instance_type, start.fallback_instance_types,
         start.spot_max_usd_per_hour, start.root_gib, start.data_gib, start.daily_budget_usd,
         start.gp3_usd_per_gib_month, start.permit_max_seconds, safety.guard_grace_seconds)
@@ -166,7 +178,7 @@ class _PlacementPreview:
             self.cached = _NoPlacementPreview()
             with conf.diagnostics() as configuration_warnings:
                 permit = hana_guest.read_permit_window(configuration)
-                settings = _read_start_settings(configuration, enabled=permit.enabled,
+                settings = _read_start_settings(configuration, enabled=_hana_on(configuration),
                                                 permit_max_seconds=permit.permit_max_seconds)
                 try:
                     max_age = configuration.whole('preview_max_age_s')
@@ -287,7 +299,8 @@ class HanaSpending[Settings: StartPermitSettings]:
         proposed = ledger.HanaComputeExposure(active[0].at if active else now, expires, generation,
             max(active[0].usd_per_hour, self.settings.spot_max_usd_per_hour) if active else self.settings.spot_max_usd_per_hour,
             instance_type=active[0].instance_type if active else self._provisioned_instance_type(),
-            region=active[0].region if active else self.settings.region)
+            region=active[0].region if active else self.settings.region,
+            observed_active=active[0].observed_active if active else False)
         compute = [row for row in state.hana_compute if isinstance(row.state, ledger.HanaExposureClosed)]
         storage = list(state.hana_storage)
         if not any(isinstance(row.state, ledger.HanaExposureOpen) for row in storage):
@@ -371,7 +384,11 @@ class HanaSpending[Settings: StartPermitSettings]:
             if generation != current_generation:
                 return
             fence = state.hana_lifecycle_fence
+            active = observed in ('pending', 'running', 'stopping', 'shutting-down')
             if isinstance(fence, ledger.HanaLifecycleFence) and now <= fence.at:
+                if now == fence.at and active:
+                    state.hana_compute = [replace(row, observed_active=True)
+                        if isinstance(row.state, ledger.HanaExposureOpen) else row for row in state.hana_compute]
                 return
             latest = max((row.at for row in (*state.hana_compute, *state.hana_storage)), default=0)
             latest = max([latest, *(row.state.at for row in (*state.hana_compute, *state.hana_storage)
@@ -384,12 +401,14 @@ class HanaSpending[Settings: StartPermitSettings]:
                     return
                 state.hana_compute = [replace(row, state=ledger.HanaExposureClosed(now))
                     if isinstance(row.state, ledger.HanaExposureOpen) else row for row in state.hana_compute]
-            elif observed in ('pending', 'running', 'stopping', 'shutting-down'):
+            elif active:
+                state.hana_compute = [replace(row, observed_active=True)
+                    if isinstance(row.state, ledger.HanaExposureOpen) else row for row in state.hana_compute]
                 if not any(isinstance(row.state, ledger.HanaExposureOpen) for row in state.hana_compute):
                     current_generation += 1
                     state.hana_compute.append(ledger.HanaComputeExposure(now, now + self.settings.guard_grace_seconds,
                         current_generation, self.settings.spot_max_usd_per_hour,
-                        instance_type=self._provisioned_instance_type(), region=self.settings.region))
+                        instance_type=self._provisioned_instance_type(), region=self.settings.region, observed_active=True))
                 if not any(isinstance(row.state, ledger.HanaExposureOpen) for row in state.hana_storage):
                     state.hana_storage.append(ledger.HanaStorageExposure(now, self.settings.storage_usd_per_month))
             state.hana_lifecycle_fence = ledger.HanaLifecycleFence(now, current_generation)

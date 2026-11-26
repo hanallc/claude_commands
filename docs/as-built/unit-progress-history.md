@@ -31,9 +31,12 @@ The live session cache remains in
 `<run root>/<run-id>/progress_history_state.json`. The run root is `/session/<name>/run` for a run made in a session folder, else `/tmp/claude/unit` (`/tmp/claude/delegate` for a run started before the folder rename). Deleting `/tmp`
 does not remove the durable event stream.
 
+The guard refuses old recorder state with a root `phase_last_percent` key.
+The warning gives the path to the state file and names no command.
+
 ## Configuration digest
 
-`_config_digest` hashes the exact model registry text and `direct.conf` bytes once per recorder process.
+`config_digest` hashes the exact model registry text and `direct.conf` bytes at each call. A call costs about 30 microseconds, and verify_helper.py can run many recorder commands in one process.
 It uses the inherited [launch configuration](agent-registry.md#configuration-lifetimes) when present.
 Without that configuration, it reads the registry through `registry_text` without catalog synchronization or publication.
 The same text and direct settings produce the same digest.
@@ -56,7 +59,7 @@ Staffed run state stores no director session, director family, or dispatch parti
 Current reads resolve those facts through the fixed staff references.
 Native transcript evidence supplies the director family.
 Shared account-home discovery includes numbered Codex accounts when staff has no session home.
-Active readers obtain the current folder through `plan_history.staff_directory`.
+Active readers obtain the current folder through `pass_record.staff_directory`.
 They do not route through saved folder copies or an absolute plan path.
 `start-run` with a plan calls `unit_config.set_plan` on the unit's existing `.unit.toml`.
 `start-run` with a different plan on an existing run records that plan and its project clock.
@@ -232,14 +235,18 @@ whether the calibration helped and continue tuning that original estimate.
 Stable finding identities preserve accepted verdicts across reviews.
 
 State lives in `findings_state.json` beside the progress state and holds the
-ledger of the newest open phase. When the current phase changes, the ledger it
-displaces is copied to `findings_state-<instance_id>.json` and read back when
+ledger of the newest open phase. When the newest open phase changes, its previous ledger is copied to `findings_state-<instance_id>.json` and read back when
 that phase is current again; a phase with no ledger yet starts fresh. Every
 command takes `--phase <id>`: a named older open phase reads and writes its
 parked file, so its repair never moves the newest phase's ledger. A named phase
 that is not open exits with `Phase <id> is not open (open phases: …)`; with two
 or more open and none named, `<N> phases are open (<ids>); name one with
---phase`. `assign_claude.py` passes the assigned phase to `landed` and `abandon`. Findings get stable
+--phase`. `decision` and `status` also take a closed phase by its newest ledger.
+`open` takes a late finding for a closed phase: it writes the parked ledger of
+the newest instance that the run started, which `review-trial` reads.
+`open --accepted` records a late finding that is already fixed, with the
+`finding_verdict` event that `verdict` writes. It refuses an open or unnamed
+phase and `--held-for-decision`. `assign_claude.py` passes the assigned phase to `landed` and `abandon`. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the unit director has to make.
 Repair states are `open`, `repair_in_flight`, `fixed_pending_review`, `accepted`, and `routed`.
@@ -268,12 +275,12 @@ The ledger enforces these batch rules:
   naming the hunk that invalidated it.
 
 Advisories, checked in this order and reported in `advisory` beside a `dispatch`
-verdict: a finding reopened `MAX_REOPENS` times after being accepted; a finding
-that failed to close after `MAX_FIX_ATTEMPTS` repair attempts; `STALLED_ROUNDS`
+verdict: a finding reopened `max_reopens` times after being accepted; a finding
+that failed to close after `max_fix_attempts` repair attempts; `stalled_rounds`
 consecutive rounds with no decrease in the gating-open count;
-`MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row; more than
-`MAX_REVIEW_CANCELLATIONS` review cancellations; a spent repair budget; the
-`RUNAWAY_ROUNDS` backstop.
+`max_consecutive_same_kind_passes` passes of one kind in a row; more than
+`max_review_cancellations` review cancellations; a spent repair budget; the
+`runaway_rounds` backstop.
 
 These advisories describe repair cost and progress.
 They do not stop the phase.
@@ -281,11 +288,11 @@ The director reports the advisory and continues through the repair rules.
 An unchanged open count can describe new findings or repeated failed repairs, so the count alone cannot decide when to stop.
 
 The repair budget is the first round's gating count times
-`REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`. All of these
+`repair_rounds_per_finding`, never below `min_repair_budget`. All of these
 limits are set in `~/.claude/config/direct.conf` and read by `findings.py` at startup.
 An absent or unusable required value exits 2.
 The budget and convergence limits control advisories.
-`ROUTING_FROM_ROUND=4` and `ASTRA_AFTER_FAILED_FIXES=2` enforce repair evidence.
+`routing_from_round=4` and `astra_after_failed_fixes=2` enforce repair evidence.
 From round four, each kept finding needs its category and evidence.
 A due Astra record applies to the finding's current fix-attempt count.
 Every dispatch records affected accepted checks or an explicit reason for none.
@@ -312,7 +319,7 @@ The parser requires three parts and nonblank run and finding ids.
 It accepts an empty phase instance id and preserves the `finding_route_closed` event format.
 
 ```text
-findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by worker|main|both [--file <path>] [--line <N>] [--detail <text>]
+findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by worker|main|both [--file <path>] [--line <N>] [--detail <text>] [--accepted]
 findings.py verdict --session-dir <dir> [--phase <id>] --id <F00N> --state accepted|still_open|reopened [--evidence <hunk>]
 findings.py gate --session-dir <dir> [--phase <id>]
 findings.py dispatch --session-dir <dir> [--phase <id>] --covers F001,F002,... --accepted-checks "<checks or none: reason>" [--keep F001=<category>:<evidence>]
@@ -322,14 +329,15 @@ findings.py status --session-dir <dir> [--phase <id>]
 ```text
 progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-doc <path>]
 progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>] [--started-at <ISO with zone>]
-progress_history.py start-pass ...        # launcher only
-progress_history.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
-progress_history.py start-activity --session-dir <dir> --label <label> --activity <text>
-progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
+pass_record.py start-pass ...        # launcher only
+pass_record.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
+progress_history.py start-activity --session-dir <dir> --label <label> --activity <text> [--started-at <ISO with zone>]
+progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>] [--finished-at <ISO with zone>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>] [--tables]
 progress_history.py eta --session-dir <dir> --time <t> [--phase-id <id>] [--earliest <t> --latest <t>] --basis stated|checkpoint|eta-command
 progress_history.py finish-phase --session-dir <dir> --status completed|stopped|error [--phase-id <id>] [--finished-at <ISO with zone>]
+progress_history.py checkpoint --session-dir <dir> --phase-id <id> --commit <full hash> --closed  # Record a missed checkpoint for a finished phase.
 progress_history.py drop-phase --session-dir <dir> --phase-id <id> --reason <text>
 progress_history.py finish-run ...
 progress_history.py review-trial --session-dir <dir> [--phase-id <id>]
@@ -346,25 +354,37 @@ It refuses an unknown phase, a completed newest instance, or an empty reason.
 A repeat with the same reason changes nothing; a different reason adds a new event.
 The board shows no row for the dropped attempt.
 
-Phases can be open together. State holds the most recently started open phase
-under `phase` (what `progress`, `eta`, `start-pass`, `arm-review` and
-`findings.py` use) and the older open ones under `open_phases`, each carrying
-its own percent, calibration and early-review state under `parked`.
-An unchanged `start-phase` retry leaves the open phase and its records unchanged from any working directory.
-A changed title or explicit start time can trigger a restart refusal from another recorded worktree.
-Reopening a finished id removes its old worktree and baselines; the next claim records the worker's repository root, HEAD and status.
+The recorder stores all open phases in `open_phases`.
+Each entry owns its start, activity, early review, percent, and calibration.
+Passes, waits, and checkpoints identify the phase instance.
+The recorder retains the last closed phase for reports on work after closure.
+When it reads an older record, it moves the active phase and saved fields into the open list.
+
+Starting another phase leaves every open phase and its work unchanged.
+A retry with the same title and start keeps the existing phase instance.
+A changed title or start can cause a refusal from a different worktree.
+Reopening a phase clears its old worktree and baselines.
 A held reservation prevents this reset until its release is confirmed.
-Starting another id leaves every open phase open. A phase closes only by its own `finish-phase`:
-`--phase-id` names it, and without it the current one closes. Only that phase's
-passes close with it (each pass carries the phase it was opened in, under
-`phase`), and when the current phase closes, the newest older open phase is
-current again. `finish-run` closes every open phase, newest first. A back-fill
-is `start-phase --started-at` then `finish-phase --phase-id <id>
---finished-at`; both events carry `backfilled: true` and `recorded_at`, neither
-time may be in the future or the finish before the start, and the phase table's
-gap samples skip them. Findings recorded between the two calls go to the
-back-filled phase. A launcher names no phase, so a pass it starts belongs to
-the current phase.
+
+Use `--phase-id` to select a phase while several are open.
+An unnamed phase command selects the only open phase or lists the open IDs in its refusal.
+`finish-phase` closes only the selected phase, its passes, and its waits.
+`drop-phase` records the reason for a stopped attempt.
+`finish-run` finishes every open phase before it closes the run.
+Elapsed time spans each phase's own start and finish.
+
+Use `progress --all` to read each open phase's elapsed time, last recorded percent, and ETA.
+Use `progress --phase-id <id>` to assess one phase.
+Use `eta --phase-id <id>` to record a time for one phase.
+
+To record a past start or finish, use `--started-at` or `--finished-at`.
+Both events carry `backfilled: true` and `recorded_at`.
+The time must be in the past or present.
+The finish must follow the start.
+The phase table excludes those events from gap samples.
+`start-activity --started-at` and `finish-activity --finished-at` follow the same rules.
+An activity cannot start before its phase starts.
+A back-dated start closes the active activity as `interrupted` at that time, or at the present time if the active activity started later.
 
 For production plans, `start-phase`, every `progress` report, `finish-phase`,
 and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's

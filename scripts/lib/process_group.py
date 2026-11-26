@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import sys
-from collections.abc import Sequence
+import tempfile
+from collections.abc import Mapping, Sequence
+from contextlib import suppress
+from typing import IO
+
+STOP_WAIT_SECONDS = 10
 
 
 def check_process_group(pid: object) -> int:
@@ -20,8 +26,66 @@ def check_process_group(pid: object) -> int:
 
 
 def send_process_group(pid: object, signum: int) -> None:
-    """Check the group id and send; let the caller handle a missing group."""
-    os.killpg(check_process_group(pid), signum)
+    """Send a signal to a checked group."""
+    _send_checked_group(check_process_group(pid), signum)
+
+
+def terminate_owned_process_group() -> None:
+    """Send SIGTERM to the group that the caller leads."""
+    pid = os.getpid()
+    if pid <= 1 or pid != os.getpgrp():
+        raise ValueError("the caller must lead its process group")
+    _send_checked_group(pid, signal.SIGTERM)
+
+
+def run_process_group(command: Sequence[str], *, timeout: float,
+                      env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run a command in its own group and stop the whole group when it exits, fails or times out.
+
+    A browser leaves helper processes after its own exit or a timeout.
+    Output goes to files, so a helper that keeps a pipe open cannot delay the result.
+    """
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        # No context manager: its exit waits for the leader with no time limit.
+        process = subprocess.Popen(command, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
+        try:
+            _ = process.wait(timeout=timeout)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        finally:
+            stop_process_group(process)
+        result = subprocess.CompletedProcess(list(command), process.returncode, _text(stdout), _text(stderr))
+    if timed_out:
+        raise subprocess.TimeoutExpired(list(command), timeout, result.stdout, result.stderr)
+    return result
+
+
+def stop_process_group(process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
+    """Stop the group that a `start_new_session` child leads, then close its pipes."""
+    try:
+        with suppress(ProcessLookupError):
+            send_process_group(process.pid, signal.SIGTERM)
+        with suppress(subprocess.TimeoutExpired):
+            _ = process.wait(timeout=STOP_WAIT_SECONDS)
+        # The leader can exit before its child processes.
+        with suppress(ProcessLookupError):
+            send_process_group(process.pid, signal.SIGKILL)
+        with suppress(subprocess.TimeoutExpired):
+            _ = process.wait(timeout=STOP_WAIT_SECONDS)
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def _text(stream: IO[bytes]) -> str:
+    _ = stream.seek(0)
+    return stream.read().decode(errors="replace")
+
+
+def _send_checked_group(group: int, signum: int) -> None:
+    os.killpg(group, signum)
 
 
 def main(argv: Sequence[str]) -> int:

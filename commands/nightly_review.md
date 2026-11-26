@@ -10,7 +10,8 @@ Modes: `$ARGUMENTS`, done one at a time in the order given. Finish a mode, its r
 
 <Rules>
 - Read-only: write nothing outside DIR except `review.jsonl` dry sample records. No edits, commits, pushes, rebuilds or installs. A worktree only when a measurement needs a build that must not touch a working copy; remove it after. Remove each repository export or clone in DIR/work when its measurement ends; keep the reports and the files the ledger names.
-- Start research subagents when a candidate needs more evidence than you can gather directly.
+- Assign read-only research through `/showrunner:worker` when enrolled. Use the existing run directory for orders and replies.
+  Send write work to a unit. Before enrollment, start a research helper when a candidate needs more evidence.
 - Nobody is watching. A denied or failed action is a finding, not a blocker: note it and continue.
 - Read LEDGER first. A proposal marked declined comes back only with new evidence, named as such.
 </Rules>
@@ -51,5 +52,5 @@ Use the unit's fixed staff id from `staff.snapshot().by_current_session(staff.ca
 When the line has no gain tag, add the source tag after the title.
 Put the source tag before ` — proposed`.
 
-Then `SendMessage` to the address `~/.claude/scripts/lib/py ~/.claude/scripts/message/sessions.py address natedev` prints, which is natedev's session on this machine: first line `Nightly proposal ready: DIR/<mode>.md`, second line the title. If it prints nothing, natedev is not running: skip the message; `/next efficiency` reads every night's reports. After the last mode, stay open: the user may open its `nightly-review` tab in the `agents` herdr session to ask about it.
+Then send with `send.py --to <address> --from nightly-review` (/message) to the address `~/.claude/scripts/lib/py ~/.claude/scripts/message/sessions.py address natedev` prints, which is natedev's session on this machine: first line `Nightly proposal ready: DIR/<mode>.md`, second line the title. If it prints nothing, natedev is not running: skip the message; `/next efficiency` reads every night's reports. After the last mode, stay open: the user may open its `nightly-review` tab in the `agents` herdr session to ask about it.
 </Proposal>

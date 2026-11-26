@@ -381,7 +381,7 @@ deliverable do?" is the same under both options, it is not the user's decision.
 </FilterFindingsForUserReview>
 
 <DecisionPresentationTemplate>
-Every user-facing decision must use this structure:
+Use this structure for inline decisions and pending decisions in Work Orders. Apply `<RequiredSubSections/>` in the body.
 
 ```markdown
 **Decision N: <concrete thing to decide>**
@@ -396,7 +396,7 @@ What should change:
 - <recommended plan/code direction>
 
 Recommendation:
-<direct recommendation, with the exact phase/doc placement>
+<direct recommendation>
 
 Approve this direction, or modify it?
 ```
@@ -405,7 +405,8 @@ Do not present a finding as "the architect flagged X". The user should not have 
 </DecisionPresentationTemplate>
 
 <RequiredSubSections>
-When a decision needs source detail, include it inside `<DecisionPresentationTemplate/>` using these facts:
+For a proposed plan change, name the exact phase and location in the document.
+When the decision needs source details, include these facts in its body:
 
 1. **What the plan currently says** — quote the exact line(s) being changed.
 2. **What just shipped** — concrete files / types / line numbers; the gap that triggered the finding.
@@ -421,12 +422,10 @@ Write the decision using `<DecisionPresentationTemplate/>`. Ask once for approve
 **Applies to every turn this command shows the user** — inline decisions,
 `/adhoc_review` items, the Step 6 final update.
 
-**Read `~/.claude/docs/user_facing_explanation.md` and follow it.** It owns the
-principle the presentation rules here derive from — you do the reconstruction,
-not the user — plus the build order, naming, banned vocabulary, the
-comprehension gate, which decisions are worth the user's attention, and the
-choice-line format. `/unit:direct` and `/adhoc_review` share the same file, so
-the three cannot drift.
+**Read `~/.claude/docs/user_facing_explanation.md` and follow it.**
+Explain how the parts relate so the user can assess each item.
+Follow its build order, naming rules, comprehension gate, decision criteria, and choice-line format.
+`/unit:direct` and `/adhoc_review` use the same guide.
 </UserFacingText>
 
 <ExplainOnDemand>
@@ -447,7 +446,9 @@ same wording softened. Afterwards, restate the pending question and wait.
 </ExplainOnDemand>
 
 <DispatchAdhocReview>
-Invoke `/adhoc_review` with the filtered user decisions. Each item must already use `<DecisionPresentationTemplate/>` so the user can decide one at a time without translating abstract review language. Apply each user decision into the plan as the walkthrough completes that item.
+Prepare the filtered decisions with the shared ad hoc review template and reader test in `<UserFacingText/>`.
+Apply `<RequiredSubSections/>` in the body of each item.
+Invoke `/adhoc_review` with those items. Apply each decision to the plan when the user makes it.
 </DispatchAdhocReview>
 
 Write `${SESSION_DIR}/phase_review_outcomes_<phase>.md` instead of appending any

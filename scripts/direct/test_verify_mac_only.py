@@ -1,11 +1,13 @@
 """Mac-only verify routing through the existing offload fixture."""
 from __future__ import annotations
 
-import signal
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -14,6 +16,8 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_service as service, placement
+from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.direct import verify_mac_offload_test_support
 from scripts.direct.verify_mac_offload_test_support import (
     CARGO_STUB, VERIFY, VerifyMacOffloadFixture, install_fixed_cargo,
@@ -21,10 +25,58 @@ from scripts.direct.verify_mac_offload_test_support import (
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.build_folders_test_support import tool_folders
+from scripts.lint.memory_test_support import write_config_fixture
+
+
+_CARGO_REFERENCE = compile(CARGO_STUB, "cargo-reference", "exec")
 
 
 @final
 class VerifyMacOnlyTests(VerifyMacOffloadFixture):
+    @override
+    def build_fixture(self) -> None:
+        super().build_fixture()
+        # The class owns the bytecode cache. Each test restores source at the same path.
+        self.environment["PYTHONPYCACHEPREFIX"] = str(self.root.parent / "bytecode")
+        _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        _ = (self.root / "direct.conf").write_text(
+            "# whole: 1..\nverify_token_hold_seconds=3600\n"
+            + "# whole: 1..\nverify_token_renew_seconds=60\n"
+            + "# whole: 1..\ntoken_guard_attempts=200\n"
+            + "# whole: 1..\ntoken_guard_delay_ms=50\n"
+            + "verify_result_env_names=NO_COLOR CLICOLOR CLICOLOR_FORCE FORCE_COLOR CI TZ LANG "
+            + "LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME LC_ADDRESS "
+            + "LC_IDENTIFICATION LC_MEASUREMENT LC_NAME LC_PAPER LC_TELEPHONE\n"
+            + "verify_result_env_prefixes=HANA_ WGPU_ BEVY_ INSTA_ TRACE_\n"
+            + "verify_test_fixed_env=TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=verify COLUMNS=80 LINES=24\n",
+            encoding="utf-8",
+        )
+        mac_settings = (
+            "offload=on\nhost=mac\n"
+            + "# range: 5e-324..\nconnect_timeout_s=6\n"
+            + "# range: 5e-324..\nleftover_timeout_s=10\n"
+            + "# range: 5e-324..\nprobe_timeout_s=15\n"
+            + "# range: 5e-324..\nunreachable_backoff_s=300\n"
+            + "# range: 5e-324..\nfree_floor_gib=100\n"
+            + "# range: 5e-324..\nmirror_busy_backoff_s=120\n"
+            + "# whole: 1..\nabandoned_session_minutes=60\n"
+            + f"mac_budget_gib=24\nlinux_only.{self.root.name}=\n"
+        )
+        for path in (self.root / "mac_test.conf", Path(self.environment["MAC_TEST_CONFIG"])):
+            _ = write_config_fixture(path, mac_settings, template="mac_test")
+        _ = write_config_fixture(self.root / "build_folders.conf",
+                                 "# range: 0.001..60\nlocks.probe_wait_seconds=0.25\n"
+                                 + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
+        _ = write_config_fixture(self.root / "build_admission.conf",
+                                 "running_pass_seconds=1\nrequest_max_bytes=1048576\n")
+
+        repository = self.root / "parser-repository"
+        git = shutil.which("git")
+        assert git is not None
+        _ = subprocess.run([git, "init", "-q", str(repository)], env=self.environment,
+                           check=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = (repository / ".gitignore").write_text("target/\n")
+
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -36,11 +88,8 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
 
     def parser_results(self, cases: list[tuple[str, ...]]) -> list[subprocess.CompletedProcess[str]]:
         repository = self.root / "parser-repository"
-        repository.mkdir(exist_ok=True)
         git = shutil.which("git")
         assert git is not None
-        _ = subprocess.run([git, "init", "-q", str(repository)], check=True)
-        _ = (repository / ".gitignore").write_text("target/\n")
         output = self.root / "parser-results"
         output.mkdir(exist_ok=True)
         commands = ["set -u", shell_functions(VERIFY, "parse_routing_arguments")]
@@ -53,7 +102,8 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
                 + f"printf '%s' \"$?\" >{shlex.quote(str(output / f'{index}.status'))}"
             )
         environment = {**self.environment, "PATH": str(Path(git).parent) + os.pathsep + self.environment["PATH"]}
-        _ = subprocess.run(["bash", "-c", "\n".join(commands)], cwd=repository, env=environment, check=True)
+        _ = subprocess.run(["bash", "-c", "\n".join(commands)], cwd=repository, env=environment,
+                           check=True, timeout=TEST_HANG_GUARD_SECS)
         return [
             subprocess.CompletedProcess(
                 arguments, int((output / f"{index}.status").read_text()),
@@ -91,9 +141,25 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         """Check caller routing through the real placement command."""
         return self.verify("test", "sample", "--mac", "needs macOS", "--no-cache")
 
+    def _cargo_reference(self, arguments: tuple[str, ...], environment: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+        argv = ["cargo-reference", *arguments]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        admission = caller_admission(self, self.root, self.environment)
+        with (admission.loop_turn(), mock.patch.dict(os.environ, environment, clear=True),
+              mock.patch.object(sys, "argv", argv), redirect_stdout(stdout), redirect_stderr(stderr)):
+            try:
+                exec(_CARGO_REFERENCE, {"__name__": "__main__"})
+            except SystemExit as exit_status:
+                status = cast(int, exit_status.code)
+            except OSError as error:
+                print(error, file=sys.stderr)
+                status = 1
+            else:
+                status = 0
+        return subprocess.CompletedProcess(argv, status, stdout.getvalue().encode(), stderr.getvalue().encode())
+
     def test_fixed_cargo_replies_match_python_events(self) -> None:
         reference = self.bin_directory / "cargo-reference"
-        self.write_executable(reference, CARGO_STUB)
         cargo = self.bin_directory / "cargo"
         install_fixed_cargo(cargo)
         token = Path(self.environment["TEST_TOKEN_RECORD"])
@@ -116,10 +182,11 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
                     replies: list[subprocess.CompletedProcess[bytes]] = []
                     for executable in (reference, cargo):
                         self.cargo_events_path.unlink(missing_ok=True)
-                        replies.append(subprocess.run(
+                        reply = self._cargo_reference(arguments, self.environment) if executable == reference else subprocess.run(
                             [str(executable), *arguments], env=self.environment,
                             capture_output=True, timeout=TEST_HANG_GUARD_SECS,
-                        ))
+                        )
+                        replies.append(reply)
                         events.append(self.cargo_events_path.read_bytes() if self.cargo_events_path.exists() else b"")
                     self.assertEqual(events[1], events[0])
                     self.assertEqual(replies[1].returncode, replies[0].returncode)
@@ -134,9 +201,10 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
 
         for executable in (reference, cargo):
             with self.subTest(executable=executable.name, event_output="/dev/full"):
-                result = subprocess.run(
-                    [str(executable), "metadata", "--format-version", "1"],
-                    env={**self.environment, "TEST_CARGO_EVENTS": "/dev/full"},
+                arguments = ("metadata", "--format-version", "1")
+                environment = {**self.environment, "TEST_CARGO_EVENTS": "/dev/full"}
+                result = self._cargo_reference(arguments, environment) if executable == reference else subprocess.run(
+                    [str(executable), *arguments], env=environment,
                     capture_output=True, timeout=TEST_HANG_GUARD_SECS,
                 )
                 self.assertNotEqual(result.returncode, 0)
@@ -172,7 +240,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.addCleanup(self.stop_verify, process)
         self.wait_for_path(self.runner_state / "routing-sleep", (process,))
         process.send_signal(signal.SIGINT)
-        output, errors = process.communicate(timeout=10)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 130, output + errors)
         self.assertEqual(self.last_call()["outcome"], "interrupted")
         self.assertEqual(self.last_call()["status"], 130)
@@ -180,10 +248,6 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assert_nothing_outlives()
 
     def test_busy_then_blocked_refuses_instead_of_polling(self) -> None:
-        from unittest import mock
-        from scripts.build_queue import admission_client, admission_protocol as wire, admission_service as service, placement
-        from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
-
         admission = caller_admission(self, self.root, self.environment)
         controls = caller_provider_controls(self, admission)
         previous = admission.server.handle_request
@@ -220,7 +284,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.wait_until(busy_wait_delivered, "the client queue wait after the busy refusal", (process,))
         _ = (self.runner_state / "busy-reason").write_text("blocked\n")
         controls.set_host("mac", placement.AllowedHost())
-        output, errors = process.communicate(timeout=10)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 2, output + errors)
         self.assertIn("verify.sh: test --mac refused: the Mac is blocked (/build:status names the holder and when it lifts); nothing ran on natedev.\n", errors)
         self.assertEqual(len(self.runner_events()), 2)
@@ -450,6 +514,33 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assertEqual(self.runner_events(), [])
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.last_call()["mac_reason"], "unreachable")
+
+    def test_mac_pass_published_during_placement_takes_no_run_slot(self) -> None:
+        passed = self.verify("test", "sample", "--mac", "why", extra={
+            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        cached, = self.saved_results()
+        contents = cached.read_bytes()
+        cached.unlink()
+        self.clear_observations()
+        fixture = caller_admission(self, self.root, self.environment)
+        handle = fixture.server.handle_request
+        requests: list[wire.VerifyRunSlotRequest] = []
+
+        def publish(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                    ) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest) and not cached.exists():
+                _ = cached.write_bytes(contents)
+            if isinstance(request, wire.VerifyRunSlotRequest):
+                requests.append(request)
+            return handle(request, connection)
+
+        with mock.patch.object(fixture.server, "handle_request", side_effect=publish):
+            reused = self.verify("test", "sample", "--mac", "why")
+        self.assertEqual(reused.returncode, 0, reused.stdout + reused.stderr)
+        self.assertIn("PASS (recorded)", reused.stdout)
+        self.assertFalse(requests)
+        self.assertEqual(self.runner_events(), [])
 
     def test_local_first_target_is_skipped_for_mac_only(self) -> None:
         config = self.root / "build_targets.conf"

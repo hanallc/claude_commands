@@ -16,12 +16,26 @@ source "$_CONF_LIB/conf_record.sh"
 if [[ -r /proc/sys/kernel/hostname ]]; then
     IFS= read -r _CONF_HOST < /proc/sys/kernel/hostname
 else
-    _CONF_HOST="$(uname -n)"
+    _CONF_HOST="$(uname -n)" || return
 fi
 _CONF_HOST="${_CONF_HOST%%.*}"
+if [[ "$_CONF_HOST" == *[[:upper:]]* ]]; then
+    if [[ -n "${ZSH_VERSION:-}" ]]; then
+        # shellcheck disable=SC2296 # zsh converts the host name to lower case.
+        _CONF_HOST="${(L)_CONF_HOST}"
+    elif (( BASH_VERSINFO[0] >= 4 )); then
+        _CONF_HOST="${_CONF_HOST,,}"
+    else
+        _CONF_HOST="$(printf '%s' "$_CONF_HOST" | LC_ALL=C tr '[:upper:]' '[:lower:]')" || return
+    fi
+fi
 
 conf_value() {
     local file="$1" key="$2" folder="${CONF_DIR:-$HOME/.claude/config}"
+    if [[ "$key" == *[[:upper:]]* ]]; then
+        printf 'conf_value: configuration key %q must be lower case\n' "$key" >&2
+        return 2
+    fi
     conf_record "$file"
     local raw line name value previous="" limit=""
     local base="" base_limit="" host_value="" host_limit="" base_seen=0 host_seen=0 found=0
@@ -89,7 +103,39 @@ conf_value() {
             fi
         fi
     fi
-    if [[ "$valid" == 1 ]]; then printf '%s\n' "$value"
+    if [[ "$valid" == 1 ]]; then
+        if [[ -n "${CONF_SHIFT_READ_LOG:-}" ]]; then
+            name="$key"
+            [[ "$host_seen" != 1 ]] || name="$key.$_CONF_HOST"
+            conf_record_shift "$folder/$file.conf" "$name" "$value"
+        fi
+        printf '%s\n' "$value"
     else "$_CONF_LIB/py" "$_CONF_LIB/conf.py" get "$file" "$key"
     fi
+}
+
+
+# Scan the selected key only when the caller traces config reads.
+conf_record_shift() {
+    local path="$1" selected="$2" value="$3"
+    local raw line key previous="" before_limit="" mark
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        line="${raw%%[[:space:]]\#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [[ "$line" != \#* && "$line" == *=* ]]; then
+            key="${line%%=*}"
+            key="${key%"${key##*[![:space:]]}"}"
+            if [[ "$key" == "$selected" ]]; then
+                if [[ ( "$previous" == '# whole:'* || "$previous" == '# range:'* ) &&
+                      "$before_limit" == '# test config shift: '*" $value" ]]; then
+                    mark="${before_limit#'# test config shift: '}"
+                    { printf '%s:%s: %s -> %s\n' "${path##*/}" "$key" "${mark%% *}" "$value" >> "$CONF_SHIFT_READ_LOG"; } 2>/dev/null || :
+                fi
+                return 0
+            fi
+        fi
+        before_limit="$previous"
+        previous="${raw#"${raw%%[![:space:]]*}"}"
+        previous="${previous%"${previous##*[![:space:]]}"}"
+    done 2>/dev/null < "$path" || :
 }

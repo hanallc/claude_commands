@@ -72,7 +72,7 @@ class ConfTests(unittest.TestCase):
         _ = self.git("config", "user.name", "Configuration test")
         _ = self.git("config", "user.email", "conf@example.invalid")
 
-    def test_config_reads_record_all_resolvers_and_cache_the_log_path(self) -> None:
+    def test_config_reads_record_all_resolvers_in_the_log_their_environment_names(self) -> None:
         self.write("value=one\n")
         log = self.root / "reads"
         program = """from pathlib import Path
@@ -94,8 +94,11 @@ conf.check('example', 'value', 'two')
         self.assertEqual(result.stderr, "")
         self.assertTrue(log.is_file(), "The reader must record its config reads")
         self.assertEqual(set(log.read_text().splitlines()), {"example"})
-        self.assertGreaterEqual(len(log.read_text().splitlines()), 8)
-        self.assertFalse(log.with_suffix(".other").exists())
+        self.assertGreaterEqual(len(log.read_text().splitlines()), 4)
+        # verify_helper.py runs many commands in one process, so each read uses the log its environment names.
+        other = log.with_name(log.name + ".other")
+        self.assertEqual(set(other.read_text().splitlines()), {"example"})
+        self.assertGreaterEqual(len(other.read_text().splitlines()), 4)
 
     def test_config_read_log_context_restores_the_cached_destination(self) -> None:
         self.write("value=one\n")
@@ -298,15 +301,24 @@ conf_reads.record('disabled')
                 self.assertIn("keys:", warnings[0])
 
     def test_sections_are_skipped_and_the_first_value_wins(self) -> None:
-        self.write("# note\n[values]\n# whole: ..\n LIMIT = 12 # first\n[another]\nLIMIT=99\nignored\n")
-        self.assertEqual(conf.read("example").whole("LIMIT"), 12)
+        self.write("# note\n[values]\n# whole: ..\n limit = 12 # first\n[another]\nlimit=99\nignored\n")
+        self.assertEqual(conf.read("example").whole("limit"), 12)
 
     def test_short_host_override_wins_and_its_first_value_is_used(self) -> None:
         self.write("# whole: ..\ncount=1\n# whole: ..\ncount.testhost=7\ncount.testhost=8\ncount.other=9\n")
-        with mock.patch("socket.gethostname", return_value="testhost.example.invalid"):
+        with mock.patch("socket.gethostname", return_value="TESTHost.Example.Invalid"):
             self.assertEqual(conf.read("example").whole("count"), 7)
         with mock.patch("socket.gethostname", return_value="unknown.example.invalid"):
             self.assertEqual(conf.read("example").whole("count"), 1)
+
+    def test_an_ignored_host_override_reads_the_key_as_written(self) -> None:
+        self.write("# whole: ..\ncount=1\n# whole: ..\ncount.testhost=7\n")
+        with mock.patch("socket.gethostname", return_value="testhost.example.invalid"):
+            settings = conf.read("example")
+            ignored = conf.HostOverride.IGNORED
+            self.assertEqual(settings.value("count", conf.positive_whole, host_override=ignored), 1)
+            self.assertEqual(settings.value("count.testhost", conf.positive_whole, host_override=ignored), 7)
+            self.assertEqual(settings.value("count.other", conf.positive_whole, default=3, host_override=ignored), 3)
 
     def test_home_config_is_used_when_conf_dir_is_not_set(self) -> None:
         home_config = self.root / "home/.claude/config"
@@ -493,7 +505,7 @@ conf_reads.record('disabled')
         self.commit("# whole: 1..10\namount=3\n")
         self.commit("# whole: 1..10\namount=8\n")
         self.commit("# whole: 1..4\namount=9\n")
-        self.write("# whole: 1..2\namount=broken\n")
+        self.write("# whole: 1..10\namount=broken\n")
         warning = io.StringIO()
         with redirect_stderr(warning):
             self.assertEqual(conf.read("example").whole("amount"), 8)
@@ -501,6 +513,50 @@ conf_reads.record('disabled')
         self.assertIn("broken", warning.getvalue())
         self.assertIn("amount", warning.getvalue())
         self.assertIn(str(self.path), warning.getvalue())
+
+    def test_recovery_skips_values_outside_the_current_limits(self) -> None:
+        self.history()
+        self.commit("# whole: 1..\ncount=2\n# range: 0..\namount=2.5\n# one of: off, on\nmode=on\n")
+        self.commit("# whole: 1..\ncount=1\n# range: 0..\namount=9\n# one of: off, on\nmode=off\n")
+        self.write("# whole: 1..\ncount=3\n# whole: 2..\ncount.testhost=broken\n"
+                   + "# range: 0..4\namount=broken\n# one of: on\nmode=broken\n")
+        with mock.patch("socket.gethostname", return_value="testhost.example"), redirect_stderr(io.StringIO()):
+            settings = conf.read("example")
+            self.assertEqual(settings.whole("count"), 2)
+            self.assertEqual(settings.number("amount"), 2.5)
+            self.assertEqual(settings.text("mode"), "on")
+
+    def test_recovery_uses_committed_limits_when_no_value_passes_the_current_limit(self) -> None:
+        self.history()
+        self.commit("# whole: -1000..1000\namount=500\n# one of: on, off\nmode=on\n")
+        self.commit("# whole: -1000..1000\namount=1001\n# one of: on, off\nmode=broken\n")
+        for limit, reason in (("# whole: -1000.1000", "invalid limit"),
+                              ("# whole: -1000..400.5", "expected a whole number"),
+                              ("# whole: 1000..-1000", "outside range 1000..-1000"),
+                              ("# whole: 0..100", "outside range 0..100")):
+            with self.subTest(limit=limit), redirect_stderr(io.StringIO()) as warning:
+                self.write(f"{limit}\namount=400\n")
+                self.assertEqual(conf.read("example").whole("amount"), 500)
+                self.assertEqual(len(warning.getvalue().splitlines()), 1)
+                self.assertIn(reason, warning.getvalue())
+
+        self.write("# one of:\nmode=off\n")
+        with redirect_stderr(io.StringIO()) as warning:
+            self.assertEqual(conf.read("example").text("mode"), "on")
+        self.assertEqual(len(warning.getvalue().splitlines()), 1)
+        self.assertIn("mode='off': expected one of", warning.getvalue())
+
+    def test_recovery_reads_each_revision_once_when_the_current_limit_rejects_all_values(self) -> None:
+        self.history()
+        self.commit("# whole: 1..1000\namount=400\n")
+        self.commit("# whole: 1..1000\namount=500\n")
+        self.commit("# whole: 1..1000\namount=1001\n")
+        self.write("# whole: 1..100\namount=600\n")
+        git = cast(Callable[..., subprocess.CompletedProcess[str]], getattr(conf, "_git"))
+        with mock.patch.object(conf, "_git", wraps=git) as history_reads, redirect_stderr(io.StringIO()):
+            self.assertEqual(conf.read("example").whole("amount"), 500)
+        # Git reads the checkout, the history, and each of the three revisions.
+        self.assertEqual(history_reads.call_count, 5)
 
     def test_missing_current_key_recovers_from_history_and_host_override_is_validated(self) -> None:
         self.history()
@@ -723,6 +779,32 @@ conf_reads.record('disabled')
         if not isinstance(live, conf.UsableLiveValue):
             self.fail("A repaired live limit must replace the recovered state")
         self.assertEqual(live.value, Decimal("7.25"))
+
+
+class RepositoryConfigurationTests(unittest.TestCase):
+    def test_all_configuration_names_are_lower_case(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        for path in sorted((root / "config").glob("*.conf")):
+            for key, setting in conf.settings(path.read_text(encoding="utf-8")).items():
+                self.assertEqual(key, key.lower(), f"{path.relative_to(root)}:{setting.line + 1}: {key}")
+
+
+class HanaConfigurationTests(unittest.TestCase):
+    source: Path = Path(__file__).resolve().parents[2] / "config/hana_aws.conf"
+
+    def test_render_configuration_has_no_host_suffixes(self) -> None:
+        settings = conf.settings(self.source.read_text())
+        self.assertTrue(settings)
+        for key in settings:
+            with self.subTest(key=key):
+                self.assertNotIn('.', key)
+
+    def test_execution_values_have_no_copies_in_hana_configuration(self) -> None:
+        settings = conf.settings(self.source.read_text())
+        for key in ('execution_compiler_version', 'execution_shell_timeout_s', 'execution_command_timeout_s'):
+            self.assertNotIn(key, settings)
+        self.assertEqual(sum(line.startswith('free_floor_gib=')
+            for line in self.source.read_text().splitlines()), 1)
 
 
 if __name__ == "__main__":

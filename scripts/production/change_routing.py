@@ -5,15 +5,19 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 from functools import cached_property
 from pathlib import Path
 from typing import cast
 
+from scripts.agents import remote
 from scripts.lib import conf
-from scripts.production import delivery_state, staff, unrouted_alert
+from scripts.production import delivery_state, record_store, staff, unrouted_alert
 from scripts.production.issues import source_paths
 from scripts.production.production_doc import Refusal, production_field
 
@@ -89,6 +93,38 @@ class UnroutedChange:
 ChangeOwner = StaffRoutedChange | ShowrunnerOwnChange | UnroutedChange
 
 
+def producer_row(record: staff.StaffSnapshot, identity: staff.StaffId) -> staff.StaffRow | UnroutedChange:
+    """Find the unit or showrunner that a Producer cell names.
+
+    The staff record keeps retired producers, so a retired unit still gives its row.
+    """
+    producer = record.by_id(identity)
+    if producer is None:
+        return UnroutedChange(f"No staff record for {identity}")
+    if producer.kind not in ("showrunner", "unit"):
+        return UnroutedChange(f"Producer {identity} is not a staff unit or showrunner")
+    return producer
+
+
+def _route_producer(record: staff.StaffSnapshot, identity: staff.StaffId) -> ChangeOwner:
+    producer = producer_row(record, identity)
+    if isinstance(producer, UnroutedChange):
+        return producer
+    if producer.kind == "showrunner":
+        return ShowrunnerOwnChange(producer.id, producer.name)
+    parent = producer
+    seen: set[staff.StaffId] = set()
+    while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo) and parent.id not in seen:
+        seen.add(parent.id)
+        ancestor = record.by_id(parent.parent.id)
+        if ancestor is None:
+            break
+        parent = ancestor
+    if parent.kind != "showrunner":
+        return UnroutedChange(f"No staff showrunner for {producer.name}")
+    return StaffRoutedChange(producer.id, parent.id, parent.name)
+
+
 @dataclass(frozen=True)
 class UnavailableProduction:
     review_list: Path
@@ -140,6 +176,34 @@ class ProductionPathUnreadable(OSError):
         self.path: Path = path
 
 
+class ReviewDocumentRoute(Enum):
+    LOCAL_OR_UNBOUND = "the staff document is local or unrecorded"
+    REMOTE_LEGACY = "the remote staff document permits legacy fallback"
+    REMOTE_ENROLLED = "the remote staff document has Merge checkout"
+    REMOTE_UNVERIFIED = "the remote staff document could not be read"
+
+
+def _remote_document_route(document: staff.LiveDoc | staff.WrappedDoc, *,
+                           production_record: bool) -> ReviewDocumentRoute:
+    try:
+        if production_record:
+            machine = remote.machine_alias(document.machine)
+            if isinstance(machine, remote.MachineNameRefused):
+                return ReviewDocumentRoute.REMOTE_UNVERIFIED
+            remote_read = shlex.join(["cat", "--", str(document.path)])
+            result = subprocess.run(["ssh", "-o", "BatchMode=yes", machine.alias, remote_read],
+                                    capture_output=True, text=True, timeout=2, check=False)
+            if result.returncode:
+                return ReviewDocumentRoute.REMOTE_UNVERIFIED
+            content = result.stdout
+        else:
+            content = document.path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, subprocess.SubprocessError, conf.Unusable):
+        return ReviewDocumentRoute.REMOTE_UNVERIFIED
+    return (ReviewDocumentRoute.REMOTE_ENROLLED if staff.declares_merge_checkout(content.splitlines())
+            else ReviewDocumentRoute.REMOTE_LEGACY)
+
+
 class StaffRouting:
     """Read fixed producer identities and staff parent edges."""
 
@@ -154,16 +218,33 @@ class StaffRouting:
         self.list_documents: dict[str, list[Path]] = {
             name: _list_document_paths(text) for name, text in lists if name not in documents}
         self.checked_paths: dict[Path, bool | ProductionPathUnreadable] = {}
+        self.document_routes: dict[str, ReviewDocumentRoute] = {}
+
+    def _document_route(self, name: str) -> ReviewDocumentRoute:
+        if name not in self.document_routes:
+            runner = self.runners_by_name.get(name)
+            route = ReviewDocumentRoute.LOCAL_OR_UNBOUND
+            if (runner is not None and isinstance(runner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                    and record_store.local_document(runner) is None):
+                if self.sources is not None and not self.record.production:
+                    self.sources.append(runner.doc.path)
+                route = _remote_document_route(runner.doc, production_record=self.record.production)
+            self.document_routes[name] = route
+        return self.document_routes[name]
 
     def production(self, name: str) -> Path | None:
         """Check only documents that can supply this production."""
         runner = self.runners_by_name.get(name)
+        if self._document_route(name) is not ReviewDocumentRoute.LOCAL_OR_UNBOUND:
+            return None
         candidates: list[Path] = []
-        if runner is not None and isinstance(runner.doc, (staff.LiveDoc, staff.WrappedDoc)):
-            candidates.append(runner.doc.path)
-        if name in self.supplied_documents:
-            candidates.append(self.supplied_documents[name])
-        candidates.extend(self.list_documents.get(name, ()))
+        document = record_store.local_document(runner)
+        if document is not None:
+            candidates.append(document)
+        if document is None or runner is None or not isinstance(runner.doc, staff.LiveDoc):
+            if name in self.supplied_documents:
+                candidates.append(self.supplied_documents[name])
+            candidates.extend(self.list_documents.get(name, ()))
         for path in dict.fromkeys(candidates):
             if path not in self.checked_paths:
                 if self.sources is not None:
@@ -256,39 +337,27 @@ class StaffRouting:
             if runner is not None and runner.kind == "showrunner":
                 return ShowrunnerOwnChange(runner.id, runner.name)
             return ShowrunnerOwnChange(MissingShowrunner(list_owner), list_owner)
-        producer = self.record.by_id(staff.StaffId(identity))
-        if producer is None:
-            return self.unrouted(review_list, row, f"No staff record for {identity}", identity)
-        if producer.kind == "showrunner":
-            return ShowrunnerOwnChange(producer.id, producer.name)
-        if producer.kind != "unit":
-            return self.unrouted(review_list, row, f"Producer {identity} is not a staff unit or showrunner", identity)
-        parent = producer
-        seen: set[staff.StaffId] = set()
-        while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo) and parent.id not in seen:
-            seen.add(parent.id)
-            ancestor = self.record.by_id(parent.parent.id)
-            if ancestor is None:
-                break
-            parent = ancestor
-        if parent.kind != "showrunner":
-            return self.unrouted(review_list, row, f"No staff showrunner for {producer.name}", identity)
-        return StaffRoutedChange(producer.id, parent.id, parent.name)
+        owner = _route_producer(self.record, staff.StaffId(identity))
+        if isinstance(owner, UnroutedChange):
+            return self.unrouted(review_list, row, owner.note, identity)
+        return owner
 
     def owner_and_production(self, review_list: Path, row: dict[str, str]) -> ChangeAssignment:
         """Read the producer and its showrunner's current production document."""
         name = self.list_owner(review_list)
         owner = self._staff_owner(row, review_list)
-        if isinstance(owner, UnroutedChange) or isinstance(owner.showrunner_id, MissingShowrunner):
-            document = self.production(name)
-        else:
-            document = self.production(owner.tab)
+        production_name = (name if isinstance(owner, UnroutedChange) or isinstance(owner.showrunner_id, MissingShowrunner)
+                           else owner.tab)
+        document = self.production(production_name)
         missing_owner = isinstance(owner, ShowrunnerOwnChange) and isinstance(owner.showrunner_id, MissingShowrunner)
-        if missing_owner or document is None:
+        route = self._document_route(production_name)
+        if missing_owner or (document is None and route is not ReviewDocumentRoute.REMOTE_ENROLLED):
             root = self._root
             if root is not None:
-                root_document = document if document is not None else self.production(root.name)
-                if root_document is not None:
+                # An unreadable remote document can belong to an enrolled showrunner.
+                # Assign the change to the root using the root's own local document.
+                root_document = record_store.local_document(root)
+                if root_document is not None and self.production(root.name) == root_document:
                     return ChangeAssignment(owner if isinstance(owner, UnroutedChange)
                                             else ShowrunnerOwnChange(root.id, root.name), root_document)
         return ChangeAssignment(owner, document if document is not None else UnavailableProduction(review_list))
@@ -300,9 +369,18 @@ class StaffRouting:
             root = self._review_root
             if not waits_for_user(review_list, row, root):
                 return UnroutedChange(note + "; no message goes out")
-            member = self.record.by_id(staff.StaffId(producer))
+            identity = staff.StaffId(producer)
+
+            def still_unrouted() -> bool:
+                try:
+                    fresh = staff.authority_snapshot()
+                except staff.StaffUnreadable:
+                    return True
+                return isinstance(_route_producer(fresh, identity), UnroutedChange)
+
+            member = self.record.by_id(identity)
             names = (member.name if member is not None else producer,)
-            unrouted_alert.notify(root, list_owner, row, note, names)
+            unrouted_alert.notify(root, list_owner, row, note, names, still_unrouted=still_unrouted)
         return UnroutedChange(note + "; no message goes out")
 
 

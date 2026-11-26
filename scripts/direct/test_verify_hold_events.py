@@ -15,6 +15,7 @@ import unittest
 from typing import cast
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     grant_call,
@@ -29,11 +30,18 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     def test_hold_release_records_before_the_fixture_restores_its_environment(self) -> None:
-        environments: tuple[tuple[str, dict[str, str]], ...] = (("ambient", {}), ("marked", self.fixture.environment))
-        for count, (name, environment) in enumerate(environments, 1):
+        startup = self.fixture.root / "caller-startup.sh"
+        _ = startup.write_text(': > "${BASH_SOURCE[0]}.ran"\nexit 97\n')
+        caller_environment = {"BASH_ENV": str(startup)}
+        environments: tuple[tuple[str, dict[str, str], dict[str, str]], ...] = (
+            ("ambient", {}, {}),
+            ("marked", self.fixture.environment, {}),
+            ("caller-startup", {}, caller_environment),
+        )
+        for count, (name, environment, caller) in enumerate(environments, 1):
             with self.subTest(environment=name):
                 self.hold()
-                with local_hold_environment(environment):
+                with mock.patch.dict(os.environ, caller), local_hold_environment(environment):
                     grant_call(self.cycle_file)
                 recorded: list[tuple[object, object]] = []
                 for path in (self.fixture.root / "buildlog").rglob("*.jsonl"):
@@ -42,10 +50,11 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                         if row.get("kind") == "hold_event":
                             recorded.append((row.get("event"), row.get("holder")))
                 self.assertEqual(recorded, [("ended", "hana")] * count)
+                self.assertFalse(startup.with_suffix(".sh.ran").exists())
 
     def test_local_admission_waits_for_release_notifications_instead_of_sleeping(self) -> None:
         from scripts.build_targets import build_targets
-        from scripts.direct.local_release_wait import LocalReleaseEvents
+        from scripts.lib.release_waiter import LocalReleaseEvents
 
         self.hold()
         def grant_on_notification(_seconds: float) -> None:
@@ -80,38 +89,38 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         self.assertEqual(read_cycle_file(self.cycle_file)["entries"], [])
 
     def test_local_release_waiter_keeps_linux_notifications(self) -> None:
-        from scripts.direct import local_release_wait
+        from scripts.lib import release_waiter
 
         holders = self.fixture.root / "event-holders"
         release = self.fixture.root / "event-release"
         holders.mkdir()
         release.mkdir()
         with mock.patch.object(time, "sleep", side_effect=AssertionError("Linux must use notifications")), \
-             local_release_wait.local_release_waiter(holders, release) as waiter:
-            self.assertIsInstance(waiter, local_release_wait.LocalReleaseEvents)
+             release_waiter.local_release_waiter(holders, release) as waiter:
+            self.assertIsInstance(waiter, release_waiter.LocalReleaseEvents)
             waiter.arm()
             _ = (holders / "owner").write_text("released")
             waiter.wait(TEST_HANG_GUARD_SECS)
 
     def test_local_release_waiter_polls_when_kernel_lacks_inotify(self) -> None:
-        from scripts.direct import local_release_wait
+        from scripts.lib import release_waiter
 
         for unavailable in (errno.ENOSYS, errno.ENOTSUP):
             with self.subTest(errno=unavailable), \
-                 mock.patch.object(local_release_wait, "LocalReleaseEvents", side_effect=OSError(unavailable, "unavailable")), \
+                 mock.patch.object(release_waiter, "LocalReleaseEvents", side_effect=OSError(unavailable, "unavailable")), \
                  mock.patch.object(time, "sleep") as polling:
-                with local_release_wait.local_release_waiter(self.fixture.root, self.fixture.root) as waiter:
-                    self.assertIsInstance(waiter, local_release_wait.IntervalReleasePolling)
+                with release_waiter.local_release_waiter(self.fixture.root, self.fixture.root) as waiter:
+                    self.assertIsInstance(waiter, release_waiter.IntervalReleasePolling)
                     waiter.arm()
                     waiter.wait(15)
                 polling.assert_called_once_with(15)
 
     def test_local_release_waiter_does_not_hide_resource_errors(self) -> None:
-        from scripts.direct import local_release_wait
+        from scripts.lib import release_waiter
 
-        with mock.patch.object(local_release_wait, "LocalReleaseEvents", side_effect=OSError(errno.EMFILE, "exhausted")), \
+        with mock.patch.object(release_waiter, "LocalReleaseEvents", side_effect=OSError(errno.EMFILE, "exhausted")), \
              self.assertRaises(OSError) as failed:
-            _ = local_release_wait.local_release_waiter(self.fixture.root, self.fixture.root)
+            _ = release_waiter.local_release_waiter(self.fixture.root, self.fixture.root)
         self.assertEqual(failed.exception.errno, errno.EMFILE)
 
     def test_fixture_releases_a_call_when_a_scanned_directory_disappears(self) -> None:
@@ -154,7 +163,7 @@ class PlacementWaitModeTests(unittest.TestCase):
                 "PLACEMENT_EPISODE=two; wait_for_placement",
                 "PLACEMENT_WAIT_MEMORY=1; PLACEMENT_EPISODE=three; wait_for_placement",
             ))
-            result = subprocess.run(["bash", "-c", script], env={**os.environ, "CALLS": str(calls)},
+            result = subprocess.run(["bash", "-c", script], env={**verify_test_environment(), "CALLS": str(calls)},
                                     capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(calls.read_text().splitlines(), [
@@ -163,7 +172,7 @@ class PlacementWaitModeTests(unittest.TestCase):
 
 class ReleaseDeadlineTests(unittest.TestCase):
     def test_wait_returns_by_its_deadline_when_irrelevant_events_never_stop(self) -> None:
-        from scripts.direct.local_release_wait import LocalReleaseEvents
+        from scripts.lib.release_waiter import LocalReleaseEvents
 
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "watched"

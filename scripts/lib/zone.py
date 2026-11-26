@@ -146,8 +146,8 @@ def notice(zone: str, before: str) -> str:
     label = now.tzname() or zone
     return (f"The user's time zone is now {zone} ({label}, {_offset(now)}) as of {now:%H:%M} {label}; it was {before}. "
             + "config/user_zone.conf says so on both machines. Write every time you give the user "
-            + f"in {label}, with its label. Read the clock with TZ=$(python3 ~/.claude/scripts/lib/user_zone.py) "
-            + "date '+%H:%M %Z', never with bare date, because each machine's clock keeps its own zone. "
+            + f"in {label}, with its label. Write no present time. Write only future times, such as an ETA. "
+            + "The tools add the present time. "
             + "Scripts that read user_zone.py change by themselves. Change any note of yours that names the old zone.")
 
 
@@ -156,19 +156,33 @@ def drain(checkout: Path | None, *, pulled: PurePosixPath | None) -> list[str]:
     change = read_queue()
     if isinstance(change, main_publish.NoPendingMacPull):
         return []
-    for pull in change.pulls:
-        if pull.mac != pulled:
+    ssh_program = os.environ.get("ZONE_SSH") or "ssh"
+    messages: list[str] = []
+    for pull in sorted(change.pulls, key=lambda item: isinstance(item, main_publish.MacCheckoutPull)):
+        if isinstance(pull, main_publish.MacPullAwaitingPublication):
+            messages.append(f"mac {pull.mac}: rerun production promotion to record the published commit")
+            continue
+        if isinstance(pull, main_publish.ProductionMacPull):
+            outcome = main_publish.run_mac_pull(main_publish.production_pull_command(pull), ssh_program=ssh_program)
+        elif pull.mac == pulled:
+            main_publish.clear_mac_pull(pull)
+            continue
+        else:
             source = pull.source if isinstance(pull.source, Path) else checkout
             if source is None:
-                return [f"mac: the {change.label} change waits since {change.since}; run /zone on natedev"]
-            outcome = main_publish.pull_mac(source, mac=pull.mac, ssh_program=os.environ.get("ZONE_SSH") or "ssh")
-            if isinstance(outcome, main_publish.MacPullFailed):
-                return [f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}"]
-        main_publish.clear_pull_only(pull.mac)
+                messages.append(f"mac: the {change.label} change waits since {change.since}; run /zone on natedev")
+                continue
+            outcome = main_publish.pull_mac(source, mac=pull.mac, ssh_program=ssh_program)
+        if isinstance(outcome, main_publish.MacPullFailed):
+            messages.append(f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}")
+            continue
+        main_publish.clear_mac_pull(pull)
+    if messages:
+        return messages
     delivered, summary = broadcast_on_mac(change.text) if change.text else (True, "no message")
     if not delivered:
         return [f"mac: pulled the {change.label} change; its message still waits: {summary}"]
-    main_publish.clear_pull_only(notice_delivered=True)
+    main_publish.clear_zone_notice(change)
     return [f"mac: took the {change.label} change queued at {change.since}; message {summary}"]
 
 

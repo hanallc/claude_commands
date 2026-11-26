@@ -9,6 +9,7 @@ import unittest
 from typing import final
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct import step_record
 from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
 from scripts.build_queue.test_placement import (
@@ -17,7 +18,7 @@ from scripts.build_queue.test_placement import (
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 from scripts.lint import memory_admit
 from scripts.message.unit_labels import UnitLabels
 from scripts.build_targets import build_targets, target_config
@@ -125,7 +126,7 @@ class QueueDiskRecoveryTests(unittest.TestCase):
                 candidates = (mac, local)
                 if disabled_linux:
                     linux = placement.PlacementCandidate(placement.PlacementDestination(
-                        "ssh", "disabled-linux", "fixture-linux", RepositoryScope("hana", "key", 1), 1))
+                        "ssh", "disabled-linux", "fixture-linux", RepositoryScope("hana", "key"), 1))
                     candidates += (linux,)
                     key = fixture.server.host_evidence_key(request, linux.destination)
                     evidence = placement.FreshHostEvidence(key, fixture.clock.now(), "linux-generation",
@@ -171,6 +172,7 @@ class QueueDiskRecoveryTests(unittest.TestCase):
                     result = subprocess.run([sys.executable, "-c",
                         "from pathlib import Path; import sys; "
                         + "Path(sys.argv[1]).open('a').write('mac\\n')", str(remote_commands)],
+                        env=verify_test_environment(),
                         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 duplicate, = fixture.connect(replace(consume, request_id="disk-ready-repeated")).replies()
@@ -199,17 +201,18 @@ class StepRetryPermissionTests(unittest.TestCase):
                         fixture.free(0)
                         fixture.hold_starts()
                         repository = fixture.root / "hana"
-                        _ = subprocess.run(["git", "init", "-q", str(repository)], check=True,
+                        _ = subprocess.run(["git", "init", "-q", str(repository)],
+                                          env=verify_test_environment(), check=True,
                             capture_output=True, timeout=TEST_HANG_GUARD_SECS)
                         configuration = "targets=" + ",".join(name for name, _ in ordered) + ",natedev\n"
                         for name in dict(ordered):
                             configuration += f"kind.{name}=ssh\nplatform.{name}={'macos' if name == 'mac' else 'linux'}\n"
                             configuration += f"settings.{name}={name}.conf\n"
                             _ = write_config_fixture(fixture.root / f"{name}.conf",
-                                "offload=on\nlinux_only.hana=\nslots=1\nkinds=test,check,lint,doc,build,example\n",
+                                "offload=on\nlinux_only.hana=\nkinds=test,check,lint,doc,build,example\n",
                                 template="mac_test")
                         configuration += "kind.natedev=local\nplatform.natedev=linux\n"
-                        _ = (fixture.root / "build_targets.conf").write_text(configuration)
+                        _ = (fixture.root / "build_targets.conf").write_text(configuration + UNREACHABLE_WAIT_FIXTURE)
                         request = placement_request(fixture)
                         constraints = build_targets.fixed_placement_constraints(repository, "hana", kind,
                             ("cargo", kind), request.constraints.session, "fixed-source",

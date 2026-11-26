@@ -51,11 +51,16 @@ def read_snapshots() -> Snapshots:
 
 
 def holder_sessions(snapshots: Snapshots) -> list[str]:
-    """Return the sessions that own a hold or block, for the page's one label pass."""
+    """Return the sessions that own a hold, a block or a kept claim, for the page's one label pass."""
     if isinstance(snapshots, SnapshotsUnreadable):
         return []
-    return [state.holder_session.session_id for snapshot in snapshots for state in snapshot.states
-            if isinstance(state, targets.Held) and isinstance(state.holder_session, targets.HolderSession)]
+    owners = (owner for snapshot in snapshots for state in snapshot.states
+              for owner in ((state, *state.kept_claims) if isinstance(state, targets.Held) else kept_claims(state)))
+    return [owner.holder_session.session_id for owner in owners if isinstance(owner.holder_session, targets.HolderSession)]
+
+
+def kept_claims(state: targets.TargetState) -> tuple[targets.KeptClaim, ...]:
+    return state.kept_claims if isinstance(state, (targets.Free, targets.Running, targets.Held)) else ()
 
 
 def holder_labels(state: targets.Held, labels: Mapping[str, unit_labels.UnitLabels]) -> unit_labels.UnitLabels:
@@ -67,7 +72,10 @@ def holder_labels(state: targets.Held, labels: Mapping[str, unit_labels.UnitLabe
 
 def availability_rows(snapshots: Snapshots, labels: Mapping[str, unit_labels.UnitLabels],
                       zone: tzinfo) -> list[TargetRow]:
-    """One row for each block, hold or unreadable target; a free or busy target has none."""
+    """One row for each block, hold, kept claim or unreadable target; a free or busy target has no other row.
+
+    The kept claims of a blocked Mac follow its block row.
+    """
     if isinstance(snapshots, SnapshotsUnreadable):
         return [unavailable_row("targets", snapshots.reason)]
     rows: list[TargetRow] = []
@@ -82,6 +90,14 @@ def availability_rows(snapshots: Snapshots, labels: Mapping[str, unit_labels.Uni
                              "since": targets.start_text(state.since, zone), "until": targets.end_text(state.end, zone)})
             elif isinstance(state, (targets.Unreachable, targets.StateUnreadable)):
                 rows.append(unavailable_row(name, state.reason))
+            for kept in kept_claims(state):
+                session = kept.holder_session
+                identity = (labels.get(session.session_id) if isinstance(session, targets.HolderSession) else None)
+                # The reason names the repository, so a claim with no known session shows no holder.
+                rows.append({"target": name, "state": "Kept", "reason": f"Kept for cleanup: {kept.repository} {kept.what}",
+                             "holder": identity.session if identity else "",
+                             "unit": identity.unit if identity else "", "showrunner": identity.showrunner if identity else "",
+                             "since": "since " + targets.kept_since_text(kept.since, zone), "until": ""})
     return rows
 
 
@@ -159,7 +175,7 @@ class MacRoutes:
             return NotAllowed(f"this step is pinned to {route.target}")
         if isinstance(route, (MacOnly, PinnedTarget)):
             mac = self.mac
-            return (self.state_fit(mac.states[0]) if isinstance(mac, targets.TargetSnapshot)
+            return (self.state_fit(mac) if isinstance(mac, targets.TargetSnapshot)
                     else FitUnreadable("Mac state unreadable, " + mac.reason)
                     if isinstance(mac, SnapshotsUnreadable) else mac)
         return self.fit(step, folder, package)
@@ -182,7 +198,7 @@ class MacRoutes:
         if isinstance(rule, build_targets.NatedevOnly):
             return NotAllowed(rule.reason)
         excluded = self.policy(mac, folder, package, kind)
-        return excluded or self.state_fit(mac.states[0])
+        return excluded or self.state_fit(mac)
 
     def policy(self, mac: targets.TargetSnapshot, folder: str, package: str | PackageNotRecorded,
                kind: build_targets.StepKind) -> TargetFit | None:
@@ -226,7 +242,8 @@ class MacRoutes:
         if isinstance(mac, NoMacTarget):
             return ""
         state = mac.states[0]
-        if isinstance(state, targets.Running):
+        if isinstance(state, (targets.Running, targets.Free)):
+            # A free Mac state leaves out guest claims, but a guest claim still holds its repository.
             jobs = self.repository_jobs(mac, folder)
             return "busy with " + "; ".join(job.what for job in jobs) if jobs else ""
         if isinstance(state, targets.StateUnreadable):
@@ -235,20 +252,22 @@ class MacRoutes:
             # The user, 2026-11-15: a block is a build hold that a unit put on the Mac, so say so.
             text = f"build hold by {self.owner(state)} {targets.end_text(state.end, self.zone)}"
             return text + (f" — {state.reason}" if state.reason else "")
-        fit = self.state_fit(state)
-        return fit.note if isinstance(fit, Allowed) and not isinstance(state, targets.Free) else ""
+        fit = self.state_fit(mac)
+        return fit.note if isinstance(fit, Allowed) else ""
 
     def repository_jobs(self, mac: targets.TargetSnapshot, folder: str) -> tuple[targets.RunningJob, ...]:
         """The live claims that keep this repository off the Mac: its own claim and any whole Mac claim."""
         from scripts.mac_test import mac_test
 
         # Cost: target_claim_scope runs git once for each Mac-only waiting folder in each page reading,
-        # and only while the Mac runs a claim. self.scopes keeps one result for each folder in the reading.
+        # and only while a Mac claim holds work. self.scopes keeps one result for each folder in the reading.
+        working = working_claims(mac)
+        if not working:
+            return ()
         if folder not in self.scopes:
             self.scopes[folder] = mac_test.target_claim_scope(mac_test.state_paths(mac.target.name), folder)
         scope = self.scopes[folder]
-        return tuple(targets.running_job(claim) for claim in mac.claims
-                     if mac_test.run_is_live(claim.record) and same_repository(claim.scope, scope))
+        return tuple(targets.running_job(claim) for claim in working if same_repository(claim.scope, scope))
 
     def owner(self, state: targets.Held) -> str:
         """The unit that holds a target, else its session, with the showrunner when known."""
@@ -256,16 +275,24 @@ class MacRoutes:
         owner = identity.unit if identity.unit != "—" else identity.session
         return owner + (f" ({identity.showrunner})" if identity.showrunner != "—" else "")
 
-    def state_fit(self, state: targets.TargetState) -> TargetFit:
+    def state_fit(self, mac: targets.TargetSnapshot) -> TargetFit:
+        state = mac.states[0]
         if isinstance(state, targets.Held):
             return Allowed(f"blocked by {self.owner(state)} {targets.end_text(state.end, self.zone)}")
-        if isinstance(state, targets.Running):
-            return Allowed("busy with " + "; ".join(job.what for job in state.jobs))
         if isinstance(state, targets.Unreachable):
             return Allowed("unreachable, " + state.reason)
         if isinstance(state, targets.StateUnreadable):
             return FitUnreadable("Mac state unreadable, " + state.reason)
-        return Allowed("no block or claim recorded")
+        # The Mac state leaves out guest claims, so the note reads the claim folder, as repository_jobs does.
+        jobs = tuple(targets.running_job(claim) for claim in working_claims(mac))
+        return Allowed("busy with " + "; ".join(job.what for job in jobs) if jobs else "no block or claim recorded")
+
+
+def working_claims(mac: targets.TargetSnapshot) -> tuple[mac_test.HeldClaim, ...]:
+    """The Mac claims that hold work, from the claim folder: a guest claim is not in the Mac state."""
+    from scripts.mac_test import mac_test
+
+    return tuple(claim for claim in mac.claims if mac_test.run_holds_work(claim.record))
 
 
 def same_repository(claim: ClaimScope, step: ClaimScope) -> bool:

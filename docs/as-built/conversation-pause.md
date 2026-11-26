@@ -46,6 +46,14 @@ mark_reply_ended(session_id: str, now: int) -> None
 
 It also maintains the scheduled-prompt record. Both hooks skip subagents. A retried Stop with `stop_hook_active` does not mark another reply end.
 
+On natedev, the hook finds file paths that start with `/Users/` in typed prompts.
+Quote a path that has punctuation followed by a space.
+The hook also accepts unquoted paths with escaped spaces and escaped backslashes.
+The hook adds one `scp` command per path to the same output as the pause reply.
+The hook reads the `mac_run_host` route from `production.conf` only when it finds a Mac path.
+The route read follows the prompt timestamp and pause handling.
+Replace `"<your scratch folder>/"` with the quoted path to the session's scratch folder.
+
 The pause record lives at `${CONVERSATION_PAUSE_STATE_DIR:-~/.local/state/conversation-pause}/<session-id>.json`:
 
 ```python
@@ -135,7 +143,19 @@ Missing action flags cause a usage error with exit 2.
 Callers use `send.py`; they do not invoke `pushover.py` directly.
 Mac callers add `--machine natedev`.
 
-A script never writes a literal phone text. It renders a catalog entry from `scripts/notify/push_catalog.py` and sends it with `push_texts.user_send_argv`, which becomes `send.py --to user --text-id ID --value k=v…`; the entry sets the need and the action. The script callers are `rust_release.send_release_text(push)` (`rust.*`), the phone branch of `sweep.send_floor_alert` (`sweep.disk_floor`), `codex_winddown` (`codex.reset_ready`), `quota_alert` (`quota.*`) and `restart_support.alert_user` (`shutdown.*`, the only phone path in `scripts/agents/`). `escalate.py` delivers registered holds through the same helper. It retains legacy free-text holds without delivery. `ci_points.review_watch` writes its alert to the production log and sends no push. The showrunner, build-report and fix instructions use the session command.
+Scripts render phone text from `scripts/notify/push_catalog.py`. Each catalog entry sets the need and the action.
+The helper `push_texts.user_send_argv` builds `send.py --to user --text-id ID --value k=v…`.
+These scripts use the helper.
+
+- `rust_release.send_release_text(push)` sends `rust.*`.
+- `sweep.send_floor_alert` sends `sweep.disk_floor` through its phone branch.
+- `quota_alert` sends `quota.*`.
+- `restart_support.alert_user` sends `shutdown.*`. It is the only phone path in `scripts/agents/`.
+- `escalate.py` sends registered holds. It retains legacy free-text holds without delivery.
+
+The showrunner, build-report, and fix instructions use the session command.
+
+The 2026-11-24 change removed the review watch and its push.
 
 ## Invariants
 
@@ -147,7 +167,13 @@ A script never writes a literal phone text. It renders a catalog entry from `scr
 - A bare yes or no is consumed only while it can still answer the return question.
 - The answer window begins when the question reaches the session. A failed delivery still reaches automatic return five minutes after the question became due.
 - A pause restores only what it changed.
-- Both hooks have a five-second budget, print at most one error line, and exit 0 so a prompt or reply cannot fail because the pause failed.
+- Both hooks use the five-second default budget from `scripts/hooks/hook_budget.py`.
+  Set `CONVERSATION_PAUSE_HOOK_BUDGET` to change it.
+  The executable starts the budget before it imports the pause library. Direct calls to `main()` run in the caller's process.
+  A supervisor ends the worker group at the deadline or when the hook closes the owner pipe.
+  The supervisor removes the worker's scheduled-prompt temporary files after cancellation.
+  When the budget expires, the supervisor prints the budget error and the hook exits 0.
+  The hooks install no signal handler. The process tests check cancellation, deadlines, output, and exit status.
 - `unit_lookup.read_run_states().state(worktree)`, not prose in a production row, is authoritative for whether the stall watch monitors a unit.
 - Correcting an as-built doc that contradicts the code is always allowed; cross-unit notice rules still apply.
 - Every scripted phone alert enters `scripts/message/send.py --to user`, with a catalog `--text-id`; channel choice stays inside `send.py`.

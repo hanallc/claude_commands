@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import base64
 import errno
+import fcntl
 import hashlib
 import inspect
 import json
 import os
 import re
-import secrets
 import shlex
 import subprocess
 import tempfile
@@ -26,13 +26,18 @@ from typing import TextIO, cast, final, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.agents import pane_record
 from scripts.agents.remote import local_machine
-from scripts.lib import atomic_file, urgency
-from scripts.production import change_review, investigation, next_item, production_lifecycle, proposal_issue, proposals_folder, record_store, session_staff, showrunners, staff, tidy_wrapped, update_registration
+from scripts.lib import atomic_file, conf, urgency
+from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.notify import review
+from scripts.production import change_review, investigation, next_item, production_admission, production_lifecycle, proposal_issue, proposals_folder, record_store, session_staff, showrunners, staff, tidy_wrapped, update_registration
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
-from scripts.review_links import change_browser, change_page, image_store, new_item_dialog, question_record, review_actions, review_events, review_items, review_page, review_submissions as submissions
+from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.review_links import change_browser, change_page, image_store, new_item_dialog, question_record, reply_tokens, review_actions, review_events, review_items, review_page, review_submissions as submissions
 
 OWNER = staff.StaffId("builds-staff")
 PRODUCER = staff.StaffId("producer-staff")
@@ -84,6 +89,7 @@ class ReviewSubmissionTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.issues = self.root / "issues"
         self.doc = self.root / "production.md"
@@ -105,12 +111,17 @@ class ReviewSubmissionTests(unittest.TestCase):
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
         _ = self.enterContext(patch.object(change_review, "lists_directory", side_effect=AssertionError("Use fixture change lists.")))
         _ = self.enterContext(patch.object(Path, "home", return_value=self.root))
+        _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "CONF_DIR": str(self.root / "config"),
             "XDG_CONFIG_HOME": str(self.root / "config"),
+            "XDG_STATE_HOME": str(self.root / "key-state"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
             "REVIEW_LINKS_ROOT": str(self.root / "review")})))
+        conf.path("machines").parent.mkdir(parents=True, exist_ok=True)
+        _ = write_config_fixture(conf.path("machines"))
 
     @property
     def identities(self) -> update_registration.QuestionStaff:
@@ -123,6 +134,66 @@ class ReviewSubmissionTests(unittest.TestCase):
         return [Issue(path, frontmatter(path)) for path in self.issues.glob("*.md")
                 if not path.name.startswith("question-")]
 
+    def test_answered_new_item_projects_one_response_from_the_same_question(self) -> None:
+        payload = request(submissions.SubmissionKind.QUESTION)
+        saved = submissions.submit(payload)
+        waiting = review_items.submission_item(saved, self.members)
+        self.assertEqual((waiting.type, waiting.state), (review_items.ReviewType.QUESTION, review_items.ReviewState.WAITING))
+
+        answer = 'Use the desktop layout.'
+        self.assertTrue(submissions.answer(saved.key, answer, saved.reply_token))
+        self.assertFalse(submissions.answer(saved.key, answer, saved.reply_token))
+        replay = submissions.submit(payload)
+        self.assertEqual((replay.key, replay.path, replay.owner), (saved.key, saved.path, OWNER))
+        native, = self.questions()
+        self.assertEqual(native.path, saved.path)
+        row = review_items.submission_item(replay, self.members)
+        self.assertEqual((row.key, row.type, row.state), (waiting.key, review_items.ReviewType.RESPONSE,
+                                                        review_items.ReviewState.OPEN))
+        self.assertEqual(row.log[-1].words, 'Answer: '+answer)
+        self.assertEqual(row.response, submissions.QuestionResponse(payload.words, answer, row.log[-1].time))
+
+    def test_scoped_review_replies_release_recipient_locks_and_recheck_the_record(self) -> None:
+        words = "Use the desktop layout."
+        for kind in submissions.SubmissionKind:
+            with self.subTest(kind=kind):
+                saved = submissions.submit(request(kind))
+                token = saved.reply_token
+
+                def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+                    lock = investigation.state_root() / "investigation-locks" / (OWNER + ".lock")
+                    with lock.open("r") as handle:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if kind == submissions.SubmissionKind.PROPOSAL:
+                        digest = hashlib.sha256(str(saved.path.resolve()).encode()).hexdigest()[:32]
+                        issue_lock = Path.home() / ".local/state/proposal-issue/locks" / f"proposal-issue-{digest}.lock"
+                        issue_lock.parent.mkdir(parents=True, exist_ok=True)
+                        with issue_lock.open("a") as handle:
+                            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with submissions.scoped_submission(new_item_dialog.read_submission_key(saved.key)) as located:
+                        match located.record:
+                            case update_registration.QuestionRecord() as record:
+                                update_registration.set_waiting_why(record, "Check the second layout.")
+                            case Issue() as issue:
+                                _ = proposal_issue.record_review(issue.path, "Check the second layout.",
+                                                                 review_events.KeepMark(), date.today())
+                            case investigation.Investigation() as record:
+                                investigation.set_waiting_why(record.owner, record.id, "Check the second layout.")
+                    return review.QuestionAccepted(words)
+
+                with patch.object(review, "review_question", side_effect=read_draft) as reader:
+                    with self.assertRaisesRegex(submissions.SubmissionError, "selected .* changed"):
+                        _ = submissions.answer(saved.key, words, token)
+                reader.assert_called_once()
+                self.assertNotIn(words, saved.path.read_text())
+                self.assertIn("Check the second layout.", saved.path.read_text())
+
+                with patch.object(review, "review_question", return_value=review.QuestionAccepted(words)) as reader:
+                    self.assertTrue(submissions.answer(saved.key, words, token))
+                    self.assertFalse(submissions.answer(saved.key, words, token))
+                reader.assert_called_once()
+                self.assertIn(words, saved.path.read_text())
+
     def test_four_kinds_use_their_native_stores_and_ids(self) -> None:
         expected = ("Q1", "P1", "I1", "I2")
         for number, (kind, identity) in enumerate(zip(submissions.SubmissionKind, expected, strict=True), 1):
@@ -133,6 +204,12 @@ class ReviewSubmissionTests(unittest.TestCase):
                 self.assertEqual(submitted.key, f"submission/{kind}/{OWNER}/{identity}/{payload.request_id}")
                 self.assertEqual(submitted.kind, kind)
                 self.assertEqual(submissions.submit(payload), submitted)
+                token = submitted.reply_token
+                self.assertTrue(token)
+                note = submitted.path.read_text(encoding="utf-8")
+                self.assertIn(reply_tokens.digest(token), note)
+                self.assertIn(submitted.details.reply_token_nonce, note)
+                self.assertNotIn(token, note)
         question, = self.questions()
         self.assertEqual((question.item.get("review_id"), question.owner, question.item.get("question")),
                          ("Q1", OWNER, request().words))
@@ -155,11 +232,12 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertIn(investigation.folder(OWNER), sources)
         self.assertIn(investigation.folder(OWNER) / "I2.md", sources)
 
-    def test_producer_uses_its_questions_and_requires_a_proposal_folder(self) -> None:
+    def test_producer_uses_its_default_and_configured_stores(self) -> None:
         question = submissions.submit(request(submissions.SubmissionKind.QUESTION, recipient=PRODUCER))
         payload = request(submissions.SubmissionKind.PROPOSAL, "proposal", recipient=PRODUCER)
-        with self.assertRaisesRegex(submissions.SubmissionError, "native proposal folder"):
-            _ = submissions.submit(payload)
+        default_proposal = submissions.submit(payload)
+        self.assertEqual((default_proposal.id, default_proposal.path.parent),
+                         ("P1", self.root / "state" / PRODUCER / "proposals"))
         self.assertEqual(question.id, "Q1")
         row = self.identities.record.by_id(PRODUCER)
         assert row is not None
@@ -173,16 +251,17 @@ class ReviewSubmissionTests(unittest.TestCase):
         producer = replace(row, doc=staff.LiveDoc(local_machine(), producer_doc))
         producer_staff = staff.StaffSnapshot((producer,))
         with patch.object(staff, 'snapshot', return_value=producer_staff):
-            proposal = submissions.submit(payload, members=producer_staff)
-        self.assertEqual(proposal.id, "P1")
-        self.assertIsInstance(proposal_issue.find_review_proposal(vault, PRODUCER, new_item_dialog.ByItemId("P1")), Issue)
+            configured = request(submissions.SubmissionKind.PROPOSAL, "configured-proposal", recipient=PRODUCER)
+            proposal = submissions.submit(configured, members=producer_staff)
+        self.assertEqual((proposal.id, proposal.path.parent), ("P2", vault))
+        self.assertIsInstance(proposal_issue.find_review_proposal(vault, PRODUCER, new_item_dialog.ByItemId("P2")), Issue)
 
-    def test_proposal_folder_is_absent_for_a_producer_directory(self) -> None:
+    def test_proposal_folder_defaults_to_local_state_for_a_producer_directory(self) -> None:
         directory = self.root / "brain"
         directory.mkdir()
         producer = replace(self.members.rows[1], doc=staff.LiveDoc(local_machine(), directory))
-        self.assertEqual(submissions.proposal_folder(producer),
-                         submissions.NoNativeFolder(submissions.SubmissionKind.PROPOSAL))
+        self.assertEqual(submissions.proposal_folder(producer, self.members),
+                         self.root / "state" / PRODUCER / "proposals")
 
     def test_concurrent_retries_reuse_the_id_for_the_same_request(self) -> None:
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -194,6 +273,125 @@ class ReviewSubmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
                 _ = submissions.submit(different)
         self.assertEqual([item.id for item in investigation.records(OWNER)], ["I1"])
+
+    def test_a_notice_change_is_not_an_exact_retry(self) -> None:
+        original = request(submissions.SubmissionKind.INVESTIGATION)
+        feedback = replace(original, notice=new_item_dialog.SubmissionNotice("feedback"))
+        standard = submissions.submit(feedback)
+        self.assertEqual(submissions.submit(feedback).key, standard.key)
+        with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
+            _ = submissions.submit(original)
+
+        legacy = replace(feedback, request_id="r2-" + "a" * 32)
+        first_legacy = submissions.submit(legacy)
+        changed_legacy = submissions.submit(replace(legacy, notice=new_item_dialog.SubmissionNotice("efficiency")))
+        self.assertNotEqual(changed_legacy.key, first_legacy.key)
+        self.assertEqual(submissions.submit(legacy).key, first_legacy.key)
+
+        browser = replace(feedback, request_id="r6-" + "b" * 32)
+        first_browser = submissions.submit(browser)
+        retry = submissions.submit(browser)
+        self.assertEqual(retry.key, first_browser.key)
+        self.assertNotIsInstance(retry, submissions.EditedSubmission)
+        changed_browser = submissions.submit(replace(browser, notice=new_item_dialog.SubmissionNotice("feedback", True)))
+        self.assertIsInstance(changed_browser, submissions.EditedSubmission)
+        self.assertEqual(changed_browser.key, first_browser.key)
+        self.assertEqual(changed_browser.details.notice, browser.notice)
+
+    def test_concurrent_draft_sends_reuse_each_recipient_item(self) -> None:
+        first = replace(request(), request_id="r2-" + "a" * 32)
+        second = replace(first, recipient_id=PRODUCER)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            saved, other, replay, other_replay = executor.map(submissions.submit, (first, second, first, second))
+        self.assertEqual(saved.key, replay.key)
+        self.assertEqual(other.key, other_replay.key)
+        self.assertNotEqual(saved.key, other.key)
+        self.assertEqual([record.id for record in investigation.records(OWNER)], [saved.id])
+        self.assertEqual([record.id for record in investigation.records(PRODUCER)], [other.id])
+
+    def test_f021_page_send_reuses_standard_item_filed_with_parent(self) -> None:
+        _ = self.wrap_fixture()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root / "config")})))
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={PRODUCER}\n")
+        standard = replace(request(), request_id="r2-" + "c" * 32)
+        saved = submissions.submit(standard)
+        self.assertEqual((saved.recipient_id, saved.owner), (OWNER, PRODUCER))
+
+        page = replace(standard, recipient_id=PRODUCER, page="review")
+        self.assertEqual(submissions.submit(page).key, saved.key)
+        self.assertEqual(submissions.submit(replace(page, page="")).key, saved.key)
+
+        # Remove the index to exercise receipts saved before it existed.
+        index = submissions.image_folder(saved).parent.with_name(f"r4-{saved.payload_hash}")
+        for marker in (".indexed", f"recipient-{PRODUCER}", "page-review"):
+            (index / marker).unlink()
+        self.assertEqual(submissions.submit(page).key, saved.key)
+        self.assertEqual([record.id for record in investigation.records(PRODUCER)], [saved.id])
+        self.assertEqual(investigation.records(OWNER), [])
+
+    def test_f022_page_retry_keeps_reused_standard_item_after_owner_retires(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root / "config")})))
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={OWNER}\n")
+        standard = replace(request(), request_id="r2-" + "d" * 32)
+        saved = submissions.submit(standard)
+        page = replace(standard, page="review")
+        self.assertEqual(submissions.submit(page).key, saved.key)
+
+        _ = self.wrap_fixture()
+        retry = replace(page, recipient_id=PRODUCER)
+        self.assertEqual(submissions.submit(retry).key, saved.key)
+        self.assertEqual([record.id for record in investigation.records(OWNER)], [saved.id])
+        self.assertEqual(investigation.records(PRODUCER), [])
+
+    def test_list_producer_uses_native_stores_without_its_staff_document(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root / "config")})))
+        _ = write_config_fixture(conf.path("console"),
+                                 f"page.review.owner={OWNER}\npage.list.owner={PRODUCER}\n")
+        morty = replace(self.members.rows[1], name="morty")
+        members = replace(self.members, rows=(self.members.rows[0], morty))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
+        for at, kind in enumerate((submissions.SubmissionKind.QUESTION, submissions.SubmissionKind.INVESTIGATION,
+                                   submissions.SubmissionKind.BUG)):
+            with self.subTest(kind=kind):
+                standard = replace(request(kind, recipient=PRODUCER), request_id=f"r2-{at:032x}")
+                selected = replace(standard, page="review", page_recipient=new_item_dialog.PageRecipient.LIST_OWNER)
+                saved = submissions.submit(selected)
+                folder = (record_store.default_question_folder(PRODUCER) if kind == submissions.SubmissionKind.QUESTION
+                          else investigation.folder(PRODUCER))
+                self.assertTrue(saved.path.is_relative_to(folder))
+                self.assertEqual(saved.owner, morty.id)
+                self.assertEqual(submissions.submit(selected).key, saved.key)
+                self.assertEqual(submissions.submit(standard).key, saved.key)
+                default = replace(selected, recipient_id=OWNER, page_recipient=new_item_dialog.PageRecipient.PAGE_OWNER)
+                self.assertNotEqual(submissions.submit(default).key, saved.key)
+        with self.assertRaisesRegex(submissions.SubmissionConflict, "List owner is unavailable"):
+            invalid = replace(request(recipient=OWNER), page="review",
+                              page_recipient=new_item_dialog.PageRecipient.LIST_OWNER)
+            _ = submissions.submit(invalid)
+
+    def test_draft_id_files_changed_content_before_and_after_native_write(self) -> None:
+        original = replace(request(), request_id="r2-" + "b" * 32, images=(IMAGE,))
+        changed_words = replace(original, words="A different report")
+        changes = (replace(original, kind=submissions.SubmissionKind.INVESTIGATION),
+                   replace(original, recipient_id=PRODUCER),
+                   replace(original, images=()))
+        with patch.object(record_store.NumberedRecords, "write", side_effect=OSError("interrupted")):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                _ = submissions.submit(original)
+        self.assertEqual(investigation.records(OWNER), [])
+        changed = submissions.submit(changed_words)
+        saved = submissions.submit(original)
+        self.assertNotEqual(changed.key, saved.key)
+        saved_keys = {changed.key, saved.key}
+        for change in changes:
+            with self.subTest(change=change):
+                item = submissions.submit(change)
+                self.assertNotIn(item.key, saved_keys)
+                saved_keys.add(item.key)
+                self.assertEqual(submissions.submit(change).key, item.key)
+        self.assertEqual(submissions.submit(original).key, saved.key)
+        self.assertEqual(len(investigation.records(OWNER)), 4)
+        self.assertEqual(len(investigation.records(PRODUCER)), 1)
 
     def test_evidence_and_image_survive_each_native_store_round_trip(self) -> None:
         for kind in submissions.SubmissionKind:
@@ -233,9 +431,10 @@ class ReviewSubmissionTests(unittest.TestCase):
         image, = (folder / "images").glob("*/image.png")
         before = image.stat()
         self.assertEqual(image.read_bytes(), base64.b64decode(PNG))
+        delivery = submissions.InitialDelivery()
         with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
-            _ = submissions.submit(replace(payload, words="Different words"))
-        saved = submissions.submit(payload)
+            _ = submissions.submit(replace(payload, words="Different words"), initial_delivery=delivery)
+        saved = submissions.submit(payload, initial_delivery=delivery)
         self.assertEqual(saved.id, "I2")
         self.assertEqual(len(saved.details.images), 1)
         self.assertEqual(image.stat().st_ino, before.st_ino)
@@ -303,17 +502,104 @@ class ReviewSubmissionTests(unittest.TestCase):
         status = change_page.DeliveryStatus(self.root / "review")
         second = submissions.submit(request(seed="second"))
         untouched = investigation.load(OWNER, second.id)
+        key = reply_tokens.path()
+        original_key = key.read_bytes()
+        original_token = second.reply_token
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+        home = self.root / "fixture-home"
+        inside = self.root / "review" / "state"
+        alias = self.root / "state-alias"
+        alias.symlink_to(inside, target_is_directory=True)
+        for environment, overlapping_key in (
+            ({"XDG_STATE_HOME": str(alias), "REVIEW_LINKS_ROOT": str(inside.parent)},
+             inside / "review-links" / key.name),
+            ({"REVIEW_LINKS_ROOT": str(home / ".local")}, home / ".local/state/review-links" / key.name),
+        ):
+            with (self.subTest(environment=environment),
+                  patch.dict(os.environ, environment, clear=True),
+                  patch.object(Path, "home", return_value=home),
+                  patch.object(reply_tokens, "platform", "darwin"),
+                  patch.object(subprocess, "run", side_effect=AssertionError("The server called SSH."))):
+                with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "outside the served Review Links root"):
+                    _ = reply_tokens.mint()
+                self.assertFalse(overlapping_key.parent.exists())
+                overlapping_key.parent.mkdir(parents=True)
+                _ = overlapping_key.write_bytes(original_key)
+                overlapping_key.chmod(0o600)
+                with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "outside the served Review Links root"):
+                    _ = reply_tokens.derive(second.details.reply_proof)
+        served = self.root / "review"
+        spelling = self.root / "review-alias"
+        spelling.symlink_to(served, target_is_directory=True)
+        state = spelling / "alias-state"
+        spelling_key = state / "review-links" / key.name
+        resolve = Path.resolve
+
+        def preserve_spelling(path: Path, strict: bool = False) -> Path:
+            # Simulate a file system that preserves the supplied case.
+            return path if path == spelling_key else resolve(path, strict=strict)
+
+        with (patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}), reply_tokens.serving(served),
+              patch.object(Path, "resolve", autospec=True, side_effect=preserve_spelling)):
+            with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "outside the served Review Links root"):
+                _ = reply_tokens.mint()
+            self.assertFalse(state.exists())
+        mac_key = key.parent / "mac" / key.name
+        with (patch.object(reply_tokens, "platform", "darwin"),
+              patch.object(reply_tokens, "path", return_value=mac_key),
+              patch.object(subprocess, "run", autospec=True) as ssh):
+            ssh.return_value = subprocess.CompletedProcess([], 0, b"short", b"")
+            with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "must contain 32 bytes"):
+                _ = reply_tokens.mint()
+            self.assertFalse(mac_key.exists())
+            ssh.side_effect = subprocess.CalledProcessError(1, "ssh")
+            with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "Cannot copy the reply key from natedev"):
+                _ = reply_tokens.derive(second.details.reply_proof)
+            self.assertFalse(mac_key.exists())
+            ssh.side_effect = None
+            ssh.reset_mock()
+            ssh.return_value = subprocess.CompletedProcess([], 0, original_key, b"")
+            self.assertEqual(reply_tokens.derive(second.details.reply_proof), original_token)
+            proof = reply_tokens.mint()
+            token = reply_tokens.derive(proof)
+            ssh.assert_called_once()
+            self.assertEqual(ssh.call_args.args[0][:4], ["ssh", "-o", "BatchMode=yes", "natedev"])
+            self.assertEqual(ssh.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertEqual(mac_key.read_bytes(), original_key)
+            self.assertEqual(mac_key.stat().st_mode & 0o777, 0o600)
+
+            def copy_with_race(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                _ = mac_key.write_bytes(original_key)
+                mac_key.chmod(0o600)
+                return subprocess.CompletedProcess([], 0, b"x" * len(original_key), b"")
+
+            mac_key.unlink()
+            ssh.side_effect = copy_with_race
+            self.assertEqual(reply_tokens.derive(second.details.reply_proof), original_token)
+            self.assertEqual(mac_key.read_bytes(), original_key)
+        self.assertEqual(reply_tokens.derive(proof), token)
+
+        def accept(_key: review.QuestionKey, draft: str, **_kwargs: object) -> review.QuestionAccepted:
+            return review.QuestionAccepted(draft)
+
         for kind in submissions.SubmissionKind:
-            with self.subTest(kind=kind):
+            with (self.subTest(kind=kind), patch.object(review, "review_question", side_effect=accept) as reader):
                 first = submissions.submit(request(kind, kind))
-                for token in ("", second.reply_token, "✓"):
-                    with self.subTest(token=token):
+                reader.reset_mock()
+                proof = first.details.reply_proof
+                token = reply_tokens.derive(proof)
+                self.assertEqual(token, first.reply_token)
+                self.assertEqual(key.read_bytes(), original_key)
+                for invalid in ("", second.reply_token, "✓"):
+                    with self.subTest(token=invalid):
                         with self.assertRaisesRegex(question_record.AnswerRefused, "token does not match"):
-                            _ = change_page.answer_item(first.key, "An answer", token, status)
-                self.assertTrue(change_page.answer_item(first.key, "An answer", first.reply_token, status))
-                self.assertFalse(change_page.answer_item(first.key, "An answer", first.reply_token, status))
-                with self.assertRaisesRegex(question_record.AnswerRefused, "no longer accepts"):
-                    _ = change_page.answer_item(first.key, "New answer", first.reply_token, status)
+                            _ = change_page.answer_item(first.key, "An answer", invalid, status)
+                with patch.object(reply_tokens, "path", return_value=key.with_suffix(".absent")):
+                    self.assertTrue(change_page.answer_item(first.key, "An answer", token, status))
+                    self.assertFalse(change_page.answer_item(first.key, "An answer", token, status))
+                    with self.assertRaisesRegex(question_record.AnswerRefused, "no longer accepts"):
+                        _ = change_page.answer_item(first.key, "New answer", token, status)
+                reader.assert_called_once()
                 match kind:
                     case submissions.SubmissionKind.QUESTION:
                         answered, = self.questions()
@@ -335,12 +621,77 @@ class ReviewSubmissionTests(unittest.TestCase):
                             _ = change_page.answer_item(first.key, "An answer", first.reply_token, status)
         self.assertEqual(investigation.load(OWNER, second.id), untouched)
 
-    def test_f001_generated_reply_command_accepts_a_dash_from_the_token_generator(self) -> None:
-        def dash_token(size: int) -> str:
-            return "-" + "a" * ((4 * size + 2) // 3 - 1)
+    def test_scrub_preserves_notes_and_legacy_replies_without_a_key(self) -> None:
+        opened = [submissions.submit(request(kind, "open")) for kind in submissions.SubmissionKind]
+        archived = opened[-1]
+        archive = archived.path.parent / "archive"
+        archive.mkdir(exist_ok=True)
+        opened[-1] = replace(archived, path=archived.path.rename(archive / archived.path.name))
+        closed = submissions.submit(request(submissions.SubmissionKind.QUESTION, "closed"))
+        self.assertTrue(submissions.answer(closed.key, "The owner replied.", closed.reply_token))
+        record = update_registration.read_review_question(closed.path)
+        update_registration.review_sent_question(record, read_production(OWNER, self.members), "read", "")
+        notes = [*opened, closed]
+        tokens = {item.key: item.reply_token for item in notes}
+        originals: dict[Path, bytes] = {}
+        for item in notes:
+            blob = item.path.read_bytes()
+            for quote in ('"', r'\"'):
+                blob = blob.replace(
+                    f', {quote}reply_token_nonce{quote}: {quote}{item.details.reply_token_nonce}{quote}'.encode(), b"")
+            self.assertNotIn(b"reply_token_nonce", blob)
+            originals[item.path] = blob
+            legacy = blob.replace(b"reply_token_sha256", b"reply_token", 1)
+            _ = item.path.write_bytes(legacy.replace(item.details.reply_token_sha256.encode(),
+                                                      tokens[item.key].encode(), 1))
 
-        with patch.object(secrets, "token_urlsafe", side_effect=dash_token):
-            saved = submissions.submit(request())
+        key = reply_tokens.path()
+        previous_key = key.with_suffix(".previous")
+        _ = key.rename(previous_key)
+        note = update_registration.read_review_question(opened[0].path)
+        legacy_details = new_item_dialog.read_submission(note.item.get("review_submission"))
+        new_item_dialog.require_reply_token(legacy_details, tokens[opened[0].key])
+        with self.assertRaisesRegex(submissions.SubmissionError, "token does not match"):
+            new_item_dialog.require_reply_token(legacy_details, tokens[closed.key])
+
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(submissions.main(["scrub-reply-tokens"]), 0)
+        self.assertCountEqual(output.getvalue().splitlines(), [f"Rewrote {item.path}" for item in notes])
+        for item in notes:
+            self.assertEqual(item.path.read_bytes(), originals[item.path])
+        before = {item.path: item.path.stat().st_mtime_ns for item in notes}
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(submissions.main(["scrub-reply-tokens"]), 0)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual({item.path: item.path.stat().st_mtime_ns for item in notes}, before)
+        self.assertFalse(key.exists())
+
+        archived = opened[-1]
+        self.assertTrue(submissions.answer(archived.key, "Reply while archived.", tokens[archived.key]))
+        status = change_page.DeliveryStatus(key.parent)
+        for item in opened[:-1]:
+            with self.subTest(kind=item.kind):
+                saved = submissions.submit(request(item.kind, "open"))
+                self.assertEqual(saved.details.reply_token_nonce, "")
+                delivery = review_actions.prepare_submission_delivery(saved, saved.words, status)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                current = submissions.submit(request(item.kind, "open"))
+                self.assertTrue(reply_tokens.valid_nonce(current.details.reply_token_nonce))
+                token = current.reply_token
+                self.assertIn(change_page.reply_command(current.key, token), change_page.outbound_review_message(delivery).text)
+                self.assertNotIn(token.encode(), current.path.read_bytes())
+                with self.assertRaisesRegex(submissions.SubmissionError, "token does not match"):
+                    _ = submissions.answer(current.key, "The old token fails.", tokens[item.key])
+                self.assertTrue(submissions.answer(current.key, "The new token works.", token))
+                with patch.object(reply_tokens, "path", return_value=key.with_suffix(".absent")):
+                    answered = submissions.submit(request(item.kind, "open"))
+                    self.assertIsInstance(review_actions.prepare_submission_delivery(answered, answered.words, status),
+                                          change_page.NoMessageDelivery)
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+
+    def test_f001_generated_reply_command_uses_the_derived_token(self) -> None:
+        saved = submissions.submit(request())
+        self.assertRegex(saved.reply_token, r"^r[A-Za-z0-9_-]{42}$")
         command = shlex.split(change_page.reply_command(saved.key, saved.reply_token))
         command[-1] = "The command works."
         self.assertEqual(change_page.main(command[2:]), 0)
@@ -357,13 +708,15 @@ class ReviewSubmissionTests(unittest.TestCase):
 
     def test_f003_proposal_requires_the_recipients_native_folder(self) -> None:
         eligible = {option["id"]: option["proposal"] for option in submissions.recipient_options(self.members)}
-        self.assertEqual(eligible, {OWNER: True, PRODUCER: False})
+        self.assertEqual(eligible, {OWNER: True, PRODUCER: True})
         _ = self.doc.write_text("# Builds\n> **Status: PRODUCTION — running.**\n")
         with self.assertRaisesRegex(submissions.SubmissionError, "native proposal folder"):
             _ = submissions.submit(request(submissions.SubmissionKind.PROPOSAL))
         self.assertFalse((self.root / "rust" / "hanadocs" / "issues").exists())
         eligible = {option["id"]: option["proposal"] for option in submissions.recipient_options(self.members)}
-        self.assertEqual(eligible, {OWNER: False, PRODUCER: False})
+        self.assertEqual(eligible, {OWNER: False, PRODUCER: True})
+        saved = submissions.submit(request(submissions.SubmissionKind.PROPOSAL, recipient=PRODUCER))
+        self.assertEqual(saved.path.parent, self.root / "state" / PRODUCER / "proposals")
 
     def test_f004_lookup_requires_one_selector(self) -> None:
         for lookup in (update_registration.find_review_question_in_folder, proposal_issue.find_review_proposal):
@@ -474,7 +827,7 @@ class ReviewSubmissionTests(unittest.TestCase):
             self.assertEqual(submissions.submit(payload), saved)
         self.assertEqual(saved.path.parent, self.issues)
         receipt = cast(dict[str, str], json.loads((submissions.image_folder(saved).parent / "receipt.json").read_text()))
-        self.assertEqual(receipt, {"id": "P1", "kind": "proposal", "recipient": OWNER,
+        self.assertEqual(receipt, {"destination": "native", "id": "P1", "kind": "proposal", "recipient": OWNER,
                                    "path": str(saved.path), "original_path": str(saved.path),
                                    "payload_hash": saved.payload_hash})
         self.assertEqual(list(new_folder.glob("*.md")), [])
@@ -517,19 +870,23 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(saved.id, "P1")
 
     def test_f012_retry_uses_the_native_path_after_wrap_moves_the_document(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, fixture_git_environment(self.root), clear=True)))
         active_doc = self.root / "docs" / "productions" / self.doc.name
         active_doc.parent.mkdir(parents=True)
         _ = active_doc.write_text(self.doc.read_text().replace(str(self.issues), "issues"))
         row = self.members.by_id(OWNER)
         assert row is not None
-        row = replace(row, doc=staff.LiveDoc(local_machine(), active_doc))
+        identity = staff.native_id(fixture_runtime_id("review-wrap-recovery"))
+        row = replace(row, id=identity, current_session=identity, doc=staff.LiveDoc(local_machine(), active_doc))
         active = staff.StaffSnapshot((row,))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=active))
+        _ = self.enterContext(patch.object(staff, "authority_snapshot", return_value=active))
+        _ = production_admission.capture_rollout_inventory([identity])
         production = read_production(row)
         native_folder = proposals_folder.issues_folder(active_doc)
         assert native_folder is not None
-        with patch.object(staff, "snapshot", return_value=active):
-            payload = replace(request(submissions.SubmissionKind.PROPOSAL), images=(IMAGE,))
-            saved = submissions.submit(payload)
+        payload = replace(request(submissions.SubmissionKind.PROPOSAL, recipient=identity), images=(IMAGE,))
+        saved = submissions.submit(payload)
         _ = active_doc.write_text(active_doc.read_text().replace("— running.**", "— wrapped.**"))
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
         _ = subprocess.run(["git", "-C", str(self.root), "add", "--", str(active_doc)], check=True)
@@ -543,17 +900,18 @@ class ReviewSubmissionTests(unittest.TestCase):
         wrapped_row = replace(row, doc=staff.WrappedDoc(local_machine(),
             self.root / "docs" / "archive" / self.root.name / row.name / active_doc.name))
         assert isinstance(wrapped_row.doc, staff.WrappedDoc)
-        with (patch.object(staff, "snapshot", return_value=active),
-              patch.object(staff, "set_doc", side_effect=OSError("Stop before the wrap commit.")) as set_doc,
+        with (patch.object(staff, "set_doc", side_effect=OSError("Stop before the wrap commit.")) as set_doc,
               patch.object(production_lifecycle, "checkout_ready", return_value=production_lifecycle.PlanLanded("fixture-tip")),
               patch.object(production_lifecycle, "merged_checkpoints", return_value=()),
               patch.object(production_lifecycle, "checked", side_effect=wrap_command)):
             with self.assertRaisesRegex(OSError, "Stop before the wrap commit"):
                 _ = production_lifecycle.wrap(production, active_doc.read_text().splitlines(), True,
                                               production_lifecycle.VerdictMissing(), production_lifecycle.VerdictMissing(), ())
-            set_doc.assert_called_once_with(OWNER, wrapped_row.doc)
+            set_doc.assert_called_once_with(identity, wrapped_row.doc, expected=row.doc)
         self.assertFalse(active_doc.exists())
         self.assertTrue(wrapped_row.doc.path.is_file())
+        text = wrapped_row.doc.path.read_text().replace("- **Proposals:** `issues`", "- **Proposals:** `new-issues`")
+        _ = wrapped_row.doc.path.write_text(text)
         self.assertNotEqual(proposals_folder.issues_folder(wrapped_row.doc.path), native_folder)
         self.assertEqual(submissions.submit(payload, members=staff.StaffSnapshot((wrapped_row,))), saved)
         self.assertEqual(saved.path.parent, native_folder.resolve())
@@ -584,7 +942,7 @@ class ReviewSubmissionTests(unittest.TestCase):
                   patch.object(review_items, "read", return_value=[item])):
                 delivery, _ = review_page.submit(status.root, body, status)
         assert isinstance(delivery, change_page.MessageDelivery)
-        return shlex.split(delivery.message.splitlines()[-1])[2:]
+        return shlex.split(change_page.outbound_review_message(delivery).text.splitlines()[-1])[2:]
 
     def test_f013_replacement_voids_the_first_token(self) -> None:
         status = change_page.DeliveryStatus(self.root / "review")
@@ -593,7 +951,11 @@ class ReviewSubmissionTests(unittest.TestCase):
                 saved = submissions.submit(request(kind))
                 original = saved.reply_token
                 command = self.replace_review_wait(saved, "Check again", status)
-                self.assertNotEqual(command[command.index("--question") + 1], original)
+                token = command[command.index("--question") + 1]
+                current = submissions.submit(request(kind))
+                self.assertEqual(current.reply_token, token)
+                self.assertNotEqual(token, original)
+                self.assertNotEqual(current.details.reply_token_nonce, saved.details.reply_token_nonce)
                 before = saved.path.read_bytes()
                 with self.assertRaisesRegex(question_record.AnswerRefused, "token does not match"):
                     _ = change_page.answer_item(saved.key, "Stale reply", original, status)
@@ -839,8 +1201,9 @@ class ReviewSubmissionTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertTrue(submissions.answer(saved.key, 'Ready for review', saved.reply_token))
                 self.assertTrue(saved.path.exists())
-                found = review_items.read(self.root / 'review', members=self.members,
-                                          kinds=(review_items.ReviewType(kind.value),))
+                review_type = (review_items.ReviewType.RESPONSE if kind == submissions.SubmissionKind.QUESTION
+                               else review_items.ReviewType(kind.value))
+                found = review_items.read(self.root / 'review', members=self.members, kinds=(review_type,))
                 self.assertTrue(any(item.source_unit == OWNER and item.id == f'builds/{saved.id}'
                                     and item.state == review_items.ReviewState.OPEN for item in found))
         latest = self.root / 'third-issues'
@@ -921,17 +1284,47 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(submissions.submit(payload), saved)
 
     def test_f082_archived_send_retries_find_each_request_before_locking(self) -> None:
-        for kind in (submissions.SubmissionKind.QUESTION, submissions.SubmissionKind.PROPOSAL,
-                     submissions.SubmissionKind.BUG):
-            with self.subTest(kind=kind):
-                payload = request(kind)
+        cases = ((submissions.SubmissionKind.QUESTION, False), (submissions.SubmissionKind.PROPOSAL, False),
+                 (submissions.SubmissionKind.BUG, False), (submissions.SubmissionKind.BUG, True))
+        for kind, transfer in cases:
+            with self.subTest(kind=kind, transfer=transfer):
+                payload = request(kind, "transfer during retry" if transfer else "archive retry")
                 saved = submissions.submit(payload)
                 archive = saved.path.parent / "archive"
                 archive.mkdir(exist_ok=True)
                 archived = saved.path.rename(archive / ("moved " + saved.path.name))
-                with patch.object(investigation, "recipient_locks", side_effect=AssertionError(
-                        "Retry locked before it could return the archived record.")):
-                    self.assertEqual(submissions.submit(payload), replace(saved, path=archived))
+                members = self.wrap_fixture() if transfer else self.members
+                locks = investigation.recipient_locks
+                checked_lookup = False
+                with patch.object(submissions, "locate_native_submission",
+                                  wraps=submissions.locate_native_submission) as locate:
+                    @contextmanager
+                    def lock_after_lookup(*owners: staff.StaffId) -> Generator[None]:
+                        nonlocal checked_lookup
+                        if not checked_lookup:
+                            self.assertEqual(locate.call_count, 1)
+                            checked_lookup = True
+                            if transfer:
+                                self.assertEqual(self.tidy_fixture(members), (0, ""))
+                        with locks(*owners):
+                            yield
+
+                    with patch.object(investigation, "recipient_locks", side_effect=lock_after_lookup):
+                        retry = submissions.submit(payload, members=members)
+                self.assertTrue(checked_lookup)
+                self.assertEqual(retry.reply_token, saved.reply_token)
+                if transfer:
+                    self.assertFalse(archived.exists())
+                else:
+                    self.assertEqual(retry, replace(saved, path=archived))
+                owner = PRODUCER if transfer else saved.owner
+                path = investigation.folder(owner) / saved.path.name if transfer else archived
+                self.assertEqual((retry.key, retry.owner, retry.path), (saved.key, owner, path))
+                receipt = submissions.image_folder(saved).parent / "receipt.json"
+                location = cast(dict[str, str], json.loads(receipt.read_text()))
+                self.assertEqual((location.get("owner", location["recipient"]),
+                                  location["path"], location["original_path"]),
+                                 (owner, str(path), str(saved.path)))
 
     def test_f083_retry_cannot_commit_a_proposal_during_native_rollback(self) -> None:
         payload = request(submissions.SubmissionKind.PROPOSAL)
@@ -1536,7 +1929,8 @@ class ReviewSubmissionTests(unittest.TestCase):
                     saved = submissions.submit(payload)
                 collision, = delivered
                 self.assertEqual((saved.id, saved.path), (peer.id, collision))
-                self.assertEqual(saved.reply_token, peer.reply_token)
+                self.assertEqual(saved.reply_token, "")
+                self.assertTrue(new_item_dialog.matches_reply_token(saved.details, peer.reply_token))
                 self.assertEqual(collision.read_bytes(), original)
                 self.assertEqual(submissions.submit(payload), saved)
                 self.assertEqual(set(collision.parent.glob("*.md")) - before, {collision})
@@ -1557,8 +1951,10 @@ class ReviewSubmissionTests(unittest.TestCase):
             kinds=(review_items.ReviewType.QUESTION,)) if isinstance(item.source, review_items.QuestionSource)
             and item.source.record.path == legacy)
         assert isinstance(projected.source, review_items.QuestionSource)
-        self.assertEqual(update_registration.open_item_key(projected.source.record), f'question/{OWNER}/Q2')
-        self.assertIn('"review_id": "Q2"', legacy.read_text())
+        self.assertEqual(projected.key, f'question/{OWNER}/Q2.md')
+        self.assertEqual(projected.id, f'{review_items.name(OWNER, self.members)}/Q2')
+        self.assertNotIn('review_id', projected.source.record.item)
+        self.assertEqual(self.question_files(), before)
 
     def test_f046_seed_refuses_unreadable_investigation(self) -> None:
         store = investigation.folder(OWNER)
@@ -1717,6 +2113,186 @@ class ReviewSubmissionTests(unittest.TestCase):
         record, = investigation.records(PRODUCER, include_read=True)
         self.assertEqual((record.id, record.owner), (saved.id, PRODUCER))
 
+    def test_list_owner_config_write_uses_the_test_directory(self) -> None:
+        path = conf.path("console")
+        live_path = Path(os.path.expanduser("~/.claude/config/console.conf"))
+        self.assertNotEqual(path, live_path)
+        self.assertEqual(path, self.root / "config" / "console.conf")
+
+        setting = f"page.list.owner={PRODUCER}"
+        _ = write_config_fixture(path, setting + "\n")
+        self.assertIn(setting, path.read_text(encoding="utf-8").splitlines())
+
+    def test_f098_send_refuses_a_failed_owner_read_before_filing(self) -> None:
+        document = self.doc.read_bytes()
+        parent_doc = self.root / "parent.md"
+        _ = parent_doc.write_text("> **Status: PRODUCTION — running.**\n")
+        parent = replace(self.members.rows[1], kind="showrunner", doc=staff.LiveDoc(local_machine(), parent_doc))
+        owner = replace(self.members.rows[0], parent=staff.ReportsTo(parent.id))
+        members = staff.StaffSnapshot((owner, parent))
+        standard = request(seed="missing owner document")
+        draft = replace(request(seed="undecodable owner document"), request_id="r2-" + "a" * 32)
+
+        with patch.object(staff, "snapshot", return_value=members):
+            self.doc.unlink()
+            with self.assertRaisesRegex(submissions.SubmissionError, rf"^The builds production document {re.escape(str(self.doc))}"
+                                        + r" is missing\. producer must fix the builds staff row\.$"):
+                _ = submissions.submit(standard)
+            _ = self.doc.write_bytes(b"\xff")
+            with self.assertRaisesRegex(submissions.SubmissionError, rf"^The builds production document {re.escape(str(self.doc))}"
+                                        + r" cannot be read\. producer must fix the builds staff row\.$"):
+                _ = submissions.submit(draft)
+            for name in ("pending.json", "receipt.json", ".indexed", "investigation.water"):
+                self.assertEqual(list(self.root.rglob(name)), [])
+            self.assertEqual(investigation.records(OWNER), [])
+            self.assertEqual(investigation.records(parent.id), [])
+
+            _ = self.doc.write_bytes(document)
+            for number, payload in enumerate((standard, draft), 1):
+                saved = submissions.submit(payload)
+                retry = submissions.submit(payload)
+                self.assertEqual((saved.owner, saved.id), (OWNER, f"I{number}"))
+                self.assertEqual((retry.key, retry.path), (saved.key, saved.path))
+            self.assertEqual([item.id for item in investigation.records(OWNER)], ["I1", "I2"])
+            self.assertEqual(investigation.records(parent.id), [])
+
+        producer_doc = self.root / "producer.md"
+        owner = self.members.rows[0]
+        producer = replace(self.members.rows[1], doc=staff.LiveDoc(local_machine(), producer_doc),
+                           parent=staff.ReportsTo(owner.id))
+        members = staff.StaffSnapshot((owner, producer))
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={producer.id}\n")
+        standard = replace(request(seed="producer standard", recipient=producer.id), images=(IMAGE,))
+        list_page = replace(request(seed="producer list", recipient=producer.id), page="list", images=(IMAGE,))
+        review = replace(standard, request_id="r2-" + "b" * 32, page="review",
+                         page_recipient=new_item_dialog.PageRecipient.LIST_OWNER)
+        before = {path: path.read_bytes() for path in self.root.rglob("receipt.json")}
+        with patch.object(staff, "snapshot", return_value=members):
+            for content in (b"", b"\xff"):
+                if content:
+                    _ = producer_doc.write_bytes(content)
+                for payload in (standard, list_page, review):
+                    with self.subTest(page=payload.page, content=content):
+                        state = "cannot be read" if content else "is missing"
+                        with self.assertRaisesRegex(submissions.SubmissionError,
+                                                    rf"^The producer production document {re.escape(str(producer_doc))}"
+                                                    + rf" {state}\. builds must fix the producer staff row\.$"):
+                            _ = submissions.submit(payload)
+                self.assertEqual({path: path.read_bytes() for path in self.root.rglob("receipt.json")}, before)
+                self.assertEqual(list(self.root.rglob("pending.json")), [])
+                self.assertEqual(list(self.root.rglob("image.png")), [])
+                self.assertEqual(investigation.records(producer.id), [])
+                self.assertEqual([item.id for item in investigation.records(owner.id)], ["I1", "I2"])
+
+            _ = producer_doc.write_text("> **Status: PRODUCTION — wrapped.**\n")
+            list_draft = replace(list_page, request_id="r2-" + "c" * 32, words="Check this from the List.")
+            for number, payload in enumerate((standard, list_page, list_draft, review), 3):
+                with self.subTest(page=payload.page, request_id=payload.request_id):
+                    saved = submissions.submit(payload)
+                    self.assertEqual((saved.owner, saved.id), (owner.id, f"I{number}"))
+                    self.assertEqual(submissions.submit(payload).key, saved.key)
+            self.assertEqual(investigation.records(producer.id), [])
+            self.assertEqual([item.id for item in investigation.records(owner.id)], ["I1", "I2", "I3", "I4", "I5", "I6"])
+
+    def test_f002_allocation_refusal_leaves_the_request_free_for_an_edited_retry(self) -> None:
+        other_doc = self.root / "missing-production.md"
+        other = replace(self.members.rows[1], kind="showrunner", doc=staff.LiveDoc(local_machine(), other_doc))
+        members = staff.StaffSnapshot((self.members.rows[0], other))
+        payload = replace(request(submissions.SubmissionKind.PROPOSAL), images=(IMAGE,))
+        draft = replace(payload, request_id="r2-" + "1" * 32)
+        folder = self.root / "review-attachments" / payload.request_id
+        with patch.object(staff, "snapshot", return_value=members):
+            for candidate in (payload, draft, draft):
+                with self.assertRaisesRegex(submissions.SubmissionError,
+                                            r"Cannot check the record folders.*missing-production.md"):
+                    _ = submissions.submit(candidate)
+                for name in ("pending.json", "receipt.json", "images", ".indexed", "recipient-*"):
+                    self.assertEqual(list(self.root.rglob(name)), [])
+            self.assertEqual(self.proposals(), [])
+
+            _ = other_doc.write_text(f"- **Proposals:** {self.root / 'other-issues'}\n")
+            registry = self.root / "state" / "review-folders" / OWNER / "proposal.json"
+            registry.parent.mkdir(parents=True)
+            _ = registry.write_text("[]\n")
+            selected = False
+            next_id = record_store.LockedRecordNumbers.next_id
+            read_text = Path.read_text
+            read_bytes = Path.read_bytes
+
+            def select_id(numbers: record_store.LockedRecordNumbers, *folders: Path,
+                          covered_owner: staff.StaffId | None = None) -> str:
+                nonlocal selected
+                identity = next_id(numbers, *folders, covered_owner=covered_owner)
+                selected = True
+                return identity
+
+            def refuse_registry_read(path: Path, encoding: str | None = None, errors: str | None = None,
+                                     newline: str | None = None) -> str:
+                if path == registry and selected:
+                    raise PermissionError("Cannot read the folder registry.")
+                return read_text(path, encoding, errors, newline)
+
+            def refuse_registry_backup(path: Path) -> bytes:
+                if path == registry:
+                    raise PermissionError("Cannot read the folder registry for rollback.")
+                return read_bytes(path)
+
+            for operation, refusal in (("read_text", refuse_registry_read), ("read_bytes", refuse_registry_backup)):
+                selected = False
+                with (self.subTest(operation=operation),
+                      patch.object(record_store.LockedRecordNumbers, "next_id", select_id),
+                      patch.object(Path, operation, refusal)):
+                    with self.assertRaisesRegex(PermissionError, "Cannot read the folder registry"):
+                        _ = submissions.submit(payload)
+                    self.assertTrue(selected)
+                    self.assertFalse(folder.exists())
+                    self.assertEqual(self.proposals(), [])
+                    self.assertFalse((self.root / "state" / "record-ids" / "proposal.water").exists())
+                self.assertEqual(registry.read_text(), "[]\n")
+
+            edited = replace(payload, words="File the edited proposal.")
+            saved = submissions.submit(edited)
+            self.assertEqual(submissions.submit(edited), saved)
+        self.assertEqual(saved.id, "P1")
+        self.assertEqual([proposal.path for proposal in self.proposals()], [saved.path])
+        self.assertTrue(proposal_issue.read_issue(saved.path).endswith(edited.words + "\n"))
+        image, = saved.details.images
+        self.assertEqual((folder / "images" / image.id / image.file).read_bytes(), base64.b64decode(PNG))
+
+    def test_f003_stale_review_action_keeps_the_unnumbered_question_wait(self) -> None:
+        path = self.issues / "question-legacy.md"
+        item = update_registration.OutstandingItem(
+            since="2026-11-17T12:00", text="Legacy question", question="What changed?", asked_by=OWNER,
+            followup=update_registration.PendingFollowup(text="Check the first result.", sent="2026-11-17T12:30"))
+        record = update_registration.QuestionRecord(path, OWNER, OWNER, item, "open")
+        update_registration.write_question_record(record)
+        stale = review_items.question_item(record, self.members)
+        pending = update_registration.PendingFollowup(text="Check the current result.", sent="2026-11-17T12:45")
+        current = replace(record, item={**item, "followup": pending})
+        update_registration.write_question_record(current)
+        before = path.read_bytes()
+        root = self.root / "review"
+        status = change_page.DeliveryStatus(root)
+        browser = change_page.ReviewBrowser("fixture-token", "")
+        body = urlencode({"row": stale.key, "token": change_browser.row_token(browser, stale.key),
+                          "outcome": "question", "feedback": "Which result is correct?"})
+        with patch.object(change_browser, "browser_manifest", return_value=(browser.token, browser.initial)):
+            with (patch.object(review_items, "read", return_value=[stale]),
+                  patch.object(status, "write_slots", wraps=status.write_slots) as write):
+                with self.assertRaisesRegex(review_items.ReviewRecordChanged, "follow-up on this question changed"):
+                    _ = review_page.submit(root, body, status)
+                write.assert_not_called()
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(self.questions()[0].item.get("followup"), pending)
+            self.assertNotIn("review_id", self.questions()[0].item)
+            with patch.object(review_items, "read", return_value=[review_items.question_item(current, self.members)]):
+                delivery, _ = review_page.submit(root, body, status)
+        self.assertIsInstance(delivery, change_page.MessageDelivery)
+        stored, = self.questions()
+        self.assertEqual(stored.item.get("review_id"), "Q1")
+        self.assertEqual(stored.item.get("waiting_why"), "Which result is correct?")
+        self.assertIn("Superseded followup: Check the current result.", stored.item.get("review_log", ""))
+
     def test_send_to_a_wrapped_owner_files_with_the_active_owner(self) -> None:
         wrapped = self.wrap_fixture()
         parent = wrapped.rows[1]
@@ -1758,12 +2334,16 @@ class ReviewSubmissionTests(unittest.TestCase):
         archive = moved.parent / 'archive' / '2026'
         archive.mkdir(parents=True)
         archived = moved.rename(archive / moved.name)
-        with patch.object(investigation, 'review_record_paths', wraps=investigation.review_record_paths) as search:
+        with (patch.object(investigation, 'review_record_paths', wraps=investigation.review_record_paths) as search,
+              patch.object(review, "review_question", return_value=review.QuestionAccepted("Answer in the archive"))):
             self.assertTrue(submissions.answer(saved.key, 'Answer in the archive', token, members=wrapped))
+            self.assertEqual(search.call_args_list, [((PRODUCER,), {"strict": True})] * 2)
+            search.reset_mock()
             retry = submissions.submit(payload, members=wrapped)
-        self.assertEqual(search.call_args_list, [((PRODUCER,), {"strict": True})] * 2)
+            search.assert_called_once_with(PRODUCER, strict=True)
         self.assertEqual((retry.id, retry.owner, retry.path), (saved.id, PRODUCER, archived))
-        self.assertEqual((retry.key, retry.reply_token), (saved.key, token))
+        self.assertEqual((retry.key, retry.reply_token), (saved.key, ""))
+        self.assertTrue(new_item_dialog.matches_reply_token(retry.details, token))
         self.assertTrue(archived.exists())
         self.assertEqual(investigation.read_review_record(archived).answer, 'Answer in the archive')
 
@@ -1830,7 +2410,8 @@ class ReviewSubmissionTests(unittest.TestCase):
         receipt.unlink()
         self.assertTrue(submissions.answer(saved.key, 'Reply without a receipt', token, members=wrapped))
         retry = submissions.submit(payload, members=wrapped)
-        self.assertEqual((retry.id, retry.key, retry.reply_token), (saved.id, saved.key, token))
+        self.assertEqual((retry.id, retry.key, retry.reply_token), (saved.id, saved.key, ""))
+        self.assertTrue(new_item_dialog.matches_reply_token(retry.details, token))
         self.assertEqual((retry.owner, retry.path), (PRODUCER, investigation.folder(PRODUCER) / saved.path.name))
         self.assertEqual(investigation.load(PRODUCER, saved.id).answer, 'Reply without a receipt')
         self.assertEqual(investigation.records(OWNER, include_read=True), [])
@@ -1986,3 +2567,107 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(investigation.records(OWNER), [])
         self.assertEqual(self.questions(), [])
         self.assertEqual(self.proposals(), [])
+
+
+_NATEDEV = staff.StaffRow(staff.StaffId("natedev-staff"), "showrunner", "natedev", staff.StaffRoot(),
+                         current_session=staff.StaffId("natedev-session"),
+                         doc=staff.LiveDoc(local_machine(), Path("/natedev-production.md")))
+_SDLC = replace(_NATEDEV, id=staff.StaffId("sdlc-staff"), name="sdlc", parent=staff.ReportsTo(_NATEDEV.id))
+_BUILDS = replace(_NATEDEV, id=staff.StaffId("builds-staff"), name="builds", parent=staff.ReportsTo(_NATEDEV.id))
+_AWS = staff.StaffRow(staff.StaffId("aws-staff"), "unit", "aws", staff.ReportsTo(_BUILDS.id),
+                      current_session=staff.StaffId("aws-session"), unit_type=staff.UnitDetails("direct"))
+_MORTY = staff.StaffRow(staff.StaffId("morty-staff"), "producer", "morty", staff.StaffRoot(),
+                        current_session=staff.StaffId("morty-session"))
+
+
+@final
+class PageOwnerReasonTests(unittest.TestCase):
+    """Each route to a page owner returns the sentence that says why."""
+
+    root: Path = Path()
+    natedev: staff.StaffRow = _NATEDEV
+    sdlc: staff.StaffRow = _SDLC
+    builds: staff.StaffRow = _BUILDS
+    aws: staff.StaffRow = _AWS
+    morty: staff.StaffRow = _MORTY
+    members: staff.StaffSnapshot = staff.StaffSnapshot((_NATEDEV, _SDLC, _BUILDS, _AWS, _MORTY))
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def route(self, page: str, owner: str, members: staff.StaffSnapshot) -> submissions.PageOwnerRoute:
+        config = self.root / "console.conf"
+        owner_line = f"page.{page}.owner={owner}\n" if owner else ""
+        _ = config.write_text(f"page.{page}.label={page.replace('_', ' ').title()}\n{owner_line}"
+                              + f"owner.default={self.sdlc.id}\n", encoding="utf-8")
+        route = submissions.page_owners(page, conf.read(config), members).route
+        assert isinstance(route, submissions.PageOwnerRoute)
+        return route
+
+    def test_reason_names_the_owner_that_takes_the_item(self) -> None:
+        for page, owner, expected in (("list", self.morty, "(why morty? because morty owns the List page!)"),
+                                      ("builds", self.builds, "(why builds? because builds owns the Builds page!)")):
+            with self.subTest(page=page):
+                route = self.route(page, owner.id, self.members)
+                self.assertEqual((route.row, route.reason), (owner, expected))
+        config = self.root / "console.conf"
+        _ = config.write_text(f"page.rebuilds.owner={self.natedev.id}\n", encoding="utf-8")
+        route = submissions.page_owners("rebuilds", conf.read(config), self.members).route
+        assert isinstance(route, submissions.PageOwnerRoute)
+        self.assertEqual(route.reason, "(why natedev? because natedev owns the Rebuilds page!)")
+
+    def test_reason_names_the_showrunner_of_a_unit_owner(self) -> None:
+        route = self.route("aws_machines", self.aws.id, self.members)
+        self.assertEqual((route.row, route.reason), (self.builds, "(why builds? because aws owns the Aws Machines page"
+                                                     + " and builds is its showrunner!)"))
+        worker = staff.StaffRow(staff.StaffId("worker-staff"), "worker", "fixer", staff.ReportsTo(self.aws.id),
+                                current_session=staff.StaffId("worker-session"))
+        route = self.route("aws_machines", worker.id, replace(self.members, rows=(*self.members.rows, worker)))
+        self.assertEqual((route.row, route.reason), (self.builds, "(why builds? because fixer owns the Aws Machines page"
+                                                     + " and builds is the nearest showrunner above it!)"))
+
+    def test_reason_names_the_owner_that_is_not_available_and_the_parent_that_takes_the_item(self) -> None:
+        retired = replace(self.members, pending_retire=(self.builds.id,))
+        expected = "(why natedev? because builds is not available and natedev is the nearest available showrunner above it!)"
+        for page, owner in (("builds", self.builds), ("aws_machines", self.aws)):
+            with self.subTest(page=page):
+                route = self.route(page, owner.id, retired)
+                self.assertEqual((route.row, route.reason), (self.natedev, expected))
+
+    def test_reason_names_the_default_owner_when_no_owner_in_the_chain_is_available(self) -> None:
+        retired = replace(self.members, pending_retire=(self.morty.id,))
+        route = self.route("list", self.morty.id, retired)
+        self.assertEqual((route.row, route.reason),
+                         (self.sdlc, "(why sdlc? because morty is not available and sdlc is the default owner!)"))
+
+    def test_reason_names_the_default_owner_when_the_page_has_no_owner(self) -> None:
+        route = self.route("disks", "", self.members)
+        self.assertEqual((route.row, route.reason),
+                         (self.sdlc, "(why sdlc? because the Disks page has no owner and sdlc is the default owner!)"))
+
+    def test_reason_names_the_default_owner_when_the_owner_is_not_on_the_staff_list(self) -> None:
+        route = self.route("disks", "missing-staff", self.members)
+        self.assertEqual((route.row, route.reason), (
+            self.sdlc, "(why sdlc? because the Disks page owner is not on the staff list and sdlc is the default owner!)"))
+
+    def test_reason_names_the_default_owner_when_a_unit_owner_has_no_showrunner(self) -> None:
+        orphan = replace(self.aws, parent=staff.StaffRoot())
+        members = staff.StaffSnapshot((self.natedev, self.sdlc, self.builds, orphan, self.morty))
+        route = self.route("aws_machines", orphan.id, members)
+        self.assertEqual((route.row, route.reason),
+                         (self.sdlc, "(why sdlc? because aws has no showrunner and sdlc is the default owner!)"))
+
+    def test_reason_names_the_parent_of_a_default_owner_that_is_not_available(self) -> None:
+        retired = replace(self.members, pending_retire=(self.sdlc.id,))
+        route = self.route("disks", "", retired)
+        self.assertEqual((route.row, route.reason), (self.natedev, "(why natedev? because the Disks page has no owner,"
+                                                     + " the default owner sdlc is not available, and natedev"
+                                                     + " is the nearest available showrunner above it!)"))
+
+    def test_no_available_owner_has_no_route_and_no_reason(self) -> None:
+        config = self.root / "console.conf"
+        _ = config.write_text("page.disks.label=Disks\nowner.default=missing-staff\n", encoding="utf-8")
+        owners = submissions.page_owners("disks", conf.read(config), self.members)
+        self.assertEqual(owners, submissions.PageOwners(submissions.PageOwnerUnavailable(),
+                                                        submissions.PageOwnerUnavailable()))

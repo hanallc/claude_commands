@@ -11,7 +11,7 @@ import tempfile
 import threading
 import unittest
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from http.client import HTTPConnection
@@ -22,11 +22,15 @@ from unittest.mock import patch
 from urllib.parse import urlencode, urlsplit
 from uuid import NAMESPACE_URL, uuid5
 
+from scripts.accounts import accounts
 from scripts.agents import remote
 from scripts.lib import file_lock
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
-from scripts.review_links import branch_page, change_page, serve
+from scripts.production.staff_test_support import fixture_member
+from scripts.review_links import branch_page, change_page, page_frame, serve
+from scripts.review_links.server_test_support import started_review_server
 
 
 class BranchForm(HTMLParser):
@@ -82,8 +86,11 @@ class ScratchBranches:
 
 @contextmanager
 def scratch_branches() -> Generator[ScratchBranches, None, None]:
-    with tempfile.TemporaryDirectory(prefix="branch-page-test-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="branch-page-test-") as temporary, ExitStack() as stack:
         root = Path(temporary)
+        stack.enter_context(patch.dict(os.environ, {
+            **fixture_git_environment(root), "GIT_ALLOW_PROTOCOL": "file",
+        }, clear=True))
         repository, origin = root / "repository", root / "origin.git"
         repository.mkdir()
         history = root / "history"
@@ -195,18 +202,58 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
 
 
 class BranchPageTests(unittest.TestCase):
+    def test_post_hides_deleted_rows_if_both_saves_fail(self) -> None:
+        with (scratch_branches() as fixture,
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "send_to_staff")):
+            page = fixture.page()
+            root = page.folder.parent
+            path = f"/{page.folder.name}/{branch_page.PAGE_NAME}"
+            branch = "TEST-merged"
+            body = urlencode({"token": page.token, "branch": branch})
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            before = fixture.remote_names()
+            with serve.ReviewLinksServer((serve.tailscale_ip(), 0), root) as server:
+                thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+                thread.start()
+                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
+                try:
+                    with (patch.object(branch_page, "write_manifest", side_effect=OSError("Cannot save the manifest.")),
+                          patch.object(branch_page, "publish_for", side_effect=OSError("Cannot publish the next list."))):
+                        connection.request("POST", path, body, headers)
+                        response = connection.getresponse()
+                        content = response.read().decode()
+                    self.assertEqual(response.status, 200)
+                    self.assertIn('id="branch-failure" role="alert">', content)
+                    self.assertIn("The original branch list could not be updated.", content)
+                    self.assertIn("The next branch page could not be prepared.", content)
+                    offered = BranchForm()
+                    offered.feed(content)
+                    self.assertNotIn(branch, offered.offered)
+                    self.assertIn("TEST-keep", offered.offered)
+                    self.assertEqual(fixture.remote_names(), before - {branch})
+                    self.assertIn(branch, [row.name for row in branch_page.page_at(root, path).rows])
+                finally:
+                    connection.close()
+                    server.shutdown()
+                    thread.join(TEST_HANG_GUARD_SECS)
+
     def test_unit_names_have_role_colors_and_unknown_names_stay_plain(self) -> None:
         member = staff.StaffRow(staff.StaffId("role-test"), "unit", "Builder", staff.StaffRoot(), current_session=staff.StaffId("role-test"))
         row = branch_page.MergedUnitBranch("merged", member.name, "abc", "2026-11-16T12:00:00+00:00",
             "def", "2026-11-16T13:00:00+00:00", branch_page.InactiveUnit())
         page = branch_page.BranchPage(Path(), (row, replace(row, unit="nate")), "private", member.id, Path())
-        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
+        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))),
+              patch.object(accounts, "role_colors", return_value={"role.unit-director": "#ffaf02"})):
             body = branch_page.render(page).decode()
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>Builder</span>')
-        self.assertIn('Unit: nate — not active', body)
+        prefix = '<span class="staff-name" data-color-text="role.unit-director" style="color:#ffaf02">Unit:</span>'
+        self.assertEqual(body.count(prefix), 2)
+        self.assertIn(prefix + ' nate — not active', body)
 
     def test_lists_only_merged_recorded_natedev_unit_branches_and_checks_each_row(self) -> None:
-        for live_directory in ("present", "missing", "pruned", "newest-run", "unrecorded", "remote-main"):
+        for live_directory in ("present", "missing", "pruned", "newest-run", "unrecorded", "remote-main", "enrolled"):
             with self.subTest(live_directory=live_directory), scratch_branches() as fixture:
                 if live_directory in ("missing", "pruned", "newest-run", "unrecorded"):
                     shutil.rmtree(fixture.live_worktree)
@@ -236,6 +283,25 @@ class BranchPageTests(unittest.TestCase):
                     _ = fixture.command("-C", str(clone), "merge", "--no-ff", "TEST-merged", "-m", "Merge new branch commit")
                     fixture.merges["TEST-merged"] = fixture.command("-C", str(clone), "rev-parse", "HEAD")
                     _ = fixture.command("-C", str(clone), "push", "origin", "main", "TEST-merged")
+                if live_directory == "enrolled":
+                    integration = fixture.root / "integration"
+                    _ = fixture.command("worktree", "add", str(integration), "TEST-production")
+                    pointer = fixture.repository / "docs/plans/former-production.md"
+                    live_doc = pointer.with_name("former-production-live.md")
+                    unit_table = pointer.read_text(encoding="utf-8").split("## Units", 1)[1]
+                    _ = live_doc.write_text(
+                        f"- **Repository:** `{fixture.repository}`\n- **Merge branch:** `TEST-production`\n"
+                        + f"- **Merge checkout:** `{fixture.repository}`\n- **Showrunner checkout:** `{integration}`\n"
+                        + f"- **Log:** `production.log`\n\n## Units{unit_table}", encoding="utf-8")
+                    _ = pointer.write_text(f"Moved to staff {fixture.publisher}.\n", encoding="utf-8")
+                    _ = fixture.command("commit", "-am", "Point to the live production")
+                    _ = fixture.command("push", "origin", "main")
+                    rows = [replace(row, doc=staff.LiveDoc("natedev", live_doc)) if row.id == fixture.publisher else row
+                            for row in staff.snapshot().rows]
+                    _ = fixture.staff_file.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}),
+                                                      encoding="utf-8")
+                    self.assertIn("TEST-production", fixture.remote_names())
+                    self.assertNotIn("TEST-production", {row.name for row in fixture.listing().rows})
                 rows = fixture.rows()
                 expected = {"TEST-merged", "TEST-keep", "TEST-rejected", "TEST-legacy", "TEST-owner-fallback",
                             "TEST-history-only", "TEST-active<&"}
@@ -306,7 +372,7 @@ class BranchPageTests(unittest.TestCase):
                             self.assertIn(f'Merged into main: {dated_row.merge[:12]} · {merge_markup}', dated_content)
 
     def test_delete_reports_each_result_and_keeps_unchecked_branches(self) -> None:
-        for state in ("unchanged", "advanced"):
+        for state in ("unchanged", "advanced", "registered after page"):
             with self.subTest(state=state), scratch_branches() as fixture:
                 hook = fixture.origin / "hooks" / "update"
                 _ = hook.write_text('#!/bin/sh\nif [ "$1" = refs/heads/TEST-rejected ]; then\n'
@@ -317,14 +383,26 @@ class BranchPageTests(unittest.TestCase):
                     _ = fixture.command("checkout", "TEST-merged")
                     _ = fixture.command("commit", "--allow-empty", "-m", "New work after publication")
                     _ = fixture.command("push", "origin", "TEST-merged")
+                if state == "registered after page":
+                    document = fixture.root / "late-production.md"
+                    _ = document.write_text("- **Merge branch:** TEST-merged\n")
+                    _ = fixture_member("showrunner", name="late-production",
+                                       doc=staff.LiveDoc(remote.local_machine(), document))
                 before = fixture.remote_names()
                 deletion = branch_page.submit(page, urlencode({"token": page.token,
                                                               "branch": ["TEST-rejected", "TEST-merged", "TEST-legacy"]}, doseq=True))
                 results = branch_page.delete_selected(deletion)
                 self.assertEqual([result.name for result in results], ["TEST-rejected", "TEST-merged", "TEST-legacy"])
                 self.assertIn("TEST deletion refused", results[0].message)
-                self.assertEqual([result.message for result in results[1:]], ["deleted", "deleted"])
-                self.assertEqual(fixture.remote_names(), before - {"TEST-merged", "TEST-legacy"})
+                if state == "advanced":
+                    self.assertIn("branch moved", results[1].message)
+                elif state == "registered after page":
+                    self.assertIn("production merge branch", results[1].message)
+                else:
+                    self.assertEqual(results[1].message, "deleted")
+                self.assertEqual(results[2].message, "deleted")
+                removed = {"TEST-merged", "TEST-legacy"} if state == "unchanged" else {"TEST-legacy"}
+                self.assertEqual(fixture.remote_names(), before - removed)
                 no_owner_page = fixture.page()
                 no_owner_rows = [row.name for row in no_owner_page.rows
                                  if isinstance(row, branch_page.MergedUnownedBranch)]
@@ -428,9 +506,10 @@ class BranchPageTests(unittest.TestCase):
 
             delete_branches = serve.ReviewLinksHandler.delete_branches
 
-            def finish_request(handler: serve.ReviewLinksHandler, current_page: branch_page.BranchPage) -> None:
+            def finish_request(handler: serve.ReviewLinksHandler) -> None:
+                current_page = branch_page.page_at(root, handler.path)
                 try:
-                    delete_branches(handler, current_page)
+                    delete_branches(handler)
                 finally:
                     completed.put(current_page.folder)
 
@@ -445,7 +524,7 @@ class BranchPageTests(unittest.TestCase):
             _ = self.enterContext(patch.object(change_page, "send_to_staff", side_effect=receive))
             _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
             address = serve.tailscale_ip()
-            with serve.ReviewLinksServer((address, 0), root) as server:
+            with started_review_server((address, 0), root) as server:
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
                 thread.start()
                 try:
@@ -464,36 +543,48 @@ class BranchPageTests(unittest.TestCase):
                     selected = ["TEST-merged", "TEST-rejected", *no_owner_rows[1:]]
                     body = urlencode({"token": form.token, "branch": selected}, doseq=True)
                     before = fixture.remote_names()
+                    connection.request("POST", path, urlencode({"token": "bad"}),
+                                       {"Content-Type": "application/x-www-form-urlencoded"})
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 400)
+                    self.assertIn(b'id="branch-failure" role="alert">invalid branch form token</p>', response.read())
+                    self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), page.folder)
+                    self.assertEqual(fixture.remote_names(), before)
                     with file_lock.exclusive(gate):
                         connection.request("POST", path, body, {"Content-Type": "application/x-www-form-urlencoded"})
-                        response = connection.getresponse()
-                        content = response.read().decode("utf-8")
-                        self.assertEqual(response.status, 200)
-                        self.assertIn(f"Deleting {len(selected)} branches. The result and a new link go to production by message.",
-                                      content)
                         self.assertEqual(started.get(timeout=TEST_HANG_GUARD_SECS), page.folder)
                         self.assertEqual(fixture.remote_names(), before)
                         saved_kept = cast(list[str], json.loads((root / branch_page.KEPT).read_text(encoding="utf-8")))
                         self.assertIn(kept_branch, saved_kept)
                         self.assertFalse((page.folder / branch_page.USED).exists())
-                        for method in ("GET", "POST"):
-                            with self.subTest(active_method=method):
-                                connection.request(method, path, body if method == "POST" else None,
-                                                   {"Content-Type": "application/x-www-form-urlencoded"})
-                                response = connection.getresponse()
-                                content = response.read().decode("utf-8")
-                                self.assertEqual(response.status, 200)
-                                self.assertIn("Deleting these branches now. The result comes by message.", content)
-                                if method == "POST":
-                                    self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), page.folder)
-                                self.assertEqual(fixture.remote_names(), before)
+                        concurrent = HTTPConnection(address, server.server_port, timeout=TEST_HANG_GUARD_SECS)
+                        self.addCleanup(concurrent.close)
+                        concurrent.request("GET", path)
+                        response = concurrent.getresponse()
+                        self.assertEqual(response.status, 200)
+                        self.assertIn(b'value="TEST-merged"', response.read())
+                        concurrent.request("POST", path, body, {"Content-Type": "application/x-www-form-urlencoded"})
+                        response = concurrent.getresponse()
+                        self.assertEqual(response.status, 409)
+                        self.assertIn(b'A branch deletion is already in progress.', response.read())
+                        self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), page.folder)
+                        self.assertEqual(fixture.remote_names(), before)
                         self.assertEqual(deletions.call_count, 1)
                         stamps = dict(server.module_stamps)
                         with patch.object(serve, "loaded_module_stamps",
                                           return_value={Path(serve.__file__): serve.ModuleStampUnavailable.UNREADABLE}):
                             server.next_code_check = 0
-                            server.service_actions()
+                            serve.ReviewLinksServer.service_actions(server)
                         self.assertEqual(server.module_stamps, stamps)
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    result = response.read().decode("utf-8")
+                    self.assertIn('id="branch-failure" role="alert">TEST-rejected:', result)
+                    self.assertIn("TEST deletion refused", result)
+                    remaining = BranchForm()
+                    remaining.feed(result)
+                    self.assertNotIn("TEST-merged", remaining.offered)
+                    self.assertIn("TEST-rejected", remaining.offered)
                     identity, sender, message = messages.get(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), page.folder)
                     self.assertTrue((page.folder / branch_page.USED).exists())
@@ -511,7 +602,9 @@ class BranchPageTests(unittest.TestCase):
                     if next_link is None:
                         self.fail(message)
                     next_path = urlsplit(next_link[1]).path
+                    self.assertIn(f'action="{next_path}"', result)
                     next_page = branch_page.page_at(root, next_path)
+                    self.assertEqual(remaining.token, next_page.token)
                     self.assertEqual(next_page.publisher, fixture.publisher)
                     self.assertEqual(int(next_link[2]), sum(isinstance(row, branch_page.MergedUnownedBranch)
                                                            for row in next_page.rows))
@@ -530,67 +623,88 @@ class BranchPageTests(unittest.TestCase):
                     self.assertNotIn(kept_branch, retry.offered)
                     self.assertIn("unowned-10", retry.offered)
                     self.assertIn("unowned-11", retry.offered)
-                    for method in ("GET", "POST"):
+                    before_reuse = fixture.remote_names()
+                    for method, expected_status in (("GET", 200), ("POST", 400)):
                         with self.subTest(method=method):
-                            before_reuse = fixture.remote_names()
                             connection.request(method, path, body if method == "POST" else None,
                                                {"Content-Type": "application/x-www-form-urlencoded"})
                             response = connection.getresponse()
                             content = response.read().decode("utf-8")
-                            self.assertEqual(response.status, 200)
-                            self.assertIn("This page was submitted. The new link comes by message.", content)
+                            self.assertEqual(response.status, expected_status)
+                            reopened = BranchForm()
+                            reopened.feed(content)
+                            self.assertEqual(reopened.offered, remaining.offered)
+                            self.assertEqual(reopened.token, remaining.token)
+                            self.assertIn(f'action="{next_path}"', content)
+                            if method == "POST":
+                                self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), next_page.folder)
+                                self.assertIn("invalid branch form token", content)
                             self.assertEqual(fixture.remote_names(), before_reuse)
                             self.assertEqual(len(sent), 1)
                     self.assertIn(kept_branch, fixture.remote_names())
                     fail_send = True
-                    retry_body = urlencode({"token": retry.token, "branch": ["TEST-rejected"]}, doseq=True)
+                    retry_body = urlencode({"token": retry.token, "branch": ["TEST-rejected", "unowned-10"]},
+                                           doseq=True)
                     connection.request("POST", next_path, retry_body,
                                        {"Content-Type": "application/x-www-form-urlencoded"})
                     response = connection.getresponse()
                     content = response.read().decode("utf-8")
                     self.assertEqual(response.status, 200)
-                    self.assertIn("Deleting 1 branches.", content)
+                    self.assertIn("The branch results could not be sent.", content)
+                    self.assertIn("TEST deletion refused", content)
+                    after_failure = BranchForm()
+                    after_failure.feed(content)
+                    self.assertIn("TEST-rejected", after_failure.offered)
+                    self.assertNotIn("unowned-10", after_failure.offered)
                     self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), next_page.folder)
-                    self.assertFalse((next_page.folder / branch_page.USED).exists())
+                    self.assertTrue((next_page.folder / branch_page.USED).exists())
                     self.assertFalse(fail_send)
                     self.assertEqual(len(sent), 1)
+                    self.assertEqual(fixture.remote_names(), before - (set(selected) - {"TEST-rejected"}) - {"unowned-10"})
+                    retry_link = re.search(r'<form method="post" action="([^"]+)"', content)
+                    assert retry_link is not None
+                    retry_path = retry_link[1]
                     connection.request("GET", next_path)
                     response = connection.getresponse()
-                    content = response.read().decode("utf-8")
                     self.assertEqual(response.status, 200)
-                    self.assertNotIn(branch_page.SUBMITTED, content)
                     reopened = BranchForm()
-                    reopened.feed(content)
-                    self.assertIn("TEST-rejected", reopened.offered)
-                    self.assertEqual(fixture.remote_names(), before - (set(selected) - {"TEST-rejected"}))
+                    reopened.feed(response.read().decode("utf-8"))
+                    self.assertEqual(reopened.offered, after_failure.offered)
+                    self.assertEqual(reopened.token, after_failure.token)
+                    self.assertEqual(branch_page.page_at(root, path).folder, root / retry_path.split("/")[1])
                     hook.unlink()
-                    connection.request("POST", next_path, urlencode({"token": retry.token, "branch": ["TEST-rejected"]},
-                                                                    doseq=True),
+                    connection.request("POST", retry_path, urlencode({"token": after_failure.token,
+                                                                    "branch": ["TEST-rejected"]}, doseq=True),
                                        {"Content-Type": "application/x-www-form-urlencoded"})
                     response = connection.getresponse()
                     content = response.read().decode("utf-8")
                     self.assertEqual(response.status, 200)
-                    self.assertIn("Deleting 1 branches.", content)
+                    self.assertIn('id="branch-failure" role="alert" hidden></p>', content)
+                    self.assertNotIn('value="TEST-rejected"', content)
                     identity, sender, message = messages.get(timeout=TEST_HANG_GUARD_SECS)
-                    self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), next_page.folder)
+                    self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), root / retry_path.split("/")[1])
                     self.assertIn("TEST-rejected: deleted", message)
-                    self.assertEqual(fixture.remote_names(), before - set(selected))
+                    self.assertEqual(fixture.remote_names(), before - set(selected) - {"unowned-10"})
                     final_link = re.search(r"Next page: (\S+)", message)
                     if final_link is None:
                         self.fail(message)
                     final_path = urlsplit(final_link[1]).path
                     final_page = branch_page.page_at(root, final_path)
                     final_selection = [row.name for row in final_page.rows]
-                    connection.request("POST", final_path,
-                                       urlencode({"token": final_page.token, "branch": final_selection}, doseq=True),
-                                       {"Content-Type": "application/x-www-form-urlencoded"})
+                    final_body = urlencode({"token": final_page.token, "branch": final_selection}, doseq=True)
+                    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+                    connection.request("POST", final_path, final_body, headers)
                     response = connection.getresponse()
-                    _ = response.read()
+                    content = response.read().decode("utf-8")
                     self.assertEqual(response.status, 200)
+                    self.assertIn("No branches are available to delete.", content)
+                    self.assertIn('id="branch-failure" role="alert" hidden></p>', content)
                     identity, sender, message = messages.get(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), final_page.folder)
                     self.assertIn("No branches remain to delete.", message)
-                    self.assertEqual(fixture.remote_names(), before - set(selected) - set(final_selection))
+                    self.assertEqual(branch_page.page_at(root, path).rows, ())
+                    self.assertEqual(fixture.remote_names(), before - set(selected) - {"unowned-10"} - set(final_selection))
                     connection.request("GET", f"/{path.split('/')[1]}/{branch_page.MANIFEST}")
                     response = connection.getresponse()
                     _ = response.read()

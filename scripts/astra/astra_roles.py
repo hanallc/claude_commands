@@ -148,7 +148,10 @@ def hold(role: AstraRole, lifetime: ExecProcess | HeldDesignRole,
         return HoldWorkerUnavailable(reason)
     current_role = staff.KnownWorkerRole("astra-reviewer" if role == "reviewer" else "astra-designer")
     if member.role != current_role:
-        member = staff.set_worker_role(member.id, current_role)
+        try:
+            member = staff.set_worker_role(member.id, current_role)
+        except (staff.StaffRefused, staff.StaffNotFound) as error:
+            raise ValueError(" ".join(str(error).splitlines())) from error
         membership = replace(membership, rows=tuple(member if row.id == member.id else row for row in membership.rows))
     now = datetime.now(timezone.utc)
     dated_role = "review" if role == "reviewer" else "impl"
@@ -239,6 +242,25 @@ def _role_record(role: HeldRole) -> RoleRecord:
     if isinstance(lifetime, ExecProcess) and isinstance(lifetime.start, process_start.Started):
         record["pid_start"] = lifetime.start.start
     return record
+
+
+def reviewer_process_running(staff_id: str) -> bool:
+    """Check the process that holds this review."""
+    if not staff_id:
+        return False
+    try:
+        fields = _json_object(_record_path(staff_id))
+    except FileNotFoundError:
+        return False
+    if fields.get("staff_id") != staff_id or "pid" not in fields:
+        raise ValueError("The review holder does not match its record.")
+    lifetime = _role_lifetime(fields, "reviewer")
+    if not isinstance(lifetime, ExecProcess) or not isinstance(lifetime.start, process_start.Started):
+        raise ValueError("The review holder has no recorded process start.")
+    observed = process_start.process_start(lifetime.pid)
+    if isinstance(observed, process_start.Unreadable):
+        raise OSError(f"Cannot check reviewer PID {lifetime.pid}: {observed.reason}")
+    return observed == lifetime.start
 
 
 

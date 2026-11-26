@@ -4,8 +4,10 @@ Every test works in a temporary git repository and a temporary list; none reads 
 """
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.production.staff_test_support import foreign_hostname
 
+import errno
 import fcntl
 import io
 import json
@@ -18,8 +20,8 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
-from collections.abc import Callable
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator
 from datetime import date, datetime
 from dataclasses import replace
 from pathlib import Path
@@ -28,9 +30,11 @@ from unittest import mock
 
 
 from scripts.production import change_review
-from scripts.lib import conf, copy_record, file_lock
+from scripts.lib import conf, copy_record, file_lock, main_push_lock, session_folder
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
+from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lint.memory_test_support import config_environment
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
@@ -48,6 +52,7 @@ from scripts.review_links import image_store, review_events
 # Importable once change_review has put scripts/lib on the path.
 from scripts.lib import scratch
 from scripts.lib import urgency
+from scripts.worktree import worktree_records, worktrees
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.production.cli_fixture import invoke_cli
@@ -77,24 +82,38 @@ GRID = Visible("The grid fades more gently", "Run `hana` in a natedev terminal",
 SEE = f"Change-Review: {GRID.change} | {GRID.check} | {GRID.see}"
 GRID_WITH_IMAGE = replace(GRID, image="012345abcdef")
 SEE_WITH_IMAGE = SEE + " | image " + GRID_WITH_IMAGE.image
-# A production doc as the vault records it; a write never reads the doc itself.
-PRODUCTION = Path.home() / "worktrees/demo-trunk/docs/plans/demo-production.md"
+DEMO_DOC = Path("worktrees/demo-trunk/docs/plans/demo-production.md")
+PRODUCTION = Path.home() / DEMO_DOC
 DOC = "demo"
 DEMO_ID = fixture_runtime_id("showrunner::demo")
 
 
 def setUpModule() -> None:
-    """The pin on the row `show` printed and the scratch folders a verdict removes are in a temporary
-    folder, never ~/.local/state/next, /tmp/claude/scratch or ~/rust/repro."""
+    """Keep the verdict state and scratch folders in the module fixture."""
     unittest.enterModuleContext(foreign_hostname())
-    folder = tempfile.TemporaryDirectory()
-    unittest.addModuleCleanup(folder.cleanup)
+    folder = Path(tempfile.mkdtemp(prefix="change-review-fixture-")).resolve()
+    unittest.addModuleCleanup(shutil.rmtree, folder)
+    home = folder / "home"
+    home.mkdir()
+    environment = staff.child_environment(fixture_git_environment(folder))
+    for key in ("BASH_ENV", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CODEX_HOME",
+                "CODEX_SESSION_ID", "CODEX_THREAD_ID", "STAFF_CONFIG", "UNIT_RUN_DIR"):
+        _ = environment.pop(key, None)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
-        "STAFF_FILE": str(Path(folder.name) / "staff.json"), "NEXT_STATE_DIR": folder.name,
-        "REVIEW_LINKS_ROOT": str(Path(folder.name) / "links"), "CHANGE_REVIEW_DIR": folder.name,
-        "SHOWRUNNER_STATE_DIR": f"{folder.name}/showrunner-state",
-        "UNIT_HISTORY_DIR": f"{folder.name}/history", copy_record.ROOT_ENV: f"{folder.name}/scratch",
-        scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro", scratch.HOLDS_ENV: f"{folder.name}/holds.json"}))
+        **environment,
+        **config_environment(folder / "config"),
+        "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
+        "NOTIFIER_SESSIONS_DIR": str(folder / "session-records"), session_folder.ROOT_ENV: str(folder / "sessions"),
+        "STAFF_FILE": str(folder / "staff.json"), "NEXT_STATE_DIR": str(folder),
+        "REVIEW_LINKS_ROOT": str(folder / "links"), "CHANGE_REVIEW_DIR": str(folder),
+        "SHOWRUNNER_STATE_DIR": str(folder / "showrunner-state"),
+        "UNIT_HISTORY_DIR": str(folder / "history"), copy_record.ROOT_ENV: str(folder / "scratch"),
+        copy_record.COPIES_ENV: str(folder / "copies"),
+        scratch.HOLDS_ENV: str(folder / "holds.json")}, clear=True))
+
+    unittest.enterModuleContext(accepting_console_text())
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(folder / "notify")}))
+    _ = unittest.enterModuleContext(mock.patch.object(sys.modules[__name__], "PRODUCTION", home / DEMO_DOC))
     _ = fixture_member("showrunner", name="fixture")
     _ = fixture_member("showrunner", name="demo", runtime_id=DEMO_ID,
                        doc=staff.LiveDoc(remote.local_machine(), PRODUCTION))
@@ -359,7 +378,9 @@ class NativeVerdictTests(unittest.TestCase):
                 self.assertFalse(pending.get('Review log'))
                 record = change_routing.delivery_path(case.root, listing, row)
                 record.parent.mkdir(parents=True, exist_ok=True)
-                _ = record.write_text(json.dumps({**fields, 'waiting_why': 'The showrunner checks the spacing.'}))
+                handed_at = '2026-11-16T12:49:08-05:00'
+                _ = record.write_text(json.dumps({**fields, 'waiting_why': 'The showrunner checks the spacing.',
+                                                  'handed_at': handed_at}))
                 result = change_review.save_verdict(listing, row, 'not works: the spacing differs',
                                                    case.fixture.production, validation_id=identity)
                 self.assertIsInstance(result, change_review.VerdictSaved)
@@ -370,6 +391,7 @@ class NativeVerdictTests(unittest.TestCase):
                 slots = change_routing.delivery_slots(record)
                 self.assertFalse(slots.validation_requested)
                 self.assertEqual(slots.waiting_why, 'The showrunner checks the spacing.')
+                self.assertEqual(cast(dict[str, object], json.loads(record.read_text())).get('handed_at'), handed_at)
 
     def test_native_verdict_uses_the_current_validation_id(self) -> None:
         from scripts.review_links import change_page, question_record, review_items, review_page, test_review_page
@@ -1066,7 +1088,7 @@ class ProducerWriterTests(ProducerFixture):
                                     (self.root / "unit" / "src", self.unit.id), (self.repo, ""), (self.root, "")):
             with self.subTest(directory=directory), redirect_stdout(io.StringIO()):
                 result = change_review.main(["add", "--repo", str(directory), "--production", "top",
-                    "--list", str(self.listing), "--change", str(directory), "--check", "Read", "--see", "Proof", "--image", fixture_image()])
+                    "--list", str(self.listing), "--change", "Check the producer", "--check", "Read", "--see", "Proof", "--image", fixture_image()])
                 self.assertEqual(result, 0)
                 self.assertEqual(change_review.pending(self.listing)[-1]["Producer"], expected)
 
@@ -2615,8 +2637,8 @@ class ChangeIdentityTests(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
-            "NEXT_STATE_DIR": str(self.root / "next"), "SCRATCH_ROOT": str(self.root / "scratch"),
-            "SCRATCH_HOLDS": str(self.root / "holds.json")})))
+            "NEXT_STATE_DIR": str(self.root / "next"), copy_record.ROOT_ENV: str(self.root / "scratch"),
+            scratch.HOLDS_ENV: str(self.root / "holds.json")})))
         self.path = self.root / "change-review - natedev.md"
         top_doc = self.root / "top.md"
         self.doc = self.root / "child.md"
@@ -2688,7 +2710,7 @@ class ChangeIdentityTests(unittest.TestCase):
         _ = self.path.rename(legacy)
         _ = self.doc.write_text(f"- **Change review:** `{legacy}`\n")
         session = next(member.current_session for member in staff.snapshot().rows if member.name == "sdlc")
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session}):
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": session}):
             code, output, error = run("mark-important", "--row", "sdlc/C1")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("C1", output)
@@ -2748,11 +2770,32 @@ class ActionTest(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        directory = tempfile.TemporaryDirectory()
+        directory = tempfile.TemporaryDirectory(dir=os.environ["CHANGE_REVIEW_DIR"])
         self.addCleanup(directory.cleanup)
-        self.path = Path(directory.name) / "change-review.md"
+        root = Path(directory.name)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            copy_record.ROOT_ENV: str(root / "scratch"),
+            scratch.HOLDS_ENV: str(root / "holds.json"),
+        })))
+        self.path = root / "change-review.md"
         _ = self.path.write_text(LIST, encoding="utf-8")
-        self.fresh = Path(directory.name) / "change-review" / "change-review - natedev.md"
+        self.fresh = root / "change-review" / "change-review - natedev.md"
+
+    def test_add_and_edit_hold_a_draft_and_store_the_revision(self) -> None:
+        for action in ("add", "edit"):
+            with self.subTest(action=action):
+                command = (action, "--production", DOC, "--list", str(self.path),
+                           "--change", "Keep the icons visible", "--see", "Both icons stay visible.")
+                if action == "edit":
+                    command += ("--row", "C76")
+                before = self.path.read_bytes()
+                code, _, errors = run_with_image(*command, "--check", "Read /tmp/icons.png.")
+                self.assertEqual(code, 1)
+                self.assertIn("Revise the change draft. omit-file-path: /tmp/icons.png", errors)
+                self.assertEqual(self.path.read_bytes(), before)
+                code, _, errors = run_with_image(*command, "--check", "Open the panel.")
+                self.assertEqual(code, 0, errors)
+                self.assertIn("Keep the icons visible", self.path.read_text())
 
     def test_add_requires_an_image_and_adds_the_image_column_to_a_list(self) -> None:
         original = """## To review
@@ -2847,13 +2890,13 @@ class ActionTest(unittest.TestCase):
             self.assertEqual(scratch.holds()[os.path.realpath(held)]["task"], f"row:{change_review._owner(self.path)}-{row}")  # pyright: ignore[reportPrivateUsage]
 
     def test_back_to_back_adds_in_one_shell_each_append_the_next_number(self) -> None:
-        changes = [Visible("cargo-handler nests a showrunner | inside its parent", "open `cargo-handler` on natedev",
+        changes = [Visible("cargo-handler nests a showrunner | inside its parent", "Open the handler on natedev",
                            "the showrunner tile sits inside its parent"),
                    Visible("tile titles carry the role: showrunner, unit director", "read the tile titles",
                            "each title names its role"),
                    Visible("cargo-tile no longer panics at startup", "start it in a natedev terminal",
-                           "~/.config/cargo-tile/panic.log gains nothing"),
-                   Visible("cargo-berth gives each phase its own reservation", "run `cargo-berth board | grep phase`",
+                           "The panic log gains no entries"),
+                   Visible("cargo-berth gives each phase its own reservation", "Run this command: `cargo-berth board | grep phase`",
                            "one line per phase")]
         repo, *commits = origin_commits(self.path.parent)
         script = str(Path(change_review.__file__))
@@ -2867,12 +2910,12 @@ class ActionTest(unittest.TestCase):
                                  "--change", item.change, "--check", item.check, "--see", item.see,
                                  "--merged", commits[-1][:8], "--image", fixture_image()]
                     if path == self.fresh and not numbers:
-                        result = subprocess.run([python, script, *arguments], capture_output=True,
+                        result = subprocess.run([python, "-m", "scripts.console_text.test_support", script, *arguments], capture_output=True,
                                                 text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                     else:
                         child = children.start(lambda arguments=arguments: run_review_child(arguments, environment))
                         result = child.result()
-                        result.check_returncode()
+                        self.assertEqual(result.returncode, 0, result.stderr)
                     numbers.append(result.stdout.strip())
                 self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
                 rows = [row for row in change_review.pending(path) if row["#"] in numbers]
@@ -3054,7 +3097,9 @@ class ActionTest(unittest.TestCase):
         _ = change_review.hold_for_row(self.path, "C76", [str(folder)])
         held = os.path.realpath(folder)
         self.assertIn(held, scratch.holds())
-        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+        caller = showrunners.owner_for("fixture")
+        with (mock.patch.object(change_review, "now", return_value=ADD_TIME),
+              mock.patch.object(staff, "runtime_id", return_value=caller.current_session)):
             with mock.patch.object(scratch, "end", side_effect=scratch.ScratchError("fixture cleanup failed")):
                 code, output, error = run(*arguments)
             self.assertEqual((code, error), (0, ""))
@@ -3067,11 +3112,11 @@ class ActionTest(unittest.TestCase):
             self.assertIn("scratch not removed: fixture scratch configuration is unavailable", output)
             self.assertIn(held, scratch.holds())
             self.assertEqual(self.path.read_bytes(), before)
-            code, output, error = run(*arguments)
-            self.assertEqual((code, error), (0, ""))
-        self.assertIn(f"removed {folder}\n", output)
-        self.assertFalse(folder.exists())
-        self.assertNotIn(held, scratch.holds())
+            code, _, error = run(*arguments)
+            self.assertEqual(code, 0)
+        self.assertIn(f"kept for a manual removal list: {folder} (scratch,", error)
+        self.assertTrue(folder.is_dir())
+        self.assertGreater(scratch.holds()[held]["ended"], 0)
         self.assertEqual(self.path.read_bytes(), before)
         snapshot = change_review.review_snapshot(self.path)
         self.assertEqual([row["#"] for row in snapshot.pending], ["C77"])
@@ -3079,11 +3124,12 @@ class ActionTest(unittest.TestCase):
         self.assertEqual((row["Verdict"], row["Date"], row["Merged"]), ("withdrawn", "2026-11-13", "2026-10-14"))
         self.assertIn("café", row["Review log"])
         self.assertEqual(review_events.decode(row["Review log"]),
-                         (review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"),))
+                         (review_events.ReviewLog(ADD_TIME, "fixture", f"Withdrawn: {words}"),))
 
     def test_withdraw_a_reviewed_row_and_keep_its_previous_verdict(self) -> None:
         words = "The change was reverted"
-        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+        with (mock.patch.object(change_review, "now", return_value=ADD_TIME),
+              mock.patch.object(staff, "runtime_id", return_value=DEMO_ID)):
             code, _, error = run("withdraw", "--production", DOC, "--list", str(self.path),
                                  "--row", "C70", "--reason", words)
             self.assertEqual(code, 0, error)
@@ -3092,8 +3138,133 @@ class ActionTest(unittest.TestCase):
         row, = snapshot.reviewed
         self.assertEqual((row["#"], row["Verdict"], row["Date"]), ("C70", "withdrawn", "2026-11-13"))
         previous, withdrawal = review_events.decode(row["Review log"])
-        self.assertEqual((previous.words, previous.time.date()), ("works", date(2026, 10, 13)))
-        self.assertEqual(withdrawal, review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"))
+        self.assertEqual((previous.who, previous.words, previous.time.date()), ("nate", "works", date(2026, 10, 13)))
+        self.assertEqual(withdrawal, review_events.ReviewLog(ADD_TIME, "demo", f"Withdrawn: {words}"))
+
+    def test_reopen_restores_the_queue_place_and_appends_one_event(self) -> None:
+        _ = self.path.write_text(LIST
+            .replace("How to check |\n", "How to check | Urgency | Production |\n")
+            .replace("| --- | --- | --- | --- | --- |\n", "| --- | --- | --- | --- | --- | --- | --- |\n")
+            .replace("Launch Hana |\n", f"Launch Hana | later | {DEMO_ID} |\n")
+            .replace("Change a font |\n", "Change a font | | |\n"), encoding="utf-8")
+        target = ("--production", DOC, "--list", str(self.path), "--row", "C76")
+        change_review.record_review_log(self.path, "C76", "A previous note", PRODUCTION, event_time=ADD_TIME)
+        before = change_review.pending(self.path)
+        self.assertEqual([row["#"] for row in before], ["C77", "C76"])
+        reason = "The change is ready again"
+        with (mock.patch.object(change_review, "now", return_value=ADD_TIME),
+              mock.patch.object(staff, "runtime_id", return_value=DEMO_ID)):
+            self.assertEqual(run("withdraw", *target, "--reason", "Check the new result"),
+                             (0, "demo/C76 withdrawn\n", ""))
+            withdrawn = next(row for row in change_review.review_snapshot(self.path).reviewed if row["#"] == "C76")
+            self.assertEqual(run("reopen", *target, "--reason", reason), (0, "demo/C76 reopened\n", ""))
+        snapshot = change_review.review_snapshot(self.path)
+        rows = [dict(row) for row in snapshot.pending]
+        log = rows[-1].pop("Review log")
+        _ = before[-1].pop("Review log")
+        self.assertEqual(rows, before)
+        self.assertEqual([row["#"] for row in snapshot.reviewed], ["C70"])
+        self.assertEqual(review_events.decode(log), (
+            *review_events.decode(withdrawn["Review log"]),
+            review_events.ReviewLog(ADD_TIME, "demo", f"Reopened: {reason}"),
+        ))
+
+    def test_reopen_requires_a_reason_and_refuses_an_open_row(self) -> None:
+        before = self.path.read_bytes()
+        arguments = ("reopen", "--production", DOC, "--list", str(self.path), "--row", "C76")
+        self.assertEqual(run(*arguments), (1, "", "--reason needs one line of words\n"))
+        self.assertEqual(run(*arguments, "--reason", "Try again"), (1, "", "C76 is not withdrawn\n"))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_reopen_keeps_the_withdrawn_rows_unit_staff_id(self) -> None:
+        runner = showrunners.owner_for(DOC)
+        unit = fixture_member("unit", name="withdrawal-owner", parent=runner.id)
+        _ = self.path.write_text(LIST
+            .replace("How to check |\n", "How to check | Production |\n")
+            .replace("| --- | --- | --- | --- | --- |\n", "| --- | --- | --- | --- | --- | --- |\n")
+            .replace("Launch Hana |\n", f"Launch Hana | {unit.id} |\n")
+            .replace("Change a font |\n", "Change a font | |\n"), encoding="utf-8")
+        before = change_review.pending(self.path)[0]
+        self.assertTrue(change_review.withdraw_row(self.path, "C76", "Fix the result", ADD_TIME, PRODUCTION))
+        withdrawn = next(row for row in change_review.review_snapshot(self.path).reviewed if row["#"] == "C76")
+        self.assertEqual(withdrawn["Production"], unit.id)
+        shown = change_review.describe(withdrawn)
+        self.assertIn(f"  Production: {DOC}", shown)
+        self.assertNotIn(unit.id, shown)
+        self.assertNotIn("Saved blank fields", shown)
+
+        change_review.reopen_row(self.path, "C76", "The result is ready", ADD_TIME, PRODUCTION)
+        reopened = change_review.pending(self.path)[0]
+        _ = reopened.pop("Review log")
+        self.assertEqual(reopened, before)
+
+    def test_reopen_uses_saved_fields_and_names_missing_fields_on_old_rows(self) -> None:
+        target = ("--production", DOC, "--list", str(self.path), "--row", "C76")
+        for rank, check, missing in (
+            ("later", "Launch Hana", ""),
+            ("", "Launch Hana", "Urgency"),
+            ("later", "", "How to check"),
+            ("", "", "Urgency, How to check"),
+        ):
+            with self.subTest(missing=missing):
+                original = f"""## To review
+
+| # | Change | Merged | How to check |
+| --- | --- | --- | --- |
+
+## Reviewed
+
+| # | Change | Verdict | Date | Merged | Urgency | How to check |
+| --- | --- | --- | --- | --- | --- | --- |
+| C76 | Panels keep shields | withdrawn | 2026-11-13 | 2026-10-14 | {rank} | {check} |
+"""
+                _ = self.path.write_text(original, encoding="utf-8")
+                code, output, error = run("reopen", *target, "--reason", "Check the result")
+                if missing:
+                    self.assertEqual((code, output, error), (
+                        1, "", f"C76: exact restoration is unavailable. Missing fields: {missing}.\n"))
+                    self.assertEqual(self.path.read_text(encoding="utf-8"), original)
+                else:
+                    self.assertEqual((code, error), (0, ""))
+                    restored, = change_review.pending(self.path)
+                    self.assertEqual((restored["Urgency"], restored["How to check"]), (rank, check))
+
+    def test_correct_withdraw_who_changes_only_the_selected_event(self) -> None:
+        target = ("--production", DOC, "--list", str(self.path), "--row", "C70")
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(run("withdraw", *target, "--reason", "It was replaced")[0], 0)
+        before, = change_review.review_snapshot(self.path).reviewed
+        events = review_events.decode(before["Review log"])
+        arguments = ("correct-withdraw-who", *target, "--who", "natedev")
+        text = self.path.read_bytes()
+        self.assertEqual(run(*arguments, "--at", events[0].time.isoformat())[0], 1)
+        self.assertEqual(self.path.read_bytes(), text)
+        self.assertEqual(run(*arguments, "--at", ADD_TIME.isoformat()),
+                         (0, "change-review/C70 withdrawal author set to natedev\n", ""))
+        after, = change_review.review_snapshot(self.path).reviewed
+        self.assertEqual(review_events.decode(after.pop("Review log")),
+                         (events[0], replace(events[1], who="natedev")))
+        _ = before.pop("Review log")
+        self.assertEqual(after, before)
+
+    def test_correct_withdraw_who_finds_a_past_event_after_reopen(self) -> None:
+        row = "C76"
+        reopen_time = ADD_TIME.replace(minute=ADD_TIME.minute + 1)
+        second_time = ADD_TIME.replace(minute=ADD_TIME.minute + 2)
+        change_review.record_review_log(self.path, row, "Keep this note", PRODUCTION, event_time=ADD_TIME)
+        self.assertTrue(change_review.withdraw_row(self.path, row, "First reason", ADD_TIME, PRODUCTION))
+        change_review.reopen_row(self.path, row, "Check again", reopen_time, PRODUCTION)
+        self.assertTrue(change_review.withdraw_row(self.path, row, "Second reason", second_time, PRODUCTION))
+        change_review.correct_withdraw_who(self.path, row, second_time.isoformat(), "fixture", PRODUCTION)
+        change_review.reopen_row(self.path, row, "Check again", second_time, PRODUCTION)
+        before = change_review.pending(self.path)[0]
+        events = review_events.decode(before.pop("Review log"))
+        self.assertEqual(events[3].who, "fixture")
+        change_review.correct_withdraw_who(self.path, row, ADD_TIME.isoformat(), "demo", PRODUCTION)
+        after = change_review.pending(self.path)[0]
+        self.assertEqual(review_events.decode(after.pop("Review log")),
+                         (events[0], replace(events[1], who="demo"), *events[2:]))
+        self.assertEqual(after, before)
 
     def test_edit_and_verdict_replacement_failures_keep_the_list_and_rerun_once(self) -> None:
         for action in ("edit", "verdict"):
@@ -3139,13 +3310,13 @@ class ActionTest(unittest.TestCase):
                 self.assertNotIn("C76", [row["#"] for row in change_review.pending(self.path)])
                 before = self.path.read_bytes()
                 code, output, error = run(*command)
-                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(code, 0)
                 self.assertIn("change-review/C76 already has this verdict (", output)
                 self.assertIn("change-review/C76 landed\n" if verdict == "works" else
                               "change-review/C76 returns to its unit (merged 2026-10-14)\n", output)
-                self.assertIn(f"removed {folder}\n", output)
-                self.assertFalse(folder.exists())
-                self.assertNotIn(os.path.realpath(folder), scratch.holds())
+                self.assertIn(f"kept for a manual removal list: {folder} (scratch, task {task} ended)", error)
+                self.assertTrue(folder.is_dir())
+                self.assertGreater(scratch.holds()[os.path.realpath(folder)]["ended"], 0)
                 self.assertEqual(self.path.read_bytes(), before)
                 self.assertEqual(self.path.read_text().split("## Reviewed")[1].count("| C76 |"), 1)
 
@@ -3158,14 +3329,14 @@ class ActionTest(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     _ = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "works")
             before = self.path.read_bytes()
-            code, output, error = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "still broken")
+            code, _, error = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "still broken")
             self.assertEqual(code, 1)
             self.assertIn('C76 has the verdict "works" from ', error)
             self.assertIn("this verdict is not recorded", error)
-            self.assertIn(f"removed {folder}", output)
+            self.assertIn(f"kept for a manual removal list: {folder} (scratch,", error)
             self.assertEqual(self.path.read_bytes(), before)
-            self.assertFalse(folder.exists())
-            self.assertNotIn(os.path.realpath(folder), scratch.holds())
+            self.assertTrue(folder.is_dir())
+            self.assertGreater(scratch.holds()[os.path.realpath(folder)]["ended"], 0)
 
     def test_missing_merge_is_explicit_for_new_and_earlier_reviewed_rows(self) -> None:
         _ = self.path.write_text(LIST.replace("Panels keep shields | 2026-10-14", "Panels keep shields |"))
@@ -3212,18 +3383,106 @@ class ActionTest(unittest.TestCase):
                 self.assertIn(f"| C76 | Panels keep shields | {verdict} | {change_review.today().isoformat()} "
                               + "| 2026-10-14 |\n| C70 |", text)
 
-    def test_a_verdict_removes_the_rows_scratch_folders_either_way(self) -> None:
-        demo = scratch.new("row:natedev-C1", "demo", visible=True)
+    def test_a_verdict_keeps_the_rows_scratch_folders_either_way(self) -> None:
+        demo = scratch.new("row:natedev-C1", "demo")
         copy = scratch.new("row:natedev-C2", "copy")
         kept = scratch.new("row:natedev-C3")
         _ = change_review.append_rows(self.fresh, pictured_changes([Visible(name, "B", "C") for name in "XYZ"]), date(2026, 10, 15), "",
                                       PRODUCTION, record=staff.snapshot())
         self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.fresh), "--row", "C1", "--verdict", "works"),
-                         (0, f"demo/C1 landed\nremoved {demo}\n", ""))
+                         (0, "demo/C1 landed\n",
+                          f"kept for a manual removal list: {demo} (scratch, task row:natedev-C1 ended)\n"))
         self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.fresh), "--row", "C2", "--verdict", "no"),
-                         (0, f"demo/C2 returns to its unit (merged 2026-10-15)\nremoved {copy}\n", ""))
-        self.assertFalse(demo.exists() or copy.exists())
+                         (0, "demo/C2 returns to its unit (merged 2026-10-15)\n",
+                          f"kept for a manual removal list: {copy} (scratch, task row:natedev-C2 ended)\n"))
+        self.assertTrue(demo.is_dir() and copy.is_dir())
         self.assertTrue(kept.is_dir())
+
+    def try_folder(self, team: str = "tryunit", row: str = "C76") -> tuple[Path, Path]:
+        """Give row C76 the Producer unit tryunit and row C77 an empty Producer cell.
+
+        Record the try folder of `team` for `row`, and return the folder and its repository.
+        """
+        unit = fixture_member("unit", name="tryunit", parent=fixture_member("showrunner", name="fixture").id)
+        _ = self.path.write_text(LIST.replace("| How to check |\n| --- | --- | --- | --- | --- |",
+                                              "| How to check | Producer |\n| --- | --- | --- | --- | --- | --- |")
+                                 .replace("| Launch Hana |", f"| Launch Hana | {unit.id} |")
+                                 .replace("| Change a font |", "| Change a font | |"), encoding="utf-8")
+        root = self.path.parent
+        origin, repo, tree = root / "origin.git", root / "repo", root / f"worktrees/repo/{team}/try-{row}"
+        for arguments in (("init", "--bare", str(origin)), ("init", "-b", "main", str(repo)),
+                          ("-C", str(repo), "commit", "--allow-empty", "-m", "base"),
+                          ("-C", str(repo), "remote", "add", "origin", str(origin)),
+                          ("-C", str(repo), "push", "-q", "origin", "main"),
+                          ("-C", str(repo), "worktree", "add", "-q", "-b", f"{team}-try-{row}", str(tree))):
+            _ = subprocess.run(["git", *arguments], check=True, capture_output=True)
+        base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
+                              text=True).stdout.strip()
+        worktrees.write_record(worktree_records.WorktreeRecord(
+            1, str(tree), f"{team}-try-{row}", str(repo), base, "main", team, "2026-11-23T00:00:00+00:00",
+            worktree_records.RecordedWorktreeOutput(team, f"try-{row}", root / f"build/repo/{team}/try-{row}")))
+        self.addCleanup(worktree_records.record_file(tree).unlink, missing_ok=True)
+        return tree, repo
+
+    def test_a_verdict_removes_the_producers_clean_try_folder(self) -> None:
+        tree, repo = self.try_folder()
+        with mock.patch.object(worktrees, "remove_git_checkout") as remove:
+            self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76",
+                                 "--verdict", "works"), (0, "fixture/C76 landed\n", ""))
+        remove.assert_called_once_with(tree, repo)
+
+    def test_a_verdict_keeps_a_dirty_try_folder_and_names_the_command(self) -> None:
+        tree = self.try_folder()[0]
+        _ = (tree / "notes.txt").write_text("work")
+        with mock.patch.object(worktrees, "remove_git_checkout") as remove:
+            code, output, _ = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76",
+                                  "--verdict", "no")
+        remove.assert_not_called()
+        self.assertEqual(code, 0)
+        command = shlex.join([str(Path.home() / ".claude/scripts/lib/py"),
+                              str(Path.home() / ".claude/scripts/worktree/worktrees.py"), "remove", str(tree)])
+        self.assertIn(f"{tree} kept: dirty worktree: ?? notes.txt. Save the work, then run: {command}\n", output)
+        self.assertTrue((tree / "notes.txt").is_file())
+
+    def test_an_empty_producer_removes_the_list_showrunners_try_folder_without_a_staff_read(self) -> None:
+        # The list change-review.md names the showrunner change-review.
+        tree, repo = self.try_folder("change-review", "C77")
+        with (mock.patch.object(worktrees, "remove_git_checkout") as remove,
+              mock.patch.object(change_routing, "producer_row") as producer_row):
+            code, _, _ = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C77",
+                             "--verdict", "works")
+        self.assertEqual(code, 0)
+        remove.assert_called_once_with(tree, repo)
+        producer_row.assert_not_called()
+
+    def test_a_try_folder_error_prints_its_first_line_and_the_verdict_stays(self) -> None:
+        _ = self.try_folder()
+        with mock.patch.object(worktrees, "git", side_effect=RuntimeError("fixture git failed\nsecond line")):
+            code, output, error = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76",
+                                      "--verdict", "works")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("\ntry folder not checked: fixture git failed\n", output)
+        self.assertNotIn("second line", output)
+        self.assertIn("| C76 | Panels keep shields | works |", self.path.read_text(encoding="utf-8"))
+
+    def test_a_try_folder_error_keeps_the_verdict_intent_for_a_retry(self) -> None:
+        _ = self.try_folder()
+        cleanup = replace(change_review.PendingVerdictCleanup.for_row(self.path.parent, self.path, "C76"), verdict="works")
+        cleanup.save()
+        with mock.patch.object(worktrees, "git", side_effect=RuntimeError("fixture git failed")):
+            self.assertEqual(cleanup.finish(lambda _: None), ["try folder not checked: fixture git failed"])
+        self.assertTrue(cleanup.intent.is_file())
+        with mock.patch.object(worktrees, "remove_git_checkout"):
+            self.assertEqual(cleanup.finish(lambda _: None), [])
+        self.assertFalse(cleanup.intent.exists())
+
+    def test_withdraw_removes_the_rows_try_folder(self) -> None:
+        tree, repo = self.try_folder()
+        with mock.patch.object(worktrees, "remove_git_checkout") as remove:
+            code, output, _ = run("withdraw", "--production", DOC, "--list", str(self.path), "--row", "C76",
+                                  "--reason", "reverted")
+        self.assertEqual((code, output), (0, "fixture/C76 withdrawn\n"))
+        remove.assert_called_once_with(tree, repo)
 
     def test_a_verdict_for_a_row_not_to_review_is_refused(self) -> None:
         for row in ("C99", "76"):
@@ -3232,13 +3491,13 @@ class ActionTest(unittest.TestCase):
             self.assertEqual(len(error.splitlines()), 1, row)
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
 
-    def test_row_cleanup_reports_retained_folders(self) -> None:
+    def test_row_cleanup_delegates_to_scratch(self) -> None:
         folder = self.path.parent / "retained-copy"
-        result = scratch.TaskCleanup()
-        result.kept.append(scratch.KeptFolder(folder, "it has uncommitted changes"))
-        with mock.patch.object(scratch, "end", return_value=result):
+        result = [scratch.KeptFolder(folder, "it has uncommitted changes")]
+        with mock.patch.object(scratch, "end", return_value=result) as end:
             lines = change_review.end_row_scratch(self.path, "C76")
-        self.assertEqual(lines, [f"kept {folder}: it has uncommitted changes"])
+        end.assert_called_once()
+        self.assertEqual(lines, [])
 
     def attached_lists(self) -> Path:
         earlier = self.path.with_name("change-review - child.md")
@@ -3255,12 +3514,13 @@ class ActionTest(unittest.TestCase):
         scratch_folder = scratch.new("row:child-C9", "earlier")
         current_scratch = scratch.new("row:current-C9", "current")
         self.assertEqual(run("verdict", "--production", DOC, "--row", "child/C9", "--verdict", "works"),
-                         (0, f"child/C9 landed\nremoved {scratch_folder}\n", ""))
+                         (0, "child/C9 landed\n",
+                          f"kept for a manual removal list: {scratch_folder} (scratch, task row:child-C9 ended)\n"))
         self.assertEqual(self.path.read_bytes(), before)
         self.assertNotIn("C9", {row["#"] for row in change_review.pending(earlier)})
         self.assertIn("| C9 | Earlier change | works |", earlier.read_text())
         self.assertNotIn("child/C9", earlier.read_text())
-        self.assertFalse(scratch_folder.exists())
+        self.assertTrue(scratch_folder.is_dir())
         self.assertTrue(current_scratch.exists())
 
     def test_list_named_important_mark_changes_only_that_lists_local_row(self) -> None:
@@ -3874,6 +4134,138 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         self.assertEqual(run_with_image("add", "--production", DOC, "--list", str(outside), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
         self.assertIn("| C1 | A |", outside.read_text(encoding="utf-8"))
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+
+    def ready_arguments(self, *, names: tuple[str, ...] = ("First", "Second"), rows_per_merge: int = 1) -> tuple[str, ...]:
+        self.path = self.path.with_name("change-review - commit-scan.md")
+        _ = self.enterContext(isolated_staff_file(self.repo.parent / "staff.json", {}))
+        self.enterContext(mock.patch.dict(os.environ, {"CHANGE_REVIEW_DIR": str(self.path.parent)}))
+        source, _, _ = origin_commits(self.repo.parent)
+        production = self.repo.parent / "production.md"
+        _ = production.write_text(f"# Scan fixture\n- **Showrunner checkout:** `{source}`\n"
+                                  + f"- **Change review:** `{self.path}`\n")
+        _ = fixture_member("showrunner", name="commit-scan", doc=staff.LiveDoc(remote.local_machine(), production))
+        for name in names:
+            titles = [name] if rows_per_merge == 1 else [f"{name} {number}" for number in range(1, rows_per_merge + 1)]
+            trailers = "\n".join(f"Change-Review: {title} | Read | Result" for title in titles)
+            message = pictured_review_lines(f"{name} change\n\n{trailers}")
+            for arguments in (("checkout", "-qb", name), ("commit", "-qm", message, "--allow-empty"),
+                              ("checkout", "-q", "main"), ("merge", "--no-ff", "-qm", f"Merge {name}", name)):
+                _ = subprocess.run(["git", "-C", str(source), *arguments], check=True,
+                                   capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = subprocess.run(["git", "-C", str(source), "push", "origin", "main"], check=True,
+                           capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        return ("list-ready", "--repo", str(source), "--production", "commit-scan", "--merge-branch", "main")
+
+    @contextmanager
+    def hold_vault_lock(self) -> Generator[Callable[[], None]]:
+        with ForkChildren() as children:
+            ready, announce = children.pipe()
+            stop, release = children.pipe()
+
+            def hold() -> int:
+                with main_push_lock.main_push_lock(self.repo, "agent-notes"):
+                    _ = os.write(announce, b"1")
+                    return 0 if os.read(stop, 1) == b"1" else 1
+
+            child = children.start(hold, pass_fds=(announce, stop))
+            self.assertEqual(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0], [ready])
+            self.assertEqual(os.read(ready, 1), b"1")
+
+            def finish() -> None:
+                _ = os.write(release, b"1")
+                result = child.result()
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            yield finish
+
+    def test_list_ready_reports_uncommitted_writes_once_while_the_vault_lock_is_held(self) -> None:
+        arguments = self.ready_arguments()
+        with self.hold_vault_lock() as release:
+            code, output, error = run(*arguments)
+            self.assertEqual(code, 0)
+            self.assertEqual(output.count("| C"), 2)
+            self.assertEqual(len(error.splitlines()), 1, error)
+            self.assertIn("2 new rows saved. The commit attempt failed", error)
+            self.assertIn(self.path.name, error)
+            self.assertIn(os.strerror(errno.EAGAIN), error)
+            self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+            code, output, error = run(*arguments)
+            self.assertEqual((code, output), (0, ""))
+            self.assertEqual(len(error.splitlines()), 1, error)
+            self.assertIn("0 new rows saved. The commit attempt failed", error)
+            release()
+
+    def test_merge_publication_warns_once_and_the_next_add_commits_all_rows(self) -> None:
+        arguments = self.ready_arguments(rows_per_merge=3)
+        production = production_doc.ProductionDocument(self.repo.parent / "production.md", "commit-scan", "main",
+                                                        Path(arguments[2]), self.repo.parent / "log", ZoneInfo("UTC"))
+        before = self.git("rev-parse", "HEAD")
+        output, warnings = io.StringIO(), io.StringIO()
+        with self.hold_vault_lock() as release:
+            with (mock.patch.object(main_push_lock, "main_push_lock", wraps=main_push_lock.main_push_lock) as lock,
+                  redirect_stdout(output), redirect_stderr(warnings)):
+                merge_checkpoint.record_publication_changes(production)
+            lock.assert_called_once_with(self.repo, "change-review", wait=False)
+            self.assertEqual(self.git("rev-parse", "HEAD"), before)
+            release()
+        self.assertIn(f"6 row(s) added to {self.path}", output.getvalue())
+        self.assertEqual(len(warnings.getvalue().splitlines()), 1, warnings.getvalue())
+        self.assertIn(f"{self.path}: 6 new rows saved.", warnings.getvalue())
+        self.assertIn(os.strerror(errno.EAGAIN), warnings.getvalue())
+        names = {f"{name} {number}" for name in ("First", "Second") for number in range(1, 4)}
+        self.assertEqual({row["Change"] for row in change_review.pending(self.path)}, names)
+        self.assertEqual(run_with_image("add", "--production", "commit-scan", "--list", str(self.path),
+                                        "--change", "Next", "--check", "Read", "--see", "Result"), (0, "C7\n", ""))
+        self.assertEqual(self.git("rev-list", "--count", f"{before}..HEAD"), "1")
+        committed = self.git("show", f"HEAD:{self.path.relative_to(self.repo)}")
+        self.assertEqual(committed, self.path.read_text(encoding="utf-8").strip())
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_list_ready_commits_after_agent_notes_releases_the_vault_lock(self) -> None:
+        arguments = self.ready_arguments()
+        with self.hold_vault_lock() as release:
+            code, output, error = run(*arguments)
+            self.assertEqual(code, 0)
+            self.assertEqual(output.count("| C"), 2)
+            self.assertEqual(len(error.splitlines()), 1, error)
+            self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+            release()
+        self.assertEqual(run(*arguments), (0, "", ""))
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual([row["Change"] for row in change_review.pending(self.path)], ["First", "Second"])
+
+    def test_list_ready_warns_only_for_the_list_that_stays_uncommitted(self) -> None:
+        arguments = self.ready_arguments(names=("First", "Second", "Third"))
+        other = self.path.with_name("change-review - other.md")
+        with self.hold_vault_lock() as release:
+            lock = (self.repo / ".git" / "main-push.lock").stat()
+            real_flock = fcntl.flock
+
+            def release_after_first_attempt(descriptor: int | TextIO, operation: int) -> None:
+                try:
+                    real_flock(descriptor, operation)
+                except BlockingIOError:
+                    number = descriptor if isinstance(descriptor, int) else descriptor.fileno()
+                    if os.path.samestat(os.fstat(number), lock):
+                        release()
+                    raise
+
+            with (mock.patch.object(fcntl, "flock", release_after_first_attempt),
+                  mock.patch.object(change_review, "list_path", side_effect=[self.path, other, self.path])):
+                code, output, error = run(*arguments)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(output.count("| C"), 3)
+        self.assertEqual(len(error.splitlines()), 1, error)
+        self.assertIn("2 new rows saved. The commit attempt failed", error)
+        reason = BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+        self.assertIn(f"({reason})", error)
+        self.assertIn(str(self.path), error)
+        self.assertNotIn(other.name, error)
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(self.git("status", "--porcelain", "-z"), f"?? {self.path.relative_to(self.repo)}\0")
+        self.assertEqual([row["Change"] for row in change_review.pending(self.path)], ["First", "Third"])
+        self.assertEqual([row["Change"] for row in change_review.pending(other)], ["Second"])
 
     def test_a_held_index_lock_warns_writes_and_the_next_add_commits_both_rows(self) -> None:
         lock = self.repo / ".git" / "index.lock"

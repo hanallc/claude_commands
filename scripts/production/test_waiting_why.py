@@ -10,10 +10,11 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.nightly_review import candidates
 from scripts.lib import file_lock
 from scripts.production import investigation, proposal_issue, staff, update_registration, waiting_why
@@ -33,9 +34,7 @@ class WaitingWhyTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = test_change_page.ChangePageTests('runTest')
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, test_change_page.ChangePageTests('runTest'))
         self.root = self.fixture.root
         _ = self.enterContext(patch.object(candidates, 'state_root', return_value=self.fixture.temporary / 'candidates'))
         folder = self.fixture.temporary / 'proposals'
@@ -54,7 +53,7 @@ class WaitingWhyTests(unittest.TestCase):
     def enter_waiting(self, kind: review_items.ReviewType, reason: str) -> review_items.ReviewItem:
         if kind == review_items.ReviewType.QUESTION:
             identities = update_registration.QuestionStaff.read()
-            source = next(item.source for item in review_items.read(self.root, assign_ids=False) if item.key == self.question)
+            source = next(item.source for item in review_items.read(self.root) if item.key == self.question)
             assert isinstance(source, review_items.QuestionSource)
             production = update_registration.question_scope(source.record.owner, identities.record)
             _ = update_registration.followup(production, source.record.item['text'], reason, identities=identities)
@@ -65,7 +64,7 @@ class WaitingWhyTests(unittest.TestCase):
                                               date(2026, 11, 17), waiting_why=reason)
         else:
             _ = candidates.record_outcome('fixture/E1', 'deferred', '', self.ledger, waiting_why=reason)
-        return next(item for item in review_items.read(self.root, assign_ids=False)
+        return next(item for item in review_items.read(self.root)
                     if item.type == kind and item.state == review_items.ReviewState.WAITING)
 
     def command(self, *args: str) -> tuple[int, str, str]:
@@ -132,7 +131,7 @@ class WaitingWhyTests(unittest.TestCase):
         item = self.enter_waiting(kind, WHY)
         reason = 'The owner must finish the requested check.'
         self.assertEqual(self.command('set', '--item', item.key, '--text', reason), (0, '', ''))
-        current = next(value for value in review_items.read(self.root, assign_ids=False) if value.key == item.key)
+        current = next(value for value in review_items.read(self.root) if value.key == item.key)
         self.assertEqual(current.waiting_why, reason)
         with patch.object(review_items, 'read', return_value=[replace(current, state=review_items.ReviewState.DONE)]):
             code, _, error = self.command('set', '--item', item.key, '--text', WHY)
@@ -162,6 +161,17 @@ class WaitingWhyTests(unittest.TestCase):
         self.assertEqual(status.slots(self.fixture.page, 'C1').waiting_why,
                          'The user asked the showrunner to validate this change.')
 
+    def test_delivery_rewrite_keeps_unknown_handoff_time(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        page = self.fixture.page
+        path = status.path(page, 'C1')
+        _ = path.write_text('{"validation":{"attempt":"check","state":"sent"}}\n')
+        with status.locked():
+            slots = replace(status.slots(page, 'C1'), waiting_why=WHY)
+            status.write_slots(page, 'C1', slots)
+        self.assertEqual(status.slots(page, 'C1').waiting_why, WHY)
+        self.assertNotIn('handed_at', cast(dict[str, object], json.loads(path.read_text())))
+
     def test_set_updates_unowned_question_under_canonical_lock(self) -> None:
         item = self.enter_waiting(review_items.ReviewType.QUESTION, WHY)
         assert isinstance(item.source, review_items.QuestionSource)
@@ -170,7 +180,7 @@ class WaitingWhyTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         record = replace(item.source.record, path=path, owner=owner)
         update_registration.write_question_record(record)
-        unowned = next(value for value in review_items.read(self.root, assign_ids=False)
+        unowned = next(value for value in review_items.read(self.root)
                        if isinstance(value.source, review_items.UnownedQuestionSource) and value.source.record.path == path)
         write = update_registration.write_question_record
 
@@ -184,7 +194,7 @@ class WaitingWhyTests(unittest.TestCase):
         reason = 'The former owner must answer the question.'
         with patch.object(update_registration, 'write_question_record', side_effect=write_under_lock):
             self.assertEqual(self.command('set', '--item', unowned.key, '--text', reason), (0, '', ''))
-        current = next(value for value in review_items.read(self.root, assign_ids=False) if value.key == unowned.key)
+        current = next(value for value in review_items.read(self.root) if value.key == unowned.key)
         self.assertEqual(current.waiting_why, reason)
 
     def test_set_prints_one_line_for_refusal(self) -> None:

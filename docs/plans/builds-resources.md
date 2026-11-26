@@ -480,7 +480,7 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 #### As-built
 
 - Every queue step's life is in `admission/queue_times.jsonl`: `admitted`, `left` and `ended` events from the admission service (`scripts/build_queue/admission_service.py`), written through a lifecycle outbox. `PendingLeft` is the durable cancellation intent; a restart replays it with its original time.
-- `finalize_reservation(..., end_kind)` takes `StepEnd | TokenReturn`. A `TokenReturn` `ended` event ends one reservation interval, never the step. One `ended` event is written per reservation id, also on a retry.
+- `finalize_reservation(..., end_kind)` takes `StepEnd | TokenReturn | HandOff`. A `TokenReturn` `ended` event ends one reservation interval, never the step. A `HandOff` `ended` event (outcome `handed_off`) ends a first-step grant that the command replaced with its own admission. It is not a completed step, and its peak goes to no estimate. One `ended` event is written per reservation id, also on a retry.
 - `read_queue_lifetimes` (`scripts/lint/memory_admit.py`) rebuilds each logical step from its reservation intervals: one arrival at the original `since`, the token gaps, and one end.
 - `WaiterPlace.queue_identity` carries each waiting place's identity. One constructor builds live places and both import paths; a migration fills a missing identity from the saved waiting row.
 - One head policy: `head_policy(...) -> HeadPolicy`, with `HeadPolicy.queued_head: QueuedHead | NoQueuedHead`, in `PassResult(rows, policy)`. Admission, the blocker lookup, `read_queue`, `explain_queue`, the release search, the queue card, the overview (`queue_view.py`) and the shell wait text read that one resolved state. `HeadAdmissionStatus` carries the override result.
@@ -551,9 +551,9 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 
 #### As-built
 
-- `build_hold.py status` prints one line per pending release record, after the holder lines or `no build hold`: `release pending: <holder name>, released <HH:MM zone> - unsent: <name>, <name>; run /build:hold release to finish it` (`every session (broadcast)` for a broadcast). An unreadable record or cycle prints `release pending: <path> could not be read: <error>; /build:hold release sets it aside`.
+- `build_hold.py status` prints one line per pending release record, after the holder lines or `no build hold`: `release pending: <holder name>, released <HH:MM zone> - unsent: <name> (<n> stopped runs), <name>; run /build:hold release to finish it` (`every session (broadcast)` for a broadcast). An unreadable record or cycle prints `release pending: <path> could not be read: <error>; /build:hold release sets it aside`.
 - Status and release share `pending_release_paths()` and `read_release_intent()`. Status takes no `release_lock()`, never calls `recorded_releases()`, and changes no file.
-- `release_notices(intent)` is the one unsent reader: `CycleNoticesToSend(cycle, entries)` or the broadcast notice. The first cycle entry per session counts; a recipient is unsent when its entry is missing, `NotAttempted` or `DeliveryFailed`. A cycle id that is not the record's `cycle_id` raises `ReleaseNoticeReadError(path, reason)`.
+- `release_notices(intent)` is the one unsent reader: `CycleNoticesToSend(cycle, entries)` or the broadcast notice. The first cycle entry per session counts; a recipient is unsent when its entry is missing, `NotAttempted`, `DeliveryFailed` or `WorkerClosed`, or `RecipientGone` for a Codex session. `QueuedUnconfirmed` is not unsent. A cycle id that is not the record's `cycle_id` raises `ReleaseNoticeReadError(path, reason)`.
 - Release sets a damaged pending record or cycle aside (`set_aside_damaged_record`, `<name>.damaged-<UTC time>[-n]`) and goes on. It rebuilds a damaged or missing cycle from the intent's recipients, so the printed command works.
 
 **Files:**
@@ -575,7 +575,7 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 - **Factor and cap.** The tiers multiply by `RELEASE_HEADROOM` (1.314) for release shapes and `DEV_HEADROOM` (about 4.203) for dev shapes; other profiles get `NoHeadroom`. Every promise caps at `BUILD_BUDGET_BYTES` (21 GiB) as `CappedAtBudget(uncapped)` or `UnderBudget`.
 - **Need basis.** `NeedBasis = LegacyNeedSource | ShapeP90 | ShapeLargest | ShapeFallback`, each shape tier with its floor, factor and cap. `need_basis_record` writes it to the waiter row's `need_basis` beside the `shape` source token; `read_need_basis` reads it back (`BasisNotRecorded` for an old row). `read_queue_pass`, `build_why.need_text` and `memory_gate.sh` read it; the wait line says "a same-shape promise", never a p90. An unknown token fails closed in the shell.
 - **Lifetime promise.** `MeasuredMemory.promise` is `RampPromise | LifetimePromise | NoPromise`, set in `step_memory`. A release `build` step holds `LifetimePromise(need)` until it ends: `charge_basis` charges `max(need, current memory, observed peak)` and `growth_headroom` keeps `need − current` as growth in the free-memory check. `build_why.charge_text` says the promise holds until the step ends. Dev builds and all other steps keep the 120 s `RampPromise`.
-- **One finalizer.** `finalize_reservation(path, row, outcome, now, status) -> HistoryRecorded | NoHistoryRecorded` runs under the caller's lock, from `release` and from `check` for each ended row. It stores a `finalization` intent with a stable `reservation_id` in the reservation, appends one `anon_peaks.jsonl` row with `need`, `shape` and `outcome` (`completed` status 0, `failed` 1–127, `killed` 128+, `owner_gone`) unless that id is already there, then removes the sidecars and the reservation last. `check` uses the evidence it records in the same admission.
+- **One finalizer.** `finalize_reservation(path, row, outcome, now, status) -> HistoryRecorded | NoHistoryRecorded` runs under the caller's lock, from `release` and from `check` for each ended row. It stores a `finalization` intent with a stable `reservation_id` in the reservation, appends one `anon_peaks.jsonl` row with `need`, `shape` and `outcome` (`completed` status 0, `failed` 1–127, `killed` 128+, `owner_gone`) unless that id is already there or the end is a first-step handoff (`handed_off`, no row), then removes the sidecars and the reservation last. `check` uses the evidence it records in the same admission.
 
 **Files:**
 - `scripts/lint/build_shape.py` — shape value, stored-key decoder, index join.
@@ -899,7 +899,7 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 #### As-built
 
 - `shrink_floor` (`scripts/lint/sweep.py`) takes `FloorTake = Group | WholeTargetTake`. An idle target with no build-unit group is one `WholeTargetTake`: the target root and the walk's observed entries, inodes, output versions and retained paths. Orphan batches of every target go first. Then unit batches and whole takes go together in `target_last_use` order, least recently used first. A target with no unit and no use stamp uses the newest mtime of its top-level entries as its last use. The floor takes only the shortfall and never a held target.
-- A whole take uses the one deletion path: `recoverable_trim` (write-ahead intent, `sweep_trim` row) → `reclaim` → `remove`. It runs under the same target lock and rechecks as a group batch (busy, build hold, process use, cargo lock, a newer use stamp). `record_target_deletes(paths, *, known_targets=())` writes the target root to `target-deletes.json` before the markers go, so `memory_admit.py` refuses a warm promise for that target.
+- A whole take goes to `reclaim` as a group batch does, and `reclaim` lists the target folder for manual review. It runs under the same target lock and rechecks as a group batch (busy, build hold, process use, cargo lock, a newer use stamp). After an approved removal, `remove_listed_output` calls `record_target_deletes(paths, *, known_targets=())`, which writes the target root to `target-deletes.json`, so `memory_admit.py` refuses a warm promise for that target.
 - A whole take keeps the target folder and its lock files: `.claude-busy`, `LOCK_NAMES` in each build tree, and `doc/.lock`. It takes `doc/.lock` with `try_lock`. When rustdoc holds it, the target is busy for this pass.
 - A cargo target inside another target's folder, outside that target's build trees, is its own target with its own last use, busy check and batches. `TargetOwnerIndex` maps each path to its deepest target once per pass (prefix check first; `/proc` paths skip `realpath`). `build_trees`, `process_uses` and `walk` use that one owner. `busy_bytes` and `after_caches` count a nested target's bytes once.
 - `unit_hash(name) -> UnitHash | NoUnitHash` gives a linker temp `.<name>-<hash>.<pid>` in `deps/` to its unit. `copied_name`, `copied_up` and `group_roots` keep their result for every other name.
@@ -1068,7 +1068,7 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 #### As-built
 
 - Hard-coded settings in this unit's files (108) are config keys read through `scripts/lib/conf.py` at use, with their old values: `hanas.conf`, `lint.conf`, `production.conf`, new `hana_shot.conf` and `scratch.conf`. `config/README.md` lists each key.
-- One key per value: `sweep.py` takes state and build-log folders from `tmp_sweep.state_dir()` and `buildlog/store.root()`; `tmp_sweep.wide_idle_seconds()` and the folder audit share `folder_remove_after_seconds`; the audit walks with `scratch.conf` `repo_skip` and keeps the configured `visible_root`; `smoke_launch.sh` reads `hana_shot.conf` `refused_port` and `host`; `mac_run.sh` reads `mac_test.conf` `connect_timeout_s`, rounded up for ssh; holder messages use the first `sweep_message_path_widths` entry; `hold_floor(floor, dry_run)` reads roots and lock from config.
+- One key per value: `sweep.py` takes state and build-log folders from `tmp_sweep.state_dir()` and `buildlog/store.root()`; `tmp_sweep.wide_idle_seconds()` and the folder audit share `folder_remove_after_seconds`; the audit walks with `scratch.conf` `repo_skip`; `smoke_launch.sh` reads `hana_shot.conf` `refused_port` and `host`; `mac_run.sh` reads `mac_test.conf` `connect_timeout_s`, rounded up for ssh; holder messages use the first `sweep_message_path_widths` entry; `hold_floor(floor, dry_run)` reads roots and lock from config.
 - Hot paths read each setting once per call (scratch repository scan, `Brp` instance, Hana polls, folder scans, dep-info scan).
 - Standalone `hana_shot.py` loads its libraries without `PYTHONPATH`. A config read failure in `scratch.holds()` keeps an active hold. `mac_run.sh` gives `scp` the raw remote path and `ssh` the quoted one.
 - Tests use `CONF_DIR`; `memory_test_support.write_config_fixture` keeps existing keys and adds the given ones.
@@ -1313,7 +1313,7 @@ A measurement script in the unit run folder splits Cargo memory waits by recorde
 
 #### As-built
 
-- `StepEvidence.arguments` (`scripts/lint/build_shape.py`) holds the decoded argv of test steps (`TEST_STEPS` = nextest, test, t). `index_step_evidence` keeps the argv and parses no test selection.
+- `StepEvidence.arguments` (`scripts/lint/build_shape.py`) holds the decoded argv of test steps (`TEST_STEPS` = nextest, test, t) and of `check` steps (since 2026-11-23). `index_step_evidence` keeps the argv and parses no test selection.
 - `history_selection(item, evidence)` (`memory_admit.py`) is the one resolver of package, scope and filters for a history row. A recorded field wins; only a missing field is parsed from `StepEvidence.arguments` through `test_selection`, once per row.
 - `expected_peak`: a full test request with a package keeps only rows whose package and scope match (test steps only).
 - `filtered_peak`: the larger of the exact-filter p90 and the package p90 from anonymous rows, then the indexed exact and package peaks × `ANON_SHARE`, then check/build peaks, the compile index and `FILTERED_FLOOR`.
@@ -1344,7 +1344,7 @@ A measurement script in the unit run folder splits Cargo memory waits by recorde
 - `FloorOutcome.assessment` holds a `tmp_sweep.SweepAssessment`. `notify_floor_problem` accepts `FloorOutcome | tmp_sweep.SweepAssessment`.
 - `send_floor_alert` returns `FloorAlertDelivery(natedev, phone)`, with one `FloorChannelOutcome` per channel (not attempted, delivered, queued or failed). `send_holder_message` is the natedev leg; it returns `FloorChannelOutcome` and logs "message to natedev ...".
 - The lock alert has one pure transition, `next_lock_alert(previous, holder, process, now)`, also used at lock acquisition. The record is written only when the state changes. An unreadable hold is `ObservedUnreadableFloorHold` or `ReportedUnreadableFloorHold`; an old `alert_delivered` true decodes as reported, false as observed. A pass that sees no holder keeps `DeliveredFloorLockAlert`, so the same holder does not alert again.
-- One copy of each floor rule: `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, `_command_text(bytes)`, and one `roots_for` lookup per distinct root. `target_dirs` is one loop over a named 3-level depth.
+- One copy of each floor rule: `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, `_command_text(bytes)`, and one `pair_roots_for` or `connected_roots_for` lookup per distinct root. `target_dirs` is one loop over a named 3-level depth.
 - `config/lint.conf` sets `sweep_scan_workers.natedev=1` and `sweep_discovery_workers=4` (the directory-search pool). The code no longer forces one scan worker.
 - A real floor pass walks each idle target once, and walks again only the targets that had deletions to compute `after_caches`.
 
@@ -1508,7 +1508,7 @@ Each estimate decodes `admission/anon_peaks.jsonl` once and asks the index once,
 - `read_estimate_history(root, host, steps, now, *, include_current_end=False) -> EstimateHistory` applies one parsed window to every tier: host, steps, `cutoff <= ended_at <= now` (`< now` unless `include_current_end`) and a positive int peak. `EstimateHistory` carries `root`, `host`, `now`, `steps`, `include_current_end` and `rows` by step.
 - `compiling_history(history)` takes only the history and joins its rows through `index_step_evidence`.
 - `expected_peak` reads once: a filtered request with a package reads `filtered_steps(step)` (`step`, `check`, `build` without repeats), others read `(step,)`. It tries `fresh_test_peak` (`ExpectedPeak | NoFreshHistory`), then `filtered_history_peak` or `full_history_peak`. No `filtered_peak` wrapper exists. `build_peaks` makes one read with `include_current_end=True`.
-- `index_step_evidence(index_path, host, steps: tuple[str, ...], call_ids: tuple[str, ...], before)` is one query over `json_each` call ids and steps with `+host=?`, so SQLite uses `steps_call`. It skips rows dated at or after `before`, keeps test arguments only for `TEST_STEPS`, and gives a `BuildShape` only to `build` rows (`NoBuildShape()` otherwise).
+- `index_step_evidence(index_path, host, steps: tuple[str, ...], call_ids: tuple[str, ...], before)` is one query over `json_each` call ids and steps with `+host=?`, so SQLite uses `steps_call`. It skips rows dated at or after `before`, keeps arguments only for `TEST_STEPS` and `check` (check since 2026-11-23), and gives a `BuildShape` only to `build` rows (`NoBuildShape()` otherwise).
 - The hana dev nextest estimate median fell from 0.462 s to 0.276 s.
 
 **Files:**
@@ -1915,7 +1915,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 **Approved:** builds showrunner, 2026-11-09 ("Your open nit is a wrong result: the alert can recommend a folder that holds output a build holds. Fix it now as phase 93. The recommendation must leave out held output, or name a different folder.").
 
 #### As-built
-- A non-dry floor pass computes the held paths when it notifies, in the `finally` of `_hold_floor_pass` (`scripts/lint/sweep.py`), from the final `busy` map. A held path is a target with a `busy` reason other than `NoRecordedEvidence`, a no-evidence target with an entry in `uses` or `hold_targets`, a `.claude-busy` judgment lock or a held cargo lock, and each paired root (`OUTPUT_ROOTS.get().roots_for`) of these. A live use that `shrink_floor` finds after the first scan is held.
+- A non-dry floor pass computes the held paths when it notifies, in the `finally` of `_hold_floor_pass` (`scripts/lint/sweep.py`), from the final `busy` map. A held path is a target with a `busy` reason other than `NoRecordedEvidence`, a no-evidence target with an entry in `uses` or `hold_targets`, a `.claude-busy` judgment lock or a held cargo lock. It also includes each root of the same saved mappings (`OUTPUT_ROOTS.get().pair_roots_for`) as one of these. A `PairHeld` target, held only because a pair root is in use, adds no roots. A live use that `shrink_floor` finds after the first scan is held.
 - `notify_floor_problem` receives them as `FloorOutcome.held_targets`. No caller reads held paths from the outcome that `_hold_floor` returns.
 - `folder_choices(..., held_targets=...)` marks a choice that is, contains or is inside a held path as `FolderChoiceKind.HELD_OUTPUT`. It compares resolved paths (`Path(label).expanduser().resolve()`, `is_relative_to` both ways). Held wins over `PROTECTED`. This applies to the Mac measurement and the natedev disk measurement.
 - A held folder line reads `<label>: holds <size>. A build is using output inside it; deleting it can break that build.`
@@ -1928,28 +1928,21 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Gotchas:** held paths taken at the first scan miss a live use that `shrink_floor` finds later; compute them from the final `busy` map. The no-evidence branch walks `_build_trees` only when a cargo lock is held.
 
-### Phase 94 — Each fall below the floor line gives one phone push, and the return gives one more  · status: done
+### Phase 94 — Each fall below the floor line gives one phone push  · status: done
 
 #### As-built
 
-- Each fall of free space below `sweep_phone_floor_gib` (150 GiB) gives one fall push for that machine, and the return gives one `sweep.disk_floor_recovered` push. No push goes between them. The rule is the same for natedev and the Mac.
-- `notify_floor_problem` rearms a crossing only when every pass during `sweep_phone_rearm_minutes` (60) reads strictly above the line plus `sweep_phone_rearm_gib` (155 GiB). `AboveRearmLine.since` keeps the first above-line time under the record lock. A reading at or below 155 GiB restarts the interval.
-- `RecoveringPhoneCrossing` holds the return receipt, the retirement result and `ReturnPushPolicy`. The fall key is `phone:<identity>` and the return key is `phone-recovered:<identity>`. A failed return delivery retries above the rearm line and a repeat is stopped by the receipt. A later fall opens a new episode even when the prior return receipt is pending.
-- At recovery, `retire_floor_fall` retires the crossing's fall key on natedev, which owns the silence queue. The Mac reaches natedev through `silence.SSH`. A dropped kept push means no return push and the crossing closes, even when the retire exits with an error. A retire with no count suppresses the return push in saved state, and the next pass retries. Only an accepted fall and a first retire result of zero dropped permit a return push.
+- Each fall below `sweep_phone_floor_gib` (150 GiB) permits one phone push per crossing. Recovery rearms the next fall without sending a phone push. The same rule applies to natedev and the Mac.
+- `notify_floor_problem` rearms a crossing after every pass reads above 155 GiB for `sweep_phone_rearm_minutes` (60 minutes). The rearm line adds `sweep_phone_rearm_gib` (5 GiB) to the alert line. `AboveRearmLine.since` records the start of the interval under the record lock. A reading at or below the rearm line restarts the interval.
+- `retire_floor_fall` retires the crossing's `phone:<identity>` fall key in the silence queue on natedev. The Mac uses `silence.SSH`. A reported dropped count confirms retirement even when the command exits with an error. `RetiringPhoneCrossing` preserves the identity and interval when retirement needs a retry. A later fall can start a new episode while retirement is pending.
 - The alert folder list shows only the largest folders that cover the shortfall, at most `sweep_alert_folder_count` (3, range 3..5). It never shows 0-byte folders and shows each path in full (`~` allowed). At the text limit it shows fewer folders. `notify_floor_problem` falls back to `UNAVAILABLE_FOLDER_CHOICES`.
 - Both Mac floor paths, the launchd job and the ssh call, read and write the same `floor.json` under one `floor-alert.lock`.
 
 **Files:**
-- `scripts/lint/sweep.py` — crossing states, timed rearm, return push, fall-key retirement, folder list.
-- `scripts/lint/test_sweep.py` — return, retirement, lost-receipt, timed-rearm and folder-list rows.
-- `scripts/notify/push_catalog.py` — `sweep.disk_floor_recovered`.
-- `scripts/notify/push_texts_reviewed.json` — approval records for the natedev and Mac return examples.
+- `scripts/lint/sweep.py` — crossing states, timed rearm, fall-key retirement and folder list.
+- `scripts/lint/test_sweep.py` — retirement, lost receipts, timed rearm and folder list.
 - `config/lint.conf` — `sweep_phone_rearm_minutes`, `sweep_alert_folder_count`.
-- `docs/as-built/build-memory-admission.md` — the two-push rule and the folder list.
-
-**Gotchas:**
-- The approval record for the return text carries the reviewer's objection to a push that asks for no action. The user approved the words on 2026-11-09.
-- A pending fall phone receipt gets no return push.
+- `docs/as-built/build-memory-admission.md` — the fall push and the folder list.
 
 **Ruled out:**
 - A deploy repair for the crossing record: the older and current formats read the same crossing, and the 147.7 GiB alert followed a real rise to 155.23 GiB.
@@ -2240,7 +2233,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - A missing, malformed or zone-less `createdAt` gives `CiUnknown`.
 - `config/mac_test.conf` has `ci_jobless_queued_minutes=60`. `read_config()` reads the key only when `ci_repo` is set, so the Linux and aws target configs need no new key.
 - No new `gh` call, flag, cancel call or state file.
-- Measured before the fix: run 43096016385 (natepiano/hana `ci.yml`) was queued from 2026-11-11 20:25 UTC with no jobs, and `gh run cancel` refused it as "completed". It held hana trunk's Mac block `pending` from 2026-11-12 20:04 EST.
+- Measured before the fix: run 43096016385 (hanallc/hana `ci.yml`) was queued from 2026-11-11 20:25 UTC with no jobs, and `gh run cancel` refused it as "completed". It held hana trunk's Mac block `pending` from 2026-11-12 20:04 EST.
 
 **Files:**
 - `scripts/mac_test/mac_test.py` — `CiRun`, `ci_activity()`, `MacTestConfig.ci_jobless_queued_minutes`
@@ -2362,7 +2355,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `memory_room` (`scripts/lint/memory_admit.py`) subtracts `agent_swap_demand` = ceil(max(0, SwapTotal − SwapFree − build_and_ci_swap) × `agent_swap_share_percent` / 100). `MemoryRoom.agent_swap_demand` carries the term; `room_text` shows it as "− N GiB swapped outside builds".
 - `read_meminfo` reads `build_and_ci_swap` (builds.slice plus the `ci_memory_slice` cgroup `memory.swap.current`) only when the host swaps. An inactive slice (empty systemd ControlGroup) or an absent cgroup folder reads as no swap. A missing counter or a failed systemctl call makes the room unavailable.
 - With no build running, the head still starts alone (the StartsAlone basis needs a readable room).
-- `config/build_admission.conf` key `agent_swap_share_percent=100` (0..100). builds.slice keeps its static MemoryMax 44G backstop; the room term is the dynamic control.
+- `config/build_admission.conf` key `agent_swap_share_percent=20` (0..100). builds.slice keeps its static MemoryMax 44G backstop; the room term is the dynamic control.
 
 **Files:**
 - `scripts/lint/memory_admit.py` — the term, `read_build_and_ci_swap`, `systemd_slice_group`, `slice_swap_current`.
@@ -2371,7 +2364,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/build_queue/memory_test_support.py` — the private CI slice writes `memory.swap.current` = 0.
 
 **Gotchas:**
-- Share 100 counts uncompressed swapped pages; zram holds them in less RAM, so the room is conservative. `agent_swap_share_percent` is the knob.
+- The config sets share 20. A share of 100 counts all uncompressed swapped pages; zram holds them in less RAM, so that room is conservative. `agent_swap_share_percent` is the knob.
 - Absent SwapTotal/SwapFree lines read as no swap; only fixtures omit them.
 
 **Ruled out:** a runtime MemoryMax change on builds.slice — the room term keeps builds dynamic.
@@ -2511,8 +2504,8 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 #### As-built
 
-- `config/build_admission.conf` `[memory]` has `gpu_test_slots=1` and `gpu_test_repositories=hana`. `read_memory_config` puts them in `AdmissionPolicy.gpu_tests` (`GpuTestSlots`); the default `NO_GPU_TESTS` names no repository.
-- `GpuTestSlots.holds(repository, step)` is true for a listed repository and a step in `GPU_TEST_STEPS` (nextest, test, t, targeted-test, merge-gate).
+- `config/build_admission.conf` `[memory]` has `gpu_test_slots=2` (set by the user) and `gpu_test_repositories=hana`. `read_memory_config` puts them in `AdmissionPolicy.gpu_tests` (`GpuTestSlots`); the default `NO_GPU_TESTS` names no repository.
+- `GpuTestSlots.holds(repository, step)` is true for a listed repository and a step in `TEST_BINARY_STEPS` (nextest, test, t, targeted-test, merge-gate).
 - `admission_walk` counts the admitted local reservations that hold a slot (`gpu_test_reservation`: the `queue_waiter` repository name, else `repo`). It adds each GPU test step it admits in the same pass. Cloud reservations, Mac placements and waiters do not count. The slot ends with the reservation; there is no file, lock or signal handler.
 - A held GPU test step gets `AdmissionDecision.gpu = GpuSlotWait(used, slots)` and cannot start. The head keeps its protected need, so no step passes it on memory. A head override does not lift the hold.
 - `queue_wait_reason` gives pressure first, then `GpuSlotWait`. The queue view shows " GPU test slot"; the head text is "waiting for the GPU test slot (U of S in use)"; the Builds page status code `gpu_slot` says "A GPU test waits: another GPU test holds the GPU test slot."; `head_after_steps_end` names "GPU test slot".
@@ -2559,36 +2552,51 @@ The cutover removal commit deletes the script after the run.
 
 **Gotchas:** a `.git` file does not prove that the Git store is outside the gate (`git init --separate-git-dir`); resolve the common directory first. Rescue refs stay in each source under `refs/rescue/`.
 
-### Phase 131 — The disk-floor sweep measures and alarms; it deletes nothing  · status: todo
+### Phase 131 — The temporary-folder sweep measures and alarms; it deletes nothing  · status: todo
 **Source:** build-folders Phase 8 (stall watch and alarm-only sweep), the resources part. builds showrunner 2026-11-15. Devtools owns the stall watch and `folder_audit.py`.
 **Depends on:** build-folders Phase 7 on main (planned Thu 11-19 morning), and devtools' stall watch on held lease owners on main first. Builds owns the order of `test_sweep.py` and `test_tmp_sweep.py` edits: claim them through berth and builds before an edit.
 
 #### Work Order
 
-**Goal:** the automatic disk-floor sweep measures and alarms and deletes nothing; explicit cleanup goes through the maker's lock and rescue path.
+**Goal:** the temporary-folder sweep measures and alarms and deletes nothing; explicit cleanup goes through the maker's lock and rescue path. The floor take on Cargo build output stays.
+
+**Decision (item 88, bob, producer, 2026-11-18 19:35 EST; the user can reverse it):** `tmp_sweep.py` becomes alarm only. The floor take on Cargo build output under `/build/cargo` and `/build/paths` stays. Removal of that floor take needs a bounding rule for each kind of Cargo output outside slots; that is a later decision for bob.
 
 **Spec:**
-1. Change `scripts/lint/tmp_sweep.py` and the floor callers in `scripts/lint/sweep.py` to measurement and alarms. They delete nothing.
+1. Change `scripts/lint/tmp_sweep.py` and its floor callers to measurement and alarms. They delete nothing. Keep the floor take in `scripts/lint/sweep.py` on Cargo build output under `/build/cargo` and `/build/paths`.
 2. Send each eligible one-off to the maker's lock and rescue path (`build_folders`). Keep explicit maker cleanup.
-   `tmp_sweep.py --apply` (`apply_cleanup_plan()` at `scripts/lint/tmp_sweep.py:1456`, which deletes through `remove_entry()` at line 1162 and `remove_idle_entry()` at line 1185) is explicit cleanup of a saved plan: route each entry through the same maker path. Keep no direct delete in it.
+   Run `tmp_sweep.py --plan <new-plan.json>` to record each candidate and the reason for the assessment.
+   Review the list that the hourly sweep publishes through `removal_guard.py` for vetted manual removal.
 3. Retire each competing managed-folder delete path after its legacy users drain.
 4. Keep `~/.cache` out of every root. Add no cleanup tool.
-5. Unfinished trim records: `_hold_floor_pass()` runs `recover_pending_trims()` before it reads free space (`scripts/lint/sweep.py:4481`), and `TrimTake.recover()` deletes the remaining paired output (`sweep.py:2051`). At the cutover, a saved `deleting` or `publishing` intent deletes nothing more: keep the remaining files and keep the record of each completed deletion.
+5. Unfinished trim records: `_hold_floor_pass()` runs `recover_pending_trims()` before it reads free space (`scripts/lint/sweep.py:4481`), and `TrimTake.recover()` deletes the remaining paired output (`sweep.py:2051`). Both stay, because the floor take on Cargo build output stays.
 
 **Constraints from prior phases:**
 - Phase 8: only the installed copy writes the shared hold, release, enforcer and admission state. A checkout or test copy that tries gets exit 2. Tests use private directories.
 - `docs/as-built/build-memory-admission.md` has an "Installed writers and private test state" section. Put the alarm-only lines beside the `tmp_sweep` lines, not in that section.
 
 **Files:**
-- `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` — alarm-only floor callers and the explicit cleanup route.
+- `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` — alarm-only `tmp_sweep` callers, the kept Cargo floor take and the explicit cleanup route.
 - `scripts/lint/test_sweep.py`, `scripts/lint/test_tmp_sweep.py` — alarm, explicit cleanup and saved-plan rows (claim through berth and builds first).
-- `docs/as-built/build-memory-admission.md` — the alarm-only floor rule beside its `tmp_sweep` lines.
+- `docs/as-built/build-memory-admission.md` — the alarm-only `tmp_sweep` rule and the kept Cargo floor take, beside its `tmp_sweep` lines.
 
 **Workers:** `1 writer + 1 tester`
 - `impl` owns `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` and the documentation.
 - `test` owns both test modules and the alarm, cleanup and saved-plan fixtures.
 
-**Acceptance gate:** a low-disk check keeps every fixture folder; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off; `tmp_sweep.py --apply` on a saved plan removes through the maker path and keeps a locked one; a saved `deleting` trim intent keeps its remaining files and the record of its completed deletions. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
+**Acceptance gate**
+
+- A low-disk check keeps every temporary fixture folder.
+- The check still takes Cargo build output under `/build/cargo` and `/build/paths`.
+- The floor alarm sends once per crossing.
+- Explicit maker cleanup rescues and removes an unlocked one-off.
+- The tmp sweep lists eligible entries for vetted manual removal.
+- The tmp sweep keeps each locked entry off the list.
+- The removal guard accepts only approved build rows for removal.
+- A saved `deleting` trim intent on Cargo output still finishes.
+
+Run the sweep, tmp sweep, folder audit and source enforcement tests.
+Run the full gate after the final migration.
 
 ### Phase 132 — hana_shot launch refuses a new app at the local app cap  · status: done
 **Source:** builds showrunner 2026-11-15 23:1x, natedev decision after the 11-15 swap peak: 8 research `hana_shot.py launch` apps on ports 15820-15827 pushed swap to 36.6 GiB at 16:15 EST. An interim step; queue's memory gate for app launches (queue phase A) replaces it.
@@ -2738,3 +2746,552 @@ The cutover removal commit deletes the script after the run.
 - Checkpoint `73bb35737`.
 
 **Files:** `scripts/lib/cargo_seed.py`, `scripts/lib/test_cargo_seed.py`, `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`, `scripts/worktree/worktrees.py`, `scripts/worktree/test_worktrees.py`, `config/build_folders.conf`.
+
+### Phase 145 — A test step with no test history gives back its build reservation once tests run  · status: dropped
+**Dropped:** builds, 2026-11-20 07:48 EST. The replay showed about 1% less mean wait; the gain does not pay for the code. No code went to main.
+
+Builds assigned this on 11-18 (List item 78): it is the cause of the one-build natedev line at 00:33 EST. A nextest step with matching test history already falls to its test-phase charge when the sampler sees the test phase. A step with no matching history keeps its full build need until it ends (Nov 17: 11.85 GiB reserved, 0.17 GiB test peak).
+
+- Change: when the sampler has observed the test phase and the row has no test-phase need, charge `max(test-phase peak so far, floor) × test_phase_margin`, the same formula as the history case. The first reservation does not change.
+- No new tunable: the existing `test_phase_margin` and the existing floor.
+- Proof: the 7-day Hana nextest test-phase peak (median, p90, max, and when in the run it comes), and a replay of 00:33 to 00:43 EST that shows builds running at one time before and after, with no moment over the memory cap.
+- Base on main. Functions touched in `memory_admit.py`: `test_phase_history` and the test-phase need record; `admission_records.py` `TestPhaseNeed` form. Queue told.
+
+Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nextest admissions (5 with history, 11 without); the compile (2.5–22 min) holds the reservation, the test phase lasts 0.1–6.4 min. Replay 20:00–00:52 EST: 72 admissions either way, mean wait 5,178 s against 5,132 s. 7-day Hana nextest buildlog peak median 13.59 GiB against promise median 11.50 GiB. Evidence: the unit session folder, `phases/145/` and `phases/diag-promise/`.
+
+**Files:** to be named by the work order.
+
+### Phase 146 — A second cancel of a gone placement request succeeds  · status: done
+
+#### As-built
+
+- Cause, proven by `scripts/build_queue/test_first_step.py`: `verify.sh` cancels the remote placement on exit, then `FirstStepAdmission.close()` cancels it again. The service found no request and refused with the owner-mismatch text; the Mac release build cleanup exited 2.
+- `AdmissionServer._handle_placement` refuses a missing request with `wire.PLACEMENT_REQUEST_MISSING_REASON` ("placement request is missing"), defined in `admission_wire.py`. A real owner difference still refuses with "placement coordinator does not match".
+- `close()` treats that reason on its own cancel as success (an idempotent cancel). Any other refusal still raises.
+- Live with no restart: the build-admission service reloads its own changed source.
+- Checkpoint `31056b27e`.
+
+**Files:** `scripts/build_queue/admission_wire.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/first_step.py`, `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_first_step.py`.
+
+### Phase 147 — Build queue and Mac tests write their own build_targets.conf  · status: done
+
+#### As-built
+
+- Cause: with `CONF_DIR` unset, `test_target_availability` and `test_offload_lifecycle` read `build_targets.conf` from the private test home and failed with `conf.Unusable` when it had none. The merge gate passed because `gate_box.py` links the checkout `config` into its home.
+- Each Mac route test and the pending-dispatch lifecycle test write a private target registry and set `CONF_DIR` (and `MAC_TEST_STATE_DIR`) for that test only.
+- `write_mac_target_registry` in `offload_test_support.py` writes the whole Mac registry (`targets`, `kind.mac`, `platform.mac`, `settings.mac`) with no merge of the tunable template. The command fixture and the cleanup-leftovers test use it, so a host override in the template cannot change them.
+- 267 tests pass in 4 layouts (empty home, normal, empty `CONF_DIR`, `~/.claude` only), and with host overrides in a template copy.
+- Checkpoint `410ad2e47`.
+
+**Files:** `scripts/build_queue/test_target_availability.py`, `scripts/mac_test/test_offload_lifecycle.py`, `scripts/mac_test/offload_test_support.py`, `scripts/mac_test/test_offload_cleanup_leftovers.py`.
+
+### Phase 148 — The warm-seed tests start no real Cargo  · status: done
+
+#### As-built
+
+- Cause: `test_real_cargo_reuses_a_registry_unit_and_rebuilds_local_inputs` in `scripts/lib/test_cargo_seed.py` started real rustup and Cargo. The merge gate puts tripwire `cargo`, `rustc`, `rustdoc`, `rustup` and `cargo-nextest` first on PATH (`gate.py` `test_module_environment`), so the warmseed row failed its merge test.
+- The test and the helpers only it used (`fixture_cargo`, `write_crate`, `build_crate`) are removed. The copy, lock, stage and recovery tests stay. The Phase 144 Hana measurement keeps the real-Cargo evidence.
+- 13 tests pass with the tripwires first on PATH, with 0 tripwire calls.
+- Rows on main `9eff6f1ee`: row 144 `7f9f08a71`, row 144 shrink `85affe59a` (56 tests pass under the tripwires).
+- Checkpoint `6f1e2452b`.
+
+**Files:** `scripts/lib/test_cargo_seed.py`.
+
+### Phase 149 — The queue-place scope test does not depend on load  · status: done
+
+#### As-built
+
+- Cause: `test_scope_is_published_at_popen_return_and_survives_holder_death` killed the holder before the program wrote its record. `cleanup_program_starts` then correctly stopped the program, because `QueuePlace.popen` makes the caller the holder. Under load the kill came early, so the test failed. `queue_place.py` has no defect and is unchanged.
+- The test checks the sidecar at `popen` return and waits for the program's full `ready` line before it kills the holder. Event waits use `TEST_HANG_GUARD_SECS`; the orphan-slice sweep keeps its 10-second limits. The scope mocks stay until the admission thread stops.
+- Proof: 10/10 full-module runs (47 tests) at 25% CPU, one run with `PYTHONUNBUFFERED=1`, and on the row 6/6 runs in the empty-home and gate layouts at 25% CPU with 0 tripwire calls.
+- Row on main `a66d4f0c8`: `a2fedffde`. Checkpoint `3466c8911`.
+
+**Files:** `scripts/build_queue/test_queue_place.py`.
+
+### Phase 150 — Find why the AWS merge gate wall time doubled  · status: done
+
+#### As-built
+
+- A read-only study from the gate records; no code change. Evidence: the cost ledger, the launch ledger, the gate index and the guest results.
+- Main cause: on 11-14 at 09:25 EST, AWS placement moved full merge gates from 32-vCPU boxes (`m7a.8xlarge`, `c7a.8xlarge`) to 16-vCPU `c7a.4xlarge` (aws commits `9cf0ac576`, `7dc450e92`, `6b6d3d516`). The gate runs one worker per CPU, so workers fell from 32 to 16. Module CPU stayed flat; the module span grew from 197 s to 388 s median.
+- Second rise on the same type, 11-17/18: median wall 358 s to 451 s, CPU 4322 s to 4930 s. Five modules added most CPU: `statusline/test_statusline.py`, `production/test_mac_run.py`, `direct/test_verify_lint_local_writes.py`, `mac_test/test_offload_lifecycle.py`, `direct/test_assign_claude_claim_follow.py`.
+- Proposed: `c7a.8xlarge` first for full gates, about 210-240 s guest wall at $0.020-0.024 per run. Builds took the box order to the user; natest took the five modules.
+- Checkpoint `74b5acf8d`.
+
+**Files:** none.
+
+### Phase 151 — A paired AWS trial takes all its cloud slots at once  · status: done
+
+#### As-built
+
+- Cause (builds 11-18 09:04): each paired trial member took one cloud slot and then waited at a launch barrier. Trial 0bcb636d held 5 slots for 4 min with no box launched. Measured over 110 trials (11-13 to 11-18): 811 idle slot-minutes; 11 other gate requests waited 36.9 min in total while a trial held idle slots.
+- `CloudPlace` carries an optional `CloudGroup` (key, size, trial start, coordinator owner). Old requests decode as single, and the wire bytes for a single request are unchanged.
+- The admission service admits a group in one pass when all its slots are free. It saves every grant before any reply. Queue order uses the trial start time, so a reconnect or a service restart keeps the group's place. A group larger than `cloud_gate_slots` refuses at once. When the coordinator ends, the service refuses the whole group.
+- A reserved cloud slot is a distinct state. It counts as used, and Builds shows it in Queued as "waits for launch". The service records the first launch it sees, so a failed progress read never moves a row back. Running starts at the first `run-instances` call, for paired trials and single gates.
+- The coordinator holds the `paired-trial-slots` lock only for the cost reservation. It watches every worker pipe until launch. A worker that ends before launch, or a failed `launch` send, sends `abort` to every worker that has not launched, and the trial fails.
+- Blind review: 7 findings, all fixed in 3 rounds.
+- Checkpoint `770c0d704`; row `49dc19798` on main `78de4e3ec`.
+
+**Files:** `scripts/aws_target/aws_trial.py`, `scripts/aws_target/cloud_gate.py`, `scripts/build_queue/admission_wire.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/queue_view.py`, and their tests.
+
+### Phase 152 — A date-boundary AWS test passes in any environment  · status: done
+
+#### As-built
+
+- Cause: not the time of day. The test set `TZ=America/New_York`. With `TZDIR` unset (NixOS), `tzset()` did not resolve that name, so `report.day_range()` used UTC and left out the departure.
+- The test now uses the fixed `EST5` offset and a fixed `time.time` for `index.update()`. It passes with `TZDIR` set, unset or wrong, on both sides of New York midnight.
+- Open for an owner: `scripts/buildlog/report.py:1571` and `cli.py:253` use UTC without a warning when `TZDIR` is unset.
+- Checkpoint `1454f2907`; row `b13507879` on main `78de4e3ec`.
+
+**Files:** `scripts/aws_target/test_measurement.py`.
+
+### Phase 153 — A gate uses the cheapest region again as soon as it has quota room  · status: done
+
+#### As-built
+
+- A Spot quota refusal no longer cools the whole region. Zone refusals keep their `capacity_cooldown_seconds` cooldown.
+- `cloud_gate.rank_variants` counts a region as full when our live gate vCPUs plus the variant exceed the quota snapshot for the variant's class. `ledger.spot_quota_class` takes the class from the instance family: Standard, G and VT, or P.
+- A quota refusal saves `GateQuotaRefusal` with our live vCPU count and the time. `GateQuotaRefusal.is_active` is the one rule: the region ranks last until our count drops or the cooldown ends. A saved mark without a time reads as expired.
+- `InvalidInstanceID.NotFound` closes a reserved box record. Ranking ignores expired boxes.
+- Checkpoint `a39bda2c4`; row `b763ff7f7` on main `62aca78ee`.
+
+**Files:** `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/ledger.py`, `scripts/aws_target/run_cost.py`, `scripts/aws_target/test_cloud_gate.py`, `scripts/aws_target/test_ledger.py`.
+
+### Phase 154 — A buildlog report day never falls back to UTC by itself  · status: done
+
+#### As-built
+
+- Cause: `run_in_user_zone()` set `TZ` to the zone name. With `TZDIR` unset (NixOS), glibc did not resolve it and used UTC without a warning, so report days and SQL `localtime` days were wrong.
+- `scripts/buildlog/cli.py` gives glibc the absolute zone file (`TZ=":<path>"`) from `zoneinfo.TZPATH`, then from the `tzdata` package. It checks the process offset against `zoneinfo` at 12:00 UTC on 15 January and 15 July. A zone it cannot load exits 2 with the zone named.
+- Tests set `TZDIR` to an empty folder; the New York row fails on the old code. Rows cover a zone found only in `tzdata`, London, a wrong zone and an offset mismatch.
+- Blind review: 4 findings, all fixed in 1 round.
+- Checkpoint `4d730e56f`; row `64e6cb9bf` on main `d26b82cff`.
+
+**Files:** `scripts/buildlog/cli.py`, `scripts/buildlog/test_report.py`.
+
+### Phase 155 — The hourly snapshot keeps Spot placement scores  · status: done
+
+#### As-built
+
+- `aws_target.hourly()` runs the price snapshot, the billed-hours check and `placement_snapshot` independently. An error in one never skips another.
+- `spot_placement_requests` is a fixed list of 10 request bodies, because AWS allows about 10 new bodies per 24 h. Each shape covers 19 regions in two batches (10 and 9):
+  1. regional, 8 boxes, the two 32-vCPU types;
+  2. regional, 8 boxes, all four gate types;
+  3. zonal, 8 boxes, the 32-vCPU pair;
+  4. zonal, 8 boxes, all four types;
+  5. regional, 20 boxes, all four types.
+- `collect_spot_placement` starts a new shape (both batches) only inside the 24-hour budget and after the earlier shapes were accepted. A refusal is a missing sample; no new shape starts after it in that hour. The lock file claims the hour before any AWS call.
+- `spot-placement-scores.json` keeps 72 h of samples and failures. `ledger.read_spot_placement_scores` reads it; unreadable history reads as empty and is replaced. Requests key on the type set and a sorted type tuple.
+- The AWS page table below Spot prices: one row per region or zone; cells for 32 vCPU (8 boxes), all types (8 boxes) and all types (20 boxes) as latest / 72 h median / samples; stale, missing and not-sampled cells marked. A note says AWS scores a request with fewer than three types lower.
+- IAM: the aws unit added `ec2:GetSpotPlacementScores` to the scaler policy (main `e3f230ea1`). Collection starts after the user's setup run.
+- Blind review: 7 findings, all fixed in 2 rounds.
+- Checkpoint `55ec0458a`; row `76a31d93a` stacked on the Phase 153 row `b763ff7f7`.
+
+**Files:** `scripts/aws_target/aws_target.py`, `scripts/aws_target/ledger.py`, `scripts/aws_target/aws_page.py`, `scripts/aws_target/aws_prices.html`, and their tests.
+
+### Phase 156 — The AWS page shows the gate-time price at which a 32-vCPU box wins  · status: done
+
+#### As-built
+
+- A table below the Spot placement scores has one row per configured gate region. It compares the cheapest eligible 16-vCPU and 32-vCPU merge gate boxes: type, Spot USD per hour, median box minutes, and run USD.
+- Break-even USD per minute of gate time = (USD32 − USD16) / (minutes16 − minutes32). Other outcomes are "always", "never", "no measurement" and "no current price".
+- `run_cost.GateRunPricing` holds the expected run USD of `cloud_gate.rank_variants`. One shared eligibility function (deployed subnets and zones, `max_gate_minutes`, current price) serves the gate and the page. The gate's ranking is unchanged: 128 comparisons match the old code.
+- A page refresh redraws the table. Display only; no config change.
+- Blind review: 4 findings, all fixed in 1 round.
+- Checkpoint `f194deaf1`; row `039bb9706` stacked on the Phase 155 row `76a31d93a`.
+
+**Files:** `scripts/aws_target/aws_page.py`, `scripts/aws_target/aws_prices.html`, `scripts/aws_target/run_cost.py`, `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_aws_page.py`, `scripts/aws_target/test_run_cost.py`.
+
+### Phase 157 — The AWS page and the AWS report survive a run kind they do not know  · status: done
+
+#### As-built
+- Cause: the natest gate-rename chain (`origin/natest-gatechain`, phase 320 `cf4ac06c4`) renames stored step names (merge-gate to gate, targeted-test to test-affected). Its gate trials wrote 93 launch rows with `test-affected` into the live ledger (11-16 20:26 to 11-17 11:54 EST). When the 11-17 bill arrived (11-18 14:29 EST), `run_cost.billed_allocations` divided by 0 and the hourly AWS page publish failed.
+- `run_cost` converts the old row modes through one alias table. It reads `merge-gate` as `gate` and `targeted-test` as `test-affected`. Other modes keep their names.
+- `billed_allocations` splits a day's bill of a type and region over every run of that day, and skips a day with zero box time.
+- natest was told to turn the alias table around when its chain merges.
+- Fast-track refused it (`run_cost.py` imports `scripts/production/staff.py` through other modules), so it went as a row.
+- Blind review: approved in 1 round.
+- Checkpoint `edc419d50`; row `957f7dd04` on main `f6c11ee64`.
+
+**Files:** `scripts/aws_target/run_cost.py`, `scripts/buildlog/test_aws_report.py`.
+
+### Phase 158 — The Phase 151 cloud slot groups merge with main  · status: done
+
+#### As-built
+- The Phase 151 row `49dc19798` conflicted with main `f6c11ee64` in four files. Main records the gate job in the cloud reservation request and the admission record. Phase 151 adds the cloud slot group.
+- The new row keeps both changes. `cloud_reservation` takes a suite mode or a step job and a group. `_prepare_admission` records `gate_job` and keeps the group grants.
+- `test_aws_trial.py`: the fake reservation function takes the job and the group. The worker named this file; the director made the fixture fix.
+- Tests on the row in both layouts, 0 failures: 8 suites, 763 tests.
+- Blind review: approved in 1 round.
+- Checkpoint `2eb06f046`; row `6160f865c` on main `f6c11ee64`, branch `builds-resources-p158`. It replaces `49dc19798`.
+- Main `cd9f5002b` moved the execution types to `execution_identity`, and `6160f865c` stopped merging clean. Row `aa966454c` on main `cd9f5002b`, branch `builds-resources-p158b`, replaces it. `test_queue_view.py` keeps only the `CloudGroup` import. Types 0; 8 suites, 767 tests, pass in both layouts.
+
+**Files:** `scripts/aws_target/aws_trial.py`, `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_cloud_gate.py`, `scripts/aws_target/test_aws_trial.py`, `scripts/build_queue/admission_service.py`.
+
+### Phase 159 — The floor pass deletes build output whose workspace is gone before it cuts a live worktree  · status: done
+**Source:** item 88, bob (producer) go 2026-11-18 19:40 EST, through builds. On 11-18, 18 folders under `/build/cargo` had no workspace (89.2 GiB) while the floor take cut live worktree output by last use.
+
+#### As-built
+- Under the floor, the pass first takes whole orphan folders, then live targets by last use. Above the floor nothing goes.
+- An orphan is a `/build/cargo` folder with no workspace through the mirror links under `roots.cargo_paths.<host>`, read from the live `build_folders` settings only. Unreadable live settings take no orphan and print one line.
+- An orphan also has no process use (cwd, exe, maps, cargo-nextest or verify.sh workspace, open descriptors), no nested target marker, no mount point, and lies on the filesystem under its floor. A process the sweep cannot read (PermissionError) is skipped, as for live targets; a `/proc` that cannot be listed keeps the folder.
+- Under the Cargo locks, the pass rechecks, renames the orphan to a detached sibling, records the detached path in the trim intent, then deletes it. Recovery deletes only the detached path, after a process check. Discovery hides only the exact detached name format.
+- A second filesystem reads free space through its highest folder on the same device, so a take does not break the reading.
+- Each take writes a `sweep_trim` row with cause "orphan take".
+- Accepted (review): a workspace created between the last check and the rename costs one rebuild; a project quota could make the probe read more space than a target can use (natedev has no quota mounts).
+- Row ebfeb01c8, stacked on the Phase 170 row c0c1e5e07 (shares `sweep.py` lines with the Phase 169 row). Tests in both layouts, 0 failures: 7 modules; types 0.
+
+### Phase 160 — The Phase 156 gate-time price card merges with main  · status: done
+
+#### As-built
+- The Phase 156 row `039bb9706` conflicted with main `cd9f5002b` in `aws_prices.html` and `test_aws_page.py`. Main `366128688` puts prices and quotas in one table, with the quota help inside it.
+- The new row keeps main's table and the gate-time price card below Spot placement scores. The old Quotas section is gone. `readAwsPage` reads both data scripts; a refresh rebuilds the region chips when the region list changes.
+- `test_aws_page.py` keeps the imports of both sides; the refresh fixture returns both data scripts.
+- Tests on the row in both layouts, 0 failures: 13 suites, 474 tests; types 0. A dark desktop shot shows the three cards; a region chip removes that region from all three.
+- Open note: the Gate column of Prices and quotas leaves out the transfer charge that the break-even card adds (us-west-2 m7a.4xlarge: 0.0396 against 0.0397).
+- Checkpoint `e1b9cfee8`; row `46539f832` on main `cd9f5002b`, branch `builds-resources-p160`. It replaces `039bb9706`.
+
+**Files:** `scripts/aws_target/aws_prices.html`, `scripts/aws_target/test_aws_page.py`.
+
+### Phase 161 — The Gate column shows the same price as the break-even card  · status: done
+**Source:** builds, 2026-11-19, from the Phase 160 open note.
+
+#### As-built
+- `spot_table.run_costs` makes one `GateRunPricing` for each scope and prices each Gate cell with its `expected_usd`. The Gate column and the cheapest-gate line now add the transfer charge outside the home region and the region extra wait, as placement and the break-even card do. The scope text names both.
+- `test_aws_page` checks that the Gate cell equals the break-even price for a home and a remote region. `test_control` expects the remote price with the transfer charge (0.0250 to 0.0252, 0.0500 to 0.0502).
+- Tests on the row in both layouts, 0 failures: 8 suites, 279 tests; types 0.
+- Open note (blind review): the Gate column takes the lowest Spot price of any zone. Placement and the card take only zones with gate boxes. A cheap zone with no gate boxes can show a lower price than placement gets. The base has the same zone choice; offered to builds as a separate phase.
+- Checkpoint `9b022b16b`; row `2604acf72` on the Phase 160 row `46539f832`, branch `builds-resources-p161`.
+
+**Files:** `scripts/aws_target/spot_table.py`, `scripts/aws_target/test_aws_page.py`, `scripts/aws_target/test_control.py`.
+
+### Phase 162 — The Gate column takes only zones with gate boxes  · status: done
+**Source:** builds, 2026-11-19, from the Phase 161 blind review.
+
+#### As-built
+- The Gate column and the cheapest-gate line take the lowest current price among the zones in `gate-deployment.json`, placement's slow filter (`max_gate_minutes`) and placement's run history window. The Spot column keeps the lowest price of any zone.
+- A Gate cell with no price shows a dash; its tooltip says `too slow`, `no current gate price` or `no runs`.
+- `run_cost` holds the shared readers: `read_deployed_gate_variants`, `slow_gate_types` and the placement history read (Phase 163 names it `read_placement_run_history`; placement uses it too). The page and the break-even card use them.
+- Each page build reads current zone prices once and passes them to the Gate table and the card (`aws_page.py`).
+- The per-type run and paid tables keep the full launch ledger read.
+- Review: 3 passes, 7 findings (2 blockers, 5 minor); 6 fixed in 2 rounds. Accepted: a `max_gate_minutes` change during one page build can make the Gate cell and the card differ until the next build.
+- Tests on the row in both layouts, 0 failures: 9 suites, 314 tests; types 0.
+- Checkpoint `b3ba4334c`; row `7a8fc310f` on the Phase 161 row `2604acf72`, branch `builds-resources-p162`.
+
+**Files:** `scripts/aws_target/spot_table.py`, `run_cost.py`, `aws_page.py`, `test_aws_page.py`, `test_control.py`.
+
+### Phase 163 — Placement reads its run history through the shared function  · status: done
+**Source:** builds, 2026-11-19, from the Phase 162 as-built.
+
+#### As-built
+- `run_cost.read_placement_run_history` reads placement's launch window once and returns `PlacementRunHistory` (launch rows and run evidence). It replaces `placement_run_evidence`.
+- `cloud_gate.GateWorker.rank_variants` calls it, and its refused-zone check uses the returned rows. The copied window and evidence lines are gone. The Gate column and the break-even card use the same function. No behavior change.
+- aws was told the lines; its runner-start fix does not overlap.
+- Accepted (review): a bad `capacity_cooldown_seconds` value prints its recovery warning twice per ranking.
+- Tests on the row in both layouts, 0 failures: 9 suites, 314 tests; types 0.
+- Checkpoint `e251ffea8`; row `15d7f8099` on the Phase 162 row `7a8fc310f`, branch `builds-resources-p163`.
+
+**Files:** `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/run_cost.py`.
+
+### Phase 164 — The doc prune never removes a doc tree a new process opened  · status: done
+**Source:** builds, 2026-11-19, from natest's phase 370 review.
+
+#### As-built
+- `prune_doc_index` locks the output root, then `prune_doc_root` takes the rustdoc lock and renames `doc` to `.doc-prune` (`DOC_PRUNE_DIR`) with an exclusive rename (`rename_doc_tree`).
+- `doc_tree_use` checks process exe, cwd and mapped files (`process_uses` without workspace matching) and open fds under the renamed tree. A use restores it to `doc`; no use removes it (`finish_doc_prune`).
+- `recover_doc_prune` handles a leftover `.doc-prune` on the next run: restored when used and `doc` is absent, removed when idle. `walk` keeps `.doc-prune` out of the main sweep.
+- Accepted (review): the window between the final check and `rmtree` (no consumer reaches `.doc-prune` by its doc path); the Mac without `/proc` (the same as the first scan); a crash leftover with a cwd user stays hidden while the root is busy (the next doc run rebuilds `doc`).
+- Row 447ebc0cd on main d5d81400c. Tests in both layouts, 0 failures: 8 suites; types 0. The merge with natest 370 (dad3666a1) is clean; test_sweep and test_tmp_sweep pass on it.
+
+### Phase 165 — One failed result upload no longer sends a merge gate to natedev  · status: done
+**Source:** builds, 2026-11-19 02:3x EST: the sdlc pageowner2 merge gate ran its whole suite on natedev after attempt `f163adff` ran 867 of 867 modules green and one 30-s result PUT timed out.
+
+#### As-built
+- `gate_box.BOX_CURL_RETRY` (2 retries, `--retry-all-errors`, 1-s delay) is the one retry setting. Merge-gate and targeted-test guest transfers, the user_data download and the trap's boot-error PUT use it. The paired guest keeps single-try transfers.
+- `boot_trap` uploads its final log first (single try), then reads the last `stage=` line from boot.log: "Tool preparation failed" for tool preparation, else "The box failed at stage <stage>". user_data prints `stage=tool preparation`; the guest writes `stage=result upload` before publish.
+- `cloud_gate.RetryableCloudFailure` (`interrupted`, `box-failed`) marks a retryable outcome. The worker returns `box-failed` on boot-error.json (after the final gate.log) or on `LogUploadFailed` from `validate_result`.
+- `run_cloud` counts box failures apart from Spot interruptions and takes the shared next-variant path up to `box_failure_retries=1` (config/cloud_gate.conf, after `spot_interruption_retries`). Then the local fallback names the box failure.
+- Accepted (review): a deadline during an upload retry; a deterministic box failure costs one more launch; the boot shell retries paired downloads. The signed URL in result.json `log_error` and the boot.log traceback is on main; aws repairs it.
+- Row 75b8c2eb9 on main d5d81400c. Tests in both layouts, 0 failures: 6 suites; types 0.
+
+### Phase 166 — The cloud gate worker polls AWS less  · status: done
+**Source:** builds, 2026-11-19 03:0x EST: "what polls, how often, and whether it can poll less". Each worker started four aws CLI processes every 2 s.
+
+#### As-built
+- `GateWorker.artifact_etags` lists `artifacts/<attempt>/` once per poll (`list-objects-v2`). gate.log downloads only on a new ETag; boot-error.json and result.json download only when listed.
+- Each poll: one `deadline_reached` flag at the top; the EC2 step (when due by `instance_check_s=30`, new key after `result_poll_s`, or at the deadline) in its own try keeps a stop result without raising; the S3 step in its own try reads boot-error.json, then result.json, then the progress log; then a kept EC2 outage error, then the kept stop (Spot code), then the time-limit result.
+- `_PollOutage` gives EC2 and S3 their own outage clocks (`observe_outage_s`). `TimeoutExpired` skips a step, as on main.
+- A running box costs one AWS CLI call per poll instead of four, plus a gate.log get per new ETag and an EC2 check every 30 s.
+- Accepted (review): a result published during the progress-log download at the deadline (main has the same window); a poll that crosses both the gate deadline and the attempt expiry; a list-only AccessDenied (the deploy probe checks `list-objects-v2`); one final gate.log get per gate.
+- Row dd4a56aae on the Phase 165 row 75b8c2eb9. Tests in both layouts, 0 failures: 6 suites; types 0.
+
+### Phase 167 — A verify.sh run outside a Cargo workspace holds no cargo target  · status: done
+**Source:** builds (from sdlc), 2026-11-19 04:1x EST: the disk floor sweep named pid 3179104 (devtools' consolecheck `verify.sh`, a Python-only suite) as the owner of the hana targets and about 230 others.
+
+#### As-built
+- Cause: the global Cargo config sets `build-dir = /build/paths{workspace-root}`. With no `Cargo.toml` at or above the cwd, `cargo_workspace_manifest` raised `FileNotFoundError`, and `workspace_targets` kept every target busy.
+- `cargo_target_config.NoCargoManifest(FileNotFoundError)` marks "no manifest in the cwd or a parent". `_cargo_manifest_exists` counts only a regular file after links; a FIFO or folder is skipped, and a dangling link stays unreadable.
+- `cargo_build_folder` keeps main's signature and looks up the manifest only for `{workspace-root}` and `{workspace-path-hash}`, so fixed paths resolve with no manifest.
+- `workspace_targets(..., verify_runner=)`: on `NoCargoManifest`, a verify.sh runner holds no workspace target; a cargo-nextest runner keeps every target busy, as on main. Other unreadable state keeps every target busy.
+- Row ee6d82130 on main 764582979. Tests in both layouts, 0 failures: 10 suites; types 0.
+
+### Phase 168 — One lint.conf key sets the /build disk floor  · status: done
+**Source:** builds, 2026-11-19 04:3x EST: natedev ruled that the /build floor should be 300 GiB, not `sweep_free_floor_percent=20` (733.3 GiB). The value change needs the user's go; this phase only adds the key at today's value.
+
+#### As-built
+- `BUILD_FLOOR_KEY = "sweep_build_floor_gib"`. `floor_setting_key(keys, base, host)` gives `<base>.<host>` when set, else `<base>`; `floor_bytes` (home floor) and `filesystem_floors` share it.
+- `filesystem_floors`: a filesystem other than the home disk uses `sweep_build_floor_gib[.<host>]` in GiB when set, else `sweep_free_floor_percent` x its size. A value that is not a live non-negative number is unusable.
+- lint.conf: `sweep_build_floor_gib.natedev=733.29` after `sweep_free_floor_percent`; 3.2 MiB above the old 20 percent byte floor (accepted in review). The 300 GiB change is `/tune lint sweep_build_floor_gib.natedev 300`, only on the user's go.
+- Row 116e24ea0 on main 764582979 (same tree as 96a8d6a67, which had no Change-Review line). Tests in both layouts, 0 failures: 11 suites; types 0.
+
+### Phase 169 — The disk floor sweep sends one notice for each holder, not one for each target  · status: done
+**Source:** builds, 2026-11-19 04:2x EST: one disk-floor.service pass (started 03:50:33) sent more than 200 session messages, one for each held target, about 9 s apart, and named pids 3179104 and 2149035 after they had ended. Other sweeps waited on its lock.
+
+#### As-built
+- The floor pass groups the holders that have a session by (session, pid) and sends one message per group: the target count, the total size and the largest paths that fit `sweep_message_limit`.
+- Each group send carries a delivery key from the pid, its start time (read from `/proc/<pid>/stat` with the holder) and the sorted target set, through `crossing_send_argv`. send.py keeps a delivered key, so the same holder with the same targets gets one notice; a new pid, start time or target set sends again.
+- Just before each send, the pass checks that the pid is the same live process; an ended holder gets no message.
+- The first line says the sweep removed idle build output only when the pass removed some; else it says it found none to remove.
+- Accepted (review): no hourly repeat for an unchanged holder (the asked rule); a repeat skip counts as told; path fit order in a long message; hard-link bytes shared across holders; one extra `/proc/<pid>/stat` read per pid on a recheck.
+- Row e9b059d52 on main 764582979. Tests in both layouts, 0 failures: 11 suites; types 0.
+
+### Phase 170 — Ten resources settings say what they do, their unit and their default  · status: done
+**Source:** builds, 2026-11-19 09:0x EST (user ask via natedev: settings must be reasonably documented), from the messaging unit's config doc audit.
+
+#### As-built
+- Comments only. `config/hana_instances.conf`: `exempt_ports`, `test_max_hours`, `unlabelled_max_minutes`, `stop_grace_seconds`. `config/lint.conf`: `clippy_fix_jobs`, `sweep_push_text_limit`, `sweep_holder_lookback_seconds`, `sweep_delete_stamp_grace_seconds`, `sweep_message_path_widths`, `sweep_message_limit`. No key name and no value changed.
+- Each comment gives what the reader does with the value, its unit, the limit form (less than or at most) and the shipped value or fallback.
+- The holder-notice text describes Phase 169: a notice lists only the largest paths that fit `sweep_message_limit`. So the row goes on the Phase 169 row.
+- Blind review: 6 findings, all fixed; closure check clean.
+- Row c0c1e5e07 on the Phase 169 row e9b059d52, branch `builds-resources-p170`. 28 modules, 1,798 tests, 0 failures.
+
+### Phase 171 — The build targets settings say what each key does, its unit and its default  · status: todo
+**Source:** builds, 2026-11-19 15:57 EST (user ask via natedev, low priority): document each undocumented key in the config files resources owns. Base main 90dc13663.
+**Scope:** `config/build_targets.conf` only: `pinned_targets`, the `kind`/`platform`/`settings` target groups, the `sync.*` timeouts and the `loopback.*` keys. Phase 170 did `hana_instances.conf` and ten `lint.conf` keys; `rust_roots.txt` and the `[sweep]` section have comments.
+
+#### Work Order
+Comments only: what the value controls, its unit, and its default or fallback, from each key's reader. No key name, value or order changes. Prompt: the unit folder `phases/171/prompt.txt`. Workers: impl writes, review2 reviews blind. Tests wait for natemerge's word (user test hold).
+
+### Phase 172 — The sweep floor tests set their own floor values  · status: done
+**Source:** builds, 2026-11-19 16:49 EST: base red on main a2d0e6eb6. The natedev subcase of `test_secondary_floor_uses_configured_floor_and_groups_each_device` read the live `sweep_build_floor_gib.natedev`; the user's 300 GiB value made it red.
+
+#### As-built
+- Row `7208538bb` on main `a2d0e6eb6`, branch `builds-resources-p172b`; `scripts/lint/test_sweep.py` only. No config change.
+- The natedev subcase writes `sweep_build_floor_gib.natedev=733.29` and expects it. The two Mac floor tests set `free_floor_gib=100`. The phone rearm test sets `sweep_phone_rearm_gib=5`.
+- Module test: 368 tests pass with both layouts.
+- Blind review: 6 findings; 2 fixed in the row; 4 go to the next phase (growth alert keys, message limits, `sweep_proc_locks_reads`, `sweep_dep_info_head_bytes`).
+
+### Phase 142b — Mac clippy fixes, part 2 (item 142)  · status: todo
+**Source:** builds 2026-11-21 08:49 EST; List item 142, producer bob. verify handed it over at 08:50. Base: 43h tip `736dd5f62` (branch `verify-cargo-token-3`); merge the new 43h tip once. Work order: verify `phases/fix_steps/part2_work_order.md`; interfaces: verify `phases/44u/contract.md` sections 2, 5.3, 6.
+
+#### Work Order
+1. Verify captures one `CallerLintPolicy` (new `scripts/lint/caller_lint_policy.py`) and passes it with `--caller-lint-policy-file` to every remote lint step: held lint, clippy --fix, the post-fix judgment (43z F009).
+2. A skipped check is a `skipped_checks` entry and never a reusable pass (`runner_result.py`: `ResultWord` skipped, `UsableRunnerResult.skipped_checks`, decoded once in `read_result`).
+3. One Clippy pass limit and progress rule in `invoke.sh`; Verify keeps host formatting and admission.
+4. A Mac fix runs only in rewrite mode, for a repairable finding in the held path.
+5. Busy fallback releases the Mac attempt at placement, reservation and runner return.
+
+### Phase 173 — No test depends on a live tuned value (item 149)  · status: in progress
+**Source:** List item 149, producer bob, go 2026-11-19 17:06 EST through builds. Base main b4e705f34. Same class as the 2026-11-16 order ("fix the class, not the instance").
+
+#### Work Order
+1. In a test run, `write_config_fixture` and `config_environment` (`scripts/lint/memory_test_support.py`) give each inherited numeric key with a `# whole:` or `# range:` bound a different value inside that bound. A test's own settings stay as written.
+2. A failing test prints the shifted keys that it read.
+3. Add a wide bound line to each true quantity among the 39 numeric keys with no bound. Values do not change. Identifiers stay unbound and unshifted.
+4. Repair `test_sweep.py` F002, F004, F005, F006.
+5. One full suite run on natemerge's word gives the offender count and the added time. Repair the offenders in this phase.
+6. bob gets the bound list, the offender count, the added time (tell him before the merge if over 1%) and the time on main.
+
+### Phase 177 — The folder audit never scans or removes a home folder  · status: done
+**Source:** builds, URGENT, 2026-11-19 20:24 EST. The audit removed top-level home folders on natedev (11-17) and on the Mac (11-18, 11-19). Row `e59e277e4` on main `f5eb6c184`.
+
+- Scan roots are `/tmp`, `/tmp/claude` and `TMPDIR` only. `checked_scan_roots` refuses `/`, `$HOME` and each ancestor of `$HOME` with a hard error.
+- A folder counts as a clone only with a maker record. The Mac `~/nixos` removal at 0.6 days came from the `.git` rule: a `.git` folder counted as a clone and got the 4-hour clone limit.
+- `copies.py` records `clone_path` in the scratch clone record.
+- A test runs the real scan-root list of `main()` against a fixture home.
+- Row tests: 4 modules, both layouts, green. Blind review: 7 findings, all repaired.
+- The audit stays off. Re-arm needs the fix on main and nate's word.
+
+### Phase 143s — The ~/worktrees settings row (item 143)  · status: done
+**Source:** builds, 2026-11-20 10:35 EST: the merge checkpoint needs a review trial line for settings commit `1c76e231d`. nate approved the two values via bob (2026-11-19 about 20:10 EST) and gave natemerge his direct yes (2026-11-20).
+
+- `settings.json`: `permissions.additionalDirectories` and `sandbox.filesystem.allowWrite` name `~/worktrees` beside `~/rust`.
+- Read-only review: 0 findings. On main `168cedb541` as `24e9e2013` (bb12).
+
+### Phase 180 — AWS local folder removal under the item 152 rules  · status: done
+**Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Row `5b283887e` in batch bb181f on main `cfa095c714`.
+
+- `gate_box.py` resets and cleans only the exact `<GATE_BOX_DIR>/<variant>` checkout, with no link in its path.
+- `gpu_size_trial.py` keeps earlier trials with the kept line and removes only below the current run folder. `remove_path` refuses a directory where the payload expects a file.
+- `teardown.py` `remove_gate_images` removes only a direct, unlinked `gate-image` child of the state directory.
+- A GPU run that did not start keeps its real refusal reason: with no `manifest.json`, the input removal is skipped.
+- Cloud deletions do not change: their authority is the cloud resource id.
+
+### Removals to arm again (item 152)
+Each removal below is off until the bubblewrap proof is on main and nate gives his word (nate, 2026-11-19 20:42 EST). Until then, the folders stay on disk for a manual removal with `removal_guard.py remove --list <file> --sha256 <hash>`.
+
+1. Phase 178: the tmp sweep, the build sweep (`sweep.py`) and `gate_folders_delete.py` write a list and remove nothing.
+2. Phase 177: the folder audit stays off.
+3. Phase 181: six sites keep a folder from an earlier run and print the kept line (merge gate recovery, the Mac lint-copy return, Hana shot shutdown, scratch task end, selection capture, session end).
+4. Phase 180: `gpu_size_trial.py:460` `new_trial` keeps earlier trial folders. At the re-arm it removes them again, with a marker file check that prepare writes (aws, 2026-11-20 10:15 EST; bob, 10:16 EST).
+5. The masked timers: disk-floor, tmp sweep, folder-audit, transcript-retention, tmpfiles-clean.
+6. Phase 185 (bob, 2026-11-21 09:11 EST): the Mac lint-copy close removes a copy when the caller gives the allocation id that the copy's claim wrote. Today the close needs the claim in memory, and the verify helper loses it, so live runs keep about 2 copies each (about 325 MB each, under `<target>/package`).
+
+### Phase 178 — One removal guard: the guard and the sweeps (item 152)  · status: done
+**Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Row `c29ac97f5` in batch bb181f on main `cfa095c714`.
+
+- The tmp sweep, the build sweep and `gate_folders_delete.py` write a removal list and remove nothing by themselves.
+- `removal_guard.py remove --list <file> --sha256 <hash>` removes an approved list, and only folders of the five `/build` forms. A live build keeps its folder.
+- Scratch lists external Cargo output for review. The folder audit reports no space freed when it only lists output.
+- The bubblewrap (Linux) and sandbox-exec (Mac) proofs show that nothing outside the forms can go.
+
+### Phase 174 — Build folders track A: the form API and the worktree tool (item 143)  · status: in progress
+
+Source: bob accepted plan version 2 of item 143 at 17:54 EST 2026-11-19; the plan is `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/item143/plan.md`. Rules: `~/rust/hanadocs/bob/designs/build-folders/rules.md`.
+
+Work Order:
+1. Part 1: the form API in `scripts/lib/build_folders.py` and the new keys in `config/build_folders.conf`.
+2. Part 2: `worktrees.py make <repo> <unit> <short-name>`, the `target` link, the cargo front repair and rule 20 check, removal (rule 27), retirement (rule 28), the unit name checks, the three other makers.
+3. Part 3: the worktree move pass, old-path links, the staff path update, the transcript check, the settings lines.
+4. The main worktree of a unit or a style production has the short name `worktree` (`~/worktrees/<repo>/<unit>/worktree`, branch `<unit>-worktree`). It replaces `director` and `production`. nate, via bob, 21:54 and 21:56 EST 2026-11-19.
+
+### Phase 175 — Build folders track B: copies, the 2-day pass and the slot keys (item 143)  · status: in progress
+
+natest answered 17:59 EST (no conflict, bob reading). Work Order: plan section 6, track B, and the stall watch interface agreed with devtools 18:04 EST.
+
+### Phase 176 — Build folders track C: the other makers and the path lookups (item 143)  · status: in progress
+
+Work Order:
+1. Part 1: the call map (read-only).
+2. Part 2: the code of V6 and V13 and the path lookups of plan section 4a item 9, on the part 1 API.
+
+### Phase 181 — The five worst removal sites refuse a path outside their own form (item 152)  · status: done
+**Source:** bob, item 152, 2026-11-19 21:03 EST; the five most severe sites of the 178 removal survey. Row `1f4c4a055` on main `f5eb6c184`.
+
+- Merge gate recovery, the Mac lint-copy return, Hana shot shutdown, scratch task end and selection capture each remove only a path of their own written form. None removes after a failed check.
+- Each site keeps a folder from an earlier run and prints `kept for a manual removal list: <path> (<tool>, <reason>)`. `scratch.end` returns `list[KeptFolder]`; a remote check returns `RemoteKeptFolder`.
+- The gate recovery entry stays until the folder and its lease files are gone. Kept Hana records move to `launches/retained/` and never select a process to signal.
+- A failed publication in `copies.py` removes only the folder that the same process made.
+- Fixtures clear inherited `GIT_*`, `RIPGREP_CONFIG_PATH`, `STAFF_CONFIG`, `BASH_ENV`, `CARGO_TARGET_DIR` and `COPIES_*`, and use a private home, config and session root.
+- Row tests: 54 modules, both layouts, 108 of 108 green. Reviews: blind review, 7 closure reviews, 8 repairs.
+
+### Phase 181m — Phase 181 merge test 1: two tests expect a removal that 181 keeps (item 152)  · status: done
+**Source:** builds, bb8 result 2026-11-20 03:17 EST. Row `67163d9b6` on main `740aae528` replaces `1f4c4a055`.
+
+- The worker scratch folder and the old Mac mirror checkout are kept and listed: a later process ends them. The turn-end and old-mirror tests expect the kept folder, its contents, its end record and the exact notice.
+- The worker turn-end hook puts each kept folder in its completion details, because the native hook child discards stderr.
+- The Mac fixture uses a private `HOME`, `XDG_CONFIG_HOME` and `SCRATCH_VISIBLE_ROOT`. The gate fixture keeps natest 385's tmpfs parent and `pin_gate_root` with 181's private Git environment.
+- Row tests: 57 modules, both layouts, 114 of 114 green. Reviews: 3 closure reviews, 2 fixes and 1 rebase.
+- Fix 2, `e918e5312` in batch bb181f on main `cfa095c714`: the close hook fixture renames its status file with Python `os.replace`. Under zsh the fixture PATH has no `mv`, so the bb15 Mac gate test waited until the module limit.
+
+### Phase 182 — The AWS cost history backup (item 165)  · status: in progress
+**Source:** builds, 2026-11-20 11:44 EST (List item 165, producer bob). Plan accepted 11:47 EST with three conditions: no secret file in the backup, config keys for the paths, the interval and the Mac folder, and the nixos timer text goes to builds.
+
+- `scripts/backup/state_backup.py run` copies the approved files under `~/.local/state/build-targets/aws` to the Mac folder `~/backups/natedev/aws-state`, only when a file changed. A secret pattern in any file refuses the run. The Mac checks the sha256 of each copy.
+- `restore` unpacks one copy into an empty scratch folder only. Nothing deletes a copy.
+- One alert on a failed run. The nixos timer text is in `docs/as-built/state-backup.md`; it goes to builds with the hash.
+- Until the timer is live, one manual copy each day.
+
+### Phase 183 — A failed crate checkout check keeps the removal notice (phase 174 F027)  · status: in progress
+**Source:** phase 174 closure review F027, moved to a follow-up by the builds landing rule (2026-11-20 17:04 EST). builds 18:27 and 18:34 EST: take F027 while the merges run.
+
+- `crate_run.py` `complete_run` saves `removal_reported` before `worktrees.remove_git_checkout` checks the checkout. A failed check then suppresses the next notice.
+- The order becomes: check, save, then print. A failed check saves nothing, so the next run reports again.
+- The phase stacks on the phase 174 commit. It moves onto main with phase 174.
+
+### Phase 184 — Mac gate close follow-ups (181m F005, F006, F007)  · status: done
+**Source:** phase 181m fix reviews, 2026-11-20 22:19 EST. builds 22:31 EST: take F005, F006 and F007 as one phase on top of `376413140` while bb15 merges.
+
+- F005: with no Mac close script, the fallback reports removed only when the checkout is gone on the Mac.
+- F006: a natedev pass that already looks at its Mac mirrors unregisters a Mac gate checkout that the Mac confirms is gone.
+- F007: the old-result removed paths unregister once; the receipt keeps only kept folders.
+- No automatic deletion, no timer and no config change (item 152).
+
+### Phase 143r — Item 143 restack: merge main into phases 174 and 183  · status: todo
+**Source:** builds, 2026-11-20 23:21 EST: the 143 hash (174 and 183) goes in the batch after bb16.
+
+- One merge of main `aacad65c6` into `f86816c9b`. It resolves the conflicts in `add_unit.py`, `test_verify_doc_checkout.py` and `test_slot_order.py`.
+- The commit holds the bb15 rows 178 and 181 under it, so it lands after bb15.
+
+### Phase 185 — return-copy works for a run that crosses an update (item 152 live issue)  · status: in progress
+**Source:** builds, 2026-11-21 09:00 EST: run 20261121T084352-3507509-bef1 started on the old `verify.sh` and failed on the new `return-copy` (`--allocation-id` required). bob 09:11 EST: no removal by the id on disk.
+
+- `return-copy` without `--allocation-id` (a caller from before the update) returns the changes, keeps the copy and prints the manual list line.
+- The close stays as on main: it removes only a copy that the in-process claim list holds.
+- The removal by the allocation id on disk joins the removals to arm again, after the bubblewrap proof and nate's word.
+- `docs/as-built/removal-by-hand.md` (bob, 2026-11-21 09:25 EST): the procedure for a removal by hand. Four checks, one yes per path, one record line per removal. It applies after nate answers who gives the yes; the hold of 09:19 EST stays until then.
+
+### Phase 186 — a live lint run keeps its lint-copy claim (item 152)  · status: in progress
+**Source:** builds, 2026-11-21 09:25 EST (go after the 143 row). Stacked on phase 185 `bc157b8eb`.
+
+- In live runs since 08:57 EST, every lint copy was kept, even with no source change during the run. The copy is taken, the run waits for memory admission, and the drop then finds no claim in memory.
+- Find the cause by test through `verify_helper.py` with the real call sequence. Fix it at the cause, so the claim survives between helper calls in one run.
+- No new removal path, no removal by an id on disk, no config change.
+
+### Phase 143z — The move pass keeps numbered build copies (item 143)  · status: in progress
+**Source:** resources, 2026-11-21 14:01 EST, from the live dry run on main e0a5e1e082: the pass plans to move the new-model copies /build/hana/hana-merges/1 and /2 (in use) to ~/worktrees/hana/errors/p1 and p2. Built on main merged with 143w-b, so both go on the line as one row.
+**Merge line:** `9c6dc62959` (branch builds-resources-143z-m6401) in batch bb143y, sent 2026-11-21 19:27 EST. Not on main yet.
+
+- `_migration_skip` keeps every numbered copy that `build_folders` knows; legacy /build/claude/scratch worktrees still move.
+
+### Phase 143u — Remote verify runs use one script version (item 143)  · status: todo
+Source: 143y F001 and an Astra review (2026-11-21 15:24). 143y pins the natedev side only.
+- Bind the run's script snapshot once to a remote executor for each host. Every run-owned SSH command and rsync receiver goes through it.
+- The Mac gate gets the placement identity as structured data over the natedev transport, not as caller text.
+- Reserve the snapshot folder inside the existing mirror, safe from `rsync --delete` and from source comparison.
+- Settlement runs without the remote copy, and keeps the claim until the process check confirms settlement.
+- No new Mac folder, no Mac setting change, no new removal tool.
+
+### Phase 143v — A cleanup failure never reads as a failed test (item 143)  · status: in progress
+Source: builds 2026-11-21 14:30, from the lfo 44eu trace.
+**State:** bullets 1-3 and 5 reviewed (PASS) in commit `74a9821df6` on main 6401c0f801. The affected tests run after the full test hold ends. Bullet 4 waits for bb143y on main.
+- `build_folders.py` remove prints the cause when it fails; today line 2161 returns 1 with no message.
+- `verify.sh` finish_tree_watch writes the pass record first. It then reports a cleanup failure on its own line, with its own status.
+- Tests: a removal that fails after a passed run keeps the pass record and prints the cleanup cause.
+- 143y F017: an attached run that is cancelled can lose the retention notice in the tee pipe (verify.sh:469, :4430, :4565). Write the notice so the cancellation cannot drop it.
+- The cleanup message names the cause, for example a lock lost after a script install during the run, so units see a false fail for what it is. Cases: lfo 44eu and hana inspectors v20261121T181454-174488-6851 (step 0, call 1).
+
+### Phase 143y — One script version for each verify.sh run (item 143)  · status: in progress
+**Merge line:** `87c3742af4` (branch builds-resources-143y-m355) in batch bb143y, sent 2026-11-21 18:01 EST. Not on main yet.
+**Source:** builds, 2026-11-21 13:48 EST: a verify.sh run queued before the 13:39 install of 143 called the new copies.py with the old `--capacity-file` argument and failed; hana's g45 suite lost its queue place. Cause: verify.sh keeps its own text but runs helpers from the live `~/.claude/scripts`.
+
+- verify.sh copies `scripts/` at the installed commit into a folder the run owns, then runs itself and every helper from that copy.
+- The run that owns the copy removes it when it ends; a detached run takes the ownership.
+- A dirty scripts tree or a failed copy runs as today and prints one line.
+
+### Phase 143x — Repair the bb143 gate red (item 143)  · status: todo
+**Source:** builds, 2026-11-21 13:00 EST: bb143 red; 4 modules are 143's (test_aws_trial guest, test_doc_routing, test_disks_page, test_perform_deletion_rerun). Repair on a merge of main 94e07d22c4 into the 143 tip.
+
+### Phase 143w — Restore the worktree short name in the move pass and add_style (item 143)  · status: todo
+**Source:** resources, 2026-11-21 11:40 EST, from the switch dry run of `f91a74ef81`: the migration fallback names 37 unit worktrees `director`, and `add_style.py` still uses `production`. nate (via bob, 2026-11-19 21:54 and 21:56 EST): `worktree` replaces both.
+
+- One name, `worktrees.UNIT_WORKTREE_NAME`, for the migration fallback and for style productions (path, output, new branch `<style>-worktree`). Existing branches keep their names.
+- Tests and as-built lines follow. Proof: the switch dry run shows no `/director` move.
+
+### Phase 187 — test_target_availability writes its own build_targets.conf  · status: in progress
+**Source:** builds, 2026-11-21 10:34 EST: verify found that `scripts/build_queue/test_target_availability.py` reads `build_targets.conf` from HOME on main `262952c406`, so it fails in a private home.
+
+- Each test writes its own fixture config (phase 147 rule). Proof: the module passes with an empty private HOME.
+
+### Phase diskred — test_disk ignores the host SCCACHE_DIR  · status: done
+**Source:** builds, 2026-11-21 19:50 EST: base red at `scripts/buildlog/test_disk.py:730`. On main `4ab2262145` (bbfast, 22:12 EST) as `9b98021e11`.
+
+- `setUp` removes `SCCACHE_DIR`, so `snapshot()` never scans the host cache. Proof: the module passes all 26 tests.
+
+### Phase runcap — At most 2 claude_commands runs on natedev  · status: in progress
+**Source:** nate via bob via builds, 2026-11-21 20:04 EST (fast-track). Branch builds-resources-runcap `3b7c9d38fc` (with the runcapfix repair); line row bbruncap, first after the restart.
+
+- `max_runs.natedev.claude_commands=2` in `build_admission.conf`. natemerge runs count, and are never held (`max_runs_exempt_unit=natemerge`).
+- A run held only by the limit never holds other work.
+- runcapfix (bbfast red, 21:52 EST): a legacy gate profile path maps to the Git repository name.
+
+### Phase runcap2 — Gate test runs go through admission  · status: in progress
+**Source:** builds, 2026-11-21 20:25 EST: `gate.py --tests-only --module` skips admission. Commit `f02d4d2e66` (reviewed, not pushed). Its tests run after the full test hold ends.
+
+### Phase runhana — One run limit reader for every repository  · status: in progress
+**Source:** nate via bob via builds, 2026-11-21 21:28 EST. Built on runcap.
+
+- One reader for all `max_runs.*`; a whole number, 0 or more; 0 means no run starts.
+- Gate steps count while they hold a reservation. Cargo steps count from the run start to the run end; one `verify.sh` call is one run.
+- A step of a started run never waits behind a row held only by its own limit.
+- Out of scope: other repositories' values, the Mac part, exceptions.

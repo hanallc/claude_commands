@@ -12,6 +12,7 @@ import tempfile
 from typing import BinaryIO, cast, override
 import unittest
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.agents.detached_runs import RunRecord
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -19,6 +20,7 @@ from scripts.lib import process_start
 
 
 DIRECT = Path(__file__).resolve().parent
+BUILD_FOLDERS = DIRECT.parent / "lib" / "build_folders.py"
 
 
 class VerifyHelperTests(unittest.TestCase):
@@ -55,6 +57,7 @@ if __name__ == "__main__":
 
     def start_helper(self) -> subprocess.Popen[bytes]:
         process = subprocess.Popen([sys.executable, str(DIRECT / "verify_helper.py")],
+                                   env=verify_test_environment(),
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(self.stop_helper, process)
         return process
@@ -64,10 +67,14 @@ if __name__ == "__main__":
             process.kill()
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
-    def encode(self, value: str, text: str, *arguments: str, directory: Path | None = None) -> bytes:
-        environment = {**os.environ, "VALUE": value}
-        _ = environment.pop("LEAK", None)
-        fields = [str(self.program), str(directory or self.root), str(len(arguments)), *arguments,
+    def encode(self, value: str, text: str, *arguments: str, directory: Path | None = None,
+               program: Path | None = None, temporary: Path | None = None) -> bytes:
+        environment = {**verify_test_environment(), "VALUE": value}
+        if temporary is not None:
+            # A build_folders call reads its settings from an empty folder, not from the live home.
+            environment["TMPDIR"] = str(temporary)
+            environment["CONF_DIR"] = str(temporary)
+        fields = [str(program or self.program), str(directory or self.root), str(len(arguments)), *arguments,
                   *(f"{name}={value}" for name, value in environment.items()), "", text, ""]
         return b"\0".join(os.fsencode(value) for value in fields) + b"\0"
 
@@ -79,12 +86,22 @@ if __name__ == "__main__":
         return self.reply(process)
 
     def reply(self, process: subprocess.Popen[bytes]) -> tuple[int, dict[str, object], str]:
+        status, output, errors = self.text_reply(process)
+        if not output:
+            self.fail(errors)
+        return status, cast(dict[str, object], json.loads(output)), errors
+
+    def text_reply(self, process: subprocess.Popen[bytes]) -> tuple[int, str, str]:
         assert process.stdout is not None
-        replies = list(map(self.read_field, (cast(BinaryIO, process.stdout),) * 3))
-        if not replies[1]:
-            self.fail(replies[2])
-        decoded = cast(dict[str, object], json.loads(replies[1]))
-        return int(replies[0]), decoded, replies[2]
+        status, output, errors = map(self.read_field, (cast(BinaryIO, process.stdout),) * 3)
+        return int(status), output, errors
+
+    def build_folders_request(self, process: subprocess.Popen[bytes], temporary: Path,
+                              *arguments: str) -> tuple[int, str, str]:
+        assert process.stdin is not None
+        _ = process.stdin.write(self.encode("", "", *arguments, program=BUILD_FOLDERS, temporary=temporary))
+        process.stdin.flush()
+        return self.text_reply(process)
 
     def read_field(self, source: BinaryIO) -> str:
         value = bytearray()
@@ -144,6 +161,49 @@ def main():
                 status, output, errors = self.request(process, "second", "", "newer")
                 self.assertEqual((status, output, errors), (0, dict(value="new"), ""))
 
+    def test_a_tool_folder_from_an_unloaded_tree_can_be_removed(self) -> None:
+        # verify.sh creates its tree-watch folder through the helper and removes it after the run.
+        # A changed source between the two calls drops the module that created the folder.
+        temporary = self.root / "tmp"
+        temporary.mkdir()
+        process = self.start_helper()
+        status, output, errors = self.build_folders_request(
+            process, temporary, "tool", "--tool", "verify-tree", "--owner-pid", str(os.getpid()))
+        self.assertEqual((status, errors), (0, ""))
+        folder = Path(output.strip())
+        self.assertTrue(folder.is_dir())
+        status, _, _ = self.request(process, "load", "", "pid")
+        self.assertEqual(status, 0)
+        replacement = self.program.with_suffix(".new")
+        _ = replacement.write_text(self.program.read_text() + "# changed\n")
+        os.replace(replacement, self.program)
+        status, output, errors = self.build_folders_request(process, temporary, "remove", str(folder))
+        self.assertEqual((status, output, errors), (0, "", ""))
+        for path in (folder, folder.with_name(folder.name + ".lock"), folder.with_name(folder.name + ".lease.json")):
+            with self.subTest(path=path.name):
+                self.assertFalse(path.exists())
+
+    def test_a_tree_update_rebinds_a_namespace_package_member(self) -> None:
+        # A namespace package has no source file, so it stays loaded across a tree update.
+        package = self.root / "fixturens"
+        package.mkdir()
+        _ = (package / "base.py").write_text("OLD = 'old'\n")
+        self.program = self.root / "namespace_program.py"
+        _ = self.program.write_text('''import json, os, sys
+from pathlib import Path
+def main():
+    from fixturens import base
+    if sys.argv[1:] == ["update"]:
+        package = Path(__file__).parent / "fixturens"
+        (package / "base.py.new").write_text("OLD = 'old'\\nNEW = 'new'\\n")
+        os.replace(package / "base.py.new", package / "base.py")
+    print(json.dumps(dict(value=getattr(base, "NEW", base.OLD))))
+    return 0
+''')
+        process = self.start_helper()
+        self.assertEqual(self.request(process, "first", "", "update"), (0, dict(value="old"), ""))
+        self.assertEqual(self.request(process, "second", "", "read"), (0, dict(value="new"), ""))
+
     def test_two_requests_in_one_write_each_get_a_reply(self) -> None:
         process = self.start_helper()
         assert process.stdin is not None
@@ -154,6 +214,39 @@ def main():
                 status, output, _ = self.reply(process)
                 self.assertEqual(status, 0)
                 self.assertEqual((output["value"], output["stdin"], output["args"]), (value, text, [text]))
+
+    def test_an_exit_at_import_returns_the_fallback_and_keeps_the_helper_ready(self) -> None:
+        exiting = self.root / "exit_at_import.py"
+        imports = self.root / "imports"
+        _ = exiting.write_text(f"with open({str(imports)!r}, 'a') as imports:\n    imports.write('import\\n')\n"
+                               + "raise SystemExit(3)\ndef main():\n    return 0\n")
+        process = self.start_helper()
+        assert process.stdin is not None and process.stdout is not None
+        for attempt in ("first", "second"):
+            with self.subTest(attempt=attempt):
+                _ = process.stdin.write(self.encode("exit", "", program=exiting))
+                process.stdin.flush()
+                self.assertEqual(self.read_field(cast(BinaryIO, process.stdout)), "fallback")
+                _ = [self.read_field(cast(BinaryIO, process.stdout)) for _ in range(2)]
+        # The second call uses the recorded fallback and does not import the module again.
+        self.assertEqual(imports.read_text(), "import\n")
+        status, output, _ = self.request(process, "after", "")
+        self.assertEqual((status, output["value"]), (0, "after"))
+
+    def test_each_call_starts_with_the_default_context_value(self) -> None:
+        self.program = self.root / "context_program.py"
+        _ = self.program.write_text('''import json
+from contextvars import ContextVar
+calls: ContextVar[int] = ContextVar("calls", default=0)
+def main():
+    print(json.dumps(dict(calls=calls.get())))
+    calls.set(calls.get() + 1)
+    return 0
+''')
+        process = self.start_helper()
+        for value in ("first", "second"):
+            with self.subTest(value=value):
+                self.assertEqual(self.request(process, value, ""), (0, dict(calls=0), ""))
 
     def test_nonzero_exit_keeps_its_status_and_output(self) -> None:
         process = self.start_helper()
@@ -180,37 +273,75 @@ VERIFY_START_DIR=$1; PY=$2
 verify_helper --start
 export FIXTURE_SPACE='one two' FIXTURE_EQUALS='one=two=three'
 export FIXTURE_NEWLINES=$'one\ntwo\n' FIXTURE_EMPTY=''
+export complete='caller complete' exported='caller exported' input='caller input' entry='caller entry'
 export FIXTURE_UNSET
 declare -ax FIXTURE_ARRAY=(one two)
 declare -Ax FIXTURE_MAPPING=([one]=two)
+fixture_function() { :; }
+export -f fixture_function
 env -0 > "$4/environment"
 env() { return 91; }
 verify_helper "$3"
 compgen() { return 1; }
-verify_helper "$3" > "$4/fallback-environment"
+verify_helper_environment='caller array name' verify_helper "$3" > "$4/env-without-compgen"
 unset -f compgen
+(unset VERIFY_HELPER_INPUT input entry; verify_helper "$3") > "$4/fallback-environment"
 FIXTURE_EXECUTION=next verify_helper "$3" > "$4/next-environment"
 '''
         result = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), sys.executable,
-                                 str(self.program), str(self.root)], capture_output=True, text=True,
+                                 str(self.program), str(self.root)],
+                                 env={**verify_test_environment(), "inherited-key": "caller"}, capture_output=True, text=True,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = dict(entry.split("=", 1) for entry in
                         (self.root / "environment").read_text().split("\0") if entry)
+        self.assertIn("BASH_FUNC_fixture_function%%", expected)
+        self.assertEqual(expected["inherited-key"], "caller")
         actual = cast(dict[str, str], json.loads(result.stdout))
         # Bash sets this entry to each external command's path.
         _ = expected.pop("_", None)
-        _ = actual.pop("_", None)
-        self.assertEqual(actual, expected)
+        helper_expected = {name: value for name, value in expected.items()
+                           if name not in ("BASH_FUNC_fixture_function%%", "inherited-key")}
+        self.assertEqual(actual, helper_expected)
+        without_compgen = cast(dict[str, str], json.loads((self.root / "env-without-compgen").read_text()))
+        self.assertEqual(without_compgen, {**helper_expected, "verify_helper_environment": "caller array name"})
         fallback = cast(dict[str, str], json.loads((self.root / "fallback-environment").read_text()))
         self.assertEqual(fallback.pop("FIXTURE_EXECUTION"), "local")
         _ = fallback.pop("_", None)
-        self.assertEqual(fallback, expected)
+        self.assertEqual(fallback, {name: value for name, value in expected.items() if name not in ("input", "entry")})
         following = cast(dict[str, str], json.loads((self.root / "next-environment").read_text()))
         self.assertEqual(following.pop("FIXTURE_EXECUTION"), "next")
-        _ = following.pop("_", None)
-        self.assertEqual(following, expected)
-        self.assertEqual(self.program.with_suffix(".py.calls").read_text(), "helper\nlocal\nnext\n")
+        self.assertEqual(following, helper_expected)
+        self.assertEqual(self.program.with_suffix(".py.calls").read_text(), "helper\nhelper\nlocal\nnext\n")
+
+    def test_failed_or_truncated_environment_leaves_the_helper_ready(self) -> None:
+        env = self.root / "env"
+        _ = env.write_text("#!/bin/sh\nprintf 'VALUE=wrong\\000partial'\nexit \"$FIXTURE_STREAM_EXIT\"\n")
+        env.chmod(0o755)
+        script = shell_functions(DIRECT / "verify.sh", "verify_helper") + r'''
+set -e
+VERIFY_START_DIR=$1; PY=$2
+verify_helper --start
+compgen() { return 1; }
+verify_helper "$3" pid
+for status in 1 0; do
+    PATH="$4:$PATH" VALUE=caller FIXTURE_STREAM_EXIT="$status" verify_helper --stdin "$3" "$status" <<< 'fixture input'
+done
+verify_helper "$3" pid
+'''
+        result = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), sys.executable,
+                                 str(self.program), str(self.root)], env=verify_test_environment(),
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        before, failed, truncated, after = result.stdout.splitlines()
+        self.assertEqual(before, after)
+        for status, reply in (("1", failed), ("0", truncated)):
+            with self.subTest(status=status):
+                decoded = cast(dict[str, object], json.loads(reply))
+                self.assertNotEqual(decoded["pid"], int(before))
+                self.assertEqual(decoded["value"], "caller")
+                self.assertEqual(decoded["stdin"], "fixture input\n")
+                self.assertEqual(decoded["args"], [status])
 
     def test_shell_recovers_after_helper_death_and_keeps_shell_fixtures(self) -> None:
         shell = self.root / "shell-fixture"
@@ -267,7 +398,8 @@ fi
 '''
                 result = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), str(runner),
                                          mode, str(self.program), str(shell), str(TEST_HANG_GUARD_SECS),
-                                         str(os.getpid()), str(record)], capture_output=True,
+                                         str(os.getpid()), str(record)],
+                                         env=verify_test_environment(), capture_output=True,
                                         text=True, timeout=TEST_HANG_GUARD_SECS)
                 if mode == "death":
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -318,7 +450,7 @@ verify_helper --start
 verify_helper "$3" pid
 '''
         caller = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), sys.executable,
-                                 str(self.program)], capture_output=True, text=True,
+                                 str(self.program)], env=verify_test_environment(), capture_output=True, text=True,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(caller.returncode, 0, caller.stderr)
         self.assertGreater(int(caller.stdout), 0)

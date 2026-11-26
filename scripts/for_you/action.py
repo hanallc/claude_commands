@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,8 @@ from uuid import UUID, uuid4
 from scripts.lib import atomic_file, file_lock
 
 ActionStatus = Literal["open", "done", "withdrawn"]
+ActionCompletion = Literal["manual", "automatic"]
+REVIEW_PATH = "/console/review.html"
 
 
 class ActionStoreError(ValueError):
@@ -23,7 +26,11 @@ class ActionStoreError(ValueError):
 
 def actions_folder() -> Path:
     """Return the action folder selected by FOR_YOU_ACTIONS_DIR."""
-    return Path(os.environ.get("FOR_YOU_ACTIONS_DIR", "~/.local/state/for-you/actions")).expanduser()
+    folder = Path(os.environ.get("FOR_YOU_ACTIONS_DIR", "~/.local/state/for-you/actions"))
+    try:
+        return folder.expanduser()
+    except RuntimeError as error:
+        raise ActionStoreError(f"Cannot expand the action folder {folder}: {error}") from error
 
 
 def action_id(key: str) -> str:
@@ -56,7 +63,7 @@ class UserAction:
     created_at: str
     updated_at: str
     completed_at: str = ""
-    completion: Literal["manual"] = "manual"
+    completion: ActionCompletion = "manual"
     evidence: str = ""
     withdraw_reason: str = ""
 
@@ -72,7 +79,7 @@ class UserAction:
                 raise ActionStoreError(f"{name}: provide a value.")
         if not Path(self.cwd).is_absolute():
             raise ActionStoreError("cwd: provide an absolute path on the target machine.")
-        if self.status not in ("open", "done", "withdrawn") or self.completion != "manual":
+        if self.status not in ("open", "done", "withdrawn") or self.completion not in ("manual", "automatic"):
             raise ActionStoreError("Unsupported action status or completion method.")
         created, updated = self._time(self.created_at), self._time(self.updated_at)
         if updated < created:
@@ -114,7 +121,7 @@ class UserAction:
                    text_fields["cwd"], text_fields["requested_by"], text_fields["reason"], text_fields["waits"],
                    text_fields["concerns"], text_fields["dedupe_key"], cast(ActionStatus, text_fields["status"]),
                    text_fields["created_at"], text_fields["updated_at"], text_fields["completed_at"],
-                   cast(Literal["manual"], text_fields["completion"]), text_fields["evidence"], text_fields["withdraw_reason"])
+                   cast(ActionCompletion, text_fields["completion"]), text_fields["evidence"], text_fields["withdraw_reason"])
 
 
 @dataclass(frozen=True)
@@ -123,15 +130,21 @@ class ActionStore:
 
     folder: Path = field(default_factory=actions_folder)
 
-    def list(self) -> tuple[UserAction, ...]:
+    def list(self, *, watch: Callable[[Path], None] | None = None) -> tuple[UserAction, ...]:
         """Read every retained action or report the damaged source."""
+        if watch is not None:
+            watch(self.folder)
         try:
             paths = sorted(path for path in self.folder.iterdir() if path.suffix == ".json")
         except FileNotFoundError:
+            if watch is not None and (self.folder.exists() or self.folder.is_symlink()):
+                raise
             return ()
         records: list[UserAction] = []
         for path in paths:
             try:
+                if watch is not None:
+                    watch(path)
                 record = UserAction.decode(path.read_text(encoding="utf-8"))
                 if path.stem != action_id(record.key):
                     raise ActionStoreError("The filename does not match the action key.")
@@ -146,20 +159,29 @@ class ActionStore:
         return record
 
     def add(self, *, title: str, command: str, machine: str, cwd: str, requested_by: str,
-            reason: str, waits: str, concerns: str, dedupe_key: str) -> UserAction:
-        """Create one action unless its requester already has the same open request."""
+            reason: str, waits: str, concerns: str, dedupe_key: str, key: str = "",
+            completion: ActionCompletion = "manual") -> UserAction:
+        """Create one action or return an existing action for the request."""
         now = datetime.now(timezone.utc).isoformat()
-        record = UserAction(f"action/{uuid4()}", 1, title, command, machine, cwd, requested_by,
-                            reason, waits, concerns, dedupe_key, "open", now, now)
+        identifier = action_id(key) if key else str(uuid4())
+        record = UserAction(f"action/{identifier}", 1, title, command, machine, cwd, requested_by,
+                            reason, waits, concerns, dedupe_key, "open", now, now, completion=completion)
         self.folder.mkdir(parents=True, exist_ok=True)
         with file_lock.exclusive(self.folder / ".lock"):
-            for existing in self.list():
+            records = self.list()
+            for existing in records:
+                if existing.key == record.key:
+                    if (existing.requested_by, existing.dedupe_key) != (requested_by, dedupe_key):
+                        raise ActionStoreError("Another request uses this action key.")
+                    return existing
+            for existing in records:
                 if (existing.status == "open" and existing.requested_by == requested_by
                         and existing.dedupe_key == dedupe_key):
                     return existing
             return self._write(record)
 
-    def _find(self, key: str) -> UserAction:
+    def get(self, key: str) -> UserAction:
+        """Read the action with this key."""
         canonical = f"action/{action_id(key)}"
         for record in self.list():
             if record.key == canonical:
@@ -172,7 +194,7 @@ class ActionStore:
             raise ActionStoreError("Provide a withdrawal reason.")
         self.folder.mkdir(parents=True, exist_ok=True)
         with file_lock.exclusive(self.folder / ".lock"):
-            record = self._find(key)
+            record = self.get(key)
             if record.requested_by != requested_by:
                 raise ActionStoreError("Another requester owns this action.")
             if record.status != "open":
@@ -186,7 +208,7 @@ class ActionStore:
             raise ActionStoreError("Provide completion evidence.")
         self.folder.mkdir(parents=True, exist_ok=True)
         with file_lock.exclusive(self.folder / ".lock"):
-            record = self._find(key)
+            record = self.get(key)
             if record.status == "done":
                 return record
             if record.status != "open":
@@ -195,13 +217,21 @@ class ActionStore:
             return self._write(replace(record, status="done", updated_at=now, completed_at=now, evidence=evidence))
 
 
+def review_place(key: str = "") -> str:
+    """Link to the open actions or select one action."""
+    fields = {"type": "for-you", "show": "open"}
+    if key:
+        fields["item"] = key
+    return REVIEW_PATH + "?" + urlencode(fields)
+
+
 def card_url(key: str) -> str:
     """Use the existing Review origin and path without creating a console page."""
-    from scripts.review_links import review_link, review_page
+    from scripts.review_links import review_link
 
     root = review_link.review_root()
-    url = review_link.snapshot_url(root, root / review_page.PAGE_PATH.lstrip("/"))
-    return url + "?" + urlencode({"type": "for-you", "show": "open", "item": key})
+    url = review_link.snapshot_url(root, root / REVIEW_PATH.lstrip("/"))
+    return url + review_place(key).removeprefix(REVIEW_PATH)
 
 
 class Arguments(argparse.Namespace):

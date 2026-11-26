@@ -18,6 +18,7 @@ from scripts.bevy_upgrade import upgrade_record
 from scripts.bevy_upgrade import upgrade_schedule
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 @final
@@ -54,7 +55,7 @@ class ScheduleTests(unittest.TestCase):
             "STATUS_EXIT": "0", "SEND_OUTCOME": "SENT: test recipient", "SEND_EXIT": "0",
             "RETIRE_OUTCOME": "retired 1 queued message", "RETIRE_EXIT": "0",
             "PYTHONDONTWRITEBYTECODE": "1", "HOME": str(self.root),
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
         })))
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -97,6 +98,11 @@ class ScheduleTests(unittest.TestCase):
         args = cast(list[str], json.loads((self.root / "send-calls").read_text()))
         self.assertEqual(args, ["--to", f"session:{self.current_id}", "--from", "bevy-upgrade", "--key",
                                 f"bevy-upgrade-{self.owner_id}", "--summary", "Two changes", "--text", "line one\nline two"])
+
+    def test_a_notice_kept_for_review_counts_as_accepted(self) -> None:
+        outcome = f"KEPT: session:{self.current_id} is in a review; delivered at its end"
+        with mock.patch.dict(os.environ, {"SEND_OUTCOME": outcome}):
+            self.assertTrue(upgrade_schedule.tell_showrunner(self.owner_id, "changes", "body"))
 
     def test_empty_address_sends_nothing_and_explains_non_delivery(self) -> None:
         stderr = io.StringIO()

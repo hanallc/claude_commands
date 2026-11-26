@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
+import fcntl
 from functools import lru_cache
 from hashlib import sha256
 from io import StringIO
@@ -26,7 +27,7 @@ from typing import ClassVar, Literal, cast, override
 from unittest import mock
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gate_probe, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, quota_requests, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
@@ -2027,7 +2028,6 @@ class DeploymentTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.object(box, 'urlopen', side_effect=AssertionError('tests require a fake tailnet transport'))))
-        _ = write_config_fixture(self.settings)
         self.now = int(datetime.fromisoformat(DAY + "T23:59:00+00:00").timestamp())
         self.bundle = self.root / 'bundle'
         self.bundle.mkdir()
@@ -2040,14 +2040,6 @@ class DeploymentTests(CostFixture):
         _ = (modules / 'tailscale.nix').write_text(
             '# The module enables Tailscale SSH.\n{ services.tailscale = {\n' +
             '  enable = true;\n  extraSetFlags = [ "--ssh" ];\n  openFirewall = true;\n}; }\n')
-        bootstrap_template = hosts / 'bootstrap.sh.in'
-        _ = bootstrap_template.write_text('\n'.join((
-            '#!/usr/bin/env bash', '# services.amazon-ssm-agent.enable = true',
-            'systemd-run --unit=aws-build-first-boot-stop --on-active=@IDLE_STOP_SECONDS@s systemctl poweroff',
-            '# udevadm wait --timeout=@DATA_VOLUME_WAIT_SECONDS@',
-            '# @SCRIPTS_SOURCE_URL_JSON@ @SCRIPTS_SOURCE_SHA256_JSON@ @SCRIPTS_SOURCE_COMMIT_JSON@',
-            '# @REMOTE_SETTINGS_JSON@ @EXISTING_DATA_VOLUME_JSON@', '# @INPUT@', '',
-        )))
         _ = (hosts / 'aws-build-base.nix').write_text(
             '# The base shares the transport module.\n{ ... }: { imports = [ ../modules/linux/tailscale.nix ]; }')
         self.notification_file = self.root / 'notification-email'
@@ -2059,14 +2051,9 @@ class DeploymentTests(CostFixture):
             'ami_id': 'ami-fixture', 'ami_owner_id': '123456789012', 'nixos_release': '26.05',
             'availability_zone': 'us-east-1a', 'vpc_id': 'vpc-fixture', 'subnet_id': 'subnet-fixture',
             'root_device_name': '/dev/xvda', 'scaler_user_name': 'build-scaler',
-            'bootstrap_template_path': str(bootstrap_template),
-            'scripts_source_url': 'https://example.invalid/public/commit.tar.gz',
-            'scripts_source_sha256': 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-            'scripts_source_commit': 'a' * 40,
         }
         values.update({
-            'root_volume_gib': '32', 'data_volume_gib': '500', 'data_volume_iops': '6000',
-            'data_volume_throughput': '500', 'spot_max_usd_per_hour': '0.5',
+            'spot_max_usd_per_hour': '0.5',
             'budget_notice_low_percent': '50', 'budget_notice_high_percent': '80', 'budget_stop_percent': '100',
             'deployment_timeout_s': '30', 'preflight_max_age_s': '300', 'fixed_usd_per_month': '0.001',
             'retained_storage_usd_per_month': '0', 'root_storage_usd_per_month': '0',
@@ -2077,7 +2064,7 @@ class DeploymentTests(CostFixture):
         for key, value in values.items():
             self.replace(key, value)
         gates = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(gates,
+        self.configure_gate(
             "regions=us-east-1\nroot_gib=40\nspot_max_usd_per_hour=0.8\nshared_usd_per_month=1\n")
         # Quota cases assume these targets; pin them in place so a /tune of the shipped values never breaks a test.
         _ = gates.write_text(re.sub(r'^(gpu_spot_quota_request_vcpus)=.*$', r'\1=4',
@@ -2443,6 +2430,60 @@ sys.exit(7)
         self.assertIn('remove-images --approve-destroy', output.getvalue())
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
 
+    def test_gate_image_cleanup_keeps_linked_paths(self) -> None:
+        from scripts.aws_target import teardown
+
+        state = self.root / 'real-state'
+        folder = state / 'gate-image'
+        folder.mkdir(parents=True)
+        marker = folder / 'image.json'
+        _ = marker.write_text('fixture image')
+        alias = self.root / 'state-alias'
+        alias.symlink_to(state, target_is_directory=True)
+        linked_image_state = self.root / 'linked-image-state'
+        linked_image_state.mkdir()
+        linked_image = linked_image_state / 'gate-image'
+        linked_image.symlink_to(folder, target_is_directory=True)
+        missing_image_state = self.root / 'missing-image-state'
+        missing_image_state.mkdir()
+        (missing_image_state / 'gate-image').symlink_to(self.root / 'missing-image')
+        api = aws_target.AwsCli('fixture', 'us-east-1', 1)
+        for directory in (alias, linked_image_state, missing_image_state):
+            with (self.subTest(directory=directory),
+                  mock.patch.object(api, 'call', side_effect=AssertionError('unexpected AWS call')) as call,
+                  redirect_stdout(StringIO()) as output):
+                self.assertIsInstance(teardown.remove_gate_images(api, directory, lambda: self.now),
+                                      teardown.GateImageRemovalRefused)
+                call.assert_not_called()
+                self.assertIn(f'kept for a manual removal list: {directory / "gate-image"} (teardown,',
+                              output.getvalue())
+        self.assertEqual(marker.read_text(), 'fixture image')
+        self.assertTrue(alias.is_symlink())
+        self.assertTrue(linked_image.is_symlink())
+        self.assertTrue((missing_image_state / 'gate-image').is_symlink())
+
+    def test_remove_images_reports_failure_for_a_linked_gate_image_and_can_retry(self) -> None:
+        subject, fake = self.gate_image_fixture()
+        folder = subject.directory / 'gate-image'
+        saved = folder.with_name('saved-gate-image')
+        _ = folder.rename(saved)
+        folder.symlink_to(saved, target_is_directory=True)
+        with redirect_stdout(StringIO()) as output:
+            self.assertFalse(subject.remove_images(approve_destroy=True))
+        self.assertIn(f'kept for a manual removal list: {folder} (teardown,', output.getvalue())
+        self.assertIn('remove-images: refused:', output.getvalue())
+        self.assertIn('remove-images: deleting the gate image and its snapshot failed after', output.getvalue())
+        self.assertNotIn('remove-images: deleting the gate image and its snapshot done in', output.getvalue())
+        self.assertTrue(folder.is_symlink())
+        self.assertEqual((saved / 'image.json').read_text(), '{"image_id":"ami-old"}')
+        self.assertTrue(fake.images)
+        folder.unlink()
+        _ = saved.rename(folder)
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.remove_images(approve_destroy=True))
+        self.assertFalse(folder.exists())
+        self.assertEqual(fake.images, {})
+
     def test_remove_gate_image_switches_to_the_official_image_before_deleting_the_gate_image(self) -> None:
         subject, fake = self.gate_image_fixture()
         with redirect_stdout(StringIO()) as output:
@@ -2546,7 +2587,7 @@ sys.exit(7)
                      ) -> tuple[deploy.Deployment, list[list[str]]]:
         subject = self.update_fixture()
         self.set_clock(self.now + 1)
-        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'instance_types=m7a.8xlarge m7a.4xlarge\n'
+        self.configure_gate('instance_types=m7a.8xlarge m7a.4xlarge\n'
             + 'hana_gpu_instance_types=g4dn.2xlarge g6.2xlarge\n'
             + 'spot_candidate_regions=us-east-2\n'
             + 'gpu_setup_dry_run_retry_timeout_s=1\ngpu_setup_dry_run_retry_interval_s=1')
@@ -2734,7 +2775,8 @@ sys.exit(7)
             if code:
                 action = ''.join(word.title() for word in operation.split('-'))
                 return subprocess.CompletedProcess(args, 1, '',
-                    f'An error occurred ({code}) when calling the {action} operation: private diagnostic')
+                    f'An error occurred ({code}) when calling the {action} operation: private diagnostic '
+                    + 'https://fixture-bucket.example/fixture-key arn:aws:ec2:us-east-2:fixture-account:instance/i-fixture')
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
 
         subject.execute = scaler
@@ -3080,7 +3122,6 @@ sys.exit(7)
         subject = self.deployment()
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
-        _ = write_config_fixture(self.root / 'cloud_gate.conf')
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
         text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-west-2 us-east-1 us-east-2 us-west-2')
         gpu_types = ('g6.xlarge', 'g4dn.xlarge', 'g4ad.xlarge', 'g5.xlarge')
@@ -3331,7 +3372,8 @@ sys.exit(7)
                     rows = [{'DesiredValue': 130, 'Status': 'FUTURE_STATUS', 'Created': hours_ago},
                             {'DesiredValue': 128, 'Status': 'PENDING', 'Created': day_ago.timestamp()}]
                 elif (region, code) == (other, 'L-3819A6DF'):
-                    rows = [{'DesiredValue': 4, 'Status': 'PENDING',
+                    rows = [{'DesiredValue': 8, 'Status': 'APPROVED', 'Created': self.now - 7 * 86400},
+                            {'DesiredValue': 4, 'Status': 'PENDING', 'Created': None,
                              'LastUpdated': day_ago.isoformat().replace('+00:00', 'Z')}]
                 reply = {'RequestedQuotas': rows}
             return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
@@ -3353,7 +3395,19 @@ sys.exit(7)
         plan_key.assert_called_once_with()
         after = {path.relative_to(self.root): path.read_bytes() if path.is_file() else None
                  for path in self.root.rglob('*')}
-        self.assertEqual(before, after)
+        record = self.state.relative_to(self.root) / quota_requests.RECORD_PATH
+        quota_paths = {record.parent, record, record.with_name('controller.lock')}
+        self.assertEqual(before, {path: value for path, value in after.items() if path not in quota_paths})
+        self.assertEqual(quota_requests.read(self.state), quota_requests.QuotaRequestSnapshot(self.now, (
+            quota_requests.OpenQuotaRequest(home, 'L-34B43A08', 'Standard Spot',
+                '129', 'CASE_OPENED', 'case-fixture', hours_ago),
+            quota_requests.OpenQuotaRequest(other, 'L-34B43A08', 'Standard Spot',
+                '130', 'FUTURE_STATUS', '', hours_ago),
+            quota_requests.OpenQuotaRequest(other, 'L-34B43A08', 'Standard Spot',
+                '128', 'PENDING', '', day_ago.isoformat()),
+            quota_requests.OpenQuotaRequest(other, 'L-3819A6DF', 'G and VT Spot',
+                '4', 'PENDING', '', day_ago.isoformat()),
+        )))
         # The candidate region has only a price read, so the report reads no quota there.
         self.assertEqual(calls, [(region, code, operation) for region, code in (
             (home, 'L-34B43A08'), (home, 'L-3819A6DF'), (other, 'L-34B43A08'), (other, 'L-3819A6DF'))
@@ -3516,7 +3570,8 @@ sys.exit(7)
             else:
                 self.assertEqual(operation, 'list-requested-service-quota-change-history-by-quota')
                 reply = {'RequestedQuotas': [{'DesiredValue': 4, 'Status': 'CASE_CLOSED', 'CaseId': 'case-private',
-                    'Id': 'request-private', 'Requester': '123456789012', 'Created': self.now - 120}]}
+                    'Id': 'request-private', 'Requester': '123456789012', 'Created': self.now - 120,
+                    'LastUpdated': 'invalid date'}]}
             return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
 
         subject.execute = execute
@@ -3595,6 +3650,120 @@ sys.exit(7)
                 self.assertEqual(output.getvalue(), '')
                 self.assertEqual(errors.getvalue(), 'aws_deploy: ' + message + '\n')
 
+    def test_quota_request_reconciles_saved_requests_after_a_successful_read(self) -> None:
+        region, code = 'us-east-1', 'L-34B43A08'
+        pending = quota_requests.OpenQuotaRequest(region, code, 'Standard Spot', '128', 'PENDING', '', '')
+        old_read_at = self.now - 100
+        cases = (
+            ('sufficient quota', ({'Quota': {'Value': 128}},), True, ()),
+            ('closed reply', ({'Quota': {'Value': 5}}, {'RequestedQuotas': [{'Status': 'CASE_CLOSED', 'DesiredValue': 128}]},
+                              {'RequestedQuota': {'Status': 'APPROVED'}}), True, ()),
+            ('failed history read', ({'Quota': {'Value': 5}}, aws_cli.AwsUnavailable('test error')), False, (pending,)),
+        )
+        for case, replies, success, expected in cases:
+            with self.subTest(case=case):
+                quota_requests.save(self.state, {pending.quota: (pending,)}, old_read_at, complete=True)
+                with (mock.patch.object(deploy, 'quota_targets', return_value=(((region,), code, 128, 'Spot'),)),
+                      mock.patch.object(aws_cli.AwsCli, 'call', side_effect=replies) as call,
+                      redirect_stdout(StringIO())):
+                    self.assertEqual(self.deployment().quota_request(), success)
+                self.assertEqual(call.call_count, len(replies))
+                snapshot = quota_requests.read(self.state)
+                self.assertEqual(snapshot.requests, expected)
+                self.assertEqual(snapshot.read_at, self.now if success else old_read_at)
+
+    def test_quota_request_clears_saved_request_when_submission_fails_after_empty_history(self) -> None:
+        region, code = 'us-east-1', 'L-34B43A08'
+        pending = quota_requests.OpenQuotaRequest(region, code, 'Standard Spot', '128', 'PENDING', '', '')
+        quota_requests.save(self.state, {pending.quota: (pending,)}, self.now - 100, complete=True)
+        replies: tuple[object, ...] = (
+            {'Quota': {'Value': 5}}, {'RequestedQuotas': []}, aws_cli.AwsUnavailable('fixture submission failed'))
+        with (mock.patch.object(deploy, 'quota_targets', return_value=(((region,), code, 128, 'Spot'),)),
+              mock.patch.object(aws_cli.AwsCli, 'call', side_effect=replies) as call,
+              redirect_stdout(StringIO())):
+            self.assertFalse(self.deployment().quota_request())
+        self.assertEqual(call.call_count, 3)
+        self.assertEqual(quota_requests.read(self.state), quota_requests.QuotaRequestSnapshot(self.now, ()))
+
+    def quota_command_lock_is_held(self) -> bool:
+        path = (self.state / quota_requests.RECORD_PATH).with_name('controller.lock')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+        return False
+
+    def test_quota_commands_hold_the_lock_across_aws_reads_and_save(self) -> None:
+        region, code = 'us-east-1', 'L-34B43A08'
+        for command in ('quota_request', 'quota_status'):
+            with self.subTest(command=command):
+                subject = self.deployment()
+                held: list[tuple[str, bool]] = []
+
+                def aws_call(operation: str, *_args: str, **_kwargs: object) -> dict[str, object]:
+                    held.append((operation, self.quota_command_lock_is_held()))
+                    if operation == 'get-service-quota':
+                        return {'Quota': {'Value': 128}}
+                    self.assertEqual(operation, 'list-requested-service-quota-change-history-by-quota')
+                    return {'RequestedQuotas': []}
+
+                def write_record(path: Path, value: str, *, new_file_mode: int | None = None) -> None:
+                    held.append(('save', self.quota_command_lock_is_held()))
+                    write_text_atomic(path, value, new_file_mode=new_file_mode)
+
+                with (mock.patch.object(deploy, 'quota_targets', return_value=(((region,), code, 128, 'Spot'),)),
+                      mock.patch.object(plan_identity, 'plan_credentials', return_value=QUOTA_PLAN_KEY),
+                      mock.patch.object(aws_cli.AwsCli, 'call', side_effect=aws_call),
+                      mock.patch.object(quota_requests, 'write_text_atomic', side_effect=write_record),
+                      redirect_stdout(StringIO())):
+                    self.assertTrue(subject.quota_request() if command == 'quota_request' else subject.quota_status())
+                expected = [('get-service-quota', True)]
+                if command == 'quota_status':
+                    expected.append(('list-requested-service-quota-change-history-by-quota', True))
+                self.assertEqual(held, [*expected, ('save', True)])
+                self.assertFalse(self.quota_command_lock_is_held())
+
+    def test_quota_request_restart_recovers_an_accepted_request_without_resubmitting(self) -> None:
+        region, code = 'us-east-1', 'L-34B43A08'
+        accepted: dict[str, object] = {'Status': 'PENDING', 'DesiredValue': 128}
+        history: list[dict[str, object]] = []
+        operations: list[str] = []
+        lock_at_exit: list[bool] = []
+
+        def aws_call(operation: str, *_args: str, **_kwargs: object) -> dict[str, object]:
+            operations.append(operation)
+            if operation == 'get-service-quota':
+                return {'Quota': {'Value': 5}}
+            if operation == 'list-requested-service-quota-change-history-by-quota':
+                return {'RequestedQuotas': history}
+            self.assertEqual(operation, 'request-service-quota-increase')
+            history.append(accepted)
+            return {'RequestedQuota': accepted}
+
+        def interrupt_save(*_args: object, **_kwargs: object) -> None:
+            lock_at_exit.append(self.quota_command_lock_is_held())
+            raise SystemExit(1)
+
+        with (mock.patch.object(deploy, 'quota_targets', return_value=(((region,), code, 128, 'Spot'),)),
+              mock.patch.object(aws_cli.AwsCli, 'call', side_effect=aws_call),
+              redirect_stdout(StringIO())):
+            with mock.patch.object(quota_requests, 'save', side_effect=interrupt_save), self.assertRaises(SystemExit):
+                _ = self.deployment().quota_request()
+            with self.assertRaises(FileNotFoundError):
+                _ = quota_requests.read(self.state)
+            self.assertFalse(self.quota_command_lock_is_held())
+            self.assertTrue(self.deployment().quota_request())
+        self.assertEqual(quota_requests.read(self.state), quota_requests.QuotaRequestSnapshot(self.now, (
+            quota_requests.OpenQuotaRequest(region, code, 'Standard Spot', '128', 'PENDING', '', ''),
+        )))
+        self.assertEqual(operations, [
+            'get-service-quota', 'list-requested-service-quota-change-history-by-quota', 'request-service-quota-increase',
+            'get-service-quota', 'list-requested-service-quota-change-history-by-quota',
+        ])
+        self.assertEqual(lock_at_exit, [True])
+
     def test_quota_request_uses_admin_credentials_and_continues_after_regional_failures(self) -> None:
         get_quota = 'get-service-quota'
         history = 'list-requested-service-quota-change-history-by-quota'
@@ -3621,9 +3790,9 @@ sys.exit(7)
         _ = path.write_text(re.sub(r'(?m)^regions=.*$', 'regions=us-east-1 us-west-2',
                                   re.sub(r'(?m)^spot_candidate_regions=.*$',
                                          'spot_candidate_regions=us-east-2 us-west-2', path.read_text())))
-        request_id = 'req-ab12cd34ef56'
-        case_id = '9876543210'
-        account_id = '123456789012'
+        request_id = 'fixture-request'
+        case_id = 'fixture-case'
+        account_id = 'fixture-account'
         for quota, history_status, request_status, failure, success in cases:
             with self.subTest(quota=quota, history=history_status, request=request_status, failure=failure):
                 subject = self.deployment()
@@ -3666,8 +3835,11 @@ sys.exit(7)
                     elif operation == get_quota:
                         reply = {'Quota': {'Value': quota}}
                     elif operation == history:
-                        reply = {'RequestedQuotas': [{'Status': history_status, 'DesiredValue': 256.0,
-                            'Id': request_id, 'CaseId': case_id, 'Requester': account_id}] if history_status else []}
+                        rows = [{'Status': history_status, 'DesiredValue': 256.0,
+                                 'Id': request_id, 'CaseId': case_id, 'Requester': account_id}] if history_status else []
+                        if history_status == 'CASE_CLOSED':
+                            del rows[0]['DesiredValue']
+                        reply = {'RequestedQuotas': rows}
                     else:
                         self.assertEqual(operation, request)
                         reply = {'RequestedQuota': {'Status': request_status, 'DesiredValue': 128.0,
@@ -3703,6 +3875,14 @@ sys.exit(7)
                     self.assertEqual(lines[0], f'us-east-1: Spot quota request 128 vCPUs; status {request_status}')
                 for private in ('fixture-admin-id', 'fixture-admin-secret', request_id, case_id, account_id):
                     self.assertNotIn(private, captured.getvalue())
+                if not failure and quota < 128 and (history_status in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}
+                                                  or request_status in {'PENDING', 'CASE_OPENED'}):
+                    already_open = history_status in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}
+                    self.assertEqual(quota_requests.read(self.state), quota_requests.QuotaRequestSnapshot(self.now, (
+                        quota_requests.OpenQuotaRequest('us-east-1', 'L-34B43A08', 'Standard Spot',
+                            '256' if already_open else '128', history_status if already_open else request_status,
+                            case_id, ''),
+                    )))
 
     def test_gpu_quota_request_cases_and_failures_in_each_gate_region(self) -> None:
         get_quota = 'get-service-quota'
@@ -3817,6 +3997,10 @@ sys.exit(7)
                         f'{region}: G and VT Spot quota 4 vCPUs; no request is needed for 4 vCPUs' for region in gates]])
                     for private in ('private-request', 'private-case', 'private-account', 'fixture-admin-id', 'fixture-admin-secret'):
                         self.assertNotIn(private, captured.getvalue())
+                    if request_status in {'PENDING', 'CASE_OPENED'}:
+                        snapshot = quota_requests.read(self.state)
+                        self.assertEqual(snapshot.requests, (quota_requests.OpenQuotaRequest(
+                            selected_region, 'L-3819A6DF', 'G and VT Spot', '4', request_status, 'private-case', ''),))
 
     def test_regional_gate_stack_reuses_home_resources_and_copies_missing_image(self) -> None:
         subject, commands = self.gate_fixture()
@@ -4192,7 +4376,7 @@ sys.exit(7)
 
     def test_gate_setup_grants_and_records_the_sorted_union_of_gpu_trial_types(self) -> None:
         subject, commands = self.gate_fixture()
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        self.configure_gate(
             'regions=us-east-2\nhana_gpu_instance_types=g6.2xlarge g4dn.2xlarge\n' +
             'gpu_size_trial_spot_max_usd_per_hour={"g6.2xlarge":0.98,"g4dn.xlarge":0.5}')
         self.assertTrue(subject.gate_up(approve_resources=True))
@@ -4203,11 +4387,28 @@ sys.exit(7)
         self.assertEqual(applied, ','.join(expected))
         self.assertEqual(remote.read_record(self.state / 'gate-deployment.json')['gpu_instance_types'], expected)
 
+    def test_interrupted_gate_setup_removes_the_previous_pass_before_regional_preparation(self) -> None:
+        subject, _commands = self.gate_fixture()
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        self.assertIsInstance(gate_probe.read_record(self.state), gate_probe.GateProbeRecord)
+        self.configure_gate('regions=us-east-2 us-west-2')
+
+        def interrupt(*_args: object) -> deploy.RegionalNetwork:
+            self.assertFalse((self.state / gate_probe.FILE_NAME).exists())
+            raise KeyboardInterrupt
+
+        with (mock.patch.object(subject, 'regional_network', side_effect=interrupt),
+              redirect_stdout(StringIO()), self.assertRaises(KeyboardInterrupt)):
+            _ = subject.gate_up(approve_resources=True)
+        self.assertIs(gate_probe.read_record(self.state), gate_probe.ProbeRecordUnavailable.ABSENT)
+
     def test_gate_setup_proves_each_saved_gpu_type_and_the_result_transfer(self) -> None:
         subject, commands = self.gate_fixture()
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        self.configure_gate(
             'regions=us-east-2\nhana_gpu_instance_types=g4dn.2xlarge\n' +
             'gpu_size_trial_spot_max_usd_per_hour={"g6.2xlarge":0.98}')
+        subject.clock = lambda: self.now + 3 if any('abort-multipart-upload' in args for args in commands) else self.now
         with (mock.patch.dict(os.environ, {'AWS_ACCESS_KEY_ID': 'fixture-admin', 'AWS_PROFILE': 'build-admin'}),
               redirect_stdout(StringIO()) as output):
             self.assertTrue(subject.gate_up(approve_resources=True))
@@ -4226,6 +4427,18 @@ sys.exit(7)
         ])
         self.assertLess(output.getvalue().index('cloud-gate: deployed'), output.getvalue().index('gate-setup probe: '))
         saved = remote.read_record(self.state / 'gate-deployment.json')
+        recorded = gate_probe.read_record(self.state)
+        assert isinstance(recorded, gate_probe.GateProbeRecord)
+        self.assertEqual(recorded.deployment_id, saved['deployment_id'])
+        self.assertEqual(recorded.ended_at, datetime.fromtimestamp(self.now + 3, UTC))
+        self.assertEqual([check.report() for check in recorded.checks], reports)
+        self.assertEqual([row for row in recorded.checks if isinstance(row.check, gate_probe.GpuLaunchCheck)], [
+            gate_probe.ProbeCheck(gate_probe.GpuLaunchCheck('us-east-2', 'g4dn.2xlarge'),
+                                  gate_probe.ProbeVerdict.PASS, gate_probe.ProbeReason.DRY_RUN),
+            gate_probe.ProbeCheck(gate_probe.GpuLaunchCheck('us-east-2', 'g6.2xlarge'),
+                                  gate_probe.ProbeVerdict.PASS, gate_probe.ProbeReason.DRY_RUN),
+        ])
+        self.assertEqual((self.state / gate_probe.FILE_NAME).stat().st_mode & 0o777, 0o600)
         launches = self.gpu_probe_launches(commands)
         self.assertEqual([launch['InstanceType'] for launch in launches], saved['gpu_instance_types'])
         for launch in launches:
@@ -4270,9 +4483,27 @@ sys.exit(7)
         return result
 
     def test_gate_setup_fails_on_one_refused_gpu_type_and_finishes_the_other_probes(self) -> None:
+        path = self.state / gate_probe.FILE_NAME
+        _ = path.write_text('previous record')
+        path.chmod(0o644)
         output = self.failed_gpu_probe_output('run-instances g4dn.2xlarge', 'UnauthorizedOperation')
         self.assertIn('gate-setup probe: run-instances g6.2xlarge: pass (DryRunOperation)', output)
         self.assertIn('gate-setup probe: get-object: pass (OK)', output)
+        recorded = gate_probe.read_record(self.state)
+        assert isinstance(recorded, gate_probe.GateProbeRecord)
+        failures = [check for check in recorded.checks if check.verdict is gate_probe.ProbeVerdict.FAIL]
+        self.assertEqual(failures, [
+            gate_probe.ProbeCheck(gate_probe.GpuLaunchCheck('us-east-2', 'g4dn.2xlarge'),
+                                  gate_probe.ProbeVerdict.FAIL, gate_probe.ProbeReason.CHECK_FAILED),
+        ])
+        self.assertIs(recorded.checks[-1].check.name, gate_probe.RegionalCheckName.MULTIPART_INPUT)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        raw = path.read_text()
+        for private in ('previous record', 'UnauthorizedOperation', 'private diagnostic', 'https://', 'arn:',
+                        'fixture-account', 'fixture-bucket', 'fixture-template', 'fixture-group',
+                        'fixture-upload', 'ami-fixture', 'i-fixture'):
+            with self.subTest(private=private):
+                self.assertNotIn(private, raw)
 
     def test_gate_setup_fails_on_an_s3_403(self) -> None:
         output = self.failed_gpu_probe_output('list-objects-v2', '403')
@@ -4309,6 +4540,10 @@ sys.exit(7)
         launches = self.gpu_probe_launches(commands)
         self.assertTrue(launches)
         self.assertTrue(all(launch['InstanceType'] != size for launch in launches))
+        recorded = gate_probe.read_record(self.state)
+        assert isinstance(recorded, gate_probe.GateProbeRecord)
+        self.assertIn(gate_probe.ProbeCheck(gate_probe.GpuLaunchCheck('us-east-2', size),
+                     gate_probe.ProbeVerdict.UNVERIFIED, gate_probe.ProbeReason.NO_OFFERED_SUBNET), recorded.checks)
 
     def test_gate_setup_retries_denied_launch_within_the_configured_deadline(self) -> None:
         self.check_gpu_launch_retries(('UnauthorizedOperation', 'DryRunOperation'), [2], success=True)
@@ -4319,7 +4554,7 @@ sys.exit(7)
     def check_gpu_launch_retries(self, codes: tuple[str, ...], expected_waits: list[float], *, success: bool) -> None:
         operation = 'run-instances g4dn.2xlarge'
         subject, commands = self.gate_fixture(probe_faults={operation: codes})
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        self.configure_gate(
             'gpu_setup_dry_run_retry_timeout_s=5\ngpu_setup_dry_run_retry_interval_s=2')
         clock = 0.0
         waits: list[float] = []
@@ -4377,10 +4612,16 @@ sys.exit(7)
         ])
         self.assertNotIn('fixture-other-principal', output.getvalue())
         self.assertFalse(any('simulate-principal-policy' in args for args in commands))
+        recorded = gate_probe.read_record(self.state)
+        assert isinstance(recorded, gate_probe.GateProbeRecord)
+        self.assertEqual(recorded.checks, (
+            gate_probe.ProbeCheck(gate_probe.AccountCheck(gate_probe.AccountCheckName.CALLER_IDENTITY),
+                                  gate_probe.ProbeVerdict.FAIL, gate_probe.ProbeReason.SCALER_IDENTITY_MISMATCH),
+        ))
 
     def test_gate_setup_reports_simulator_access_denial_once_across_regions(self) -> None:
         subject, commands = self.gate_fixture(has_gpu_target=False, probe_faults={'simulate-principal-policy': 'AccessDenied'})
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        self.configure_gate(
             'regions=us-east-2 us-west-2\nspot_candidate_regions=us-east-2 us-west-2')
         network = deploy.RegionalNetwork('us-west-2', 'fixture-vpc', [], 'ami-fixture')
         stack = {'region': 'us-west-2', 'subnets': [{'id': 'fixture-other-subnet', 'zone': 'us-west-2a'}]}
@@ -4421,7 +4662,7 @@ sys.exit(7)
 
     def test_gate_setup_simulates_each_saved_spot_candidate_and_fails_on_a_regional_denial(self) -> None:
         subject, commands = self.gate_fixture(denied_region='us-west-2')
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        self.configure_gate(
             'regions=us-east-2 us-west-2 eu-west-1 eu-west-2\n'
             + 'spot_candidate_regions=us-east-2 us-west-2 eu-west-2 us-east-1')
 
@@ -4769,6 +5010,31 @@ sys.exit(7)
         self.assertEqual(image, {'image_id': 'ami-cache'})
         self.assertEqual(box.saved_image(api, self.state)['ImageId'], 'ami-cache')
 
+
+    def test_down_keeps_its_journal_after_a_gate_image_refusal_and_can_retry(self) -> None:
+        _ = self.removal_fixture()
+        folder = self.state / 'gate-image'
+        saved = self.root / 'gate-image-data'
+        saved.mkdir()
+        _ = (saved / 'image.json').write_text('fixture image data')
+        folder.symlink_to(saved, target_is_directory=True)
+        with mock.patch.object(box, 'cleanup_images') as cleanup:
+            success, output = self.down_output()
+            self.assertFalse(success, output)
+            cleanup.assert_not_called()
+            self.assertIn('gate-image: refused:', output)
+            self.assertTrue(folder.is_symlink())
+            self.assertEqual((saved / 'image.json').read_text(), 'fixture image data')
+            self.assertTrue((self.state / 'down.json').is_file())
+            self.assertFalse((self.state / 'down-complete.json').exists())
+            self.assertTrue((self.state / 'deployment.json').is_file())
+            folder.unlink()
+            _ = saved.rename(folder)
+            success, output = self.down_output()
+            self.assertTrue(success, output)
+        self.assertFalse(folder.exists())
+        self.assertFalse((self.state / 'down.json').exists())
+        self.assertTrue((self.state / 'down-complete.json').is_file())
 
     def test_down_keeps_and_reports_the_saved_image(self) -> None:
         _ = self.removal_fixture()
@@ -5385,10 +5651,7 @@ else: raise AssertionError(args)
 
     def install_reviewed_template(self) -> None:
         hosts = self.root / 'nixos/hosts'
-        template = hosts / 'reviewed-bootstrap.sh.in'
-        _ = template.write_text(self.patch_source('hosts/aws-bootstrap.sh.in'))
         _ = (hosts / 'aws-build-base.nix').write_text(self.patch_source('hosts/aws-build-base.nix'))
-        self.replace('bootstrap_template_path', str(template))
 
     def reviewed_bundle(self) -> str:
         self.install_reviewed_template()

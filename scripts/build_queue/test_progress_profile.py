@@ -249,6 +249,78 @@ class ProgressCaptureTests(unittest.TestCase):
             self.assertEqual(progress.read_processes((123,), proc),
                              (progress.ProfileProcess(123, ("verify",), 42 * 1024),))
 
+    def test_trace_counters_ignore_the_partial_frame_used_by_the_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "cargo.log"
+            _ = path.write_text("Compiling hana v0.1.0\rBuilding [=>] 7/90\rBuilding [=>] 8/9")
+            reader = progress.CaptureReader(root, track_trace=True)
+            self.addCleanup(reader.close_trace_log)
+            self.assertEqual(reader.log_counter(path), progress.ProgressCounter("build:2", 8, 9))
+            partial = reader.trace_log(path)
+            assert isinstance(partial, progress.TraceCaptureReading)
+            self.assertEqual(partial.counter, progress.ProgressCounter("build:1", 7, 90))
+            with path.open("a") as output:
+                _ = output.write("0\r")
+            complete = reader.trace_log(path)
+            assert isinstance(complete, progress.TraceCaptureReading)
+            self.assertEqual(complete.counter, progress.ProgressCounter("build:1", 8, 90))
+
+    def test_trace_capture_keeps_frame_facts_and_reads_the_unlinked_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "cargo.log"
+            _ = path.write_text("\r\x1b[32m Compiling hana v0.1.0\x1b[0m\rBuilding [=>] 5/")
+            reader = progress.CaptureReader(root, track_trace=True)
+            self.addCleanup(reader.close_trace_log)
+            reading = reader.trace_log(path)
+            assert isinstance(reading, progress.TraceCaptureReading)
+            self.assertEqual(reading.frames, progress.TraceFrames("hana"))
+            with path.open("a") as output:
+                _ = output.write("9\rChecking another v0.1.0\r")
+            reading = reader.trace_log(path)
+            assert isinstance(reading, progress.TraceCaptureReading)
+            self.assertEqual(reading.counter, progress.ProgressCounter("build:1", 5, 9))
+            self.assertEqual(reading.frames, progress.TraceFrames("hana"))
+            with path.open("a") as output:
+                _ = output.write("    Nextest run")
+                output.flush()
+                reading = reader.trace_log(path)
+                assert isinstance(reading, progress.TraceCaptureReading)
+                self.assertFalse(reading.frames.test_started)
+                _ = output.write(" ID edd0\n    Starting 1 test\n")
+                output.flush()
+                reading = reader.trace_log(path)
+                assert isinstance(reading, progress.TraceCaptureReading)
+                self.assertEqual(reading.frames, progress.TraceFrames("hana", test_started=True))
+                path.unlink()
+                summary = "    Summary [   0.02s] 1 test run: 1 passed"
+                _ = output.write(summary)
+            partial = reader.trace_tail(final=True, replay_bytes=len(summary) - 1)
+            assert isinstance(partial, progress.TraceCaptureReading)
+            self.assertFalse(partial.caught_up)
+            self.assertFalse(partial.frames.test_completed)
+            reading = reader.trace_tail(final=True, replay_bytes=1)
+            assert isinstance(reading, progress.TraceCaptureReading)
+            self.assertTrue(reading.caught_up)
+            self.assertEqual(reading.frames, progress.TraceFrames("hana", test_started=True, test_completed=True))
+
+    def test_trace_terminal_capture_requires_the_current_pid_birth_and_boot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            account = root / "1000"
+            registration = account / "state/pids/42.run"
+            registration.parent.mkdir(parents=True)
+            _ = registration.write_bytes(b"cargo-tile-v3\0run\0boot\0born\0cargo.log\0folder\0")
+            _ = (account / "cargo.log").write_text("   Compiling hana v0.1.0\n")
+            reader = progress.CaptureReader(root, track_trace=True)
+            self.addCleanup(reader.close_trace_log)
+            self.assertIsInstance(reader.trace_terminal({42: "earlier"}, "boot"), progress.NoTraceCapture)
+            self.assertIsInstance(reader.trace_terminal({42: "born"}, "other-boot"), progress.NoTraceCapture)
+            reading = reader.trace_terminal({42: "born"}, "boot")
+            assert isinstance(reading, progress.TraceCaptureReading)
+            self.assertEqual(reading.frames, progress.TraceFrames("hana"))
+
     def test_a_counter_split_between_log_reads_is_complete_after_the_next_read(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "cargo.log"
@@ -344,7 +416,7 @@ class ProgressWindowTests(unittest.TestCase):
     def test_legacy_gate_records_are_not_anonymous_progress_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "gate.json"
-            _ = path.write_text('{"step":"merge-gate","anon_peak_bytes":99999999999,"at":100}')
+            _ = path.write_text('{"step":"gate","anon_peak_bytes":99999999999,"at":100}')
             self.assertIsInstance(progress.read_profile(path, cutoff=99), progress.NoMatchingProfile)
             self.assertIsInstance(progress.read_profile(path.with_name("missing.json"), cutoff=99), progress.NoMatchingProfile)
 

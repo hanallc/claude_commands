@@ -14,6 +14,45 @@ from scripts.lib import conf
 from scripts.build_targets import target_config
 
 
+@dataclass(frozen=True)
+class AwsOn:
+    """A named machine has enabled=on."""
+
+
+@dataclass(frozen=True)
+class AwsOff:
+    """Each named machine has enabled=off."""
+
+
+@dataclass(frozen=True)
+class AwsSwitchUnusable:
+    """No named machine is on, and the enabled value of one is not usable, which counts as off."""
+    reason: str
+
+
+type AwsSwitch = AwsOn | AwsOff | AwsSwitchUnusable
+
+
+def aws_switch(*machines: conf.ConfigRead) -> AwsSwitch:
+    """Answer whether this process may call AWS for any machine whose settings it names.
+
+    The enabled key of cloud_gate.conf switches the cloud gate box, and that of hana_aws.conf switches the Hana box.
+    An invalid live value counts as off, and a missing key or a missing live file takes the committed value."""
+    unusable: list[str] = []
+    for settings in machines:
+        try:
+            if settings.value('enabled', conf.on_off, recover_invalid=False):
+                return AwsOn()
+        except conf.Unusable as error:
+            unusable.append(str(error))
+    return AwsSwitchUnusable('; '.join(unusable)) if unusable else AwsOff()
+
+
+def cloud_gate_off_reason(switch: AwsOff | AwsSwitchUnusable) -> str:
+    """Name why the cloud gate routes make no AWS call."""
+    return switch.reason if isinstance(switch, AwsSwitchUnusable) else 'cloud gates are off (cloud_gate.conf enabled=off)'
+
+
 def gate_regions(home: str, configuration: conf.ConfigRead | None = None) -> tuple[str, ...]:
     """Read the ordered regions permitted by the account policy."""
     values = configuration if configuration is not None else conf.read_or_repository('cloud_gate')
@@ -74,6 +113,9 @@ class SpendingSettings:
     cost_explorer_interval_seconds: int
     cost_explorer_read_usd: Decimal
     cost_explorer_lookback_days: int
+    cost_explorer_watch_days: int
+    cost_explorer_unchanged_reads: int
+    cost_explorer_change_recipient: str
     notification_recipient: str
     notification_timeout_s: int
     notification_retry_s: int
@@ -157,10 +199,23 @@ def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
         zone = ZoneInfo(live_text("accounting_zone"))
     except (ValueError, KeyError) as error:
         raise SpendingConfigurationUnavailable(f"accounting_zone: {error}", tuple(limits)) from error
+    try:
+        unchanged_reads = _live(settings, 'cost_explorer_unchanged_reads', conf.positive_whole)
+    except ValueError as error:
+        raise SpendingConfigurationUnavailable(str(error), tuple(limits)) from error
+    lookback_days = seconds('cost_explorer_lookback_days')
+    watch_days = seconds('cost_explorer_watch_days')
+    if watch_days < lookback_days:
+        raise SpendingConfigurationUnavailable(
+            'cost_explorer_watch_days must be at least cost_explorer_lookback_days', tuple(limits))
+    cost_explorer_change_recipient = live_text('cost_explorer_change_recipient').strip()
+    if not cost_explorer_change_recipient or cost_explorer_change_recipient.casefold() == 'user':
+        raise SpendingConfigurationUnavailable('cost_explorer_change_recipient must name a session', tuple(limits))
     return SpendingSettings(daily, monthly, reserve, fallback, max(fixed, sum((cost for _, cost in components), Decimal(0))),
                             components, zone, seconds("price_refresh_seconds"), seconds("price_max_age_seconds"),
                             seconds("observation_max_age_seconds"), seconds("cost_explorer_interval_seconds"),
-                            explorer, seconds("cost_explorer_lookback_days"), live_text("notification_recipient"), seconds("notification_timeout_s"),
+                            explorer, lookback_days, watch_days, unchanged_reads, cost_explorer_change_recipient,
+                            live_text("notification_recipient"), seconds("notification_timeout_s"),
                             seconds("notification_retry_s"), live_text("cost_explorer_tag_key"),
                             live_text("cost_explorer_tag_value"), tuple(limits), seconds('box_minimum_seconds'),
                             live_text('instance_type'), spot_bid)

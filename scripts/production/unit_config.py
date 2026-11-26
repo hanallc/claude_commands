@@ -87,6 +87,8 @@ def default_port(worktree: Path, selected: AppPort | NoAppPort) -> AppPort | NoA
         return selected
     settings = conf.read("production")
     first, last = settings.whole("unit_port_first"), settings.whole("unit_port_last")
+    if first > last:
+        raise ConfigRefused(f"unit_port_first ({first}) must be at most unit_port_last ({last})")
     reserved = {settings.whole("mac_run_port"), settings.whole("smoke_port")}
     for row in staff.snapshot().rows:
         if row.kind != "unit":

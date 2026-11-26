@@ -1,5 +1,5 @@
 # Render the assignment, path, account, model, usage, and cached counts.
-# assignment.py supplies the assignment text, role, and input payload.
+# The shell or assignment.py supplies the session fields.
 # Direct callers can supply the input payload through stdin.
 
 def trim: gsub("^\\s+|\\s+$"; "");
@@ -104,6 +104,13 @@ def usage($config; $label; $window; $fmt):
     + (if ($reset | type) == "number" then " until " + ($reset | user_time($fmt)) else "" end);
 
 ($ARGS.named.payload // .)
+| (if $ARGS.named | has("render") then $ARGS.named.render else $ARGS.named end) as $render
+| if ($ARGS.named | has("render")) and
+     ($render | type != "object" or
+      any(.assignment, .role, .branch, .counts, .adhoc, .for_you, .rebuild;
+          type != "string" or index("\u0000") != null) or
+      (.for_you | test("\\A(unavailable|[0-9]+)\\z") | not))
+  then error("Invalid session fields") else . end
 | ($ARGS.named.colors // "" | color_config) as $colors
 | (if ($ARGS.named.legacy_home // "") == "1" then
      ($ARGS.named.home_config // "" | try (fromjson | .oauthAccount.emailAddress // "") catch "") as $login
@@ -120,9 +127,9 @@ def usage($config; $label; $window; $fmt):
 | ((.model.display_name // "")
    + (if (.effort.level // "") == "" then "" else " " + .effort.level end)) as $m
 | ([
-     ($ARGS.named.assignment // "" | select(. != "") | color($colors; "role." + $ARGS.named.role)),
+     ($render.assignment // "" | select(. != "") | color($colors; "role." + $render.role)),
      $path,
-     ($ARGS.named.branch // "" | select(. != ""))
+     ($render.branch // "" | select(. != ""))
    ] | join(" | ")) as $first_line
 | ([
      # A label is a note name; an address never reaches the line.
@@ -146,11 +153,11 @@ def usage($config; $label; $window; $fmt):
    ] | join(" | ")) as $second_line
 # assignment.py associates each unit cache with its current session before this selection.
 | ((.session_id // "") as $id
-   | ([$ARGS.named.counts // "" | split("\n")[]
+   | ([$render.counts // "" | split("\n")[]
        | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]
        # Older caches can still use the former heading.
        | ltrimstr("Review: ") | ltrimstr("For you: ") | split(", ")[]] ) as $parts
-   | ((if ($ARGS.named.adhoc // "") == "" then [] else [$ARGS.named.adhoc] end)
+   | ((if ($render.adhoc // "") == "" then [] else [$render.adhoc] end)
       + ($parts | map(select(test("^[0-9]+ (question|change)s?$"))))
       + ($parts | map(select(test("^[0-9]+ (question|change)s?$") | not))))
    | if length == 0 then "" else "Review: " + join(", ") end
@@ -161,9 +168,12 @@ def usage($config; $label; $window; $fmt):
                else (. + " " + $part.word + $part.s)
                  | color($colors; "counts." + ($part.word | gsub(" "; "_")) + (if $part.word == "efficiency" then "" else "s" end))
                end)) as $counts_row
-| ($ARGS.named.for_you // "") as $actions
-| (if $actions == "unavailable" then "For you: Unavailable"
-   elif ($actions | test("^[1-9][0-9]*$")) then
-     "For you: " + "\u001b[1m" + $actions + "\u001b[22m" + (if $actions == "1" then " action" else " actions" end)
-   else "" end) as $action_row
+| ($render.for_you // "") as $actions
+| ([($render.rebuild // ""),
+    (if $actions == "unavailable" then "Unavailable"
+     elif ($actions | test("\\A([1-9][0-9]*|[0-9]+\\+)\\z")) then
+       "\u001b[1m" + $actions + "\u001b[22m" + (if $actions == "1" then " action" else " actions" end)
+     else "" end)]
+   | map(select(. != ""))
+   | if length == 0 then "" else "For you: " + join(", ") end) as $action_row
 | [$first_line, $second_line, $action_row, $counts_row] | map(select(. != "")) | join("\n")

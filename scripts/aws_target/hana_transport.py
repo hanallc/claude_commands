@@ -22,7 +22,7 @@ from typing import Protocol, cast
 from scripts.aws_target import hana_protocol, hana_provider, hana_render, hana_source, s3_presign
 from scripts.aws_target.aws_cli import AwsUnavailable
 from scripts.copies import copies
-from scripts.lib import build_folders, conf
+from scripts.lib import build_folders, conf, copy_record, git_files
 from scripts.lib.atomic_file import write_text_atomic
 
 
@@ -81,6 +81,33 @@ class AcknowledgedCommits:
     commits: tuple[str, ...]
 
 
+class UnmanagedHanaCheckout(hana_protocol.SourceRefused):
+    """The source or its Git directory lies outside the build folders model."""
+
+
+def managed_source_metadata(source: Path) -> Path:
+    """Verify the source and return the main checkout's local Git directory."""
+    try:
+        checkout = git_files.at(source)
+        main = hana_protocol.main_checkout(Path.home()).absolute()
+        common = main / '.git'
+        if (main.resolve() == main and checkout.common_dir == common
+                and git_files.at(main).git_dir == common):
+            actual = Path(os.fsdecode(copies.git(source, 'rev-parse', '--path-format=absolute',
+                                                '--git-common-dir').rstrip(b'\n')))
+            if actual == common and checkout.toplevel == main and checkout.git_dir == common:
+                return common
+            if (actual == common and checkout.git_dir.parent == common / 'worktrees'
+                    and checkout.toplevel.is_relative_to(copy_record.worktree_root())):
+                parts = checkout.toplevel.relative_to(copy_record.worktree_root()).parts
+                if (len(parts) == 3 and parts[0] == hana_protocol.REPOSITORY
+                        and checkout.toplevel == build_folders.worktree_path(*parts).resolve()):
+                    return common
+    except (OSError, ValueError, copies.CopyError) as error:
+        raise UnmanagedHanaCheckout('The Hana source requires a managed checkout and local Git metadata') from error
+    raise UnmanagedHanaCheckout('The Hana source requires a managed checkout and local Git metadata')
+
+
 def path_matches(path: str, pattern: str) -> bool:
     return (path.startswith(pattern) or ('/' + pattern in '/' + path)) if pattern.endswith('/') else fnmatch.fnmatchcase(path, pattern)
 
@@ -90,8 +117,11 @@ def check_inputs(source: Path, configuration: conf.ConfigRead) -> None:
     allowed = configuration.words('source_allowed_ignored')
     ignored = copies.git(source, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
     for raw in ignored.split(b'\0'):
-        if raw and not any(path_matches(os.fsdecode(raw), pattern) for pattern in allowed):
-            raise hana_protocol.SourceRefused('IgnoredInput: source has an ignored path outside source_allowed_ignored')
+        path = os.fsdecode(raw)
+        if path and not any(path_matches(path, pattern) for pattern in allowed):
+            display_path = repr(path)[1:-1]
+            raise hana_protocol.SourceRefused('IgnoredInput: source has an ignored path outside source_allowed_ignored: '
+                                              + display_path)
     if any(row.startswith(b'160000 ') for row in copies.git(source, 'ls-files', '--stage', '-z').split(b'\0')):
         raise hana_protocol.SourceRefused('SubmoduleInput: source contains an unsupported Git link')
     forbidden = configuration.words('source_forbidden_paths')
@@ -186,7 +216,7 @@ class SourceSender:
             commits = tuple(dict.fromkeys((identity.commit, *previous.commits)))[:maximum]
             self.save(AcknowledgedCommits(identity.repository, commits))
 
-    def forget_basis(self, answer: hana_source.MissingBasis) -> None:
+    def forget_basis(self, answer: hana_protocol.MissingBasis) -> None:
         """Forget the repository's basis so the next bundle is complete."""
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.record_path(answer.repository).with_suffix('.lock').open('a') as lock:
@@ -196,14 +226,14 @@ class SourceSender:
     def prepare(self, source: Path, argv: tuple[str, ...], *, environment: Mapping[str, str],
                 staging: ExitStack, features: tuple[str, ...] = ()) -> tuple[hana_protocol.SourceManifest, Callable[[], None]]:
         """Stage the exact source archive until the sender validates the command."""
+        common = managed_source_metadata(source)
         check_inputs(source, self.configuration)
         try:
-            commit = copies.capture_source(source)
+            commit = copies.capture_source(source, index_parent=build_folders.ExplicitBuildParent(common))
         except copies.NestedRepository as error:
             raise hana_protocol.SourceRefused(os.fsencode(str(error)).decode('utf-8', 'backslashreplace')) from error
         check_inputs(source, self.configuration)
         # Use the common Git directory so linked worktrees share acknowledgement history.
-        common = copies.git(source, 'rev-parse', '--path-format=absolute', '--git-common-dir').decode().strip()
         repository = copies.repository_name(source) + '-' + hashlib.sha256(os.fsencode(common)).hexdigest()
         basis = tuple(value for value in self.acknowledged(repository).commits
                       if value != commit and hana_source.git(source, self.limits, 'cat-file', '-t', value,
@@ -211,16 +241,16 @@ class SourceSender:
         files = hana_render.runtime_files(self.checkout, self.configuration)
         abi = _captured_runtime_abi(files)
         manifest, upload = staging.enter_context(
-            self._stage_archive(source, repository, commit, argv, features, environment, basis, files, abi))
+            self._stage_archive(source, common, repository, commit, argv, features, environment, basis, files, abi))
         self.runtime = CapturedRuntime(manifest.bundle_sha256, files, abi)
         return manifest, upload
 
     def retry_complete(self, source: Path, manifest: hana_protocol.SourceManifest,
-                       answer: hana_source.MissingBasis, *, staging: ExitStack
+                       answer: hana_protocol.MissingBasis, *, staging: ExitStack
                        ) -> tuple[hana_protocol.SourceManifest, Callable[[], None]]:
         """Retry the captured commit without reading changed caller working files."""
         hana_protocol.validate_manifest(manifest, self.limits)
-        common = copies.git(source, 'rev-parse', '--path-format=absolute', '--git-common-dir').decode().strip()
+        common = managed_source_metadata(source)
         repository = copies.repository_name(source) + '-' + hashlib.sha256(os.fsencode(common)).hexdigest()
         if repository != manifest.repository or answer.repository != repository:
             raise hana_protocol.SourceRefused('RetryRepositoryMismatch: source retry belongs to another repository')
@@ -228,20 +258,19 @@ class SourceSender:
         if not isinstance(runtime, CapturedRuntime) or runtime.bundle_sha256 != manifest.bundle_sha256:
             raise hana_protocol.SourceRefused('The original Hana runtime is unavailable for source repair')
         self.forget_basis(answer)
-        return staging.enter_context(self._stage_archive(source, repository, manifest.commit, manifest.argv,
+        return staging.enter_context(self._stage_archive(source, common, repository, manifest.commit, manifest.argv,
             manifest.features, dict(manifest.environment), (), runtime.files, runtime.abi))
 
     @contextmanager
-    def _stage_archive(self, source: Path, repository: str, commit: str, argv: tuple[str, ...], features: tuple[str, ...],
+    def _stage_archive(self, source: Path, common: Path, repository: str, commit: str, argv: tuple[str, ...], features: tuple[str, ...],
                        environment: Mapping[str, str], basis: tuple[str, ...],
                        runtime: tuple[hana_render.RenderedGuestFile, ...], abi: int
                        ) -> Generator[tuple[hana_protocol.SourceManifest, Callable[[], None]]]:
-        common = copies.git(source, 'rev-parse', '--path-format=absolute', '--git-common-dir').decode().strip()
-        with build_folders.tool_folder('hana-source-bundle') as temporary:
+        with build_folders.tool_folder('hana-source-bundle', parent=common) as temporary:
             # This bare metadata repository isolates bundle refs from the caller's refs.
             _ = hana_source.git(temporary, self.limits, 'init', '--bare', '--quiet',
                                 '--object-format=' + ('sha256' if len(commit) == 64 else 'sha1'))
-            objects = Path(common) / 'objects'
+            objects = common / 'objects'
             alternate = temporary / 'objects/info/alternates'
             _ = alternate.write_text(str(objects) + '\n')
             _ = hana_source.git(temporary, self.limits, 'update-ref', 'refs/heads/hana-source', commit)

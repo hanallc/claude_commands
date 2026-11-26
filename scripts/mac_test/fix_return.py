@@ -30,7 +30,7 @@ unchanged. A commit record finishes the renames, so the tree has every fix.
 Usage:
   fix_return.py finish --repo-root DIR
   fix_return.py copy --repo-root DIR --owner PID < cargo-metadata.json
-  fix_return.py return-copy --repo-root DIR --folder DIR
+  fix_return.py return-copy --repo-root DIR --folder DIR [--allocation-id ID]
 """
 
 from __future__ import annotations
@@ -56,6 +56,7 @@ import subprocess
 import sys
 from typing import Literal, TypedDict, cast
 
+from scripts.buildlog import repository, store
 from scripts.lib import berth_board
 
 
@@ -413,10 +414,11 @@ def apply_fix(repo_root: Path, staging: Path, changes: MirrorChanges,
     return FixApplied(changes.changed, changes.removed, withheld)
 
 
-COPY_NAME = "verify-lint-copy"
+COPY_NAME = repository.LINT_COPY_FOLDER_STEM
 OWNER_NAME = "owner"
+ALLOCATION_NAME = repository.LINT_COPY_ALLOCATION_FILE
 SENT_NAME = "sent.json"
-TREE_NAME = "tree"
+TREE_NAME = repository.LINT_COPY_TREE_NAME
 FileStat = tuple[int, int, int, int]
 
 
@@ -433,6 +435,7 @@ class CopyMade:
     tree: Path
     manifest: Path
     target: Path
+    allocation_id: str
 
 
 @dataclass(frozen=True)
@@ -497,28 +500,42 @@ def copy_parent(target: Path) -> Path:
     return (target if target.name == "target" else target / "target") / "package"
 
 
-def claim_folder(parent: Path, owner: int) -> Path:
-    """Take the copy folder in parent.
+@dataclass(frozen=True)
+class ClaimedLintCopy:
+    """A lint copy made by this process."""
 
-    The name is the same in each run, so cargo finds the copy's earlier build
-    of the workspace members fresh. A folder that a stopped run left is
-    deleted. A folder that a live run owns gives a name with this owner.
-    """
+    folder: Path
+    directory: os.stat_result
+    process: int
+    allocation_id: str
+
+
+_CREATED_LINT_COPIES: dict[Path, ClaimedLintCopy] = {}
+
+
+def claim_folder(parent: Path, owner: int) -> ClaimedLintCopy:
+    """Create a lint copy and keep folders from previous claims."""
     parent.mkdir(parents=True, exist_ok=True)
-    staged = parent / f".{COPY_NAME}-{owner}.new"
-    shutil.rmtree(staged, ignore_errors=True)
-    for name in (COPY_NAME, f"{COPY_NAME}-{owner}"):
+    old_stage = parent / f".{COPY_NAME}-{owner}.new"
+    if not old_stage.is_symlink() and old_stage.is_dir():
+        report_retained_lint_copy(old_stage, "an earlier lint claim used this path")
+    allocation_id = secrets.token_hex(repository.LINT_COPY_ALLOCATION_BYTES)
+    for name in repository.lint_copy_folder_names(str(owner), allocation_id):
         folder = parent / name
-        if folder.exists() and not owner_alive(folder, owner):
-            shutil.rmtree(folder)
-        staged.mkdir()
-        _ = (staged / OWNER_NAME).write_text(str(owner), encoding="utf-8")
         try:
-            os.rename(staged, folder)
-        except OSError:
-            shutil.rmtree(staged, ignore_errors=True)
+            folder.mkdir(mode=0o700)
+        except FileExistsError:
+            if not owner_alive(folder, owner):
+                report_retained_lint_copy(folder, "an earlier lint claim used this path")
             continue
-        return folder
+        try:
+            _ = (folder / OWNER_NAME).write_text(str(owner), encoding="utf-8")
+            _ = (folder / ALLOCATION_NAME).write_text(allocation_id, encoding="utf-8")
+            directory = folder.lstat()
+        except BaseException:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
+        return ClaimedLintCopy(folder, directory, os.getpid(), allocation_id)
     raise OSError(f"{parent / COPY_NAME} is in use by another lint run")
 
 
@@ -535,9 +552,10 @@ def make_copy(repo_root: Path, metadata: CargoMetadata, owner: int,
     if not workspace.is_relative_to(root):
         return FixFailed(f"the cargo workspace {workspace} is not inside {root}")
     try:
-        folder = claim_folder(copy_parent(Path(metadata["target_directory"])), owner)
+        claimed = claim_folder(copy_parent(Path(metadata["target_directory"])), owner)
     except OSError as error:
         return FixFailed(str(error))
+    folder = claimed.folder
     tree = folder / TREE_NAME
     try:
         sent: dict[str, FileStat] = {}
@@ -557,16 +575,40 @@ def make_copy(repo_root: Path, metadata: CargoMetadata, owner: int,
                 raise OSError(f"{relative} changed while the copy was made")
             sent[relative] = before
         _ = (folder / SENT_NAME).write_text(json.dumps(sent), encoding="utf-8")
-    except OSError as error:
+        source_key = repository.repository_key(str(root))
+        if source_key != store.UNKNOWN_IDENTITY:
+            marker = folder / repository.LINT_COPY_REPOSITORY_KEY_FILE
+            _ = marker.write_text(source_key + "\n", encoding="utf-8")
+    except (OSError, ValueError) as error:
         shutil.rmtree(folder, ignore_errors=True)
         return FixFailed(str(error))
+    _CREATED_LINT_COPIES[folder.absolute()] = claimed
     return CopyMade(folder, tree, tree / workspace.relative_to(root) / "Cargo.toml",
-                    Path(metadata["target_directory"]))
+                    Path(metadata["target_directory"]), claimed.allocation_id)
 
 
 def read_sent(folder: Path) -> dict[str, FileStat]:
-    values = cast(dict[str, list[int]], json.loads((folder / SENT_NAME).read_text(encoding="utf-8")))
-    return {relative: (status[0], status[1], status[2], status[3]) for relative, status in values.items()}
+    tree = folder / TREE_NAME
+    if tree.is_symlink() or not tree.is_dir():
+        raise ValueError("the lint copy has no real source tree")
+    snapshot = folder / SENT_NAME
+    descriptor = os.open(snapshot, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, encoding="utf-8") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("the lint copy snapshot is not a regular file")
+        values = cast(object, json.load(stream))
+    if not isinstance(values, dict):
+        raise ValueError("the lint copy snapshot is invalid")
+    sent: dict[str, FileStat] = {}
+    for relative, status in cast(dict[str, object], values).items():
+        path = Path(relative)
+        if (not path.parts or path.is_absolute() or ".." in path.parts or ".git" in path.parts
+                or not isinstance(status, list) or len(cast(list[object], status)) != 4
+                or any(type(value) is not int for value in cast(list[object], status))):
+            raise ValueError("the lint copy snapshot is invalid")
+        size, modified, inode, mode = cast(list[int], status)
+        sent[relative] = size, modified, inode, mode
+    return sent
 
 
 def copy_changes(repo_root: Path, tree: Path, sent: dict[str, FileStat]) -> MirrorChanges:
@@ -589,10 +631,41 @@ def copy_changes(repo_root: Path, tree: Path, sent: dict[str, FileStat]) -> Mirr
     return MirrorChanges(tuple(sorted(changed)), tuple(sorted(removed)))
 
 
-def return_copy(repo_root: Path, folder: Path, board_reader: BoardReader | None = None) -> FixResult:
-    """Bring the held changes of the copy back, then delete the copy."""
-    root = repo_root.resolve()
+def close_lint_copy(folder: Path, reason: str) -> None:
+    """Remove a lint copy made here or report the folder for manual removal."""
+    claimed = _CREATED_LINT_COPIES.pop(folder.absolute(), None)
+    if claimed is not None and claimed.process == os.getpid():
+        try:
+            current = folder.lstat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            pass
+        else:
+            if os.path.samestat(current, claimed.directory):
+                shutil.rmtree(folder, ignore_errors=True)
+                if not os.path.lexists(folder):
+                    return
+    report_retained_lint_copy(folder, reason)
+
+
+def report_retained_lint_copy(folder: Path, reason: str) -> None:
+    print(f"kept for a manual removal list: {folder} (fix_return, {reason})", file=sys.stderr)
+
+
+def return_copy(repo_root: Path, folder: Path, allocation_id: str | None,
+                board_reader: BoardReader | None = None) -> FixResult:
+    """Bring back the held changes and close the lint copy."""
+    if allocation_id is not None:
+        try:
+            recorded_id = (folder / ALLOCATION_NAME).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            recorded_id = ""
+        if not recorded_id or recorded_id != allocation_id:
+            report_retained_lint_copy(folder, "the lint copy allocation differs")
+            return FixRefused("the lint copy allocation differs")
     try:
+        root = repo_root.resolve()
         sent = read_sent(folder)
 
         def unchanged() -> bool:
@@ -609,7 +682,7 @@ def return_copy(repo_root: Path, folder: Path, board_reader: BoardReader | None 
     except (OSError, ValueError, KeyError, IndexError) as error:
         return FixFailed(str(error))
     finally:
-        shutil.rmtree(folder, ignore_errors=True)
+        close_lint_copy(folder, "the lint copy return ended")
 
 
 def report_copy(result: FixResult) -> None:
@@ -633,6 +706,10 @@ def main(arguments: Sequence[str]) -> int:
     returning = commands.add_parser("return-copy", help="bring the held changes of the copy back")
     _ = returning.add_argument("--repo-root", required=True)
     _ = returning.add_argument("--folder", required=True)
+    _ = returning.add_argument("--allocation-id")
+    dropping = commands.add_parser("drop-copy", help="close the lint copy without returning changes")
+    _ = dropping.add_argument("--repo-root", required=True)
+    _ = dropping.add_argument("--folder", required=True)
     parsed = parser.parse_args(arguments)
     command = cast(str, parsed.command)
     if command == "copy":
@@ -647,10 +724,14 @@ def main(arguments: Sequence[str]) -> int:
         if isinstance(made, InPlace):
             print("in-place")
         else:
-            print(f"copy\n{made.folder}\n{made.tree}\n{made.manifest}\n{made.target}")
+            print(f"copy\n{made.folder}\n{made.tree}\n{made.manifest}\n{made.target}\n{made.allocation_id}")
+        return 0
+    if command == "drop-copy":
+        close_lint_copy(Path(cast(str, parsed.folder)), "the lint copy was dropped")
         return 0
     if command == "return-copy":
-        result = return_copy(Path(cast(str, parsed.repo_root)), Path(cast(str, parsed.folder)))
+        result = return_copy(Path(cast(str, parsed.repo_root)), Path(cast(str, parsed.folder)),
+                             cast(str | None, parsed.allocation_id))
         report_copy(result)
         return 0 if fix_passed(result) else 1
     try:

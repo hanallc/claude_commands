@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 from contextlib import ExitStack
+import contextvars
 from dataclasses import dataclass
 import hashlib
 import importlib.util
@@ -79,6 +80,15 @@ def source_stamp(path: str) -> SourceStamp | MissingSource:
     return SourceStamp(status.st_mtime_ns, status.st_size, status.st_ino)
 
 
+def module_source_path(module: object) -> str:
+    """Read the source path without executing a lazy module."""
+    if not isinstance(module, ModuleType):
+        return ""
+    attributes = cast(dict[str, object], object.__getattribute__(module, "__dict__"))
+    path = attributes.get("__file__")
+    return path if isinstance(path, str) else ""
+
+
 def installation_roots() -> tuple[str, ...]:
     """Folders of the Python installation, whose files do not change while the helper runs."""
     paths = sysconfig.get_paths()
@@ -105,9 +115,8 @@ class LoadedSources:
         for name, module in list(sys.modules.items()):
             if name == "__main__" or name in self.untracked:
                 continue
-            path = getattr(module, "__file__", None)
-            if (not isinstance(path, str) or not path.endswith(".py")
-                    or os.path.realpath(path).startswith(self.installation)):
+            path = module_source_path(module)
+            if not path.endswith(".py") or os.path.realpath(path).startswith(self.installation):
                 self.untracked.add(name)
             elif path not in self.stamps:
                 stamp = source_stamp(path)
@@ -119,8 +128,13 @@ class LoadedSources:
         if all(source_stamp(path) == stamp for path, stamp in self.stamps.items()):
             return
         for name, module in list(sys.modules.items()):
-            if name != "__main__" and getattr(module, "__file__", None) in self.stamps:
+            if name != "__main__" and module_source_path(module) in self.stamps:
                 del sys.modules[name]
+                # A namespace package has no source, so it stays loaded; drop its
+                # binding too, or `from package import name` returns the old module.
+                parent, _, child = name.rpartition(".")
+                if parent in sys.modules and getattr(sys.modules[parent], child, None) is module:
+                    delattr(sys.modules[parent], child)
         programs.clear()
         self.stamps.clear()
         importlib.invalidate_caches()
@@ -229,11 +243,18 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
                 _ = forwarded.seek(0)
                 os.environ["VERIFY_RESULT_ENVIRONMENT_FD"] = str(forwarded.fileno())
             if call.program not in programs:
-                programs[call.program] = load_program(call.program)
+                try:
+                    programs[call.program] = load_program(call.program)
+                except SystemExit:
+                    # A module that exits at import time runs in its own process from now on.
+                    programs[call.program] = SeparateProcess()
+                    raise
             program = programs[call.program]
             if isinstance(program, LoadedProgram):
                 try:
-                    value = program.invoke()
+                    # A ContextVar value lives for one command, as in its own process: each call
+                    # runs in a copy of the helper's context, and the copy ends with the call.
+                    value = contextvars.copy_context().run(program.invoke)
                     status = str(value if isinstance(value, int) else 0)
                 except SystemExit as exit_request:
                     value = exit_request.code
@@ -243,8 +264,9 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
                 except Exception:
                     traceback.print_exc()
                     status = "1"
-        except Exception:
-            # An import or protocol failure uses the original process path.
+        except (Exception, SystemExit):
+            # An import or protocol failure uses the original process path. A module that
+            # exits at import time ends only its call, so the caller runs it in its own process.
             status = "fallback"
         finally:
             stdout.flush()

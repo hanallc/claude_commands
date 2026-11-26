@@ -25,6 +25,7 @@ from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
 )
 from scripts.statusline import counts_row
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 AT = "2026-10-04T11:00"
@@ -34,7 +35,7 @@ AT = "2026-10-04T11:00"
 def canonical_outstanding(root: Path, entries: list[dict[str, object]]) -> Generator[Path]:
     environment = {**source_environment(root / "sources"), "HOME": str(root / "home"),
                    "USER_ZONE": "America/Los_Angeles",
-                   "HERDR_BIN": "/nonexistent/herdr"}
+                   "HERDR_BIN": MISSING_HERDR_BIN}
     with (isolated_staff_file(root / "staff.json", environment),
           mock.patch.dict(os.environ, environment), production_paths(environment)):
         folder = root / "issues"
@@ -138,7 +139,7 @@ class QuestionLibraryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             environment = {**source_environment(root / "sources"), "HOME": str(root),
-                           "HERDR_BIN": "/nonexistent/herdr", "SHOWRUNNER_STATE_DIR": str(root / "showrunner")}
+                           "HERDR_BIN": MISSING_HERDR_BIN, "SHOWRUNNER_STATE_DIR": str(root / "showrunner")}
             with (isolated_staff_file(root / "staff.json", environment),
                   mock.patch.dict(os.environ, environment), isolated_source_readers()):
                 owner = fixture_member("showrunner", name="old-display-name")
@@ -161,11 +162,30 @@ class QuestionLibraryTests(unittest.TestCase):
                 self.assertIn("unavailable", errors.getvalue())
                 self.assertIn("missing-owner", errors.getvalue())
 
+    def test_deferred_time_skips_expired_deadlines_in_the_repeated_dst_hour(self) -> None:
+        entries: list[dict[str, object]] = [
+            {"since": AT, "text": "Choose the compiler", "question": "Which compiler?",
+             "after": "2026-11-01T02:05"},
+            {"since": AT, "text": "Choose the layout", "question": "Which layout?",
+             "after": "2026-11-01T01:45"},
+        ]
+        zone = ZoneInfo("America/Los_Angeles")
+        with (tempfile.TemporaryDirectory() as scratch,
+              canonical_outstanding(Path(scratch), entries) as path):
+            for fold, hour, minute in ((0, 1, 45), (1, 2, 5)):
+                now = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=fold)
+                clock = mock.Mock(now=mock.Mock(return_value=now))
+                with self.subTest(fold=fold), mock.patch.object(showrunner_footer, "datetime", clock):
+                    deadline = showrunner_footer.deferred_until([path.stem], zone.key)
+                    assert deadline is not None
+                    expected = datetime(2026, 11, 1, hour, minute, tzinfo=zone)
+                    self.assertEqual(deadline.timestamp(), expected.timestamp())
+
     def test_row_reports_missing_owner_and_keeps_readable_efficiency_count(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             environment = {**source_environment(root / "sources"), "HOME": str(root),
-                           "HERDR_BIN": "/nonexistent/herdr", "USER_ZONE": "UTC"}
+                           "HERDR_BIN": MISSING_HERDR_BIN, "USER_ZONE": "UTC"}
             with (isolated_staff_file(root / "staff.json", environment),
                   mock.patch.dict(os.environ, environment), isolated_source_readers()):
                 owner = fixture_member("showrunner", name="display-owner")
@@ -193,7 +213,7 @@ class QuestionLibraryTests(unittest.TestCase):
     def test_switch_and_outstanding_paths_keep_the_fixed_staff_id(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
-            environment = {"HOME": str(root), "HERDR_BIN": "/nonexistent/herdr",
+            environment = {"HOME": str(root), "HERDR_BIN": MISSING_HERDR_BIN,
                            "SHOWRUNNER_STATE_DIR": str(root / "showrunner")}
             with (isolated_staff_file(root / "staff.json", environment),
                   mock.patch.dict(os.environ, environment)):
@@ -234,7 +254,7 @@ class QuestionLibraryTests(unittest.TestCase):
     def test_counts_and_deferred_time_share_one_question_staff_context(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
-            environment = {**source_environment(root / "sources"), "HOME": str(root), "HERDR_BIN": "/nonexistent/herdr"}
+            environment = {**source_environment(root / "sources"), "HOME": str(root), "HERDR_BIN": MISSING_HERDR_BIN}
             environment["USER_ZONE"] = "UTC"
             environment["NEXT_STATE_DIR"] = str(root / "next")
             with (isolated_staff_file(root / "staff.json", environment),

@@ -52,10 +52,26 @@ class RecoveryOwner(TypedDict):
     unit: str
 
 
+class RestartFailureNotice(TypedDict):
+    account: str
+    generation: str
+    session: str
+    reference: str
+    delivered: NotRequired[bool]
+
+
+@dataclass
+class ExitRecovery:
+    identity: str
+    notice: RestartFailureNotice | None
+    managed: bool = False
+
+
 class DownOutage(TypedDict):
     first_seen: str
     job: NotRequired[RecoveryJob]
     alert_context: NotRequired[RecoveryOwner]
+    restart_notice: NotRequired[RestartFailureNotice]
 
 
 @dataclass(frozen=True)
@@ -117,6 +133,16 @@ def _read_state() -> dict[str, DownOutage]:
                 if not isinstance(production, str) or not isinstance(unit, str):
                     raise ValueError("invalid watchdog recovery owner")
                 outage["alert_context"] = RecoveryOwner(production=production, unit=unit)
+            notice = fields.get("restart_notice")
+            if isinstance(notice, dict):
+                details = cast(dict[str, object], notice)
+                label, generation = details.get("account"), details.get("generation")
+                session, reference = details.get("session"), details.get("reference")
+                if not (isinstance(label, str) and isinstance(generation, str)
+                        and isinstance(session, str) and isinstance(reference, str)):
+                    raise ValueError("invalid watchdog restart notice")
+                outage["restart_notice"] = RestartFailureNotice(account=label, generation=generation,
+                    session=session, reference=reference, delivered=details.get("delivered") is True)
             job = fields.get("job")
             if isinstance(job, dict):
                 job_fields = cast(dict[str, object], job)
@@ -187,29 +213,37 @@ def _restart(label: str, identity: str, source: str) -> str:
         member = record.by_member_reference(identity) or record.by_member_reference(source) or record.by_path(identity)
         if member is None:
             return f"{identity}: unknown staff member"
-        identity = member.current_session
-        parent = record.parent_of(member)
-        if member.kind == "unit" and parent is not None:
-            match live_units.listing_in(parent.name, _fresh_units()).checked_unit(member.name):
-                case unit_lookup.UnknownUnit(reason=reason):
-                    return reason
-                case unit_lookup.ProvedLiveUnit():
-                    return ""
-                case unit_lookup.ProvedAbsentUnit():
-                    pass
-        live = sessions.session_liveness(identity)
-        if isinstance(live, sessions.SessionLivenessUnknown):
-            return live.reason
-        if isinstance(live, sessions.LiveSessionProcess):
-            return ""  # Another recovery already brought this conversation back.
-        resume = cast(ResumeUnit, import_module("scripts.agents.stop_resume").resume)
-        result = resume(identity, why="unit watchdog recovery", to=label)
+        if not isinstance(staff.row_activity(member.id), staff.RowAvailable):
+            return "account move in progress"
+        with staff.slot_operation(member.id, member.name):
+            record = staff.snapshot()
+            current = record.by_id(member.id)
+            if current is None:
+                return "staff member no longer exists"
+            member = current
+            identity = member.current_session
+            parent = record.parent_of(member)
+            if member.kind == "unit" and parent is not None:
+                match live_units.listing_in(parent.name, _fresh_units()).checked_unit(member.name):
+                    case unit_lookup.ProvedAbsentUnit() | unit_lookup.NonAgentPaneHolders():
+                        pass
+                    case unit_lookup.UnknownUnit(reason=reason):
+                        return reason
+                    case unit_lookup.ProvedLiveUnit():
+                        return ""
+            live = sessions.session_liveness(identity)
+            if isinstance(live, sessions.SessionLivenessUnknown):
+                return live.reason
+            if isinstance(live, sessions.LiveSessionProcess):
+                return ""  # Another recovery already brought this conversation back.
+            resume = cast(ResumeUnit, import_module("scripts.agents.stop_resume").resume)
+            result = resume(identity, why="unit watchdog recovery", to=label)
         if isinstance(result, stop_results.ClaudeUp):
             return ""
         return (result.reason
                 if isinstance(result, stop_results.ResumeFailed)
                 else f"{identity}: no pane launch")
-    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+    except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
         return str(error)
 
 
@@ -264,7 +298,7 @@ def _live_account(production_name: str, unit: str) -> str:
             return accounts.claude_config_label(identity.path)
         case unit_lookup.ProvedLiveUnit():
             raise OSError("the live owner is not Claude")
-        case unit_lookup.ProvedAbsentUnit():
+        case unit_lookup.ProvedAbsentUnit() | unit_lookup.NonAgentPaneHolders():
             return ""
         case unit_lookup.UnknownUnit(reason=reason):
             raise OSError(reason)
@@ -282,7 +316,7 @@ def _recovery_result(job: RecoveryJob, now: datetime) -> RecoveryStillRunning | 
     return RecoveryFinished(failure, result)
 
 
-def run(now: datetime, *, dry_run: bool) -> list[str]:
+def run(now: datetime, *, dry_run: bool, exited: ExitRecovery | None = None) -> list[str]:
     """Serialize direct calls with the same state lock as the scheduled pass."""
     if not role_map.is_role_map_host():
         return []
@@ -296,12 +330,19 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
         with herdr.process_snapshot():
             token = _recovery_observations.set(cache(_fresh_units))
             try:
-                return _run(now, dry_run=dry_run)
+                return _run(now, dry_run=dry_run, exited=exited)
             finally:
                 _recovery_observations.reset(token)
 
 
-def _run(now: datetime, *, dry_run: bool) -> list[str]:
+def _retain_exit(exited: ExitRecovery, outage: DownOutage, state: dict[str, DownOutage]) -> None:
+    if exited.notice is not None and "restart_notice" not in outage:
+        outage["restart_notice"] = exited.notice
+        _write_state(state)
+    exited.managed = True
+
+
+def _run(now: datetime, *, dry_run: bool, exited: ExitRecovery | None = None) -> list[str]:
     """Check local production units, under the watcher's lock."""
     lines: list[str] = []
     runners = showrunners.ShowrunnerDiscovery()
@@ -311,6 +352,9 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
     try:
         state = _read_state()
         before = deepcopy(state)
+        if exited is not None and (outage := state.get(exited.identity)) is not None and "job" in outage:
+            exited.managed = True
+            _retain_exit(exited, outage, state)
         sources = _sources(lines.append)
         runners = showrunners.registered_showrunners()
         observed_at = time.time()
@@ -332,10 +376,13 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                         source = sources.get((runner["name"], unit))
                         if source is None:
                             continue
+                        if isinstance(source, RecoverySource) and not isinstance(
+                                staff.row_activity(source.identity), staff.RowAvailable):
+                            continue
                         owner = found.owner
                         if not isinstance(owner, unit_lookup.ProvedLiveUnit):
                             owner = fresh_production().checked_unit(unit)
-                        if isinstance(owner, unit_lookup.UnknownUnit):
+                        if isinstance(owner, unit_lookup.UnknownUnit) and not isinstance(owner, unit_lookup.NonAgentPaneHolders):
                             raise OSError(owner.reason)
                         if isinstance(source, NoRecovery):
                             if not dry_run:
@@ -351,7 +398,7 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                                 claude = live
                             case unit_lookup.ProvedLiveUnit():
                                 raise OSError("the live owner is not Claude")
-                            case unit_lookup.ProvedAbsentUnit():
+                            case unit_lookup.ProvedAbsentUnit() | unit_lookup.NonAgentPaneHolders():
                                 claude = unit_lookup.ClaudeNotRunning()
                         if isinstance(claude, unit_lookup.LiveClaude):
                             outage = state.get(claude.session_id)
@@ -361,6 +408,8 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                                 if not restored:
                                     claude = unit_lookup.ClaudeNotRunning()
                             if isinstance(claude, unit_lookup.LiveClaude):
+                                if exited is not None and source.session["session_id"] == exited.identity:
+                                    exited.managed = True
                                 if not dry_run:
                                     _ = outage_alerts.clear(claude.session_id, observed_at)
                                 if outage is not None and not dry_run:
@@ -375,9 +424,9 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                         outage = state.get(key)
                         if outage is None:
                             outage = DownOutage(first_seen=now.isoformat())
-                            retained[key] = outage
-                            continue
                         retained[key] = outage
+                        if exited is not None and key == exited.identity and not exited.managed:
+                            _retain_exit(exited, outage, retained)
                         if datetime.fromisoformat(outage["first_seen"]) >= now:
                             continue
                         if dry_run:
@@ -390,6 +439,12 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                                 continue
                             failure = outcome.failure
                             restored = _live_account(runner["name"], unit)
+                            notice = outage.get("restart_notice")
+                            if not restored and notice is not None and not notice.get("delivered"):
+                                send = cast(Callable[[str, RestartFailureNotice], bool],
+                                            import_module("scripts.agents.stop_resume").send_restart_failure)
+                                if send(key, notice):
+                                    notice["delivered"] = True
                             # Keep the result and job if the fresh read is unreadable.
                             outcome.result_path.unlink(missing_ok=True)
                             _ = outage.pop("job")

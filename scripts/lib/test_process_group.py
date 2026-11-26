@@ -19,12 +19,15 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from typing import cast, override
 from unittest.mock import MagicMock, patch
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
+from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.shell_test_support import refusing_bash_startup, shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 
@@ -150,7 +153,7 @@ def unguarded_group_signals(scripts: Path) -> list[str]:
                     lines.add(number)
         if relative == Path("lib/process_group.py"):
             allowed = next((node for node in ast.walk(ast.parse(source))
-                            if isinstance(node, ast.FunctionDef) and node.name == "send_process_group"), None)
+                            if isinstance(node, ast.FunctionDef) and node.name == "_send_checked_group"), None)
             if allowed is not None:
                 send_line = next((node.lineno for node in ast.walk(allowed)
                                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -189,6 +192,16 @@ class ProcessGroupTests(PrivateGroupFixture):
             process_group.send_process_group(child.pid, signal.SIGTERM)
             send.assert_called_once_with(child.pid, signal.SIGTERM)
 
+    def test_only_the_group_leader_can_terminate_its_own_group(self) -> None:
+        pid = os.getpid()
+        with patch.object(os, "killpg") as send, patch.object(os, "getpgrp", return_value=pid + 1):
+            with self.assertRaises(ValueError):
+                process_group.terminate_owned_process_group()
+            send.assert_not_called()
+        with patch.object(os, "killpg") as send, patch.object(os, "getpgrp", return_value=pid):
+            process_group.terminate_owned_process_group()
+            send.assert_called_once_with(pid, signal.SIGTERM)
+
     def test_cli_refuses_invalid_ids_without_sending_a_signal(self) -> None:
         invalid: tuple[object, ...] = (MagicMock(), True, False, 0, 1, -2, os.getpgrp())
         with patch.object(os, "killpg") as send, redirect_stderr(io.StringIO()):
@@ -207,9 +220,42 @@ class ProcessGroupTests(PrivateGroupFixture):
             send.assert_called_once_with(child.pid, signal.SIGKILL)
 
 
+def process_ended(pid: int) -> bool:
+    """Wait a short time for a process to leave or become a zombie."""
+    deadline = time.monotonic() + process_group.STOP_WAIT_SECONDS + 5
+    while time.monotonic() < deadline:
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
+                               timeout=TEST_HANG_GUARD_SECS, check=False).stdout.strip()
+        if not state or state.startswith("Z"):
+            return True
+        time.sleep(.05)
+    return False
+
+
+class RunProcessGroupTests(unittest.TestCase):
+    def test_a_finished_command_returns_at_once_and_leaves_no_child(self) -> None:
+        started = time.monotonic()
+        done = process_group.run_process_group(
+            ["sh", "-c", r"sleep 30 & echo $!; printf 'said \377' >&2"], timeout=TEST_HANG_GUARD_SECS)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual((done.returncode, done.stderr), (0, "said \ufffd"))
+        self.assertTrue(process_ended(int(done.stdout)))
+
+    def test_a_timeout_stops_the_command_and_its_child(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        record = folder / "child"
+        written = shlex.quote(str(folder / "child.new"))
+        with self.assertRaises(subprocess.TimeoutExpired) as stopped:
+            _ = process_group.run_process_group(
+                ["sh", "-c", f"sleep 30 & echo $! > {written}; mv {written} {shlex.quote(str(record))}; echo waiting; wait"],
+                timeout=15)
+        self.assertEqual(cast(str, stopped.exception.output), "waiting\n")
+        self.assertTrue(process_ended(int(record.read_text())))
+
+
 class ShellProcessGroupTests(PrivateGroupFixture):
     root: Path = Path()
-    environment: dict[str, str] = {}
+    fixture_environment: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
@@ -224,9 +270,13 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         copy_startup(self.root)
         home = self.root / "home"
         home.mkdir()
-        self.environment = {**os.environ, **config_environment(self.root / "config"),
-                            "HOME": str(home), **interpreter_cache_environment(self.root / "cache"),
-                            "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
+        self.fixture_environment = {**config_environment(self.root / "config"),
+                                    "HOME": str(home), **interpreter_cache_environment(self.root / "cache"),
+                                    "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
+
+    @property
+    def environment(self) -> dict[str, str]:
+        return {**verify_test_environment(), **self.fixture_environment}
 
     def release_child_group(self, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
         board = self.root / "scripts/direct/board.sh"
@@ -268,10 +318,12 @@ class ShellProcessGroupTests(PrivateGroupFixture):
             + f"raise SystemExit({status})\n")
 
     def cancel_step(self, function: str, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
-        source = (self.root / "scripts/direct/verify.sh").read_text()
-        definition = re.search(rf"^{function}\(\) \{{\n.*?^\}}", source, re.MULTILINE | re.DOTALL)
-        self.assertIsNotNone(definition)
-        assert definition is not None
+        verify = self.root / "scripts/direct/verify.sh"
+        definitions = shell_functions(
+            verify, "first_free_fd", "save_verify_exit_stderr", "finish_exit_diagnostics", "wait_for_verify_child",
+            "wait_for_verify_step_group", "finish_verify_temp_allocation", "close_verify_session_temp",
+            "stop_verify_step", function,
+        )
         watch = self.root / "watch"
         watch.mkdir(exist_ok=True)
         driver = """
@@ -289,18 +341,34 @@ note_event() { :; }
 interrupt_hold_wait() { :; }
 verify_cleanup() { :; }
 final_pass_finish() { :; }
+finish_verify_run() { :; }
+stop_interrupted_run_log() { :; }
+"""
+        if function == "verify_interrupted":
+            driver += """
+VERIFY_START_DIR="$4"
+PY="$VERIFY_START_DIR/../lib/py"
+save_verify_exit_stderr
+exit_diagnostics="$TREE_WATCH_DIR/exit-diagnostics"
 """
         return subprocess.run(
-            ["bash", "-c", driver + definition.group() + f"\n{function} 15\n", "fixture",
-             str(child.pid), str(self.root / "scripts/direct/step_record.py"), str(watch)],
+            ["bash", "-c", definitions + driver + f"\n{function} 15\n", "fixture",
+             str(child.pid), str(verify.with_name("step_record.py")), str(watch),
+             str(Path(__file__).resolve().parents[1] / "direct")],
             env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def test_copied_verify_cancellation_uses_the_local_helper(self) -> None:
         self.fake_helper(0)
         child = self.private_child()
-        for function, status, signum in (("cancel_tree_run", 77, "KILL"), ("verify_interrupted", 143, "15")):
-            with self.subTest(function=function):
+        startup = refusing_bash_startup(self.root)
+        for function, status, signum, bash_env in (
+            ("cancel_tree_run", 77, "KILL", ""),
+            ("verify_interrupted", 143, "15", ""),
+            ("cancel_tree_run", 77, "KILL", str(startup)),
+        ):
+            with (self.subTest(function=function, caller_startup=bool(bash_env)),
+                  patch.dict(os.environ, {"BASH_ENV": bash_env})):
                 result = self.cancel_step(function, child)
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 self.assertEqual((self.root / "helper-arguments").read_text(), f"{child.pid} {signum}")
@@ -343,7 +411,7 @@ final_pass_finish() { :; }
     def test_verify_forward_uses_its_local_helper_without_an_individual_signal(self) -> None:
         self.fake_helper(0)
         forward = self.forward()
-        with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
+        with patch.dict(os.environ, self.environment, clear=True), patch.object(os, "kill") as individual:
             forward(signal.SIGTERM, None)
         individual.assert_not_called()
         self.assertTrue((self.root / "helper-arguments").read_text().endswith(f" {signal.SIGTERM}"))
@@ -355,7 +423,7 @@ final_pass_finish() { :; }
                 self.fake_helper(2)
                 if failure == "missing":
                     (self.root / "scripts/lib/process_group.py").unlink()
-                with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
+                with patch.dict(os.environ, self.environment, clear=True), patch.object(os, "kill") as individual:
                     with self.assertRaises(SystemExit) as refused:
                         forward(signal.SIGTERM, None)
                 individual.assert_not_called()
@@ -365,7 +433,7 @@ final_pass_finish() { :; }
     def test_verify_only_uses_individual_fallback_for_a_missing_group(self) -> None:
         self.fake_helper(3)
         forward = self.forward()
-        with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
+        with patch.dict(os.environ, self.environment, clear=True), patch.object(os, "kill") as individual:
             forward(signal.SIGTERM, None)
         arguments = (self.root / "helper-arguments").read_text().split()
         individual.assert_called_once_with(int(arguments[0]), signal.SIGTERM)

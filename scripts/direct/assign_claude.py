@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import NoReturn, TypedDict, cast
 
@@ -159,17 +160,22 @@ def run(launch: ClaudeLaunch) -> int:
     return code
 
 
-def claim_phase(run: Path, phase: str, cwd: Path, log: Path, status: Path,
+class UnclaimedPhaseStatus(Enum):
+    PRESERVE = "preserve the slot status"
+
+
+def claim_phase(run: Path, phase: str, cwd: Path, log: Path, status: Path | UnclaimedPhaseStatus,
                 slot: str, env: dict[str, str]) -> bool:
     """Claim the phase files before the worker opens."""
     if phase:
         with log.open("a") as output:
             reserved = subprocess.run([PYTHON, str(SCRIPTS / "phase_reservation.py"), "claim",
-                "--session-dir", str(run), "--phase", phase, "--repo", str(cwd)],
+                "--session-dir", str(run), "--phase", phase, "--launch-cwd", str(cwd)],
                 env=env, stdout=output, stderr=subprocess.STDOUT)
         if reserved.returncode:
             print(f"ERROR: phase {phase} could not claim its files before its worker opens; see {log}.", file=sys.stderr)
-            write_text_atomic(status, "error\n")
+            if isinstance(status, Path):
+                write_text_atomic(status, "error\n")
             _ = subprocess.run(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "blocked",
                 f"launcher: phase {phase} could not claim its files; its worker did not open"],
                 env=env, text=True, check=False)
@@ -238,6 +244,8 @@ def _run(launch: ClaudeLaunch) -> int:
             worker_state.publish_worker_claim(claim, name)
     if not claim_phase(launch.run, launch.phase, launch.cwd, log, status, launch.slot, env):
         return 1
+    if launch.phase:
+        launch = replace(launch, cwd=phase_reservation.claimed_launch_directory(directory, launch.cwd))
     env["UNIT_RUN_DIR"] = str(launch.run)
     env["UNIT_PASS_OWNER"] = "launcher"
     build_folders = str(SCRIPTS / "../lib/build_folders.py")
@@ -271,7 +279,7 @@ def _run(launch: ClaudeLaunch) -> int:
     phase_options = ["--phase-id", launch.phase] if launch.phase else []
     worker_options = ["--worker-id", slot.row.id] if isinstance(slot, worker_admission.ExistingWorkerSlot) else []
     if progress.is_file():
-        started = child([PYTHON, str(SCRIPTS / "progress_history.py"), "start-pass", "--session-dir", str(launch.run),
+        started = child([PYTHON, str(SCRIPTS / "pass_record.py"), "start-pass", "--session-dir", str(launch.run),
             "--pass-kind", launch.role, "--prompt-file", str(launch.prompt), "--fix-cause", launch.fix_cause,
             "--fix-pass", str(launch.fix_pass), "--activity", launch.role, "--called-task", task,
             "--worker-name", name, "--called-family", "claude", "--called-model", launch.model,
@@ -321,7 +329,7 @@ def _run(launch: ClaudeLaunch) -> int:
     resolves = env.get("UNIT_RESOLVES_ROUND", "1" if launch.role == "fix" and launch.slot == "impl" else "0") == "1"
     repair_options = ["--phase", launch.phase] if launch.phase else []
     if code == 0:
-        if progress.is_file() and child([PYTHON, str(SCRIPTS / "progress_history.py"), "finish-pass",
+        if progress.is_file() and child([PYTHON, str(SCRIPTS / "pass_record.py"), "finish-pass",
                 "--session-dir", str(launch.run), "--status", "completed"], check=False).returncode:
             print(f"ERROR: unable to record the {launch.role} pass completion.", file=sys.stderr)
             _ = status.write_text("error\n")
@@ -338,7 +346,7 @@ def _run(launch: ClaudeLaunch) -> int:
         board("done", f"launcher: {launch.role} finished; summary at impl_summary_{launch.slot}.txt")
     else:
         ledger_error = 0
-        if progress.is_file() and child([PYTHON, str(SCRIPTS / "progress_history.py"), "finish-pass",
+        if progress.is_file() and child([PYTHON, str(SCRIPTS / "pass_record.py"), "finish-pass",
                 "--session-dir", str(launch.run), "--status", "error"], check=False).returncode:
             print(f"ERROR: unable to record the {launch.role} pass error.", file=sys.stderr)
             ledger_error = 1

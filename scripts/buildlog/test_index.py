@@ -164,7 +164,7 @@ def ci_run(run_id: int, attempt: int, jobs: list[Record]) -> Record:
     return {
         "kind": "ci_run",
         "v": 1,
-        "repo": "natepiano/hana",
+        "repo": "hanallc/hana",
         "run_id": run_id,
         "attempt": attempt,
         "workflow": "CI",
@@ -176,7 +176,7 @@ def ci_run(run_id: int, attempt: int, jobs: list[Record]) -> Record:
         "created_at": "2026-10-02T12:00:00Z",
         "started_at": "2026-10-02T12:00:00Z",
         "updated_at": "2026-10-02T12:10:00Z",
-        "url": f"https://github.com/natepiano/hana/actions/runs/{run_id}",
+        "url": f"https://github.com/hanallc/hana/actions/runs/{run_id}",
         "jobs": jobs,
     }
 
@@ -341,7 +341,7 @@ class IndexTests(unittest.TestCase):
                           ("test_read.py", '["scripts/a.py", "scripts/z.py"]')])
 
     def test_update_enables_the_configured_spill_threshold(self) -> None:
-        spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
+        spill_pages = conf.read("buildlog").whole("index_spill_pages")
         with closing(index.open_for_update(index.index_path())) as writer:
             self.assertEqual(writer.execute("PRAGMA cache_spill").fetchone(), (spill_pages,))
 
@@ -466,7 +466,7 @@ class IndexTests(unittest.TestCase):
 
     def test_cleanup_reads_the_unused_schema_age_from_config_at_use(self) -> None:
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=30")
+        _ = write_config_fixture(config / "buildlog.conf", "index_unused_days=30")
         self.write(self.host_file, step("retained"))
         self.assertEqual(index.update(), 1)
         active_path = index.index_path()
@@ -487,7 +487,7 @@ class IndexTests(unittest.TestCase):
             os.utime(path, (accessed, modified))
         self.assertEqual(index.update(), 0)
         self.assertTrue(old_path.is_file())
-        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
+        _ = write_config_fixture(config / "buildlog.conf", "index_unused_days=1")
         os.utime(active_path, (old, old))
         self.assertEqual(index.update(), 0)
         self.assertFalse(old_path.exists())
@@ -498,7 +498,7 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(index.update(), 0)
         self.assertFalse(recent_path.exists())
         self.assertEqual(self.ids(), ["retained"])
-        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=0")
+        _ = write_config_fixture(config / "buildlog.conf", "index_unused_days=0")
         self.assertEqual(index.update(), 0)
         self.assertTrue(active_path.is_file())
 
@@ -517,7 +517,7 @@ class IndexTests(unittest.TestCase):
 
     def test_update_finishes_interrupted_index_cleanup_and_removes_orphan_sidecars(self) -> None:
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
+        _ = write_config_fixture(config / "buildlog.conf", "index_unused_days=1")
         self.write(self.host_file, step("retained"))
         self.assertEqual(index.update(), 1)
         old = time.time() - 2 * 86400
@@ -580,7 +580,7 @@ class IndexTests(unittest.TestCase):
         now = time.time()
         for minutes, age, touches in ((120, 61, False), (60, 59, False), (60, 61, True)):
             with self.subTest(minutes=minutes, age=age):
-                _ = write_config_fixture(config / "buildlog.conf", f"INDEX_TOUCH_MINUTES={minutes}")
+                _ = write_config_fixture(config / "buildlog.conf", f"index_touch_minutes={minutes}")
                 stamp = now - age * 60
                 os.utime(current, (stamp, stamp))
                 self.assertEqual(index.update(), 0)
@@ -691,7 +691,7 @@ class IndexTests(unittest.TestCase):
 
     def test_mac_nextest_rows_use_the_call_repository_from_local_steps_or_ssh_attempts(self) -> None:
         config = configure_cleanup(self, self.root)
-        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(config / "test_times.conf", "nextest_slow_test_s=1.0")
         identity = "https://github.com/example/hana"
         facts = parse.log_facts("nextest", "        PASS [ 2.000s] hana tests::slow\n")
         mac_file = self.root / "Mac" / "2026-10.jsonl"
@@ -823,12 +823,71 @@ class IndexTests(unittest.TestCase):
             (1.25, {"tests::above_higher_boundary", "tests::failed", "tests::retried", "tests::reported_slow"}),
         ):
             with self.subTest(threshold=threshold):
-                _ = write_config_fixture(config / "test_times.conf", f"NEXTEST_SLOW_TEST_S={threshold}")
-                tests = parse.test_results(lines)[0]
+                _ = write_config_fixture(config / "test_times.conf", f"nextest_slow_test_s={threshold}")
+                tests = parse.test_results(lines).timing_rows
                 self.assertEqual({test["test"] for test in tests}, expected)
                 self.write(self.host_file, step("threshold", step="nextest", tests=tests))
                 _ = index.update()
                 self.assertEqual({row[0] for row in self.rows("SELECT test FROM tests")}, expected)
+
+    def test_fast_passes_get_a_gpu_class_only_with_proof(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "test_times.conf", "nextest_slow_test_s=1.0")
+        _ = write_config_fixture(config / "buildlog.conf", "index_spill_pages=65536\nindex_touch_minutes=60")
+        passed = "PASS [ 0.010s] hana tests::fast\n"
+        summary = "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n"
+        partial = "Summary [ 0.020s] 2 tests run: 2 passed, 0 skipped\n"
+        retry = "TRY 1 FAIL [ 0.008s] (───) hana tests::fast\n"
+        captured = parse.log_facts("nextest", """\
+PASS [ 0.010s] hana tests::fast
+  stdout ───
+PASS [ 0.001s] hana tests::printed
+Summary [ 0.011s] 2 tests run: 2 passed, 0 skipped
+  ──────────
+PASS [ 0.010s] hana tests::gpu
+Summary [ 0.020s] 2 tests run: 2 passed, 1 skipped
+""")
+        self.assertEqual(captured["tests_skipped"], 1)
+        malformed: dict[str, object] = {
+            "string-names": {"by_binary": {"hana": "x"}, "complete": True},
+            "nested-names": {"by_binary": {"hana": [["tests::fast"]]}, "complete": True},
+            "array-by-binary": {"by_binary": ["tests::fast"], "complete": True},
+            "numeric-complete": {"by_binary": {"hana": ["tests::fast"]}, "complete": 1},
+        }
+        self.write(self.host_file,
+                   step("complete", step="nextest", **parse.log_facts("nextest", passed + summary)),
+                   step("hidden", step="nextest", **parse.log_facts("nextest", summary)),
+                   step("duplicate", step="nextest", **parse.log_facts("nextest", passed + passed + summary)),
+                   step("failed", step="nextest", status=101, **parse.log_facts("nextest", passed + summary)),
+                   step("partial", step="nextest", **parse.log_facts("nextest", passed + partial)),
+                   step("retry", step="nextest", **parse.log_facts("nextest", retry + summary)),
+                   step("missing-proof", step="nextest", **parse.log_facts(
+                       "nextest", passed + "PASS [ 0.010s] hana tests::other\n" + partial)),
+                   step("captured-output", step="nextest", **captured),
+                   step("legacy", step="nextest", tests_run=1,
+                        tests=[{"binary": "hana", "test": "tests::fast", "status": "passed"}]),
+                   *(step(name, step="nextest", tests_run=1, observed_tests=observed)
+                     for name, observed in malformed.items()))
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT step_id FROM tests ORDER BY step_id"), [("legacy",), ("retry",)])
+        classes = index.NextestGpuClass
+        with closing(index.read_only()) as database:
+            proof = {("hana", "tests::fast"): classes.NO_GPU}
+            for verdict in (classes.NO_GPU, classes.GPU):
+                proof["hana", "tests::fast"] = verdict
+                self.assertEqual(index.nextest_gpu_class(database, "complete", proof), verdict)
+                for step_id in ("legacy", "hidden", "duplicate", "failed", "partial", "retry"):
+                    with self.subTest(step_id=step_id, verdict=verdict):
+                        self.assertEqual(index.nextest_gpu_class(database, step_id, proof), classes.UNKNOWN)
+            proof["hana", "tests::fast"] = classes.NO_GPU
+            self.assertEqual(index.nextest_gpu_class(database, "missing-proof", proof), classes.UNKNOWN)
+            proof["hana", "tests::printed"] = classes.NO_GPU
+            proof["hana", "tests::gpu"] = classes.GPU
+            self.assertEqual(index.nextest_gpu_class(database, "captured-output", proof), classes.UNKNOWN)
+            proof["hana", "x"] = classes.NO_GPU
+            for step_id in malformed:
+                with self.subTest(step_id=step_id):
+                    self.assertEqual(index.nextest_gpu_class(database, step_id, proof), classes.UNKNOWN)
 
     def cargo_build_rows(self, *commands: list[str]) -> list[tuple[object, ...]]:
         self.write(self.host_file, *(step(f"build-{number:03}", argv=argv) for number, argv in enumerate(commands)))

@@ -10,7 +10,7 @@ import argparse
 import base64
 from configparser import ConfigParser
 from io import StringIO
-from collections.abc import Callable, Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -34,11 +34,11 @@ from uuid import uuid4
 
 
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
-from scripts.aws_target import admin_secrets, aws_test_identity, box, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
+from scripts.aws_target import admin_secrets, aws_test_identity, box, gate_probe, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, quota_requests, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
-from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
+from scripts.aws_target.config import AwsOn, BudgetNotificationAddress, DeploymentSettings, aws_switch, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.lib import conf
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
@@ -73,14 +73,14 @@ def _operation_failure(operation: str, error: Exception) -> str:
 
 @dataclass(frozen=True)
 class ScalerProbe:
-    operation: str
+    operation: str | gate_probe.GateCheck
     call: Callable[[AwsCli], object]
-    success_code: str = 'OK'
+    success_reason: gate_probe.ProbeReason = gate_probe.ProbeReason.OK
 
 
 @dataclass(frozen=True)
 class ScalerProbeUnverified:
-    reason: str = ''
+    reason: gate_probe.ProbeReason
 
 
 @dataclass(frozen=True)
@@ -113,31 +113,42 @@ class ScalerIdentityMismatch(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class ScalerProbeRun:
+    checks: tuple[gate_probe.ProbeCheck, ...]
+    failures: tuple[ScalerProbeFailure, ...]
+
+
 def run_scaler_probes(label: str, api: AwsCli, probes: Iterable[ScalerProbe], *,
-                      show_codes: bool = False) -> tuple[ScalerProbeFailure, ...]:
-    failed: list[ScalerProbeFailure] = []
+                      show_codes: bool = False) -> ScalerProbeRun:
+    checks: list[gate_probe.ProbeCheck] = []
+    failures: list[ScalerProbeFailure] = []
     for probe in probes:
+        code = ''
         try:
             result = probe.call(api)
         except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
             code = aws_error_code(error, allow_status=show_codes) if isinstance(error, AwsUnavailable) else ''
             code = code or (type(error).__name__ if show_codes else '')
-            failed.append(ScalerProbeFailure(probe.operation, code))
-            if isinstance(error, ScalerIdentityMismatch):
-                report = f'{probe.operation}: fail. The scaler profile does not match the stack user.'
-            else:
-                report = f'{probe.operation}: fail' + (f' ({code})' if code else '')
+            verdict = gate_probe.ProbeVerdict.FAIL
+            reason = (gate_probe.ProbeReason.SCALER_IDENTITY_MISMATCH if isinstance(error, ScalerIdentityMismatch)
+                      else gate_probe.ProbeReason.CHECK_FAILED)
         else:
             if isinstance(result, ScalerProbeUnverified):
-                report = f'{probe.operation} unverified.'
-                if result.reason:
-                    report += f' {result.reason}'
+                verdict = gate_probe.ProbeVerdict.UNVERIFIED
+                reason = result.reason
             else:
-                report = f'{probe.operation}: pass'
-                if show_codes:
-                    report += f' ({probe.success_code})'
+                verdict = gate_probe.ProbeVerdict.PASS
+                reason = probe.success_reason
+        operation = probe.operation
+        if not isinstance(operation, str):
+            checks.append(gate_probe.ProbeCheck(operation, verdict, reason))
+            operation = operation.operation
+        if verdict is gate_probe.ProbeVerdict.FAIL:
+            failures.append(ScalerProbeFailure(operation, code))
+        report = gate_probe.format_verdict(operation, verdict, reason, failure_code=code, show_success_code=show_codes)
         print(f'{label}: {report}', flush=True)
-    return tuple(failed)
+    return ScalerProbeRun(tuple(checks), tuple(failures))
 
 
 def put_probe_object(api: AwsCli, bucket: str, key: str, content: bytes) -> None:
@@ -387,19 +398,13 @@ def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...
     )
 
 
-def quota_timestamp(value: object) -> float:
-    """Convert AWS timestamps to seconds for request ordering."""
-    if value is None:
-        return float('-inf')
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        moment = datetime.fromtimestamp(value, UTC)
-    elif isinstance(value, str):
-        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=UTC)
-    else:
-        raise ValueError('The quota request date is invalid')
-    return moment.timestamp()
+def quota_display_name(label: str) -> str:
+    return 'Standard Spot' if label == 'Spot' else label
+
+
+def _quota_request_timestamp(request: Mapping[str, object]) -> float:
+    created = request.get('Created')
+    return quota_requests.timestamp(request.get('LastUpdated') if created is None else created)
 
 
 def _quota_request_age(created: float, now: float) -> str:
@@ -413,62 +418,34 @@ def _quota_request_age(created: float, now: float) -> str:
     return f'{elapsed}s old'
 
 
-class _KnownQuotaRequestStatus(StrEnum):
-    PENDING = 'PENDING'
-    CASE_OPENED = 'CASE_OPENED'
-    IN_PROGRESS = 'IN_PROGRESS'
-    APPROVED = 'APPROVED'
-    DENIED = 'DENIED'
-    CASE_CLOSED = 'CASE_CLOSED'
-    NOT_APPROVED = 'NOT_APPROVED'
-    INVALID_REQUEST = 'INVALID_REQUEST'
-
-
-CLOSED_QUOTA_REQUEST_STATUSES: frozenset[str] = frozenset((
-    _KnownQuotaRequestStatus.APPROVED, _KnownQuotaRequestStatus.DENIED, _KnownQuotaRequestStatus.CASE_CLOSED,
-    _KnownQuotaRequestStatus.NOT_APPROVED, _KnownQuotaRequestStatus.INVALID_REQUEST,
-))
-
-
-@dataclass(frozen=True)
-class _UnknownQuotaRequestStatus:
-    value: str
-
-
-def _quota_request_status(value: str) -> _KnownQuotaRequestStatus | _UnknownQuotaRequestStatus:
-    try:
-        return _KnownQuotaRequestStatus(value)
-    except ValueError:
-        return _UnknownQuotaRequestStatus(value)
-
-
-@dataclass(frozen=True)
-class _QuotaRequest:
-    created_at: float
-    requested_vcpus: Decimal
-    status: _KnownQuotaRequestStatus | _UnknownQuotaRequestStatus
-
-
-def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool:
+def request_spot_quota(api: AwsCli, code: str, desired: int, label: str,
+                       histories: dict[quota_requests.RegionalQuota, tuple[quota_requests.OpenQuotaRequest, ...]]) -> bool:
     """Request one regional quota unless its value is sufficient or a request is open."""
     region = api.region
     try:
         quota = spot_quota(api, code)
         if quota >= desired:
+            histories[region, code] = ()
             print(f'{region}: {label} quota {quota.normalize():f} vCPUs; no request is needed for {desired} vCPUs')
             return True
-        history = api.call('list-requested-service-quota-change-history-by-quota',
-            '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
-        opened = [row for row in ledger.rows(history, 'RequestedQuotas') if ledger.text(row, 'Status') not in CLOSED_QUOTA_REQUEST_STATUSES]
+        name = quota_display_name(label)
+        opened: list[quota_requests.OpenQuotaRequest] = []
+        for row in quota_requests.read_quota_request_rows(api, code):
+            status = ledger.text(row, 'Status')
+            if status not in quota_requests.CLOSED_QUOTA_REQUEST_STATUSES:
+                opened.append(quota_requests.OpenQuotaRequest.from_reply(region, code, name, status, row))
+        histories[region, code] = tuple(opened)
         if opened:
-            for row in opened:
-                status = ledger.text(row, 'Status')
-                value = conf.decimal(str(row['DesiredValue']))
-                print(f'{region}: open {label} quota request {value.normalize():f} vCPUs; status {status}')
+            for request in opened:
+                print(f'{region}: open {label} quota request {request.asked_vcpus} vCPUs; status {request.status}')
             return True
         reply = api.call('request-service-quota-increase', '--service-code', 'ec2',
             '--quota-code', code, '--desired-value', str(desired), service='service-quotas')
-        status = ledger.text(ledger.mapping(reply['RequestedQuota']), 'Status')
+        row = ledger.mapping(reply['RequestedQuota'])
+        status = ledger.text(row, 'Status')
+        if status not in quota_requests.CLOSED_QUOTA_REQUEST_STATUSES:
+            histories[region, code] = (
+                quota_requests.OpenQuotaRequest.from_reply(region, code, name, status, {'DesiredValue': desired, **row}),)
         print(f'{region}: {label} quota request {desired} vCPUs; status {status}')
         return status not in {'DENIED', 'NOT_APPROVED', 'INVALID_REQUEST'}
     except (admin_secrets.SecretsRefused, DeploymentRefused):
@@ -561,10 +538,7 @@ def _hana_setup_ownership(saved: dict[str, object]) -> HanaBoxOwnership:
 
 
 def _print_hana_placement(workload: conf.ConfigRead) -> None:
-    enabled = workload.text('enabled')
-    if enabled not in ('on', 'off'):
-        raise ValueError('enabled must be on or off')
-    state = 'enabled' if enabled == 'on' else 'disabled'
+    state = 'enabled' if isinstance(aws_switch(workload), AwsOn) else 'disabled'
     print(f'Hana placement is {state}. This command does not change it.')
 
 
@@ -1361,7 +1335,7 @@ class Deployment:
             ScalerProbe('stop-instances', lambda api: api.ec2_dry_run('stop-instances', '--instance-ids', identity.instance)),
             ScalerProbe('put-object', lambda api: put_probe_object(api, provider.bucket, key, content)),
             ScalerProbe('get-object', lambda api: get_probe_object(api, provider.bucket, key, content)),
-        ])
+        ]).failures
 
     def _hana_spot_candidates(self, api: AwsCli, settings: DeploymentSettings,
                               limits: hana_spend.PermitSettings, workload: conf.ConfigRead) -> tuple[HanaSpotCandidate, ...]:
@@ -2510,8 +2484,14 @@ class Deployment:
                 with step('remove-images', 'removing the old image permission', self.settings_path,
                           hint='can take several minutes'):
                     self._gate_change(api, stack_id, template, changes)
-            with step('remove-images', 'deleting the gate image and its snapshot', self.settings_path):
-                removed = teardown.remove_gate_images(api, self.directory, self.clock)
+            try:
+                with step('remove-images', 'deleting the gate image and its snapshot', self.settings_path):
+                    removed = teardown.remove_gate_images(api, self.directory, self.clock)
+                    if isinstance(removed, teardown.GateImageRemovalRefused):
+                        raise DeploymentRefused(removed.reason)
+            except DeploymentRefused as error:
+                print('remove-images: refused: ' + self.admin.redact(str(error)))
+                return False
             with step('remove-images', 'deleting the former builder image and its snapshot', self.settings_path):
                 removed = teardown.remove_builder_image(api, self.directory) or removed
         print('remove-images: done; gates boot from the official image and no saved image remains' if removed
@@ -2712,17 +2692,27 @@ class Deployment:
 
     def quota_request(self) -> bool:
         """Request both regional Spot quotas without duplicating open requests."""
+        with quota_requests.command_lock(self.directory):
+            return self._quota_request()
+
+    def _quota_request(self) -> bool:
         settings = read_deployment_settings(self.settings_path)
         api = self._api(settings)
         success = True
+        histories: dict[quota_requests.RegionalQuota, tuple[quota_requests.OpenQuotaRequest, ...]] = {}
         for regions, code, desired, label in quota_targets(settings.region):
             for region in regions:
-                if not request_spot_quota(api.in_region(region), code, desired, label):
+                if not request_spot_quota(api.in_region(region), code, desired, label, histories):
                     success = False
+        quota_requests.save(self.directory, histories, int(self.clock()), complete=False)
         return success
 
     def quota_status(self) -> bool:
-        """Read regional Spot quotas with the plan identity."""
+        """Report applied quotas and save open requests without changing AWS."""
+        with quota_requests.command_lock(self.directory):
+            return self._quota_status()
+
+    def _quota_status(self) -> bool:
         from scripts.aws_target import gpu_size_trial
         plan = plan_run.PlanRun(plan_identity.plan_credentials, self.execute, self.pause)
         _ = plan.credential
@@ -2733,13 +2723,14 @@ class Deployment:
         regional: dict[str, list[tuple[str, str, int]]] = {}
         for regions, code, desired, label in quota_targets(settings.region):
             for region in dict.fromkeys(regions):
-                regional.setdefault(region, []).append((code, 'Standard Spot' if label == 'Spot' else label, desired))
+                regional.setdefault(region, []).append((code, quota_display_name(label), desired))
         success = True
         ready: list[str] = []
         opened: list[str] = []
         unknown: list[str] = []
         unknown_quota: list[str] = []
         lines: list[str] = []
+        histories: dict[quota_requests.RegionalQuota, tuple[quota_requests.OpenQuotaRequest, ...]] = {}
         for region, quotas in regional.items():
             target = api.in_region(region)
             lines.append(region)
@@ -2750,25 +2741,26 @@ class Deployment:
                     lines.append(f'  {name}: {applied.normalize():f} vCPUs applied, {desired} vCPUs needed')
                     if code == 'L-3819A6DF' and applied >= needed:
                         ready.append(region)
-                    history = target.call('list-requested-service-quota-change-history-by-quota',
-                        '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
-                    requests: list[_QuotaRequest] = []
-                    for request in ledger.rows(history, 'RequestedQuotas'):
-                        created_value = request.get('Created')
-                        created = quota_timestamp(request.get('LastUpdated') if created_value is None else created_value)
-                        asked = conf.decimal(str(request['DesiredValue'])).normalize()
-                        status = _quota_request_status(ledger.text(request, 'Status'))
-                        requests.append(_QuotaRequest(created, asked, status))
-                    requests.sort(key=lambda request: request.created_at, reverse=True)
+                    requests = sorted(quota_requests.read_quota_request_rows(target, code),
+                                      key=_quota_request_timestamp, reverse=True)
+                    open_requests: list[quota_requests.OpenQuotaRequest] = []
+                    for request in requests:
+                        status = ledger.text(request, 'Status')
+                        asked = quota_requests.format_asked_vcpus(request['DesiredValue'])
+                        if status not in quota_requests.CLOSED_QUOTA_REQUEST_STATUSES:
+                            entry = quota_requests.OpenQuotaRequest.from_reply(region, code, name, status, request)
+                            open_requests.append(entry)
+                            opened.append(f'{region} {name} {asked} vCPUs ({status})')
+                    histories[region, code] = tuple(open_requests)
                     if requests:
                         newest = requests[0]
-                        age = _quota_request_age(newest.created_at, now)
-                        lines.append(f'    Newest request: {newest.status.value} for {newest.requested_vcpus:f} vCPUs ({age}).')
+                        created = _quota_request_timestamp(newest)
+                        age = _quota_request_age(created, now)
+                        status = ledger.text(newest, 'Status')
+                        asked = quota_requests.format_asked_vcpus(newest['DesiredValue'])
+                        lines.append(f'    Newest request: {status} for {asked} vCPUs ({age}).')
                     else:
                         lines.append('    No requests.')
-                    for item in requests:
-                        if item.status.value not in CLOSED_QUOTA_REQUEST_STATUSES:
-                            opened.append(f'{region} {name} {item.requested_vcpus:f} vCPUs ({item.status.value})')
                 except (KeyError, OSError, OverflowError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
                     code_text = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
                     if code_text in QUOTA_PLAN_AUTH_FAILURES:
@@ -2793,6 +2785,7 @@ class Deployment:
         lines.append(f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
                      + 'open requests: ' + requests_text + incomplete)
         print('\n'.join(lines), flush=True)
+        quota_requests.save(self.directory, histories, int(now), complete=success)
         return success
 
     def gpu_size_trial(self, folder: Path, *, approve_resources: bool = False) -> bool:
@@ -2992,6 +2985,7 @@ class Deployment:
         from scripts.aws_target import aws_trial, cloud_gate, gpu_size_trial
         self._authorize(approve_resources)
         with self._require_account_stack('up --workload merge-gates'):
+            gate_probe.invalidate_record(self.directory)
             settings = read_deployment_settings(self.settings_path)
             regions = gate_regions(settings.region)
             api = self._api(settings)
@@ -3096,7 +3090,7 @@ class Deployment:
         spending = read_settings(self.settings_path)
         termination_targets: list[str] = []
         offered_zones: dict[str, set[str]] = {}
-        label = 'gate-setup probe'
+        label = gate_probe.LABEL
         retry_interval = values.whole('gpu_setup_dry_run_retry_interval_s')
         simulation_access_denied = False
 
@@ -3127,7 +3121,7 @@ class Deployment:
             zones = offered_zones.get(size, set())
             subnet = next((row for row in subnets if ledger.text(row, 'zone') in zones), None)
             if subnet is None:
-                return ScalerProbeUnverified('No saved subnet offers this type.')
+                return ScalerProbeUnverified(gate_probe.ProbeReason.NO_OFFERED_SUBNET)
             launch = gpu_size_trial.GpuSpotLaunch(deployment_id, nonce, f'{nonce}-{size}', size, caps[size],
                 now + 60 * values.whole('hana_gpu_lifetime_minutes'), values.whole('gpu_size_trial_root_gib'),
                 base64.b64encode(b'#!/bin/sh\nexit 0\n').decode())
@@ -3165,7 +3159,7 @@ class Deployment:
                 if aws_error_code(error, operation='SimulatePrincipalPolicy', allow_status=True) not in PROBE_DENIED_CODES:
                     raise
                 simulation_access_denied = True
-                return ScalerProbeUnverified()
+                return ScalerProbeUnverified(gate_probe.ProbeReason.SIMULATOR_ACCESS_DENIED)
             incomplete = 'The termination simulation result is incomplete'
             results = ledger.rows(reply, 'EvaluationResults')
             if reply.get('IsTruncated') or len(results) != 1 or results[0].get('EvalActionName') != action:
@@ -3198,43 +3192,53 @@ class Deployment:
             _ = api.call('abort-multipart-upload', *location, '--upload-id', ledger.text(reply, 'UploadId'), service='s3api')
 
         def probes() -> Iterable[ScalerProbe]:
-            yield ScalerProbe('describe-instances', describe_instances)
-            yield ScalerProbe('describe-instance-type-offerings', describe_offerings)
-            yield ScalerProbe('describe-spot-price-history', lambda api: api.call('describe-spot-price-history',
+            regional = gate_probe.RegionalCheck
+            name = gate_probe.RegionalCheckName
+            yield ScalerProbe(regional(name.INSTANCES, api.region), describe_instances)
+            yield ScalerProbe(regional(name.OFFERINGS, api.region), describe_offerings)
+            yield ScalerProbe(regional(name.SPOT_PRICES, api.region), lambda api: api.call('describe-spot-price-history',
                 '--instance-types', *types, '--product-descriptions', 'Linux/UNIX', '--start-time', started))
-            yield ScalerProbe('get-service-quota', lambda api: spot_quota(api, 'L-3819A6DF'))
-            yield ScalerProbe('get-cost-and-usage', lambda api: fetch_account_charges(
-                api, utc_day - 86400, utc_day, now, spending.cost_explorer_read_usd))
+            yield ScalerProbe(regional(name.SPOT_QUOTA, api.region), lambda api: spot_quota(api, 'L-3819A6DF'))
+            yield ScalerProbe(gate_probe.AccountCheck(gate_probe.AccountCheckName.ACCOUNT_CHARGES),
+                lambda api: fetch_account_charges(api, utc_day - 86400, utc_day, now, spending.cost_explorer_read_usd))
             deadline = time.monotonic() + values.whole('gpu_setup_dry_run_retry_timeout_s')
             for size in types:
-                yield ScalerProbe(f'run-instances {size}',
-                                  lambda api, size=size: launch_probe(api, size, deadline), 'DryRunOperation')
+                yield ScalerProbe(gate_probe.GpuLaunchCheck(api.region, size),
+                                  lambda api, size=size: launch_probe(api, size, deadline), gate_probe.ProbeReason.DRY_RUN)
             if termination_targets:
-                yield ScalerProbe('terminate-instances', lambda api: api.ec2_dry_run(
-                    'terminate-instances', '--instance-ids', termination_targets[0]), 'DryRunOperation')
+                yield ScalerProbe(regional(name.TERMINATE, api.region), lambda api: api.ec2_dry_run(
+                    'terminate-instances', '--instance-ids', termination_targets[0]), gate_probe.ProbeReason.DRY_RUN)
             for row in regions:
                 region = ledger.text(row, 'region')
                 if region in candidates and row.get('subnets'):
-                    yield ScalerProbe(f'termination {region}', lambda _api, region=region: simulate_termination(region),
-                                      'IAM simulation')
-            yield ScalerProbe('export-credentials', gpu_size_trial.gpu_signing_key)
-            yield ScalerProbe('put-object', lambda api: put_probe_object(api, bucket, key, content))
-            yield ScalerProbe('list-objects-v2', list_result_probe)
-            yield ScalerProbe('get-object', lambda api: get_probe_object(api, bucket, key, content))
-            yield ScalerProbe('put-object inputs', lambda api: put_probe_object(api, bucket, input_key, content))
-            yield ScalerProbe('get-object inputs', lambda api: get_probe_object(api, bucket, input_key, content))
-            yield ScalerProbe('create/abort-multipart-upload', probe_multipart)
+                    yield ScalerProbe(regional(name.TERMINATION_SIMULATION, region),
+                                      lambda _api, region=region: simulate_termination(region),
+                                      gate_probe.ProbeReason.IAM_SIMULATION)
+            yield ScalerProbe(gate_probe.AccountCheck(gate_probe.AccountCheckName.CREDENTIAL_EXPORT),
+                              gpu_size_trial.gpu_signing_key)
+            yield ScalerProbe(regional(name.PUT_RESULT, api.region), lambda api: put_probe_object(api, bucket, key, content))
+            yield ScalerProbe(regional(name.LIST_RESULT, api.region), list_result_probe)
+            yield ScalerProbe(regional(name.GET_RESULT, api.region), lambda api: get_probe_object(api, bucket, key, content))
+            yield ScalerProbe(regional(name.PUT_INPUT, api.region),
+                              lambda api: put_probe_object(api, bucket, input_key, content))
+            yield ScalerProbe(regional(name.GET_INPUT, api.region),
+                              lambda api: get_probe_object(api, bucket, input_key, content))
+            yield ScalerProbe(regional(name.MULTIPART_INPUT, api.region), probe_multipart)
 
-        failed = run_scaler_probes(label, api, (ScalerProbe('get-caller-identity', verify_scaler_identity),),
-                                   show_codes=True)
-        if failed and failed[0].code == ScalerIdentityMismatch.__name__:
-            return False
+        caller = gate_probe.AccountCheck(gate_probe.AccountCheckName.CALLER_IDENTITY)
+        identity = run_scaler_probes(label, api, (ScalerProbe(caller, verify_scaler_identity),), show_codes=True)
+        checks, failed = identity.checks, identity.failures
         if not failed:
-            failed = run_scaler_probes(label, api, probes(), show_codes=True)
+            run = run_scaler_probes(label, api, probes(), show_codes=True)
+            checks += run.checks
+            failed = run.failures
         if simulation_access_denied:
             print('gate-setup: The administrator cannot call iam:SimulatePrincipalPolicy.', flush=True)
-        for next_step in dict.fromkeys(failure.next_step() for failure in failed):
-            print(f'gate-setup: {next_step}', flush=True)
+        if identity.checks[0].reason is not gate_probe.ProbeReason.SCALER_IDENTITY_MISMATCH:
+            for next_step in dict.fromkeys(failure.next_step() for failure in failed):
+                print(f'gate-setup: {next_step}', flush=True)
+        gate_probe.save_record(self.directory, gate_probe.GateProbeRecord(
+            deployment_id, datetime.fromtimestamp(self.clock(), UTC), checks))
         return not failed
 
     def _fill_prices(self) -> None:
@@ -3412,6 +3416,7 @@ class DeploymentArguments(argparse.Namespace):
         self.output: Path = Path.home() / '.local/state/aws-build/deployment'
         self.approve_resources: bool = False
         self.approve_destroy: bool = False
+        self.approve_release: bool = False
         self.plan: bool = False
         self.check: bool = False
         self.trial_action: str | None = None
@@ -3451,7 +3456,7 @@ def main() -> int:
         with step('aws-trial', 'running the trial', settings_path):
             return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__, epilog=aws_test_identity.CONSOLE_SETUP)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply', 'plan-identity', 'test-identity'),
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'probe-status', 'prepare', 'hana-setup', 'hana-image', 'hana-release-unknown-stop', 'apply', 'plan-identity', 'test-identity'),
                             help='Use quota-status to read Spot quotas with the plan key. Use quota-request to request increases with the admin key.')
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
@@ -3462,6 +3467,7 @@ def main() -> int:
     _ = parser.add_argument('--output', type=Path)
     _ = parser.add_argument('--approve-resources', action='store_true')
     _ = parser.add_argument('--approve-destroy', action='store_true')
+    _ = parser.add_argument('--approve-release', action='store_true', help='Save an approved release of a Hana unknown stop.')
     _ = parser.add_argument('--plan', action='store_true', help='Check setup with the AWS plan identity.')
     _ = parser.add_argument('--check', action='store_true', help='Verify the saved plan or test identity without a prompt.')
     args = parser.parse_args(namespace=DeploymentArguments())
@@ -3475,6 +3481,20 @@ def main() -> int:
         return plan_identity.command_check(args.settings)
     if args.plan:
         return run_setup_plan(args)
+    if args.command == 'probe-status':
+        gate_probe.print_status(args.directory, now=datetime.now(UTC))
+        return 0
+    if args.command == 'hana-release-unknown-stop':
+        try:
+            release = hana_box.release_unknown_stop(args.directory, approve_release=args.approve_release)
+        except hana_box.UnknownStopReleaseRefused as error:
+            print(f'hana-release-unknown-stop: {error}', file=sys.stderr)
+            return 1
+        except (OSError, KeyError, TypeError, ValueError):
+            print('hana-release-unknown-stop: Could not read or save the local Hana state.', file=sys.stderr)
+            return 1
+        print(f'hana-release-unknown-stop: {release}')
+        return 0
     deploy = Deployment(args.settings, args.directory, args.output)
     try:
         if args.workload == 'plan-identity' and args.command != 'down':

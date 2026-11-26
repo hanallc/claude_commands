@@ -15,11 +15,12 @@ from unittest import mock
 from urllib.parse import urlsplit
 
 from scripts.aws_target import hana_protocol
-from scripts.aws_target import aws_target, hana_box as box, hana_guest, hana_provider as provider, hana_receiver, deploy, ledger
+from scripts.aws_target import aws_target, hana_box as box, hana_guest, hana_provider as provider, hana_receiver, deploy, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.test_hana_box import record_lifecycle_image, write_lifecycle_configuration
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 IDENTITY = box.DeploymentIdentity('fixture-deployment', 'fixture-instance', 'fixture-request', 'us-east-2')
@@ -133,6 +134,9 @@ class HanaProviderTests(CostFixture):
     def start(self) -> box.DemandStart:
         return box.DemandStart('fixture-start', self.clock.now, self.clock.now + conf.read(self.workload).whole('start_timeout_seconds'))
 
+    def mutation_path(self, operation: box.PendingOperation) -> Path:
+        return self.state / 'hana' / 'provider' / (operation.token + '.json')
+
     def test_bootstrap_start_observe_publish_stop_and_policy_cover_the_same_calls(self) -> None:
         start = self.start()
         for action in (box.Action.BOOTSTRAP, box.Action.START):
@@ -158,8 +162,15 @@ class HanaProviderTests(CostFixture):
             _ = self.provider.step(IDENTITY, start, publication)
         self.fake.objects[prefix + '/report.json'].update(token=publication.token, generation=1, execution=publication.execution)
         self.assertIsInstance(self.provider.step(IDENTITY, start, publication), box.PermitAccepted)
-        _ = self.provider.step(IDENTITY, start, self.operation(box.Action.STOP))
+        stop = self.operation(box.Action.STOP)
+        dispatched_at = self.clock.now
+        _ = self.provider.step(IDENTITY, start, stop)
         self.assertEqual(self.fake.state, 'stopped')
+        saved = remote.read_record(self.mutation_path(stop))
+        self.assertEqual(saved['generation'], stop.generation)
+        self.assertEqual(saved['dispatched_at'], dispatched_at)
+        self.assertEqual(saved['accepted_at'], dispatched_at + 1)
+        self.assertEqual(saved['acceptance_source'], 'direct')
         actions = {provider.PROVIDER_OPERATIONS[op] for service, op, _timeout in self.fake.calls if service != 'configure'}
         template = ledger.mapping(cast(object, json.loads(deploy.HANA_TEMPLATE.read_text())))
         policy = ledger.mapping(ledger.mapping(ledger.mapping(template['Resources'])['ScalerPolicy'])['Properties'])
@@ -319,6 +330,44 @@ class HanaProviderTests(CostFixture):
         self.fake.failure = ''
         self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationUnresolved)
 
+    def test_start_records_only_a_definite_refusal_for_the_start_call(self) -> None:
+        self.fake.failure = 'start-instances'
+        for index, (header, refused) in enumerate((
+                ('(Blocked) when calling the StartInstances operation', True),
+                ('(Blocked) when calling the StartInstances operation (reached max retries: 0)', True),
+                ('(Blocked) when calling the StartInstances operation (reached max retries: 2)', False),
+                ('(Blocked) when calling the StopInstances operation', False),
+                ('(InternalError) when calling the StartInstances operation', False),
+                ('(DryRunOperation) when calling the StartInstances operation', False))):
+            with self.subTest(header=header):
+                operation = replace(self.operation(box.Action.START), token=f'start-{index}')
+                self.fake.failure_stderr = 'An error occurred ' + header + ': private fixture diagnostic'
+                with self.assertRaises(provider.ProviderPending):
+                    _ = self.provider.step(IDENTITY, self.start(), operation)
+                saved = remote.read_record(self.mutation_path(operation))
+                self.assertEqual(saved['dispatched'], True)
+                self.assertEqual(remote.start_was_refused(saved), refused)
+                if refused:
+                    self.assertEqual(saved['start_refusal_code'], 'Blocked')
+                else:
+                    self.assertNotIn('start_refusal_code', saved)
+                self.assertNotIn('private fixture diagnostic', json.dumps(saved))
+
+    def test_active_observation_preserves_possible_compute_after_a_start_refusal(self) -> None:
+        operation, start = self.operation(box.Action.START), self.start()
+        self.fake.failure = 'start-instances'
+        self.fake.failure_stderr = 'An error occurred (Blocked) when calling the StartInstances operation: Fixture'
+        with self.assertRaises(provider.ProviderStartRefused):
+            _ = self.provider.step(IDENTITY, start, operation)
+        path = self.mutation_path(operation)
+        self.fake.state = 'running'
+        self.clock.advance(1)
+        _ = self.provider.recover(IDENTITY, start, operation, abandon_start=True)
+        saved = remote.read_record(path)
+        self.assertEqual(saved['observed_active_at'], self.clock.now)
+        self.assertFalse(remote.start_was_refused(saved))
+        self.assertEqual(remote.read_hana_start_journal(self.state).possible_starts, (operation.generation,))
+
     def test_abandoned_start_with_a_lost_reply_keeps_exposure_until_a_later_stop(self) -> None:
         controller = box.HanaController(self.state, self.settings, self.workload, self.provider, clock=self.clock)
         book = ledger.CostLedger(self.state)
@@ -371,7 +420,13 @@ class HanaProviderTests(CostFixture):
 
     def test_recovery_fences_a_call_that_has_not_started(self) -> None:
         operation, start = self.operation(box.Action.START), self.start()
+        cancelled_at = self.clock.now
         self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationSettled)
+        saved = remote.read_record(self.mutation_path(operation))
+        self.assertEqual(saved['generation'], operation.generation)
+        self.assertEqual(saved['cancellation_at'], cancelled_at)
+        self.assertNotIn('dispatched_at', saved)
+        self.assertNotIn('accepted_at', saved)
         with self.assertRaises(provider.ProviderPending):
             _ = self.provider.step(IDENTITY, start, operation)
         self.assertNotIn('start-instances', [op for _, op, _ in self.fake.calls])
@@ -399,14 +454,20 @@ class HanaProviderTests(CostFixture):
         pending = controller.inspect()
         assert isinstance(pending, box.HanaLifecycleEvidence) and isinstance(pending.operation, box.PendingOperation)
         self.assertEqual(pending.operation.action, box.Action.BOOTSTRAP)
-        saved_path = self.state / 'hana/provider' / (pending.operation.token + '.json')
+        saved_path = self.mutation_path(pending.operation)
         saved = ledger.mapping(cast(object, json.loads(saved_path.read_text())))
         self.assertEqual(saved['dispatched'], True)
+        self.assertEqual(saved['generation'], pending.operation.generation)
+        self.assertEqual(saved['dispatched_at'], self.clock.now)
+        self.assertNotIn('accepted_at', saved)
         self.fake.failure = ''
         self.clock.advance(1)
         self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
         accepted = ledger.mapping(cast(object, json.loads(saved_path.read_text())))
         self.assertEqual(accepted['accepted'], True)
+        self.assertEqual(accepted['dispatched_at'], saved['dispatched_at'])
+        self.assertEqual(accepted['accepted_at'], self.clock.now)
+        self.assertEqual(accepted['acceptance_source'], 'direct')
         self.assertEqual(accepted['descriptor'], saved['descriptor'])
         self.assertEqual(accepted['token'], pending.operation.token)
         self.assertEqual(cast(object, json.loads(base64.b64decode(self.fake.userdata))), saved['descriptor'])
@@ -453,13 +514,102 @@ class HanaProviderTests(CostFixture):
         self.fake.lose_response = 'modify-instance-attribute'
         with self.assertRaises(provider.ProviderPending):
             _ = self.provider.step(IDENTITY, start, operation)
+        self.clock.advance(1)
         self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationSettled)
+        observed = remote.read_record(self.mutation_path(operation))
+        self.assertNotIn('accepted', observed)
+        self.assertNotIn('accepted_at', observed)
         before = len(self.fake.calls)
+        self.clock.advance(1)
         self.assertEqual(self.provider.step(IDENTITY, start, operation), box.OperationAccepted(operation.token))
+        accepted = remote.read_record(self.mutation_path(operation))
+        self.assertEqual(accepted['accepted_at'], self.clock.now)
+        self.assertEqual(accepted['acceptance_source'], 'observed')
         operations = [op for _, op, _ in self.fake.calls[before:]]
         self.assertIn('describe-instance-attribute', operations)
         self.assertNotIn('modify-instance-attribute', operations)
         self.assertNotIn('put-object', operations)
+
+    def test_start_cancellation_keeps_the_fractional_fence_time(self) -> None:
+        operation, start = self.operation(box.Action.START), self.start()
+        self.fake.lose_response = 'start-instances'
+        with self.assertRaises(provider.ProviderPending):
+            _ = self.provider.step(IDENTITY, start, operation)
+        self.fake.state = 'stopped'
+        self.provider.clock = lambda: self.clock() + 0.75
+        result = self.provider.recover(IDENTITY, start, operation, abandon_start=True)
+        self.assertIsInstance(result, box.MutationUnresolved)
+        cancelled = remote.read_record(self.mutation_path(operation))
+        self.assertNotIn('accepted_at', cancelled)
+        self.assertEqual(cancelled['cancellation_at'], self.clock.now)
+        self.assertEqual(cancelled['cancelled_at'], self.clock.now + 0.75)
+        self.assertIsInstance(self.provider.recover(IDENTITY, start, operation, abandon_start=True), box.MutationUnresolved)
+        self.assertEqual(remote.read_record(self.mutation_path(operation)), cancelled)
+
+    def test_legacy_mutation_records_read_without_a_rewrite(self) -> None:
+        start = self.start()
+        self.fake.state = 'running'
+        for action, accepted_fields in ((box.Action.START, {}), (box.Action.STOP, {'accepted': True})):
+            with self.subTest(action=action):
+                operation = self.operation(action)
+                path = self.mutation_path(operation)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                legacy = json.dumps({'version': 1, 'token': operation.token, 'action': action.value,
+                    'deployment': IDENTITY.deployment, 'dispatched': True, **accepted_fields})
+                _ = path.write_text(legacy)
+                self.assertEqual(self.provider.step(IDENTITY, start, operation), box.OperationAccepted(operation.token))
+                self.assertEqual(path.read_text(), legacy)
+        self.assertNotIn('stop-instances', [op for _, op, _ in self.fake.calls])
+
+    def test_provider_retains_the_mutation_write_order(self) -> None:
+        start = self.start()
+        report_key = 'control/' + IDENTITY.deployment + '/' + start.token + '/report.json'
+        writes: list[tuple[list[str], list[str]]] = []
+
+        def record_write(path: Path, document: str, *, new_file_mode: int) -> None:
+            saved = ledger.mapping(cast(object, json.loads(document)))
+            flags = [flag for flag in ('dispatched', 'accepted', 'cancelled') if saved.get(flag) is True]
+            writes.append(([op for _, op, _ in self.fake.calls], flags))
+            write_text_atomic(path, document, new_file_mode=new_file_mode)
+
+        with mock.patch.object(provider, 'write_text_atomic', side_effect=record_write):
+            for action, request in ((box.Action.START, 'start-instances'), (box.Action.STOP, 'stop-instances'),
+                                    (box.Action.PUBLISH, 'put-object')):
+                with self.subTest(action=action):
+                    self.fake.calls.clear()
+                    writes.clear()
+                    operation = self.operation(action)
+                    expected: box.OperationAccepted | box.PermitAccepted = box.OperationAccepted(operation.token)
+                    if action == box.Action.PUBLISH:
+                        permit = hana_guest.WorkPermit(self.clock.now + 1, '1', 'fixture-boot')
+                        operation = replace(operation, permit=permit, execution='fixture-execution')
+                        self.fake.objects[report_key] = {'deployment': IDENTITY.deployment, 'start_token': start.token,
+                            'token': operation.token, 'boot_id': permit.boot_id, 'generation': operation.generation,
+                            'execution': operation.execution}
+                        expected = box.PermitAccepted(operation.token, IDENTITY, box.VerifiedBoot(permit.boot_id, start.token),
+                            operation.generation, operation.execution)
+                    self.fake.lose_response = request
+                    with self.assertRaises(provider.ProviderPending):
+                        _ = self.provider.step(IDENTITY, start, operation)
+                    self.clock.advance(1)
+                    self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationSettled)
+                    self.assertEqual(self.provider.step(IDENTITY, start, operation), expected)
+                    self.assertEqual(writes, [([], ['dispatched'])])
+                    self.assertNotIn('accepted_at', remote.read_record(self.mutation_path(operation)))
+
+                    self.fake.calls.clear()
+                    writes.clear()
+                    direct = replace(operation, token=operation.token + '-direct')
+                    if isinstance(expected, box.PermitAccepted):
+                        self.fake.objects[report_key]['token'] = direct.token
+                    self.assertEqual(self.provider.step(IDENTITY, start, direct), replace(expected, token=direct.token))
+                    self.assertEqual(writes, [([], ['dispatched']), ([request], ['dispatched', 'accepted'])])
+
+            self.fake.calls.clear()
+            writes.clear()
+            unstarted = replace(self.operation(box.Action.START), token='fixture-unstarted')
+            self.assertIsInstance(self.provider.recover(IDENTITY, start, unstarted), box.MutationSettled)
+            self.assertEqual(writes, [([], ['cancelled'])])
 
     def test_bootstrap_recovery_leaves_a_running_box_unchanged(self) -> None:
         operation, start = self.operation(box.Action.BOOTSTRAP), self.start()
@@ -573,6 +723,14 @@ class HanaProviderTests(CostFixture):
             _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
         self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:DescribeInstances (InvalidInstanceID.NotFound)')
 
+    def test_a_refused_key_names_its_code_for_the_controller(self) -> None:
+        self.fake.failure = 'describe-instances'
+        self.fake.failure_stderr = 'An error occurred (AuthFailure) when calling the DescribeInstances operation: Fixture'
+        with self.assertRaises(provider.ProviderKeyRefused) as refused:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
+        self.assertEqual(refused.exception.code, 'AuthFailure')
+        self.assertEqual(str(refused.exception), 'Hana provider call failed: ec2:DescribeInstances (AuthFailure)')
+
     def test_cli_timeout_reports_only_the_action(self) -> None:
         self.fake.lose_response = 'modify-instance-attribute'
         with self.assertRaises(provider.ProviderPending) as pending:
@@ -582,12 +740,15 @@ class HanaProviderTests(CostFixture):
     def test_scaler_environment_removes_inherited_admin_credentials(self) -> None:
         with mock.patch.dict('os.environ', {'AWS_ACCESS_KEY_ID': 'inherited-admin', 'AWS_SESSION_TOKEN': 'inherited-token'}):
             subject = provider.AwsHanaProvider.from_settings(self.settings, self.state, self.workload, execute=self.fake)
-            _ = subject.step(IDENTITY, box.NoDemandStart(), self.operation(box.Action.OBSERVE))
+            subject.api.ec2_dry_run('start-instances', '--instance-ids', IDENTITY.instance)
+            _ = subject.step(IDENTITY, self.start(), self.operation(box.Action.START))
         self.assertNotIn('AWS_ACCESS_KEY_ID', self.fake.environments[-1])
         self.assertNotIn('AWS_SESSION_TOKEN', self.fake.environments[-1])
         self.assertEqual(self.fake.environments[-1]['AWS_CONFIG_FILE'], '/dev/null')
+        self.assertNotIn('AWS_MAX_ATTEMPTS', self.fake.environments[-2])
+        self.assertEqual(self.fake.environments[-1]['AWS_MAX_ATTEMPTS'], '1')
 
-    def test_receiver_checks_boot_generation_expiry_and_shutdown_fence(self) -> None:
+    def test_receiver_ignores_legacy_state_and_checks_the_shutdown_fence(self) -> None:
         folder = self.root / 'guest'
         folder.mkdir()
         boot = self.root / 'boot-id'
@@ -599,9 +760,21 @@ class HanaProviderTests(CostFixture):
         control: dict[str, object] = {'deployment': IDENTITY.deployment, 'start_token': 'fixture-start', 'token': 'fixture-token',
             'expected_generation': 0, 'execution': 'fixture-execution',
             'permit': {'expires_at': self.clock.now + settings.permit_max_seconds, 'generation': '1', 'boot_id': 'fixture-boot'}}
+        legacy = json.dumps(control['permit'])
+        _ = (folder / 'work-permit.json').write_text(legacy)
+        _ = (folder / 'generation').write_text('1')
+        with hana_guest.guest_lock(paths):
+            self.assertIs(hana_guest.bound_permit(settings, paths, clock=self.clock, uptime=lambda: 1),
+                          hana_guest.PermitRefusal.NOT_INSTALLED)
+        with self.assertRaisesRegex(ValueError, 'generation changed'):
+            _ = hana_receiver.receive(settings, descriptor, {**control, 'expected_generation': 1},
+                                      paths=paths, clock=self.clock)
         reply = hana_receiver.receive(settings, descriptor, control, paths=paths, clock=self.clock)
         self.assertEqual(reply['generation'], 1)
-        self.assertEqual(hana_guest.read_identity(paths.generation), '1')
+        self.assertEqual(hana_guest.read_permit(paths.permit),
+                         hana_guest.WorkPermit(self.clock.now + settings.permit_max_seconds, '1', 'fixture-boot'))
+        self.assertEqual((folder / 'work-permit.json').read_text(), legacy)
+        self.assertEqual((folder / 'generation').read_text(), '1')
         self.assertEqual(hana_receiver.receive(settings, descriptor, control, paths=paths, clock=self.clock), reply)
         _ = paths.fence.write_text('{}')
         with self.assertRaisesRegex(ValueError, 'shutdown is fenced'):

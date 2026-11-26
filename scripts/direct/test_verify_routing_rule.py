@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from typing import cast, override
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_targets import build_targets, targets
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
@@ -36,7 +37,8 @@ class RoutingRuleTests(unittest.TestCase):
             for flag, message in cases:
                 with self.subTest(flag=flag):
                     result = subprocess.run(["bash", "-c", parser + '\nCMD=build\nparse_routing_arguments "$@"',
-                        "verify-parser", flag], cwd=directory, capture_output=True, text=True,
+                        "verify-parser", flag],
+                        env=verify_test_environment(), cwd=directory, capture_output=True, text=True,
                         check=False, timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(result.returncode, 2)
                     self.assertIn(message, result.stderr)
@@ -52,6 +54,7 @@ printf '%s\n' "${ARGS[@]}"
         with tempfile.TemporaryDirectory() as directory:
             def parse(*words: str) -> subprocess.CompletedProcess[str]:
                 return subprocess.run(["bash", "--noprofile", "--norc", "-c", parser, "verify-parser", *words],
+                                      env=verify_test_environment(),
                                       cwd=directory, capture_output=True, text=True, check=False,
                                       timeout=TEST_HANG_GUARD_SECS)
             build = parse("build", "sample", "--release", "--attached")
@@ -87,7 +90,8 @@ for CMD in check test doc lint example build final; do
 done
 '''
         with tempfile.TemporaryDirectory() as directory:
-            result = subprocess.run(["bash", "--noprofile", "--norc", "-c", parser], cwd=directory,
+            result = subprocess.run(["bash", "--noprofile", "--norc", "-c", parser],
+                                   env=verify_test_environment(), cwd=directory,
                                     capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [
@@ -199,6 +203,41 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["build"]], [])
 
 
+def add_peer_target(root: Path) -> None:
+    """Register a linux SSH target named peer, with its settings file."""
+    _ = write_config_fixture(root / "linux.conf", "offload=on\nhost=fake-linux\nkinds=test,check,doc\n",
+                             template="mac_test")
+    targets_file = root / "build_targets.conf"
+    _ = targets_file.write_text(targets_file.read_text().replace("targets=mac,natedev", "targets=mac,natedev,peer")
+        + "kind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n")
+
+
+class RemoteWaitStateTests(VerifyMacOffloadFixture):
+    """The machine watch counts a waiting_ssh step only for the target that the state names."""
+
+    def declined_states(self, mode: str, reason: str) -> list[str]:
+        """Run try_mac_test on peer with a runner answer, and return each published step state."""
+        add_peer_target(self.root)
+        states = self.root / "step-states"
+        assigned = self.assigned_remote("peer", "nextest")
+        result = self.call_mac_functions('step_state() { printf "%s\\n" "$*" >> "$TEST_STEP_STATES"; }\n'
+            + 'PLACEMENT_ASSIGNMENT_FILE="$TEST_DIRECT_ASSIGNMENT"\n'
+            + 'STEP_ASSIGNED_TARGET=peer STEP_ASSIGNED_PLATFORM=linux\n'
+            + 'try_mac_test "$MAC_TEST_CONFIG" || true\n',
+            extra={"MAC_TEST_CONFIG": str(self.root / "linux.conf"), "TEST_DIRECT_ASSIGNMENT": str(assigned),
+                   "TEST_STEP_STATES": str(states), "TEST_RUNNER_MAC": mode, "TEST_RUNNER_REASON": reason})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return states.read_text().splitlines()
+
+    def test_a_declined_ssh_step_names_its_target_in_each_wait_state(self) -> None:
+        self.assertEqual(self.declined_states("declined", "busy"),
+                         ["waiting_ssh peer", "on_ssh peer", "waiting_ssh peer"])
+
+    def test_an_unusable_runner_result_names_the_target_in_its_wait_state(self) -> None:
+        """A runner that writes no result takes the runner-declined branch."""
+        self.assertEqual(self.declined_states("none", ""), ["waiting_ssh peer", "on_ssh peer", "waiting_ssh peer"])
+
+
 class FinalRemoteEnvironmentTests(VerifyMacOffloadFixture):
     @override
     def setUp(self) -> None:
@@ -221,11 +260,7 @@ with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as outpu
         self.environment.update({"NO_COLOR": "1", "RUST_LOG": "sample=trace",
                                  **{name: "caller" for name in FIXED_ENVIRONMENT},
                                  "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
-        _ = write_config_fixture(self.root / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\nkinds=test,check,doc\n",
-                                 template="mac_test")
-        targets_file = self.root / "build_targets.conf"
-        _ = targets_file.write_text(targets_file.read_text().replace("targets=mac,natedev", "targets=mac,natedev,peer")
-            + "kind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n")
+        add_peer_target(self.root)
 
     def assert_remote_environment(self, *, copied: bool) -> None:
         rows = [cast(dict[str, object], json.loads(line))

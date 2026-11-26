@@ -1,27 +1,91 @@
 """Check named assignment review with the shared loopback fixture."""
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
 import json
 import os
 import subprocess
 import sys
+import tempfile
+import unittest
 from pathlib import Path
 from collections.abc import Callable
 from typing import cast, final, override
 from unittest.mock import patch
 from scripts.agents import codex_test_support as codex_fixture
+from scripts.agents import remote
+from scripts.agents.remote import local_machine
 from scripts.astra import astra_roles
 from scripts.astra.design_role_test_support import HeldRolePaneCase
 from scripts.direct import assign, progress_history, recorder_state
 from scripts.production import staff, worker
+from scripts.production.production_doc import EnrolledPaths
+from scripts.production.staff_test_support import fixture_member
 from scripts.herdr import turn_end, worker_panes
 from scripts.production.cli_fixture import invoke_cli
-from scripts.direct.assign_launcher_test_support import ROOT, read_object
+from scripts.direct.assign_launcher_test_support import (
+    ROOT, AssignLauncherFixture, assignment_environment, read_object,
+)
+from scripts.lib import build_folders, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.git_test_support import commit_repository
+from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
+from scripts.lint import style_review
 
 setUpModule = codex_fixture.setUpModule
 
+
+@final
+class AssignmentFixtureIsolationTests(unittest.TestCase):
+    def test_commits_keep_the_inherited_git_repository_unchanged(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        sentinel = root / "sentinel"
+        git_dir = sentinel / ".git"
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        environment.update(GIT_CONFIG_GLOBAL=str(write_fixture_git_config(root)), GIT_CONFIG_NOSYSTEM="1")
+        _ = subprocess.run(["git", "init", "-q", str(sentinel)], env=environment, check=True, capture_output=True)
+        write_text_atomic(sentinel / "tracked", "Sentinel contents.\n")
+        head = commit_repository(sentinel, "Create the sentinel.", env=environment)
+        index = (git_dir / "index").read_bytes()
+        shallow = root / "shallow"
+        write_text_atomic(shallow, head + "\n")
+        locations = {
+            "GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(sentinel), "GIT_INDEX_FILE": str(git_dir / "index"),
+            "GIT_COMMON_DIR": str(git_dir), "GIT_OBJECT_DIRECTORY": str(git_dir / "objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(git_dir / "objects"), "GIT_CEILING_DIRECTORIES": str(root),
+            "GIT_SHALLOW_FILE": str(shallow), "GIT_TEMPLATE_DIR": str(root / "external-templates"),
+        }
+        case = AssignLauncherFixture("runTest")
+        with patch.dict(os.environ, locations):
+            try:
+                case.setUp()
+                self.assertEqual({name for name in os.environ if name.startswith("GIT_")},
+                                 {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_TEMPLATE_DIR"})
+                # The worktree model gets the fixture's own empty templates, never the inherited folder.
+                self.assertEqual(Path(os.environ["GIT_TEMPLATE_DIR"]), case.home / "git-templates")
+                write_text_atomic(case.project / "fixture.txt", "Private work.\n")
+                case.commit_project("Record private work.")
+            finally:
+                case.doCleanups()
+        current = subprocess.check_output(["git", "-C", str(sentinel), "rev-parse", "HEAD"],
+                                          env=environment, text=True).strip()
+        self.assertEqual(current, head)
+        self.assertEqual((git_dir / "index").read_bytes(), index)
+        self.assertEqual((sentinel / "tracked").read_text(), "Sentinel contents.\n")
+
+    def test_fixture_context_releases_the_style_folder_lock(self) -> None:
+        descriptors = Path("/dev/fd")
+        before = len(list(descriptors.iterdir()))
+        case = AssignLauncherFixture("runTest")
+        try:
+            case.setUp()
+            held = build_folders.held_build_folder_descriptors()
+            folder = style_review.start(case.project, "HEAD", case.session_dir / "phases/7", case.prompt, "review")
+            self.assertEqual(build_folders.held_build_folder_descriptors(), held)
+            self.assertTrue((folder / "prompt.md").is_file())
+        finally:
+            case.doCleanups()
+        self.assertEqual(len(list(descriptors.iterdir())), before)
 
 
 @final
@@ -30,10 +94,10 @@ class PaneAstraReviewTests(HeldRolePaneCase):
 
     @override
     def setUp(self) -> None:
+        bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_BIN": sys.executable})))
         super().setUp()
-        from scripts.lib import unit_runs
-
+        _ = self.enterContext(assignment_environment(bytecode_setting))
         _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.panes.root))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"ASTRA_REVIEW_DIR": str(self.panes.root)})))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""})))
@@ -61,7 +125,28 @@ class PaneAstraReviewTests(HeldRolePaneCase):
             "--prompt", str(self.panes.command_case.prompt), "--reply-file", str(run / "review.md")],
             os.environ.copy(), ROOT)
 
+    def test_named_review_refuses_an_unreadable_staff_reread(self) -> None:
+        case = self.panes.command_case
+        begin = assign.execute_herdr
+
+        def lose_staff(args: assign.Arguments, run: Path, phase: str, prompt: Path,
+                       role: staff.WorkerRole, paths: list[str], environment: dict[str, str]) -> int:
+            with patch.object(staff, "snapshot", side_effect=staff.StaffUnreadable("private reread failure")):
+                return begin(args, run, phase, prompt, role, paths, environment)
+
+        submitted = case.agent.submitted.copy()
+        with patch.object(assign, "execute_herdr", side_effect=lose_staff):
+            result = invoke_cli(assign, assign.main, ["--role", "review",
+                "--to", "models-review-adversary", "--lens", "adversary", "--phase", "8",
+                "--session-dir", str(case.run_dir), "--cwd", str(self.panes.root), "--prompt", str(case.prompt)],
+                os.environ.copy(), ROOT)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("staff: review: not opened: private reread failure", result.stderr)
+        self.assertEqual(case.agent.submitted, submitted)
+
     def test_named_review_done_records_the_status_style_and_one_notice(self) -> None:
+        _ = self.enterContext(patch.object(remote, "local_machine", new=local_machine))
+        write_text_atomic(Path(os.environ["LINT_CONFIG_FILE"]), "style_review=on\n")
         project = self.panes.root / "project"
         project.mkdir()
         _ = subprocess.run(["git", "init", "-q", str(project)], check=True, capture_output=True)
@@ -74,9 +159,53 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         _ = progress_history.begin_dispatch(case.run_dir, slot="impl", phase="8", role="impl",
             worker_name="impl", worker_id=opened.row.id, launcher_command=["implementation"],
             prompt=case.prompt, kind="impl", lens="")
-        for lens, style in (("adversary", False), ("contract", True)):
-            with self.subTest(lens=lens, style=style):
-                name = "models-review-" + lens
+        for lens, style, enrolled in (("adversary", False, False), ("contract", True, False),
+                                      ("contract", True, True)):
+            with self.subTest(lens=lens, style=style, enrolled=enrolled):
+                name = "models-review-" + lens + ("-enrolled" if enrolled else "")
+                environment = os.environ.copy()
+                if enrolled:
+                    integration = self.panes.root / "style-integration"
+                    integration.mkdir()
+                    enrolled_paths = EnrolledPaths(project, project / "production.md", project / "LOG.md",
+                                                  project / "notes", integration)
+                    write_text_atomic(enrolled_paths.live_doc, f"# Production\n- **Merge checkout:** `{project}`\n")
+                    with (project / ".git/info/exclude").open("a") as excludes:
+                        _ = excludes.write("/production.md\n")
+                    owner = fixture_member("showrunner", name="style-showrunner",
+                                           doc=staff.LiveDoc(remote.local_machine(), enrolled_paths.live_doc))
+                    unit = case.fixture.parent
+                    _ = staff.clear_run(unit.id, case.run_dir)
+                    owner = staff.set_run(owner.id, staff.OpenRun(case.run_dir))
+                    case.fixture.parent_id = owner.id
+                    self.panes.world.add(owner, "w2:p0", workspace="w2", tab="w2:t0")
+                    state_path = case.run_dir / unit_runs.STATE_FILE
+                    state = read_object(state_path)
+                    state[unit_runs.OWNER_FIELD] = owner.id
+                    write_text_atomic(state_path, json.dumps(state))
+                    _ = self.enterContext(patch.object(worker_panes, "resolve_production_paths", return_value=enrolled_paths))
+                    environment["CODEX_THREAD_ID"] = owner.current_session
+                    path_bin = self.panes.root / "fixture-admission"
+                    path_bin.mkdir()
+                    ps = path_bin / "ps"
+                    write_text_atomic(ps, f"#!/bin/sh\nprintf '%s\\n' '1 python3 {ROOT}/scripts/direct/assign.py'\n")
+                    ps.chmod(0o755)
+                    invocation = ["bash", str(ROOT / "scripts/direct/review.sh"), "--phase", "F018",
+                                  "--style-since", baseline, str(case.run_dir), str(project), str(case.prompt)]
+                    admitted = {**environment, "PATH": f"{path_bin}:{environment['PATH']}"}
+                    for saved_owner, reason in ((owner.id, "enrolled showrunners"),
+                                                (unit.id, "conflicts with the run pointer")):
+                        with self.subTest(saved_owner=saved_owner):
+                            write_text_atomic(state_path, json.dumps({**state, unit_runs.OWNER_FIELD: saved_owner}))
+                            artifacts = {path: path.read_bytes() for path in case.run_dir.rglob("*") if path.is_file()}
+                            paths_before = set(case.run_dir.rglob("*"))
+                            refused = subprocess.run(invocation, capture_output=True, text=True, env=admitted, check=False)
+                            self.assertNotEqual(refused.returncode, 0)
+                            self.assertIn(reason, refused.stderr)
+                            self.assertIn("assign.sh --role review --style-since", refused.stderr)
+                            self.assertEqual(set(case.run_dir.rglob("*")), paths_before)
+                            self.assertEqual({path: path.read_bytes() for path in artifacts}, artifacts)
+                    write_text_atomic(state_path, json.dumps(state))
                 case.agent.final = ("<!-- phase-style-review:start -->\nStyle review: Pass\n"
                                     "<!-- phase-style-review:end -->\nAPPROVE")
                 arguments = ["--role", "review", "--to", name, "--lens", lens, "--pass", "1",
@@ -84,19 +213,55 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                              "--prompt", str(case.prompt)]
                 if style:
                     arguments += ["--style-since", baseline]
+                if enrolled:
+                    stale = self.panes.root / "stale-review.md"
+                    write_text_atomic(stale, "Phase 7 — Earlier work\nReview the assigned change.\n")
+                    submitted = list(case.agent.submitted)
+                    refused = invoke_cli(assign, assign.main, [*arguments, "--prompt", str(stale)], environment, project)
+                    self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                    self.assertIn("Stale prompt phase", refused.stderr)
+                    self.assertEqual(case.agent.submitted, submitted)
                 notices = len(case.agent.notices)
-                result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), project)
+                result = invoke_cli(assign, assign.main, arguments, environment, project)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 pane = case.agent.submitted[-1][0]
                 row = case.agent.row(pane)
                 active = progress_history.active_dispatch(row.id, case.run_dir)
                 assert isinstance(active, progress_history.ActiveDispatch)
+                if enrolled:
+                    phase_dir = case.run_dir / "phases/8"
+                    saved = read_object(phase_dir / "style_review_state.json")
+                    directory = Path(str(saved["input_directory"]))
+                    self.assertTrue(directory.is_relative_to(phase_dir))
+                    original = directory.with_name(directory.name + "-original")
+                    report = directory / "report.md"
+                    trees = (project, self.panes.root / "style-integration")
+                    for tree in trees:
+                        write_text_atomic(tree / report.name, "Keep the checkout report.\n")
+                    replace_file = os.replace
+
+                    def move_style_parent(source: str | Path, target: str | Path, *,
+                                          src_dir_fd: int | None = None, dst_dir_fd: int | None = None) -> None:
+                        if target == report.name:
+                            _ = directory.rename(original)
+                            directory.symlink_to(trees[1], target_is_directory=True)
+                        replace_file(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+                    with patch.object(os, "replace", side_effect=move_style_parent):
+                        with self.assertRaises(OSError):
+                            _ = case.finish(name)
+                    self.assertTrue(directory.is_symlink())
+                    self.assertIn("Style review: Pass", (original / report.name).read_text())
+                    for tree in trees:
+                        self.assertEqual((tree / report.name).read_text(), "Keep the checkout report.\n")
+                    directory.unlink()
+                    _ = original.rename(directory)
                 for expected in (turn_end.TurnOutcome.DONE, turn_end.TurnOutcome.IGNORED):
                     self.assertEqual(case.finish(name), expected)
                     self.assertEqual(len(case.agent.notices), notices + 1)
                 passed = worker_panes.worker_pass(row, case.run_dir)
                 self.assertEqual(passed["status"], "completed")
-                delivery = progress_history.dispatch_delivery(passed)
+                delivery = pass_recorder.dispatch_delivery(passed)
                 self.assertEqual(Path(delivery.actions.status_file).read_text(), "done\n")
                 self.assertTrue(Path(delivery.reply_file).read_text().endswith(f"DONE {active.instance_id}\n"))
                 self.assertIn(f"{name}: phase 8: done", case.agent.notices[-1])
@@ -104,6 +269,11 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     saved = read_object(case.run_dir / "phases/8/style_review_state.json")
                     self.assertEqual(saved["state"], "complete")
                     self.assertEqual(saved["in_flight"], False)
+                    directory = Path(str(saved["input_directory"]))
+                    self.assertTrue(directory.name.startswith(f"{name}-"))
+                    self.assertEqual(len(directory.name.removeprefix(f"{name}-")), 11)
+                    self.assertTrue((directory / "assignment.md").read_text())
+                    self.assertEqual((directory / "style-review-additions.txt").read_text(), "+The next design.\n")
 
     def assert_review_lifetime(self, failed: bool) -> None:
         records: list[dict[str, object]] = []

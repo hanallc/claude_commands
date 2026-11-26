@@ -1,4 +1,4 @@
-"""Keep copy operations outside live slot, gate, and session roots during tests."""
+"""Keep copy operations outside live build, gate, and session roots during tests."""
 from __future__ import annotations
 
 import json
@@ -12,16 +12,18 @@ from typing import cast
 from unittest.mock import patch
 
 from scripts.copies import copies
-from scripts.lib import build_folders, conf, session_folder
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib import build_folders, conf, conf_reads, session_folder
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.cli_fixture import ImmutableGitSeed
 
 
 def live_roots() -> tuple[Path, ...]:
     values = conf.read_or_repository("build_folders").values()
+    root_keys = ("roots.build", "roots.session", "roots.workspace")
     configured = [Path(value).expanduser() for key, value in values.items()
-                  if key in ("roots.slots", "roots.session") or key.startswith(("roots.slots.", "roots.session."))]
+                  if key in root_keys
+                  or key.startswith(tuple(root + "." for root in root_keys))]
     return tuple(path.resolve() for path in (
         *configured, Path.home() / "worktrees/gates", Path.home() / "worktrees",
         session_folder.configured_root(), session_folder.former_root(),
@@ -45,11 +47,11 @@ class LiveRootsGuardTests(unittest.TestCase):
             self.assertFalse(any(base.is_relative_to(parent) for parent in caller_roots), caller_roots)
             guarded = base / "guarded"
             root = base / "private"
-            protected = private_slot_config(guarded, repository="origin")
-            private = private_slot_config(root, repository="origin")
+            protected = private_copy_config(guarded)
+            private = private_copy_config(root)
             for fixture in (protected, private):
                 _ = write_config_fixture(Path(fixture.environment["COPIES_CONFIG"]),
-                                         "wait_seconds=0.01\ngit_timeout_seconds=30\nguard_timeout_seconds=30\n")
+                                         "git_timeout_seconds=30\nguard_timeout_seconds=30\n")
             guarded_temporary = guarded / "temporary"
             guarded_temporary.mkdir()
             with patch.dict(os.environ, {**protected.environment, "TMPDIR": str(guarded_temporary),
@@ -63,16 +65,19 @@ class LiveRootsGuardTests(unittest.TestCase):
             home = root / "home"
             home.mkdir()
             environment = {"PATH": os.environ.get("PATH", os.defpath), **private.environment,
-                           "TMPDIR": str(temporary), "HOME": str(home),
+                           **conf_reads.shift_child_environment(), "TMPDIR": str(temporary), "HOME": str(home),
                            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
             with patch.dict(os.environ, environment, clear=True):
                 source = ImmutableGitSeed.create(root, "main", "Copy Tests", "copy@example.invalid",
                     {"source.txt": "source\n"}).checkout
             program = '''import json, os, pathlib, subprocess, sys
 from scripts.copies import copies
-from scripts.lib import build_folders, copy_record, scratch
+from scripts.copies.workspace_test_support import registered_workspace
+from scripts.lib import build_folders, conf_reads, copy_record, scratch
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 root, source = map(pathlib.Path, sys.argv[1:3])
+if conf_reads.shift_reads_enabled():
+    conf_reads.set_shift_read_log(str(root / 'shift-reads'))
 forbidden = tuple(pathlib.Path(value) for value in json.loads(sys.argv[3]))
 def checked(value, descriptor=None, *, writing=False):
     if not isinstance(value, (str, bytes, os.PathLike)):
@@ -151,10 +156,10 @@ with fake_cargo_output_roots():
     copies.unregister_remote(mirror.host, mirror.path)
     assert not record.exists()
     with copies.standing('private-test', source, copies.CommittedSource('HEAD')) as gate:
-        assert gate.is_relative_to(root / 'slots')
+        assert gate.is_relative_to(root / 'build')
         assert (gate / 'source.txt').read_text() == 'source\\n'
     assert build_folders.build_folder_state(gate) == 'free'
-    with copies.workspace('private-test', source, 'HEAD', name='editor', branch='editor') as workspace:
+    with registered_workspace('private-test', source, 'HEAD', name='editor', branch='editor') as workspace:
         assert workspace.is_relative_to(root / 'workspaces')
         assert copy_record.copy_folder(workspace) == workspace
         assert (workspace / 'source.txt').read_text() == 'source\\n'

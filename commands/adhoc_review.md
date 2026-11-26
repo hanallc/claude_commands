@@ -4,17 +4,31 @@ description: Review decisions one at a time.
 
 Use this when the user has just received a long list — recommendations, findings, options, todos — and wants to review them deliberately one by one instead of responding to the whole wall of text.
 
-**Read `~/.claude/docs/user_facing_explanation.md` first and follow it.** It owns
-the principle every rule here derives from — you do the reconstruction, not the
-user — plus the build order, the naming rules, the banned vocabulary, the
-comprehension gate, the choice-line format, and what to do when an explanation
-fails to land. This file adds only what is specific to walking a list.
+**Read `~/.claude/docs/user_facing_explanation.md` first and follow it.**
 
 **Read `~/.claude/docs/type_design.md` too and follow it.** When an item concerns
 types, APIs, stored state, or optional values, use that contract to evaluate the
 proposal and recommendation. A vague name or domain-owned `Option<T>` is a
 design issue; consider the restructuring needed to make a precise semantic type
 truthful, not only a rename.
+
+## Join a review
+
+Run `~/.claude/scripts/adhoc_review/shared_review.py` with `~/.claude/scripts/lib/py`.
+Pass the returned `owner` and `review` IDs as `OWNER REVIEW`.
+For `/adhoc_review join bob`, run `join bob` on the owner's machine.
+
+Apply `remaining` from `join` with the Step 3 status command.
+
+1. Run `next OWNER REVIEW` to claim an item. Use `--item N` to revisit one.
+2. Apply `remaining` from `next` before you handle the result, including `busy` or `complete`.
+3. Read the decisions in the returned `items`.
+4. On `busy`, say another session holds the remaining items. Wait for the user to continue.
+5. On `complete`, proceed to `leave` below.
+6. Apply Step 3.5 when needed. Use the split, explanation, and choice instructions in Step 4.
+7. Run `record OWNER REVIEW ITEM DECISION --actions ACTIONS` after a decision. Record `Skipped` if the user skips. Apply `remaining`.
+8. Run `leave OWNER REVIEW` when you stop. Skip it if the owner ended the review.
+9. Set this session's count to zero. Use the held message steps in Step 5.
 
 ## Step 1: Identify the items
 
@@ -30,13 +44,20 @@ count into Step 2 without listing the items.
 
 ## Step 2: Set up where decisions get recorded
 
-
-By default the review gets a transient doc: a new file at the working repo's root, excluded from git with `bash ~/.claude/scripts/exclude/exclude.sh <path>` (the scratchpad does not survive compaction), headed with today's date and where the items came from. It holds each decision and any action the decision leaves pending, and is deleted in Step 5. Create it without asking, and open the first item with one line: `N items; decisions in <path>, deleted when the review ends.` An item may also be acted on as soon as it is decided; the doc then records that it was done.
+Create a transient document at the repository root by default.
+Give it today's date and the source of the items.
+Exclude it from Git with `bash ~/.claude/scripts/exclude/exclude.sh <path>`.
+Record each decision and its pending actions. If you act on a decision during the review, record the action as done.
+Before the first item's choice line, add `N items. Decisions go in <path>. I'll delete this file when the review ends.`
 
 Ask first only when an obvious doc is in scope that the user did not name, a file they have been editing or named this session that the decisions belong in:
   > `N items. Record decisions in <relative/path/to/doc.md> (recommended)? (yes / transient doc)`
 
 Wait for that answer before continuing. Never write "existing path": name the doc. If the user names a path that doesn't exist, create it with the same one-line header.
+
+Try `start --source SOURCE --items -` with the full item texts as a JSON array on stdin.
+Enable sharing only after `start` returns the review IDs.
+If `start` fails, continue the solo review silently. Use shared commands only when sharing is active.
 
 ## Step 3: Build the todo list
 
@@ -88,95 +109,88 @@ turns.
 
 ## Step 4: Walk the list
 
+For a shared review, run `claim OWNER REVIEW` before you open each task.
+Reconcile tasks by stable ID in the returned `items` order. Add new tasks and update changed texts.
+Copy joined decisions into the decision document and mark their tasks complete.
+Open the task for the claimed item ID. On `busy`, wait for the user to continue.
+On `complete`, go to Step 5.
+
 For each item, in order:
 
 1. Mark the task `in_progress`.
 2. Check that the item contains **one decision**. If it contains independent questions, split them into ordered subitems, preserve the original ID as their prefix, update the task list, and present only the first.
-3. **Build a decision-ready explanation before formatting the item**, following
-   the build order and naming rules in the shared file. Two additions specific to
-   list items:
-   - Use one concrete scenario when timing, lifecycle, ownership, or state transitions create the decision.
-   - Distinguish existing behavior from proposed behavior, but do not make the user reconstruct the causal story from implementation facts.
-4. Apply the **comprehension gate** from the shared file before presenting. `elaborate` never supplies context the initial decision required.
-5. Present the item with the decision frame below.
-6. **Present the choices as an inline text line** per the shared file's Choices section — one line of message text, exactly one option marked recommended with its reason, never a survey or multiple-choice UI. Pick a choice set that fits the item (`keep / drop / modify`, `approve / reject / redirect`, …) and always include `elaborate`:
-   > `keep (recommended — survived review unchanged) / modify / drop / elaborate`
-7. **Wait for the user's response.** Do not move on until they reply.
+   In a shared review, save the split with `split OWNER REVIEW ITEM SUBITEM1 SUBITEM2 ...` before you show it.
+   Keep the original task ID prefix in each subitem's text.
+3. Build the causal explanation with the shared file's build order. Then use its **Ad hoc review items** template.
+4. When a subagent or worker prepares items, give it the shared guide, the user's own words for the request, and the text the user sees on screen.
+5. Run the shared **reader test** and **comprehension gate** on each item before the user sees it, prepared items included. Then show the item.
+6. **Wait for the user's response.**
    - If the user picks `elaborate` (also: "more", "detail", "expand", "why"): add one new rationale, constraint, or example relevant to the current item. Do not broaden scope or dump the raw item. Then re-present the same choices and wait again.
+   - If the user picks `simplify`, follow **Simplify the item** below.
+   - If the user picks `read messages`, run `~/.claude/scripts/lib/py ~/.claude/scripts/message/review_hold.py end-now`.
+     Read each release named by the command or the prompt hook's held-messages notice.
+     Summarize the messages in one line. Show the same item again.
    - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation and stop asking for a decision. Apply repair-downward-then-upward from the shared file: **the upward repair here is Step 3.5** — run it now, whether or not it ran earlier. Re-running it mid-walk costs one turn; iterating item detail at ever finer grain costs many and does not terminate.
    - If the user asks a clarifying question, answer it without recording a decision or advancing. Re-present the choices only when useful.
    - If the user proposes a modification, restate only the revised decision, update the recommendation or example as needed, and wait for explicit acknowledgment before recording it.
-8. When they clearly acknowledge a terminal choice (including terse approvals such as `agreed`, `approved`, `okay`, or `continue` when unambiguous), record the decision, and any action it leaves pending, in the doc, mark the task `completed`, and move to the next item.
+7. Accept a terse reply such as `okay` or `continue` when it clearly selects a terminal choice. Record the decision and any pending actions. Mark the task `completed` and continue to the next item.
+
+   When sharing, mirror each decision or skip with `decide OWNER REVIEW ITEM DECISION --actions ACTIONS`.
 
 Do not ask "continue or add more?" between items — assume continue unless the user volunteers something.
 
-After each terminal choice, including a skip, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` with the open count.
+After each terminal choice, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` if items remain.
 Run it again when the user returns to a closed item; include that item in the count.
 
-### Decision frame
+### Simplify the item
 
-Use this order by default:
-
-1. **Situation** — explain the triggering event or user task, what the system must decide, and what goes wrong if it chooses incorrectly. Start in application/user behavior, not implementation terminology.
-2. **How the choices behave** — explain every choice in terms of what happens. Introduce a type, API, or variant name only after its behavior is understood, and define it at that point. Mark every undecided name immediately as `(name TBD)`.
-3. **Concrete scenario** — when the decision involves timing, lifecycle, ownership, state, or multiple actors, walk through one short example before asking the question.
-4. **Question** — state the single decision in behavioral language. The user should not need to know the implementation names to answer it.
-5. **Recommendation** — give the recommended outcome first and connect it to the user's stated goal or the concrete failure it avoids. Name meaningful costs or restrictions.
-6. **Implementation mapping (optional)** — only after the behavior is understood, show the proposed type/API names or a small new-behavior code example when that helps record the decision precisely.
-7. **Still pending** — name only nearby decisions that could otherwise look silently decided. Say where they will be handled when known. Do not dump the full backlog.
-8. **Choices** — one plain-text line with exactly one recommendation and `elaborate`; describe behavior before labels.
-
-Example shape:
-
-```text
-### A3 — <decision title>
-
-When <triggering situation>, the application currently/proposedly ... . The
-decision matters because ... .
-
-The choices behave differently:
-- With <behavioral choice>, the system ... .
-- With <other behavioral choice>, the system ... .
-
-The question is whether ...
-
-I recommend ... because ...
-
-In the implementation, this would be named `<ProposedType>` (name TBD).
-
-Still pending:
-- ... remains for A4.
-
-approve (recommended — reason) / alternative / elaborate
-```
-
-This is a scaffold, not a demand for headings when a very small item reads more clearly in a few sentences.
+1. Rewrite the same item in simpler words. Keep every technical detail and add no facts or rationale.
+2. Save both complete versions in private scratch files. Send the versions and one line about how the first version failed:
+   `~/.claude/scripts/lib/py ~/.claude/scripts/adhoc_review/simplify_report.py --from <session-name> report --before <file> --after <file> --failure <line>`
+   Continue the review if the report fails.
+3. Keep the report ID, including for a queued report. Keep the simplified item file while the item is open. Show only the simplified item with the same choices.
+4. If the user gives feedback on the rewrite, apply it to the explanation. Save their exact words in a private scratch file. If you have the report ID, send the feedback.
+   `~/.claude/scripts/lib/py ~/.claude/scripts/adhoc_review/simplify_report.py --from <session-name> feedback --report <id> --item <after-file> --words <file>`
+   Keep the report and delivery result out of the review.
 
 ## Step 5: Wrap up
 
+For a shared review, run these steps as the owner:
+
+1. Run `end OWNER REVIEW` to close claims and read the final decisions.
+2. Save those decisions in the decision document. Update existing entries by item ID.
+3. Run `end OWNER REVIEW --finish` after the save succeeds.
+
+If wrap-up stops, use `resume` to recover the IDs. If it returns `closing`, repeat these steps.
+
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" 0` when the review ends, including an early end.
+The command output names the held messages file. Read the file at your own pace.
+Each release in the file lists its messages oldest first.
+
+For a transient document, summarize each completed decision inline as `1. <label> → <decision>`.
+List all pending actions, or say `none pending`. Then delete the document.
 
 When every item is done:
 
-
-- Transient doc: summarize inline, one line per item — `1. <label> → <decision>` — then every action still pending (or `none pending`), then delete the doc.
 - A doc the user chose: one-line summary — `Wrote decisions for N completed items to <path>`. It stays.
 - Ensure every task has a terminal status.
 
 ## Rules
 
-`~/.claude/docs/user_facing_explanation.md` carries the explanation rules — build
-order, naming, banned vocabulary, comprehension gate, choice format, repair when
-an item does not land. These are the ones specific to walking a list.
-
-- **NEVER run the review as a survey.** No AskUserQuestion, no option chips, no questionnaire UI — for the items themselves or for any step of this workflow. Every item is a succinct summary followed by the inline choice line from Step 4. Keep the technical content, drop the widget.
 - One item at a time. Never present two items in the same turn.
+- When you ask another agent for input during an open review, tell it to answer with `send.py --urgent`. Only an urgent message arrives while the review is open.
 - **Model-level questions get model-level answers, at Step 3.5's altitude** — participants, what is durable versus transient, how they connect, one worked instance — and then return to the item. Adopt the user's wording verbatim if they restate the model themselves.
-- Keep the recommendation scoped to the active question. Put adjacent unresolved consequences in **Still pending** rather than deciding them implicitly.
 - Step 2's doc question, when asked, is a choice like any other: mark exactly one option recommended.
-- Avoid unsolicited before/after code comparisons. This never permits omitting the triggering situation.
+- Show before and after code comparisons only when the user asks.
+- Code in an item: show at most the one or two lines that show what the thing is, and one use of it. Show no derive lines, asserts, exports or neighbour types.
+- When the user asks a question on an open item, give the answer alone, in one to three lines. Do not show the item again with added lines. Show it again only when the user asks, and then shorter.
+- The reason in the recommendation names the result that the user sees, not the mechanism.
+- Put a number that the decision depends on in the point or the first fact line, with its unit.
+- An item that asks the user to approve a new thing (a type, a command, a setting, a page) says in one line what exists today that is nearest to it, and why that does not do the job. Check this before you show the item.
 - If the user says skip, use a supported skipped/cancelled terminal status; if none exists, mark it completed with the skip noted. Then move on without arguing.
 - If they want to revisit an earlier item, jump back. Don't insist on linear order.
+  When sharing, use `claim OWNER REVIEW --item N` as owner or `next OWNER REVIEW --item N` after joining.
 - An explanation request never suspends the one-at-a-time rhythm.
 - If the review maintains a decision ledger, update it only after acknowledgment and leave undecided decision cells blank. Show it after each acknowledgment only when the user requested a running ledger; otherwise show it at wrap-up.
 - When the user adds a later review item, record it without forcing an immediate decision; place it after any prerequisites they named.
+  When sharing, use `add OWNER REVIEW TEXT`. Pass `--after N` to place the new item after its last prerequisite.

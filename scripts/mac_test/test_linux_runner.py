@@ -20,14 +20,17 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import process_stat
+from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.lib import process_stat, removal_guard
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.copies_test_support import copies_environment
-from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
+from scripts.mac_test import eligibility, claim_state, floor_claims, linux_runner, mac_test, offload, test_repository_claims
+from scripts.mac_test.offload_test_commands import WORKSPACE_SWEEP_SETTINGS, WorkspaceSweepFixture
 from scripts.mac_test.offload_test_support import mirror_use_payload
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 
 class DiskReading(NamedTuple):
@@ -139,6 +142,7 @@ rustup)
     ;;
 cargo|cargo-nextest|cargo-mend)
     if [[ $tool == cargo && "$*" == "metadata --format-version 1 --no-deps" && $# == 4 ]]; then
+        [[ -f Cargo.toml ]] || exit 101
         if [[ -n ${FAKE_CARGO_NEEDS_TOOLCHAIN-} && -z ${RUSTUP_TOOLCHAIN-} \
               && ! -f rust-toolchain && ! -f rust-toolchain.toml ]]; then
             echo "error: rustup could not choose a version of cargo to run" >&2
@@ -199,22 +203,24 @@ class LinuxShellTests(unittest.TestCase):
         self.settings = self.root / "linux.conf"
         _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
         _ = write_config_fixture(self.settings,
-            "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\n"
+            "offload=on\nhost=fake-linux\nkinds=test,check,doc\n"
             + "free_floor_gib=10\nbuild_budget_gib=32\ntarget_budget_gib=24\n"
             + "target_budget_gib.hana=31\ntarget_budget_gib.phase-copy=2\n"
             + "devshell.hana=ci\ndevshell.phase-copy=wrong\nskip.hana=test(gpu)\n"
-            + "devshell=default\nshell_cache=.local/state/build-target/shells\nshell_timeout_s=2\n",
+            + "devshell=default\nshell_cache=.local/state/build-target/shells\n"
+            + f"shell_timeout_s={TEST_HANG_GUARD_SECS}\n",
             template="mac_test",
         )
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(
             "targets=linux,mac\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n" + UNREACHABLE_WAIT_FIXTURE
         )
         _ = (self.root / "mac.conf").write_text("offload=on\nhost=fake-mac\nlinux_only.phase-copy=\n")
-        _ = write_config_fixture(self.root / "lint.conf", "recent_minutes=60\n")
+        _ = (self.root / "lint.conf").write_text(WORKSPACE_SWEEP_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
+            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / ".config"),
+            "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.mirror = self.root / offload.remote_mirror(self.identity, "linux", 2)
@@ -228,7 +234,7 @@ class LinuxShellTests(unittest.TestCase):
         self.event_path = self.root / "events.jsonl"
         tools = self.root / "bin"
         tools.mkdir()
-        for tool in ("nix", "df", "rm", "rustup", "cargo-nextest", "cargo-mend"):
+        for tool in ("nix", "df", "rm", "rustup", "cargo", "cargo-nextest", "cargo-mend"):
             self.write_tool(tools / tool)
         self.write_tool(self.root / ".claude/scripts/lint/lint")
         _ = copy_helpers(self.root, *COPY_HELPERS)
@@ -238,7 +244,8 @@ class LinuxShellTests(unittest.TestCase):
             self.fail("The fixture needs the rm executable")
         self.environment = {
             **interpreter_cache_environment(self.root / "cache"),
-            "HOME": str(self.root), "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
+            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / ".config"),
+            "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
             "TEST_REAL_RM": real_rm,
             "TOOL_EVENTS": str(self.event_path), "BUILD_TARGETS_CONFIG": str(registry),
             "CONF_DIR": str(self.root),
@@ -289,11 +296,15 @@ class LinuxShellTests(unittest.TestCase):
         free = int(self.environment.get("FAKE_FREE_GIB", "100")) * 1024 ** 3
         real_run = subprocess.run
         def child(argv: list[str], *, cwd: Path | str = "", check: bool = False,
-                  capture_output: bool = False, text: bool = False, timeout: float = 5,
+                  capture_output: bool = False, text: bool = False, timeout: float = TEST_HANG_GUARD_SECS,
                   env: dict[str, str] | None = None, pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
-            if len(argv) > 2 and argv[1] == "-c" and "sweep.sweep_workspace" in argv[2] and not self.use_real_sweep:
-                return subprocess.CompletedProcess(argv, 0, "", "")
+            if len(argv) > 2 and argv[1] == "-c" and "sweep.sweep_workspace" in argv[2]:
+                if not self.use_real_sweep:
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                proc = self.root / "proc"
+                proc.mkdir(exist_ok=True)
+                argv = [*argv[:2], WorkspaceSweepFixture(proc).python_prefix() + argv[2], *argv[3:]]
             completed = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True,
                                  text=True, timeout=timeout, env=env, pass_fds=pass_fds)
             if not capture_output:
@@ -441,7 +452,7 @@ class LinuxShellTests(unittest.TestCase):
         self.assertNotIn("BUILDLOG_REPO_IDENTITY", event["environment"])
 
 
-    def test_unchanged_inputs_reuse_exports_and_the_slot_build_folder(self) -> None:
+    def test_unchanged_inputs_reuse_exports_and_the_build_mirror(self) -> None:
         _ = self.assert_ran(self.request())
         self.write_input("src/main.rs", "fn main() { println!(\"changed\"); }\n")
 
@@ -611,7 +622,16 @@ class LinuxShellTests(unittest.TestCase):
         self.assertNotIn("BUILDLOG_BUILD_BUDGET_GIB", event["environment"])
         self.assertEqual(event["environment"]["LINT_SWEEP_BUDGET_GIB"], "35")
 
-    def test_slot_budget_removes_only_the_selected_build_folder(self) -> None:
+    def assert_budget_review(self, result: subprocess.CompletedProcess[str], target: Path) -> None:
+        plans = [Path(line.removeprefix("removal list: ")) for line in result.stdout.splitlines()
+                 if line.startswith("removal list: ")]
+        self.assertEqual(len(plans), 1, result.stdout + result.stderr)
+        [plan] = plans
+        self.assertEqual(plan.parent, self.root / removal_guard.LIST_DIRECTORY)
+        rows = [removal_guard.ListedEntry.parse(line) for line in plan.read_text().splitlines()]
+        self.assertEqual([(row.path, row.fingerprint) for row in rows], [(target, "")])
+
+    def test_slot_budget_lists_only_the_selected_build_folder(self) -> None:
         self.use_real_sweep = True
         _ = self.settings.write_text(self.settings.read_text().replace("target_budget_gib.hana=31", "target_budget_gib.hana=0.0001"))
         old = self.build_output("target", "old", 1, 196608)
@@ -624,12 +644,13 @@ class LinuxShellTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("mac_cleanup=kept", result.stdout)
-        self.assertFalse(old.exists())
+        self.assert_budget_review(result, self.mirror / "target")
+        self.assertTrue(old.exists())
         self.assertTrue(recent.exists())
         self.assertEqual((self.mirror / "target/warm-proof").read_text(), "warm\n")
         self.assertEqual(other.read_text(), "another slot\n")
 
-    def test_budget_trims_old_output_and_keeps_recent_output_until_the_disk_floor(self) -> None:
+    def test_budget_lists_output_and_keeps_it_until_the_disk_floor(self) -> None:
         self.use_real_sweep = True
         _ = self.settings.write_text(self.settings.read_text().replace(
             "target_budget_gib.hana=31", "target_budget_gib.hana=0.0001"))
@@ -642,11 +663,12 @@ class LinuxShellTests(unittest.TestCase):
         result = self.execute(self.request())
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(old.exists())
+        self.assert_budget_review(result, self.mirror / "target")
+        self.assertTrue(old.exists())
         self.assertTrue(recent.exists())
         self.assertEqual((self.mirror / "target/warm-proof").read_text(), "warm\n")
         used = sum(path.stat().st_size for path in (self.mirror / "target").rglob("*") if path.is_file())
-        self.assertLessEqual(used, 0.0001 * 1024 ** 3)
+        self.assertGreater(used, 0.0001 * 1024 ** 3)
         self.assertEqual(neighbor.read_text(), "another slot\n")
 
         self.environment["FAKE_FREE_GIB"] = "1"
@@ -667,7 +689,8 @@ class LinuxShellTests(unittest.TestCase):
         result = self.execute(self.request(words=("--target-dir", "custom-build")))
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(old.exists())
+        self.assert_budget_review(result, self.mirror / "custom-build")
+        self.assertTrue(old.exists())
         self.assertTrue(recent.exists())
         self.assertEqual((self.mirror / "custom-build/warm-proof").read_text(), "warm\n")
         self.assertEqual((self.mirror / "target/retained").read_text(), "default folder\n")
@@ -809,7 +832,7 @@ class LinuxShellTests(unittest.TestCase):
         real_run = subprocess.run
 
         def capture(argv: list[str], *, cwd: Path | str = "", check: bool = False,
-                    capture_output: bool = False, text: bool = False, timeout: float = 5,
+                    capture_output: bool = False, text: bool = False, timeout: float = TEST_HANG_GUARD_SECS,
                     pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
             result = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True,
@@ -874,9 +897,7 @@ class LinuxShellTests(unittest.TestCase):
         self.assertNotIn("mac_exit=", wire.stdout)
         self.assertFalse(self.events("lint"))
 
-        dispatch = LinuxDispatchTests()
-        self.addCleanup(dispatch.doCleanups)
-        dispatch.setUp()
+        dispatch = set_up_fixture(self.addCleanup, LinuxDispatchTests())
 
         class CompletedRemoteStep:
             stdout: io.StringIO = io.StringIO(wire.stdout + wire.stderr)
@@ -911,6 +932,8 @@ class LinuxShellTests(unittest.TestCase):
             self.write_tool(self.root / "bin" / tool)
         stamp = self.root / ".claude/.build-target-script-commit"
         _ = stamp.write_text("fixture-commit\n")
+        # Probe a registered mirror so the disk and tool checks do not start the setup helper.
+        _ = (self.mirror / floor_claims.MIRROR_MARK).write_text("registered remote mirror\n")
 
         result = subprocess.run(
             ["bash", "-c", offload.probe_script(self.identity, "linux", 2)], cwd=self.root,
@@ -1037,7 +1060,7 @@ class LinuxShellTests(unittest.TestCase):
         real_run = subprocess.run
 
         def capture(argv: list[str], *, cwd: Path | str = "", check: bool = False,
-                    capture_output: bool = False, text: bool = False, timeout: float = 5,
+                    capture_output: bool = False, text: bool = False, timeout: float = TEST_HANG_GUARD_SECS,
                     env: Mapping[str, str] | None = None, pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
             reply = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True, text=True,
@@ -1387,10 +1410,7 @@ class LinuxProcessTests(unittest.TestCase):
     def test_unattributed_unreadable_process_retains_claim_through_completion_and_takeover(self) -> None:
         run_command = subprocess.run
         open_process = subprocess.Popen
-        dispatch = LinuxDispatchTests()
-        self.addCleanup(dispatch.doCleanups)
-        dispatch.setUp()
-        _ = dispatch.settings.write_text(dispatch.settings.read_text().replace("slots.hana=4", "slots.hana=1"))
+        dispatch = set_up_fixture(self.addCleanup, LinuxDispatchTests())
         identity = eligibility.repository_identity(dispatch.source)
         if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
@@ -1411,7 +1431,7 @@ class LinuxProcessTests(unittest.TestCase):
             dispatch.actions.append("cleanup")
             selector = self.selector_output()
             _ = selector_runner.write_text(
-                "#!/bin/bash\nprintf '%s' " + shlex.quote(selector.stdout)
+                "#!/usr/bin/env bash\nprintf '%s' " + shlex.quote(selector.stdout)
                 + "; printf '%s' " + shlex.quote(selector.stderr)
                 + " >&2; exit " + str(selector.returncode) + "\n"
             )
@@ -1423,7 +1443,7 @@ class LinuxProcessTests(unittest.TestCase):
             with mock.patch.object(subprocess, "Popen", open_process):
                 result = run_command(["bash", "-c", stubs + argv[-1]], text=True,
                                      capture_output=True, check=False, timeout=5,
-                                     env={"HOME": str(dispatch.fixture.root), "PATH": "/usr/bin:/bin"})
+                                     env={"HOME": str(dispatch.fixture.root), "PATH": os.environ["PATH"]})
             cleanups.append(result)
             return result
 
@@ -1465,6 +1485,9 @@ class LinuxProcessTests(unittest.TestCase):
             with self.assertRaises(linux_runner.SlotProcessesUnresolved):
                 _ = linux_runner.slot_processes(self.mirror, self.proc)
             self.assertEqual(dispatch.fixture.claim("linux", dispatch.source, 103, remote=True)[0], 11)
+            lost = dispatch.fixture.claims("linux")[900]
+            lost_identity = claim_state.ClaimIdentity(*(cast(str, lost[field])
+                                                       for field in ("claim_id", "episode", "attempt")))
             dispatch.fixture.dead.add(900)
             dispatch.actions.clear()
             with mock.patch.object(os, "getpid", return_value=999):
@@ -1479,10 +1502,11 @@ class LinuxProcessTests(unittest.TestCase):
         self.assertNotIn("run", dispatch.actions)
         self.assertTrue((self.mirror / ".linux-run.json").exists())
         self.assertEqual(len(cleanups), 2)
-        for result in cleanups:
-            self.assertNotEqual(result.returncode, 0)
+        # The takeover settles the lost start before its leftover count fails.
+        settled = ["", "dispatch_start_settled=" + offload.pending_start_key(lost_identity)]
+        for result, stdout in zip(cleanups, settled, strict=True):
             self.assertEqual(result.returncode, 3)
-            self.assertEqual(result.stdout.strip(), "")
+            self.assertEqual(result.stdout.strip(), stdout)
             self.assertNotIn("Traceback", result.stderr)
         self.assertNotIn("Traceback", output + errors)
         self.assertFalse(kill_log.exists())
@@ -1509,9 +1533,7 @@ class LinuxProcessTests(unittest.TestCase):
         self.assertTrue(marker.exists())
 
     def assert_unresolved_startup_stays_busy(self, stage: Literal["run", "probe", "after-probe"]) -> None:
-        dispatch = LinuxDispatchTests()
-        self.addCleanup(dispatch.doCleanups)
-        dispatch.setUp()
+        dispatch = set_up_fixture(self.addCleanup, LinuxDispatchTests())
         identity = eligibility.repository_identity(dispatch.source)
         if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
@@ -1738,7 +1760,8 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.git("config", "user.name", "Fixture")
         _ = self.git("config", "user.email", "fixture@example.invalid")
         registry = self.root / "build_targets.conf"
-        _ = registry.write_text("targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
+        _ = registry.write_text("targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
+                                + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
         _ = write_config_fixture(self.root / "linux.conf", "host=fake-linux\noffload=on\n", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -1914,13 +1937,12 @@ class LinuxDispatchTests(unittest.TestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.fixture: test_target_slots.RepositorySlotTests = test_target_slots.RepositorySlotTests()
+        self.fixture: test_repository_claims.RepositoryClaimTests = test_repository_claims.RepositoryClaimTests()
         self.controller: offload.ProcessController = offload.ProcessController()
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         self.source = self.fixture.repository("rust/phase-copy", "https://example.com/team/hana.git")
         for name in ("flake.nix", "flake.lock", "nix/shell.nix", "src/main.rs"):
             path = self.source / name
@@ -2118,10 +2140,7 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertIn(os.getpid(), self.fixture.claims("linux"))
         self.assertNotIn("release", self.actions)
 
-    def test_copy_excludes_private_files_and_preserves_the_received_slot(self) -> None:
-        self.assertEqual(self.fixture.claim("linux", self.source, 101, remote=True)[0], 0)
-        first = self.fixture.claims("linux")[101]
-
+    def test_copy_excludes_private_files_and_uses_the_repository_mirror(self) -> None:
         result, _, _ = self.run_request(self.request())
 
         self.assertIsInstance(result, offload.PassedOnTarget)
@@ -2137,11 +2156,21 @@ class LinuxDispatchTests(unittest.TestCase):
             self.fail("The fixture must have a repository identity")
         command = next(argv[-1] for argv in self.commands if argv[0] == "ssh" and "--mirror" in argv[-1])
         words = shlex.split(command)
-        self.assertEqual(words[words.index("--mirror") + 1], offload.remote_mirror(identity, "linux", 2))
-        self.assertEqual(self.fixture.claims("linux"), {101: first})
+        self.assertEqual(words[words.index("--mirror") + 1], offload.remote_mirror(identity, "linux", 1))
+        self.assertFalse(self.fixture.claims("linux"))
+
+    def assert_takeover_settles_before_release(self, old_identity: claim_state.ClaimIdentity) -> None:
+        # One cleanup settles the old start and counts leftovers before the release.
+        self.assertEqual(self.actions[:4], ["claim:13", "cleanup", "release", "claim:0"])
+        settlements = [index for index, argv in enumerate(self.commands)
+                       if argv[0] == "ssh" and shlex.split(argv[-1])[:2] == ["python3", "-c"]
+                       and "dispatch_start_settled=" in argv[-1] and "select_leftovers()" in argv[-1]
+                       and offload.pending_start_key(old_identity) in argv[-1]]
+        self.assertEqual(len(settlements), 1)
+        release = next(index for index, argv in enumerate(self.commands) if len(argv) > 2 and argv[2] == "release")
+        self.assertLess(settlements[0], release)
 
     def test_lost_run_keeps_ownership_until_confirmed_cleanup_and_a_fresh_claim(self) -> None:
-        _ = self.settings.write_text(self.settings.read_text().replace("slots.hana=4", "slots.hana=1"))
         self.stream_status = offload.MISSING_MAC_STATUS
         self.cleanup_reply = subprocess.CompletedProcess([], 255, "", "fixture cannot reach Linux")
 
@@ -2165,16 +2194,10 @@ class LinuxDispatchTests(unittest.TestCase):
             retry, _, _ = self.run_request(self.request())
 
         self.assertIsInstance(retry, offload.PassedOnTarget)
-        self.assertEqual(self.actions[:5], ["claim:13", "cleanup", "release", "cleanup", "claim:0"])
-        settlements = [argv[-1] for argv in self.commands
-                       if argv[0] == "ssh" and shlex.split(argv[-1])[:2] == ["python3", "-c"]
-                       and "dispatch_start_settled=" in argv[-1]
-                       and offload.pending_start_key(old_identity) in argv[-1]]
-        self.assertEqual(len(settlements), 1)
+        self.assert_takeover_settles_before_release(old_identity)
         self.assertFalse(self.fixture.claims("linux"))
 
     def test_live_slot_children_block_new_work_until_cleanup_confirms_they_ended(self) -> None:
-        _ = self.settings.write_text(self.settings.read_text().replace("slots.hana=4", "slots.hana=1"))
         identity = eligibility.repository_identity(self.source)
         if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
@@ -2229,40 +2252,45 @@ class LinuxDispatchTests(unittest.TestCase):
         self.cleanup_reply = subprocess.CompletedProcess([], 0, "leftovers=0\nrc=0\n", "")
         self.fixture.dead.add(999)
         self.actions.clear()
+        # The blocked takeover also tried to settle this start; count only the fresh run.
+        self.commands.clear()
         with mock.patch.object(os, "getpid", return_value=1000):
             fresh, _, _ = self.run_request(self.request())
         self.assertIsInstance(fresh, offload.PassedOnTarget)
-        self.assertEqual(self.actions[:5], ["claim:13", "cleanup", "release", "cleanup", "claim:0"])
-        settlements = [argv[-1] for argv in self.commands
-                       if argv[0] == "ssh" and shlex.split(argv[-1])[:2] == ["python3", "-c"]
-                       and "dispatch_start_settled=" in argv[-1]
-                       and offload.pending_start_key(old_identity) in argv[-1]]
-        self.assertEqual(len(settlements), 1)
+        self.assert_takeover_settles_before_release(old_identity)
         self.assertFalse(self.fixture.claims("linux"))
 
-    def test_deleted_worktree_cleanup_selects_only_the_retained_slot(self) -> None:
+    def test_offload_recovers_two_legacy_linux_claims_for_one_repository(self) -> None:
         old = self.fixture.repository("old-worktree", "https://example.com/team/hana.git", self.source)
-        self.assertEqual(self.fixture.claim("linux", old, 101, remote=True)[0], 0)
-        self.assertEqual(self.fixture.claim("linux", self.source, 102, remote=True)[0], 0)
-        before = self.fixture.claims("linux")
-        _ = self.settings.write_text(self.settings.read_text().replace("slots.hana=4", "slots.hana=2"))
+        paths = mac_test.state_paths("linux")
+        first_identity = claim_state.ClaimIdentity("claim-a", "episode-a", "attempt-a")
+        second_identity = claim_state.ClaimIdentity("claim-b", "episode-b", "attempt-b")
+        self.assertEqual(self.fixture.claim("linux", old, 101, remote=True, request_identity=first_identity)[0], 0)
+        first, = mac_test.read_claims(paths)
+        old_first = first.path.with_name(first.path.stem + ".slot-1.json")
+        mac_test.write_json(old_first, {**first.record, "slot": 1})
+        first.path.unlink()
+        self.fixture.dead.add(101)
+        self.assertEqual(self.fixture.claim("linux", self.source, 102, request_identity=second_identity)[0], 11)
+        old_second = first.path.with_name(first.path.stem + ".slot-2.json")
+        mac_test.write_json(old_second, {**first.record, "slot": 2, "pid": 102, "proc_start": "start-102",
+            "claim_id": second_identity.claim_id, "episode": second_identity.episode, "attempt": second_identity.attempt})
         (old / ".git").unlink()
         old.rmdir()
-        self.fixture.dead.add(101)
+        self.fixture.dead.add(102)
 
-        result, _, _ = self.run_request(self.request())
+        result, _, errors = self.run_request(self.request())
 
-        self.assertIsInstance(result, offload.PassedOnTarget)
-        self.assertEqual(self.actions[:4], ["claim:13", "cleanup", "release", "claim:0"])
-        cleanup = next(argv for argv in self.commands if argv[0] == "ssh" and "select_leftovers" in argv[-1])
+        self.assertIsInstance(result, offload.PassedOnTarget, errors)
+        self.assertEqual(self.actions[:7], ["claim:13", "cleanup", "release", "claim:13", "cleanup", "release", "claim:0"])
+        cleanup = [argv[-1] for argv in self.commands if argv[0] == "ssh" and "select_leftovers" in argv[-1]]
         identity = eligibility.repository_identity(self.source)
-        if not isinstance(identity, eligibility.KnownRepository):
-            self.fail("The fixture must have a repository identity")
-        self.assertIn(offload.remote_mirror(identity, "linux", 1), cleanup[-1])
-        self.assertNotIn(offload.remote_mirror(identity, "linux", 2), cleanup[-1])
-        self.assertNotIn("lsof", cleanup[-1])
-        self.assertNotIn("pgrep", cleanup[-1])
-        self.assertEqual(self.fixture.claims("linux"), {102: before[102]})
+        assert isinstance(identity, eligibility.KnownRepository)
+        for mirror_number, command in enumerate(cleanup[:2], start=1):
+            self.assertIn(offload.remote_mirror(identity, "linux", mirror_number), command)
+        self.assertFalse(old_first.exists())
+        self.assertFalse(old_second.exists())
+        self.assertFalse(self.fixture.claims("linux"))
 
     def test_unrelated_environment_does_not_gain_automatic_shell_approval(self) -> None:
         unrelated = self.fixture.repository("unrelated/project", "https://example.com/team/hana.git")

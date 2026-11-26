@@ -40,6 +40,7 @@ class WorkerResume:
     state: worker_panes.OpenWorker | worker_panes.StoppedWorker | worker_panes.ClosedWorker
     role: staff.WorkerRole
     source: str
+    policy: worker_panes.LaunchPolicy
     close_check: worker_panes.CloseAllowed | worker_panes.Kept = worker_panes.CloseAllowed()
     detached_context: str = ""
 
@@ -85,7 +86,13 @@ def _source_account(row: staff.StaffRow) -> str:
 
 
 def _own_policy(move: WorkerMove, role: staff.WorkerRole) -> worker_panes.LaunchPolicy:
-    """Keep the worker's own family and model; a move changes only the account."""
+    """Keep the worker's launch settings across the move."""
+    passed = worker_panes.worker_pass(move.row, move.run)
+    if progress_history.parked_worker_pass(passed):
+        saved = worker_panes.parked_launch_policy(move.row, passed)
+        if isinstance(saved, progress_history.ParkedLaunchUnavailable):
+            raise ValueError(saved.value)
+        return saved
     family = "codex" if move.family == "codex" else "claude" if move.family == "claude" else "assigned"
     policy = worker_panes.launch_policy(role, family)
     try:
@@ -98,7 +105,7 @@ def _own_policy(move: WorkerMove, role: staff.WorkerRole) -> worker_panes.Launch
 def _request(move: WorkerMove, source: str, terminal: str) -> moves.MoveCommon:
     common = moves.MoveCommon(at=datetime.now(timezone.utc).isoformat(), tool="codex" if move.family == "codex" else "claude",
                               subject=move.row.id, move_id=uuid4().hex)
-    requested: moves.RequestedMove = {**common, "kind": "requested", "terminal": terminal,
+    requested: moves.RequestedMove = {**common, "kind": "requested", "scope": "group", "terminal": terminal,
                                       "from": source, "to": move.target, "why": move.why, "window": "unknown"}
     moves.append_move(requested)
     refusal = refusal_watch.transcript_refusal(str(move.row.current_session))
@@ -131,23 +138,27 @@ def _recover_source(move: WorkerMove, source: str, role: staff.WorkerRole, polic
     return _failed(move.row, rollback).reason
 
 
-def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenWorker | worker_panes.StoppedWorker | worker_panes.ClosedWorker,
-                        role: staff.WorkerRole, hold: worker_panes.WorkerLockHold,
-                        detached: str = "") -> SessionMoveOutcome:
-    try:
-        policy = _own_policy(move, role)
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        return accounts.SessionMoveRefused(move.row.id, f"anomaly: worker launch settings are unreadable: {error}")
+def _resume_destination(move: WorkerMove, decision: WorkerResume,
+                        hold: worker_panes.WorkerLockHold) -> SessionMoveOutcome:
+    state, source, role = decision.state, decision.source, decision.role
+    policy = decision.policy
     terminal = state.terminal if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)) else ""
     common = _request(move, source, terminal)
     began = time.monotonic()
     if isinstance(state, worker_panes.OpenWorker):
         settings = conf.read("shutdown")
-        stop_seconds = sum(settings.whole(key) for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "MOVE_STOP_MARGIN_SECONDS"))
+        stop_seconds = sum(settings.whole(key) for key in ("stop_grace_seconds", "kill_grace_seconds", "move_stop_margin_seconds"))
         stopped = restart.stop_row(move.row, move.client, deadline=time.monotonic() + stop_seconds)
         fresh = _observe(move)
         if not stopped or not isinstance(fresh, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
             reason = "anomaly: stop did not prove the worker stopped"
+            moves.append_move(moves.FailedMove(**common, kind="failed", reason=reason))
+            return accounts.SessionMoveRefused(move.row.id, reason)
+        try:
+            policy = _own_policy(move, role)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            recovery = _recover_source(move, source, role, decision.policy, hold)
+            reason = f"anomaly: worker launch settings are unreadable: {error}; {recovery}"
             moves.append_move(moves.FailedMove(**common, kind="failed", reason=reason))
             return accounts.SessionMoveRefused(move.row.id, reason)
     result = worker_panes.start_or_resume(move.parent, staff.WorkerName.parse(move.row.name), role,
@@ -155,7 +166,7 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
     if isinstance(result, worker_panes.OpenWorker):
         elapsed_seconds = time.monotonic() - began
         _confirm(move, common)
-        _continue_pass(move, result, source, move.target, detached)
+        _continue_pass(move, result, source, move.target, decision.detached_context)
         return stop_results.ClaudeUp(move.row.id, result.pane, move.target, elapsed_seconds=elapsed_seconds)
     failure = _failed(move.row, result)
     reason = f"{failure.reason}; {_recover_source(move, source, role, policy, hold)}"
@@ -201,7 +212,11 @@ def _move_decision(move: WorkerMove, *, lock: worker_panes.WorkerLockHold | work
     role = worker_panes.dispatch_role(move.row)
     if isinstance(role, worker_panes.WorkerRoleUnavailable):
         return accounts.SessionMoveRefused(move.row.id, role.reason)
-    return WorkerResume(state, role, source, close_check, detached)
+    try:
+        policy = _own_policy(move, role)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return accounts.SessionMoveRefused(move.row.id, f"anomaly: worker launch settings are unreadable: {error}")
+    return WorkerResume(state, role, source, policy, close_check, detached)
 
 
 def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> SessionMoveOutcome:
@@ -213,7 +228,7 @@ def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> Session
         reason = closed.blocker if isinstance(closed, worker_panes.Kept) else closed.reason
         return accounts.SessionMoveRefused(move.row.id, reason)
     if isinstance(decision, WorkerResume):
-        return _resume_destination(move, decision.source, decision.state, decision.role, hold, decision.detached_context)
+        return _resume_destination(move, decision, hold)
     if isinstance(decision, stop_results.ClaudeUp):
         _confirm_pending(move)
     return decision

@@ -4,21 +4,28 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import closing
+import zoneinfo
+from importlib import resources
+from contextlib import closing, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
+from zipfile import ZipFile, Path as ZipPath
+
+from scripts.aws_target.ledger_test_support import install_cost_settings
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 from scripts.buildlog.cli_probe_test_support import measure_cli_work
 
-from scripts.buildlog import disk, ci
+from scripts.buildlog import cli, disk, ci
 from scripts.buildlog import index
 from scripts.buildlog import mac_outcome
 from scripts.buildlog import moments, report, holds, health
@@ -65,7 +72,12 @@ class ReportSpeedTests(unittest.TestCase):
         _ = isolated_journal(self)
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, mac_natedev_environment(temporary / "config"))))
+        configuration = temporary / "config"
+        account_settings = configuration / "aws_target.conf"
+        install_cost_settings(account_settings)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **mac_natedev_environment(configuration), "AWS_TARGET_CONFIG": str(account_settings),
+        })))
 
     def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:
@@ -96,6 +108,17 @@ class ReportSpeedTests(unittest.TestCase):
                 self.assertIn("| Held target | 10.0 min", result.stdout)
                 self.assertIn("| Mac ran | Mac passed | Mac failed |", result.stdout)
                 print(result.stdout, flush=True)
+
+    def test_report_command_refuses_an_unknown_user_zone(self) -> None:
+        result = subprocess.run(
+            configured_host_cli(Path("scripts/buildlog/cli.py"), "report", "2026-01-15"),
+            cwd=Path(__file__).resolve().parents[2],
+            env={**os.environ, "USER_ZONE": "Mars/Phobos"},
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("buildlog: USER_ZONE: 'Mars/Phobos' is not a zone name", result.stderr)
 
     def test_report_cli_work_grows_near_linearly_at_the_live_index_size(self) -> None:
         self.addCleanup(time.tzset)
@@ -231,6 +254,53 @@ class ReportTests(unittest.TestCase):
         _ = index.update()
         with closing(index.read_only()) as connection:
             return report.report(connection, day or local_day(STAMP))
+
+    def test_sccache_report_sums_deltas_within_the_date_range_and_server_life(self) -> None:
+        host = store.host_name()
+
+        def reading(at: str, boot: str, start: int, hits: int, misses: int) -> Record:
+            return {"kind": "sccache_sample", "host": host, "at": at, "boot_id": boot,
+                    "server_started_us": start, "rust_hits": hits, "rust_misses": misses}
+
+        self.write(self.root / host / "samples-2026-10.jsonl",
+                   reading("2026-10-02T06:59:00.000Z", "boot-a", 10, 1, 1),
+                   reading("2026-10-02T07:00:00.000Z", "boot-a", 10, 100, 60),
+                   reading("2026-10-02T08:00:00.000Z", "boot-a", 10, 115, 65),
+                   reading("2026-10-02T09:00:00.000Z", "boot-a", 20, 200, 100),
+                   reading("2026-10-02T10:00:00.000Z", "boot-a", 20, 205, 115),
+                   reading("2026-10-02T11:00:00.000Z", "boot-b", 20, 300, 200),
+                   reading("2026-10-02T12:00:00.000Z", "boot-b", 20, 310, 200),
+                   reading("2026-10-02T13:00:00.000Z", "boot-b", 20, 2, 3),
+                   reading("2026-10-03T06:59:00.000Z", "boot-b", 20, 2, 8),
+                   reading("2026-10-03T07:00:00.000Z", "boot-b", 20, 1000, 1000))
+        self.write(self.root / "fixture-remote" / "samples-2026-10.jsonl",
+                   {**reading("2026-10-02T08:00:00.000Z", "boot-a", 10, 0, 0), "host": "fixture-remote"},
+                   {**reading("2026-10-02T09:00:00.000Z", "boot-a", 10, 100, 0), "host": "fixture-remote"})
+        self.write(self.root / host / "samples-0999-01.jsonl",
+                   reading("0999-01-01T12:00:00.000Z", "boot-old", 10, 1, 1),
+                   reading("0999-01-01T13:00:00.000Z", "boot-old", 10, 2, 2))
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(cli.main(["sccache", "2026-10-02", "2026-10-02"]), 0)
+        self.assertEqual(output.getvalue(),
+                         "Rust sccache hit rate (2026-10-02 to 2026-10-02): 54.55% (30 hits, 25 misses)\n")
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(cli.main(["sccache", "2026-10-03", "2026-10-04"]), 0)
+        self.assertEqual(output.getvalue(),
+                         "Rust sccache hit rate (2026-10-03 to 2026-10-04): unavailable (no deltas with requests)\n")
+        with closing(index.read_only()) as connection:
+            self.assertEqual(report.sccache_hit_rate(connection, date(1, 1, 1), date(999, 1, 1)),
+                             "Rust sccache hit rate (0001-01-01 to 0999-01-01): 50.00% (1 hits, 1 misses)")
+
+    def test_sccache_report_rejects_invalid_date_ranges(self) -> None:
+        for dates in (["2026-10-02"], ["2026-10-02", "bad"], ["2026-10-03", "2026-10-02"],
+                      ["1999-12-31", "2000-01-01"]):
+            errors = StringIO()
+            with self.subTest(dates=dates), redirect_stderr(errors), mock.patch.object(index, "update") as update:
+                self.assertEqual(cli.main(["sccache", *dates]), 2)
+            update.assert_not_called()
+            self.assertEqual(errors.getvalue(), "usage: buildlog sccache [YYYY-MM-DD YYYY-MM-DD]\n")
 
     def test_report_uses_one_target_identity_for_all_sections(self) -> None:
         from scripts.buildlog import record
@@ -604,6 +674,66 @@ class ReportTests(unittest.TestCase):
                     self.assertEqual(sorted(call.call_id for call in selected if call.on_report_day), [row[0] for row in expected])
                     self.assertTrue(all(call.ran_on_natedev for call in selected))
         time.tzset()
+
+    def test_report_day_uses_new_york_when_tzdir_is_empty(self) -> None:
+        self.addCleanup(time.tzset)
+        empty_zones = self.root.parent / "empty-zones"
+        empty_zones.mkdir()
+        with mock.patch.dict(os.environ, {"TZ": "UTC0", "TZDIR": str(empty_zones), "USER_ZONE": "America/New_York"}):
+            time.tzset()
+            cli.run_in_user_zone()
+            self.write(
+                self.root / "natedev" / "2026-01.jsonl",
+                call("late", started_at="2026-01-16T02:00:00Z", mac="passed", mac_reason="", mac_s=1),
+                call("next-day", started_at="2026-01-16T05:00:00Z", mac="passed", mac_reason="", mac_s=1),
+            )
+            _ = index.update()
+            with closing(index.read_only()) as connection:
+                day = "2026-01-15"
+                selected = report.reported_mac_calls(connection, day)
+                self.assertEqual([call.call_id for call in selected if call.on_report_day], ["late"])
+                self.assertEqual(report.fetch(connection,
+                    "SELECT id FROM calls WHERE date(started_at, 'localtime') = ?", day), [("late",)])
+
+    def test_report_uses_a_zone_file_from_the_tzdata_package(self) -> None:
+        self.addCleanup(time.tzset)
+        zone = "America/New_York"
+        zone_info = zoneinfo.ZoneInfo(zone)
+        zone_file = next((Path(directory) / zone for directory in zoneinfo.TZPATH
+                          if (Path(directory) / zone).is_file()), None)
+        packaged = zone_file if zone_file is not None else resources.files("tzdata.zoneinfo").joinpath("America", "New_York")
+        archive = self.root.parent / "tzdata.zip"
+        with ZipFile(archive, "w") as output:
+            output.writestr(zone, packaged.read_bytes())
+
+        with ZipFile(archive) as package, mock.patch.dict(os.environ, {"USER_ZONE": zone}):
+            with mock.patch.object(zoneinfo, "TZPATH", ()), mock.patch.object(
+                    resources, "files", return_value=ZipPath(package)) as package_files:
+                cli.run_in_user_zone()
+            package_files.assert_called_once_with("tzdata.zoneinfo")
+            self.assertTrue(Path(os.environ["TZ"].removeprefix(":")).is_file())
+            winter = datetime(2026, 1, 15, 12, tzinfo=UTC)
+            self.assertEqual(timedelta(seconds=time.localtime(winter.timestamp()).tm_gmtoff),
+                             winter.astimezone(zone_info).utcoffset())
+
+    def test_report_rejects_a_process_offset_that_differs_from_the_user_zone(self) -> None:
+        self.addCleanup(time.tzset)
+        winter = datetime(2026, 1, 15, 12, tzinfo=UTC).timestamp()
+        for zone in ("America/New_York", "Europe/London"):
+            with self.subTest(zone=zone), mock.patch.dict(os.environ, {"TZ": "UTC0", "USER_ZONE": zone}):
+                time.tzset()
+                with mock.patch.object(time, "time", return_value=winter), mock.patch.object(
+                        time, "tzset"), self.assertRaisesRegex(ValueError, f"{zone}.*process offset"):
+                    cli.run_in_user_zone()
+
+    def test_report_loads_the_user_zone_at_a_dst_change(self) -> None:
+        self.addCleanup(time.tzset)
+        transition = datetime(2026, 3, 8, 7, tzinfo=UTC).timestamp()
+        before_transition = math.nextafter(transition, -math.inf)
+        with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}), mock.patch.object(
+                time, "time", return_value=before_transition):
+            cli.run_in_user_zone()
+            self.assertEqual(time.localtime(transition).tm_gmtoff, -4 * 3600)
 
     def test_lead_block_has_all_five_facts_before_waiting(self) -> None:
         write_mac_block(datetime(2026, 10, 12, 15, tzinfo=UTC), "mac-holder", "preview")

@@ -1,19 +1,20 @@
 """Run the common trial and production guest on a disposable gate instance."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 import inspect
 import json
 import shlex
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 from enum import StrEnum
 import math
 
 from scripts.lib.python_startup import sitecustomize as python_startup
+from scripts.production.gate_routes import GateJobKind, GateJobResult, GateRun, SuiteMode
 
 if TYPE_CHECKING:
-    from scripts.production.merge_gate import GateRun
     from scripts.test_times import gate_record
 
 
@@ -62,6 +63,8 @@ def validate_paired_result(row: dict[str, object], request: dict[str, object], i
 # The candidate supplies the supervisor for both tested trees.
 PAIRED_GUEST = r'''from pathlib import Path
 import math, signal, tempfile
+from scripts.production.gate import process_memory_mib, test_module_environment
+
 
 def paired_trial():
     rows = []
@@ -71,11 +74,8 @@ def paired_trial():
     active = None
     adopt_descendants()
     log = root / 'gate.log'
-    def put(url, content):
-        subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '30',
-                        '-X', 'PUT', '--data-binary', '@-', url], input=content, check=True)
     def upload():
-        put(links['log'], b''.join(path.read_bytes() for path in (root / 'boot.log', log, root / 'timeline.log') if path.exists()))
+        put('log', b''.join(path.read_bytes() for path in (root / 'boot.log', log, root / 'timeline.log') if path.exists()))
     try:
         trees = {variant: root / variant for variant in ('base', 'changed')}
         (root / 'measure').touch()
@@ -91,6 +91,12 @@ def paired_trial():
                     stage('warm-up ' + variant if warming else f"round {round_number} of {gate_request['rounds']} {variant}")
                     upload()
                     repo = trees[variant]
+                    expected = root.absolute() / variant
+                    if repo.absolute() != expected or repo.resolve() != expected:
+                        raise ValueError(f"Cannot reset {repo}: expected the checkout at {expected} without links")
+                    top = subprocess.run(['git', '-C', str(repo), 'rev-parse', '--show-toplevel'], capture_output=True)
+                    if top.returncode or os.fsdecode(top.stdout.removesuffix(b'\n')) != str(expected):
+                        raise ValueError(f"Cannot reset {repo}: Git must report {expected} as the working tree root")
                     subprocess.run(['git', '-C', str(repo), 'reset', '--hard'], check=True, capture_output=True)
                     subprocess.run(['git', '-C', str(repo), 'clean', '-fdx', '-e', '__pycache__/'], check=True, capture_output=True)
                     with tempfile.TemporaryDirectory(dir=root) as temporary:
@@ -184,20 +190,90 @@ result.update(paired_trial())
 '''
 
 
-GUEST_TRANSFERS = r'''import json, subprocess, time
+BOX_CURL_RETRY = ('--retry', '2', '--retry-all-errors', '--retry-delay', '1')
+GATE_RECORD_FILTER = r'''function remember(secret, i) {
+    if (!length(secret) || seen[secret]++) return
+    i = ++count
+    while (i > 1 && length(secrets[i - 1]) < length(secret)) {
+        secrets[i] = secrets[i - 1]
+        i--
+    }
+    secrets[i] = secret
+}
+FILENAME == ARGV[1] {
+    if (length($0)) {
+        remember($0)
+        query = substr($0, index($0, "?") + 1)
+        fragment = index(query, "#")
+        if (fragment) query = substr(query, 1, fragment - 1)
+        remember(query)
+    }
+    next
+}
+{
+    record = $0
+    for (i = 1; i <= count; i++) {
+        prefix = ""
+        while ((offset = index(record, secrets[i])) > 0) {
+            prefix = prefix substr(record, 1, offset - 1) "[URL removed]"
+            record = substr(record, offset + length(secrets[i]))
+        }
+        record = prefix record
+    }
+    print record
+}'''
+
+
+def signed_urls(links: Mapping[str, object]) -> tuple[str, ...]:
+    return tuple(link for link in links.values() if isinstance(link, str)
+                 and link.startswith(('http://', 'https://')) and link.partition('?')[2].partition('#')[0])
+
+
+GUEST_TRANSFERS = f'''import json, os, subprocess, tempfile, time
+from collections.abc import Mapping
+{inspect.getsource(signed_urls)}
+gate_record_filter = {GATE_RECORD_FILTER!r}
+# The controller validates the suite mode before it sends the request.
+transfer_retries = {BOX_CURL_RETRY!r} if gate_request.get('task') != 'paired' and 'mode' in gate_request else ()
+''' + r'''secret_file = root / 'transfer-secrets'
+try:
+    descriptor = os.open(secret_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+except FileExistsError:
+    pass
+else:
+    with os.fdopen(descriptor, 'w', encoding='utf-8') as output:
+        for secret in signed_urls(links):
+            output.write(secret + '\n')
+def safe_gate_record(content):
+    return subprocess.run(['awk', gate_record_filter, str(secret_file), '-'],
+                          input=content, stdout=subprocess.PIPE, check=True).stdout
 def stage(name):
     try:
         with (root / 'boot.log').open('a') as output:
             output.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + ' stage=' + name + '\n')
     except OSError:
         pass
-def get(url, destination):
-    subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '60', url, '-o', str(destination)], check=True)
-def put(url, content):
-    subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '30', '-X', 'PUT', '--data-binary', '@-', url],
-                   input=content, check=True)
+def transfer(stage, name, arguments, *, content=None):
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=root, encoding='utf-8') as config:
+            config.write('url = ' + json.dumps(links[name]) + '\n')
+            config.flush()
+            answer = subprocess.run(['curl', '--disable', '--config', config.name, '--fail', '--silent',
+                                     '--write-out', '%{http_code}', *transfer_retries, *arguments],
+                                    input=content, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        raise RuntimeError(f'{stage} {name} failed (curl could not run)') from None
+    if answer.returncode:
+        status = answer.stdout
+        http = status.decode() if len(status) == 3 and status.isdigit() else '000'
+        raise RuntimeError(f'{stage} {name} failed (curl exit {answer.returncode}, HTTP {http})')
+def get(name, destination):
+    transfer('GET', name, ['--max-time', '60', '-o', str(destination)])
+def put(name, content):
+    transfer('PUT', name, ['--max-time', '30', '-X', 'PUT', '--data-binary', '@-', '-o', '/dev/null'],
+             content=safe_gate_record(content))
 def publish(name):
-    put(links[name], json.dumps(result).encode())
+    put(name, json.dumps(result).encode())
 '''
 
 
@@ -222,11 +298,11 @@ memory_thread = None
 cpu_started = None
 try:
     repo = root / 'repo'
-    from scripts.production import merge_gate
+    from scripts.production import gate as gate_runner
     from scripts.lib import cancellation
     timings = {}
     if 'module_seconds' in links:
-        get(links['module_seconds'], root / 'module_seconds.json')
+        get('module_seconds', root / 'module_seconds.json')
         timings = json.loads((root / 'module_seconds.json').read_text())
     result['tools_ready_at'] = time.time()
     result['module_time_limit_s'] = links['module_time_limit_s']
@@ -240,19 +316,20 @@ try:
         cpu_started = busy_cpu_seconds()
         result['gate_started_at'] = time.time()
         if links.get('production'):
-            gate = merge_gate.run_suites(repo, full=gate_request.get('full', False), machine=merge_gate.WholeMachine(timings),
-                                        time_limit=(merge_gate.gate_record.GateTimeLimit(float(links['gate_time_limit_s']))
+            gate = gate_runner.run_suites(repo, full=gate_request.get('full', False), machine=gate_runner.WholeMachine(timings),
+                                        time_limit=(gate_runner.gate_record.GateTimeLimit(float(links['gate_time_limit_s']))
                                                     if float(links.get('gate_time_limit_s', 0)) > 0 else
-                                                    merge_gate.gate_record.NoGateTimeLimit('no passing history on the controller')),
+                                                    gate_runner.gate_record.NoGateTimeLimit('no passing history on the controller')),
                                         module_time_limit_s=links['module_time_limit_s'],
-                                        selected=merge_gate.SelectedModules(tuple(gate_request['modules'])),
-                                        mode=merge_gate.SuiteMode(links['mode']))
+                                        selected=gate_runner.SelectedModules(tuple(gate_request['modules'])),
+                                        mode=gate_runner.SuiteMode(links['mode']))
         else:
-            gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
+            gate = gate_runner.run_suites(repo, full=True, machine=gate_runner.WholeMachine(timings),
                                         module_time_limit_s=links['module_time_limit_s'])
         if links.get('production'):
             result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,
-                                                 result['gate_started_at'], time.time(), links['mode'])
+                                                 result['gate_started_at'], time.time(), links['mode'],
+                                                 split=gate_request.get('split') is True)
             dirty = gate_request['dirty_paths']
             result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
                                     dirty_path_count=len(dirty))
@@ -296,26 +373,22 @@ finally:
 
 def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -> None:
     """Run the verified candidate with its own suite and record code."""
+    request = (cast(dict[str, object], json.loads((root / 'request.json').read_text()))
+               if links.get('production') else {})
     namespace: dict[str, object] = {
-        'root': root, 'links': links, 'result': result, 'log': root / 'gate.log',
+        'root': root, 'links': links, 'result': result, 'log': root / 'gate.log', 'gate_request': request,
         'encode_run': encode_run, 'completion_record': completion_record,
     }
     exec(GUEST_TRANSFERS, namespace)
-    if links.get('production'):
-        request = cast(dict[str, object], json.loads((root / 'request.json').read_text()))
-        namespace['gate_request'] = request
-        if request.get('task') == 'paired':
-            from scripts.production import merge_gate
-            from scripts.lib.descendants import adopt_descendants
-            from scripts.lib.process_group import send_process_group
-            namespace.update(
-                timestamps={key: result[key] for key in ('nix_ready_at', 'user_data_started_at',
-                           'kernel_boot_at', 'instance_running_at') if key in result},
-                adopt_descendants=adopt_descendants, send_process_group=send_process_group,
-                test_module_environment=merge_gate.test_module_environment,
-                process_memory_mib=merge_gate.process_memory_mib)
-            exec('import json, os, subprocess, sys, time, traceback\n' + PAIRED_GUEST, namespace)
-            return
+    if request.get('task') == 'paired':
+        from scripts.lib.descendants import adopt_descendants
+        from scripts.lib.process_group import send_process_group
+        namespace.update(
+            timestamps={key: result[key] for key in ('nix_ready_at', 'user_data_started_at',
+                       'kernel_boot_at', 'instance_running_at') if key in result},
+            adopt_descendants=adopt_descendants, send_process_group=send_process_group)
+        exec('import json, os, subprocess, sys, time, traceback\n' + PAIRED_GUEST, namespace)
+        return
     exec(CANDIDATE_GUEST, namespace)
 
 
@@ -324,8 +397,7 @@ GUEST = (r'''import concurrent.futures, datetime, importlib, json, os, pathlib, 
 root = pathlib.Path(os.environ.pop('GATE_BOX_DIR', '/var/lib/gate-trial'))
 os.environ.pop('box_dir', None)
 links = json.loads((root / 'links.json').read_text())
-if links.get('production'):
-    gate_request = json.loads((root / 'request.json').read_text())
+gate_request = json.loads((root / 'request.json').read_text()) if links.get('production') else {}
 timestamps = {'nix_ready_at': time.time()}
 started_at = os.environ.pop('GATE_USER_DATA_STARTED_AT', '')
 if started_at:
@@ -379,11 +451,11 @@ try:
             if links.get('production'):
                 subprocess.run(['git', 'clone', gate_request['clone_url'], str(repo)], check=True)
                 if links.get('source'):
-                    get(links['source'], root / 'source.bundle')
+                    get('source', root / 'source.bundle')
                     subprocess.run(['git', '-C', str(repo), 'fetch', str(root / 'source.bundle'), links['commit']], check=True)
                 subprocess.run(['git', '-C', str(repo), 'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']], check=True)
             else:
-                get(links['source'], root / 'source.bundle')
+                get('source', root / 'source.bundle')
                 subprocess.run(['git', 'clone', str(root / 'source.bundle'), str(repo)], check=True)
             subprocess.run(['git', '-C', str(repo), 'checkout', '--detach', links['commit']], check=True)
             if links.get('production'):
@@ -415,9 +487,10 @@ try:
         entry(root, links, result)
 except Exception as error:
     result['verdict'] = 'error'
-    result['error'] = str(error) if str(error) == 'candidate predates guest entry point' else traceback.format_exc()
+    result['error'] = (str(error) if str(error) == 'candidate predates guest entry point'
+                       else safe_gate_record(traceback.format_exc().encode()).decode())
     if result['error'] == 'candidate predates guest entry point' and 'boot_error' in links:
-        put(links['boot_error'], json.dumps(result).encode())
+        put('boot_error', json.dumps(result).encode())
     with log.open('a') as output:
         output.write(result['error'])
 finally:
@@ -429,14 +502,16 @@ finally:
             content = b''.join(path.read_bytes() for path in (root / 'boot.log', log, root / 'timeline.log') if path.exists())
             try:
                 snapshot = subprocess.run(['ps', '-eo', 'etimes,pcpu,rss,args', '--sort=-etimes'], capture_output=True, text=True)
-                lines = [line[:200] for line in snapshot.stdout.splitlines() if 'curl' not in line][:60]
+                rows = safe_gate_record(snapshot.stdout.encode()).decode().splitlines()
+                lines = [line[:200] for line in rows if 'curl' not in line][:60]
                 content += ('\n' + '\n'.join(lines) + '\n').encode()
             except (OSError, subprocess.SubprocessError):
                 pass
             content += time.strftime('\nUTC: %Y-%m-%dT%H:%M:%SZ\n', time.gmtime()).encode()
-            put(links['log'], content)
+            put('log', content)
         except Exception as error:
             result['log_error'] = str(error)
+    stage('result upload')
     publish('result' if links['step'] == 'size' else 'ready-' + links['boot'])
     if links['step'] == 'start' and result['verdict'] == 'ready':
         (root / 'prepared').touch()
@@ -444,13 +519,31 @@ finally:
     .replace('__GATE_STARTUP_FILENAME__', repr(python_startup.__file__)))
 
 
-def log_upload(links: dict[str, str]) -> str:
-    transfer = f'curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @- {shlex.quote(links["log"])}'
+SHELL_CURL = r'''gate_curl() {
+    transfer_stage=$1
+    shift
+    curl_status=0
+    http_code=$(curl --disable --fail --silent --write-out '%{http_code}' "$@" 2>/dev/null) || curl_status=$?
+    if [ "$curl_status" -ne 0 ]; then
+        case "$http_code" in
+            [0-9][0-9][0-9]) ;;
+            *) http_code=000 ;;
+        esac
+        printf '%s failed (curl exit %s, HTTP %s)\n' "$transfer_stage" "$curl_status" "$http_code" >&2
+    fi
+    return "$curl_status"
+}
+'''
+
+
+def log_upload(*, retry: bool = True) -> str:
+    retries = shlex.join(BOX_CURL_RETRY) + ' ' if retry else ''
     return f'''{{ cat "${{box_dir:-/var/lib/gate-trial}}/boot.log" "${{box_dir:-/var/lib/gate-trial}}/gate.log" "${{box_dir:-/var/lib/gate-trial}}/timeline.log" 2>/dev/null || :
-    ps -eo etimes,pcpu,rss,args --sort=-etimes 2>/dev/null | awk '!/curl/ {{print substr($0,1,200); if (++n==60) exit}}' || :
+    ps -eo etimes,pcpu,rss,args --sort=-etimes 2>/dev/null | safe_gate_record |
+        awk '!/curl/ {{print substr($0,1,200); if (++n==60) exit}}' || :
     printf '\\n'
     date -u '+UTC: %Y-%m-%dT%H:%M:%SZ'
-}} | {transfer} || :'''
+}} | safe_gate_record | gate_curl 'PUT log' --config "$box_dir/log.curl" {retries}--max-time 30 -X PUT --data-binary @- -o /dev/null || :'''
 
 
 def log_push_loop(links: dict[str, str], interval_s: float) -> str:
@@ -467,7 +560,7 @@ def log_push_loop(links: dict[str, str], interval_s: float) -> str:
         busy=$(awk -v total="$(($1-previous_total))" -v idle="$(($2-previous_idle))" 'BEGIN {{printf "%.2f", (total>0 ? 100*(total-idle)/total : 0)}}')
         previous_total=$1 previous_idle=$2
         printf '%s loadavg=%s %s processes=%s cpu_busy_percent=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(cat /proc/loadavg)" "$(awk '/^MemAvailable:/' /proc/meminfo)" "$(ps -e --no-headers | wc -l)" "$busy" >> "${{box_dir:-/var/lib/gate-trial}}/timeline.log" || :
-        {log_upload(links)}
+        {log_upload()}
         {lock_end}
     done
 }}
@@ -476,22 +569,40 @@ log_push_pid=$!
 '''
 
 
-def boot_trap(links: dict[str, str]) -> str:
+BWRAP_UNAVAILABLE_STAGE = 'bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial'
+
+
+def boot_trap(cold: str, warm: str, *, production: bool) -> str:
     """Publish a shell failure before the tool shell can publish a result."""
-    cold = links.get('boot_error', links['result']) if links['step'] == 'size' else links['ready-cold']
-    warm = links.get('boot_error', links['result']) if links['step'] == 'size' else links['ready-warm']
-    return f'''boot_failed() {{
+    destination = f'destination="$box_dir/{cold}.curl"'
+    if cold != warm:
+        destination += f'\n        if [ -e "$box_dir/prepared" ]; then destination="$box_dir/{warm}.curl"; fi'
+    poweroff = '    shutdown -h now || :\n' if production else ''
+    return fr'''boot_failed() {{
     status=$?
+    set +e
     trap - EXIT
     if [ -n "${{log_push_pid:-}}" ]; then kill "$log_push_pid" 2>/dev/null || :; fi
     if [ "$status" -ne 0 ]; then
-        destination={shlex.quote(cold)}
-        if [ -e "${{box_dir:-/var/lib/gate-trial}}/prepared" ]; then destination={shlex.quote(warm)}; fi
-        {log_upload(links)}
-        printf '{{"verdict":"error","error":"Tool preparation failed (exit %s)"}}' "$status" > "${{box_dir:-/var/lib/gate-trial}}/boot-error.json"
-        curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @"${{box_dir:-/var/lib/gate-trial}}/boot-error.json" "$destination" || :
+        {destination}
+        {log_upload(retry=False)}
+        stage=$(sed -n 's/^[0-9T:Z-]\{{20\}} stage=//p' "$box_dir/boot.log" | tail -n 1)
+        if [ "$stage" = 'tool preparation' ]; then
+            message='Tool preparation failed'
+        elif [ "$stage" = '{BWRAP_UNAVAILABLE_STAGE}' ]; then
+            message="stage=$stage"
+        else
+            message="The box failed at stage ${{stage:-boot}}"
+        fi
+        message=$(printf '%s' "$message" | LC_ALL=C tr -d '[:cntrl:]' | sed 's/[\\"]/\\&/g')
+        file="${{box_dir:-/var/lib/gate-trial}}/boot-error.json"
+        printf '{{"verdict":"error","error":"%s (exit %s)"}}' "$message" "$status" > "$file"
+        if [ "$?" -eq 0 ]; then
+            safe_gate_record < "$file" |
+                gate_curl 'PUT boot error' --config "$destination" {shlex.join(BOX_CURL_RETRY)} --max-time 30 -X PUT --data-binary @- -o /dev/null || :
+        fi
     fi
-    exit "$status"
+{poweroff}    exit "$status"
 }}
 trap boot_failed EXIT
 '''
@@ -506,15 +617,26 @@ def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_p
     from scripts.lib import conf
     packages = conf.read_or_repository('cloud_gate').words('packages')
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
+    if links['step'] == 'size':
+        cold = warm = 'boot_error' if 'boot_error' in links else 'result'
+    else:
+        cold, warm = 'ready-cold', 'ready-warm'
+    shell_links = {'log', 'guest', 'request', cold, warm}
+    signed = set(signed_urls(links))
+    link_rows = '\n'.join(
+        f'{json.dumps(key)}\t{int(key in shell_links)}\t{int(value in signed)}\t{json.dumps(value)}'
+        for key, value in {**links, 'module_time_limit_s': module_time_limit_s}.items())
     def download(key: str, name: str) -> str:
-        url, destination = shlex.quote(links[key]), '"$box_dir/' + name + '"'
-        return f'curl --fail --silent --show-error --max-time 60 {url} -o {destination}\n'
+        return (f"gate_curl 'GET {key}' --config \"$box_dir/{key}.curl\" {shlex.join(BOX_CURL_RETRY)} "
+                f'--max-time 60 -o "$box_dir/{name}"\n')
     downloads = download('guest', 'guest.py')
     if 'request' in links:
         downloads += download('request', 'request.json')
+    production = bool(links.get('production'))
     # The boot script's 077 protects its files; tests expect the normal umask.
-    session = '''umask 022
-printf '%s stage=tools ready\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    session = '''set +x +v
+umask 022
+''' + SHELL_CURL + '''printf '%s stage=tools ready\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 ''' + downloads + f'''ln -sf "$(command -v bash)" /bin/bash
 ln -sf "$(command -v zsh)" /bin/zsh
 mkdir -p "$box_dir/tool-profile"
@@ -528,12 +650,17 @@ tool_path=$PATH
 unset __NIXOS_SET_ENVIRONMENT_DONE __ETC_PROFILE_SOURCED
 . /etc/profile
 export PATH="$tool_path:$PATH"
+if ! bwrap --ro-bind / / true; then
+    printf "%s stage={BWRAP_UNAVAILABLE_STAGE}\\n" "$(date -u +%FT%TZ)" >&2
+    exit 1
+fi
+printf "%s stage=bwrap ready\\n" "$(date -u +%FT%TZ)" >&2
 exec python3 "$box_dir/guest.py"'
-{('shutdown -h now' if links.get('production') else '')}
 '''
     deadline = (f'systemd-run --unit=cloud-gate-expiry --on-calendar=@{int(links["expires"])} /run/current-system/sw/bin/shutdown -h now'
-                if links.get('production') else f'shutdown -h +{lifetime_minutes}')
+                if production else f'shutdown -h +{lifetime_minutes}')
     return f'''#!/bin/sh
+set +x +v
 GATE_USER_DATA_STARTED_AT=$(date -u +%s)
 export GATE_USER_DATA_STARTED_AT
 {deadline}
@@ -545,15 +672,37 @@ mkdir -p "$box_dir"
 : > "$box_dir/boot.log"
 exec >> "$box_dir/boot.log" 2>&1
 export PATH=$PATH:/run/current-system/sw/bin
-{boot_trap(links)}printf '%s stage=boot\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-{log_upload(links)}
-{log_push_loop(links, log_push_s)}cat > "$box_dir/links.json" <<'GATE_LINKS'
-{json.dumps({**links, 'module_time_limit_s': module_time_limit_s})}
+printf '{{' > "$box_dir/links.json"
+: > "$box_dir/transfer-secrets"
+tab=$(printf '\\t')
+separator=
+while IFS="$tab" read -r key shell_config signed_link value; do
+    printf '%s\\n  %s: %s' "$separator" "$key" "$value" >> "$box_dir/links.json"
+    separator=,
+    if [ "$shell_config" -eq 1 ]; then
+        name=${{key#\\"}}
+        name=${{name%\\"}}
+        printf 'url = %s\\n' "$value" > "$box_dir/$name.curl"
+    fi
+    if [ "$signed_link" -eq 1 ]; then
+        url=${{value#\\"}}
+        url=${{url%\\"}}
+        printf '%s\\n' "$url" >> "$box_dir/transfer-secrets"
+    fi
+done <<'GATE_LINKS'
+{link_rows}
 GATE_LINKS
-touch "$box_dir/timeline.log"
+printf '\\n}}\\n' >> "$box_dir/links.json"
+safe_gate_record() {{
+    awk {shlex.quote(GATE_RECORD_FILTER)} "$box_dir/transfer-secrets" -
+}}
+{SHELL_CURL}{boot_trap(cold, warm, production=production)}printf '%s stage=boot\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+{log_upload()}
+{log_push_loop(links, log_push_s)}touch "$box_dir/timeline.log"
 id -u gate-trial >/dev/null 2>&1 || useradd -m -g users gate-trial
 loginctl enable-linger gate-trial
 export PYTHONUNBUFFERED=1
+printf '%s stage=tool preparation\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 nix --extra-experimental-features 'nix-command flakes' shell {tools} --command bash -ec {shlex.quote(session)}
 '''
 
@@ -562,7 +711,6 @@ nix --extra-experimental-features 'nix-command flakes' shell {tools} --command b
 def encode_run(run: object) -> dict[str, object]:
     """Return the complete gate result for object transfer."""
     from scripts.test_times import gate_record
-    from scripts.production.merge_gate import GateRun, GateJobResult
     from dataclasses import asdict
     from typing import cast
     if not isinstance(run, GateRun):
@@ -595,15 +743,20 @@ def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
     from scripts.test_times import gate_record
     from scripts.aws_target.ledger import mapping, rows, text
-    from scripts.production.merge_gate import GateRun, GateJobResult, GateJobKind
     import math
     from typing import cast
 
     def number(row: dict[str, object], key: str) -> float:
         value = row[key]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f'{key}: expected a finite nonnegative number')
-        return float(value)
+        try:
+            result = float(value)
+        except OverflowError as error:
+            raise ValueError(f'{key}: expected a finite nonnegative number') from error
+        if not math.isfinite(result) or result < 0:
+            raise ValueError(f'{key}: expected a finite nonnegative number')
+        return result
 
     def job(row: dict[str, object]) -> GateJobResult:
         status = row['returncode']
@@ -648,13 +801,19 @@ def execution_records(value: GateRun) -> list[gate_record.Execution]:
             for job in value.executions or value.jobs]
 
 
+def completion_selection(mode: str, *, split: bool) -> Literal["full", "affected", "subset"]:
+    """Classify a record from the assignment."""
+    if split:
+        return "subset"
+    return "affected" if SuiteMode.step(mode) == SuiteMode.TARGETED.value else "full"
+
+
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
-                      started: float, ended: float, mode: str) -> dict[str, object]:
+                      started: float, ended: float, mode: str, *, split: bool = False) -> dict[str, object]:
     """Return an explicit buildlog record with the remote host identity."""
     from scripts.test_times import gate_record
     from datetime import UTC
     from scripts.buildlog import record, store
-    from scripts.production.merge_gate import GateRun
     import os
     if not isinstance(value, GateRun):
         raise TypeError('expected a completed gate')
@@ -665,11 +824,11 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     return {'kind': 'gate_run', 'v': record.RECORD_VERSION, 'id': 'gate-' + attempt, 'host': host,
             'started_at': datetime.fromtimestamp(started, UTC).isoformat(),
             'ended_at': datetime.fromtimestamp(ended, UTC).isoformat(), 'wall_s': value.seconds,
-            'hold_wait_s': 0, 'selection': 'affected' if mode == 'targeted-test' else 'full',
+            'hold_wait_s': 0, 'selection': completion_selection(mode, split=split),
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',
-            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': mode,
+            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': SuiteMode.step(mode),
             'aborted': False, 'dirty': False, 'dirty_paths': [], 'dirty_path_count': 0,
             'suites': suites, 'modules': modules, 'slow_test_s': gate_record.slow_test_s(),
             'tests_run': sum(module['tests_run'] for module in modules)}

@@ -44,10 +44,10 @@ def standard_configuration() -> str:
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "direct.conf"
         _ = write_config_fixture(path,
-            "MIN_REPAIR_BUDGET=3\nREPAIR_ROUNDS_PER_FINDING=0.5\nRUNAWAY_ROUNDS=5\n"
-            + "MAX_FIX_ATTEMPTS=2\nMAX_REOPENS=2\nSTALLED_ROUNDS=2\n"
-            + "MAX_CONSECUTIVE_SAME_KIND_PASSES=3\nMAX_REVIEW_CANCELLATIONS=1\n"
-            + "ROUTING_FROM_ROUND=4\nASTRA_AFTER_FAILED_FIXES=2\n")
+            "min_repair_budget=3\nrepair_rounds_per_finding=0.5\nrunaway_rounds=5\n"
+            + "max_fix_attempts=2\nmax_reopens=2\nstalled_rounds=2\n"
+            + "max_consecutive_same_kind_passes=3\nmax_review_cancellations=1\n"
+            + "routing_from_round=4\nastra_after_failed_fixes=2\n")
         return path.read_text(encoding="utf-8")
 
 
@@ -140,7 +140,7 @@ class FindingsLedgerFixture(unittest.TestCase):
         """Stand in for progress_history.py: the ledger reads phase identity from it."""
         state = {
             "history_file": str(self.history_file),
-            "phase": {"instance_id": instance_id, "id": phase_id, "title": phase_id},
+            "open_phases": [{"instance_id": instance_id, "id": phase_id, "title": phase_id, "status": "active"}],
         }
         _ = (self.session_dir / "progress_history_state.json").write_text(
             json.dumps(state), encoding="utf-8"
@@ -244,9 +244,10 @@ class FindingsLedgerFixture(unittest.TestCase):
         """Phase 15 started first and stays open while Phase 16 is the newest."""
         state = {
             "history_file": str(self.history_file),
-            "phase": {"instance_id": "phase-sixteen", "id": "16", "title": "16", "status": "active"},
-            "open_phases": [{"instance_id": "phase-fifteen", "id": "15", "title": "15",
-                             "status": "active"}],
+            "open_phases": [
+                {"instance_id": "phase-fifteen", "id": "15", "title": "15", "status": "active"},
+                {"instance_id": "phase-sixteen", "id": "16", "title": "16", "status": "active"},
+            ],
         }
         _ = (self.session_dir / "progress_history_state.json").write_text(
             json.dumps(state), encoding="utf-8"

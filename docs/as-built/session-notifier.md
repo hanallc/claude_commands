@@ -38,7 +38,7 @@ Use `/showrunner:units` for production status.
 
 
 
-| `config/direct.conf` | `UNIT_PROGRESS_INTERVAL_SECONDS`, the Codex unit poll timeout. |
+| `config/direct.conf` | `unit_progress_interval_seconds`, the Codex unit poll timeout. |
 
 | `/etc/nixos/modules/common/session-notifier.nix` | The 15 s job. |
 
@@ -61,7 +61,11 @@ The root is `$NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`. Each insta
   `HOLD` and `ALIGN` use 0 or 1.
 - `state`: `ENABLED`, `NEXT_DUE`, `LAST_SENT`, `LAST_RESTART`, `LAST_TARGET` (the socket of the last send).
 - `lock`: the instance's flock. Every read-modify-write of `conf` or `state` holds it, and each file is rewritten whole (temp file, then `mv`).
-- `fire.log`: one line per attempt, stamped in local time with UTC beside it: `<stamp> | exit <rc> | to <target> uds:<socket> | <send.py output>`, `<stamp> | skip <reason>` (`check timeout`, `check exit <rc>`, `session not running`, `session lookup exit <rc>`, `hold`), `<stamp> | hold released: socket changed|two intervals`, or, for a run-only instance, `<stamp> | run timeout` or `<stamp> | run exit <rc>` (a clean run logs nothing; its output replaces `run.log`).
+- `fire.log` records attempts in local time and UTC.
+  - A send logs `<stamp> | exit <rc> | to <target> uds:<socket> | <send.py output>`.
+  - A skip logs `<stamp> | skip <reason>`. Reasons include `check timeout`, `check exit <rc>`, `session not running`, `session lookup exit <rc>`, and `hold`.
+  - A hold release logs `<stamp> | hold released: socket changed|two intervals`.
+  - A run logs `<stamp> | run result exit <rc>` or `<stamp> | run result timeout`. Exit `0` records success.
 
 At the root: `.tick.lock`, `.last_tick` (epoch of the latest tick) and `notifier.log` (instance removals and lock or tick failures). `tick` creates the root only when it is absent.
 
@@ -90,7 +94,9 @@ job (15 s) → notifier.sh tick
   wait for every subshell, release .tick.lock
 ```
 
-A run-only instance (`RUN`) is not run inside the tick. `launch_run` starts `notifier.sh run-due <name>` in its own transient service (`systemd-run --user --collect --quiet --no-block --unit session-notifier-<name>-<pid>-<random>` on Linux; on the Mac a `launchctl submit` job that runs `run-due-and-remove`, which removes its own label). The Mac job is then started with `launchctl kickstart gui/<uid>/<label>`: on macOS 27 a submitted job is only registered and never runs on its own (measured 2026-10-16). With neither launcher, or when the Mac kickstart fails (the tick then removes the label), the tick logs `run launcher unavailable: <name>; waiting after tick` to `notifier.log` and runs the job once it has released `.tick.lock`. The job claims its slot, runs `RUN` with output to `<instance>/run.log` under the `zselect` watchdog (TERM at `TIMEOUT`), and logs only `run timeout` or `run exit <rc>`. A background child of the tick would die with the tick's cgroup or launchd job.
+A run-only instance (`RUN`) is not run inside the tick. `launch_run` starts `notifier.sh run-due <name>` in its own transient service (`systemd-run --user --collect --quiet --no-block --unit session-notifier-<name>-<pid>-<random>` on Linux; on the Mac a `launchctl submit` job that runs `run-due-and-remove`, which removes its own label). The Mac job is then started with `launchctl kickstart gui/<uid>/<label>`: on macOS 27 a submitted job is only registered and never runs on its own (measured 2026-10-16). With neither launcher, or when the Mac kickstart fails (the tick then removes the label), the tick logs `run launcher unavailable: <name>; waiting after tick` to `notifier.log` and runs the job once it has released `.tick.lock`.
+The job claims its slot and replaces `<instance>/run.log` with the command output. The `zselect` watchdog sends TERM at `TIMEOUT`.
+A background child of the tick would die with the tick's cgroup or launchd job.
 
 The slot is claimed before the check runs, so a concurrent tick or `fire` cannot send the same slot twice, and a skip uses up its slot: the next try is one interval later. The check runs as a background process with a `zselect` watchdog that kills it after `TIMEOUT` seconds. `TIMEOUT` is also the relay's delivery limit.
 
@@ -101,7 +107,6 @@ For `session:<staff-id>`, the staff row supplies the current session.
 A restarted session can therefore receive messages at its current socket.
 
 `COMMAND` supplies fixed message text.
-`codex_winddown.start_count` passes its `TICK` text through `--command` and creates no prompt file.
 For `PROMPT=scheduled`, the notifier runs `update_registration.py delivery --owner <staff-id>` once before delivery.
 It removes the `session:` prefix from `TARGET` for that command.
 The command resolves the owner's current name and document through one staff read.
@@ -137,8 +142,12 @@ An undelivered tick replaces the previous queued tick for that instance.
 | `remove <instance>` | Deletes the instance directory. Exits 0 when it is already gone. |
 | `status <instance>` | Target, interval, enabled or stopped, `next_due`, `last_sent`, `last_restart`, `last_tick`, last five `fire.log` lines. |
 | `status` | One line per instance (`<name> every N min next HH:MM enabled\|stopped`), then `last_tick`. |
-| `health <instance>` | Exit 1 with `failing: no instance`, `failing: no tick since <time\|never>` (`.last_tick` missing or older than 120 s), or `failing: last two sends exit a, b` (the last two `exit` lines both nonzero). Otherwise exit 0 with `ok`, or `ok: stopped` for a stopped instance. |
+| `health <instance>` | Exit 1 if the instance is missing, the last tick is missing or older than 120 s, or the last two results failed. Print the reason. Otherwise exit 0 with `ok` or `ok: stopped`. |
 | `tick` | The job's verb. Always exits 0. |
+
+For a send job, health reports `failing: last two sends exit a, b` when both sends exit nonzero.
+For a run-only job, health reports both results, for example `failing: last two runs exit 3, timeout`.
+Health uses `run result` lines because older run logs omit successes.
 
 `restart`, `start`, `resume`, `interval`, `fire` and a fresh `new` print exactly one line `next_due=<epoch> (<YYYY-MM-DD HH:MM TZ>)`, in local time.
 
@@ -218,7 +227,8 @@ A row without a run produces no health check.
 
 - Check contract: 0 sends, 2 removes the instance, other nonzero skips, and the check finishes within `TIMEOUT`. `direct_run.py check` stays a quick file read and never treats an old run as gone.
 
-- Every message, `--help` text, comment and docstring under `scripts/` that names a run of `/unit:direct` calls it a "unit run" (`Unit run`, `unit run`, `mid-unit-run`) (user, 2026-10-08); `phase_table.py --help` reads `Show or refresh a unit run's plan phases.` Nothing is called "delegate" (user, 2026-10-20): the directories are `scripts/direct/` and `docs/direct/`, the config is `config/direct.conf`, the variables are `UNIT_*`, the hook module is `scripts/hooks/direct_run.py`, a run's directory is the "unit session directory" (the session-start hook prints `Unit session directory:`), and the agent that receives the work is a "worker". Stored data moves to new names: the history folder is `~/.local/state/unit-history` and the run archive `usage-model/unit-archive` once `unit_runs.py move-history` moves them on each machine; the buildlog field is `unit_session`, renamed in the log files on their next index read; findings record `--caught-by worker`. Until then, and for records already written, these readers keep the old word: the `plan-delegate` and `delegate-archive` folder names, the `plan-delegate` skill in old events, the `delegate_session` field rename, `--caught-by delegate` (accepted and stored as `worker`, and counted in old history), the `delegate.` task names in the history ledger, a phase's `delegated_phase_reservation_state.json`, `/tmp/claude/delegate` and the `delegate-` notifier prefix. The last three go with the old run folder. Two more keep it for good: the old command name `/unit:delegate`, which the model study and the roles audit match in old transcripts and text, and the dated review `docs/direct_footprint_review.md`. The check: `git grep -niwE 'delegates?' -- scripts commands docs ':!docs/plans'`; any hit outside that list breaks the rule.
+- Every message, `--help` text, comment and docstring under `scripts/` that names a run of `/unit:direct` calls it a "unit run" (`Unit run`, `unit run`, `mid-unit-run`) (user, 2026-10-08); `phase_table.py --help` reads `Show or refresh a unit run's plan phases.` Nothing is called "delegate" (user, 2026-10-20): the directories are `scripts/direct/` and `docs/direct/`, the config is `config/direct.conf`, the variables are `UNIT_*`, the hook module is `scripts/hooks/direct_run.py`, a run's directory is the "unit session directory" (the session-start hook prints `Unit session directory:`), and the agent that receives the work is a "worker". Stored data moves to new names: the history folder is `~/.local/state/unit-history` and the run archive `usage-model/unit-archive` once `unit_runs.py move-history` moves them on each machine; the buildlog field is `unit_session`, renamed in the log files on their next index read; findings record `--caught-by worker`. Until then, and for records already written, these readers keep the old word: the `plan-delegate` and `delegate-archive` folder names, the `plan-delegate` skill in old events, the `delegate_session` field rename, `--caught-by delegate` (accepted and stored as `worker`, and counted in old history), the `delegate.` task names in the history ledger, a phase's `delegated_phase_reservation_state.json`, `/tmp/claude/delegate` and the `delegate-` notifier prefix. The last three go with the old run folder. The roles audit still matches `/unit:delegate` in old transcripts and text.
+  The dated review `docs/direct_footprint_review.md` also retains the name. The check: `git grep -niwE 'delegates?' -- scripts commands docs ':!docs/plans'`; any hit outside that list breaks the rule.
 
 - **Run folders and staff.** A new run goes in its director's session folder, `/session/<name>/run/<run id>/`
   (user decision 8, 2026-11-15); before the session root exists it goes in `/tmp/claude/unit/<run id>/`.
@@ -316,8 +326,19 @@ The dry run uses `would move` in that line.
 Both modes keep folders with a running session or an active process when they check candidates.
 The real run checks again after it writes the session index and just before it saves the journal.
 If that check finds a live source, the next run can reuse its index entry.
-Both modes continue with other candidates and return status 0 if they only skip live entries before copying.
-A destination conflict or a failed copy stops a real run and returns status 1.
+Both modes continue with other candidates and return status 0 if they only skip live entries or folders with no destination before copying.
+Both modes check the source, its parent, the destination, and the session index before they print each move.
+The source check reads file contents, symbolic link targets, and metadata.
+It checks write and search permission on the parent of each source entry, including the source folder.
+It also checks whether sticky directory permissions prevent removal.
+The destination check includes write and search permission where the move must create entries.
+If discovery cannot read a project or an entry, both modes report the refusal and continue with the next entry.
+Both modes keep entries that fail these checks and continue in the same order.
+A destination conflict found during these checks counts as a refusal.
+The command returns status 1 if it records a refusal.
+An error at or after the first write to the session index or the journal stops the real run.
+A source that becomes live before journal publication is an exception.
+If the journal names a live source, the run keeps the journal and returns status 1.
 The dry run reads the session index and folder records without creating a preview directory.
 It reads compressed transcripts through a pipe.
 The command checks the scratchpad copy after it scans the source for deletion.
@@ -341,4 +362,6 @@ If source data changes before publication, the command saves a copy-in-progress 
 The command keeps the source and can rebuild the stage on retry.
 The command reports unrecognized entries and preserves them.
 Entries outside Claude projects do not affect the refusal count or the exit status.
-It refuses an existing destination unless the journal identifies it as the result of the pending move.
+A session with no working folder in any transcript has no destination.
+Both modes keep its folder and report it, but it does not affect the refusal count or the exit status.
+The command refuses an existing destination unless the journal identifies it as the result of the pending move.

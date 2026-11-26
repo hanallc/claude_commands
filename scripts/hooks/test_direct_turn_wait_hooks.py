@@ -26,6 +26,7 @@ from scripts.hooks.conversation_pause_test_support import ConversationPauseFixtu
 from scripts.message import send
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file, recorded_unit
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 HOOKS = Path(__file__).resolve().parent
@@ -93,8 +94,8 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
         phase: dict[str, object] = {"id": "6", "instance_id": "original-six", "title": "Wait hooks",
                                     "status": "active", "started_at": 1000}
         state: dict[str, object] = {"run_id": "run", "history_file": str(history), "working_dir": str(root),
-                                    "worktree": "fixture-unit", "phase": phase,
-                                    "main_agent": {"session_id": SESSION}, "pass": {}, "open_phases": [],
+                                    "worktree": "fixture-unit", "open_phases": [phase],
+                                    "main_agent": {"session_id": SESSION}, "pass": {},
                                     "unit": "fixture-unit", "project_plan_doc": "plan.md"}
         _ = (root / "plan.md").write_text('> **Production: wait-production** — unit `fixture-unit`; production doc `production.md`\n')
         _ = (run / "progress_history_state.json").write_text(json.dumps(state))
@@ -162,7 +163,7 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
             "CONVERSATION_PAUSE_NOTIFIER": false_command, "AUTO_SILENCE_COMMAND": true_command,
             "CONVERSATION_PAUSE_HOOK_BUDGET": "25",
             "SHOWRUNNERS_SESSIONS": str(session_lookup), "NOTIFIER_SESSIONS_DIR": str(sessions),
-            "STAFF_FILE": staff_environment["STAFF_FILE"], "HERDR_BIN": "/nonexistent/herdr",
+            "STAFF_FILE": staff_environment["STAFF_FILE"], "HERDR_BIN": MISSING_HERDR_BIN,
         }
         yield DirectorWaitFixture(root, run, history, environment, execution)
 
@@ -236,16 +237,18 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
     def test_only_expected_showrunner_can_relay_the_users_decision(self) -> None:
         relay = "From the user (via the showrunner): Approved."
         multiline = send.Message(SESSION, "expected-showrunner\nProduction", "Decision\n\nTag: 01234567", relay, None,
-                                 shown_sender="expected-showrunner · showrunner\nProduction")
+                                 shown_sender="expected-showrunner · showrunner\nProduction",
+                                 sent_header="\nSent: 01:12 EST")
         delivery = send.delivered_text(multiline, "abcdef12")
         self.assertEqual(delivery, "expected-showrunner Production: Decision  Tag: 01234567\n"
                          + "Sender native id: unavailable\nShown sender: expected-showrunner · showrunner Production\n"
-                         + "Tag: abcdef12\n\n" + relay)
+                         + "Sent: 01:12 EST\nTag: abcdef12\n\n" + relay)
         for text in (
             relay,
             "expected-showrunner: Decision\nSender native id: unavailable\nTag: abcdef12\n\n" + relay,
             "expected-showrunner: Decision\nSender native id: session:showrunner\n"
             + "Shown sender: expected-showrunner · showrunner\nTag: abcdef12\n\n" + relay,
+            "expected-showrunner: Decision\nSender native id: unavailable\nSent: 01:12 EST\nTag: abcdef12\n\n" + relay,
             delivery,
         ):
             with self.subTest(text=text), director_wait_fixture() as fixture:
@@ -435,7 +438,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             fixture.call(STOP, {"last_assistant_message": "decision: approve?"}, 1010)
             path = fixture.run / "progress_history_state.json"
             state = cast(dict[str, object], json.loads(path.read_text()))
-            state["phase"] = {"id": "7", "instance_id": "new-seven", "status": "active"}
+            state["open_phases"] = [{"id": "7", "instance_id": "new-seven", "status": "active"}]
             _ = path.write_text(json.dumps(state))
             # Even a marker older than active_run's liveness window retains
             # the exact wait to close when the user finally answers.

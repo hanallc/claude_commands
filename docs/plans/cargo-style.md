@@ -29,7 +29,7 @@ Where each Rust step of M1 and of every later cargo-liner phase runs (builds, aw
 | Step | Working folder | Build folder |
 | --- | --- | --- |
 | Edits | a `copies.py` clone of cargo-liner under `/build/claude/scratch/<task>`; no cargo and no verify.sh run in it directly | none |
-| check, test, lint, release build | `copies.py run --repo <clone> --commit HEAD --apply-uncommitted <clone> -- ~/.claude/scripts/direct/verify.sh <step>` (drop `--apply-uncommitted` for committed work only; a release build adds `--publish <relative path>` to keep the binary) | a cargo-liner slot: source `/build/slot/cargo-liner-slot<N>`, output `/build/cargo/cargo-liner-slot<N>` (`copies.py:1027`, `build_folders.conf:39` 5 on natedev, `:42` 2 on the Mac). A full pool waits; it never falls back to scratch. |
+| check, test, lint, release build | `copies.py run --repo <clone> --commit HEAD --apply-uncommitted <clone> -- ~/.claude/scripts/direct/verify.sh <step>`. Omit `--apply-uncommitted` for committed work. Add `--publish <relative path>` to keep the release binary. | A numbered copy under `/build/cargo-liner/<unit>/<number>` on natedev or `~/build/cargo-liner/<unit>/<number>` on the Mac. Cargo writes to `target` inside the copy. |
 
 The reader phases 1 to 5 ran verify.sh directly in scratch clones, so they built in `/build/cargo/scratch/<task>`, outside the slots. That is the "bypassing the slots" nate named. `copies.py run` ends it.
 

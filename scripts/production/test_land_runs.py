@@ -14,7 +14,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.lib.process_start import Started, process_start
-from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, merge_gate
+from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, gate
 
 
 class LandRunTests(unittest.TestCase):
@@ -23,10 +23,38 @@ class LandRunTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(self.root)}))
+        self.enterContext(patch.dict(os.environ, {"GATE_STATE_DIR": str(self.root)}))
+
+    def test_default_state_requires_the_folder_move(self) -> None:
+        for label, old_exists, new_exists, explicit in (
+            ("move required", True, False, False),
+            ("explicit state", True, False, True),
+            ("neither folder", False, False, False),
+            ("new folder", True, True, False),
+        ):
+            with self.subTest(state=label), patch.dict(os.environ, {"HOME": str(self.root / label)}):
+                _ = os.environ.pop("GATE_STATE_DIR", None)
+                old = Path.home() / ".local/state/merge-gate"
+                new = Path.home() / ".local/state/gate"
+                if old_exists:
+                    old.mkdir(parents=True)
+                if new_exists:
+                    new.mkdir(parents=True)
+                if explicit:
+                    os.environ["GATE_STATE_DIR"] = str(self.root / "selected")
+                    self.assertEqual(land_runs.state_dir(), self.root / "selected")
+                elif old_exists and not new_exists:
+                    with self.assertRaises(land_runs.GateStateMoveRequired) as refused:
+                        _ = land_runs.state_dir()
+                    self.assertIn("bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh",
+                                  str(refused.exception))
+                    self.assertIn("/build:hold drain natedev", str(refused.exception))
+                    self.assertFalse(new.exists())
+                else:
+                    self.assertEqual(land_runs.state_dir(), new)
 
     def test_a_land_is_running_only_while_its_process_holds_the_record(self) -> None:
-        self.assertEqual(merge_gate.gate_state_dir(), self.root)
+        self.assertEqual(gate.gate_state_dir(), self.root)
         self.assertEqual(land_runs.running_lands(), {})
         with land_runs.landing(["a" * 40, "b" * 9], ["shelled images-card"]):
             self.assertEqual(land_runs.running_lands(), {"a" * 40: "shelled images-card", "b" * 9: ""})
@@ -85,7 +113,8 @@ class LandRunTests(unittest.TestCase):
         self.assertEqual((failed["landed"], failed["step"], failed["state"], failed["detail"], failed["unit"]),
                          (False, "conflicts", "held", "scripts/x.py conflicts\nmore", "unit-board"))
         with (patch.object(merge_checkpoint, "record"), patch.object(merge_checkpoint, "end_phase_scratch"),
-              patch.object(merge_checkpoint, "checkpoint_step_record", return_value=self.root / "steps" / "promotion"),
+              patch.object(merge_checkpoint, "production_checkpoint_step_record",
+                           return_value=self.root / "steps" / "promotion"),
               contextlib.redirect_stdout(io.StringIO())):
             merge_checkpoint.finish_checkpoint(request, "b" * 40, "merge tests")
         landed = land_runs.result_for(land_runs.last_results(), "a" * 40)

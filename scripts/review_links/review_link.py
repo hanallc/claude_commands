@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 from string import Template
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import quote
 
 from scripts.lib import atomic_file, conf
@@ -31,7 +31,7 @@ SNAPSHOT_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
 def private_name(name: str) -> bool:
     """Identify publisher metadata and unfinished writes in any letter case."""
     folded = name.casefold()
-    return (folded in (".index.json", ".index.lock") or folded.startswith(".review-link-")
+    return (folded in (".index.json", ".index.lock", "page-states") or folded.startswith(".review-link-")
             or atomic_file.temporary_target(folded) is not None)
 
 
@@ -41,13 +41,23 @@ def review_root() -> Path:
     return change_routing.review_root()
 
 
-def link_host() -> str:
-    """The local Tailscale IPv4 address, or an explicit host override."""
+def tailscale_ip(version: Literal[4, 6] = 4) -> str:
+    """Read the local Tailscale address for one IP version."""
+    result = subprocess.run(["tailscale", "ip", f"-{version}"], capture_output=True, text=True,
+                            check=True, timeout=conf.read("review_links").number("tailscale_timeout_seconds"))
+    address = ipaddress.ip_address(result.stdout.strip())
+    if address.version != version:
+        raise ValueError(f"Tailscale did not return an IPv{version} address.")
+    return str(address)
+
+
+def link_host(*, bound_address: str = "") -> str:
+    """Use the host override or the local Tailscale IPv4 address."""
     if override := os.environ.get("REVIEW_LINKS_HOST"):
         return override.rstrip(".")
-    result = subprocess.run(["tailscale", "ip", "-4"],
-                            capture_output=True, text=True, check=True, timeout=conf.read("review_links").number("tailscale_timeout_seconds"))
-    return str(ipaddress.IPv4Address(result.stdout.strip()))
+    if bound_address:
+        return bound_address
+    return tailscale_ip()
 
 
 def snapshot_url(root: Path, path: Path, *,

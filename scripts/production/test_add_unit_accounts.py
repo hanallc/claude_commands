@@ -89,7 +89,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior.mkdir()
         # The pane mark joins its unit only through the unit's staff row.
         row = unit_membership("build-followups", "alpha")
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.unit_tree("alpha")), expected=row.worktree)
         self.persist_herdr_unit("alpha", prior)
         transcript = Path(self.env["HOME"]) / ".claude/projects/project/62ccbd64-f22e-5647-b20e-7899aa39d766.jsonl"
         transcript.parent.mkdir(parents=True)

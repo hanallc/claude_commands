@@ -263,7 +263,12 @@ A second renewal caller prints `already claimed by <id>` and exits with code 0.
 A busy renewal lock permits usage reads.
 Renewal tries each expired local Claude account at most once per hour.
 A renewal error prints one diagnostic and preserves the usage messages and saved readings.
-The refresher writes no notes, sends no quota alerts, and runs neither the Codex pacer nor account moves.
+Then it completes the Mac's own group members that are off the current group selection.
+This step runs at most once in each `parts.refusals.interval_seconds`, the cadence of the natedev refusal pass.
+It reads a completion plan that the natedev refusal pass writes, and it completes only the groups in that plan.
+It does nothing when the plan is unreadable or older than three refusal intervals.
+It never changes a group selection.
+The refresher writes no notes, sends no quota alerts, and runs neither the Codex pacer nor refusal moves.
 Natedev owns those actions.
 Install the scripts before activating `modules/darwin/account-usage.nix`.
 
@@ -431,6 +436,7 @@ A single session is found by id, then exact name.
 A move outside the group account prints that the member returns to the group account at its next resume or restart.
 Ambiguous or unknown sessions return an error.
 A session already on the target returns success.
+When another operation holds its row, the session skips the quota check and the move waits for the row.
 A group move selects its account for future launches, then moves each live member on another account once.
 The `producers` move also resumes eligible stopped Claude producers.
 An empty group still selects its account.
@@ -630,7 +636,10 @@ It also records waits, failures, and renewed room.
 
 ## Automatic group rules
 
-The account moves log on natedev holds ordered, one-shot moves for Claude groups and Codex workers in `~/.local/state/accounts/next_moves.json`. Use `/account_moves` in ordinary words, or:
+The Accounts page shows the next move for each selected group.
+Use its `next` control to set the first move for a Claude group.
+Natedev stores the ordered moves for Claude groups and Codex workers in `~/.local/state/accounts/next_moves.json`.
+Use `accounts.py next` for workers, holds, and changes to later entries.
 
 ```sh
 accounts.py next add units 1 claude4 --hold-minutes 30
@@ -706,7 +715,8 @@ At that reset, new launches use the default account.
 The Mac uses its last saved map when natedev is offline.
 A launch reports an error when no usable map exists.
 Bare `claude` keeps the caller or showrunners account.
-Subagents use their Claude session's account.
+An enrolled showrunner uses the worker account for read-only helpers.
+Before enrollment, built-in Claude helpers use the parent session's account.
 Only the first workers entry runs on natedev, before the zero policy.
 The selected account needs a fresh reading at or below the entry's percentage.
 A Codex target needs a fresh reading above that threshold and no unresolved quota refusal.
@@ -717,13 +727,14 @@ Each session attempt has its own `move_id`, with a request and one confirmed or 
 The request uses the session process account as its source.
 Saved launch settings cannot replace the requested destination account.
 The notes timer delegates moves to a detached batch before it stops any session.
-A session that owns a live build step moves when its steps end, or after `MOVE_BUILD_WAIT_MINUTES` in `config/shutdown.conf`; the others move at once.
+Each session moves at once, even if it owns a live build step, a queued run, or a verify call.
+The resumed session must do its interrupted work again.
 The batch records each outcome when its resume and existing stay observation finish.
 A failed resume uses the existing move failure report to tell the showrunners.
 Blocked notices use the current queue head and target at delivery.
 Each notice addresses a session once, even when its name and ID both select it.
 
-A workers move to Claude needs a known source weekly reset and holds its work routing on Claude until that reset, even if Codex has room earlier. Status detail shows it under `Codex work routing:` with cause `auto`. While any workers entry is queued, default, provider-refusal and credits-off moves wait. With no workers entry, weekly zero first moves workers to included Codex usage when it is available. With credits on and no included room, workers stay and spend their paid credits. With credits off, or after a refusal, workers use the Codex account with room whose weekly reset is soonest, else Claude.
+A workers move to Claude needs a known source weekly reset and holds its work routing on Claude until that reset, even if Codex has room earlier. Status detail shows it under `Codex work routing:` with cause `auto`. While any workers entry is queued, default, provider-refusal and credits-off moves wait. With no workers entry, weekly zero first moves workers to included Codex usage when it is available. With credits on and no included room, workers stay and spend their paid credits. With credits off, or after a refusal, workers use the Codex account with room whose weekly reset is soonest. When no Codex account has room, no-worker mode goes on: the Codex workers stop, no worker starts, and each director does the work itself.
 
 Failed routing-journal appends retain the Claude hold and a saved retry. A refused workers swap saves its failure before attempting the journal append; pending rows must reach the journal before replay checks can consume entries.
 
@@ -755,7 +766,7 @@ Historical jobs remain keyed by session id in `~/.local/state/accounts/unit_watc
 
 Watcher inventories read live sessions and `staff.json` membership. They neither collect nor read a desktop snapshot. Maintenance now runs through the separate agent-notes job; a `--dry-run` still writes nothing.
 
-The agent-notes job’s refusal part checks local top-level sessions' last transcript entries for provider quota refusals. A refused Claude session can move its group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac usage refresher does not run this refusal check.
+The agent-notes job’s refusal part checks local top-level sessions' last transcript entries for provider quota refusals. A refused Claude session can move its group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac usage refresher does not run this refusal check. It completes only the Mac's own off-target group members.
 
 The board and group moves share one staff member list. Each live member uses its process account. Timer registrations do not decide membership. Absent registration targets are checked separately.
 
@@ -791,7 +802,7 @@ Legacy stored `default` values read as numbers on their next normal write.
 Historical move entries use evidence recorded at the time, or show `home account unresolved`.
 Setup creates `~/.codexN` when no home holds that account.
 
-`codex_credit_accounts` in `config/accounts.conf` names the Codex accounts that may spend paid credits. Every other Codex account is off. A `/tune accounts codex_credit_accounts` change is live on both machines at once, before main has it, and starts the quota pass at once; a refused main change keeps the new value live and says so. With off, an exhausted weekly or 5-hour window makes the account unavailable even with credits. At weekly 0%, workers first move to another Codex account with room when no workers entry is queued. With credits on, workers move only to included usage, and that move sends no alert. When no account has included usage left, workers use paid credits, with one phone notice and hourly forecasts. Each pass checks for included usage again. A move to that usage closes the paid episode with no alert. With credits off, workers prefer included usage, then another account using its own credits. When neither is available or the move fails, Codex assignments move to Claude until the earliest refill, no-worker mode goes on, and the Codex workers stop. When the setting names the account again and it has a credit balance, the assignments return and no-worker mode goes off. Only the first forecast goes to the phone. See `docs/quota_alerts.md` for delivery retries and unknown forecasts.
+`codex_credit_accounts` in `config/accounts.conf` names the Codex accounts that may spend paid credits. Every other Codex account is off. A `/tune accounts codex_credit_accounts` change is live on both machines at once, before main has it, and starts the quota pass at once; a refused main change keeps the new value live and says so. With off, an exhausted weekly or 5-hour window makes the account unavailable even with credits. At weekly 0%, workers first move to another Codex account with room when no workers entry is queued. With credits on, workers move only to included usage, and that move sends no alert. When no account has included usage left, workers use paid credits, with one phone notice and hourly forecasts. Each pass checks for included usage again. A move to that usage closes the paid episode with no alert. With credits off, workers prefer included usage, then another account using its own credits. When neither is available, Codex assignments move to Claude until the earliest refill, no-worker mode goes on, and the Codex workers stop. When an account has room but the move fails, the assignments move to Claude and no-worker mode goes on, as with no room. When the setting names the account again and it has a credit balance, the assignments return and no-worker mode goes off. Only the first forecast goes to the phone. See `docs/quota_alerts.md` for delivery retries and unknown forecasts.
 
 Account notes use numbered filenames such as `claude1.md` and `codex2.md`.
 Each note has a `role` list and a `sessions` count from the current roster.
@@ -828,3 +839,12 @@ Missing-note instructions name that folder.
 The refusal pass reads the usage age once and passes it through account selection.
 
 See the [account design](as-built/accounts.md) for types, invariants, shared settings, and machine-local settings.
+
+### Published settings order
+
+`config/settings-orders.json` records the save order of settings published to `main`.
+Each top-level key names a `config/*.conf` file without its extension.
+Each nested key names a setting in that file.
+Its value is a positive integer sequence number.
+A missing entry has order zero.
+The publisher uses these numbers to keep an older pending save from replacing a newer published save.

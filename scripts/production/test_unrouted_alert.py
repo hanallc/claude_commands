@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
 from scripts.production import change_routing, staff, unrouted_alert
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 from scripts.production.staff_test_support import fixture_member, production_staff_record
 
 
@@ -35,13 +36,14 @@ class UnroutedAlertTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root), "STAFF_FILE": str(self.root / "staff.json"),
                                                "REVIEW_LINKS_ROOT": str(self.root / "links")}))
         source_config = Path(__file__).resolve().parents[2] / "config/change_review.conf"
-        _ = (self.root / "change_review.conf").write_text(source_config.read_text())
+        _ = copy_config_file_fixture(source_config, self.root / "change_review.conf")
         self.config = self.root / "review_links.conf"
         _ = write_config_fixture(self.config, "unrouted_alert_recipient=alert-owner\nunrouted_alert_retry_seconds=60\n")
         self.row = {"#": "C8", "Change": "A broken producer"}
 
     def notify(self, reason: str = "conflict") -> None:
-        unrouted_alert.notify(self.root / "links", "top", self.row, reason, ("one", "two"))
+        unrouted_alert.notify(self.root / "links", "top", self.row, reason, ("one", "two"),
+                              still_unrouted=lambda: True)
 
     def isolated_sender(self) -> Callable[[str, str, str], None]:
         """Use the sender implementation with a fake subprocess, independent of the probe."""
@@ -168,7 +170,9 @@ assert 'send' not in sys.modules
                 send.assert_called_once()
 
     def test_unaccepted_send_outcomes_keep_alerts_pending(self) -> None:
-        for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"), (4, "HELD"), (5, "PENDING"), (6, "RETRY")):
+        for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"),
+                             (4, "HELD"), (5, "PENDING"), (6, "RETRY"),
+                             (SEND_CLOSED_EXIT, "CLOSED"), (SEND_ABSENT_EXIT, "ABSENT")):
             with self.subTest(header=header):
                 error = StringIO()
                 with (patch.object(unrouted_alert, "send_message", side_effect=self.isolated_sender()),
@@ -244,7 +248,8 @@ assert 'send' not in sys.modules
         _ = self.enterContext(production_staff_record())
         _ = self.enterContext(patch.object(change_routing, "configured_lists_directory", return_value=self.root))
         router, _, unit = self.orphan_router()
-        with (patch.object(unrouted_alert, "send_message", side_effect=RuntimeError("not reached")), redirect_stderr(StringIO())):
+        with (patch.object(staff, "authority_snapshot", lambda: router.record),
+              patch.object(unrouted_alert, "send_message", side_effect=RuntimeError("not reached")), redirect_stderr(StringIO())):
             owner = router.owner(self.row | {"Producer": str(unit.id)}, self.root / "change-review - top.md")
         self.assertIsInstance(owner, change_routing.UnroutedChange)
         self.assertEqual(owner.tab, "unrouted")
@@ -252,11 +257,21 @@ assert 'send' not in sys.modules
     def test_an_unrouted_list_in_the_real_folder_sends_once_through_the_fake_sender(self) -> None:
         _ = self.enterContext(production_staff_record())
         router, _, unit = self.orphan_router()
+        authority_reads = 0
+
+        def read_authority() -> staff.StaffSnapshot:
+            nonlocal authority_reads
+            authority_reads += 1
+            return router.record
+
         with (patch.object(change_routing, "configured_lists_directory", return_value=self.root),
+              patch.object(staff, "authority_snapshot", read_authority),
               patch.object(unrouted_alert, "send_message") as send):
-            for _ in range(2):
-                owner = router.owner(self.row | {"Producer": str(unit.id)}, self.root / "change-review - top.md")
-                self.assertIsInstance(owner, change_routing.UnroutedChange)
+            for render in ("first", "repeat"):
+                with self.subTest(render=render):
+                    owner = router.owner(self.row | {"Producer": str(unit.id)}, self.root / "change-review - top.md")
+                    self.assertIsInstance(owner, change_routing.UnroutedChange)
+                    self.assertEqual(authority_reads, 1)
         send.assert_called_once()
         self.assertIn("Row: C8", cast(str, send.call_args.args[2]))
 

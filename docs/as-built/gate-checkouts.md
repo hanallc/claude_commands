@@ -1,12 +1,7 @@
 # Standing gate checkouts
 
-`scripts/copies/copies.py` is the single place that makes gate, review, merge,
-and landing checkouts.
-`standing` calls `keeps_build_cache(source, base)` to select cache storage.
-The function runs `git cat-file -e <base>:Cargo.toml`.
-Every gate uses a private temporary checkout under TMPDIR.
-A root Cargo manifest selects a retained cache slot.
-Other commits keep no gate cache, including commits with only nested Cargo manifests.
+`scripts/copies/copies.py` prepares gate, review, merge, and landing checkouts.
+`copies.standing` takes a numbered copy under `roots.build` through `take_copy`.
 
 ## Configuration, place, and names
 
@@ -18,70 +13,40 @@ below is required; the implementation has no fallback values.
 
 | Key | Shipped value | Meaning |
 | --- | --- | --- |
-| `root` | `~/worktrees/gates` | Absolute pool root after expanding `~`. |
-| `wait_seconds` | `1` | Positive, finite interval in seconds for rechecking the second checkout while both are busy. |
 | `git_timeout_seconds` | `600` | Positive, finite deadline in seconds for each Git subprocess. |
 | `guard_timeout_seconds` | `10` | Positive, finite deadline in seconds for the combined repository-copy and scratch guard. |
 
 These values come from configuration.
 `owner.nightly=nightly`, `owner.style=style`, and `owner.verify=verify` supply owners when production context is unavailable.
-Each owner and repository with a root Cargo manifest has two standing cache slots.
 
 The same file holds `allow.<path>=<reason>` entries under `[allow-list]`, with
 paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
 entries to the guard's scan. The guard does not read configuration separately.
 
-Standing cache folders live below `<root>/<repo>/`.
-`StaffOwner(row_id)` identifies a staff row. `RoleOwner(name)` identifies a fixed role without a staff row.
-The records hold the row id or the role name.
-A new folder uses the current staff name or the role name, followed by `-gate`.
-Another owner's folder takes that name, so the new folder uses the next free numbered suffix.
-The folder keeps its creation name through a staff rename.
-Lookup selects the owner's records before it selects free readable names.
-The caller writes the first record while it holds the claim.
-A gate folder without a record is free when lookup reaches its readable name.
-The caller takes that folder only after it acquires the claim.
-Owner removal does not select an unrecorded folder.
-A rename removes no copy and changes no copy record.
-Lists show the current staff name from the row id.
-`<repo>` is the repository identity from the last part of its origin URL, without `.git`.
+`config/build_folders.conf` sets the build root.
+The root uses `roots.build.<machine>`, with `roots.build` as the default.
+Each checkout uses `<roots.build>/<repository>/<unit>/<N>`.
+The lock `<N>.lock` and the lease `<N>.lease.json` are beside the checkout. The lease records the owner.
+The unit is the caller's staff unit name. Without a staff row, the unit is the owner.
+The maker takes the lowest free existing number or makes the smallest missing number. No setting limits the count.
+The repository name comes from the last part of its origin URL, with the `.git` suffix removed.
+A `repo_word.<name>` setting in `build_folders.conf` replaces that name.
 Local origins, including relative paths and `file://` URLs, lead to the source repository's identity.
 A cycle of local origins is an error.
-A repository without an origin uses its main checkout's folder name.
+A repository without an origin cannot take a copy.
 Linked worktrees and local clones use the same identity.
-`~/.claude` has no root Cargo manifest and uses fresh copies.
-Its nested proof crate does not select a standing cache.
-The cache root under `~/worktrees` belongs to the existing trusted direnv root.
-The temporary checkout uses a separate record for direnv trust.
 
 The CLI reads the calling session's local staff row.
 A worker uses its parent unit's row id.
 A caller without a staff row receives an error.
 Text owners enter through one boundary as staff row ids or fixed role names.
 
-## Fresh copies
+## Copy preparation
 
-`fresh_tree(owner)` creates one `TemporaryDirectory` under TMPDIR for every gate.
-Its prefix contains the current staff name or role name and `-gate`.
-It creates a `checkout` folder inside that temporary folder and yields a `GateLease`.
-The temporary folder's busy lock protects preparation and caller use.
-Command children inherit the lease descriptors.
-The checkout does not register as an editable workspace or a scratch task.
-Preparation writes `.gate-copy.json` beside `checkout/`, outside the tracked tree.
-The record contains `task`, `source_path`, and the selected `source_commit`.
-`copy_record.record_path(checkout)` finds this record in another process.
-`nix_env.registered_copy()` requires a regular `.envrc` whose blob matches that commit in the trusted source.
-A changed `.envrc` or an untrusted source receives no automatic approval.
-The temporary folder removes the record when the gate ends.
-The standing cache keeps its separate `.gate.json` record.
-Cargo gates also hold a standing cache lease.
-Other gates receive separate folders without waiting for a cache slot.
-
-Preparation fetches the selected commit and applies the requested source and merge policies.
-The context removes the temporary folder after success, a caller exception, or a preparation failure.
-A failed removal raises `PostUseError` and retains the caller's exception in `caller_error`.
-TMPDIR cleanup at reboot removes folders left by killed processes.
-Non-Cargo gates skip the metadata and cache refresh after use.
+The copy lease covers checkout preparation and caller use. Command children inherit the lock descriptor.
+Preparation selects the requested commit and applies the source and merge policies.
+The checkout remains after use. A later caller can reuse its build output.
+See [Repository copies](copies.md) for copy cleanup and build output details.
 
 ## Reset and build output
 
@@ -139,18 +104,8 @@ Cache marking does not follow a caller's replacement target symlink.
 
 ## Acquisition and cleanup
 
-A Cargo gate holds `scratch.busy_locks(cache, create=True)` throughout preparation and caller use. The mark is the existing `.claude-busy`
-flock. There is no second lock implementation or central registry.
-
-Standing acquisition tries both trees in order without waiting. If both trees are
-busy, it prints one stderr line naming the trees and their recorded holder
-pids, then blocks on the primary tree's flock while rechecking the second at
-`wait_seconds` intervals (one second in the shipped configuration). Primary
-release wakes acquisition immediately. A third simultaneous caller waits; it
-never creates a third tree. Failed
-preparation and failed commands release the lock.
-Git runs automatic maintenance synchronously because its children inherit the busy lock.
-This also releases the lock after a failed metadata refresh.
+Acquisition does not wait for a copy. When a copy is busy, the maker tries the next number.
+The copy lease releases when preparation fails or the caller ends.
 
 Each prepared checkout and standing cache has a `.gate.json` record:
 
@@ -180,7 +135,7 @@ Run targeted tests with the source worktree's uncommitted changes and a merge, i
   --commit HEAD \
   --apply-uncommitted ~/worktrees/claude-build-followups-verify \
   --merge origin/builds -- \
-  ~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout '{tree}'
+  ./scripts/lib/py scripts/production/gate.py --affected
 ```
 
 `run --repo R --commit C [--apply-uncommitted W] [--merge REF] [--publish PATH ...]
@@ -198,8 +153,9 @@ Stdout prints `published: <absolute path> <full commit>` for each file.
 A path that does not exist prints `copies: publish: <path> not built` on stderr.
 A copy failure ends the scratch folder and prints `copies: publish: <error>` on stderr.
 Publication never changes the exit status of `run`.
-The scratch deadline removes the folder; the hourly sweep does the removal.
-The scratch default task has a random suffix, so `scratch.end()` removes only this folder.
+After the scratch deadline, the hourly sweep lists the eligible folder for vetted manual removal.
+The default scratch task has a random suffix.
+`scratch.end()` records task completion and keeps the folder for vetted manual removal.
 The folder is outside the cache root, so a unit reads it with no permission prompt.
 `/hana_shot` launches a gate build with the `published:` path as `--binary`.
 A unit never copies from a gate checkout's `target`.
@@ -291,12 +247,13 @@ Callers must finish all checkout access before the context ends.
 `CopyError` represents a refusal.
 `PreparationError` represents an application or merge failure.
 
-`hold --repo R` holds a staged checkout until its standard input closes.
-It computes the staged tree through a private index before it prepares the checkout.
-It accepts no staged-tree argument.
-It prints the tree identity first and the checkout path second.
+`hold --repo R --tree T --scratch` holds a checkout of staged tree `T` until its standard input closes.
+It prints the checkout path.
+`hold --repo R --tree T` without `--scratch` runs one step in a numbered copy of that tree.
+`hold` without `--tree` exits with status 2 and prints `copies: hold requires --tree. Run verify.sh again.` before it opens a checkout.
+That message reaches a `verify.sh` run that started before the `--tree` change.
 It reads the source owner, including the owner in a standing checkout's `.gate.json`.
-`verify.sh doc` reads both lines and retains the lease through descriptor 8.
+`verify.sh doc` reads the path line and retains the lease through a free descriptor.
 The source index and unchanged file modification times remain unchanged.
 `run` requires `--commit` and accepts no staged-source flags.
 
@@ -305,7 +262,8 @@ The source index and unchanged file modification times remain unchanged.
 `scripts/copies/copy_guard.py` owns the creation rule; `config/copies.conf` owns
 the allow list. The
 PreToolUse Bash dispatcher refuses direct repository cloning, worktree
-creation, and recursive repository copying. Its refusal gives a `copies.py run` example and the `make_worktree.sh <path> <branch>` command for a lasting phase tree.
+creation, and recursive repository copying. Its refusal gives a `copies.py run` example.
+Use `make_worktree.sh <repo-word> <unit> <short-name>` for a lasting phase tree.
 Run that command from the source repository. The repository scan applies the same allow list to script code.
 
 The guard distinguishes a detected tree-making operation from an unresolved relevant input and an allowed operation.
@@ -352,16 +310,15 @@ An unset source or Git path inside interpreter text can also pass when its top-l
 | `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` | Clones external upstream at a version, not a copy of our work. |
 | `scripts/worktree/make_worktree.sh` | Makes an original work worktree, not a build copy. |
 
-Cargo gates use the first available cache slot.
-More than two Cargo gates for one owner and repository wait.
+Cargo gates use the lowest available copy number.
+If all existing copies are busy, the next gate takes the lowest unused number.
 TMPDIR cleanup at reboot removes checkouts left by killed gate processes.
 
 ## Remote mirrors
 
 `copies.py` creates and refreshes mirrors for Mac, Linux, and AWS targets.
 `offload.py` requests a mirror through this API.
-`mac_run.sh` creates and registers its test clone through the same implementation.
-Neither caller has a copy-creation exception.
+`mac_run.sh` requests a numbered copy on the Mac through `copies.py run`.
 
 `remote_lease_path(mirror)` names the lease beside the mirror's registry record.
 The claim service reads `/proc/locks` once and reports held mirrors by host, path, and session.
@@ -406,24 +363,41 @@ The lsof scanner accepts output only with exit status 0 or 1.
 Every other status makes the scan unavailable.
 The Linux scanner reports unreadable working directories during its single process scan.
 
-`target_config.slot_capacity` reads the slot capacity for claims and offload admission.
-Both callers raise `ConfigError` for a bad configured value, including an empty value.
-The required `missing` policy applies only when both capacity keys are absent.
-Mac claims still use one slot.
+Each SSH target permits one claim per repository.
+The claim reader keeps the saved file for each old numbered claim until release.
 Offload records use `owning_session.owning_session()` before the shell session fallback.
 Busy refusals can therefore name the unit director's session.
 
-After confirmed clone cleanup, `mac_run.sh` calls `copies.py unregister-remote` for both registry records.
-It removes the Mac's `localhost` record before the natedev record.
+`mac_run.sh` clears the numbered copy's keep file only after `stop-checkout` confirms the copy is clear.
+The queue retries scratch cleanup for an old smoke run with `argv.json.state`.
+It keeps the run record and receipt if cleanup fails.
+If the record names a task without a checkout path, the callback lists the record for manual cleanup.
 `unregister-remote` accepts only `--host` and `--path`.
 `mirror-remove` accepts `--host`; receive and use accept the command arguments.
-A failed clone cleanup keeps both records.
 A marked mirror probe starts no remote Python and skips `mirror_local_path`.
 An unmarked probe keeps the existing path check and metadata creation.
 
 ## Original worktrees and landing
 
-`make_worktree.sh <path> <branch>` calls `worktrees.py make` from the source repository.
+`make_worktree.sh <repo-word> <unit> <short-name>` creates a worktree from the main checkout for the repo word.
+It refuses a new checkout if the same unit has a finished linked worktree.
+A finished worktree has a HEAD on the local `origin/main` history, a clean Git status, and no untracked files.
+The guard checks the current user's processes for working directories in the worktree.
+On Linux, it treats a thread with `EACCES` or `EPERM` on its working directory as a privileged daemon.
+On macOS, it applies the same rule to processes that `lsof` omits.
+The guard counts these processes as outside every worktree.
+Other scan failures let worktree creation proceed.
+It skips the main checkout, staff home worktrees, other units' checkouts, and checkouts with unreadable ownership records.
+A retry for a registered checkout can proceed.
+The refusal lists the finished paths and the manual removal steps.
+
+1. Get the showrunner's approval for each exact path.
+2. Write each removal record in `~/.local/state/removal-lists/by-hand.log`.
+3. Run the printed `git worktree remove` command for each path.
+
+The [removal procedure](removal-by-hand.md) supplies a separate process check.
+Record its result before you remove the worktree.
+
 `config/copies.conf` permits both original-worktree helpers.
 The helper creates the Git worktree and records it under `~/.local/state/worktrees/made/<path hash>.json`.
 The path hash uses SHA-256.

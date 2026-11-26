@@ -9,17 +9,26 @@ import argparse
 import fcntl
 import json
 import sys
+import time
+from collections.abc import Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import cast
 
 
+from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
+from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX
+from scripts.agents import worker_lifecycle
 from scripts.agents.stop_results import shutdown_state_root
 
 
 def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
                resolver: session_staff.RowResolver | None = None) -> tuple[str, Path]:
+    if isinstance(row.launch_folder, staff.SessionLaunchFolder):
+        return row.launch_folder.machine, row.launch_folder.path
     facts = session_staff.RowResolver(record) if resolver is None else resolver
     # A recorded worker folder remains valid for older stopped worker rows.
     tree = row.worktree if isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else facts.unit_worktree(row)
@@ -28,6 +37,13 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     if row.kind == "unit":
         raise ValueError(f"{row.name}: the staff worktree is unavailable")
     if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        if row.kind == "showrunner" and isinstance(row.doc, staff.LiveDoc):
+            document = facts.production_doc(row)
+            if isinstance(document, session_staff.ProductionDoc):
+                return document.machine, session_staff.enrolled_launch_directory(
+                    document.text.splitlines(), document.path.parent)
+            if row.doc.path.name.endswith(LIVE_DOCUMENT_SUFFIX):
+                raise ValueError(f"{row.name}: {document.reason}")
         return row.doc.machine, row.doc.path.parent
     if row.kind == "producer":
         from scripts.agents import remote
@@ -35,12 +51,56 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
         return remote.local_machine(), Path.home()
     document = facts.production_doc(row)
     if isinstance(document, session_staff.ProductionDoc):
-        return document.machine, document.path.parent
+        return document.machine, session_staff.enrolled_launch_directory(document.text.splitlines(), document.path.parent)
     raise ValueError(f"{row.name}: {document.reason}")
 
 
 def record_path() -> Path:
     return shutdown_state_root() / "restart.json"
+
+
+def _activity_path() -> Path:
+    return record_path().with_suffix(".active")
+
+
+_RECORD_LOCK_SECONDS: ContextVar[float | None] = ContextVar("_RECORD_LOCK_SECONDS", default=None)
+
+
+class RecordBusy(TimeoutError):
+    """The restart record lock did not become available before the deadline."""
+
+
+def record_lock_seconds() -> float:
+    key = "restart_record_lock_seconds"
+    config = conf.read_or_repository("shutdown")
+    if isinstance(config.settings, dict) and config.effective_key(key) not in config.settings:
+        config = conf.read(Path(__file__).resolve().parents[2] / "config" / "shutdown.conf")
+    return config.number(key)
+
+
+@contextmanager
+def active_operation(*, record_lock_seconds: float | None = None) -> Generator[None]:
+    path = _activity_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        token = _RECORD_LOCK_SECONDS.set(record_lock_seconds)
+        try:
+            yield
+        finally:
+            _RECORD_LOCK_SECONDS.reset(token)
+
+
+def active() -> bool:
+    try:
+        with _activity_path().open("r") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+    except FileNotFoundError:
+        pass
+    return False
 
 
 def read() -> list[str]:
@@ -97,7 +157,16 @@ def update(*, started: list[str], pending: list[str]) -> None:
     path = record_path().with_suffix(".lock")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        wait = _RECORD_LOCK_SECONDS.get()
+        if wait is None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        else:
+            try:
+                worker_lifecycle.acquire_flock(lock, deadline=time.monotonic() + wait)
+            except worker_lifecycle.OperationDeadlineExpired as error:
+                action = (f"remove {', '.join(started)} from" if started else
+                          f"save {', '.join(pending)} to" if pending else "update")
+                raise RecordBusy(f"could not {action} the restart record: the record is busy") from error
         save([row for row in read() if row not in started] + pending)
 
 

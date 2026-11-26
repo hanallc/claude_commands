@@ -6,17 +6,21 @@ from __future__ import annotations
 import json
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from collections.abc import Callable
 from contextlib import redirect_stderr
-from typing import override
+from typing import override, cast
 from unittest import mock
 
 from scripts.direct import remove_run_scratch, workers
 from scripts.lib import scratch
+from scripts.lib.build_copies_test_support import private_copy_config
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
@@ -26,17 +30,24 @@ SCRIPT = Path(__file__).parent / "remove_run_scratch.py"
 
 class RemoveRunScratchTests(unittest.TestCase):
     owner_id: str = ""
+    fixture_root: Path = Path()
 
     @override
     def setUp(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="run-scratch-fixture-"))).resolve()
+        self.fixture_root = root / "fixture"
+        self.fixture_root.mkdir()
         self.enterContext(isolated_staff_file(root / "staff.json", {}))
+        environment = {**fixture_git_environment(root), **private_copy_config(root).environment}
+        _ = environment.pop("STAFF_CONFIG", None)
+        environment["HOME"] = str(root / "home")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
         owner = fixture_member("showrunner", name="demo")
         self.owner_id = fixture_member("unit", name="builders", parent=owner.id).id
 
     def make_run(self) -> tuple[Path, Path]:
         """A run folder with copies at several depths, and a folder outside it."""
-        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        root = self.fixture_root
         run = root / "run"
         (run / "verify_cache").mkdir(parents=True)
         _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": self.owner_id}))
@@ -67,62 +78,61 @@ class RemoveRunScratchTests(unittest.TestCase):
         (run / "scratch" / "linked").symlink_to(outside)
         return run, outside
 
-    def test_tracked_cleanup_reports_retained_folders(self) -> None:
+    def test_tracked_cleanup_preserves_the_working_directory(self) -> None:
         run, outside = self.make_run()
-        result = scratch.TaskCleanup()
-        result.kept.append(scratch.KeptFolder(outside, scratch.BUSY_REASON))
-        error = io.StringIO()
-        with (mock.patch.object(scratch, "end", return_value=result),
-              mock.patch.object(workers, "protected_working_directories", return_value=[]), redirect_stderr(error)):
-            self.assertEqual(remove_run_scratch.end_tracked_scratch(run), 0)
-        self.assertIn(f"kept {outside}: {scratch.BUSY_REASON}", error.getvalue())
+        kept = [scratch.KeptFolder(outside, "selected by the keep rule")]
+        with (mock.patch.object(scratch, "end", return_value=kept) as end,
+              mock.patch.object(workers, "protected_working_directories", return_value=[outside])):
+            self.assertEqual(remove_run_scratch.end_tracked_scratch(run), kept)
+        end.assert_called_once_with(f"run:{run.name}", keep=mock.ANY)
+        keep = cast(Callable[[Path], bool], end.call_args.kwargs["keep"])
+        self.assertTrue(keep(outside))
+        self.assertFalse(keep(run))
 
-    def test_a_bad_cargo_removal_mark_does_not_stop_other_folder_removals(self) -> None:
+    def test_run_reports_folders_and_keeps_an_unreadable_cargo_record(self) -> None:
         run, _ = self.make_run()
         checkout = run / "phases" / "p4" / "gate"
         mark = scratch.cargo_removal_mark(checkout)
         _ = mark.write_text("{broken")
         with (mock.patch.object(workers, "protected_working_directories", return_value=()),
-              mock.patch.object(sys, "argv", [str(SCRIPT), str(run)])):
-            self.assertEqual(remove_run_scratch.main(), 1)
-        self.assertTrue(checkout.exists())
+              mock.patch.object(sys, "argv", [str(SCRIPT), str(run)]),
+              mock.patch.object(scratch, "remove_folder") as remove,
+              redirect_stderr(io.StringIO()) as report):
+            self.assertEqual(remove_run_scratch.main(), 0)
+        remove.assert_not_called()
         self.assertEqual(mark.read_text(), "{broken")
-        self.assertFalse((run / "scratch" / "export").exists())
-        self.assertFalse((run / "p26_before").exists())
-        self.assertFalse((run / "verify_cache").exists())
+        for folder in (checkout, run / "scratch/export", run / "p26_before", run / "verify_cache"):
+            self.assertTrue(folder.is_dir())
+            self.assertIn(f"kept for a manual removal list: {folder} (", report.getvalue())
 
-    def test_run_checkout_cleanup_uses_the_saved_cargo_output_guard(self) -> None:
-        run, _ = self.make_run()
-        checkout = run / "phases" / "p4" / "gate"
-        events: list[str] = []
-        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
-            self.assertEqual(path, checkout)
-            self.assertEqual(saved, ())
-            self.assertTrue((path / ".git").exists())
-            events.append("guard")
-        with mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean):
-            remove_run_scratch.remove(checkout)
-        self.assertEqual(events, ["guard"])
-        self.assertFalse(checkout.exists())
-
-    def test_run_cleanup_finishes_both_marks_after_the_source_disappears(self) -> None:
+    def test_run_keeps_removal_records_after_the_source_disappears(self) -> None:
         run, _ = self.make_run()
         checkout = run / "phases/p4/gate"
         task_mark = scratch.removal_mark(checkout)
         cargo_mark = scratch.cargo_removal_mark(checkout)
         scratch.atomic_record(cargo_mark, [])
-        with mock.patch.object(scratch, "finish_removal", side_effect=OSError("stopped before completion")):
-            with self.assertRaisesRegex(OSError, "stopped before completion"):
-                remove_run_scratch.remove(checkout)
+        scratch.atomic_record(task_mark, {"task": "gate:fixture"})
+        shutil.rmtree(checkout)
         self.assertFalse(checkout.exists())
         self.assertTrue(task_mark.is_file())
         self.assertTrue(cargo_mark.is_file())
-        self.assertIn(checkout, remove_run_scratch.scratch_folders(run))
+        self.assertNotIn(checkout, remove_run_scratch.scratch_folders(run))
         with (mock.patch.object(workers, "protected_working_directories", return_value=()),
               mock.patch.object(sys, "argv", [str(SCRIPT), str(run)])):
             self.assertEqual(remove_run_scratch.main(), 0)
-        self.assertFalse(task_mark.exists())
-        self.assertFalse(cargo_mark.exists())
+        self.assertTrue(task_mark.is_file())
+        self.assertTrue(cargo_mark.is_file())
+
+    def test_run_omits_a_folder_that_disappeared_after_the_scan(self) -> None:
+        run, _ = self.make_run()
+        missing = run / "missing"
+        retained = run / "verify_cache"
+        with (mock.patch.object(remove_run_scratch, "scratch_folders", return_value=[missing, retained]),
+              mock.patch.object(sys, "argv", [str(SCRIPT), str(run)]),
+              redirect_stderr(io.StringIO()) as report):
+            self.assertEqual(remove_run_scratch.main(), 0)
+        self.assertNotIn(str(missing), report.getvalue())
+        self.assertIn(str(retained), report.getvalue())
 
     def test_cleanup_keeps_the_checkout_holding_a_paused_workers_live_command(self) -> None:
         run, _ = self.make_run()
@@ -147,15 +157,17 @@ class RemoveRunScratchTests(unittest.TestCase):
                                     text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(command_cwd.is_dir(), result.stdout)
-            self.assertFalse((run / "scratch" / "export").exists())
+            self.assertTrue((run / "scratch" / "export").is_dir())
+            self.assertNotIn(f"kept for a manual removal list: {checkout} (", result.stderr)
             self.assertTrue(record.exists())
             _ = record.write_text(json.dumps({"status": "finished", "pid": os.getpid(), "worker": "w7", "staff_id": member.id}))
             result = subprocess.run([sys.executable, str(SCRIPT), str(run)], capture_output=True,
                                     text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(checkout.exists())
+            self.assertTrue(checkout.is_dir())
+            self.assertIn(f"kept for a manual removal list: {checkout} (", result.stderr)
 
-    def test_old_gate_copies_beside_a_protected_branch_are_still_removed(self) -> None:
+    def test_run_reports_old_folders_beside_a_protected_branch(self) -> None:
         run, _ = self.make_run()
         protected = run / "phases" / "p5" / "gate"
         (protected / ".git").mkdir(parents=True)
@@ -165,14 +177,17 @@ class RemoveRunScratchTests(unittest.TestCase):
         old_target.mkdir(parents=True)
         _ = (old_target / ".rustc_info.json").write_text("{}")
         with (mock.patch.object(workers, "protected_working_directories", return_value=(cwd,)),
-              mock.patch.object(sys, "argv", [str(SCRIPT), str(run)])):
+              mock.patch.object(sys, "argv", [str(SCRIPT), str(run)]),
+              redirect_stderr(io.StringIO()) as report):
             self.assertEqual(remove_run_scratch.main(), 0)
         self.assertTrue(cwd.is_dir())
-        self.assertFalse((run / "phases" / "p4" / "gate").exists())
-        self.assertFalse(old_target.exists())
+        self.assertTrue((run / "phases" / "p4" / "gate").is_dir())
+        self.assertTrue(old_target.is_dir())
+        self.assertNotIn(f"kept for a manual removal list: {protected} (", report.getvalue())
+        self.assertIn(f"kept for a manual removal list: {old_target} (", report.getvalue())
         self.assertTrue((run / "phases" / "p4" / "review.diff").is_file())
 
-    def test_checkouts_and_targets_go_at_any_depth_and_the_rest_stays(self) -> None:
+    def test_run_reports_checkouts_targets_and_verify_cache(self) -> None:
         run, outside = self.make_run()
         found = remove_run_scratch.scratch_folders(run)
         self.assertEqual(
@@ -181,12 +196,15 @@ class RemoveRunScratchTests(unittest.TestCase):
                     run / "p26_before"]),
         )
 
-        result = subprocess.run([sys.executable, str(SCRIPT), str(run)], check=False, capture_output=True, text=True)
+        result = subprocess.run([sys.executable, str(SCRIPT), str(run)], check=False, capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"removed 4 scratch folders from {run}", result.stdout)
-        for gone in found:
-            self.assertFalse(gone.exists(), gone)
+        self.assertCountEqual(result.stderr.splitlines(),
+                              [f"kept for a manual removal list: {folder} (remove_run_scratch, the run ended)"
+                               for folder in found])
+        for folder in found:
+            self.assertTrue(folder.is_dir())
         for kept in ("workers", "heartbeat.log", "board.json", "phases/p4/review.diff"):
             self.assertTrue((run / kept).is_file(), kept)
         self.assertTrue((run / "scratch" / "linked").is_symlink())
@@ -212,7 +230,7 @@ class RemoveRunScratchTests(unittest.TestCase):
 
     def worktree_run(self) -> tuple[Path, Path, Path]:
         """A source repo, and a run folder holding a linked worktree of its branch copy."""
-        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        root = self.fixture_root
         source, run = root / "source", root / "run"
         def git(*arguments: str) -> None:
             _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
@@ -231,17 +249,14 @@ class RemoveRunScratchTests(unittest.TestCase):
                                  check=True, capture_output=True, text=True).stdout
         return [line.removeprefix("worktree ") for line in listing.splitlines() if line.startswith("worktree ")]
 
-    def test_a_worktree_copy_leaves_no_entry_in_its_source_repo(self) -> None:
-        # A stale entry keeps the branch "already checked out", so the next worktree add of it refuses.
+    def test_run_keeps_the_worktree_and_its_source_entry(self) -> None:
         source, run, gate = self.worktree_run()
 
         result = subprocess.run([sys.executable, str(SCRIPT), str(run)], check=False, capture_output=True, text=True)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(gate.exists())
-        self.assertEqual(self.worktrees(source), [str(source)])
-        _ = subprocess.run(["git", "-C", str(source), "worktree", "add", "-q", str(gate), "copy"],
-                           check=True, capture_output=True)
+        self.assertTrue(gate.is_dir())
+        self.assertCountEqual(self.worktrees(source), [str(source), str(gate)])
 
     def test_a_worktree_the_source_cannot_remove_is_deleted_and_the_source_pruned(self) -> None:
         source, _, gate = self.worktree_run()
@@ -250,13 +265,13 @@ class RemoveRunScratchTests(unittest.TestCase):
             return False if arguments[0] == "remove" else real(common, *arguments)
 
         with mock.patch.object(remove_run_scratch, "git", side_effect=refuse_remove) as git:
-            remove_run_scratch.remove(gate)
+            scratch.remove_marked(gate, source_deletion=scratch.SourceDeletion.RUN)
 
         self.assertEqual([call.args[1] for call in git.call_args_list], ["remove", "prune"])
         self.assertFalse(gate.exists())
         self.assertEqual(self.worktrees(source), [str(source)])
 
-    def test_a_worktree_with_linked_commondir_keeps_its_staged_deletion(self) -> None:
+    def test_run_keeps_a_worktree_with_staged_changes(self) -> None:
         source, run, gate = self.worktree_run()
 
         def git(*arguments: str) -> str:
@@ -274,20 +289,21 @@ class RemoveRunScratchTests(unittest.TestCase):
 
         result = subprocess.run([sys.executable, str(SCRIPT), str(run)], check=False, capture_output=True, text=True)
 
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(f"{gate}: it has uncommitted changes", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"kept for a manual removal list: {gate} (", result.stderr)
         self.assertTrue(gate.is_dir())
         self.assertEqual(git("status", "--porcelain"), "D  tracked\n")
 
-    def test_a_worktree_whose_source_is_gone_is_still_deleted(self) -> None:
+    def test_run_keeps_a_worktree_after_its_source_disappears(self) -> None:
         source, run, gate = self.worktree_run()
-        _ = subprocess.run(["rm", "-rf", str(source)], check=True)
+        shutil.rmtree(source)
         self.assertIsNone(remove_run_scratch.worktree_source(gate))
 
         result = subprocess.run([sys.executable, str(SCRIPT), str(run)], check=False, capture_output=True, text=True)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(gate.exists())
+        self.assertTrue(gate.is_dir())
+        self.assertIn(f"kept for a manual removal list: {gate} (", result.stderr)
 
 
 if __name__ == "__main__":

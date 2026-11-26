@@ -25,6 +25,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 
+from scripts.agents import remote
 from scripts.production import fake_unit_host
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import showrunners, staff_sources
@@ -213,7 +214,7 @@ raise SystemExit(1)
         doc = self.root / f"{production_name}-production.md"
         row = fixture_member("showrunner", name=production_name)
         self.instance(f"showrunner-{production_name}", target=f"session:{row.id}", doc=doc)
-        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(row.id, staff.LiveDoc(remote.local_machine(), doc))
         if running:
             pid = self.record(name or production_name, row.id)
             path = self.sessions / f"{pid}.json"
@@ -488,7 +489,9 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
 
     def test_failed_lookup_keeps_healthy_rows_and_reserves_inspection_budget(self) -> None:
         self.instance("showrunner-a-stalled", target="session:stalled-id", doc=self.doc)
-        self.instance("showrunner-b-healthy", target="session:healthy-id", doc=self.doc)
+        healthy_doc = self.root / "healthy-production.md"
+        _ = healthy_doc.write_text("# Healthy production\n")
+        self.instance("showrunner-b-healthy", target="session:healthy-id", doc=healthy_doc)
         for failure in (TimeoutError, OSError):
             clock = [100.0]
             errors = io.StringIO()
@@ -800,11 +803,20 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
     def test_settings_read_exact_staff_recipient_ids(self) -> None:
         row = fixture_member("showrunner", name="director")
         _ = self.config.write_text("# range: 0..100\nthreshold_percent=2\n"
-                                   + "# range: 0..\nrepeat_minutes=30\n# range: 0..\nstall_minutes=5\n"
+                                   + "# range: 0..\nstall_minutes=5\n"
                                    + f"faults_to={row.id}\nalways={row.id}\n")
         settings = showrunners.load_settings_from(self.config)
         self.assertEqual(settings["always"], [str(row.id)])
         self.assertEqual(settings["faults_to"], str(row.id))
+
+    def test_settings_ignore_the_removed_repeat_interval(self) -> None:
+        settings = ("# range: 0..100\nthreshold_percent=2\n"
+                    + "# range: 0..\nstall_minutes=5\nfaults_to=fixture\nalways=\n")
+        expected = showrunners.ShowrunnerSettings(threshold_percent=2, stall_minutes=5, faults_to="fixture", always=[])
+        for extra in ("", "# range: 0..\nrepeat_minutes=30\n", "# range: 0..\nrepeat_minutes=invalid\n"):
+            with self.subTest(extra=extra):
+                _ = self.config.write_text(settings + extra)
+                self.assertEqual(showrunners.load_settings_from(self.config), expected)
 
     def test_an_absent_or_invalid_settings_file_names_the_file(self) -> None:
         for contents in (None, "invalid configuration", "always=wrong"):

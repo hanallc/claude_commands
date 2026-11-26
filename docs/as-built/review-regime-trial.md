@@ -22,7 +22,7 @@ Review records and closure replies do not change the counts.
 | --- | --- |
 | UX findings | Ledger entries whose lens names `ux`. |
 | Code findings | Ledger entries with no lens or any lens other than `ux`. |
-| Review-worker minutes | Finished review passes and UX review activities. |
+| Review-worker minutes | Finished review passes, `UX review` activities and `Subagent review` activities. |
 | UX check minutes | Finished `UX review` activities. |
 | UX repair minutes | Finished fix passes joined to ledger rounds that cover a UX finding. |
 
@@ -44,7 +44,7 @@ The regime is `before`, `trial`, or `after`.
 `add` requires times with UTC offsets and refuses a merge time before the start time.
 `add` requires `--checkpoint` and resolves it to a full commit hash in the current repository.
 It keeps an existing row only when the unit, plan, phase and checkpoint match.
-Reports and the watch still count eligible older rows that have no checkpoint.
+Reports count eligible older rows that have no checkpoint.
 
 `report [--since <ISO date>]` excludes rows with an `excluded` reason.
 It reports means for findings, holds, defects, and review times.
@@ -60,8 +60,7 @@ Missing metric fields do not mean zero.
 Older code counts can describe review records or opening events; current counts use the phase instance's ledger file.
 Compare records with the same count definition.
 
-`watch` waits for 12 eligible `after` phases, then returns 3 until `ack` records the user's acknowledgment.
-An acknowledged watch returns 0.
+The 2026-11-24 change removed the review watch and its push.
 
 ## Why
 

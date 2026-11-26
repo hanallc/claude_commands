@@ -2,28 +2,33 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from io import StringIO
 import fcntl
 import json
 import shutil
 import os
+from pathlib import Path
 import subprocess
 import sys
 from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
+from scripts.aws_target import plan_identity, quota_requests
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, text_setting
+from scripts.buildlog import aws_report
+from scripts.for_you import action
 from scripts.lib import atomic_file, conf
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.message import send_budget
 from scripts.notify import push_texts
 from scripts.review_links import console_theme, review_link
 
@@ -31,7 +36,7 @@ from scripts.review_links import console_theme, review_link
 def table_texts(tables: spot_table.SpotTables) -> tuple[str, ...]:
     """Every snapshot line, then every title, header and cell of the tables, for text checks."""
     every = (*tables.prices, *tables.quotas, *(table for costs in tables.runs
-             for table in (*costs.tables, costs.gate_prices, costs.refused, costs.launched)), tables.hours)
+             for table in (*costs.tables, costs.gate_prices, costs.refused, costs.launched)))
     return (*(text for _region, text in tables.snapshot_rows),
             *(text for table in every for text in (table.title, *table.headers, *(cell for row in table.rows for cell in row))))
 
@@ -63,13 +68,15 @@ class ControlTests(CostFixture):
         self.notice_accepted = True
         self.failure_reason = 'AccessDenied: account 123456789012'
         self.omitted = ''
+        _ = (self.root / 'build_steps.conf').write_text('names.gate=gate\n')
         values_path = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(values_path, """spot_candidate_regions=us-east-1 us-west-1 us-east-1
+        self.configure_gate("""spot_candidate_regions=us-east-1 us-west-1 us-east-1
 instance_types=c7a.4xlarge m7a.2xlarge
 price_compare_instance_types=m7a.8xlarge c7a.4xlarge
 gpu_instance_types=g6.2xlarge g4dn.xlarge
 hana_gpu_instance_types=g6.2xlarge g4dn.2xlarge
 gate_wait_usd_per_minute=0
+region_transfer_usd={"us-west-1":0.00015}
 """)
         values = conf.read(values_path)
         self.regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
@@ -84,6 +91,8 @@ gate_wait_usd_per_minute=0
             'AWS_PROFILE': 'fixture-admin', 'AWS_DEFAULT_PROFILE': 'fixture-admin',
             'AWS_SHARED_CREDENTIALS_FILE': str(self.root / 'private-scaler'),
         }))
+        _ = self.enterContext(mock.patch.object(plan_identity, 'plan_credentials',
+                                                side_effect=plan_identity.PlanIdentityRefused('The AWS plan key is missing.')))
 
     def execute(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                 timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -135,6 +144,200 @@ gate_wait_usd_per_minute=0
 
     def snapshot(self) -> int:
         return aws_target.snapshot(self.settings, self.state, execute=self.execute, clock=self.clock, notify=self.notify)
+
+    def deploy_gate_zones(self) -> None:
+        _ = (self.state / 'gate-deployment.json').write_text(json.dumps({'regions': [
+            {'region': region, 'subnets': [{'id': 'subnet-' + region, 'zone': region + 'a'}]} for region in self.regions
+        ]}))
+
+    def test_snapshot_saves_each_quota_request_history_with_the_plan_identity(self) -> None:
+        calls: list[tuple[str, str]] = []
+        credential = mock.Mock(spec=plan_identity.PlanCredentials, environment=mock.Mock(
+            return_value={'AWS_FIXTURE_IDENTITY': 'plan'}))
+        expected_timeout = conf.read(self.settings).number('aws_timeout_s')
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                    check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if 'list-requested-service-quota-change-history-by-quota' not in arguments:
+                return self.execute(arguments, capture_output=capture_output, text=text, timeout=timeout,
+                                    check=check, env=env)
+            self.assertEqual(env, {'AWS_FIXTURE_IDENTITY': 'plan'})
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, expected_timeout)
+            self.assertNotIn('--profile', arguments)
+            self.assertNotIn('--no-paginate', arguments)
+            region = arguments[arguments.index('--region') + 1]
+            code = arguments[arguments.index('--quota-code') + 1]
+            calls.append((region, code))
+            if code == 'L-34B43A08' and region == self.regions[0]:
+                history = [{'Status': 'APPROVED', 'DesiredValue': 16, 'Created': '2026-01-01T03:00:00Z',
+                            'LastUpdated': '2026-01-04T05:00:00Z'},
+                           {'Status': 'CASE_OPENED', 'DesiredValue': 32, 'Created': '2026-01-02T03:00:00Z',
+                            'LastUpdated': '2026-01-03T04:00:00Z'}]
+            elif code == 'L-34B43A08':
+                history = [{'Status': 'arn:aws:iam::123456789012:user/private', 'DesiredValue': 64,
+                            'LastUpdated': '2026-01-03T05:00:00+01:00'}]
+            elif region == self.regions[0]:
+                history = []
+            else:
+                return subprocess.CompletedProcess(arguments, 1, '',
+                    'An error occurred (AccessDeniedException) when calling the '
+                    + 'ListRequestedServiceQuotaChangeHistoryByQuota operation: Private error detail')
+            return subprocess.CompletedProcess(arguments, 0, json.dumps({'RequestedQuotas': history}), '')
+
+        with mock.patch.object(plan_identity, 'plan_credentials', return_value=credential) as load:
+            status = aws_target.snapshot(self.settings, self.state, execute=execute, clock=self.clock,
+                                         notify=self.notify)
+        load.assert_called_once_with()
+        self.assertCountEqual(calls, [(region, code) for region in self.regions for code in ('L-34B43A08', 'L-3819A6DF')])
+        document = aws_target.read_snapshot(self.state)
+        histories = ledger.rows(document, 'quota_requests')
+        standard = {'state': 'requested', 'status': 'CASE_OPENED', 'requested_vcpus': '32',
+                    'created_at': '2026-01-02T03:00:00+00:00', 'updated_at': '2026-01-03T04:00:00+00:00'}
+        self.assertEqual(histories, (
+            {'region': self.regions[0], 'standard': standard, 'gpu': {'state': 'no_request'}},
+            {'region': self.regions[1], 'standard': {'state': 'requested', 'status': 'unknown',
+                'requested_vcpus': '64', 'updated_at': '2026-01-03T04:00:00+00:00'},
+             'gpu': {'state': 'read_failed', 'reason': 'AccessDeniedException'}},
+        ))
+        self.assertEqual(status, 0)
+        self.assertEqual(len(ledger.read_spot_prices(self.state)), len(self.regions) * len(self.sizes) * 2)
+        self.assertEqual(len(ledger.rows(document, 'regions')), len(self.regions))
+        self.assertEqual(aws_target.snapshot_failures(document), ())
+        self.assertEqual(self.notices, [])
+        first, second = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).quota_requests
+        self.assertEqual(first.standard, quota_requests.QuotaRequest(quota_requests.QuotaRequestStatus.CASE_OPENED,
+            Decimal(32), datetime(2026, 1, 2, 3, tzinfo=UTC), datetime(2026, 1, 3, 4, tzinfo=UTC)))
+        self.assertEqual(first.gpu, quota_requests.NoQuotaRequest())
+        self.assertEqual(second.standard, quota_requests.QuotaRequest(quota_requests.QuotaRequestStatus.UNKNOWN,
+            Decimal(64), quota_requests.QuotaRequestTimeUnavailable(), datetime(2026, 1, 3, 4, tzinfo=UTC)))
+        self.assertEqual(second.gpu, quota_requests.QuotaRequestReadFailed('AccessDeniedException'))
+
+    def test_snapshot_publishes_prices_when_a_history_worker_cannot_start(self) -> None:
+        credential = mock.Mock(spec=plan_identity.PlanCredentials)
+        with (mock.patch.object(plan_identity, 'plan_credentials', return_value=credential),
+              mock.patch.object(ThreadPoolExecutor, '_adjust_thread_count',
+                                side_effect=RuntimeError('Private thread startup detail'))):
+            self.assertEqual(self.snapshot(), 0)
+        document = aws_target.read_snapshot(self.state)
+        self.assertEqual(len(ledger.rows(document, 'regions')), len(self.regions))
+        self.assertEqual(len(ledger.rows(document, 'prices')), len(self.regions) * len(self.sizes) * 2)
+        self.assertEqual(ledger.rows(document, 'quota_requests'), tuple(
+            {'region': region, 'standard': {'state': 'read_failed', 'reason': 'QuotaHistoryUnavailable'},
+             'gpu': {'state': 'read_failed', 'reason': 'QuotaHistoryUnavailable'}} for region in self.regions))
+
+    def test_snapshot_validates_quota_request_values_before_publication(self) -> None:
+        credential = mock.Mock(spec=plan_identity.PlanCredentials, environment=mock.Mock(return_value={}))
+        rejected = {'state': 'read_failed', 'reason': 'QuotaHistoryUnavailable'}
+        requested = {'state': 'requested', 'status': 'PENDING', 'requested_vcpus': '128'}
+        rows: tuple[tuple[str, object, dict[str, str]], ...] = (
+            ('DesiredValue', '000000000128', rejected),
+            ('DesiredValue', True, rejected),
+            ('DesiredValue', 128.5, rejected),
+            ('DesiredValue', 0, rejected),
+            ('DesiredValue', -1, rejected),
+            ('DesiredValue', 10_000_000_001, rejected),
+            ('DesiredValue', 10_000_000_000, {**requested, 'requested_vcpus': '10000000000'}),
+            ('DesiredValue', 128.0, requested),
+            ('Created', '000000000128', rejected),
+            ('LastUpdated', '000000000128', rejected),
+        )
+        for field, value, expected in rows:
+            with self.subTest(field=field, value=value):
+                def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                            check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    if 'list-requested-service-quota-change-history-by-quota' not in arguments:
+                        return self.execute(arguments, capture_output=capture_output, text=text,
+                                            timeout=timeout, check=check, env=env)
+                    history = [{'Status': 'PENDING', 'DesiredValue': 128, field: value}]
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps({'RequestedQuotas': history}), '')
+
+                self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+                with mock.patch.object(plan_identity, 'plan_credentials', return_value=credential):
+                    self.assertEqual(aws_target.snapshot(self.settings, self.state, execute=execute,
+                                                         clock=self.clock, notify=self.notify), 0)
+                document = aws_target.read_snapshot(self.state)
+                self.assertEqual(ledger.rows(document, 'quota_requests'), tuple(
+                    {'region': region, 'standard': expected, 'gpu': expected} for region in self.regions))
+
+    def test_snapshot_does_not_retry_prices_for_history_errors(self) -> None:
+        credential = mock.Mock(spec=plan_identity.PlanCredentials, environment=mock.Mock(return_value={}))
+        failures = (
+            subprocess.TimeoutExpired('private command detail', 1),
+            RuntimeError('Private executor detail'),
+            'An error occurred (PrivateAccount123456789012) when calling the '
+            + 'ListRequestedServiceQuotaChangeHistoryByQuota operation: Private error detail',
+        )
+        for failure in failures:
+            with self.subTest(failure=failure):
+                def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                            check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    if 'list-requested-service-quota-change-history-by-quota' not in arguments:
+                        return self.execute(arguments, capture_output=capture_output, text=text,
+                                            timeout=timeout, check=check, env=env)
+                    if isinstance(failure, str):
+                        return subprocess.CompletedProcess(arguments, 1, '', failure)
+                    raise failure
+
+                self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+                with mock.patch.object(plan_identity, 'plan_credentials', return_value=credential):
+                    self.assertEqual(aws_target.snapshot(self.settings, self.state, execute=execute,
+                                                         clock=self.clock, notify=self.notify), 0)
+                document = aws_target.read_snapshot(self.state)
+                self.assertEqual(len(ledger.rows(document, 'regions')), len(self.regions))
+                self.assertTrue(all(row.read_at == self.clock.now for row in ledger.read_spot_prices(self.state)))
+                self.assertEqual(aws_target.snapshot_failures(document), ())
+                self.assertEqual(ledger.rows(document, 'quota_requests'), tuple(
+                    {'region': region, 'standard': {'state': 'read_failed', 'reason': 'QuotaHistoryUnavailable'},
+                     'gpu': {'state': 'read_failed', 'reason': 'QuotaHistoryUnavailable'}} for region in self.regions))
+
+    def test_snapshot_history_shares_one_deadline_across_quota_calls(self) -> None:
+        credential = mock.Mock(spec=plan_identity.PlanCredentials, environment=mock.Mock(return_value={}))
+        clock = TestClock()
+        timeout_seen: list[float] = []
+
+        def execute(arguments: Sequence[str], *, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+            timeout_seen.append(timeout)
+            clock.advance(1 if len(timeout_seen) == 1 else 9)
+            return subprocess.CompletedProcess(arguments, 0, '{"RequestedQuotas": []}', '')
+
+        with (mock.patch.object(plan_identity, 'plan_credentials', return_value=credential),
+              mock.patch.object(aws_target, 'monotonic', clock),
+              mock.patch.object(aws_target, 'ThreadPoolExecutor', return_value=ThreadPoolExecutor(max_workers=1))):
+            first, second = aws_target.read_snapshot_quota_requests(self.regions, 10, execute)
+        self.assertEqual(timeout_seen, [10, 9])
+        self.assertEqual(first.standard, quota_requests.NoQuotaRequest())
+        missing = quota_requests.QuotaRequestsNotMeasured('The quota request history deadline expired.')
+        self.assertEqual(first.gpu, missing)
+        self.assertEqual(second, quota_requests.RegionalQuotaRequests(self.regions[1], missing, missing))
+
+    def test_snapshot_keeps_prices_when_the_plan_identity_cannot_load(self) -> None:
+        for error in (plan_identity.PlanAgentCold('The AWS plan key is locked.'),
+                      plan_identity.PlanIdentityRefused('The AWS plan key is missing.')):
+            with self.subTest(error=error), mock.patch.object(plan_identity, 'plan_credentials', side_effect=error) as load:
+                self.calls.clear()
+                self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+                self.assertEqual(self.snapshot(), 0)
+                load.assert_called_once_with()
+                self.assertEqual(len(self.calls), len(self.regions) * 3)
+                self.assertEqual(len(ledger.read_spot_prices(self.state)), len(self.regions) * len(self.sizes) * 2)
+                document = aws_target.read_snapshot(self.state)
+                self.assertEqual(len(ledger.rows(document, 'regions')), len(self.regions))
+                missing = quota_requests.QuotaRequestsNotMeasured(str(error))
+                self.assertEqual(spot_table.spot_tables(self.state, int(self.clock.now),
+                    settings_path=self.settings).quota_requests, tuple(
+                        quota_requests.RegionalQuotaRequests(region, missing, missing) for region in self.regions))
+
+    def test_spot_table_marks_legacy_snapshots_as_not_measured(self) -> None:
+        self.assertEqual(self.snapshot(), 0)
+        document = aws_target.read_snapshot(self.state)
+        del document['quota_requests']
+        _ = (self.state / 'spot-prices.json').write_text(json.dumps(document))
+        tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
+        missing = quota_requests.QuotaRequestsNotMeasured('The snapshot has no quota request history for this region.')
+        self.assertEqual(tables.quota_requests, tuple(
+            quota_requests.RegionalQuotaRequests(region, missing, missing) for region in self.regions))
+        self.assertEqual(tables.quotas[0].rows[0][1], f'{self.quota} vCPUs')
 
     def test_snapshot_writes_prices_and_quotas_with_one_atomic_write_and_limits_repeats(self) -> None:
         self.assertFalse((self.state / 'gate-deployment.json').exists())
@@ -340,39 +543,76 @@ gate_wait_usd_per_minute=0
 
     def test_table_ranks_cost_per_run_with_region_times_and_marks_other_region_times(self) -> None:
         self.assertEqual(self.snapshot(), 0)
+        self.deploy_gate_zones()
         fast, slow = self.standard
         home, other = self.regions
         events: list[dict[str, object]] = []
         for attempt, size, region, box_s in (('fast', fast, home, 360), ('slow', slow, home, 720)):
-            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'merge-gate', 'region': region}
+            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'gate', 'region': region}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
                            {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
-        events.append({'attempt': 'fast', 'instance_type': fast, 'mode': 'merge-gate', 'region': home, 'result': 'refused',
+        events.append({'attempt': 'fast', 'instance_type': fast, 'mode': 'gate', 'region': home, 'result': 'refused',
                        'time': self.clock.now - 3600 - 400, 'error_code': 'InsufficientInstanceCapacity'})
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
         merge_gates = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).runs[0]
         tables = {table.title: table for table in merge_gates.tables}
 
-        # The fixture lowest zone price is 0.25 USD/h, so 6 minutes cost 0.0250 and 12 minutes 0.0500.
+        # At 0.25 USD/h, 6 minutes cost 0.0250 USD and 12 minutes cost 0.0500 USD.
+        # The other region adds the configured transfer charge of 0.00015 USD before rounding.
         # One refused request came before one launch of the fast type at home; the other region has no requests.
         # No bill covers the runs yet; the other region has no runs of its own.
         self.assertEqual(tables[fast].rows, (
             (home, '0.2500', '6.0', '1', '0.0250', 'bill due', '1 bill due', '0'),
-            (other, '0.2500', '6.0', '1 elsewhere', '0.0250', 'no runs', 'no runs', '0')))
+            (other, '0.2500', '6.0', '1 elsewhere', '0.0252', 'no runs', 'no runs', '0')))
         self.assertEqual([row[:5] for row in tables[slow].rows], [(home, '0.2500', '12.0', '1', '0.0500'),
-                                                                 (other, '0.2500', '12.0', '1 elsewhere', '0.0500')])
+                                                                 (other, '0.2500', '12.0', '1 elsewhere', '0.0502')])
         for size in self.compare:
             self.assertEqual([row[2:] for row in tables[size].rows], [('—', '0', '—', 'no runs', 'no runs', '0')]
                              * len(self.regions))
         # Every column after the region holds a number.
         self.assertEqual(tables[fast].headers[-1], 'paid runs')
-        self.assertIn('merge gate (minutes)', tables[fast].headers)
+        self.assertIn('gate (minutes)', tables[fast].headers)
         self.assertEqual(tables[fast].right, frozenset(range(1, len(tables[fast].headers))))
         self.assertEqual(merge_gates.summary_of(merge_gates.cheapest),
-                         f'Cheapest merge gate: {fast} in {home}, 0.0250 USD (estimate)')
+                         f'Cheapest gate: {fast} in {home}, 0.0250 USD (estimate)')
         # Refused requests and launched boxes have their own tables: one row per type, one column per region.
         self.assertEqual(merge_gates.refused.rows[0], (fast, '1', '0'))
         self.assertEqual(merge_gates.launched.rows[0], (fast, '1', '0'))
+
+    def test_launch_history_readers_accept_missing_and_unreadable_gate_jobs(self) -> None:
+        self.assertEqual(self.snapshot(), 0)
+        now = int(self.clock.now)
+        end = datetime.fromtimestamp(now, UTC)
+        start = end - timedelta(hours=1)
+        region = self.regions[0]
+        size = self.standard[0]
+        attempt: dict[str, object] = {
+            'attempt': 'fixture', 'instance_type': size, 'mode': 'gate', 'region': region}
+        launched = {**attempt, 'result': 'launched', 'time': now - 600}
+        finished = {**attempt, 'result': 'finished', 'time': now - 240, 'gate_s': 300}
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(now - 900,
+            (ledger.PricedResource('fixture-fixed', Decimal(0)),), 'fixture'))
+        gate_job = {'kind': 'StepJob', 'step': 'test-all', 'unit': '', 'branch': '', 'modules': 0}
+        job_fields: tuple[dict[str, object], ...] = ({}, {'gate_job': gate_job},
+            {'gate_job': {'kind': 'GateJobNotRecorded'}}, {'gate_job': {'kind': 'FutureGateJob'}},
+            {'gate_job': {**gate_job, 'modules': []}})
+        for job_field in job_fields:
+            with self.subTest(job_field=job_field):
+                rows = ({**launched, **job_field}, {**finished, **job_field})
+                _ = book.launch_history_path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                self.assertEqual(book.launches(), rows)
+                self.assertEqual(ledger.recent_gate_launches(self.state, start.timestamp()), rows[::-1])
+                runs = run_cost.gate_runs(book, start, end, region).runs
+                self.assertEqual([(run.instance_type, run.box_s) for run in runs], [(size, Decimal(360))])
+                self.assertEqual(sum(day.runs for day in book.spend_days(aws_config.read_settings(self.settings), now)), 1)
+                report = aws_report.gate_type_report(self.state, end.date().isoformat(), 1)
+                self.assertTrue(any(line.startswith(f'| {size} |') for line in report.tables))
+                page = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
+                payload = page.read_text().split('<script id="aws-prices-data" type="application/json">', 1)[1]
+                data = cast(aws_page.PageData, json.loads(payload.split('</script>', 1)[0]))
+                table = next(table for table in data['runs'][0]['tables'] if table.get('title') == size)
+                self.assertEqual(table['rows'][0][:3], [region, '6.0', '1'])
 
     def test_paid_run_cell_counts_the_runs_whose_bill_is_still_due(self) -> None:
         self.assertEqual(self.snapshot(), 0)
@@ -384,7 +624,7 @@ gate_wait_usd_per_minute=0
         # The billed type runs yesterday and today; the other type runs only today. Only yesterday has a bill.
         for attempt, size, finished in (('old', billed_size, midnight - 3600), ('new', billed_size, midnight + 60),
                                         ('due', due_size, midnight + 60)):
-            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'merge-gate', 'region': home}
+            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'gate', 'region': home}
             events.extend(({**row, 'time': finished - 360, 'result': 'launched'},
                            {**row, 'time': finished, 'result': 'finished', 'gate_s': 300}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
@@ -401,22 +641,23 @@ gate_wait_usd_per_minute=0
 
     def test_each_scope_counts_only_its_run_kinds(self) -> None:
         self.assertEqual(self.snapshot(), 0)
+        self.deploy_gate_zones()
         size = self.standard[0]
         home = self.regions[0]
         events: list[dict[str, object]] = []
-        for attempt, mode, box_s in (('gate', 'merge-gate', 360), ('targeted', 'targeted-test', 120)):
+        for attempt, mode, box_s in (('gate', 'gate', 360), ('targeted', 'test-affected', 120)):
             row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': mode, 'region': home}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
                            {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
         refusal: dict[str, object] = {'instance_type': size, 'region': home, 'result': 'refused',
                                       'time': self.clock.now - 7200, 'error_code': 'InsufficientInstanceCapacity'}
-        events.extend(({**refusal, 'attempt': 'gate', 'mode': 'merge-gate'},
-                       *({**refusal, 'attempt': 'targeted', 'mode': 'targeted-test'} for _ in range(2)),
+        events.extend(({**refusal, 'attempt': 'gate', 'mode': 'gate'},
+                       *({**refusal, 'attempt': 'targeted', 'mode': 'test-affected'} for _ in range(2)),
                        # A request from before launch rows recorded a mode counts only when every kind counts.
                        {**refusal, 'attempt': 'old'}, {**refusal, 'attempt': 'old', 'result': 'launched'}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
-        self.assertEqual([costs.scope.name for costs in tables.runs], ['merge-gate', 'targeted-test', 'both'])
+        self.assertEqual([costs.scope.name for costs in tables.runs], ['gate', 'test-affected', 'both'])
         self.assertEqual([(costs.refused.rows[0][:2], costs.launched.rows[0][:2]) for costs in tables.runs],
                          [((size, count), (size, launched)) for count, launched in (('1', '1'), ('2', '1'), ('4', '3'))])
         end = datetime.fromtimestamp(self.clock.now, UTC)
@@ -438,7 +679,7 @@ gate_wait_usd_per_minute=0
         home = self.regions[0]
         events: list[dict[str, object]] = []
         for attempt, size, box_s in (('eight', 'c7a.8xlarge', 240), ('four', 'c7a.4xlarge', 420)):
-            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'merge-gate', 'region': home}
+            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'gate', 'region': home}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
                            {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
         end = datetime.fromtimestamp(self.clock.now, UTC)
@@ -449,7 +690,7 @@ gate_wait_usd_per_minute=0
                                             ('m7a.8xlarge', home, [240], same), ('m7a.4xlarge', home, [420], same),
                                             ('m7a.2xlarge', home, [], same), ('unknown', home, [], same)):
             with self.subTest(size=size, region=region):
-                self.assertEqual(evidence.box_seconds(size, region, ('merge-gate',)), ([Decimal(time) for time in times], source))
+                self.assertEqual(evidence.box_seconds(size, region, ('gate',)), ([Decimal(time) for time in times], source))
 
     def test_page_holds_the_tables_as_data_and_its_link_needs_the_page(self) -> None:
         self.assertEqual(self.snapshot(), 0)
@@ -473,7 +714,10 @@ gate_wait_usd_per_minute=0
         self.assertGreater(data["render_seconds"], 0)
         self.assertEqual(data, {**expected, "render_seconds": data["render_seconds"]})
         self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
-                         [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
+                         [('gate', 'Gates'), ('test-affected', 'Targeted runs'), ('both', 'Both')])
+        self.assertTrue(data['runs'][0]['explanation'].startswith('USD per gate, '))
+        self.assertEqual(data['runs'][0]['refused']['title'], 'Refused gate requests (capacity and quota)')
+        self.assertEqual(data['runs'][0]['launched']['title'], 'Launched gate boxes')
         self.assertEqual([table['right'] for table in data['prices']],
                          [list(range(1, len(types) + 1)) for types in ((*self.standard, *self.compare), self.gpu)])
         # The fixture lowest zone price is 0.25 USD/h for every type and region; the region column has no number.
@@ -484,6 +728,8 @@ gate_wait_usd_per_minute=0
             self.assertNotIn('title', table)
         # The Spot and Gate columns in Prices and quotas show these values.
         run_headers = data['runs'][0]['tables'][0]['headers']
+        self.assertEqual(data['runs'][0]['scope'], 'gate')
+        self.assertIn('gate (minutes)', run_headers)
         self.assertNotIn(spot_table.SPOT_HEADER, run_headers)
         self.assertNotIn(spot_table.ESTIMATE_HEADER, run_headers)
         self.assertEqual(data['runs'][0]['tables'][0]['right'], list(range(1, len(run_headers))))
@@ -549,19 +795,20 @@ gate_wait_usd_per_minute=0
 
     def test_paid_cells_name_why_no_bill_counts_and_the_cheapest_is_a_placement_type(self) -> None:
         self.assertEqual(self.snapshot(), 0)
+        self.deploy_gate_zones()
         size, = self.compare
         home = self.regions[0]
         events: list[dict[str, object]] = []
-        # A short targeted run of a type that placement never picks: the cheapest estimate, but not a candidate.
-        for attempt, kind, mode, box_s in (('a', self.standard[0], 'merge-gate', 360), ('b', size, 'targeted-test', 60)):
+        # The ledger contains a short targeted run of a type outside the deployment.
+        for attempt, kind, mode, box_s in (('a', self.standard[0], 'gate', 360), ('b', size, 'test-affected', 60)):
             row: dict[str, object] = {'attempt': attempt, 'instance_type': kind, 'mode': mode, 'region': home}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
                            {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
         paid = {costs.scope.name: next(table for table in costs.tables if table.title == size).rows[0][5:] for costs in tables.runs}
-        self.assertEqual(paid, {'merge-gate': ('bill due', 'no runs', '0'),
-                                'targeted-test': ('bill due', '1 bill due', '0'),
+        self.assertEqual(paid, {'gate': ('bill due', 'no runs', '0'),
+                                'test-affected': ('bill due', '1 bill due', '0'),
                                 'both': ('bill due', '1 bill due', '0')})
         self.assertEqual([(costs.cheapest.size if costs.cheapest else None) for costs in tables.runs],
                          [self.standard[0], None, self.standard[0]])
@@ -624,6 +871,20 @@ gate_wait_usd_per_minute=0
             with self.subTest(action=action):
                 self.assertTrue(any(action in cast(list[str], row['Action']) and row['Resource'] == '*'
                                     and row['Effect'] == 'Allow' and 'Condition' not in row for row in statements))
+
+    def test_scaler_policy_reads_quota_request_history_for_only_the_spot_quotas(self) -> None:
+        document = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))
+        resources = ledger.mapping(document['Resources'])
+        policy = ledger.mapping(ledger.mapping(resources['GateGpuTrialScalerPolicy'])['Properties'])
+        statements = [row for row in ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement')
+                      if 'servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota' in cast(list[str], row['Action'])]
+        self.assertEqual(len(statements), 1)
+        statement, = statements
+        self.assertEqual((statement['Effect'], statement['Action']),
+                         ('Allow', ['servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota']))
+        codes = sorted({code for _regions, code, _desired, _label in deploy.quota_targets('us-east-2')})
+        self.assertEqual(statement['Resource'], [
+            {'Fn::Sub': 'arn:${AWS::Partition}:servicequotas:*:${AWS::AccountId}:ec2/' + code} for code in codes])
 
     def test_initial_failure_saves_each_error_and_the_table_names_its_time(self) -> None:
         self.failure = 'describe-spot-price-history'
@@ -691,6 +952,249 @@ gate_wait_usd_per_minute=0
         self.assertEqual(len(self.notices), 2)
         self.assertNotEqual(self.notices[-1][0], key)
 
+    def test_permission_refusal_files_one_price_read_action(self) -> None:
+        self.configure_gate('spot_candidate_regions=us-west-1 us-east-1 us-west-1\n')
+        self.failure = 'all'
+        self.notice_accepted = False
+        actions = action.ActionStore()
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        opened, = actions.list()
+        self.assertEqual(opened.title, 'Allow AWS price reads')
+        self.assertEqual(opened.command,
+                         '~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources')
+        self.assertEqual((opened.machine, opened.cwd), ('natedev', '/home/natepiano'))
+        self.assertEqual((opened.status, opened.requested_by, opened.concerns, opened.dedupe_key),
+                         ('open', 'aws-unit', 'aws', 'aws-price-read'))
+        self.assertEqual(opened.completion, 'automatic')
+        self.assertEqual(opened.reason, 'AWS refused the price read in us-west-1, us-east-1. '
+                         + 'After 2 hours without the read, test runs on AWS can pick a region that costs more. '
+                         + 'The command allows the read, costs nothing, and asks for your AWS admin passphrase.')
+        self.assertEqual(opened.waits, 'Test runs on AWS in us-west-1, us-east-1')
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.notice_accepted = True
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (opened,))
+        self.assertEqual(len(self.notices), 2)
+
+    def test_clean_read_withdraws_the_price_read_action(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        unrelated = actions.add(title='Other action', command='true', machine='natedev', cwd='/fixture',
+                                requested_by='other-unit', reason='Fixture.', waits='Fixture',
+                                concerns='aws', dedupe_key=opened.dedupe_key)
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.failure = ''
+        self.assertEqual(self.snapshot(), 0)
+        withdrawn = actions.get(opened.key)
+        stamp = datetime.fromtimestamp(self.clock.now, UTC).isoformat()
+        self.assertEqual((withdrawn.status, withdrawn.withdraw_reason),
+                         ('withdrawn', f'The hourly read succeeded at {stamp}.'))
+        self.assertEqual(actions.get(unrelated.key), unrelated)
+        self.assertEqual(len(self.notices), 1)
+
+    def test_clean_snapshot_ends_the_streak_before_a_failed_withdrawal(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+
+        def fail_withdrawal(key: str, *, requested_by: str, reason: str) -> action.UserAction:
+            self.assertEqual((key, requested_by), (opened.key, opened.requested_by))
+            self.assertTrue(reason.startswith('The hourly read succeeded at '))
+            saved = aws_target.read_snapshot(self.state)
+            self.assertEqual(aws_target.snapshot_failures(saved), ())
+            self.assertNotIn('failure_streak', saved)
+            raise OSError('Fixture withdrawal failure.')
+
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        self.clock.advance(interval)
+        self.failure = ''
+        with (mock.patch.object(action.ActionStore, 'withdraw', side_effect=fail_withdrawal) as withdraw,
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(self.snapshot(), 1)
+        withdraw.assert_called_once()
+        self.assertIn('Fixture withdrawal failure.', errors.getvalue())
+        self.assertNotIn('failure_streak', aws_target.read_snapshot(self.state))
+        self.assertEqual(actions.list(), (opened,))
+
+        self.clock.advance(interval)
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(len(self.notices), 2)
+        self.assertNotEqual(self.notices[0][0], self.notices[1][0])
+        streak = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        replacement, = (record for record in actions.list() if record.status == 'open')
+        self.assertNotEqual(replacement.key, opened.key)
+        self.assertEqual((streak['action_key'], streak['action_created']), (replacement.key, True))
+        self.clock.advance(interval)
+        self.failure = ''
+        self.assertEqual(self.snapshot(), 0)
+        self.assertEqual(actions.get(replacement.key).status, 'withdrawn')
+
+    def test_timeout_keeps_the_price_read_action_open(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.failure = 'timeout'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        failure, = aws_target.snapshot_failures(aws_target.read_snapshot(self.state))
+        self.assertEqual(failure.error, 'TimeoutExpired')
+        self.assertEqual(actions.list(), (opened,))
+
+    def test_new_price_read_streak_replaces_the_open_action_after_failed_withdrawal(self) -> None:
+        self.configure_gate('spot_candidate_regions=us-east-2\n')
+        self.failure = 'all'
+        actions = action.ActionStore()
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        old, = actions.list()
+        self.assertEqual(old.waits, 'Test runs on AWS in us-east-2')
+
+        self.clock.advance(interval)
+        self.failure = ''
+        with (mock.patch.object(action.ActionStore, 'withdraw', side_effect=OSError('Fixture withdrawal failure.')),
+              redirect_stderr(StringIO())):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (old,))
+
+        self.clock.advance(interval)
+        self.configure_gate('spot_candidate_regions=us-west-2\n')
+        self.failure = 'all'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        opened, = (record for record in actions.list() if record.status == 'open')
+        self.assertNotEqual(opened.key, old.key)
+        self.assertTrue(opened.reason.startswith('AWS refused the price read in us-west-2. '))
+        self.assertNotIn('us-east-2', opened.reason)
+        self.assertEqual(opened.waits, 'Test runs on AWS in us-west-2')
+        withdrawn = actions.get(old.key)
+        self.assertEqual((withdrawn.status, withdrawn.withdraw_reason),
+                         ('withdrawn', 'A new refused read replaced this action.'))
+
+    def test_action_store_errors_keep_the_snapshot_and_push(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with (mock.patch.object(action.ActionStore, 'add', side_effect=action.ActionStoreError('fixture\nadd failure')),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(aws_target.snapshot(self.settings, self.state, execute=self.execute, clock=self.clock,
+                                                 notify=self.notify, allow_aws_unavailable=True), 1)
+        self.assertEqual([line for line in errors.getvalue().splitlines() if 'action:' in line],
+                         ['aws_target: cannot update the AWS price read action: fixture add failure'])
+        self.assertTrue(aws_target.snapshot_failures(aws_target.read_snapshot(self.state)))
+        self.assertEqual(len(self.notices), 1)
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.failure = ''
+        with (mock.patch.object(action.ActionStore, 'list', side_effect=OSError('fixture list failure')),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(errors.getvalue().splitlines(),
+                         ['aws_target: cannot update the AWS price read action: fixture list failure'])
+        self.assertEqual(aws_target.snapshot_failures(aws_target.read_snapshot(self.state)), ())
+        self.assertNotIn('failure_streak', aws_target.read_snapshot(self.state))
+        self.assertEqual(len(self.notices), 1)
+
+    def test_failed_price_read_action_retries_after_a_successful_notice(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        actions = action.ActionStore()
+        with (mock.patch.object(action.ActionStore, 'add', side_effect=action.ActionStoreError('Fixture failure.')),
+              redirect_stderr(StringIO())):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), ())
+        previous = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        self.assertTrue(previous['notice_claimed'])
+        self.assertFalse(previous['action_created'])
+
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        opened, = actions.list()
+        self.assertEqual((opened.key, opened.status), (previous['action_key'], 'open'))
+        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['action_created'])
+        self.assertEqual(len(self.notices), 1)
+
+    def test_done_price_read_action_stays_done_when_the_notice_retries(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        self.notice_accepted = False
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        done = actions.mark_done(opened.key, evidence='The user completed the action.')
+        document = aws_target.read_snapshot(self.state)
+        streak = ledger.mapping(document['failure_streak'])
+        self.assertTrue(streak['action_created'])
+        self.assertFalse(streak['notice_claimed'])
+
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        self.clock.advance(interval)
+        self.notice_accepted = True
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (done,))
+        self.assertEqual(len(self.notices), 2)
+        self.assertEqual(self.notices[0][0], self.notices[1][0])
+
+        # Replay the saved state from before the card creation was recorded.
+        document = aws_target.read_snapshot(self.state)
+        ledger.mapping(document['failure_streak'])['action_created'] = False
+        _ = (self.state / 'spot-prices.json').write_text(json.dumps(document))
+        self.clock.advance(interval)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (done,))
+        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['action_created'])
+        self.assertEqual(len(self.notices), 2)
+
+        self.failure = ''
+        self.clock.advance(interval)
+        self.assertEqual(self.snapshot(), 0)
+        self.assertNotIn('failure_streak', aws_target.read_snapshot(self.state))
+        self.failure = 'describe-spot-price-history'
+        self.clock.advance(interval)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(sorted(record.status for record in actions.list()), ['done', 'open'])
+
+    def test_saved_price_read_action_key_survives_a_stop_before_the_success_save(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        actions = action.ActionStore()
+
+        def stop_before_success(path: Path, text: str) -> None:
+            output = ledger.mapping(cast(object, json.loads(text)))
+            if ledger.mapping(output['failure_streak']).get('action_created') is True:
+                raise RuntimeError('Fixture stop before the success save.')
+            atomic_file.write_text_atomic(path, text)
+
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        with (mock.patch.object(aws_target, 'write_text_atomic', side_effect=stop_before_success),
+              redirect_stderr(StringIO()),
+              self.assertRaisesRegex(RuntimeError, 'Fixture stop before the success save')):
+            _ = self.snapshot()
+        opened, = actions.list()
+        pending = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        self.assertFalse(pending['action_created'])
+        self.assertEqual(pending['action_key'], opened.key)
+        self.assertEqual(self.notices, [])
+
+        done = actions.mark_done(opened.key, evidence='The user completed the action.')
+        self.clock.advance(interval)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (done,))
+        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['action_created'])
+        self.assertEqual(len(self.notices), 1)
+
     def test_crash_after_notice_delivery_does_not_repeat_the_streak_notice(self) -> None:
         self.failure = 'describe-spot-price-history'
 
@@ -709,8 +1213,11 @@ gate_wait_usd_per_minute=0
 
     def test_previous_notified_field_still_suppresses_the_streak_notice(self) -> None:
         self.failure = 'describe-spot-price-history'
-        with redirect_stderr(StringIO()):
+        with (mock.patch.object(action.ActionStore, 'add', side_effect=action.ActionStoreError('Fixture failure.')),
+              redirect_stderr(StringIO())):
             self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        self.assertEqual(actions.list(), ())
         path = self.state / 'spot-prices.json'
         document = aws_target.read_snapshot(self.state)
         streak = ledger.mapping(document['failure_streak'])
@@ -720,7 +1227,23 @@ gate_wait_usd_per_minute=0
         with redirect_stderr(StringIO()):
             self.assertEqual(self.snapshot(), 1)
         self.assertEqual(len(self.notices), 1)
-        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['notice_claimed'])
+        saved = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        self.assertTrue(saved['notice_claimed'])
+        opened, = actions.list()
+        self.assertEqual(opened.status, 'open')
+        self.assertEqual(saved['action_key'], opened.key)
+
+    def test_file_price_read_action_rejects_an_empty_key_before_withdrawal(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        failures = aws_target.snapshot_failures(aws_target.read_snapshot(self.state))
+
+        with self.assertRaises(action.ActionStoreError):
+            aws_target.file_price_read_action(failures, key='')
+        self.assertEqual(actions.list(), (opened,))
 
     def test_failed_notice_retries_without_changing_its_key(self) -> None:
         self.failure = 'describe-spot-price-history'
@@ -853,6 +1376,48 @@ gate_wait_usd_per_minute=0
 
 
 
+class HanaBilledHoursTests(CostFixture):
+    def test_hana_billed_hours_reads_only_the_day_and_configured_spot_types(self) -> None:
+        configuration = self.root / 'hana_aws.conf'
+        text_setting(configuration, 'instance_type', 'm7a.4xlarge')
+        text_setting(configuration, 'fallback_instance_types', 'c7a.4xlarge')
+        text_setting(configuration, 'region', 'us-east-2')
+        day = date(2026, 1, 15)
+        start = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp())
+        directory = self.state / 'charges'
+        directory.mkdir()
+        path = directory / (day.isoformat() + '.json')
+        self.assertIsNone(run_cost.hana_billed_hours(self.state, day))
+
+        ignored = (
+            ledger.UsageTypeCost('USE1-SpotUsage:m7a.4xlarge', Decimal(0), Decimal(4), 'Hrs'),
+            ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal(0), Decimal(2), 'Hrs'),
+            ledger.UsageTypeCost('USE2-BoxUsage:m7a.4xlarge', Decimal(0), Decimal(3), 'Hrs'),
+        )
+        primary = ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal(0), Decimal('0.490279'), 'Hrs')
+        fallback = ledger.UsageTypeCost('USE2-SpotUsage:c7a.4xlarge', Decimal(0), Decimal('0.25'), 'Hrs')
+        bill = ledger.ChargeRead(day.isoformat(), start + 86400, start, start + 86400,
+                                 Decimal(0), Decimal(0), Decimal(0))
+        for usage, expected in (
+            ((*ignored, primary), Decimal('0.490279')),
+            ((*ignored, primary, fallback), Decimal('0.740279')),
+            (ignored, Decimal('0.0')),
+        ):
+            with self.subTest(hours=expected):
+                _ = path.write_text(json.dumps(ledger.charge_record(replace(bill, usage_types=usage))))
+                self.assertEqual(run_cost.hana_billed_hours(self.state, day), expected)
+
+        next_day = replace(bill, at=start + 2 * 86400, period_start=start + 86400,
+                           period_end=start + 2 * 86400, usage_types=(primary,))
+        _ = path.write_text(json.dumps(ledger.charge_record(next_day)))
+        self.assertIsNone(run_cost.hana_billed_hours(self.state, day))
+
+        damaged = ledger.charge_record(bill)
+        damaged['at'] = 'invalid'
+        _ = path.write_text(json.dumps(damaged))
+        self.assertIsNone(run_cost.hana_billed_hours(self.state, day))
+
+
 class HoursCheckTests(CostFixture):
     """Billed Spot hours against the cost ledger's box hours, per type, region and UTC day."""
     clock: TestClock = TestClock()
@@ -863,26 +1428,41 @@ class HoursCheckTests(CostFixture):
     limit: Decimal = Decimal(0)
     observations: list[ledger.InstanceObservation] = []
     reservations: list[ledger.GateReservation] = []
+    exposures: list[ledger.HanaComputeExposure] = []
     bills: list[ledger.ChargeRead] = []
-    notices: list[tuple[str, push_texts.RenderedPush]] = []
-    notice_accepted: bool = True
+    notice_commands: list[tuple[str, ...]] = []
 
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.configure('region=us-east-1\ninstance_type=m7a.4xlarge\n'
+                       + '# whole: 1..\nrun_cost_days=7\n# whole: 1..\nprice_max_age_seconds=7200\n'
+                       + '# range: 0.001..\nsnapshot_notification_timeout_s=5\n'
+                       + '# range: 0..1\nbilled_hours_gap_max_ratio=0.15\n')
+        self.configure_gate(
+                                 'instance_types=c7a.4xlarge\nprice_compare_instance_types=m7a.8xlarge\n'
+                                 + 'gpu_instance_types=g4dn.xlarge\nhana_gpu_instance_types=g6.2xlarge\n'
+                                 + 'spot_candidate_regions=us-east-1 us-east-2\n'
+                                 + '# range: 0..100\ngate_wait_usd_per_minute=0\n'
+                                 + 'unmeasured_region_extra_seconds={}\n# whole: 1..60\nlifetime_minutes=20\n')
         self.clock = TestClock()
         configuration = conf.read(self.settings)
         self.home = configuration.text('region')
-        self.other = next(region for region in ledger.REGION_USAGE_PREFIXES if region != self.home)
+        self.other = 'us-east-2'
         self.size = conf.read_or_repository('cloud_gate').words('instance_types')[0]
+        workload = self.root / 'hana_aws.conf'
+        text_setting(workload, 'region', self.other)
+        text_setting(workload, 'instance_type', 'm7a.2xlarge')
+        text_setting(workload, 'fallback_instance_types', f'{self.size},m6a.4xlarge')
         self.builder = configuration.text('instance_type')
         self.observations = []
         self.limit = conf.decimal(configuration.text('billed_hours_gap_max_ratio'))
-        self.reservations, self.bills, self.notices = [], [], []
-        self.notice_accepted = True
+        self.reservations, self.bills, self.notice_commands = [], [], []
+        self.exposures = []
 
         def evidence(_book: ledger.CostLedger) -> ledger.LedgerEvidence:
-            return ledger.LedgerEvidence(observations=list(self.observations), gate_reservations=list(self.reservations))
+            return ledger.LedgerEvidence(observations=list(self.observations), gate_reservations=list(self.reservations),
+                                         hana_compute=list(self.exposures))
 
         def bills(_book: ledger.CostLedger) -> tuple[ledger.ChargeRead, ...]:
             return tuple(self.bills)
@@ -912,16 +1492,26 @@ class HoursCheckTests(CostFixture):
     def checks(self) -> dict[run_cost.DayKey, run_cost.HoursCheck]:
         end = datetime.fromtimestamp(self.clock.now, UTC)
         days = conf.read(self.settings).whole('run_cost_days')
+        scope = aws_target.hours_check_scope(conf.read_or_repository('cloud_gate'))
+        scope = replace(scope, sizes=(*scope.sizes, self.builder))
         return run_cost.day_hours_checks(ledger.CostLedger(self.state), end - timedelta(days=days), end, self.home,
-                                         self.builder, (self.size, self.builder), self.limit)
+                                         self.builder, scope, self.limit)
 
-    def notify(self, key: str, push: push_texts.RenderedPush, _timeout: float) -> bool:
-        self.notices.append((key, push))
-        return self.notice_accepted
+    def notice_run(self, *, code: int = 0, stdout: str = 'SENT: fixture\n', sender_times_out: bool = False) -> int:
+        def run(arguments: Sequence[str], *, capture_output: bool, text: bool, check: bool,
+                timeout: float = 0) -> subprocess.CompletedProcess[str]:
+            if arguments[0] == 'git':
+                return git_only(arguments, check=check)
+            self.assertEqual((capture_output, text, check, timeout), (True, True, False, send_budget.seconds(5)))
+            self.assertGreater(timeout, 5)
+            self.notice_commands.append(tuple(arguments))
+            if sender_times_out:
+                self.assertFalse((self.state / 'hours-gap-notices.json').exists())
+                raise subprocess.TimeoutExpired(arguments, timeout)
+            return subprocess.CompletedProcess(arguments, code, stdout, '')
 
-    def notice_run(self) -> int:
-        with redirect_stderr(StringIO()):
-            return aws_target.hours_gap_notices(self.settings, self.state, clock=self.clock, notify=self.notify)
+        with (redirect_stderr(StringIO()), mock.patch.object(subprocess, 'run', run)):
+            return aws_target.hours_gap_notices(self.settings, self.state, clock=self.clock)
 
     def test_box_hours_split_at_utc_midnight_and_count_only_confirmed_gates(self) -> None:
         two, one = self.day(2), self.day(1)
@@ -957,7 +1547,7 @@ class HoursCheckTests(CostFixture):
         self.assertNotIn((self.size, self.home, self.day(0).date().isoformat()), checks)
         end = datetime.fromtimestamp(self.clock.now, UTC)
         window = run_cost.hours_checks(ledger.CostLedger(self.state), end - timedelta(days=3), end, self.home,
-                                       self.builder, (self.size,), self.limit)
+                                       self.builder, run_cost.SpotHoursScope((self.size,), {}), self.limit)
         self.assertEqual(window[self.size, self.home],
                          run_cost.hours_check(within + above, Decimal(2), self.limit))
         self.assertEqual(window[self.size, self.other], run_cost.HoursCheck(Decimal(0), Decimal('0.5'), Decimal(1), True))
@@ -990,55 +1580,242 @@ class HoursCheckTests(CostFixture):
         self.assertEqual(checks[self.size, self.other, self.day(2).date().isoformat()],
                          run_cost.HoursCheck(None, Decimal(1), None, False))
 
-    def test_gap_sends_one_notice_per_type_region_and_day(self) -> None:
+    def test_hana_exposure_sets_the_upper_bound(self) -> None:
+        day = self.day(1)
+        at = int(day.timestamp())
+        stop = at + 11232
+        self.exposures.append(ledger.HanaComputeExposure(at, stop, 1, Decimal('.25'),
+            ledger.HanaExposureClosed(stop), self.size, region=self.other))
+        for billed, over in (('0.49', False), ('0', False), ('3.588', False), ('4.0', True)):
+            with self.subTest(billed=billed):
+                self.bills.clear()
+                self.bill(day, {(self.size, self.other): Decimal(billed)} if billed != '0' else {})
+                check = self.checks()[self.size, self.other, day.date().isoformat()]
+                self.assertEqual((check.billed_hours, check.box_hours, check.hana_reserved_hours, check.hours_gap_over),
+                                 (Decimal(billed), Decimal(0), Decimal('3.12'), over))
+
+        self.gate(self.size, self.other, day, 3600)
+        self.bills.clear()
+        self.bill(day, {(self.size, self.other): Decimal('.84')})
+        check = self.checks()[self.size, self.other, day.date().isoformat()]
+        self.assertTrue(check.hours_gap_over)
+        self.assertEqual(check.hours_gap_ratio, Decimal('.16'))
+
+    def test_gate_only_hours_keep_both_limits(self) -> None:
+        day = self.day(1)
+        self.gate(self.size, self.home, day, 3600)
+        for billed, over in (('0.84', True), ('0.85', False), ('1.15', False), ('1.16', True)):
+            with self.subTest(billed=billed):
+                self.bills.clear()
+                self.bill(day, {(self.size, self.home): Decimal(billed)})
+                check = self.checks()[self.size, self.home, day.date().isoformat()]
+                self.assertEqual(check.hours_gap_over, over)
+                self.assertEqual(check.hours_gap_ratio, abs(Decimal(billed) - 1))
+
+    def test_gate_only_check_preserves_ratio_rounding(self) -> None:
+        day = self.day(1)
+        self.gate(self.size, self.home, day, 1)
+        self.bill(day, {(self.size, self.home): Decimal('0.0003194444444444444444444444445')})
+        check = self.checks()[self.size, self.home, day.date().isoformat()]
+        self.assertTrue(check.hours_gap_over)
+
+    def test_hana_midnight_split_and_open_exposure_past_its_permit(self) -> None:
+        two, one = self.day(2), self.day(1)
+        midnight = int(one.timestamp())
+        self.exposures.extend((
+            ledger.HanaComputeExposure(midnight - 900, midnight + 900, 1, Decimal('.25'),
+                ledger.HanaExposureClosed(midnight + 900), self.size, region=self.other),
+            ledger.HanaComputeExposure(midnight + 22 * 3600, midnight + 22 * 3600 + 60, 2, Decimal('.25'),
+                instance_type=self.size, region=self.other),
+        ))
+        checks = self.checks()
+        self.assertEqual(checks[self.size, self.other, two.date().isoformat()].hana_reserved_hours, Decimal('.25'))
+        self.assertEqual(checks[self.size, self.other, one.date().isoformat()].hana_reserved_hours, Decimal('2.25'))
+
+    def test_hana_types_share_regional_hours_and_count_the_first_row_per_generation(self) -> None:
+        day = self.day(1)
+        at = int(day.timestamp())
+        primary, fallback, gate_only = 'm7a.2xlarge', 'm6a.4xlarge', 'm7a.8xlarge'
+        first = ledger.HanaComputeExposure(at, at + 3600, 1, Decimal('.25'),
+            ledger.HanaExposureClosed(at + 3600), primary, region=self.other)
+        self.exposures.extend((first, replace(first, state=ledger.HanaExposureClosed(at + 7200)),
+                               replace(first, generation=2, region=self.home),
+                               replace(first, generation=3, instance_type='')))
+        self.bill(day, {(primary, self.other): Decimal(1), (fallback, self.other): Decimal(1),
+                        (fallback, self.home): Decimal(1), (gate_only, self.other): Decimal(1)})
+        checks = self.checks()
+        for size in (primary, fallback, self.size):
+            check = checks[size, self.other, day.date().isoformat()]
+            self.assertEqual(check.hana_reserved_hours, Decimal(2))
+            self.assertFalse(check.hours_gap_over)
+        self.assertTrue(checks[fallback, self.home, day.date().isoformat()].hours_gap_over)
+        self.assertTrue(checks[gate_only, self.other, day.date().isoformat()].hours_gap_over)
+
+    def test_fallback_hana_type_outside_the_gate_list_sends_a_notice_with_reserved_hours(self) -> None:
+        fallback = 'm6a.4xlarge'
+        text_setting(self.root / 'hana_aws.conf', 'mount_timeout_seconds', 'invalid')
+        self.assertNotIn(fallback, aws_target.gate_sizes(conf.read(self.root / 'cloud_gate.conf')))
+        day = self.day(1)
+        at = int(day.timestamp())
+        self.exposures.append(ledger.HanaComputeExposure(at, at + 3600, 1, Decimal('.25'),
+            ledger.HanaExposureClosed(at + 3600), fallback, region=self.other))
+        self.bill(day, {(fallback, self.other): Decimal(2)})
+        self.assertEqual(self.notice_run(), 0)
+        command, = self.notice_commands
+        self.assertIn('The ledger also reserves 1.00 h of Hana box time in that region for that day.', command[-1])
+        claims = ledger.mapping(cast(object, json.loads((self.state / 'hours-gap-notices.json').read_text())))
+        self.assertEqual(claims['claimed'], [f'aws-hours-gap:{fallback}:{self.other}:{day.date().isoformat()}'])
+        table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+        assert isinstance(table, spot_table.HoursComparison)
+        row = next(row for row in table.rows if row.size == fallback)
+        self.assertTrue(row.check.hours_gap_over)
+        self.assertEqual(aws_page.hours_row_data(row)['cells'], [fallback, self.other, '2.0', '0.0', '+2.0', '1.0'])
+
+    def test_unusable_hana_size_setting_preserves_gate_notices_and_table(self) -> None:
+        text_setting(self.root / 'hana_aws.conf', 'fallback_instance_types', 'm6a.4xlarge,')
+        day = self.day(1)
+        at = int(day.timestamp())
+        self.gate(self.size, self.other, day, 3600)
+        self.exposures.append(ledger.HanaComputeExposure(at, at + 3600, 1, Decimal('.25'),
+            ledger.HanaExposureClosed(at + 3600), self.size, region=self.other))
+        self.bill(day, {(self.size, self.other): Decimal(2)})
+        self.assertEqual(self.notice_run(), 0)
+        command, = self.notice_commands
+        self.assertIn('The gap is 100%.', command[-1])
+        self.assertNotIn('Hana box time', command[-1])
+        table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+        assert isinstance(table, spot_table.HoursComparison)
+        row, = table.rows
+        self.assertTrue(row.check.hours_gap_over)
+        self.assertEqual(aws_page.hours_row_data(row)['cells'], [self.size, self.other, '2.0', '1.0', '+1.0', '—'])
+
+    def test_gap_sends_one_staff_message_and_no_user_push(self) -> None:
         one = self.day(1)
         self.gate(self.size, self.home, one, 3600)
         self.gate(self.size, self.other, one, 3600)
         self.bill(one, {(self.size, self.home): Decimal(1) + self.limit * 2, (self.size, self.other): Decimal(1)})
         self.assertEqual(self.notice_run(), 0)
-        key = f'aws-hours-gap:{self.size}:{self.home}:{one.date().isoformat()}'
-        self.assertEqual([sent for sent, _push in self.notices], [key])
-        push = self.notices[0][1]
-        self.assertEqual(push.id, 'aws.hours_gap')
-        self.assertIn(f'AWS billed {Decimal(1) + self.limit * 2:.2f} h of {self.size} Spot in {self.home}', push.body)
-        self.assertIn(f'The gap is {self.limit * 2:.0%}, above the {self.limit:.0%} limit.', push.body)
-        # The next hourly run sends nothing again for the same day.
+        day = one.date().isoformat()
+        self.assertEqual(len(self.notice_commands), 1)
+        self.assertEqual(self.notice_commands[0][2:], (
+            '--to', 'staff:a898cb38-dbac-4751-b72b-d0b14ab9c38d', '--from', 'AWS hours check',
+            '--timeout', '5', '--text',
+            'AWS Spot hours differ from the cost ledger.\n'
+            + f'On {day} UTC, AWS billed 1.30 h of {self.size} Spot in {self.home}.\n'
+            + 'The cost ledger records 1.00 h for that size, region, and day.\n'
+            + 'The gap is 30%. The limit is 15%.\n'
+            + 'File an investigation for this gap and add it to the list.',
+        ))
+        self.assertTrue(self.notice_commands[0][1].endswith('/message/send.py'))
         self.assertEqual(self.notice_run(), 0)
-        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(len(self.notice_commands), 1)
 
-    def test_spot_table_shows_billed_over_box_hours_with_the_gap(self) -> None:
+    def test_spot_table_shows_separate_hours_and_the_signed_difference(self) -> None:
         one, two = self.day(1), self.day(2)
         gpu = conf.read_or_repository('cloud_gate').words('gpu_instance_types')[0]
         self.gate(self.size, self.home, one, 3600)
         self.gate(self.size, self.other, one, 1800)
         self.gate(gpu, self.home, two, 3600)
         self.bill(one, {(self.size, self.home): Decimal(1) + self.limit * 2})
-        tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
-        columns = tables.hours.headers
-        cells = {row[0]: dict(zip(columns[1:], row[1:])) for row in tables.hours.rows}
-        self.assertEqual(set(cells), {self.size, gpu})
-        self.assertEqual(cells[self.size][self.home], f'{Decimal(1) + self.limit * 2:.1f}/1.0 ({self.limit * 2:.0%}) over')
-        # The other region has no Spot hours on the billed day.
-        self.assertEqual(cells[self.size][self.other], '0.0/0.5 (100%) over')
-        self.assertEqual(cells[gpu][self.home], 'not billed')
-        self.assertIn(f'above {self.limit:.0%}', tables.hours_note)
-        self.assertEqual(tables.hours.title, 'Billed hours / box hours')
+        hours = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).hours
+        assert isinstance(hours, spot_table.HoursComparison)
+        self.assertEqual([aws_page.hours_row_data(row)['cells'] for row in hours.rows], [
+            [self.size, self.home, '1.3', '1.0', '+0.3', '—'],
+            [self.size, self.other, '0.0', '0.5', '-0.5', '—'],
+            [gpu, self.home, '—', '1.0', '—', '—'],
+        ])
+        self.assertEqual([row.check.hours_gap_over for row in hours.rows], [True, True, False])
+
+    def test_over_uses_the_full_precision_of_the_hours_and_limit(self) -> None:
+        day = self.day(1)
+        self.gate(self.size, self.home, day, 3600)
+        self.bill(day, {(self.size, self.home): Decimal('1.154')})
+        for ratio, mark in (('0.155', False), ('0.150', True), ('0.0000123', True)):
+            with self.subTest(ratio=ratio):
+                self.replace('billed_hours_gap_max_ratio', ratio)
+                hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+                assert isinstance(hours, spot_table.HoursComparison)
+                row, = hours.rows
+                self.assertEqual(aws_page.hours_row_data(row)['cells'][4], '+0.2')
+                self.assertEqual(row.check.hours_gap_over, mark)
+
+    def test_hours_difference_rounds_only_after_subtracting(self) -> None:
+        for billed, recorded, cells in (
+            ('0.96', '1', ['1.0', '1.0', '0.0']),
+            ('4.24', '4.26', ['4.2', '4.3', '0.0']),
+            ('1.24', '1.06', ['1.2', '1.1', '+0.2']),
+        ):
+            with self.subTest(billed=billed, recorded=recorded):
+                check = run_cost.hours_check(Decimal(billed), Decimal(recorded), self.limit)
+                row = spot_table.MachineHoursRow(self.size, self.home, check)
+                self.assertEqual(aws_page.hours_row_data(row)['cells'][2:5], cells)
+
+    def test_billed_hours_empty_states_distinguish_a_missing_bill_from_no_hours(self) -> None:
+        def check(note: str) -> None:
+            hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+            self.assertEqual(hours, spot_table.HoursComparisonUnavailable(note))
+
+        check('No AWS bill is available yet for the last 7 days.')
+        self.bill(self.day(2), {})
+        check('There are no machine hours to compare.')
+        self.gate(self.size, self.home, self.day(1), 3600)
+        hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+        assert isinstance(hours, spot_table.HoursComparison)
+        row, = hours.rows
+        self.assertEqual(aws_page.hours_row_data(row)['cells'], [self.size, self.home, '—', '1.0', '—', '—'])
+        self.assertFalse(row.check.hours_gap_over)
+
+    def test_spot_table_keeps_gate_hours_and_shows_the_hana_allowance(self) -> None:
+        day = self.day(1)
+        at = int(day.timestamp())
+        self.gate(self.size, self.other, day, 3600)
+        self.exposures.append(ledger.HanaComputeExposure(at, at + 7200, 1, Decimal('.25'),
+            ledger.HanaExposureClosed(at + 7200), self.size, region=self.other))
+        fallback = 'm6a.4xlarge'
+        self.bill(day, {(self.size, self.other): Decimal(3), (fallback, self.other): Decimal('0.9')})
+        table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+        assert isinstance(table, spot_table.HoursComparison)
+        cells = {row.size: aws_page.hours_row_data(row)['cells'][1:] for row in table.rows}
+        self.assertEqual(cells, {
+            self.size: [self.other, '3.0', '1.0', '+2.0', '2.0'],
+            fallback: [self.other, '0.9', '0.0', '+0.9', '2.0'],
+        })
+        self.assertFalse(any(row.check.hours_gap_over for row in table.rows))
 
     def test_failed_notice_stays_pending_and_old_days_leave_the_claims(self) -> None:
         one = self.day(1)
         self.gate(self.size, self.home, one, 3600)
         self.bill(one, {(self.size, self.home): Decimal(1) + self.limit * 2})
-        self.notice_accepted = False
-        self.assertEqual(self.notice_run(), 1)
-        self.notice_accepted = True
-        self.assertEqual(self.notice_run(), 0)
-        self.assertEqual(len(self.notices), 2)
+        self.assertEqual(self.notice_run(code=3, stdout='FAILED: fixture\n'), 1)
         claims = self.state / 'hours-gap-notices.json'
+        self.assertEqual(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed'], [])
+        self.assertEqual(self.notice_run(), 0)
+        self.assertEqual(len(self.notice_commands), 2)
+        self.assertEqual(self.notice_commands[0], self.notice_commands[1])
         self.assertEqual(len(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed']), 1)
         # After the window passes the day, its claim is dropped.
         self.clock.advance((conf.read(self.settings).whole('run_cost_days') + 1) * 86400)
         self.assertEqual(self.notice_run(), 0)
         self.assertEqual(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed'], [])
+
+    def test_queued_notice_saves_the_claim(self) -> None:
+        one = self.day(1)
+        self.bill(one, {(self.size, self.home): Decimal(1)})
+        self.assertEqual(self.notice_run(code=1, stdout='QUEUED: fixture\n'), 0)
+        claims = self.state / 'hours-gap-notices.json'
+        self.assertEqual(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed'],
+                         [f'aws-hours-gap:{self.size}:{self.home}:{one.date().isoformat()}'])
+        self.assertEqual(self.notice_run(), 0)
+        self.assertEqual(len(self.notice_commands), 1)
+
+    def test_timed_out_notice_never_saves_the_claim(self) -> None:
+        one = self.day(1)
+        self.bill(one, {(self.size, self.home): Decimal(1)})
+        self.assertEqual(self.notice_run(sender_times_out=True), 1)
+        claims = self.state / 'hours-gap-notices.json'
+        self.assertEqual(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed'], [])
+        self.assertEqual(self.notice_run(), 0)
+        self.assertEqual(len(self.notice_commands), 2)
 
     def test_hourly_runs_the_snapshot_and_the_hours_check_and_keeps_the_worse_status(self) -> None:
         # buildlog hourly calls aws_target.hourly; a failed snapshot must not skip the hours check.

@@ -16,9 +16,9 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib.test_models_registry import write_registry
+from scripts.accounts import role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.message import send_budget
-from scripts.agents import remote
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert
 from scripts.notify import review
@@ -55,7 +55,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         for summary, text, ask in self.pushed:
             self.assertLess(len(summary), 45)
             self.assertLess(len("Action: " + ask.action + "\n" + text), 500)
-            self.assertTrue(remote.local_machine() in ask.action or "chatgpt.com/codex/settings/usage" in ask.action)
+            self.assertTrue("natedev Claude session" in ask.action or "chatgpt.com/codex/settings/usage" in ask.action)
             self.assertLessEqual(text.count("recommended"), 1)
 
     def test_every_user_push_states_its_action_as_send_py_requires(self) -> None:
@@ -63,15 +63,16 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         claude = self.note("claude2.md", "active", "0", limit_reset_count="3")
         codex = self.note("codex1.md", "active", "0")
         spare = self.note("claude1.md", "inactive", "80", login="spare@example.invalid")
-        sends = self.user_sends(lambda: self.alert([claude, codex, spare], self.now))
-        sends |= self.user_sends(lambda: self.block([codex], self.now))
+        with mock.patch("socket.gethostname", return_value=role_map.ROLE_MAP_HOST):
+            sends = self.user_sends(lambda: self.alert([claude, codex, spare], self.now))
+            sends |= self.user_sends(lambda: self.block([codex], self.now))
         notes = [title for title, (need, _action) in sends.items() if need == "note"]
         self.assertEqual(len(notes), 1)
         for title in notes:
             _ = sends.pop(title)
         self.assertEqual(sends, {
-            "quota_alert: codex1 now uses paid credits": ("decision", ActionRequired(
-                f"To stop it, remove codex1 from codex_credit_accounts in ~/.claude/config/accounts.conf on {remote.local_machine()}")),
+            "codex1 uses credits: balance unknown": ("decision", ActionRequired(
+                "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts codex2 codex3 codex4")),
             "Codex work stopped for lack of usage": ("decision", ActionRequired(REFUSAL_ACTION)),
         })
 
@@ -89,7 +90,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         settings = Path(os.environ["CONF_DIR"]) / "accounts.conf"
         _ = write_config_fixture(settings, "quota_relay_timeout_seconds=40\n")
         config = self.root / "notify.conf"
-        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        _ = config.write_text("review_timeout_seconds=90\n")
         done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
         with (mock.patch.object(review, "NOTIFY_CONFIG", config),
               mock.patch.object(subprocess, "run", return_value=done) as run):

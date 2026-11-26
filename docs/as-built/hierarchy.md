@@ -19,7 +19,7 @@ The hierarchy connects the user's product choices to work in separate repository
 
 Morty, brain, and dwight have staff kind `producer` and no parent.
 They remain individual operators; their shared kind defines management.
-Each producer's job is in `<PRODUCER_FOLDER_ROOT>/<name>/README.md`.
+Each producer's job is in `<producer_folder_root>/<name>/README.md`.
 `commands/producer/greenlight.md` and `commands/producer/to_production.md` define production preparation separately.
 The [staff contract](staff-accessors.md#producer-rows-and-commands) defines their commands and document folders.
 
@@ -74,7 +74,7 @@ The roster, unit board, staff display, and cleanup consumers use this evidence.
 
 Unknown evidence retains its reason. Unrelated process diagnostics do not refuse a staff write about another member.
 The target's own live identity still refuses retirement. Unavailable peer evidence also retains the target.
-`unit_runs.report_anomaly` prints each repeated run anomaly once per process.
+`unit_runs.report_anomaly` prints each repeated run anomaly once per command. A `ContextVar` holds the printed messages, and verify_helper.py runs each command in a new context copy.
 A shared read through `worker_lifecycle.locked_state` creates no missing state folder.
 
 ### Assignment and result flow
@@ -115,7 +115,9 @@ A replacement process in that terminal stays open.
 Records and logs live under `<run>/detached_runs/`.
 `detached_run_process.py` proves supervisor identity before a caller stops a run.
 The command runs in its own session, and the record saves its process group.
-`detached_runs.py stop` signals that group, so the supervisor stays alive and delivers the result.
+`detached_runs.py stop` signals the command group.
+The supervisor stays alive and delivers the result.
+A worker that stops its own run keeps its pass active and receives the STOPPED result.
 The supervisor installs no signal handler.
 The orphan reaper finishes a dead supervisor's record and delivers its result during start, restore, or explicit recovery.
 Results return to the worker or its current holder. Callers do not poll.
@@ -155,6 +157,17 @@ Prerequisites retain that list qualification.
 Row commands accept both displayed IDs and existing list-based IDs.
 An ambiguous displayed ID requires `--list <path>`.
 Saved pins therefore survive attachment changes without copying or renumbering rows.
+
+`change_review.py withdraw --row <id> --reason <text>` records the caller's staff name and preserves any prior verdict.
+The event uses `unknown` when the current session has no staff name.
+Withdrawal of an open row keeps its staff ID, urgency, and check instructions.
+`reopen --row <id> --reason <text>` restores the row to To review.
+It keeps the row ID and review log. It adds an event with the caller's name and reason.
+The change queue uses the saved urgency and move-to-end time to order the row.
+The command refuses a row without a withdrawn verdict.
+If an older withdrawal lacks the saved urgency or check instructions, the command names the missing fields and refuses to reopen it.
+`correct-withdraw-who --row <id> --at <ISO timestamp> --who <staff name>` corrects one withdrawal event in either table.
+Use the full timestamp from the log, with its offset. The correction keeps the other log entries.
 
 `record_verdict` returns `VerdictRecorded`, `VerdictAlreadyRecorded`, or `VerdictConflict`.
 An identical retry repeats the result and scratch cleanup.
@@ -211,7 +224,12 @@ A cleanup failure prints its step and returns nonzero.
 The failure does not prevent pointer cleanup.
 A busy repository copy can remain through the separate `copies.py remove` step.
 
-Workers create private work folders with `scratch.py new --worker [--name <word>]`.
+The director creates a model worktree for a parallel phase or trial project.
+The director runs `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>` after the checkpoint reaches origin.
+The director sends the reported paths to the showrunner as a removal list.
+Workers use numbered copies for tests and proofs that need source copies.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_copies.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
+Workers use `scratch.py new --worker [--name <word>]` only for downloads and files unrelated to builds, tests, gates, or source copies.
 Names have the form `<showrunner>-<unit>-<worker>-<suffix>[-<word>]` under `TMPDIR`.
 `scratch.worker_task(staff_id) -> str` names their shared task.
 `scratch.end(task)` removes folders for that exact task and permits retries.

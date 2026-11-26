@@ -13,18 +13,22 @@ import os
 import tempfile
 import unittest
 from collections.abc import Generator
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
-from typing import final, override
+from typing import cast, final, override
 from unittest import mock
 
+from scripts.console_text.test_support import accepting_console_text
+from scripts.agents.remote import local_machine
+from scripts.notify import review
 from scripts.production import proposal_issue
 from scripts.production.issues import Issue, frontmatter
 from scripts.production import proposals_folder, record_store, staff, unit_names
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.user_zone import user_zone
-from scripts.review_links import new_item_dialog
-from scripts.review_links.review_events import ReviewMark
+from scripts.review_links import new_item_dialog, reply_tokens
+from scripts.review_links.review_events import NoMark, ReviewMark
 from scripts.style import rules
 
 ISSUE = """---
@@ -69,8 +73,13 @@ class ProposalIssueTests(unittest.TestCase):
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.runtime = home / ".local/state/proposal-issue/locks"
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=home))
+        self.enterContext(accepting_console_text())
+        _ = self.enterContext(mock.patch.object(reply_tokens, "platform", "linux"))
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime),
-                                                     "SHOWRUNNER_STATE_DIR": str(home / "showrunners")}))
+                                                     "XDG_STATE_HOME": str(home / "key-state"),
+                                                     "NOTIFY_STATE_DIR": str(home / "notify"),
+                                                     "SHOWRUNNER_STATE_DIR": str(home / "showrunners"),
+                                                     "REVIEW_LINKS_ROOT": str(home / "review-links")}))
         members: tuple[tuple[str, staff.Kind], ...] = (
             ("hana", "showrunner"), ("build-report", "unit"), ("u", "unit"),
             ("names", "unit"), ("style", "showrunner"), ("sample-style", "showrunner"))
@@ -90,10 +99,18 @@ class ProposalIssueTests(unittest.TestCase):
         _ = original.write_text(VAULT_ISSUE)
         self.assertEqual(proposal_issue.number([original], date(2026, 11, 17)), ["number a proposal.md: P1"])
         recipient = next(row.id for row in staff.snapshot().rows if row.name == "hana")
-        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        token = "r" + "b" * 42
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), token)
+        with self.assertRaisesRegex(proposal_issue.Refusal, "omit-file-path: /tmp/layout.png"):
+            _ = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Read /tmp/layout.png.",
+                                                    "hana answers this", details)
+        self.assertEqual(list(folder.glob("*.md")), [original])
         issue = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Words",
                                                     "hana answers this", details)
         self.assertEqual(issue.value("proposal_id"), "P2")
+        note = issue.path.read_text(encoding="utf-8")
+        self.assertNotIn(token, note)
+        self.assertIn(reply_tokens.digest(token), note)
         self.assertEqual(proposal_issue.number([issue.path], date(2026, 11, 17)), ["number next proposal.md: P2"])
         archive = self.root / proposal_issue.ARCHIVE
         archive.mkdir(parents=True)
@@ -102,6 +119,35 @@ class ProposalIssueTests(unittest.TestCase):
         assert saved is not None
         self.assertEqual(saved.path, archived)
         self.assertEqual(proposal_issue.review_submission(saved), details)
+
+    def test_f099_proposal_filing_reports_the_missing_document_before_writing(self) -> None:
+        recipient, other, *_ = staff.snapshot().find(kind="showrunner")
+        document = self.root / "other-production.md"
+        other = replace(other, doc=staff.LiveDoc(local_machine(), document))
+        folder = self.root / "issues"
+        former = self.root / "former"
+        former.mkdir()
+        legacy = former / "legacy.md"
+        _ = legacy.write_text(VAULT_ISSUE.replace("---\n", "---\nproposal_id: P8\n", 1))
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        prepared: list[tuple[str, Path]] = []
+
+        def file() -> Issue:
+            return proposal_issue.file_review_proposal(folder, recipient.id, "Next proposal", "Words",
+                                                        "hana answers this", details,
+                                                        before_write=lambda identity, path: prepared.append((identity, path)))
+
+        members = staff.StaffSnapshot((recipient, other))
+        with mock.patch.object(staff, "snapshot", return_value=members):
+            with self.assertRaisesRegex(proposal_issue.Refusal, r"Cannot check the record folders.*other-production.md"):
+                _ = file()
+            self.assertEqual(prepared, [])
+            self.assertEqual(list(folder.glob("*.md")), [])
+            self.assertFalse((record_store.state_root() / "record-ids" / "proposal.water").exists())
+            _ = document.write_text(f"- **Proposals:** {former}\n")
+            saved = file()
+        self.assertEqual(saved.value("proposal_id"), "P9")
+        self.assertEqual(prepared, [("P9", saved.path)])
 
     def test_approve_clears_the_waiting_mark_of_a_review_submission(self) -> None:
         folder = self.root / "issues"
@@ -117,8 +163,23 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(approved.value(proposal_issue.REVIEW_MARK_FIELD), "")
         key = new_item_dialog.ScopedSubmissionKey(new_item_dialog.SubmissionKind.PROPOSAL, recipient,
                                                    issue.value("proposal_id"), details.request_id)
+        self.assertFalse(reply_tokens.path().exists())
         with self.assertRaisesRegex(new_item_dialog.SubmissionError, "no longer accepts"):
             _ = proposal_issue.reply_to_submission(issue.path, key, "Stale reply", details.reply_token, owner=key.recipient_id)
+
+    def test_number_replaces_a_legacy_reply_token_with_its_hash(self) -> None:
+        token = "r" + "b" * 42
+        fields: dict[str, object] = {"request_id": "request-1", "request_digest": "a" * 64,
+                                     "evidence": {"kind": "none"}, "images": [], "reply_token": token}
+        text, _ = proposal_issue.set_fields(VAULT_ISSUE, {"review_submission": json.dumps(fields)}, self.issue)
+        _ = self.issue.write_text(text)
+
+        self.assertEqual(proposal_issue.number([self.issue], date(2026, 11, 17)), ["number a proposal.md: P1"])
+        note = self.issue.read_text()
+        self.assertNotIn(token, note)
+        origin = proposal_issue.review_submission(Issue(self.issue, frontmatter(self.issue)))
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        self.assertTrue(new_item_dialog.matches_reply_token(origin, token))
 
     def test_f060_number_scans_the_folder_of_a_selected_numbered_proposal(self) -> None:
         today = date(2026, 11, 17)
@@ -262,6 +323,80 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertNotIn("review_due", text)
         _ = self.run_cli("urgency", str(self.issue), "--level", "normal")
         self.assertNotIn("review_", self.issue.read_text())
+
+    def test_number_reviews_a_private_draft_once_and_refuses_changes_before_publication(self) -> None:
+        draft = self.root / "draft.md"
+        destination = self.root / "new proposal.md"
+        initial = VAULT_ISSUE + "\nUse the new layout.\n"
+        _ = draft.write_text(initial)
+        arguments = ("number", "--draft-file", str(draft), str(destination))
+
+        with (mock.patch.object(proposal_issue, "issue_lock", wraps=proposal_issue.issue_lock) as issue_lock,
+              mock.patch.object(proposal_issue, "proposal_numbers", wraps=proposal_issue.proposal_numbers) as numbers):
+            def approve(_key: review.QuestionKey, text: str, **_options: object) -> review.QuestionAccepted:
+                issue_lock.assert_not_called()
+                numbers.assert_not_called()
+                self.assertFalse(destination.exists())
+                return review.QuestionAccepted(text)
+
+            def change_draft(key: review.QuestionKey, text: str, **options: object) -> review.QuestionAccepted:
+                accepted = approve(key, text, **options)
+                _ = draft.write_text(initial.replace("layout", "menu"))
+                return accepted
+
+            with mock.patch.object(review, "review_question", side_effect=change_draft) as reader:
+                code, _, errors = self.run_cli(*arguments)
+                self.assertEqual(code, 2)
+                self.assertIn("the reviewed proposal draft changed", errors)
+                self.assertFalse(destination.exists())
+                reader.assert_called_once()
+            self.assertFalse((record_store.state_root() / "record-ids/proposal.water").exists())
+
+            _ = draft.write_text(initial)
+            issue_lock.reset_mock()
+            numbers.reset_mock()
+            with mock.patch.object(review, "review_question", side_effect=approve) as reader:
+                self.assertEqual(self.run_cli(*arguments), (0, "number new proposal.md: P1\n", ""))
+                reader.assert_called_once()
+                reviewed = cast(str, reader.call_args.args[1])
+            saved_body = destination.read_text().split("\n---\n", 1)[1]
+            self.assertEqual(reviewed, "## new proposal\n\n" + saved_body)
+            self.assertEqual(draft.read_text(), initial)
+
+    def test_native_proposal_reply_uses_the_named_state(self) -> None:
+        today = date(2026, 11, 25)
+        native = proposal_issue.NoProposalSubmissionReply()
+        _ = self.issue.write_text(VAULT_ISSUE)
+        self.assertTrue(proposal_issue.record_review(self.issue, "Answer: Use the new layout.", NoMark(), today,
+                                                    submission_reply=native))
+        issue = Issue(self.issue, frontmatter(self.issue))
+        self.assertEqual(proposal_issue.review_log(issue)[-1].words, "Answer: Use the new layout.")
+
+        scoped, _ = proposal_issue.set_fields(VAULT_ISSUE, {"review_submission": "{}"}, self.issue)
+        _ = self.issue.write_text(scoped)
+        with self.assertRaisesRegex(new_item_dialog.SubmissionError, "Use the scoped reply"):
+            _ = proposal_issue.record_review(self.issue, "Answer: Use the new layout.", NoMark(), today,
+                                             submission_reply=native)
+        self.assertEqual(self.issue.read_text(), scoped)
+
+    def test_number_refuses_a_draft_then_numbers_the_revision(self) -> None:
+        draft = VAULT_ISSUE + "\nRead /tmp/proof.txt.\n"
+        _ = self.issue.write_text(draft)
+        with (mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.root / "notify")}),
+              mock.patch.object(review, "review_question",
+                                return_value=review.QuestionAccepted("Use the new layout.")) as reader):
+            code, _, errors = self.run_cli("number", str(self.issue))
+            self.assertEqual(code, 2)
+            self.assertIn("Revise the proposal draft. omit-file-path: /tmp/proof.txt", errors)
+            self.assertEqual(self.issue.read_text(), draft)
+            reader.assert_not_called()
+
+            _ = self.issue.write_text(VAULT_ISSUE + "\nUse the new layout.\n")
+            code, _, errors = self.run_cli("number", str(self.issue))
+            self.assertEqual(code, 0, errors)
+            self.assertIn("P1", frontmatter(self.issue)[proposal_issue.NUMBER_FIELD])
+            self.assertIn("Use the new layout.", self.issue.read_text())
+            reader.assert_called_once()
 
     def run_cli(self, *argv: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -735,6 +870,10 @@ class ProposalIssueTests(unittest.TestCase):
             with self.subTest(outcome=outcome), self.assertRaisesRegex(proposal_issue.Refusal, "The record changed"):
                 _ = action()
             self.assertEqual(self.issue.read_bytes(), before)
+        with self.assertRaisesRegex(proposal_issue.Refusal, "The record changed"):
+            proposal_issue.approve_from_review(self.issue, staff.StaffId(fixture_runtime_id("names")),
+                                               today, ("Approve",), check=refuse)
+        self.assertEqual(self.issue.read_bytes(), before)
 
     def test_fill_ranking_writes_an_empty_ranking_once_under_the_issue_lock(self) -> None:
         self.decision_issue()

@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import TextIO, cast, override
 from unittest.mock import patch
 
+from scripts.console_text.test_support import accepting_console_text, real_review_question
+from scripts.notify import review
 from scripts.production import investigation, staff
-from scripts.review_links import change_page, review_page, test_review_page
+from scripts.review_links import change_page, new_item_dialog, reply_tokens, review_page, test_review_page
 
 RUNNER = staff.StaffRow(staff.StaffId("32102748-cf44-498e-9a53-b710c2a70916"), "showrunner", "show", staff.StaffRoot(),
                         current_session=staff.StaffId("2b7d4419-b8d4-4c43-b9b2-48bed9337f27"))
@@ -31,12 +33,16 @@ class InvestigationTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         staff_file = self.root / "staff.json"
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [RUNNER.to_json(), OWNER.to_json(), OTHER.to_json()]}))
+        _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
+        _ = self.enterContext(patch.object(review, "reviewer_environment", side_effect=OSError("Fixture reviewer.")))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "STAFF_FILE": str(staff_file), "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
-            "REVIEW_LINKS_ROOT": str(self.root / 'reviews'),
+            "REVIEW_LINKS_ROOT": str(self.root / 'reviews'), "NOTIFY_STATE_DIR": str(self.root / "notify"),
+            "XDG_STATE_HOME": str(self.root / "key-state"),
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": OWNER.current_session})))
 
     def command(self, *args: str) -> tuple[int, str, str]:
@@ -47,6 +53,45 @@ class InvestigationTests(unittest.TestCase):
                 arguments.extend(["--waiting-why", "The owner must complete the investigation."])
             result = investigation.main(arguments)
         return result, output.getvalue(), errors.getvalue()
+
+    def test_answer_refuses_a_draft_and_records_a_model_outage(self) -> None:
+        self.assertEqual(self.command("file", "--title", "Find the cause", "--question", "Why did it stop?")[0], 0)
+        before = investigation.load(OWNER.id, "I1")
+        directory = self.root / "notify"
+        with (patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(directory)}),
+              patch.object(review, "review_question", new=real_review_question),
+              patch.object(review, "_review", return_value=review.Unreviewed("reviewer unavailable")) as reader):
+            code, _, errors = self.command("answer", "--id", "I1", "--text", "Read /tmp/result.txt.")
+            self.assertEqual(code, 1)
+            self.assertIn("Revise the investigation answer draft. omit-file-path: /tmp/result.txt", errors)
+            self.assertEqual(investigation.load(OWNER.id, "I1"), before)
+            reader.assert_not_called()
+
+            answer = "The download stopped when the disk filled."
+            code, _, errors = self.command("answer", "--id", "I1", "--text", answer)
+            self.assertEqual(code, 0, errors)
+            self.assertEqual(investigation.load(OWNER.id, "I1").answer, answer)
+            self.assertIn("unreviewed: reviewer unavailable", (directory / "review.jsonl").read_text())
+            reader.assert_called_once()
+
+    def test_answer_reviews_without_the_owner_lock_and_refuses_a_changed_record(self) -> None:
+        report = investigation.file(OWNER.id, "Find the cause", "Which check failed?",
+                                    waiting_why="The owner answers.")
+        answer = "The first check failed."
+        lock = investigation.state_root() / "investigation-locks" / (OWNER.id + ".lock")
+
+        def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+            with lock.open("r") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            investigation.set_waiting_why(OWNER.id, report.id, "The owner checks a new result.")
+            return review.QuestionAccepted(answer)
+
+        with patch.object(review, "review_question", side_effect=read_draft) as reader:
+            with self.assertRaisesRegex(investigation.InvestigationError, "The selected investigation changed"):
+                _ = investigation.answer(OWNER.id, report.id, answer)
+        reader.assert_called_once()
+        current = investigation.load(OWNER.id, report.id)
+        self.assertEqual((current.waiting_why, current.answer), ("The owner checks a new result.", ""))
 
     def test_file_answer_read_and_list(self) -> None:
         question = "Find the cause.\r\n\n## Answer\n\nThis heading is part of the question.\n"
@@ -211,6 +256,35 @@ class InvestigationTests(unittest.TestCase):
             self.assertIsInstance(case.status.slots(delivery.page, delivery.row).question, change_page.AnsweredQuestion)
         finally:
             case.doCleanups()
+
+    def test_answering_a_sent_investigation_uses_only_the_note_hash(self) -> None:
+        kind = new_item_dialog.SubmissionKind.INVESTIGATION
+        request = f"r1-{'0' * 32}-{kind}-{OWNER.id}"
+        proof = reply_tokens.mint()
+        token = reply_tokens.derive(proof)
+        details = new_item_dialog.ReviewSubmission(request, "b" * 64, new_item_dialog.NoEvidence(), (),
+                                                   proof.sha256, reply_token_nonce=proof.nonce)
+        report = investigation.file(OWNER.id, "Find the cause", "Which check failed?",
+                                    waiting_why="The owner answers.", submission=details)
+        path = investigation.folder(OWNER.id) / f"{report.id}.md"
+        key = new_item_dialog.submission_key(kind, OWNER.id, report.id, request)
+        note = path.read_text(encoding="utf-8")
+        self.assertNotIn(token, note)
+        self.assertIn(proof.nonce, note)
+        reply_tokens.path().unlink()
+        answer = "The first check failed."
+
+        def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+            lock = investigation.state_root() / "investigation-locks" / (OWNER.id + ".lock")
+            with lock.open("r") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return review.QuestionAccepted(answer)
+
+        with patch.object(review, "review_question", side_effect=read_draft) as reader:
+            self.assertTrue(investigation.answer_submission(path, new_item_dialog.read_submission_key(key),
+                                                            answer, token, owner=OWNER.id))
+        reader.assert_called_once()
+        self.assertFalse(reply_tokens.path().exists())
 
     def test_all_owners_number_records_under_one_lock(self) -> None:
         def file_one(number: int) -> str:

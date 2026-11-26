@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, cast
 
 from scripts.aws_target import ledger, run_cost
 from scripts.lib import conf
+from scripts.lib.build_steps import read_step_names
 
 if TYPE_CHECKING:
     from scripts.aws_target.measurement import MeasurementUnavailable, number
@@ -84,30 +85,32 @@ def gate_type_report(directory: Path, day: str, days: int) -> GateCostReport:
     runs, omitted, fallbacks = measured.runs, measured.omitted, measured.fallbacks
     kinds = run_cost.KINDS
     allocations = run_cost.billed_allocations(run_cost.spot_bills(book, start, end), runs)
-    lines = ['| Machine type | Merge gates | Targeted tests | All runs |', '|---|---:|---:|---:|']
+    gate = read_step_names().shown('gate').capitalize()
+    lines = [f'| Machine type | {gate}s | Targeted tests | All runs |', '|---|---:|---:|---:|']
     sizes = sorted({run.instance_type for run in runs})
     for size in sizes:
         selected = [run for run in runs if run.instance_type == size]
-        cells = [run_cost_cell([run for run in selected if run.mode == mode], allocations) for mode, _label in kinds]
+        cells = [run_cost_cell([run for run in selected if run.mode == mode], allocations) for mode in kinds]
         lines.append(f'| {size} | ' + ' | '.join([*cells, run_cost_cell(selected, allocations)]) + ' |')
     if len(sizes) >= 2:
-        cells = [run_cost_cell([run for run in runs if run.mode == mode], allocations) for mode, _label in kinds]
+        cells = [run_cost_cell([run for run in runs if run.mode == mode], allocations) for mode in kinds]
         lines.append('| All types | ' + ' | '.join([*cells, run_cost_cell(runs, allocations)]) + ' |')
     source = (f'Source: cloud-gate-launches.jsonl and charges/<day>.json; UTC {start.date()} through {end.date() - timedelta(days=1)} '
               + f'({days} days); billed days only; {omitted} rows omitted with no kind or matching launch.')
-    lines.extend(('', '| Day (UTC) | Merge gates | Merge gate test time | Merge gate box time | Targeted tests | Targeted test time | Targeted box time | Cost per run |',
+    lines.extend(('', f'| Day (UTC) | {gate}s | {gate} test time | {gate} box time |'
+        + ' Targeted tests | Targeted test time | Targeted box time | Cost per run |',
         '|---|---:|---:|---:|---:|---:|---:|---:|'))
     for at in sorted({run.day for run in runs}, reverse=True):
         selected = [run for run in runs if run.day == at]
         cells: list[str] = []
-        for mode, _label in kinds:
+        for mode in kinds:
             matching = [run for run in selected if run.mode == mode]
             cells.extend((str(len(matching)), run_cost.median_run_time([run.test_s for run in matching]),
                           run_cost.median_run_time([run.box_s for run in matching])))
         cost = trend_cost_cell(selected, allocations)
         lines.append(f'| {at} | ' + ' | '.join([*cells, cost]) + ' |')
     totals: list[str] = []
-    for mode, _label in kinds:
+    for mode in kinds:
         matching = [run for run in runs if run.mode == mode]
         totals.extend((str(len(matching)), run_cost.median_run_time([run.test_s for run in matching]),
                        run_cost.median_run_time([run.box_s for run in matching])))

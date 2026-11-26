@@ -1,4 +1,4 @@
-"""The line of checkpoint lands that wait for the merge gate.
+"""The queue of checkpoints that wait for the integrate job.
 
 The land runner takes each item with `next`, in order. Each item has a label, which is the runner's own
 line, and the commits it lands: the third field of each line of its batch file, and each `--commit`.
@@ -260,7 +260,7 @@ def remove(label: str) -> None:
 
 
 def take_next() -> str:
-    """Check the first item before removal and format its label and batch path."""
+    """Return the saved batch path unchanged so integration can resume the same batch."""
     with edited() as items:
         if not items:
             return ""

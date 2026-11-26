@@ -23,8 +23,8 @@ if TYPE_CHECKING:
 CONTROL = Path('/var/lib/hana-aws')
 IMAGE_RUNTIME = Path('/var/lib/hana-runtime')
 DATA = Path('/var/lib/hana')
-PERMIT = Path('/run/hana-aws/work-permit.json')
-GENERATION = Path('/run/hana-aws/generation')
+RUNNER_HOME = DATA / 'runner'
+PERMIT = Path('/run/hana-aws/active-work-permit.json')
 BOOT_ID = Path('/proc/sys/kernel/random/boot_id')
 WORK_SLICE = 'hana-work.slice'
 # NixOS gives a raw unit no system PATH; the guest programs run systemctl and systemd-run from here.
@@ -92,9 +92,9 @@ class WorkPermit:
 
 
 class PermitRefusal(StrEnum):
+    NOT_INSTALLED = 'no permit record is installed'
     UNREADABLE = 'no valid permit record is readable'
     BOOT_MISMATCH = 'the permit does not match the current boot'
-    GENERATION_MISMATCH = 'the permit does not match the current generation'
     INVALID_EXPIRY = 'the permit expiry is invalid'
     WALL_CLOCK_EXPIRED = 'the wall-clock expiry has passed'
     OUTSIDE_WINDOW = 'the expiry exceeds the permit renewal window'
@@ -111,6 +111,14 @@ class NoWorkPermit:
 Permit = WorkPermit | NoWorkPermit
 
 
+def _generation_number(generation: str) -> int:
+    if generation.isascii() and generation.isdecimal():
+        number = int(generation)
+        if number > 0:
+            return number
+    raise ValueError('The Hana permit generation is invalid')
+
+
 def read_permit(path: Path) -> Permit:
     """Read the permit and record the reason if the guest cannot use it."""
     try:
@@ -119,8 +127,9 @@ def read_permit(path: Path) -> Permit:
             return NoWorkPermit()
         row = cast(dict[str, object], raw)
         generation, boot_id = row['generation'], row['boot_id']
-        if not isinstance(generation, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', generation):
+        if not isinstance(generation, str):
             return NoWorkPermit()
+        _ = _generation_number(generation)
         if not isinstance(boot_id, str) or not boot_id.strip():
             return NoWorkPermit()
         expires = row.get('expires_at')
@@ -128,21 +137,21 @@ def read_permit(path: Path) -> Permit:
                 or not math.isfinite(expires) or expires <= 0):
             return NoWorkPermit(PermitRefusal.INVALID_EXPIRY)
         return WorkPermit(float(expires), generation, boot_id)
+    except FileNotFoundError:
+        return NoWorkPermit(PermitRefusal.NOT_INSTALLED)
     except OverflowError:
         return NoWorkPermit(PermitRefusal.INVALID_EXPIRY)
     except (OSError, UnicodeError, ValueError, KeyError):
         return NoWorkPermit()
 
 
-def check_permit(settings: SafetySettings, permit: Permit, generation: str, boot_id: str,
+def check_permit(settings: SafetySettings, permit: Permit, boot_id: str,
                  now: float) -> WorkPermit | PermitRefusal:
     """Require the current identity and a bounded wall-clock expiry."""
     if isinstance(permit, NoWorkPermit):
         return permit.reason
     if not boot_id or permit.boot_id != boot_id:
         return PermitRefusal.BOOT_MISMATCH
-    if not generation or permit.generation != generation:
-        return PermitRefusal.GENERATION_MISMATCH
     if not math.isfinite(permit.expires_at) or permit.expires_at <= 0:
         return PermitRefusal.INVALID_EXPIRY
     remaining = permit.expires_at - now
@@ -151,11 +160,6 @@ def check_permit(settings: SafetySettings, permit: Permit, generation: str, boot
     if not remaining <= settings.permit_max_seconds:
         return PermitRefusal.OUTSIDE_WINDOW
     return permit
-
-
-def fresh_permit(settings: SafetySettings, permit: Permit, generation: str, boot_id: str,
-                 clock: Callable[[], float]) -> bool:
-    return isinstance(check_permit(settings, permit, generation, boot_id, clock()), WorkPermit)
 
 
 @dataclass(frozen=True)
@@ -167,11 +171,7 @@ class GuestPaths:
 
     @property
     def permit(self) -> Path:
-        return self.directory / 'work-permit.json'
-
-    @property
-    def generation(self) -> Path:
-        return self.directory / 'generation'
+        return self.directory / PERMIT.name
 
     @property
     def lock(self) -> Path:
@@ -258,14 +258,14 @@ def read_deadline(path: Path) -> PreviousDeadline:
 
 
 def observe_permit(settings: SafetySettings, permit: Permit, previous: PreviousDeadline,
-                   generation: str, boot_id: str, *, clock: Callable[[], float],
+                   boot_id: str, *, clock: Callable[[], float],
                    uptime: Callable[[], float]) -> BoundPermit:
     """Bound each new permit read without extending an unchanged permit's boot-clock deadline."""
     if isinstance(previous, PermitDeadlineUnreadable):
         return PermitRefusal.DEADLINE_UNREADABLE
     boot_time = uptime()
     now = clock()
-    checked = check_permit(settings, permit, generation, boot_id, now)
+    checked = check_permit(settings, permit, boot_id, now)
     if isinstance(checked, PermitRefusal):
         return checked
     if isinstance(previous, PermitDeadline) and previous.permit == checked:
@@ -278,20 +278,38 @@ def bound_permit(settings: SafetySettings, paths: GuestPaths, *, clock: Callable
     """Read and record permission while the caller holds the guest lock."""
     previous = read_deadline(paths.deadline)
     permit = observe_permit(settings, read_permit(paths.permit), previous,
-        read_identity(paths.generation), read_identity(paths.boot_id), clock=clock, uptime=uptime)
+        read_identity(paths.boot_id), clock=clock, uptime=uptime)
     if isinstance(permit, PermitDeadline) and permit != previous:
         atomic_record(paths.deadline, {**asdict(permit.permit), 'monotonic_deadline': permit.monotonic_deadline})
     return permit
 
 
-def write_permit(settings: SafetySettings, permit: WorkPermit, *, paths: GuestPaths = GUEST_PATHS,
+def write_permit(settings: SafetySettings, permit: WorkPermit, *, expected_generation: int,
+                 paths: GuestPaths = GUEST_PATHS,
                  clock: Callable[[], float] = time.time) -> None:
-    """Renew permission atomically unless the guest has fenced shutdown."""
+    """Install a permit or confirm an exact replay under the guest lock."""
+    generation = _generation_number(permit.generation)
     with guest_lock(paths):
         if paths.fence.exists():
-            raise ValueError('Shutdown is fenced; permit renewal is refused')
-        if not fresh_permit(settings, permit, read_identity(paths.generation), read_identity(paths.boot_id), clock):
-            raise ValueError('The permit identity or renewal window is invalid')
+            raise ValueError('Hana shutdown is fenced')
+        boot = read_identity(paths.boot_id)
+        current = read_permit(paths.permit)
+        if isinstance(check_permit(settings, permit, boot, clock()), PermitRefusal):
+            raise ValueError('The Hana permit identity or renewal window is invalid')
+        if current == permit:
+            return
+        if isinstance(current, WorkPermit):
+            if current.boot_id != boot:
+                raise ValueError('The installed Hana permit belongs to another boot')
+            previous = int(current.generation)
+        elif current.reason is PermitRefusal.NOT_INSTALLED:
+            previous = 0
+        else:
+            raise ValueError('The installed Hana permit is unreadable')
+        if type(expected_generation) is not int or expected_generation != previous:
+            raise ValueError('The Hana permit generation changed')
+        if generation <= previous:
+            raise ValueError('The Hana permit generation did not increase')
         atomic_record(paths.permit, asdict(permit))
 
 
@@ -326,7 +344,7 @@ def check_deadline(settings: SafetySettings, permit: BoundPermit, *, clock: Call
     if isinstance(permit, PermitRefusal):
         return permit
     work = permit.permit
-    checked = check_permit(settings, work, work.generation, work.boot_id, clock())
+    checked = check_permit(settings, work, work.boot_id, clock())
     if isinstance(checked, PermitRefusal):
         return checked
     return permit if uptime() < permit.monotonic_deadline else PermitRefusal.BOOT_CLOCK_EXPIRED

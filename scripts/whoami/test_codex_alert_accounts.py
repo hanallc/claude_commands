@@ -34,7 +34,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_worker
 from scripts.agents import stop_resume
 from scripts.whoami import usage_store
 from scripts.notify.push_texts import RenderedPush, catalog, render_entry
-from scripts.notify.user_action import ActionRequired
+from scripts.notify.user_action import ActionRequired, NoActionRequired
 from scripts.whoami.test_quota_alert import REGISTRY
 from scripts.whoami.credit_accounts_test_support import hold_credit_accounts, set_credits
 from scripts.whoami.quota_alert_test_support import complete_worker_moves, worker_mode_broadcasts
@@ -89,8 +89,6 @@ class CodexAccountAlertTests(unittest.TestCase):
         config = self.root / "showrunners.conf"
         _ = config.write_text(("""# range: 0..
 threshold_percent=1
-# range: 0..
-repeat_minutes=30
 # range: 0..
 stall_minutes=5
 faults_to=director
@@ -158,7 +156,7 @@ always=director
         # The low account's stored allowance must never make it its own fallback.
         self.save_room(source, 100, reset=self.now + timedelta(hours=1))
         for credits in ("on", "off"):
-            for fallback in ("codex2", "Claude"):
+            for fallback in ("codex2", "alone"):
                 for left in (2, 1, 0, 3):
                     with self.subTest(credits=credits, fallback=fallback, left=left):
                         self.save_room(target, 80 if fallback == "codex2" else 0,
@@ -173,53 +171,59 @@ always=director
                         self.assertIsInstance(push, quota_alert.UserPush)
                         assert isinstance(push, quota_alert.UserPush)
                         rendered = push.rendered
-                        self.assertEqual(rendered.values["fallback"], fallback)
-                        self.assertNotEqual(rendered.values["fallback"], source.label)
-                        self.assertLessEqual(len(rendered.title), 45)
-                        self.assertLess(len(rendered.body), 500)
+                        outcome = ("codex2 next" if fallback == "codex2" else "paid credits next" if credits == "on"
+                                   else "units work alone next")
+                        self.assertEqual(rendered.values, {
+                            "account": "codex1", "remaining": f"{left}%", "outcome_title": outcome,
+                        })
+                        self.assertNotEqual(rendered.values["outcome_title"], f"{source.label} next")
+                        self.assertLessEqual(len(rendered.title), 44)
                         self.assertLess(len(rendered.message), 500)
-                        if credits == "on" and fallback == "Claude":
-                            title = "codex1 Codex workers will use paid credits"
-                            body = (f"codex1 has {left}% of its weekly usage left, and no move is set up for its workers. "
-                                    + f"When it runs out, they spend its paid credits, then move to {fallback}. Nothing is needed.")
-                        elif fallback == "Claude":
-                            title = "codex1 Codex workers will move to Claude"
-                            body = (f"codex1 has {left}% of its weekly usage left. When it runs out, its workers move on their own "
-                                    + "to Claude, since no other Codex account has room. Nothing is needed.")
-                        else:
-                            title = "codex1 Codex workers will move to codex2"
-                            body = (f"codex1 has {left}% of its weekly usage left. When it runs out, its workers move on their own "
-                                    + "to codex2, the Codex account with room whose weekly reset comes first. Nothing is needed.")
-                        self.assertEqual(rendered.title, title)
-                        self.assertEqual(rendered.body, body)
-                        self.assertEqual(rendered.action, ActionRequired(
-                            "Optional: to move them at 1% instead, type in the natedev session: "
-                            + f"/account_moves when workers reach 1% switch to {fallback}"))
+                        self.assertEqual(rendered.title, f"codex1 has {left}% left; {outcome}")
+                        self.assertEqual(rendered.body, "")
+                        self.assertEqual(rendered.action, NoActionRequired())
+
+    def test_codex_reminder_shows_a_tiny_positive_quota_as_less_than_one_percent(self) -> None:
+        _ = self.account(2)
+        set_credits(self.credits, "codex2", "on")
+        note = self.note(2, "active", 0.0000123457)
+
+        push = quota_alert.codex_next_move_push(note, now=self.now)
+
+        assert isinstance(push, quota_alert.UserPush)
+        self.assertLessEqual(len(push.rendered.title), 44)
+        self.assertEqual(push.rendered.title, "codex2 has <1% left; paid credits next")
+
+    def test_codex_reminder_keeps_full_account_labels(self) -> None:
+        source = self.account(123456789)
+        target = self.account(987654321)
+        self.save_room(target, 80)
+        note = self.note(123456789, "active", 2)
+
+        push = quota_alert.codex_next_move_push(note, now=self.now)
+
+        assert isinstance(push, quota_alert.UserPush)
+        self.assertEqual(push.name, source.label)
+        self.assertEqual(push.rendered.title, f"{source.label} has 2% left; {target.label} next")
 
     def test_codex_reminder_catalog_examples_match_the_three_chosen_texts(self) -> None:
         entry = next(entry for entry in catalog() if entry.id == "quota.codex_next_move")
         expected = {
-            "credits_on": ("codex2", "2%", "codex1",
-                "codex2 Codex workers will use paid credits",
-                "codex2 has 2% of its weekly usage left, and no move is set up for its workers. When it runs out, they spend its paid credits, then move to codex1. Nothing is needed."),
-            "credits_off_codex": ("codex2", "2%", "codex1",
-                "codex2 Codex workers will move to codex1",
-                "codex2 has 2% of its weekly usage left. When it runs out, its workers move on their own to codex1, the Codex account with room whose weekly reset comes first. Nothing is needed."),
-            "credits_off_claude": ("codex1", "1%", "Claude",
-                "codex1 Codex workers will move to Claude",
-                "codex1 has 1% of its weekly usage left. When it runs out, its workers move on their own to Claude, since no other Codex account has room. Nothing is needed."),
+            "credits_on": ("codex2", "<1%", "paid credits next"),
+            "credits_off_codex": ("codex2", "2%", "codex1 next"),
+            "credits_off_alone": ("codex1", "1%", "units work alone next"),
         }
         self.assertEqual({example.name for example in entry.examples}, set(expected))
         for example in entry.examples:
             with self.subTest(example=example.name):
-                account, remaining, fallback, title, body = expected[example.name]
+                account, remaining, outcome = expected[example.name]
                 rendered = render_entry(entry, example.values)
-                self.assertEqual((rendered.values["account"], rendered.values["remaining"], rendered.values["fallback"]),
-                                 (account, remaining, fallback))
-                self.assertEqual((rendered.title, rendered.body), (title, body))
-                self.assertEqual(rendered.action, ActionRequired(
-                    "Optional: to move them at 1% instead, type in the natedev session: "
-                    + f"/account_moves when workers reach 1% switch to {fallback}"))
+                self.assertEqual(rendered.values, {
+                    "account": account, "remaining": remaining, "outcome_title": outcome,
+                })
+                self.assertEqual(rendered.title, f"{account} has {remaining} left; {outcome}")
+                self.assertEqual(rendered.body, "")
+                self.assertEqual(rendered.action, NoActionRequired())
 
     def test_scheduled_codex_move_fires_once_consumes_entry_and_keeps_auto_role_reason(self) -> None:
         source, target = self.account(1), self.account(2)
@@ -310,7 +314,7 @@ always=director
         entry = next_moves.add_next_move("workers", 1, "codex2")
         append_move = moves.append_move
 
-        def append_or_fail(row: moves.MoveEntry) -> None:
+        def append_or_fail(row: moves.MoveWriteEntry) -> None:
             if row["kind"] == "failed":
                 raise OSError("fixture failed-row append failed")
             append_move(row)
@@ -333,7 +337,7 @@ always=director
         entry = next_moves.add_next_move("workers", 1, "codex2")
         append_move = moves.append_move
 
-        def refuse_failure_append(row: moves.MoveEntry) -> None:
+        def refuse_failure_append(row: moves.MoveWriteEntry) -> None:
             if row["kind"] == "failed":
                 raise OSError("fixture failed-row append failed")
             append_move(row)
@@ -794,7 +798,7 @@ always=director
         _ = self.note(number, "inactive", 80)
         return agent_accounts.KnownCodexAccount(home, login, f"codex{number}")
 
-    def note(self, number: int, state: str, left: int, credits: str = "0") -> quota_alert.AgentNote:
+    def note(self, number: int, state: str, left: float, credits: str = "0") -> quota_alert.AgentNote:
         path = self.root / f"codex{number}.md"
         _ = path.write_text(f"---\nlogin: account{number}@example.invalid\nrole: {'worker' if state == 'active' else '[]'}\nsessions: 0\n"
             + f"weekly_remaining_usage: {left}\ncredit_balance: {credits}\n"
@@ -876,7 +880,7 @@ always=director
         errors = io.StringIO()
         with patch.object(usage_store, "write", side_effect=PermissionError("read-only store")), redirect_stderr(errors):
             _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=readings)
-        self.assertEqual([push.title for push in self.pushes], ["codex1 Codex workers will use paid credits"])
+        self.assertEqual([push.title for push in self.pushes], ["codex1 has 1% left; paid credits next"])
         self.assertIn("read-only store", errors.getvalue())
 
     def test_swap_advice_does_not_write_usage_store(self) -> None:
@@ -1249,16 +1253,15 @@ always=director
                 with self.subTest(id=entry.id, example=example.name):
                     rendered = render_entry(entry, example.values)
                     self.assertEqual((rendered.sender, rendered.need), (example.values["sender"], "decision"))
-                    self.assertIsInstance(rendered.action, ActionRequired)
-                    assert isinstance(rendered.action, ActionRequired)
-                    self.assertIn(f"remove {example.values['account']} from codex_credit_accounts", rendered.action.text)
-                    keys = {"sender", "account", "machine", "credits", "refill"}
+                    self.assertEqual(rendered.action, ActionRequired(
+                        f"To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts {example.values['credit_accounts']}"))
+                    keys = {"sender", "account", "machine", "credits", "refill", "credit_accounts"}
                     if entry.id == "quota.paid_credits":
                         keys.add("next_reset")
-                        self.assertIn("Claude", rendered.body)
+                        self.assertIn("now spends paid credits", rendered.title)
                     else:
-                        self.assertNotIn("Claude", rendered.body)
-                        self.assertIn("queued move", rendered.body)
+                        self.assertIn("uses credits until move", rendered.title)
+                    self.assertEqual(rendered.body, "")
                     self.assertEqual(set(example.values), keys)
 
     def test_codex_refusal_and_swap_advice_use_worker_wording_and_the_home_note_number(self) -> None:
@@ -1403,7 +1406,7 @@ always=director
             return self.report(a if home == a.home else b, 1 if home == a.home else 80)
         with patch.object(quota_alert, "codex_live", side_effect=live):
             _ = quota_alert.alert([note])
-            self.assertEqual([push.title for push in self.pushes], ["codex1 Codex workers will move to codex2"])
+            self.assertEqual([push.title for push in self.pushes], ["codex1 has 1% left; codex2 next"])
             self.assertEqual(self.relayed, [])
             quota_alert.STATE.unlink(missing_ok=True)
             self.sent.clear()

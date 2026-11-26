@@ -28,14 +28,14 @@ This ledger replaces the counter with state:
 Convergence advisories, all computed from recorded state and all reported
 rather than enforced:
 
-  * a finding failed to close `MAX_FIX_ATTEMPTS` times
-  * a finding reopened `MAX_REOPENS` times after being accepted
-  * the gating open count failed to decrease across `STALLED_ROUNDS` rounds
+  * a finding failed to close `max_fix_attempts` times
+  * a finding reopened `max_reopens` times after being accepted
+  * the gating open count failed to decrease across `stalled_rounds` rounds
   * the phase spent its repair budget, which is the first round's gating count
-    times `REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`
-  * one worker ran `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row
-  * one worker had a review canceled more than `MAX_REVIEW_CANCELLATIONS` times
-  * a runaway backstop at `RUNAWAY_ROUNDS` rounds
+    times `repair_rounds_per_finding`, never below `min_repair_budget`
+  * one worker ran `max_consecutive_same_kind_passes` passes of one kind in a row
+  * one worker had a review canceled more than `max_review_cancellations` times
+  * a runaway backstop at `runaway_rounds` rounds
 
 Every one of those limits is set in `~/.claude/config/direct.conf`, which is
 authoritative: no limit has a compiled default, and a missing or unusable value
@@ -68,6 +68,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict, cast
 
+from scripts.direct import recorder_state  # noqa: E402
 from scripts.lib import conf, unit_runs  # noqa: E402
 from scripts.history.rounds import pass_ledger_round, phase_rounds, refunded_batches  # noqa: E402
 from scripts.usage.agents_log import LENSES as REVIEW_LENSES  # noqa: E402
@@ -78,9 +79,7 @@ FORMER_WORKER = "delegate"
 
 SCHEMA_VERSION = 1
 STATE_FILENAME = "findings_state.json"
-PROGRESS_STATE_FILENAME = "progress_history_state.json"
-# The progress recorder's key for the older open phases (progress_history.OPEN_PHASES_KEY).
-OPEN_PHASES_KEY = "open_phases"
+PROGRESS_STATE_FILENAME = recorder_state.STATE_FILENAME
 PHASE_HELP = "the plan phase id this call is for; required when more than one phase is open"
 
 SEVERITIES = ("blocker", "minor", "nit")
@@ -209,13 +208,17 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
 
     The newest open phase owns `findings_state.json`, which assign_claude.py checks.
     An older open phase named with `--phase` writes its parked file.
+    A closed phase writes its parked file unless the live file already holds it.
     """
     session_dir.mkdir(parents=True, exist_ok=True)
     live = _state_path(session_dir)
     instance_id = _string(state.get("phase_instance_id"))
     displaced = _ledger_instance(live) if live.exists() else ""
-    newest = _newest_open_instance(session_dir)
-    if live.exists() and displaced != instance_id and instance_id and newest and newest != instance_id:
+    open_instances = _open_instances(session_dir)
+    newest = open_instances[-1] if open_instances else ""
+    # A closed phase never takes the live file from another phase.
+    closed = bool(instance_id) and instance_id not in open_instances and displaced != instance_id
+    if closed or (live.exists() and displaced != instance_id and instance_id and newest and newest != instance_id):
         target = _parked_path(session_dir, instance_id)
     else:
         target = live
@@ -235,28 +238,31 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
 
 
 def _progress_state(session_dir: Path) -> dict[str, object] | None:
-    path = session_dir / PROGRESS_STATE_FILENAME
-    if not path.exists():
-        return None
     try:
-        return _json_object(path.read_text(encoding="utf-8"))
-    except OSError:
+        return recorder_state.read_state(session_dir / PROGRESS_STATE_FILENAME)
+    except (OSError, ValueError):
         return None
 
 
-def _open_phases(progress: dict[str, object]) -> list[dict[str, object]]:
-    """Every open phase, oldest first: the older ones the recorder parks, then the newest."""
-    phases = _object_list(progress.get(OPEN_PHASES_KEY))
-    current = _object_dict(progress.get("phase"))
-    if current is not None and _string(current.get("status")) == "active":
-        phases.append(current)
-    return phases
-
-
-def _newest_open_instance(session_dir: Path) -> str:
+def _open_instances(session_dir: Path) -> list[str]:
     progress = _progress_state(session_dir)
-    phases = _open_phases(progress) if progress is not None else []
-    return _string(phases[-1].get("instance_id")) if phases else ""
+    phases = recorder_state.open_phases(progress) if progress is not None else []
+    return [_string(phase.get("instance_id")) for phase in phases]
+
+
+def _started_instance(session_dir: Path, phase_id: str) -> str:
+    """Return the newest instance the run started for the named phase."""
+    history_file = _history_file(session_dir)
+    try:
+        lines = history_file.read_text(encoding="utf-8").splitlines() if history_file is not None else []
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        event = _json_object(line)
+        if (event is not None and _string(event.get("event_type")) == "phase_started"
+                and _string(event.get("phase_id")) == phase_id):
+            return _string(event.get("phase_instance_id"))
+    return ""
 
 
 def _newest_ledger_instance(session_dir: Path, phase_id: str) -> str:
@@ -274,24 +280,26 @@ def _newest_ledger_instance(session_dir: Path, phase_id: str) -> str:
 
 
 def _phase_identity(
-    session_dir: Path, phase_id: str = "", *, closed_phase_ok: bool = False,
+    session_dir: Path, phase_id: str = "", *, closed_phase_ok: bool = False, late_finding: bool = False,
 ) -> tuple[str, str]:
     """Resolve the phase for this ledger command.
 
     A named phase must be open unless the caller permits a closed phase.
+    A late finding goes to the newest instance the run started, the one review-trial reads.
     An unnamed command selects the only open phase.
     Several open phases require an explicit name.
     """
     progress = _progress_state(session_dir)
     if progress is None:
         return "", phase_id
-    phases = _open_phases(progress)
+    phases = recorder_state.open_phases(progress)
     if phase_id:
         for phase in phases:
             if _string(phase.get("id")) == phase_id:
                 return _string(phase.get("instance_id")), phase_id
-        if closed_phase_ok:
-            instance_id = _newest_ledger_instance(session_dir, phase_id)
+        if late_finding or closed_phase_ok:
+            instance_id = (_started_instance(session_dir, phase_id) if late_finding
+                           else _newest_ledger_instance(session_dir, phase_id))
             if instance_id:
                 return instance_id, phase_id
         open_ids = ", ".join(_string(phase.get("id")) for phase in phases) or "none"
@@ -299,22 +307,14 @@ def _phase_identity(
     if len(phases) > 1:
         open_ids = ", ".join(_string(phase.get("id")) for phase in phases)
         raise SystemExit(f"{len(phases)} phases are open ({open_ids}); name one with --phase")
-    phase = phases[0] if phases else _object_dict(progress.get("phase"))
-    if phase is None:
+    if not phases:
         return "", ""
-    if not closed_phase_ok and _string(phase.get("status")) not in ("", "active"):
-        raise SystemExit(f"Phase {_string(phase.get('id'))} is not open (open phases: none)")
+    phase = phases[0]
     return _string(phase.get("instance_id")), _string(phase.get("id"))
 
 
 def _history_file(session_dir: Path) -> Path | None:
-    path = session_dir / PROGRESS_STATE_FILENAME
-    if not path.exists():
-        return None
-    try:
-        progress = _json_object(path.read_text(encoding="utf-8"))
-    except OSError:
-        return None
+    progress = _progress_state(session_dir)
     if progress is None:
         return None
     value = _string(progress.get("history_file"))
@@ -359,11 +359,16 @@ def _fresh_state(instance_id: str, phase_id: str, now: float) -> dict[str, objec
 
 
 def _read_state(
-    session_dir: Path, now: float, phase: str = "", *, closed_phase_ok: bool = False,
+    session_dir: Path, now: float, phase: str = "", *, closed_phase_ok: bool = False, late_finding: bool = False,
 ) -> dict[str, object]:
     """Load the phase's ledger: the live file, a parked one, or a fresh one."""
-    instance_id, phase_id = _phase_identity(session_dir, phase, closed_phase_ok=closed_phase_ok)
-    return read_phase_ledger(session_dir, instance_id, phase_id, now)
+    instance_id, phase_id = _phase_identity(session_dir, phase, closed_phase_ok=closed_phase_ok,
+                                            late_finding=late_finding)
+    state = read_phase_ledger(session_dir, instance_id, phase_id, now)
+    if not (closed_phase_ok or late_finding) and not instance_id and _string(state.get("phase_instance_id")):
+        ledger_phase = _string(state.get("phase_id"))
+        raise SystemExit(f"Phase {ledger_phase} is not open (open phases: none)")
+    return state
 
 
 def read_phase_ledger(
@@ -456,7 +461,7 @@ def _astra_due(entry: dict[str, object], repair_round: int, settings_read: conf.
     if _string(entry.get("state")) != STATE_OPEN:
         return False
     attempts = _integer(entry.get("fix_attempts"))
-    triggered = repair_round >= settings_read.whole("ROUTING_FROM_ROUND") or attempts >= settings_read.whole("ASTRA_AFTER_FAILED_FIXES")
+    triggered = repair_round >= settings_read.whole("routing_from_round") or attempts >= settings_read.whole("astra_after_failed_fixes")
     return triggered and not any(
         _integer(record.get("fix_attempts"), -1) == attempts
         for record in _object_list(entry.get("astra_reviews"))
@@ -611,7 +616,7 @@ def _repair_budget(state: dict[str, object], settings_read: conf.ConfigRead) -> 
     if not rounds:
         return 0
     initial = _integer(rounds[0].get("gating_open_before"), 0)
-    return max(settings_read.whole("MIN_REPAIR_BUDGET"), math.ceil(initial * settings_read.number("REPAIR_ROUNDS_PER_FINDING")))
+    return max(settings_read.whole("min_repair_budget"), math.ceil(initial * settings_read.number("repair_rounds_per_finding")))
 
 
 def _gating_severities(state: dict[str, object]) -> tuple[str, ...]:
@@ -703,30 +708,30 @@ def _advisory_reason(
         entry = _finding(state, finding_id)
         if _string(entry.get("state")) != STATE_OPEN:
             continue
-        if _integer(entry.get("reopen_count")) >= settings_read.whole("MAX_REOPENS"):
+        if _integer(entry.get("reopen_count")) >= settings_read.whole("max_reopens"):
             return f"{finding_id} reopened {_integer(entry.get('reopen_count'))} times after being accepted"
     for finding_id in sorted(_findings(state)):
         entry = _finding(state, finding_id)
         if _string(entry.get("state")) != STATE_OPEN:
             continue
-        if _integer(entry.get("fix_attempts")) >= settings_read.whole("MAX_FIX_ATTEMPTS"):
+        if _integer(entry.get("fix_attempts")) >= settings_read.whole("max_fix_attempts"):
             attempts = _integer(entry.get("fix_attempts"))
             return f"{finding_id} failed to close after {attempts} repair attempts"
     kind, run = _consecutive_same_kind(passes)
-    if run >= settings_read.whole("MAX_CONSECUTIVE_SAME_KIND_PASSES"):
+    if run >= settings_read.whole("max_consecutive_same_kind_passes"):
         return f"{run} consecutive {kind} passes ran without the phase advancing"
     cancellations = _review_cancellations(passes)
-    if cancellations > settings_read.whole("MAX_REVIEW_CANCELLATIONS"):
+    if cancellations > settings_read.whole("max_review_cancellations"):
         return f"the blind review was canceled {cancellations} times, so it is never completing"
     # Stall and budget read live rounds: an abandoned round repaired nothing, so
     # counting it would stop the phase for a repair that never ran.
     rounds = _live_rounds(state)
-    if len(rounds) >= settings_read.whole("STALLED_ROUNDS"):
+    if len(rounds) >= settings_read.whole("stalled_rounds"):
         previous = _integer(rounds[-1].get("gating_open_before"), -1)
         earlier = _integer(rounds[-2].get("gating_open_before"), -1)
         if previous >= 0 and earlier >= 0 and gating_open >= previous >= earlier:
             trend = f"({earlier} -> {previous} -> {gating_open})"
-            return f"the gating open count has not decreased for {settings_read.whole("STALLED_ROUNDS")} rounds {trend}"
+            return f"the gating open count has not decreased for {settings_read.whole("stalled_rounds")} rounds {trend}"
     budget = _repair_budget(state, settings_read)
     if budget and len(rounds) >= budget:
         initial = _integer(rounds[0].get("gating_open_before"), 0)
@@ -735,17 +740,23 @@ def _advisory_reason(
             f"past the {budget}-round repair budget, with {gating_open} still open"
         )
     # Refunded batches spend no repair round, including this advisory threshold.
-    if len(rounds) >= settings_read.whole("RUNAWAY_ROUNDS"):
-        return f"the runaway backstop of {settings_read.whole("RUNAWAY_ROUNDS")} fix rounds was reached"
+    if len(rounds) >= settings_read.whole("runaway_rounds"):
+        return f"the runaway backstop of {settings_read.whole("runaway_rounds")} fix rounds was reached"
     return ""
 
 
 def _open(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now, _arg_string(args, "phase"))
+    phase = _arg_string(args, "phase")
+    state = _read_state(session_dir, now, phase, late_finding=bool(phase))
     severity = _arg_string(args, "severity")
     held = bool(getattr(args, "held_for_decision", False))
+    accepted = bool(getattr(args, "accepted", False))
+    if accepted and (not phase or _string(state.get("phase_instance_id")) in _open_instances(session_dir)):
+        raise SystemExit("--accepted records a late finding in a closed phase; an open phase accepts a finding after review")
+    if accepted and held:
+        raise SystemExit("--accepted and --held-for-decision exclude each other")
     lenses = _arg_string(args, "lens").split(",")
     if held and "simplify" not in lenses:
         raise SystemExit("--held-for-decision requires --lens simplify")
@@ -762,12 +773,14 @@ def _open(args: argparse.Namespace) -> None:
         "detail": _arg_string(args, "detail"),
         "caught_by": _caught_by(args),
         "lens": _arg_string(args, "lens"),
-        "state": STATE_HELD if held else STATE_OPEN,
+        "state": STATE_HELD if held else STATE_ACCEPTED if accepted else STATE_OPEN,
         "opened_at": now,
         "opened_round": len(_rounds(state)),
         "fix_attempts": 0,
         "reopen_count": 0,
     }
+    if accepted:
+        entry["accepted_at"] = now
     _findings(state)[finding_id] = entry
     state["next_ordinal"] = ordinal + 1
     _write_state(session_dir, state)
@@ -789,6 +802,23 @@ def _open(args: argparse.Namespace) -> None:
             "round": len(_rounds(state)),
         },
     )
+    if accepted:
+        # A late fixed finding counts as accepted in the round tally, as a verdict would make it.
+        _append_event(
+            session_dir,
+            state,
+            {
+                "event_type": "finding_verdict",
+                "timestamp": _iso_time(now),
+                "timestamp_epoch": now,
+                "finding_id": finding_id,
+                "verdict": "accepted",
+                "resulting_state": STATE_ACCEPTED,
+                "fix_attempts": 0,
+                "reopen_count": 0,
+                "round": len(_rounds(state)),
+            },
+        )
     print(finding_id)
 
 
@@ -928,7 +958,7 @@ def _gate(args: argparse.Namespace) -> None:
             "open_counts": payload.get("open_counts"),
         },
     )
-    if _integer(payload.get("repair_round")) >= settings_read.whole("ROUTING_FROM_ROUND") and any(
+    if _integer(payload.get("repair_round")) >= settings_read.whole("routing_from_round") and any(
         _integer(entry.get("fix_attempts")) >= 1
         for entry in _open_entries(state, _gating_severities(state))
     ):
@@ -1083,7 +1113,7 @@ def _dispatch(args: argparse.Namespace) -> None:
     if due:
         raise SystemExit("Astra review due for " + ", ".join(due) + "; record it with findings.py astra")
     kept = _kept_evidence(args, covered)
-    if repair_round >= settings_read.whole("ROUTING_FROM_ROUND"):
+    if repair_round >= settings_read.whole("routing_from_round"):
         missing_kept = sorted(covered - set(kept))
         if missing_kept:
             raise SystemExit(
@@ -1292,7 +1322,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     opened = subparsers.add_parser("open", help="record a confirmed finding and print its id")
     _ = opened.add_argument("--session-dir", required=True)
-    _ = opened.add_argument("--phase", default="", help=PHASE_HELP)
+    _ = opened.add_argument("--phase", default="", help=PHASE_HELP + "; a closed phase takes a late finding")
     _ = opened.add_argument("--severity", choices=SEVERITIES, required=True)
     _ = opened.add_argument("--title", required=True)
     _ = opened.add_argument("--file", default="")
@@ -1308,6 +1338,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # review or the main review alone.
     _ = opened.add_argument("--lens", type=_lens_list, default="")
     _ = opened.add_argument("--held-for-decision", action="store_true")
+    _ = opened.add_argument("--accepted", action="store_true",
+                            help="record a late finding in a closed phase as already fixed")
     opened.set_defaults(handler=_open)
 
     decision = subparsers.add_parser("decision", help="record the user's answer to a held or decided finding")
@@ -1403,11 +1435,11 @@ def _command_settings(args: argparse.Namespace) -> conf.ConfigRead:
 
 def require_configuration(settings_read: conf.ConfigRead) -> None:
     problems: list[str] = []
-    for key in ("MAX_FIX_ATTEMPTS", "MAX_REOPENS", "STALLED_ROUNDS", "RUNAWAY_ROUNDS",
-                "ROUTING_FROM_ROUND", "ASTRA_AFTER_FAILED_FIXES", "MIN_REPAIR_BUDGET",
-                "MAX_CONSECUTIVE_SAME_KIND_PASSES", "MAX_REVIEW_CANCELLATIONS", "REPAIR_ROUNDS_PER_FINDING"):
+    for key in ("max_fix_attempts", "max_reopens", "stalled_rounds", "runaway_rounds",
+                "routing_from_round", "astra_after_failed_fixes", "min_repair_budget",
+                "max_consecutive_same_kind_passes", "max_review_cancellations", "repair_rounds_per_finding"):
         try:
-            if key == "REPAIR_ROUNDS_PER_FINDING":
+            if key == "repair_rounds_per_finding":
                 _ = settings_read.number(key)
             else:
                 _ = settings_read.whole(key)
@@ -1436,12 +1468,18 @@ def main() -> None:
     handler = cast(Callable[[argparse.Namespace], None], handler_value)
     session_dir = _session_dir(args)
     session_dir.mkdir(parents=True, exist_ok=True)
-    with (session_dir / ".findings.lock").open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            handler(args)
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    lock_path = session_dir / ".findings.lock"
+    try:
+        if not lock_path.exists():
+            _ = _progress_state(session_dir)
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                handler(args)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except recorder_state.OldRecorderState as error:
+        raise SystemExit(str(error)) from error
 
 
 if __name__ == "__main__":

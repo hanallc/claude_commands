@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+from pathlib import Path
 import re
-from typing import ClassVar, Literal, cast
+from typing import ClassVar, Literal, TypedDict, cast
 from urllib.parse import urlsplit
 
 from scripts.aws_target import hana_result
@@ -17,7 +18,14 @@ CONTROL_MAX_BYTES = 65536
 # Reserve space for the wrapper, the permit, and both signed publication URLs.
 COMMAND_ENVELOPE_RESERVE_BYTES = 16 * 1024
 COMMAND_RESULT_PENDING = 'The command result is pending'
-RUNTIME_ABI = 1
+RUNTIME_ABI = 2
+REPOSITORY = 'hana'
+COPY_UNIT = 'aws-hana'
+
+
+def main_checkout(home: Path) -> Path:
+    """Select the guest's main checkout."""
+    return home / 'rust' / REPOSITORY
 
 
 def fence_settlement_seconds(control_timeout_s: int, poll_seconds: int) -> int:
@@ -56,6 +64,13 @@ class SourceManifest:
 class SourceLimits:
     git_timeout_s: int
     allowed_environment: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MissingBasis:
+    """The guest lacks commits needed to apply an incremental bundle."""
+    repository: str
+    commits: tuple[str, ...]
 
 
 def validate_manifest(manifest: SourceManifest, limits: SourceLimits) -> None:
@@ -178,6 +193,29 @@ class HanaSourceUpdateEnvelope:
 HanaExecutionEnvelope = HanaCommandEnvelope | HanaFenceEnvelope | HanaSourceUpdateEnvelope
 
 
+class HanaCommandTiming(TypedDict, total=False):
+    """The guest records when it first confirms each command stage."""
+
+    unit_exited_at: float
+    unit_exit_observed_at: float
+    lease_free_at: float
+    upload_started_at: float
+
+
+def decode_command_timing(value: object) -> HanaCommandTiming:
+    row = hana_result.object_fields(value)
+    timing: HanaCommandTiming = {}
+    if 'unit_exited_at' in row:
+        timing['unit_exited_at'] = hana_result.seconds_field(row, 'unit_exited_at')
+    if 'unit_exit_observed_at' in row:
+        timing['unit_exit_observed_at'] = hana_result.seconds_field(row, 'unit_exit_observed_at')
+    if 'lease_free_at' in row:
+        timing['lease_free_at'] = hana_result.seconds_field(row, 'lease_free_at')
+    if 'upload_started_at' in row:
+        timing['upload_started_at'] = hana_result.seconds_field(row, 'upload_started_at')
+    return timing
+
+
 @dataclass(frozen=True)
 class HanaCommandObservation:
     """The guest reports acceptance, fencing, termination, and slot lease release."""
@@ -190,6 +228,7 @@ class HanaCommandObservation:
     observed_at: float
     evidence: execution_identity.ExecutionEvidence
     source_updated: bool = False
+    timing: HanaCommandTiming = field(default_factory=HanaCommandTiming)
 
 
 @dataclass(frozen=True)
@@ -202,6 +241,7 @@ class ConfirmedCommandAdmissionRefusal:
     observed_at: float
     reason: str
     refusal_code: CommandAdmissionRefusalCode
+    timing: HanaCommandTiming = field(default_factory=HanaCommandTiming)
 
     accepted: ClassVar[Literal[True]] = True
     terminated: ClassVar[Literal[True]] = True
@@ -289,10 +329,13 @@ def encode_observation(observation: HanaExecutionObservation) -> bytes:
     evidence = encode_evidence(observation.evidence)
     if isinstance(observation, ConfirmedCommandAdmissionRefusal):
         evidence['refusal_code'] = observation.refusal_code.value
-    return encode_document({'version': 1, 'key': hana_result.encode_attempt_key(observation.key), 'slot': observation.slot,
+    row: dict[str, object] = {'version': 1, 'key': hana_result.encode_attempt_key(observation.key), 'slot': observation.slot,
         'accepted': observation.accepted, 'fenced': observation.fenced, 'terminated': observation.terminated,
         'lease_free': observation.lease_free, 'observed_at': observation.observed_at,
-        'evidence': evidence, 'source_updated': observation.source_updated})
+        'evidence': evidence, 'source_updated': observation.source_updated}
+    if observation.timing:
+        row['timing'] = observation.timing
+    return encode_document(row)
 
 
 def decode_observation(content: bytes) -> HanaExecutionObservation:
@@ -309,15 +352,16 @@ def decode_observation(content: bytes) -> HanaExecutionObservation:
     slot = _positive_integer(row, 'slot')
     observed_at = hana_result.seconds_field(row, 'observed_at')
     evidence = decode_evidence(evidence_row)
+    timing = decode_command_timing(row['timing']) if 'timing' in row else HanaCommandTiming()
     accepted, fenced, terminated, lease_free, source_updated = flags
     if 'refusal_code' in evidence_row:
         code = CommandAdmissionRefusalCode(hana_result.string_field(evidence_row, 'refusal_code'))
         if (not (accepted and terminated and lease_free) or source_updated
                 or not isinstance(evidence, execution_identity.ExecutionEvidenceUnavailable)):
             raise ValueError('A Hana command admission refusal needs confirmed departure and a cause')
-        return ConfirmedCommandAdmissionRefusal(key, slot, fenced, observed_at, evidence.reason, code)
+        return ConfirmedCommandAdmissionRefusal(key, slot, fenced, observed_at, evidence.reason, code, timing)
     observation = HanaCommandObservation(key, slot, accepted, fenced, terminated, lease_free,
-                                         observed_at, evidence, source_updated)
+                                         observed_at, evidence, source_updated, timing)
     if accepted and isinstance(evidence, execution_identity.ExecutionNotStarted):
         raise ValueError('An accepted Hana command needs execution evidence')
     if source_updated and not accepted:

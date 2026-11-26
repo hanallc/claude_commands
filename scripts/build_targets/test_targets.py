@@ -16,16 +16,17 @@ from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold.owning_session import OwningSession
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.build_hold import build_hold
 from scripts.build_hold import owning_session as session_owner
+from scripts.buildlog import repository
 from scripts.mac_test import mac_test
 from scripts.lib import atomic_file
 from scripts.lib import process_start as process_identity
 
-from scripts.mac_test import eligibility, offload
+from scripts.mac_test import claim_state, eligibility, offload
 
 
 from scripts.build_hold.override_guard import require_checkout
@@ -37,6 +38,13 @@ SHIPPED_CONFIG = Path(__file__).resolve().parents[2] / "config" / "build_targets
 NOW = datetime(2026, 10, 11, 21, 0, tzinfo=timezone.utc)
 SINCE = datetime(2026, 10, 11, 20, 5, tzinfo=timezone.utc)
 END = datetime(2026, 10, 11, 22, 5, tzinfo=timezone.utc)
+
+
+def fixture_mac_mirror(worktree: Path, repository: str, key: str) -> claim_state.ResolvedMacMirror:
+    """Give routing tests a mirror identity without Git commands."""
+    fence = claim_state.mac_claim_stem(key)
+    return claim_state.ResolvedMacMirror(key, repository, f"{fence}.json", fence, str(worktree))
+
 
 HoldRecord = TypedDict(
     "HoldRecord",
@@ -182,6 +190,46 @@ class ConfigurationTests(IsolatedTargetTest):
             targets.SshTarget("mac", "macos", self.settings),
             targets.LocalTarget("natedev", "linux"),
         ))
+
+    def test_pinned_targets_require_an_explicit_registry_lookup(self) -> None:
+        gpu_settings = self.write_config("execution_transport=hana-gpu\n", "gpu.conf")
+        config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\nsettings.hana-gpu=gpu.conf\n")
+        local = targets.LocalTarget("natedev", "linux")
+        gpu = targets.SshTarget("hana-gpu", "linux", gpu_settings)
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
+                target_config.command_configuration()):
+            self.assertEqual(targets.read_targets(config), (local,))
+            self.assertEqual(target_config.configured_ssh_target("hana-gpu"), gpu)
+            self.assertEqual(targets.read_targets(config, target_name="hana-gpu"), (gpu,))
+            self.assertEqual(targets.read_targets(config), (local,))
+
+    def test_lookup_validates_only_the_requested_target(self) -> None:
+        hana = self.write_config("execution_transport=hana-control\nhost=hana\n", "hana.conf")
+        config = self.write_config("targets=hana-aws\nkind.hana-aws=ssh\nplatform.hana-aws=linux\n"
+            + "settings.hana-aws=hana.conf\npinned_targets=hana-gpu\n"
+            + "kind.hana-gpu=ssh\nplatform.hana-gpu=linux\nsettings.hana-gpu=missing.conf\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+            self.assertEqual(target_config.configured_ssh_target("hana-aws"),
+                             targets.SshTarget("hana-aws", "linux", hana))
+            with self.assertRaisesRegex(targets.ConfigError, "settings.hana-gpu"):
+                _ = target_config.configured_ssh_target("hana-gpu")
+            _ = self.write_config("execution_transport=invalid\n", "missing.conf")
+            self.assertEqual(target_config.configured_ssh_target("hana-aws").settings, hana)
+            with self.assertRaisesRegex(targets.ConfigError, "execution_transport"):
+                _ = target_config.read_execution_transport(target_config.configured_ssh_target("hana-gpu"))
+
+    def test_malformed_pinned_list_does_not_block_hana_lookup(self) -> None:
+        hana = self.write_config("execution_transport=hana-control\nhost=hana\n", "hana.conf")
+        gpu = self.write_config("execution_transport=hana-gpu\n", "gpu.conf")
+        for pinned in ("hana-gpu,", " , hana-gpu, hana-gpu ,hana-aws,"):
+            with self.subTest(pinned=pinned):
+                config = self.write_config("targets=hana-aws\nkind.hana-aws=ssh\nplatform.hana-aws=linux\n"
+                    + f"settings.hana-aws=hana.conf\npinned_targets={pinned}\n"
+                    + "kind.hana-gpu=ssh\nplatform.hana-gpu=linux\nsettings.hana-gpu=gpu.conf\n")
+                with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+                    self.assertEqual(target_config.configured_ssh_target("hana-aws").settings, hana)
+                    self.assertEqual(target_config.configured_ssh_target("hana-gpu").settings, gpu)
 
     def test_order_follows_targets_key(self) -> None:
         config = self.write_config(
@@ -668,7 +716,7 @@ class TargetStateTests(IsolatedTargetTest):
 class ReservationTests(IsolatedTargetTest):
     def test_takeover_retry_publishes_its_session_after_an_interrupted_publication(self) -> None:
         _ = self.write_config(
-            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.settings, "offload=on\nhost=test-mac\nlinux_only.hana=\n", template="mac_test")
         args = build_targets.CliArguments()
         args.target, args.kind, args.package = "mac", "test", "sample"
@@ -704,7 +752,9 @@ class ReservationTests(IsolatedTargetTest):
                         mock.patch.object(session_owner, "owning_session", return_value=session), \
                         mock.patch.object(process_identity, "process_start", side_effect=process_start), \
                         mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
-                        mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
+                        mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.ResolvedMacMirror(
+                            "fixture-hana", "hana", "hana.json", "hana", str(self.root))), \
+                        mock.patch.object(repository, "repository_key", return_value="https://fixture.invalid/hana"), \
                         mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
                     with mock.patch.object(atomic_file, "write_text_atomic", side_effect=interrupted_write):
                         with self.assertRaisesRegex(OSError, "publication interrupted"):

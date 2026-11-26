@@ -14,6 +14,9 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Generator
+from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,16 +31,18 @@ def _cadence() -> Schedule:
 
 def upkeep() -> None:
     from scripts.accounts import accounts
-    from scripts.agents import stop_resume
+    from scripts.agents import shutdown_record, stop_resume
     from scripts.herdr import detection_rules, herdr
-    from scripts.production import merge_gate
+    from scripts.production import gate, staff, the_list
     from scripts.production.gate_modules import GateRefused
 
     try:
-        _ = merge_gate.check_nightly_assignments()
+        _ = gate.check_nightly_assignments()
     except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"herdr-upkeep: nightly result check: {error}", file=sys.stderr)
 
+    if shutdown_record.active():
+        return
     cadence = _cadence()
     deadline = min(time.monotonic() + cadence.timeout_seconds,
                    float(os.environ.get("HERDR_UPKEEP_DEADLINE", "inf")))
@@ -48,19 +53,31 @@ def upkeep() -> None:
         running = {session["name"] for session in herdr.live_sessions()}
         herdr.save_shared_layout(running)
         _ = detection_rules.refresh(running, herdr.reload_agent_rules)
+        try:
+            with operation_deadline.within(time.monotonic() + operation_deadline.remaining() / 4):
+                the_list.fire_scheduled(timedelta(seconds=cadence.interval_seconds))
+        except (OSError, ValueError, staff.StaffRefused, subprocess.SubprocessError) as error:
+            print(f"herdr-upkeep: scheduled List items: {error}", file=sys.stderr)
         producers = accounts.producer_upkeep_members()
         if producers:
             offset = int(time.time() // cadence.interval_seconds) % len(producers)
             producers = producers[offset:] + producers[:offset]
-        start_seconds = conf.read("shutdown").number("START_SECONDS")
+        start_seconds = conf.read("shutdown").number("start_seconds")
         for row in producers:
+            if shutdown_record.active():
+                break
             if time.monotonic() >= deadline:
                 print("herdr-upkeep: producer budget ended; retry remaining producers next run", file=sys.stderr)
                 break
             try:
                 with operation_deadline.within(min(deadline, time.monotonic() + start_seconds)):
-                    result = stop_resume.resume(str(row.id))
-                if isinstance(result, stop_resume.ResumeFailed):
+                    result = stop_resume.resume_for_upkeep(row.id)
+                if result is None:
+                    break
+                if isinstance(result, stop_resume.StoppedOnPurpose):
+                    print(f"herdr-upkeep: {result.name}: stopped on purpose; agents resume brings it back",
+                          file=sys.stderr)
+                elif isinstance(result, stop_resume.ResumeFailed):
                     print(f"herdr-upkeep: {row.name}: {result.reason}", file=sys.stderr)
                 elif isinstance(result, stop_resume.SessionNotFound):
                     print(f"herdr-upkeep: {row.name}: session not found", file=sys.stderr)
@@ -68,14 +85,24 @@ def upkeep() -> None:
                 print(f"herdr-upkeep: {row.name}: {error}", file=sys.stderr)
 
 
-def run_job() -> int:
-    cadence = _cadence()
+@contextmanager
+def upkeep_lock(*, blocking: bool) -> Generator[Path | None]:
+    """Use the timer's job lock to hold upkeep work."""
     directory = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "herdr-upkeep"
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "lock").open("a") as lock:
         try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            yield None
+        else:
+            yield directory
+
+
+def run_job() -> int:
+    cadence = _cadence()
+    with upkeep_lock(blocking=False) as directory:
+        if directory is None:
             print("herdr-upkeep: already running; exit 0")
             return 0
         completed = directory / "completed"

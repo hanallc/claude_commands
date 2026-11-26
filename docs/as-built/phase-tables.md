@@ -169,7 +169,16 @@ A run whose plan file was removed, as for ad hoc work after the as-built, writes
   It skips a plan with no staff unit. Otherwise it runs `phase_table.py refresh`.
   A failure prints `phase table not written: <reason>` and keeps the recorder's result.
 - **Report.** `progress` reads `build_plan`: its short report's ETA line (`_phase_eta_line`, the reported phase's own row, its latest promise rather than `schedule_end`) and the clocks table's Project ETA (`_project_chain_eta`, the plan finish). `scripts/production/unit_phases.py` builds the Units table from the same record.
-- **Shared readers.** `plan_history` holds `plan_phases`, `plan_runs`, `eta_band_seconds(percent, elapsed, spread) -> EtaBand | EtaProjectionUnavailable` (`EtaBand`: `remaining`, `earliest`, `latest`, in seconds), `percent_spread`, `now_epoch` and `resolve_plan_path`, with `read_run_events(path)` (the one run-event reader: a shared flock, invalid JSON lines skipped, no events on `OSError` or `UnicodeError`), `run_starts()`, `staff_record()` and the `history_snapshot(record)` context manager, which shares the staff record, run headers and run events for one command (`HistorySnapshot`); outside it each reader reads directly. `staff_directory` and `plan_runs` share one staff path rule (`_staff_paths`). Also `history_root`, `BLOCKED_BY_PATTERN`, `STATE_FILENAME` and `PlanPhase`. Tests patch `plan_history.now_epoch` for the clock.
+- **Shared readers.** `plan_history` holds `plan_phases`, `plan_runs`, `percent_spread` and `resolve_plan_path`.
+  `eta_band_seconds(percent, elapsed, spread)` returns `EtaBand` or `EtaProjectionUnavailable`.
+  `EtaBand` gives the remaining, earliest and latest times in seconds.
+  `read_run_events(path)` reads events under a shared lock and skips invalid JSON lines.
+  It returns no events on `OSError` or `UnicodeError`.
+  `history_snapshot(record)` shares the staff record, run headers and run events for one command.
+  `staff_record()`, `run_starts()` and `read_run_events(path)` read directly outside the snapshot.
+  `staff_directory` and `plan_runs` share the `pass_record.staff_paths` function.
+  `plan_history` also holds `history_root`, `STATE_FILENAME` and `PlanPhase`.
+  Tests patch `pass_record.now_epoch` to set the clock.
 - **Command files.** `commands/unit/report.md` step 5 says the `progress` call rewrites the note and that a requested table is `phase_table.py show --session-dir "${SESSION_DIR}"`. `<ProgressContract>` in `commands/unit/direct.md` records every ETA the unit director states before stating it (`--phase-id` for a phase other than the active one) and states the recorder's printed time. `docs/direct/phase_end.md` step 2 and `docs/production_format.md` item 3 record the next phase's ETA with `--phase-id <next> --basis checkpoint` before the checkpoint notice. `commands/unit/eta.md` records the ETA, range and `--basis eta-command` before the answer is sent, as `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta …`. `commands/unit/eta_breakdown.md` runs the same command on every answer, with the bullets' last end time and no range.
 
 ### Production unit status
@@ -224,7 +233,7 @@ Dailies and their separate ETA judgments were retired on 2026-11-11.
 - Repair-round starts go through `_moment` to datetimes, the representation of `stated_at`. A raw float epoch compared against the microsecond-rounded `stated_at` would count an equal-moment round as later.
 - **Pruning (2026-10-13; user: "Yes do the part C").** `prune_phase_notes.py` reads each `showrunner-*` folder under `NOTIFIER_STATE_DIR` and takes the production doc from the staff row that the folder's id names; no session record is read, so a stopped showrunner's production is pruned too. It calls `phase_table.prune(doc)` for each, in one process, and uses the standard library alone. A timer with no readable doc, or a prune that raises `Refusal`, `OSError` or `UnicodeError`, prints `phase notes not pruned for <showrunner name>: <reason>` to stderr and the next production still runs; the exit is 1 when any failed. Success prints nothing. `scripts/maintenance/agent_notes_job.py` runs it as its own process with the interval and limit in `config/agent_notes.toml`, so a failure never costs another maintenance part. Natedev owns this job; nothing prunes on the Mac (accepted 2026-10-13: no Mac production needed it).
 - A live run of `prune_phase_notes.py` archives retired notes in the real vault unless `PHASE_TABLE_VAULT` points elsewhere.
-- The recorder's tests (`scripts/direct/test_progress_history.py`) run `progress_history.main()` in-process through `recorder_fixture.py` and are still among the merge gate's slowest modules; the table suite takes about six seconds. See [merge-gate-and-test-speed.md](merge-gate-and-test-speed.md).
+- The recorder's tests (`scripts/direct/test_progress_history.py`) run `progress_history.main()` in-process through `recorder_fixture.py` and are still among the gate's slowest modules. The table suite takes about six seconds. See [merge-gate-and-test-speed.md](merge-gate-and-test-speed.md).
 
 ## Why
 

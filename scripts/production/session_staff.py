@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 from scripts.production import staff
 from scripts.production import unit_config as configuration
 from scripts.agents import remote
+from scripts.lib import process_start
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr.pane_launch import without_staff_labels
@@ -41,7 +42,7 @@ class ReportProcessIdentity:
 @dataclass
 class AnomalyReport:
     check: Callable[[int, str], ReportProcessIdentity] | None
-    lines: list[str] = field(default_factory=list)
+    entries: list[tuple[int, str]] = field(default_factory=list)
     processes: dict[int, ReportProcessIdentity] = field(default_factory=dict)
     reported: set[int] = field(default_factory=set)
 
@@ -53,21 +54,28 @@ class AnomalyReport:
             self.processes[pid] = result
         return result
 
-    def add(self, message: str, pid: int, *, check_identity: bool = True) -> None:
+    def add(self, message: str, pid: int, *, check_identity: bool = True, exited_pid: int = 0) -> None:
         message = " ".join(message.splitlines())
         if not pid:
             line = "anomaly: " + message
-            if line not in self.lines:
-                self.lines.append(line)
+            entry = (exited_pid, line)
+            if entry not in self.entries:
+                self.entries.append(entry)
             return
         if check_identity and self.process(pid, "").is_morty:
             return
         if pid in self.reported:
             return
-        self.reported.add(pid)
+        if not exited_pid:
+            self.reported.add(pid)
         if f"pid {pid}" not in message:
             message = f"pid {pid}: {message}"
-        self.lines.append("anomaly: " + message)
+        self.entries.append((exited_pid, "anomaly: " + message))
+
+    def lines(self) -> list[str]:
+        """Drop exit reports for processes that no longer exist."""
+        return [line for exited_pid, line in self.entries
+                if not exited_pid or not isinstance(process_start.process_start(exited_pid), process_start.Gone)]
 
 
 _anomaly_report: ContextVar[AnomalyReport | None] = ContextVar("unit_anomaly_report", default=None)
@@ -75,13 +83,15 @@ _anomaly_report: ContextVar[AnomalyReport | None] = ContextVar("unit_anomaly_rep
 
 @contextmanager
 def anomalies(check: Callable[[int, str], ReportProcessIdentity] | None = None) -> Generator[list[str]]:
-    """Collect observations by PID; other callers retain stderr."""
+    """Collect anomalies by PID and fill the list when the context exits."""
     report = AnomalyReport(check)
+    lines: list[str] = []
     token = _anomaly_report.set(report)
     try:
-        yield report.lines
+        yield lines
     finally:
         _anomaly_report.reset(token)
+        lines.extend(report.lines())
 
 
 def report_process(pid: int, identity: str = "") -> ReportProcessIdentity:
@@ -89,16 +99,16 @@ def report_process(pid: int, identity: str = "") -> ReportProcessIdentity:
     return report.process(pid, identity) if report is not None else ReportProcessIdentity(identity, False)
 
 
-def collect_anomaly(message: str, *, pid: int = 0, check_identity: bool = True) -> bool:
+def collect_anomaly(message: str, *, pid: int = 0, check_identity: bool = True, exited_pid: int = 0) -> bool:
     report = _anomaly_report.get()
     if report is None:
         return False
-    report.add(message, pid, check_identity=check_identity)
+    report.add(message, pid, check_identity=check_identity, exited_pid=exited_pid)
     return True
 
 
-def report_anomaly(message: str, *, pid: int = 0, check_identity: bool = True) -> None:
-    if not collect_anomaly(message, pid=pid, check_identity=check_identity):
+def report_anomaly(message: str, *, pid: int = 0, check_identity: bool = True, exited_pid: int = 0) -> None:
+    if not collect_anomaly(message, pid=pid, check_identity=check_identity, exited_pid=exited_pid):
         print("anomaly: " + " ".join(message.splitlines()), file=sys.stderr)
 
 
@@ -260,7 +270,9 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
         if owner is not None:
             if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc):
                 from scripts.production.production_doc import read_production
-                return read_production(owner).checkout
+
+                production = read_production(owner)
+                return production_session_directory(production.doc, production.checkout)
             tree = RowResolver(record).unit_worktree(row)
             if isinstance(tree, PresentWorktree):
                 return tree.path
@@ -268,6 +280,27 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
                 return Path.cwd()
     report_anomaly(f"{reference}: staff worktree is unavailable")
     return Path.cwd()
+
+
+def enrolled_launch_directory(lines: list[str], legacy: Path) -> Path:
+    if not staff.declares_merge_checkout(lines):
+        return legacy
+    from scripts.production.production_doc import Refusal, production_field
+    from scripts.production.production_names import MERGE_CHECKOUT_FIELD
+
+    try:
+        directory = Path(production_field(lines, "Repository"))
+        if not directory.is_absolute() or directory != Path(production_field(lines, MERGE_CHECKOUT_FIELD)):
+            raise Refusal("Repository must match the absolute main checkout path")
+        return directory
+    except Refusal as error:
+        raise ValueError(str(error)) from error
+
+
+def production_session_directory(document: Path, legacy: Path) -> Path:
+    """Use the main checkout for an enrolled showrunner."""
+    lines = document.read_text(encoding="utf-8").splitlines()
+    return enrolled_launch_directory(lines, legacy)
 
 
 @dataclass(frozen=True)
@@ -374,9 +407,21 @@ def _read_facts(requests: list[tuple[str, str]]) -> dict[str, tuple[str, str]]:
     for kind, path in requests:
         key = kind + ":" + path
         try:
-            if kind == "git":
+            if kind in ("git", "merge-branch"):
+                folder = Path(path)
+                if kind == "merge-branch":
+                    from scripts.production.production_doc import Refusal, read_new_production
+
+                    lines = folder.read_text(encoding="utf-8").splitlines()
+                    if staff.declares_merge_checkout(lines):
+                        try:
+                            folder = read_new_production(folder, folder.stem).checkout
+                        except Refusal as error:
+                            raise OSError(str(error)) from error
+                    else:
+                        folder = folder.parent
                 result = subprocess.run(
-                    ["git", "--no-optional-locks", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+                    ["git", "--no-optional-locks", "-C", str(folder), "rev-parse", "--abbrev-ref", "HEAD"],
                     capture_output=True, text=True, check=False,
                 )
                 if result.returncode or not result.stdout.strip():
@@ -434,7 +479,7 @@ class RowResolver:
             if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) and owner.doc.machine == machine:
                 requests.add(("file", str(owner.doc.path)))
                 if not production_documents_only:
-                    requests.add(("git", str(owner.doc.path.parent)))
+                    requests.update((("git", str(owner.doc.path.parent)), ("merge-branch", str(owner.doc.path))))
         return sorted(requests)
 
     def production_document_facts(self) -> ProductionDocumentFacts:
@@ -555,7 +600,9 @@ class RowResolver:
         doc = self.production_doc(row)
         if not isinstance(doc, ProductionDoc):
             return BranchUnreadable(doc.reason)
-        state, text = self._fact(doc.machine, "git", doc.path.parent)
+        state, text = (self._fact(doc.machine, "merge-branch", doc.path)
+                       if staff.declares_merge_checkout(doc.text.splitlines())
+                       else self._fact(doc.machine, "git", doc.path.parent))
         return Branch(text) if state == "value" else BranchUnreadable(text)
 
     def unit_state(self, row: staff.StaffRow) -> ActiveUnit | RetiredUnit | LocationUnfilled:
@@ -746,6 +793,12 @@ class ClaudeUnknown(NamedTuple):
     reason: str
 
 
+class PaneHeldByNonAgents(ClaudeUnknown):
+    """Non-agent processes block the pane. The pane has no other local ownership blocks."""
+
+    __slots__: tuple[str, ...] = ()
+
+
 Claude = LiveClaude | ClaudeNotRunning | ClaudeUnknown
 
 
@@ -873,6 +926,11 @@ class UnknownUnit:
     reason: str
 
 
+@dataclass(frozen=True)
+class NonAgentPaneHolders(UnknownUnit):
+    """Resume can wait for the pane holders to exit."""
+
+
 type UnitOwner = ProvedLiveUnit | ProvedAbsentUnit | UnknownUnit
 
 
@@ -888,6 +946,8 @@ def checked_unit_owner(pane: LabeledSession | None, failures: tuple[str, ...] = 
             return UnknownUnit("the registry identity differs from the pane evidence")
         if isinstance(pane.identity, LiveSession) and isinstance(pane.process, ProvedCodexPaneProcess):
             return ProvedLiveUnit(pane)
+        if isinstance(pane.claude, PaneHeldByNonAgents):
+            return NonAgentPaneHolders(pane.claude.reason)
         if isinstance(pane.claude, ClaudeUnknown):
             return UnknownUnit(pane.claude.reason)
         if not isinstance(pane.empty, ShellNotObserved):
@@ -1071,7 +1131,8 @@ def _group_labeled_sessions(marked: SessionLabelObservations | Iterable[LabeledS
             if not assigned:
                 unassigned.append(UnassignedPaneObservation(unit.place, unit.claude.reason))
                 report_anomaly(f"{place_text(unit.place)}: cannot assign the pane to a unit: {unit.claude.reason}",
-                               pid=process_pid(unit), check_identity=False)
+                               pid=process_pid(unit), check_identity=False,
+                               exited_pid=herdr.exited_process_pid(unit.claude.reason) or 0)
             elif process_pid(unit):
                 report_anomaly(f"{holder_text(unit)}: cannot read its thread; staff status may be incomplete",
                                pid=process_pid(unit), check_identity=False)

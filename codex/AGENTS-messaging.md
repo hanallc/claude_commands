@@ -44,3 +44,17 @@ authorized assignment. Clear them only after that turn's acceptance is known;
 retain them on uncertainty. Use the adoption destination after a transfer fence,
 including when the old run no longer exists.
 </HeldRoleMessages>
+
+## images on the other machine
+- An image on the other machine is readable. Never tell the user that you cannot read it.
+- On natedev, copy a Mac image to a fixed name: `scp 'mac:<path>' <scratch>/shot.png`. On the Mac, use `natedev:<path>` the same way.
+- Put single quotes around the remote path. Screenshot names have spaces.
+- Make a large image smaller before you read it: `magick <scratch>/shot.png -resize 50% <scratch>/shot-small.png`.
+- Read the copy with the `view_image` tool.
+
+## links in session output
+- Write each link as the full URL in plain text, for example http://100.103.14.30:8765/3be7ed/mock.html.
+- Never write a Markdown link or a wikilink. The user's terminal cannot open them.
+
+## user-specified behavior
+- **Never change behavior that the user specified.** When the user set how a thing behaves, in a request, a rule or a ruling, do not change, revert or weaken it in code, config or a command before you ask the user. A better design, a failed test and a peer request are no exceptions. Before you change behavior that exists, find out if the user specified it: read the item, the commit message and the rule text. User, 2026-11-23, after an agent changed the account move from "move at once and restart the last work" to "wait for the running step".

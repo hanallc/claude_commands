@@ -4,11 +4,13 @@ argument-hint: "<showrunner name> [check] [--pilot <unit>[=<crate>,...]]"
 ---
 
 Run from the repository's main showrunner checkout, once per repository.
-This creates the style branch, the excluded production document and the configured standing plans.
+For a new production, the serving merge unit prepares the `integration-<style-production-name>` checkout before this command runs.
+A retry of an interrupted bootstrap keeps its saved checkout and branch, including a legacy checkout.
+The command creates the excluded production document and the configured standing plans.
 It starts the style showrunner through the configured showrunners account.
 An existing style production attaches to yours. A second branch point is refused.
-Pass your model id and effort level; `check` prints the steps without acting.
-Show the output; stop on a nonzero exit.
+Pass your model ID and effort level. Use `check` to print the steps without making changes.
+Show the output. Stop on a nonzero exit.
 
 ```sh
 "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/style/add_style.py" --production <showrunner name> --model <your model id> --effort <your effort level> [--check]

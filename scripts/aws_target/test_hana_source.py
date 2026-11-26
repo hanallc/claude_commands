@@ -1,4 +1,4 @@
-"""Exercise exact source bundles with private Git repositories and guest slots."""
+"""Exercise exact source bundles with private Git repositories and guest copies."""
 from __future__ import annotations
 
 from collections.abc import Generator
@@ -20,11 +20,11 @@ from unittest import mock
 
 from scripts.aws_target import hana_payload, hana_protocol, hana_receiver, hana_render
 from scripts.aws_target import hana_source as source, hana_transport as transport
+from scripts.aws_target.ledger_test_support import install_aws_fixture_settings, override_fixture_settings
 from scripts.copies import copies
-from scripts.lib import build_folders, build_slots, conf
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib import build_folders, conf
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib.git_test_support import commit_repository
-from scripts.lint.memory_test_support import write_config_fixture
 
 
 class MemorySourceObjects:
@@ -60,6 +60,10 @@ class HanaSourceTests(unittest.TestCase):
     def limits(self) -> hana_protocol.SourceLimits:
         return source.read_limits(self.configuration)
 
+    @property
+    def guest_home(self) -> Path:
+        return self.root / 'guest'
+
     @cached_property
     def sender(self) -> transport.SourceSender:
         return transport.SourceSender(self.objects, self.root / 'acknowledged', self.configuration,
@@ -68,25 +72,65 @@ class HanaSourceTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        private = private_slot_config(self.root, repository='hana')
+        config_dir = self.root / 'config'
+        install_aws_fixture_settings(config_dir)
+        _ = (config_dir / 'copies.conf').write_text(
+            'wait_seconds=1\ngit_timeout_seconds=60\nguard_timeout_seconds=10\n')
+        _ = (config_dir / 'build_targets.conf').write_text(
+            '# range: 0.001..\nloopback.shell_timeout_s=120\n')
+        private = private_copy_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, private.environment))
+        self.enterContext(mock.patch.dict(os.environ, {'HOME': str(self.root / 'home')}))
 
         self.pool_settings = private.settings
-        _ = write_config_fixture(self.configuration.source, 'host=aws-hana\n')
+        configuration = config_dir / 'hana_aws.conf'
+        _ = configuration.write_text("""\
+host=aws-hana
+enabled=on
+# whole: 1..60
+guard_grace_seconds=60
+# whole: 1..60
+watchdog_check_seconds=1
+# whole: 1..1800
+permit_max_seconds=1800
+# whole: 1..8
+step_cpu_limit=4
+# whole: 1..24
+step_memory_gib=24
+# whole: 1..60
+mount_timeout_seconds=15
+execution_shell=ci
+# whole: 1..
+free_floor_gib=30
+source_allowed_ignored=target/ .direnv/ __pycache__/ **/__pycache__/ .claude/settings.local.json .unit.toml
+source_forbidden_paths=.claude/settings.local.json .direnv/ .aws/ .env .env.* **/.env **/.env.* *.pem **/*.pem *.key **/*.key
+source_allowed_environment=RUSTFLAGS RUSTDOCFLAGS CARGO_INCREMENTAL RUST_BACKTRACE
+# whole: 1..
+source_max_bytes=1073741824
+# whole: 1..
+source_download_timeout_s=120
+# whole: 1..
+source_git_timeout_s=60
+# whole: 1..
+source_basis_max_commits=8
+""")
         self.runtime_checkout = self.root / 'commands'
         (self.runtime_checkout / 'config').mkdir(parents=True)
         for name in ('build_targets.conf', 'build_folders.conf', 'copies.conf'):
             _ = shutil.copyfile(self.configuration.source.with_name(name), self.runtime_checkout / 'config' / name)
         manifest = self.runtime_checkout / hana_render.RUNTIME_FILE_LIST
         manifest.parent.mkdir(parents=True)
-        _ = manifest.write_text('scripts/aws_target/fixture_runtime.py\nscripts/aws_target/hana_protocol.py\n')
+        _ = manifest.write_text('scripts/aws_target/fixture_runtime.py\nscripts/aws_target/hana_protocol.py\n'
+            + f'{hana_render.RUNNER_ENTRY}\n')
+        _ = shutil.copyfile(Path(__file__).with_name(hana_render.RUNNER_ENTRY.name),
+                            self.runtime_checkout / hana_render.RUNNER_ENTRY)
         _ = (manifest.parent / 'hana_protocol.py').write_text(f'RUNTIME_ABI = {hana_protocol.RUNTIME_ABI}\n')
         _ = (manifest.parent / 'fixture_runtime.py').write_text('version = "captured"\n')
-        _ = write_config_fixture(private.settings,
-            f'roots.slots.aws-hana={self.root / "guest-slots"}\n'
+        override_fixture_settings(private.settings,
+            f'roots.build.aws-hana={self.root / "guest-build"}\n'
             + '# whole: 1..\nslots.aws-hana.hana.max=1\n# whole: 1..\nslots.aws-hana.hana.max_bytes=1073741824\n')
-        self.checkout = self.enterContext(build_folders.leased_build_folder(build_folders.BuildFolderSpec(
-            kind='mirror', parent=self.root / 'sources', suffix_length=0, repository='hana', owner='fixture', slot=0)))
+        self.checkout = hana_protocol.main_checkout(Path.home())
+        self.checkout.mkdir(parents=True)
         _ = self.git('init', '--quiet', '-b', 'main')
         _ = self.git('remote', 'add', 'origin', 'https://example.invalid/fixture/hana.git')
         _ = (self.checkout / '.gitignore').write_text('target/\n.direnv/\n__pycache__/\n.claude/settings.local.json\nprivate.bin\n')
@@ -119,8 +163,7 @@ class HanaSourceTests(unittest.TestCase):
     @contextmanager
     def materialize(self, manifest: hana_protocol.SourceManifest) -> Generator[source.LeasedSource | source.MissingBasis]:
         with (self.verified_bundle(manifest) as bundle,
-              source.materialize(manifest, self.limits, bundle, root=self.root / 'guest',
-                  showrunner='builds', unit='aws', work='source-test') as leased):
+              source.materialize(manifest, self.limits, bundle, number=1, work='source-test') as leased):
             yield leased
 
     def member(self, manifest: hana_protocol.SourceManifest, name: str) -> bytes:
@@ -130,13 +173,17 @@ class HanaSourceTests(unittest.TestCase):
             with member:
                 return member.read()
 
-    def guest(self):
-        return mock.patch('socket.gethostname', return_value='aws-hana')
+    @contextmanager
+    def guest(self) -> Generator[None]:
+        with (mock.patch('socket.gethostname', return_value='aws-hana'),
+              mock.patch.dict(os.environ, {'HOME': str(self.guest_home)})):
+            yield
 
     def test_two_dirty_worktrees_preserve_exact_files_modes_links_index_and_refs(self) -> None:
-        with build_slots.take_slot(self.checkout, self.base, showrunner='builds', unit='aws', work='dirty',
-                                   purpose='test', wait_policy=build_slots.SlotWaitPolicy.REFUSE) as other:
-            for number, checkout in enumerate((self.checkout, other.path)):
+        other = build_folders.worktree_path('hana', 'aws', 'dirty')
+        _ = self.git('worktree', 'add', '--detach', str(other), self.base)
+        with mock.patch.dict(os.environ, {'TMPDIR': str(self.root / 'outside')}):
+            for number, checkout in enumerate((self.checkout, other)):
                 with self.subTest(worktree=number):
                     _ = (checkout / 'tracked').write_text('staged\n')
                     _ = copies.git(checkout, 'add', 'tracked')
@@ -166,9 +213,40 @@ class HanaSourceTests(unittest.TestCase):
                         actual = source.git(leased.path, self.limits, 'rev-parse', 'HEAD')
                         self.assertEqual(actual, manifest.commit)
                         self.sender.acknowledge(leased.identity)
+        self.assertFalse((self.root / 'outside').exists())
+
+    def test_sender_accepts_a_worktree_under_a_symlinked_workspace_root(self) -> None:
+        workspace = self.root / 'workspace-disk'
+        workspace.mkdir()
+        alias = self.root / 'workspace-link'
+        alias.symlink_to(workspace)
+        override_fixture_settings(self.pool_settings, f'roots.workspace={alias}\n')
+        checkout = build_folders.worktree_path('hana', 'aws', 'linked')
+        self.assertEqual(checkout, alias / 'hana/aws/linked')
+        _ = self.git('worktree', 'add', '--detach', str(checkout.resolve()), self.base)
+
+        manifest = self.prepare(checkout)
+
+        self.assertEqual(self.objects.uploads, [manifest.bundle_sha256])
+
+    def test_sender_refuses_unmanaged_checkouts_before_capture_and_retry(self) -> None:
+        manifest = self.prepare()
+        linked = self.root / 'unmanaged-worktree'
+        _ = self.git('worktree', 'add', '--detach', str(linked), self.base)
+        separate = build_folders.worktree_path('hana', 'aws', 'separate')
+        _ = self.git('clone', '--quiet', str(self.checkout), str(separate))
+        for checkout in (linked, separate):
+            with (self.subTest(checkout=checkout), ExitStack() as staging,
+                  mock.patch.object(copies, 'capture_source') as capture):
+                with self.assertRaises(transport.UnmanagedHanaCheckout):
+                    _ = self.prepare(checkout)
+                with self.assertRaises(transport.UnmanagedHanaCheckout):
+                    _ = self.sender.retry_complete(checkout, manifest,
+                        hana_protocol.MissingBasis(manifest.repository, ()), staging=staging)
+                capture.assert_not_called()
 
     def test_acknowledged_basis_sends_only_new_objects_and_retains_a_small_record(self) -> None:
-        _ = write_config_fixture(self.configuration.source, 'source_basis_max_commits=1\n')
+        override_fixture_settings(self.configuration.source, 'source_basis_max_commits=1\n')
         first = self.prepare()
         with self.guest(), self.materialize(first) as leased:
             assert isinstance(leased, source.LeasedSource)
@@ -198,13 +276,13 @@ class HanaSourceTests(unittest.TestCase):
             self.assertEqual(answer.repository, delta.repository)
             self.assertIn(first.commit, answer.commits)
             self.assertNotIn(self.base, answer.commits)
-            _ = (self.checkout / 'new').write_text('caller changed after the request\n')
-            runtime = self.runtime_checkout / 'scripts/aws_target/fixture_runtime.py'
-            _ = runtime.write_text('version = "changed"\n')
-            _ = runtime.with_name('hana_protocol.py').write_text(f'RUNTIME_ABI = {delta.runtime_abi + 1}\n')
-            with ExitStack() as staging:
-                complete, upload = self.sender.retry_complete(self.checkout, delta, answer, staging=staging)
-                upload()
+        _ = (self.checkout / 'new').write_text('caller changed after the request\n')
+        runtime = self.runtime_checkout / 'scripts/aws_target/fixture_runtime.py'
+        _ = runtime.write_text('version = "changed"\n')
+        _ = runtime.with_name('hana_protocol.py').write_text(f'RUNTIME_ABI = {delta.runtime_abi + 1}\n')
+        with ExitStack() as staging:
+            complete, upload = self.sender.retry_complete(self.checkout, delta, answer, staging=staging)
+            upload()
         self.assertEqual(self.objects.uploads, [first.bundle_sha256, delta.bundle_sha256, complete.bundle_sha256])
         self.assertEqual(self.member(complete, 'runtime/scripts/aws_target/fixture_runtime.py'),
                          b'version = "captured"\n')
@@ -247,25 +325,48 @@ class HanaSourceTests(unittest.TestCase):
             self.fail('invalid bundle was admitted')
         self.assertIsInstance(refused.exception.__cause__, subprocess.CalledProcessError)
 
-    def test_full_pool_uses_existing_admission_and_never_creates_an_overflow_slot(self) -> None:
+    def test_assigned_copy_uses_the_guest_main_checkout_and_refuses_a_second_holder(self) -> None:
         manifest = self.prepare()
         with self.guest(), self.materialize(manifest) as leased:
             assert isinstance(leased, source.LeasedSource)
-            with self.assertRaises(build_slots.SlotsFull), self.materialize(manifest):
+            main = self.guest_home / 'rust/hana'
+            self.assertEqual((main / 'tracked').read_text(), 'committed\n')
+            self.assertEqual(source.git(main, self.limits, 'rev-parse', '--is-bare-repository'), 'false')
+            self.assertEqual(leased.path, self.root / 'guest-build/hana/aws-hana/1')
+            proof = build_folders.numbered_copy_record(leased.path)
+            assert isinstance(proof, build_folders.NumberedCopySource)
+            self.assertEqual(proof.source, main)
+            self.assertEqual(proof.commit, manifest.commit)
+            self.assertFalse((main / '.git/hana-bundle').exists())
+            with self.assertRaisesRegex(BlockingIOError, 'assigned copy 1'), self.materialize(manifest):
                 self.fail('full pool admitted source')
-            self.assertFalse((self.root / 'guest-slots/hana-slot2').exists())
+            self.assertFalse(leased.path.with_name('2').exists())
+            self.assertFalse((self.guest_home / 'mirrors').exists())
+        self.assertEqual(build_folders.build_folder_state(leased.path), 'free')
+
+    def test_oversize_copy_discards_only_cargo_output(self) -> None:
+        manifest = self.prepare()
+        with self.guest(), self.materialize(manifest) as leased:
+            assert isinstance(leased, source.LeasedSource)
+            artifact = leased.copy.cargo_dir / 'artifact'
+            _ = artifact.write_text('cache')
+        override_fixture_settings(self.pool_settings, '# whole: 1..\nslots.aws-hana.hana.max_bytes=1\n')
+        with self.guest(), self.materialize(manifest) as leased:
+            assert isinstance(leased, source.LeasedSource)
+            self.assertFalse(artifact.exists())
+            self.assertTrue(leased.copy.cargo_dir.is_dir())
+            self.assertEqual((leased.path / 'tracked').read_text(), 'committed\n')
 
     def test_missing_guest_slot_keys_stop_admission(self) -> None:
         manifest = self.prepare()
         original = self.pool_settings.read_text()
-        for key in ('roots.slots.aws-hana', 'slots.aws-hana.hana.max', 'slots.aws-hana.hana.max_bytes'):
+        for key in ('slots.aws-hana.hana.max', 'slots.aws-hana.hana.max_bytes'):
             with self.subTest(key=key):
                 _ = self.pool_settings.write_text('\n'.join(line for line in original.splitlines()
                                                             if not line.startswith(key + '=')) + '\n')
-                expected = build_slots.SlotsNotConfigured if key.startswith('roots') else conf.Unusable
-                with self.guest(), self.assertRaises(expected), self.materialize(manifest):
+                with self.guest(), self.assertRaises(conf.Unusable), self.materialize(manifest):
                     self.fail('missing guest keys admitted source')
-                self.assertFalse((self.root / 'guest-slots').exists())
+                self.assertFalse((self.root / 'guest-build').exists())
         _ = self.pool_settings.write_text(original)
 
     def test_ignored_input_outside_the_allowed_list_refuses_before_upload(self) -> None:
@@ -273,6 +374,44 @@ class HanaSourceTests(unittest.TestCase):
         with self.assertRaisesRegex(hana_protocol.SourceRefused, 'IgnoredInput'):
             _ = self.prepare()
         self.assertEqual(self.objects.uploads, [])
+
+    def test_ignored_inputs_use_the_allowed_list_and_name_the_refused_path(self) -> None:
+        settings = self.root / 'source-inputs.conf'
+        _ = (self.checkout / '.gitignore').write_text(
+            '/private.bin\n/.clippy.toml\n/.env\n/crates/x/.env\n/generated.rs\n/.cache/\n/.link\n/odd/\n')
+        cases = (
+            ('private.bin', 'private.bin', ''),
+            ('.clippy.toml', '.clippy.toml', ''),
+            ('.env', '.env', ''),
+            ('crates/x/.env', 'crates/x/.env', ''),
+            ('generated.rs', 'generated.rs', ''),
+            ('.cache/x', '.cache/x', ''),
+            ('.cache/x', '.cache/x', '.cache/'),
+            ('.link', '.link', ''),
+            (os.fsdecode(b'odd/line\n\x1b[31m\xff'), r'odd/line\n\x1b[31m\udcff', ''),
+        )
+        for path, displayed_path, allowed in cases:
+            with self.subTest(path=path, allowed=allowed):
+                _ = settings.write_text(f'source_allowed_ignored=target/ {allowed}\nsource_forbidden_paths=*.key\n')
+                ignored = self.checkout / path
+                ignored.parent.mkdir(parents=True, exist_ok=True)
+                if path == '.link':
+                    ignored.symlink_to('tracked')
+                else:
+                    _ = ignored.write_text('ignored input\n')
+                try:
+                    if allowed:
+                        transport.check_inputs(self.checkout, conf.read(settings))
+                        commit = copies.capture_source(self.checkout)
+                        self.assertNotIn(path, self.git('ls-tree', '-r', '--name-only', '-z', commit).split('\0'))
+                    else:
+                        with self.assertRaises(hana_protocol.SourceRefused) as refused:
+                            transport.check_inputs(self.checkout, conf.read(settings))
+                        self.assertEqual(str(refused.exception),
+                                         'IgnoredInput: source has an ignored path outside source_allowed_ignored: '
+                                         + displayed_path)
+                finally:
+                    ignored.unlink()
 
     def test_credentials_and_disallowed_environment_refuse_before_upload(self) -> None:
         _ = (self.checkout / '.env').write_text('fixture secret')
@@ -338,7 +477,7 @@ class HanaSourceTests(unittest.TestCase):
     def test_upload_bound_applies_to_the_entire_archive(self) -> None:
         manifest = self.prepare()
         bundle_size = len(self.member(manifest, 'source.bundle'))
-        _ = write_config_fixture(self.configuration.source, f'source_max_bytes={bundle_size}\n')
+        override_fixture_settings(self.configuration.source, f'source_max_bytes={bundle_size}\n')
         objects = MemorySourceObjects()
         sender = transport.SourceSender(objects, self.root / 'acknowledged', self.configuration,
                                         checkout=self.runtime_checkout)
@@ -412,8 +551,9 @@ class HanaSourceTests(unittest.TestCase):
         _ = (self.checkout / 'tracked').write_text('modified script\n')
         index = (self.checkout / '.git/index').read_bytes()
         staged_tree = copies.staged_tree
-        def change_mode(path: Path, *, include_worktree: bool = False) -> str:
-            tree = staged_tree(path, include_worktree=include_worktree)
+        def change_mode(path: Path, *, include_worktree: bool = False,
+                        index_parent: build_folders.ExplicitBuildParent) -> str:
+            tree = staged_tree(path, include_worktree=include_worktree, index_parent=index_parent)
             if include_worktree:
                 (path / 'tracked').chmod(0o755)
             return tree
@@ -427,8 +567,9 @@ class HanaSourceTests(unittest.TestCase):
         index = self.checkout / '.git/index'
         before = index.read_bytes()
         staged_tree = copies.staged_tree
-        def change_during_capture(path: Path, *, include_worktree: bool = False) -> str:
-            tree = staged_tree(path, include_worktree=include_worktree)
+        def change_during_capture(path: Path, *, include_worktree: bool = False,
+                                  index_parent: build_folders.ExplicitBuildParent) -> str:
+            tree = staged_tree(path, include_worktree=include_worktree, index_parent=index_parent)
             if include_worktree:
                 _ = (path / 'tracked').write_text('changed during capture\n')
             return tree

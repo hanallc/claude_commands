@@ -24,7 +24,6 @@ from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 from scripts.message import send
 from scripts.message import repeat_guard as guard
-from scripts.message import repeats
 from scripts.message.repeat_guard_test_support import (
     NoticeAttemptTrace, NoticeDrainClock, install_guard_test_budget, install_notice_test_config, run_ready_notice_attempt,
     wait_for_notice_exit, wait_for_notice_readiness,
@@ -33,6 +32,13 @@ from scripts.message.repeat_guard_test_support import (
 
 def setUpModule() -> None:
     install_guard_test_budget()
+
+
+FIXTURE_LIMITS = guard.Limits(
+    window_seconds=1800, repeat_count=3, receiver_rate_count=100,
+    max_senders=4096, max_keys=256, preview_characters=240,
+    notice_timeout_seconds=15, drain_timeout_seconds=30, notice_max_age_seconds=86400,
+)
 
 
 # A time bound is this many times its limit, so gate load cannot fail it.
@@ -108,7 +114,8 @@ class RepeatGuardTests(unittest.TestCase):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state")}))
         config = install_notice_test_config(self.home)
-        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)}))
+        limits_path = self.limits_file(FIXTURE_LIMITS, name="default-limits.conf")
+        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config), "SEND_REPEAT_CONFIG": str(limits_path)}))
         limits = guard.configuration()
         if isinstance(limits, guard.GuardUnavailable):
             raise AssertionError(limits.reason)
@@ -176,7 +183,8 @@ class RepeatGuardTests(unittest.TestCase):
             return child
 
         errors = io.StringIO()
-        with (patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state")}, clear=True),
+        with (patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state"),
+                                      "SEND_REPEAT_CONFIG": os.environ["SEND_REPEAT_CONFIG"]}, clear=True),
               patch.object(guard, "Popen", slow_start), redirect_stderr(errors)):
             held = [guard.check(self.root, self.attempt(at=index)).held for index in range(3)]
         self.assertEqual(held, [False, False, True])
@@ -553,8 +561,8 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
             self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertFalse(self.root.exists())
 
-    def limits_file(self, limits: guard.Limits) -> Path:
-        path = self.home / "limits.conf"
+    def limits_file(self, limits: guard.Limits, *, name: str = "limits.conf") -> Path:
+        path = self.home / name
         values = cast(dict[str, int], asdict(limits))
         _ = path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
         return path
@@ -569,18 +577,6 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
             self.assertEqual([item[1].kind for item in delivered], ["owner"])
             guard.drain(self.root, lambda state, notice, limits: "delivered", self.limits.window_seconds + 6)
         self.assertEqual(list(self.root.glob("*.json")), [])
-
-    def test_replay_is_pure_and_counts_no_distinct_or_protected_holds(self) -> None:
-        rows: list[dict[str, object]] = [{"from": "watchdog", "to": "morty", "text": text,
-            "time": f"2026-10-31T01:00:0{index}+00:00", "machine": "fixture-host",
-            "safety": "distinct" if text == "recovered" else "repeat"}
-            for index, text in enumerate(("stopped", "stopped", "stopped", "recovered"))]
-        rows += [{**rows[0], "from": "user"}, {**rows[0], "to": "user"}]
-        result = repeats.replay(rows, self.limits)
-        self.assertEqual(result["watchdog"].held, 1)
-        self.assertEqual(sum(item.distinct_held for item in result.values()), 0)
-        self.assertEqual(sum(item.protected_held for item in result.values()), 0)
-        self.assertFalse(self.root.exists())
 
     def prime_outbox(self) -> None:
         self.assertEqual([self.persist(self.attempt(at=index)).held for index in range(3)],
@@ -802,7 +798,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 finally:
                     self.owned.finish()
 
-    def test_direct_events_report_observed_outcomes_and_replay_uses_independent_labels(self) -> None:
+    def test_direct_events_record_observed_outcomes(self) -> None:
         receiver = guard.recipient_identity("", thread_id="thread-1")
         for text in ["stopped"] * 3:
             decision = guard.transport_check("direct", receiver, text)
@@ -811,15 +807,8 @@ os.kill(os.getpid(), signal.SIGSTOP)
         rows = [cast(dict[str, object], json.loads(line))
                 for line in (self.home / "state/message/transports.jsonl").read_text().splitlines()]
         self.assertEqual([row["outcome"] for row in rows], ["queued", "queued", "held"])
-        totals = repeats.replay(rows, self.limits, simulate=False)["direct"]
-        self.assertEqual((totals.count, totals.held, totals.receivers), (3, 1, {receiver}))
-        labelled = [{**rows[0], "text": f"process {name} stopped", "safety": "distinct"}
-                    for name in ("Ada", "Abe", "Bea")]
-        result = repeats.replay(labelled, self.limits)["direct"]
-        self.assertEqual((result.held, result.distinct_held), (0, 0))
-        with patch.object(guard, "normalize", return_value="broken collision"):
-            result = repeats.replay(labelled, self.limits)["direct"]
-        self.assertEqual((result.held, result.distinct_held), (1, 1))
+        self.assertEqual({row["from"] for row in rows}, {"direct"})
+        self.assertEqual({row["to"] for row in rows}, {receiver})
 
     def test_digit_prefixed_names_dates_durations_and_meaningful_paths_stay_distinct(self) -> None:
         for texts in (
@@ -970,6 +959,8 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
             _ = self.persist(self.attempt("other flood", at=at))
         clock = [0.0]
         completed: list[str] = []
+        limits = replace(self.limits, drain_timeout_seconds=90, notice_timeout_seconds=60)
+
         def deliver(state: guard.SenderState, notice: guard.Notice, limits: guard.Limits) -> guard.NoticeOutcome:
             self.assert_notice(state, notice, limits)
             clock[0] += 60 if notice.text == "Morty: worker stopped" else 45
@@ -977,7 +968,9 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
                 completed.append(notice.text)
                 return "delivered"
             return "unknown"
-        with patch.object(time, "monotonic", side_effect=lambda: clock[0]):
+        with (patch.object(guard, "configuration", return_value=limits),
+              patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+              patch.dict(os.environ, {"SEND_REPEAT_NOTICE_DEADLINE": "inf"})):
             guard.drain(self.root, deliver, 3, cleanup_seconds=20)
             self.assertEqual(completed, [])
             state = guard.decode(next(self.root.glob("*.json")).read_text())

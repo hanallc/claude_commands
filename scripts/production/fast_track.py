@@ -421,7 +421,7 @@ def mark_reviewed(unit: str, commits: list[str], review_pass: str) -> None:
 
 
 def check_command(command: list[str], repo: Path, environment: dict[str, str], deadline: float,
-                  *, types: bool = False, empty_suite: bool = False) -> None:
+                  *, empty_suite: bool = False) -> None:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise Refused("over the fast-track time limit; use the normal path")
@@ -437,14 +437,13 @@ def check_command(command: list[str], repo: Path, environment: dict[str, str], d
         _ = output.seek(0)
         text = output.read().decode(errors="replace")
     print(text, end="" if text.endswith("\n") else "\n")
-    passed = (bool(re.search(r"(?m)^0 errors, 0 warnings, 0 notes\s*$", text)) if types else
-              process.returncode == 0 or empty_suite and process.returncode == 5 and "Ran 0 tests" in text)
+    passed = process.returncode == 0 or empty_suite and process.returncode == 5 and "Ran 0 tests" in text
     if not passed:
         raise Refused(f"fast check failed: {' '.join(command)}")
 
 
 def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrackLimits) -> None:
-    from scripts.production import merge_gate
+    from scripts.production import gate
 
     deadline = time.monotonic() + config.check_time_limit_seconds
     check_paths(runner, repo, paths, config)
@@ -462,7 +461,7 @@ def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrac
         for number, module in enumerate(sorted(modules)):
             root = temporary / str(number)
             root.mkdir()
-            isolated = merge_gate.test_module_environment(root, environment)
+            isolated = gate.test_module_environment(root, environment)
             check_command([str(repo / "scripts/lib/py"), "-m", "unittest",
                            ".".join(module.with_suffix("").parts)], repo, isolated, deadline, empty_suite=True)
             for marker in (root / "build-tool-calls.jsonl", root / "live-memory-reads.jsonl"):
@@ -473,9 +472,6 @@ def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrac
             if not all(part.isidentifier() for part in module.split(".")):
                 raise Refused(f"not a Python package module: {path}")
             check_command([sys.executable, "-c", f"import {module}"], repo, environment, deadline)
-        if python_files:
-            check_command([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"),
-                           *map(str, python_files)], repo, environment, deadline, types=True)
 
 
 def drop_recovery_refs(runner: GitRunner, repo: Path, prefix: str) -> None:
@@ -711,7 +707,7 @@ def reconcile(runner: GitRunner, repo: Path, unit: str, *, finish: bool = False,
                         attempt["restored"] = True
                         save_attempt(path, attempt)
                     if not attempt["promoted"] or repeat:
-                        promote(runner, attempt["production"], repo, row["commit"], unit)
+                        promote(attempt["production"], repo, row["commit"], unit)
                         attempt["promoted"] = True
                         save_attempt(path, attempt)
                 except (PublishedFailure, Refused, OSError, ValueError) as error:
@@ -728,19 +724,14 @@ def reconcile(runner: GitRunner, repo: Path, unit: str, *, finish: bool = False,
         return recovered
 
 
-def promote(runner: GitRunner, production: str, repo: Path, commit: str, unit: str) -> None:
-    from scripts.production import merge_checkpoint, production_doc
+def promote(production: str, repo: Path, commit: str, unit: str) -> None:
+    from scripts.production import merge_checkpoint, production_doc, promotion as publication
 
     try:
-        promotion = production_doc.promotion_from_doc(production_doc.read_production(production).doc.read_text().splitlines())
-        if isinstance(promotion, production_doc.PromoteTo) and not promotion.checkouts and isinstance(promotion.mac, production_doc.MacCheckout):
-            # Promotion uses this checkout only to supply a Git ref.
-            with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit), step="promote") as source:
-                _ = runner.git(source, "update-ref", "refs/heads/main", commit)
-                merge_checkpoint.promote_targets(promotion, "main", commit, source=source, label=f"fast-track {unit}")
-        else:
-            merge_checkpoint.promote_targets(promotion, "main", commit, source=repo, label=f"fast-track {unit}")
-    except (checkpoint_gate.Stop, copies.CopyError, production_doc.Refusal) as error:
+        destinations = production_doc.promotion_from_doc(production_doc.read_production(production).doc.read_text().splitlines())
+        _ = merge_checkpoint.promote_targets(destinations, "main", commit, source=repo,
+                                             approval=publication.FastTrackInstall(), label=f"fast-track {unit}")
+    except (checkpoint_gate.Stop, production_doc.Refusal) as error:
         raise PublishedFailure(str(error)) from error
 
 

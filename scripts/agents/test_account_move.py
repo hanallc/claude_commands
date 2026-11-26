@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
-from scripts.production import staff_sources
+from scripts.production import staff, staff_sources
 import io
 import json
 import os
@@ -29,7 +29,7 @@ from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.accounts import accounts, refusals
 from scripts.accounts.home_test_support import scratch_accounts_config
-from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
+from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall, write_claude_move_credentials
 from scripts.agents import stop_resume
 from scripts.agents.test_restart import showrunner, top_level, unit
 from scripts.agents.test_support import ShutdownTestCase
@@ -99,17 +99,25 @@ class AccountMoveTests(ShutdownTestCase):
         running = frozenset(without_account).union(member.session_id for member in members)
         return accounts.LocalRoleSessions({}, groups, (), (), (), False, running)
 
+    @staticmethod
+    def role_staff(identity: str, name: str, kind: staff.Kind) -> staff.StaffRow:
+        return staff.StaffRow(staff.StaffId(identity), kind, name, staff.STAFF_ROOT,
+                              current_session=staff.StaffId(identity))
+
     def test_group_and_single_move_ignore_stale_shutdown_holds(self) -> None:
         for subject in ("units", "move-id"):
             with self.subTest(subject=subject):
                 self.moves.calls.clear()
                 listed = self.current_listing()[0]
                 member = accounts.LiveGroupMember(listed.session_id, listed.name, "units", listed.config_dir)
-                with patch("scripts.accounts.accounts._read_local_role_sessions", return_value=self.role_sessions(member)):
+                row = self.role_staff(member.session_id, member.name, "unit")
+                with (patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
+                      patch("scripts.accounts.accounts._read_local_role_sessions", return_value=self.role_sessions(member))):
                     result, output, error = self.cli(subject)
                 self.assertEqual(result, 0, error)
                 self.assertEqual(error, "")
-                self.assertIn("move-id: Claude is up on claude3", output)
+                expected_name = "kept name" if subject == "units" else "move-id"
+                self.assertIn(f"{expected_name}: Claude is up on claude3", output)
                 self.assertEqual([call.session_id for call in self.moves.calls], ["move-id"])
 
     def test_target_preview_reads_usage_without_querying_holds(self) -> None:
@@ -151,6 +159,7 @@ class AccountMoveTests(ShutdownTestCase):
         _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": login},
         }), encoding="utf-8")
+        write_claude_move_credentials(accounts.account_dir(label))
 
 
     def live_registry(self) -> list[sessions.SessionRecord]:
@@ -198,7 +207,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual((status, output), (0, ""))
         self.assertEqual(error, "accounts: anomaly: remote-only: no saved session was found\n")
         moved.assert_called_once_with(["remote-only"], "claude3", why="finish account move", cause="by hand",
-                                      source_accounts={})
+                                      source_accounts={}, user_command=True)
 
     def test_stopped_move_keeps_pending_outcome_then_rerun_reaches_resume(self) -> None:
         with (patch.object(inventory, "listing", return_value=[]),
@@ -290,18 +299,19 @@ class AccountMoveTests(ShutdownTestCase):
         producer = accounts.LiveGroupMember("producer", "producer", "producers", self.root / ".claude2")
         runners = tuple(accounts.LiveGroupMember(member.session_id, member.name, "showrunners", member.config_dir)
                         for member in members)
-        with (patch.object(inventory, "listing", return_value=members),
+        rows = tuple(self.role_staff(member.session_id, member.name, "showrunner") for member in runners)
+        with (patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(rows)),
+              patch.object(inventory, "listing", return_value=members),
               patch("scripts.accounts.accounts._read_local_role_sessions", return_value=self.role_sessions(*runners, producer)),
               patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(()))):
             result = accounts.move_group("showrunners", "claude3", why="manual group move")
         self.assertIsInstance(result, accounts.GroupMoveStarted)
         self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "manual group move") for identity in ("first", "second")])
-        self.assertEqual(self.moves.batches, [["first", "second"]])
+        self.assertEqual(self.moves.batches, [["first", "second", "already"]])
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
         assert isinstance(result, accounts.GroupMoveStarted)
         self.assertEqual(sum("Claude is up on" in line for line in result.stdout.splitlines()), 2)
 
-        from scripts.production import staff
         from scripts.agents import remote
         from scripts.lib.test_models_registry import write_registry
 
@@ -320,7 +330,7 @@ class AccountMoveTests(ShutdownTestCase):
                     row = staff.set_home(row.id, staff.SessionHome(self.root / ".claude1"))
                 if state == "unreadable account":
                     row = staff.set_home(row.id, staff.SessionHome(self.root / ".claude3"))
-                    self.moves.failures[identity] = "live process account is unreadable"
+                    self.moves.failures[row.id] = "live process account is unreadable"
                 family = "codex:gpt-test:high" if state == "control codex" else "claude:opus:max"
                 registry = write_registry(self.root / "producer-models.conf", {"producers": {row.name: family}})
                 live = [accounts.LiveGroupMember(identity, row.name, "producers", self.root / ".claude1")] if state == "interrupted" else []
@@ -344,7 +354,7 @@ class AccountMoveTests(ShutdownTestCase):
                             side_effect=producer_roles)):
                     if state in ("interrupted", "early exit after home write"):
                         if state == "interrupted":
-                            self.moves.failures[identity] = "resume pending"
+                            self.moves.failures[row.id] = "resume pending"
                         first = accounts.move_group("producers", "claude3", why="retry")
                         self.assertIsInstance(first, accounts.GroupMoveStartFailed)
                         self.assertEqual(accounts.group_accounts().get("producers"), "claude3")
@@ -356,14 +366,14 @@ class AccountMoveTests(ShutdownTestCase):
                 if state == "unreadable account":
                     self.assertIsInstance(retry, accounts.GroupMoveStartFailed)
                     assert isinstance(retry, accounts.GroupMoveStartFailed)
-                    self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "retry")])
+                    self.assertEqual(self.moves.calls, [MoveCall(row.id, "claude3", "retry")])
                     self.assertIn("live process account is unreadable", retry.stderr)
                     self.moves.failures.clear()
                     continue
                 self.assertIsInstance(retry, accounts.GroupMoveStarted)
                 assert isinstance(retry, accounts.GroupMoveStarted)
                 expected = 2 if state in ("interrupted", "early exit after home write") else 1 if state == "unknown home" else 0
-                self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "retry")] * expected)
+                self.assertEqual(self.moves.calls, [MoveCall(row.id, "claude3", "retry")] * expected)
                 if state == "unknown home":
                     self.assertIn("saved account is unknown", retry.stdout)
 
@@ -379,7 +389,8 @@ class AccountMoveTests(ShutdownTestCase):
                   stop_resume.SessionNotFound("missing")]) as batch):
             outcomes = accounts.move_sessions(("failed", "ok", "worker", "missing"), "claude3", why="retry")
         batch.assert_called_once_with(["failed", "ok", "worker", "missing"], "claude3", why="retry", cause="by hand",
-                                      source_accounts={"failed": "claude1", "ok": "claude1", "worker": "claude1"})
+                                      source_accounts={"failed": "claude1", "ok": "claude1", "worker": "claude1"},
+                                      user_command=False)
         self.assertEqual([accounts.move_result_line(item) for item in outcomes], [
             "failed: not moved: stop refused", "ok: Claude is up on claude3 in w1:p1 (0.0 s)",
             "worker: Claude is up on claude3 in w1:p1 (0.0 s)"])
@@ -424,7 +435,10 @@ class AccountMoveTests(ShutdownTestCase):
         if dry_run:
             arguments.append("--dry-run")
         report = self.showrunner_inventory()
-        with (patch.object(sessions, "live_sessions", return_value=self.batch_registry(report)),
+        rows = tuple(self.role_staff(owner["session_id"], owner["name"], "showrunner")
+                     for owner in report["sessions"] if owner["kind"] == "showrunner")
+        with (patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(rows)),
+              patch.object(sessions, "live_sessions", return_value=self.batch_registry(report)),
               patch.object(account, "account_of", return_value=account.Account("claude", report["login"], report["label"])),
               redirect_stdout(output), redirect_stderr(error)):
             result = accounts.main(arguments)

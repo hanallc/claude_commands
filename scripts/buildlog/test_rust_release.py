@@ -20,7 +20,7 @@ from unittest import mock
 from scripts.buildlog import rust_release
 from scripts.lib import build_folders, cargo_output, scratch
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.notify import review
 from scripts.notify.push_texts import RenderedPush, render, user_send_argv
 from scripts.notify.user_action import ActionRequired
@@ -95,7 +95,7 @@ class RustReleaseTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
-        private = private_slot_config(Path(temporary), repository="hana")
+        private = private_copy_config(Path(temporary))
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.root = Path(temporary) / "buildlog"
         self.scratch = Path(temporary) / "scratch"
@@ -109,7 +109,8 @@ class RustReleaseTests(unittest.TestCase):
         source = self.scratch / "hana"
         source.mkdir()
         for arguments in (("init", "-q"), ("config", "user.name", "Trial tests"),
-                          ("config", "user.email", "trial@example.invalid")):
+                          ("config", "user.email", "trial@example.invalid"),
+                          ("remote", "add", "origin", (self.scratch / "origin/hana.git").as_uri())):
             _ = subprocess.run(["git", "-C", str(source), *arguments], check=True, capture_output=True)
         _ = (source / ".gitignore").write_text("/target/\n/mend-target/\n/mend-root/\n")
         _ = (source / "Cargo.toml").write_text("[workspace]\n")
@@ -188,7 +189,7 @@ class RustReleaseTests(unittest.TestCase):
 
         def send(push: RenderedPush) -> bool:
             if texts is not None:
-                texts.append((push.title, push.body))
+                texts.append((push.title, push.message))
             return True
 
         def no_run(args: list[str], cwd: Path | None, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
@@ -255,21 +256,30 @@ class RustReleaseTests(unittest.TestCase):
             self.assertFalse(rust_release.send_release_text(render("rust.passed", version="1.100.0", pin="1.99.0")))
 
     def test_every_compiler_decision_names_the_claude_session_that_takes_the_reply(self) -> None:
-        for errors, warnings, mend_builds in ((0, 0, True), (0, 2, True), (1, 2, True), (0, 0, False)):
-            trial: rust_release.TrialFinished = {"status": "finished", "version": "1.100.0", "warnings": warnings,
+        wait = "In the hana session, reply wait (recommended) or upgrade."
+        upgrade = "In the hana session, reply upgrade (recommended) or wait."
+        for version, errors, warnings, mend_builds, title, action in (
+            ("1.100.0", 0, 0, True, "Hana passes on Rust 1.100.0", upgrade),
+            ("1.100.0", 0, 2, True, "Rust 1.100.0 adds 2 warnings to Hana", wait),
+            ("1.100.0", 0, 1, True, "Rust 1.100.0 adds 1 warning to Hana", wait),
+            ("1.100.0", 1, 2, True, "Rust 1.100.0 fails Hana's check: 1 error", wait),
+            ("1.100.0", 14, 2, True, "Rust 1.100.0 fails Hana's check: 14 errors", wait),
+            ("100.100.100", 14, 2, True, "Rust 100.100.100: 14 errors in Hana", wait),
+            ("1.100.0", 0, 0, False, "Rust 1.100.0 breaks the build repair tool", wait),
+            ("100.100.100", 0, 0, False, "Rust 100.100.100 breaks build repair", wait),
+        ):
+            trial: rust_release.TrialFinished = {"status": "finished", "version": version, "warnings": warnings,
                 "warning_crates": 1, "errors": errors, "error_crates": 1, "mend_builds": mend_builds,
                 "target_gib": 1, "mend_target_gib": 1}
-            with self.subTest(errors=errors, warnings=warnings, mend_builds=mend_builds):
-                push = rust_release.release_push("1.100.0", "1.99.0", trial)
-                self.assertIsInstance(push.action, ActionRequired)
-                assert isinstance(push.action, ActionRequired)
-                self.assertTrue(push.action.text.startswith("In the Claude session named natedev, reply "))
-                self.assertIn("upgrade", push.action.text)
-                self.assertIn("wait", push.action.text)
+            with self.subTest(version=version, errors=errors, warnings=warnings, mend_builds=mend_builds):
+                push = rust_release.release_push(version, "1.99.0", trial)
+                self.assertEqual(push.action, ActionRequired(action))
+                self.assertEqual(push.title, title)
+                self.assertEqual(push.body, "")
 
     def test_release_send_wait_includes_the_configured_review_limit(self) -> None:
         config = self.scratch / "notify.conf"
-        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        _ = config.write_text("review_timeout_seconds=90\n")
         done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
         with (mock.patch.object(review, "NOTIFY_CONFIG", config),
               mock.patch.object(subprocess, "run", return_value=done) as run):
@@ -408,9 +418,8 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual("1", mend[2]["RUSTC_BOOTSTRAP"])
         self.assertEqual(str(runner.clone / "target/mend-target"), mend[2]["CARGO_TARGET_DIR"])
         self.assertEqual(str(runner.clone / "target/mend-target/intermediates"), mend[2]["CARGO_BUILD_BUILD_DIR"])
-        self.assertEqual(1, len(texts))
-        self.assertIn("Errors: 1; new warnings: 2", texts[0][1])
-        self.assertIn("Hana still uses Rust 1.99.0", texts[0][1])
+        self.assertEqual(texts, [("Rust 1.100.0 fails Hana's check: 1 error",
+                                  "Action: In the hana session, reply wait (recommended) or upgrade.")])
 
     def test_mend_outputs_remain_in_marked_caches_after_success_failure_and_timeout(self) -> None:
         clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
@@ -462,7 +471,8 @@ class RustReleaseTests(unittest.TestCase):
         self.assertTrue(runner.clone.exists())
         self.assertEqual(build_folders.build_folder_state(runner.clone), "free")
         self.assertTrue(runner.cache.is_dir())
-        self.assertIn("The tool that repairs Rust build errors fails to compile", texts[0][1])
+        self.assertEqual(texts, [("Rust 1.100.0 breaks the build repair tool",
+                                  "Action: In the hana session, reply wait (recommended) or upgrade.")])
 
     def test_failed_clippy_step_records_first_error_and_is_not_retried(self) -> None:
         clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
@@ -562,8 +572,8 @@ class RustReleaseTests(unittest.TestCase):
         assert trial["status"] == "finished"
         self.assertEqual((1, 1), (trial["errors"], trial["error_crates"]))
         self.assertEqual("cargo", runner.calls[-1][0][0])
-        self.assertIn("Errors: 1", texts[0][1])
-        self.assertIn("Hana still uses Rust 1.99.0", texts[0][1])
+        self.assertEqual(texts, [("Rust 1.100.0 fails Hana's check: 1 error",
+                                  "Action: In the hana session, reply wait (recommended) or upgrade.")])
         self.assertIn("1 error in 1 crate, cargo-mend builds", rust_release.report_line()[0])
 
         rust_release.state_path().unlink()

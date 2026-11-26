@@ -120,7 +120,6 @@ Rules:
 - If moving leaves a genuinely dead item (e.g. a now-unused `Default` impl), remove
   it and say so. Surface any larger removal for the user to decide rather than
   doing it silently.
-- Respect the forbidden-words list in every comment you write.
 </Reorganize>
 
 <Verify>

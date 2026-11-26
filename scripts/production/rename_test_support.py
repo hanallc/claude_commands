@@ -41,6 +41,7 @@ from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
@@ -99,7 +100,7 @@ class RenameDisplays:
         """Replace backend reads and writes, and retain the real retitle behavior."""
         from scripts.herdr import herdr
 
-        with (mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+        with (mock.patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}),
               mock.patch.object(herdr.Herdr, "panes", READ_HERDR_PANES),
               mock.patch.object(herdr.Herdr, "listed", side_effect=self.listed),
               mock.patch.object(herdr.Herdr, "run", side_effect=self.run),
@@ -210,8 +211,10 @@ class FolderMoveBackend:
         self.publish_process_state()
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
-                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
-                    timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *,
+                    publication: herdr.LaunchPublicationTiming = herdr.LaunchPublicationTiming.ON_START,
+                    ) -> herdr.PromptSubmissionNotRequired:
+        _ = publication
         self.fixture.assertFalse(self.live, "a live session must not start again")
         self.fixture.assertEqual((name, pane, kind), (self.fixture.owner.name, "w1:p1", self.kind))
         self.fixture.assertIn(self.fixture.owner.current_session, agent_arguments)
@@ -267,7 +270,7 @@ class FolderMoveFixture(StaffTestCase):
             "UNIT_RUN_ROOT": str(self.run_dir.parent),
             "SCRATCH_ROOT": str(self.root / "scratch"),
             "HERDR_PANE_RECORD_DIR": str(self.records),
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
         })))

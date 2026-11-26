@@ -1,0 +1,48 @@
+{
+  "accounts": {
+    "login_sitting_interval_days": 25
+  },
+  "aws_target": {
+    "accounting_zone": 8
+  },
+  "build_admission": {
+    "head_stall_alert_minutes": 9
+  },
+  "build_targets": {
+    "enabled.mac-linux": 22
+  },
+  "cloud_gate": {
+    "hana_gpu_route_enabled": 3
+  },
+  "console": {
+    "page.accounts.owner": 7,
+    "page.aws.owner": 10
+  },
+  "hana_aws": {
+    "source_allowed_ignored": 1
+  },
+  "lint": {
+    "sweep": 11,
+    "sweep_build_floor_gib.natedev": 6
+  },
+  "mac_test": {
+    "free_floor_gib": 27,
+    "offload": 21,
+    "probe_timeout_s": 26
+  },
+  "gate": {
+    "gate_time_limit_factor": 5
+  },
+  "send": {
+    "review_hold": 16,
+    "review_hold_idle_minutes": 23
+  },
+  "statusline": {
+    "account.claude2": 15,
+    "account.claude6": 24,
+    "role.worker": 12
+  },
+  "user_zone": {
+    "zone": 17
+  }
+}

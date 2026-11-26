@@ -73,8 +73,7 @@ advance_tick() {
     cp "$ticks/$tick/memory.stat" "$scope/memory.stat"
     cp "$ticks/$tick/cgroup.procs" "$scope/cgroup.procs"
 }
-sleep() {
-    [[ "$1" == 1 ]] || exit 91
+buildlog_wait_sample_tick() {
     printf '%s:%s\n' "$tick" "$(cat "$maximum")" >> "$ticks/observed"
     tick=$((tick + 1))
     if (( tick == 4 )); then
@@ -117,7 +116,7 @@ class TestPhasePeakTests(unittest.TestCase):
             HOME=str(self.recovery.fixture.base), BUILDLOG_PROC=str(timeline.proc),
             BUILDLOG_SYNC="1", BUILDLOG_OFF="0", LINT_INVOKE_SOURCED="",
             TEST_PHASE_RECORDER=str(Path(record.__file__).resolve()),
-            CODEX_THREAD_ID="original-step-worker", BUILDLOG_CALLER=caller,
+            **self.recovery.runner_sessions, BUILDLOG_CALLER=caller,
             BUILDLOG_CALL_ID="original-phase-call", USER_ZONE="UTC", TZ="UTC",
         )
 

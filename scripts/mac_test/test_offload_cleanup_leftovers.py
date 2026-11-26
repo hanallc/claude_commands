@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import hashlib
 import json
 import os
 import subprocess
@@ -10,19 +11,58 @@ from typing import cast
 import unittest
 from unittest import mock
 from scripts.build_queue.admission_test_support import caller_admission
-from scripts.mac_test import eligibility, offload
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.mac_test import claim_state, eligibility, offload
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
-from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent
+from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
+class RunnerFenceCommandTests(unittest.TestCase):
+    def test_mac_runner_command_pins_the_fence_descriptor(self) -> None:
+        identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        # Pin all command bytes, including the export that appends fd 8 to COPIES_MIRROR_LEASE_FDS.
+        for scope, expected in (
+            ("run", "a7c69949c03746503691afd99d8833096047070cdbfc3d06d849c3727e15f4d2"),
+            ("claims/alpha.json", "bc44cbea9f76c188499e7dc534f7e98bd3b9b5d1bba0d5fb934d52f4280ca4c8"),
+        ):
+            with self.subTest(scope=scope):
+                command = offload.fenced_start_command(identity, "mac", "printf 'mac_exit=42\\n'", scope_key=scope)
+                self.assertEqual(hashlib.sha256(command.encode()).hexdigest(), expected)
+
+
 class OffloadCommandTests(SeededCleanupFixture):
+    def test_fence_holder_diagnostic_preserves_the_test_verdict(self) -> None:
+        stream = offload.ProcessController.stream_mac_run
+
+        def remote_run(controller: offload.ProcessController, arguments: Sequence[str],
+                       cleanup_limit: offload.CleanupAfterVerdict | offload.CleanupOnly
+                       | offload.NoCommandTimeLimit = offload.NO_COMMAND_TIME_LIMIT) -> offload.RemoteRunStatus:
+            command = arguments[-1]
+            if arguments[0] != "ssh" or "exec 8<&-" not in command:
+                return stream(controller, arguments, cleanup_limit)
+            identity = controller.claim_identity
+            assert isinstance(identity, claim_state.ClaimIdentity)
+            key = offload.pending_start_key(identity)
+            self.assertIn("dispatch_start_settled=", command.split("exec 8<&-\n", 1)[1])
+            self.assertNotIn("fence_holders", command)
+            lines = f"mac_exit=42\nmac_cleanup=skipped\ndispatch_start_pending={key}\n"
+            return stream(controller, ["/bin/sh", "-c", 'printf "%s" "$1"', "fence", lines], cleanup_limit)
+
+        with mock.patch.object(offload.ProcessController, "stream_mac_run", remote_run), \
+             mock.patch.object(offload, "settle_pending_start") as settle:
+            result = self.command("--no-fail-fast", direct_placement=True, separate_stderr=True)
+        self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+        settle.assert_not_called()
+        self.assertEqual(self.leftover_events(), [])
+        self.assert_wire("failed", "")
+        self.assertEqual(self.remote_claim()["remote_host"], "mac")
+
     def command_with_changed_cleanup_timeout(self, value: str) -> subprocess.CompletedProcess[str]:
         self.config["leftover_timeout_s"] = "10"
         self.sync_config()
         _ = write_config_fixture(self.root / "transport-mac.conf", self.config_path.read_text(), template="mac_test")
-        _ = write_config_fixture(self.root / "build_targets.conf", "settings.mac=transport-mac.conf\n")
+        write_mac_target_registry(self.root, "transport-mac.conf")
         settings = self.root / "cleanup-settings.conf"
         configuration = self.config_path.read_text()
         _ = settings.write_text(configuration)
@@ -30,9 +70,10 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.sync_fixture()
         stream = offload.ProcessController.stream_mac_run
 
-        def change_settings(controller: offload.ProcessController,
-                            arguments: Sequence[str]) -> offload.RemoteRunStatus:
-            answer = stream(controller, arguments)
+        def change_settings(controller: offload.ProcessController, arguments: Sequence[str],
+                            cleanup_limit: offload.CleanupAfterVerdict | offload.CleanupOnly
+                            | offload.NoCommandTimeLimit = offload.NO_COMMAND_TIME_LIMIT) -> offload.RemoteRunStatus:
+            answer = stream(controller, arguments, cleanup_limit)
             # Keep the admission fixture configuration valid during later passes.
             _ = settings.write_text(configuration.replace(
                 "leftover_timeout_s=10\n", f"leftover_timeout_s={value}\n"))
@@ -78,7 +119,7 @@ class OffloadCommandTests(SeededCleanupFixture):
 
     def test_leftover_check_uses_connection_settings_and_the_recorded_host(self) -> None:
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
-        connection = eligibility.SshConnectionSettings("current-host", 7, 19)
+        connection = eligibility.SshConnectionSettings("current-host", 7, 19, UNREACHABLE_WAIT_FIXTURE_SECONDS)
         repository = eligibility.KnownRepository("hana")
         response = subprocess.CompletedProcess(["ssh"], 0, "leftovers=0\nrc=0\n", "")
         with mock.patch.object(subprocess, "run", return_value=response) as run:
@@ -99,13 +140,13 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.config["leftover_timeout_s"] = "19"
         self.sync_config()
         self.assertEqual(eligibility.read_connection_settings(self.config_path),
-                         eligibility.SshConnectionSettings("first-host", 7, 19))
+                         eligibility.SshConnectionSettings("first-host", 7, 19, UNREACHABLE_WAIT_FIXTURE_SECONDS))
         self.config["host"] = "second-host"
         self.config["connect_timeout_s"] = "8"
         self.config["leftover_timeout_s"] = "21"
         self.sync_config()
         self.assertEqual(eligibility.read_connection_settings(self.config_path),
-                         eligibility.SshConnectionSettings("second-host", 8, 21))
+                         eligibility.SshConnectionSettings("second-host", 8, 21, UNREACHABLE_WAIT_FIXTURE_SECONDS))
 
     def test_unconfirmed_cleanup_checks_leftovers_before_release_and_keeps_test_result(self) -> None:
         self.fixture["run_cleanup_line"] = ""

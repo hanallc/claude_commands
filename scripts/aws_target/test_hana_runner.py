@@ -1,35 +1,43 @@
 """Test leased guest commands and root fences with private source and process state."""
 from __future__ import annotations
 
+from array import array
 import errno
 import fcntl
 import hashlib
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, replace
 from http.client import IncompleteRead
+from io import BytesIO
 import json
 import os
 from pathlib import Path
 import select
+import selectors
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import termios
+import time
+from types import SimpleNamespace
 from typing import BinaryIO, NamedTuple, cast, override
 import unittest
 from unittest import mock
 from urllib.request import Request
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.build_queue import execution_identity
-from scripts.aws_target import hana_protocol
+from scripts.aws_target import hana_protocol, hana_render
 from scripts.aws_target import hana_guest as guest, hana_receiver as receiver
 from scripts.aws_target import hana_result, hana_runner as runner, hana_source as source
 from scripts.aws_target.hana_placement import HanaHostGeneration
 from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
+from scripts.aws_target.ledger_test_support import override_fixture_settings
 from scripts.aws_target import test_hana_receiver as receiver_tests, test_hana_source as source_tests
-from scripts.lib import build_folders, build_slots, process_stat
+from scripts.lib import build_folders, build_copies, process_stat
 from scripts.mac_test import linux_runner
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
@@ -123,17 +131,13 @@ class HanaRunnerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = source_tests.HanaSourceTests()
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
-        _ = write_config_fixture(self.fixture.configuration.source,
-                                 'step_cpu_limit=4\nstep_memory_gib=24\n')
+        self.fixture = set_up_fixture(self.addCleanup, source_tests.HanaSourceTests())
         _ = write_config_fixture(self.fixture.configuration.source.with_name('build_targets.conf'),
                                  'loopback.command_timeout_s=600\n')
         self.root = self.fixture.root
         self.receiver_settings = receiver.ReceiverSettings(7, 1, 83, 1048576, 120, 600)
         self.slot_policy = self.root / 'image-slots.conf'
-        receiver_tests.write_policy(self.slot_policy, self.root / 'guest-slots')
+        receiver_tests.write_policy(self.slot_policy, self.root / 'guest-build')
         self.compiler_version = self.root / 'compiler-version'
         _ = self.compiler_version.write_text('1.2.3\n')
         _ = self.enterContext(mock.patch.object(runner, 'IMAGE_COMPILER_VERSION', self.compiler_version))
@@ -142,7 +146,6 @@ class HanaRunnerTests(unittest.TestCase):
         self.binaries = self.root / 'bin'
         self.binaries.mkdir()
         home = self.root / 'home'
-        home.mkdir()
         self.enterContext(mock.patch.dict(os.environ, {'HOME': str(home),
             'RUSTUP_HOME': str(home / '.rustup'), 'CARGO_HOME': str(home / '.cargo'),
             'PATH': str(self.binaries) + os.pathsep + os.environ['PATH']}))
@@ -165,10 +168,9 @@ class HanaRunnerTests(unittest.TestCase):
         self.paths = guest.GuestPaths(self.root / 'root-control', self.root / 'boot-id')
         self.paths.directory.mkdir(mode=0o700)
         _ = self.paths.boot_id.write_text('boot')
-        _ = self.paths.generation.write_text('1')
         self.permit = guest.WorkPermit(1100, '1', 'boot')
-        guest.atomic_record(self.paths.permit, {'expires_at': 1100, 'generation': '1', 'boot_id': 'boot'})
         self.settings = replace(guest.read_settings(self.fixture.configuration), enabled=True)
+        guest.write_permit(self.settings, self.permit, expected_generation=0, paths=self.paths, clock=lambda: 1000)
         self.descriptor = {'version': 1, 'deployment': 'deployment', 'start_token': 'start', 'expires': 1200}
         self.access = hana_protocol.HanaExecutionAccess(
             'https://fixture.s3.us-east-2.amazonaws.com/observation',
@@ -184,7 +186,7 @@ class HanaRunnerTests(unittest.TestCase):
     def run_request(self, request: hana_protocol.HanaExecutionRequest, *, command_timeout_s: float = 600,
                     output_max_bytes: int = 16 * 1024 * 1024, build_start_fd: int = -1) -> hana_protocol.HanaRunOutcome:
         with self.fixture.guest(), self.fixture.verified_bundle(request.manifest) as bundle:
-            return runner.materialize_and_run(request, bundle, root=self.root / 'guest',
+            return runner.materialize_and_run(request, bundle,
                 command_timeout_s=command_timeout_s, output_max_bytes=output_max_bytes, build_start_fd=build_start_fd)
 
     def receive(self, envelope: hana_protocol.HanaExecutionEnvelope):
@@ -192,6 +194,7 @@ class HanaRunnerTests(unittest.TestCase):
             paths=self.paths, clock=lambda: 1000, uptime=lambda: 10)
 
     def test_exact_command_keeps_cargo_environment_and_compiler_failure_result(self) -> None:
+        override_fixture_settings(self.fixture.pool_settings, 'patterns.legacy-stable=other-{purpose}\n')
         with tempfile.TemporaryFile() as marker:
             outcome = self.run_request(self.request, build_start_fd=marker.fileno())
             _ = marker.seek(0)
@@ -200,11 +203,13 @@ class HanaRunnerTests(unittest.TestCase):
         assert isinstance(outcome, hana_protocol.HanaCommandFinished)
         result = outcome.result
         self.assertEqual((result.status, result.argv, result.key), (13, self.request.argv, self.request.key))
-        self.assertIn(b'hana-slot1|1|ci|check', result.stdout)
+        self.assertIn(b'hana/aws-hana/1/target|1|ci|check', result.stdout)
+        cache = self.root / 'guest-build/hana/main/shells'
+        self.assertEqual(len(list(cache.glob('*/exports.sh'))), 1)
         self.assertEqual(result.commit, self.manifest.commit)
         self.assertEqual(result.toolchain, self.manifest.toolchain)
         self.assertEqual(result.host, 'aws-hana')
-        self.assertEqual(build_folders.build_folder_state(self.root / 'guest-slots/hana-slot1'), 'free')
+        self.assertEqual(build_folders.build_folder_state(self.root / 'guest-build/hana/aws-hana/1'), 'free')
         self.assertEqual(hana_protocol.decode_outcome(hana_protocol.encode_outcome(outcome)), outcome)
 
     def test_cargo_exit_127_differs_from_a_missing_executable(self) -> None:
@@ -244,7 +249,7 @@ class HanaRunnerTests(unittest.TestCase):
         for request in (replace(self.request, argv=('cargo', 'clippy')), replace(self.request, slot=2)):
             with self.subTest(request=request.slot):
                 self.assertIsInstance(self.run_request(request), hana_protocol.HanaExecutionRefused)
-        self.assertFalse((self.root / 'guest-slots/hana-slot2').exists())
+        self.assertFalse((self.root / 'guest-build/hana/aws-hana/2').exists())
 
     def test_missing_basis_reports_the_same_source_without_acquiring_a_slot(self) -> None:
         missing = replace(self.manifest, basis_commits=('f' * 40,))
@@ -252,7 +257,7 @@ class HanaRunnerTests(unittest.TestCase):
         assert isinstance(outcome, hana_protocol.HanaExecutionRefused)
         self.assertIn('MissingBasis:', outcome.reason)
         self.assertIn('f' * 40, outcome.reason)
-        self.assertFalse((self.root / 'guest-slots/hana-slot1').exists())
+        self.assertFalse((self.root / 'guest-build/hana/aws-hana/1').exists())
 
     def test_output_bound_retains_a_lost_outcome_instead_of_a_compiler_result(self) -> None:
         directory = self.root / 'command-output'
@@ -267,28 +272,172 @@ class HanaRunnerTests(unittest.TestCase):
                 _ = output.write(hana_protocol.encode_outcome(outcome))
             self.assertEqual(supervisor.outcome(directory), outcome)
 
-    def test_silent_command_deadline_kills_its_descendants_and_releases_the_slot(self) -> None:
-        pids = self.root / 'hung-pids'
-        code = ('import os, pathlib, subprocess, sys, threading; '
-            + 'child = subprocess.Popen([sys.executable, "-c", "import threading; threading.Event().wait(60)"]); '
-            + f'pathlib.Path({str(pids)!r}).write_text(str(os.getpid()) + " " + str(child.pid)); '
-            + 'threading.Event().wait(60)')
-        self.tool('cargo', 'exec ' + shlex.join([sys.executable, '-c', code]) + '\n')
-        outcome = self.run_request(self.request, command_timeout_s=0.25)
-        assert isinstance(outcome, hana_protocol.HanaExecutionLost)
-        self.assertIn('execution deadline', outcome.reason)
-        for value in pids.read_text().split():
-            try:
-                self.assertIn(process_stat.process_fields(int(value))[0], ('Z', 'X'))
-            except FileNotFoundError:
-                pass
-        self.assertEqual(build_folders.build_folder_state(self.root / 'guest-slots/hana-slot1'), 'free')
+    def test_command_exit_drains_output_while_a_descendant_holds_both_pipes(self) -> None:
+        slot = build_copies.LeasedCopy(self.root, 'hana', 1, {}, ())
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, 'rb'), os.fdopen(write_fd, 'wb'):
+            script = '''
+import os, sys
+gate = int(sys.argv[1])
+if os.fork() == 0:
+    os.read(gate, 1)
+    os._exit(0)
+print('compiler output')
+print('compiler diagnostic', file=sys.stderr)
+raise SystemExit(13)
+'''
+            execution = linux_runner.LeasedSlotExecution(slot, (read_fd,))
+            started = time.monotonic()
+            result = linux_runner.capture_leased_command([sys.executable, '-c', script, str(read_fd)],
+                execution, os.environ, 1024, timeout_s=10)
+            self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual((result.status, result.stdout, result.stderr),
+                         (13, b'compiler output\n', b'compiler diagnostic\n'))
 
-    def test_command_deadline_also_bounds_the_wait_after_output_closes(self) -> None:
-        self.tool('cargo', 'exec >/dev/null 2>&1\nexec sleep 60\n')
-        outcome = self.run_request(self.request, command_timeout_s=0.1)
-        assert isinstance(outcome, hana_protocol.HanaExecutionLost)
-        self.assertIn('execution deadline', outcome.reason)
+    def require_command_exit(self, child: subprocess.Popen[bytes]) -> None:
+        with os.fdopen(os.pidfd_open(child.pid), 'rb') as exit_fd:
+            ready, _, _ = select.select([exit_fd], [], [], TEST_HANG_GUARD_SECS)
+            self.assertTrue(ready, 'The command did not exit')
+
+    def test_command_exit_wins_when_the_runner_resumes_after_its_deadline(self) -> None:
+        slot = build_copies.LeasedCopy(self.root, 'hana', 1, {}, ())
+        execution = linux_runner.LeasedSlotExecution(slot, ())
+        command = [sys.executable, '-c', 'import sys; sys.stdin.buffer.read(1); print("done"); sys.exit(13)']
+        clock = 1000.0
+        with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE) as child:
+            assert child.stdin is not None
+            release = child.stdin.close
+
+            def resume(*_args: object, **_kwargs: object) -> subprocess.Popen[bytes]:
+                nonlocal clock
+                release()
+                self.require_command_exit(child)
+                clock = 1002.0
+                return child
+
+            with (mock.patch.object(subprocess, 'Popen', side_effect=resume),
+                  mock.patch.object(time, 'monotonic', side_effect=lambda: clock)):
+                result = linux_runner.capture_leased_command(command, execution, os.environ,
+                    1024, timeout_s=1)
+        self.assertEqual((result.status, result.stdout, result.stderr), (13, b'done\n', b''))
+
+    def test_command_exit_reads_only_pending_bytes_from_pipes_with_a_continuous_writer(self) -> None:
+        slot = build_copies.LeasedCopy(self.root, 'hana', 1, {}, ())
+        read_fd, write_fd = os.pipe()
+        ready_read, ready_write = os.pipe()
+        script = '''
+import os, sys
+if os.fork() == 0:
+    if not os.read(int(sys.argv[1]), 1):
+        os._exit(0)
+    try:
+        os.write(1, b'late output\\n')
+        os.write(2, b'late diagnostic\\n')
+        os.write(int(sys.argv[2]), b'r')
+        while True:
+            os.write(1, b'x' * 4096)
+            os.write(2, b'y' * 4096)
+    except BrokenPipeError:
+        os._exit(0)
+print('compiler output')
+print('compiler diagnostic', file=sys.stderr)
+raise SystemExit(13)
+'''
+        command = [sys.executable, '-c', script, str(read_fd), str(ready_write)]
+        execution = linux_runner.LeasedSlotExecution(slot, (read_fd, ready_write))
+        payload = b'x' * (3 * 65536 + 1)
+        buffered = BytesIO(payload)
+        read = os.read
+        ioctl = fcntl.ioctl
+        with (os.fdopen(read_fd, 'rb'), os.fdopen(write_fd, 'wb', buffering=0) as release,
+              os.fdopen(ready_read, 'rb') as ready, os.fdopen(ready_write, 'wb'),
+              subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               pass_fds=execution.descriptors) as child):
+            self.require_command_exit(child)
+            assert child.stdout is not None and child.stderr is not None
+            stdout_fd = child.stdout.fileno()
+            stderr_fd = child.stderr.fileno()
+            pending_counts: dict[int, int] = {}
+
+            def pending_at_exit(fd: int, request: int, count: array[int]) -> int:
+                self.assertNotIn(fd, pending_counts)
+                self.assertEqual(request, termios.FIONREAD)
+                status = cast(int, ioctl(fd, request, count))
+                # Simulate a pipe with capacity above the kernel default.
+                if fd == stdout_fd:
+                    count[0] += len(payload)
+                pending_counts[fd] = count[0]
+                if len(pending_counts) == 2:
+                    _ = release.write(b'x')
+                    readable, _, _ = select.select([ready], [], [], TEST_HANG_GUARD_SECS)
+                    self.assertTrue(readable, 'The descendant did not write to the pipes')
+                    self.assertEqual(ready.read(1), b'r')
+                return status
+
+            def read_buffered(fd: int, size: int) -> bytes:
+                self.assertEqual(set(pending_counts), {stdout_fd, stderr_fd})
+                if fd == stdout_fd and (chunk := buffered.read(size)):
+                    return chunk
+                return read(fd, size)
+
+            started = time.monotonic()
+            with (mock.patch.object(subprocess, 'Popen', return_value=child),
+                  mock.patch.object(fcntl, 'ioctl', side_effect=pending_at_exit),
+                  mock.patch.object(os, 'read', side_effect=read_buffered)):
+                result = linux_runner.capture_leased_command(command, execution, os.environ,
+                    len(payload) + 1024, timeout_s=10)
+            self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual((result.status, result.stdout, result.stderr),
+                         (13, payload + b'compiler output\n', b'compiler diagnostic\n'))
+
+    def test_command_deadline_leaves_a_live_command_for_the_unit_to_stop(self) -> None:
+        slot = build_copies.LeasedCopy(self.root, 'hana', 1, {}, ())
+        execution = linux_runner.LeasedSlotExecution(slot, ())
+        script = '''
+import os, sys
+if sys.argv[1] == 'True':
+    os.close(1)
+    os.close(2)
+os.write(int(sys.argv[2]), b'r')
+sys.stdin.buffer.read(1)
+'''
+        for close_output in (False, True):
+            with self.subTest(close_output=close_output):
+                read_fd, write_fd = os.pipe()
+                with os.fdopen(read_fd, 'rb') as ready, os.fdopen(write_fd, 'wb'):
+                    command = [sys.executable, '-c', script, str(close_output), str(write_fd)]
+                    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, pass_fds=(write_fd,), start_new_session=True) as child:
+                        assert child.stdin is not None
+                        try:
+                            readable, _, _ = select.select([ready], [], [], TEST_HANG_GUARD_SECS)
+                            self.assertTrue(readable, 'The command did not signal readiness')
+                            self.assertEqual(ready.read(1), b'r')
+                            started = time.monotonic()
+                            with selectors.DefaultSelector() as streams:
+                                def monotonic() -> float:
+                                    count = len(streams.get_map())
+                                    if not count:
+                                        return 0.0
+                                    if close_output and count > 1:
+                                        self.assertLess(time.monotonic() - started, TEST_HANG_GUARD_SECS,
+                                                        'The runner did not observe both closed output streams')
+                                        return 0.0
+                                    return 1.0
+
+                                clock = SimpleNamespace(time=time.time, monotonic=monotonic)
+                                selector = SimpleNamespace(DefaultSelector=lambda: streams, EVENT_READ=selectors.EVENT_READ)
+                                with (mock.patch.object(subprocess, 'Popen', return_value=child),
+                                      mock.patch.object(linux_runner, 'time', clock),
+                                      mock.patch.object(linux_runner, 'selectors', selector),
+                                      self.assertRaisesRegex(linux_runner.LeasedCommandLost, 'execution deadline')):
+                                    _ = linux_runner.capture_leased_command(command, execution, os.environ,
+                                        1024, timeout_s=1)
+                            self.assertIsNone(child.poll())
+                        finally:
+                            child.stdin.close()
+                            _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_complete_source_update_repairs_the_original_capture_without_running_cargo(self) -> None:
         self.fixture.sender.acknowledge(hana_protocol.SourceIdentity(self.manifest.repository,
@@ -310,15 +459,14 @@ class HanaRunnerTests(unittest.TestCase):
         with (self.fixture.guest(), self.fixture.verified_bundle(complete) as bundle,
               mock.patch.object(linux_runner, 'run_slot') as command,
               mock.patch.object(linux_runner, 'prepare_shell') as shell):
-            updated = runner.materialize_source_update(replace(original, manifest=complete), bundle,
-                root=self.root / 'guest')
+            updated = runner.materialize_source_update(replace(original, manifest=complete), bundle)
         assert isinstance(updated, hana_protocol.HanaSourceUpdated)
         self.assertEqual(updated.identity.commit, original.manifest.commit)
-        self.assertEqual((self.root / 'guest-slots/hana-slot1/tracked').read_text(), 'captured update\n')
+        self.assertEqual((self.root / 'guest-build/hana/aws-hana/1/tracked').read_text(), 'captured update\n')
         self.assertEqual(hana_protocol.decode_source_outcome(hana_protocol.encode_source_outcome(updated)), updated)
         command.assert_not_called()
         shell.assert_not_called()
-        self.assertEqual(build_folders.build_folder_state(self.root / 'guest-slots/hana-slot1'), 'free')
+        self.assertEqual(build_folders.build_folder_state(self.root / 'guest-build/hana/aws-hana/1'), 'free')
 
     def test_source_update_entry_point_materializes_source_without_cargo_or_shell_preparation(self) -> None:
         cargo = self.root / 'cargo-started'
@@ -332,14 +480,11 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
 '''
         content = json.dumps({'action': 'source-update',
             'request': cast(object, json.loads(hana_protocol.encode_request(self.request)))}).encode()
-        code = ('from pathlib import Path\nfrom scripts.aws_target import hana_runner\n'
-            + 'original = hana_runner.materialize_source_update\n'
-            + f'hana_runner.materialize_source_update = lambda request, bundle: original(request, bundle, root=Path({str(self.root / "guest")!r}))\n'
-            + code)
         with self.fixture.verified_bundle(self.manifest) as bundle:
             result = subprocess.run([sys.executable, '-c', code, '--bundle-fd', str(bundle.descriptor),
                 '--bundle-offset', str(bundle.offset), '--bundle-size', str(bundle.size),
                 '--command-timeout-s', '600'], input=content, pass_fds=(bundle.descriptor,),
+                env={**os.environ, 'HOME': str(self.fixture.guest_home)},
                 capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
         updated = hana_protocol.decode_source_outcome(result.stdout)
@@ -349,7 +494,7 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
         # The bootstrap must apply the image limits before the runner acquires the exact slot.
         bootstrap_root = self.root / 'bootstrap'
         bootstrap_root.mkdir()
-        slot_root = self.root / 'image-slots'
+        slot_root = self.root / 'image-build'
         receiver_tests.write_policy(bootstrap_root / 'policy.conf', slot_root)
         entry = f'import sys\nsys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n' + code
         config = Path(os.environ['CONF_DIR'])
@@ -361,15 +506,86 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
               for name in ('build_folders.conf', 'hana_aws.conf', 'copies.conf')),
         )
         request = replace(self.request, manifest=replace(self.manifest, bundle_sha256=hashlib.sha256(payload).hexdigest()))
-        bootstrap, content, env = receiver_tests.bootstrap_fixture(bootstrap_root, bootstrap_root, payload, request,
+        bootstrap, content, env = receiver_tests.bootstrap_fixture(bootstrap_root, payload, request,
                                                                   action='source-update')
         result = subprocess.run(bootstrap, input=content, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
                                 check=False, env=env)
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
         self.assertIsInstance(hana_protocol.decode_source_outcome(result.stdout), hana_protocol.HanaSourceUpdated,
                               result.stdout)
-        self.assertEqual((slot_root / 'hana-slot1/tracked').read_text(), 'committed\n')
+        self.assertEqual((slot_root / 'hana/aws-hana/1/tracked').read_text(), 'committed\n')
         self.assertFalse(cargo.exists() or shell.exists())
+
+    def test_isolated_runtime_writes_a_refusal_for_input_import_and_runtime_errors(self) -> None:
+        runtime = self.root / 'runtime'
+        for file in hana_render.runtime_files(Path(__file__).resolve().parents[2], self.fixture.configuration):
+            path = runtime / file.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_bytes(file.content)
+            path.chmod(file.mode)
+        source_module = runtime / 'scripts/aws_target/hana_source.py'
+        source_text = source_module.read_text()
+        runner_module = runtime / 'scripts/aws_target/hana_runner.py'
+        runner_text = runner_module.read_text()
+        request = cast(object, json.loads(hana_protocol.encode_request(self.request)))
+        fixture_message = 'The source worker failed at /private/credentials with fixture-private-text'
+
+        for case, action, expected, diagnostic in (
+            ('arguments', 'execute', 'The Hana runner refused its arguments', 'The verified bundle range is invalid'),
+            ('input', 'execute', 'The Hana runner stopped: ValueError', 'Invalid Hana integer: output_max_bytes'),
+            ('missing-dependency', 'execute', 'The Hana runner stopped: ImportError', "cannot import name 'hana_source'"),
+            ('missing-runner', 'execute', 'The Hana runner stopped: ImportError', "cannot import name 'hana_runner'"),
+            ('runtime-error', 'execute', 'The Hana runner stopped: RuntimeError', fixture_message),
+            ('runtime-error', 'source-update', 'The Hana runner stopped: RuntimeError', fixture_message),
+            ('broken-string', 'execute', 'The Hana runner stopped: UnprintableError', '<exception str() failed>'),
+            ('broken-stderr', 'execute', 'The Hana runner stopped: RuntimeError', None),
+        ):
+            with self.subTest(case=case, action=action), self.fixture.verified_bundle(self.manifest) as bundle:
+                if case == 'missing-dependency':
+                    source_module.unlink()
+                else:
+                    _ = source_module.write_text(source_text)
+                if case == 'missing-runner':
+                    runner_module.unlink()
+                else:
+                    script = runner_text
+                    if case == 'runtime-error':
+                        operation = 'materialize_and_run' if action == 'execute' else 'materialize_source_update'
+                        script += f'\ndef {operation}(*args, **kwargs):\n    raise RuntimeError({fixture_message!r})\n'
+                    if case == 'broken-string':
+                        script += (
+                            '\nclass UnprintableError(Exception):\n'
+                            + '    def __str__(self):\n        raise RuntimeError("fixture-private-text")\n'
+                            + '\ndef materialize_and_run(*args, **kwargs):\n    raise UnprintableError()\n')
+                    if case == 'broken-stderr':
+                        script += (
+                            '\nclass UnwritableStderr:\n'
+                            + '    def write(self, text):\n        raise OSError("The diagnostic write failed")\n'
+                            + '    def flush(self):\n        pass\n'
+                            + '\ndef materialize_and_run(*args, **kwargs):\n'
+                            + '    sys.stderr = UnwritableStderr()\n    raise RuntimeError("fixture failure")\n')
+                    _ = runner_module.write_text(script)
+                fields = {'action': action, 'request': request}
+                if case != 'input':
+                    fields['output_max_bytes'] = 1024
+                size = 0 if case == 'arguments' else bundle.size
+                result = subprocess.run([sys.executable, '-IB', str(runtime / 'runner.py'),
+                    '--bundle-fd', str(bundle.descriptor), '--bundle-offset', str(bundle.offset),
+                    '--bundle-size', str(size), '--command-timeout-s', '600'],
+                    input=json.dumps(fields).encode(), pass_fds=(bundle.descriptor,), capture_output=True,
+                    cwd=runtime, env={**os.environ, 'CONF_DIR': str(runtime / 'config')},
+                    timeout=TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0)
+                if diagnostic is None:
+                    self.assertEqual(result.stderr, b'')
+                else:
+                    self.assertIn(diagnostic.encode(), result.stderr)
+                    if case != 'arguments':
+                        self.assertIn(b'Traceback (most recent call last):', result.stderr)
+                outcome = (hana_protocol.decode_source_outcome(result.stdout) if action == 'source-update'
+                    else hana_protocol.decode_outcome(result.stdout))
+                assert isinstance(outcome, (hana_protocol.HanaExecutionRefused, hana_protocol.HanaSourceUpdateRefused))
+                self.assertEqual(outcome.reason, expected)
 
     def test_shell_failure_and_compiler_mismatch_start_no_cargo(self) -> None:
         cargo = self.root / 'cargo-started'
@@ -400,7 +616,7 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
     def test_execution_settings_use_the_image_and_shared_deadlines_and_disk_floor(self) -> None:
         _ = write_config_fixture(self.fixture.configuration.source.with_name('build_targets.conf'),
             'loopback.shell_timeout_s=7\nloopback.command_timeout_s=600\n')
-        _ = write_config_fixture(self.fixture.configuration.source, 'free_floor_gib=11\n')
+        override_fixture_settings(self.fixture.configuration.source, 'free_floor_gib=11\n')
         settings = runner.read_settings(self.fixture.configuration, 19)
         self.assertEqual((settings.compiler_version, settings.shell_timeout_s,
             settings.command_timeout_s, settings.free_floor_gib), ('1.2.3', 7, 19, 11))
@@ -424,23 +640,24 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
         code = '''import os, pathlib, sys
 from unittest import mock
 from scripts.aws_target import hana_protocol, hana_source as source
-from scripts.lib import build_slots, conf
+from scripts.lib import conf
 from scripts.mac_test import linux_runner
-manifest_path, root = map(pathlib.Path, sys.argv[1:3])
-ready = int(sys.argv[3])
-bundle = source.VerifiedGitBundle(*map(int, sys.argv[4:]))
+manifest_path = pathlib.Path(sys.argv[1])
+ready = int(sys.argv[2])
+bundle = source.VerifiedGitBundle(*map(int, sys.argv[3:]))
 limits = source.read_limits(conf.read_or_repository('hana_aws'))
 manifest = hana_protocol.decode_manifest(manifest_path.read_bytes(), limits)
 with mock.patch('socket.gethostname', return_value='aws-hana'):
-    with source.materialize(manifest, limits, bundle, root=root,
-        showrunner='hana', unit='test', work='child', selection=build_slots.ExactSlotRequest(1)) as leased:
-        execution = linux_runner.LeasedSlotExecution(leased.slot, (*leased.descriptors, ready))
+    with source.materialize(manifest, limits, bundle, number=1, work='child') as leased:
+        execution = linux_runner.LeasedSlotExecution(leased.copy, (*leased.descriptors, ready))
         child = "import os,sys; os.write(int(sys.argv[1]), b'ready'); sys.stdin.buffer.read(1)"
-        linux_runner.capture_leased_command([sys.executable, '-c', child, str(ready)], execution, os.environ, 1024, timeout_s=30)
+        linux_runner.capture_leased_command([sys.executable, '-c', child, str(ready)], execution, os.environ, 1024,
+                                            timeout_s=30)
 '''
         with self.fixture.verified_bundle(self.manifest) as bundle:
-            wrapper = subprocess.Popen([sys.executable, '-c', code, str(manifest), str(self.root / 'guest'),
+            wrapper = subprocess.Popen([sys.executable, '-c', code, str(manifest),
                 str(ready_write), str(bundle.descriptor), str(bundle.offset), str(bundle.size)], stdin=subprocess.PIPE,
+                env={**os.environ, 'HOME': str(self.fixture.guest_home)},
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(ready_write, bundle.descriptor))
         try:
             readable, _, _ = select.select([ready_read], [], [], TEST_HANG_GUARD_SECS)
@@ -448,9 +665,9 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
             self.assertEqual(os.read(ready_read, 5), b'ready')
             wrapper.kill()
             _ = wrapper.wait(timeout=TEST_HANG_GUARD_SECS)
-            slot = self.root / 'guest-slots/hana-slot1'
+            slot = self.root / 'guest-build/hana/aws-hana/1'
             self.assertEqual(build_folders.build_folder_state(slot), 'held')
-            with self.fixture.guest(), self.assertRaises(build_slots.SlotsFull), self.fixture.materialize(self.manifest):
+            with self.fixture.guest(), self.assertRaises(BlockingIOError), self.fixture.materialize(self.manifest):
                 self.fail('The source reset ignored the child lease')
             assert wrapper.stdin is not None
             _ = wrapper.stdin.write(b'x')
@@ -499,10 +716,18 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
         pending = self.receive(fence)
         self.assertTrue(pending.fenced and pending.accepted)
         self.assertFalse(pending.terminated or pending.lease_free)
-        self.supervisor.departure_value = receiver.CommandDeparture(True, False)
-        self.assertFalse(self.receive(fence).lease_free)
-        self.supervisor.departure_value = receiver.CommandDeparture(True, True)
-        self.assertTrue(self.receive(fence).lease_free)
+        self.supervisor.departure_value = receiver.CommandDeparture(True, False, {'unit_exit_observed_at': 980})
+        pending = self.receive(fence)
+        self.assertFalse(pending.lease_free)
+        self.assertEqual(pending.timing, {'unit_exit_observed_at': 980})
+        self.supervisor.departure_value = receiver.CommandDeparture(True, True,
+            {'unit_exit_observed_at': 985, 'lease_free_at': 990})
+        departed = self.receive(fence)
+        self.assertTrue(departed.lease_free)
+        self.assertEqual(departed.timing, {'unit_exit_observed_at': 980, 'lease_free_at': 990})
+        self.supervisor.departure_value = receiver.CommandDeparture(True, True,
+            {'unit_exit_observed_at': 995, 'lease_free_at': 996})
+        self.assertEqual(self.receive(fence).timing, departed.timing)
         self.assertEqual(len(self.supervisor.starts), 1)
 
     def test_receiver_restart_does_not_repeat_acceptance(self) -> None:
@@ -609,7 +834,8 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
     def test_result_publication_precedes_terminal_observation_and_idle_objects_do_nothing(self) -> None:
         outcome = self.run_request(self.request)
         assert isinstance(outcome, hana_protocol.HanaCommandFinished)
-        self.supervisor.departure_value = receiver.CommandDeparture(True, True)
+        departure_timing: hana_protocol.HanaCommandTiming = {'unit_exit_observed_at': 980, 'lease_free_at': 990}
+        self.supervisor.departure_value = receiver.CommandDeparture(True, True, departure_timing)
         prefix = 'https://fixture.s3.us-east-2.amazonaws.com/'
         transport = self.receiver_settings
         for case, boot_deadline, access_deadline, cause in (
@@ -655,7 +881,7 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
                 directory = receiver.command_directory(self.paths, key)
                 if case == 'restart':
                     _ = self.receive(envelope)
-                    guest.atomic_record(directory / 'result-upload.json', {'state': 'started'})
+                    guest.atomic_record(directory / 'result-upload.json', {'state': 'started', 'upload_started_at': 995})
                 status = {'timeout': 28, 'http-error': 22}.get(case, 0)
                 curl = FixtureCurl(status)
 
@@ -668,7 +894,7 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
                     self.assertEqual(upload_path, Path(f'/proc/self/fd/{pass_fds[0]}'))
                     self.assertEqual(hana_result.decode_result(upload_path.read_bytes()), result)
                     self.assertEqual(receiver.read_document((directory / 'result-upload.json').read_bytes()),
-                                     {'state': 'started'})
+                                     {'state': 'started', 'upload_started_at': 1000})
                     published.append(self.access.result_url)
                     return curl
 
@@ -680,17 +906,24 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
                             pause=lambda _seconds: None, clock=lambda: 1000, keep_running=lambda: next(running))
                 if case.startswith('short-') or case == 'restart':
                     popen.assert_not_called()
+                    expected_record: dict[str, object] = {'state': 'lost', 'reason': cause}
+                    if case == 'restart':
+                        expected_record['upload_started_at'] = 995
                     self.assertEqual(receiver.read_document((directory / 'result-upload.json').read_bytes()),
-                                     {'state': 'lost', 'reason': cause})
+                                     expected_record)
                 else:
                     popen.assert_called_once()
                     self.assertLess(published.index(self.access.result_url), published.index(self.access.observation_url))
                     self.assertEqual(curl.polls, 1)
                     self.assertEqual(curl.kills, 0)
                 self.assertGreaterEqual(len(observations), 2)
+                expected_timing = dict(departure_timing)
+                if not case.startswith('short-'):
+                    expected_timing['upload_started_at'] = 995 if case == 'restart' else 1000
                 for observation in observations:
                     self.assertTrue(observation.terminated and observation.lease_free)
                     self.assertEqual(observation.evidence, execution_identity.ExecutionEvidenceUnavailable(cause, 1000))
+                    self.assertEqual(observation.timing, expected_timing)
         self.assertEqual(len(self.supervisor.starts), 6)
 
     def test_receiver_renews_and_fences_during_an_upload_despite_failed_control_reads(self) -> None:
@@ -776,6 +1009,7 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
         fenced = observations[0]
         self.assertEqual(fenced.key, self.request.key)
         self.assertTrue(fenced.fenced and fenced.terminated and fenced.lease_free)
+        self.assertEqual(fenced.timing, {'upload_started_at': 1000})
 
     def test_receiver_processes_fence_before_failing_permit_steps(self) -> None:
         prefix = 'https://fixture.s3.us-east-2.amazonaws.com/'
@@ -833,13 +1067,15 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
                 self.assertEqual(steps, [*expected, 'read command'])
 
     def test_root_keeps_publication_urls_outside_the_runner_input(self) -> None:
+        _ = self.receive(self.envelope)
         directory = self.paths.directory / ('a' * 64)
         directory.mkdir(mode=0o700)
         supervisor = receiver.GuestCommandSupervisor(replace(self.receiver_settings, aws_timeout_s=10), slot_policy=self.slot_policy)
         with mock.patch.object(subprocess, 'Popen', return_value=mock.Mock(pid=os.getpid())) as launch:
-            _ = supervisor.start(self.envelope, directory,
-                ['systemd-run', '--unit=hana-command-1', '--uid=hana-runner', '--', 'runner'])
+            _ = supervisor.start(self.envelope, directory, self.supervisor.starts[0])
         arguments = cast(list[str], launch.call_args.args[0])
+        self.assertIn('--property=ExitType=main', arguments)
+        self.assertIn('--property=KillMode=control-group', arguments)
         self.assertIn('--property=RuntimeMaxSec=600', arguments)
         self.assertIn('--property=TimeoutStopSec=10', arguments)
         self.assertIn('--property=EnvironmentFile=/etc/hana-aws/runner-environment', arguments)
@@ -851,22 +1087,93 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
     def test_supervisor_requires_launcher_completion_and_the_exact_slot_lock_release(self) -> None:
         directory = self.paths.directory / ('b' * 64)
         directory.mkdir(mode=0o700)
-        supervisor = receiver.GuestCommandSupervisor(replace(self.receiver_settings, aws_timeout_s=10), slot_policy=self.slot_policy)
+        times = iter((1000.0, 1001.0, 1002.0))
+        supervisor = receiver.GuestCommandSupervisor(replace(self.receiver_settings, aws_timeout_s=10),
+                                                     slot_policy=self.slot_policy, clock=lambda: next(times))
         poll = mock.Mock(return_value=0)
         child = mock.Mock(poll=poll)
         supervisor.children[directory] = cast(subprocess.Popen[bytes], child)
         inactive = subprocess.CompletedProcess(['systemctl'], 0,
             'LoadState=not-found\nActiveState=inactive\nControlGroup=\nJob=0\n', '')
-        with mock.patch.object(subprocess, 'run', return_value=inactive), self.fixture.guest():
-            slot = self.root / 'guest-slots/hana-slot1.lock'
-            slot.parent.mkdir(exist_ok=True)
+        journal_reads: list[list[str]] = []
+
+        def inspect_unit(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+            if arguments[0] == 'systemctl':
+                return inactive
+            self.assertEqual(arguments[0], 'journalctl')
+            self.assertIn('UNIT=' + receiver.command_unit(directory), arguments)
+            self.assertIn('_PID=1', arguments)
+            journal_reads.append(arguments)
+            return subprocess.CompletedProcess(arguments, 0, b'{"__REALTIME_TIMESTAMP":"999750000"}\n', b'')
+
+        with mock.patch.object(subprocess, 'run', side_effect=inspect_unit), self.fixture.guest():
+            slot = self.root / 'guest-build/hana/aws-hana/1.lock'
+            slot.parent.mkdir(parents=True, exist_ok=True)
             with slot.open('a') as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                self.assertEqual(supervisor.departure(directory, 1), receiver.CommandDeparture(True, False))
-            self.assertEqual(supervisor.departure(directory, 1), receiver.CommandDeparture(True, True))
+                self.assertEqual(supervisor.departure(directory, 1),
+                                 receiver.CommandDeparture(True, False,
+                                     {'unit_exited_at': 999.75, 'unit_exit_observed_at': 1000.0}))
+            self.assertEqual(supervisor.departure(directory, 1),
+                             receiver.CommandDeparture(True, True,
+                                 {'unit_exited_at': 999.75, 'unit_exit_observed_at': 1001.0, 'lease_free_at': 1002.0}))
             (directory / 'launcher-finished.json').unlink()
             poll.return_value = -9
-            self.assertEqual(supervisor.departure(directory, 1), receiver.CommandDeparture(False, False))
+            self.assertEqual(supervisor.departure(directory, 1),
+                             receiver.CommandDeparture(False, False, {'unit_exited_at': 999.75}))
+        self.assertEqual(len(journal_reads), 2)
+
+    def test_supervisor_recovers_the_unit_exit_time_after_a_receiver_restart(self) -> None:
+        directory = self.paths.directory / ('d' * 64)
+        directory.mkdir(mode=0o700)
+        guest.atomic_record(directory / 'launcher.json', {'pid': 123, 'start_time': 456})
+        supervisor = receiver.GuestCommandSupervisor(self.receiver_settings, slot_policy=self.slot_policy,
+                                                     clock=lambda: 1000)
+        inactive = subprocess.CompletedProcess(['systemctl'], 0,
+            'LoadState=not-found\nActiveState=inactive\nControlGroup=\nJob=0\n', '')
+        entry = subprocess.CompletedProcess(['journalctl'], 0, b'{"__REALTIME_TIMESTAMP":"999750000"}\n', b'')
+        with (mock.patch.object(process_stat, 'process_fields', side_effect=FileNotFoundError),
+              mock.patch.object(subprocess, 'run', side_effect=[inactive, entry, inactive]) as run,
+              self.fixture.guest()):
+            self.assertEqual(supervisor.departure(directory, 1),
+                             receiver.CommandDeparture(False, False, {'unit_exited_at': 999.75}))
+            (self.root / 'guest-build').mkdir(exist_ok=True)
+            guest.atomic_record(directory / 'stopped.json', {'stopped': True})
+            self.assertEqual(supervisor.departure(directory, 1), receiver.CommandDeparture(True, True, {
+                'unit_exited_at': 999.75, 'unit_exit_observed_at': 1000, 'lease_free_at': 1000,
+            }))
+        arguments = cast(list[str], run.call_args_list[1].args[0])
+        self.assertIn('--boot', arguments)
+        self.assertIn('UNIT=' + receiver.command_unit(directory), arguments)
+
+    def test_supervisor_reads_a_late_exit_time_on_the_next_pass(self) -> None:
+        directory = self.paths.directory / ('e' * 64)
+        directory.mkdir(mode=0o700)
+        supervisor = receiver.GuestCommandSupervisor(self.receiver_settings, slot_policy=self.slot_policy,
+                                                     clock=lambda: 1000)
+        child = mock.Mock(poll=mock.Mock(return_value=0))
+        supervisor.children[directory] = cast(subprocess.Popen[bytes], child)
+        inactive = subprocess.CompletedProcess(['systemctl'], 0,
+            'LoadState=not-found\nActiveState=inactive\nControlGroup=\nJob=0\n', '')
+        missing = subprocess.CompletedProcess(['journalctl'], 0, b'', b'')
+        entry = subprocess.CompletedProcess(['journalctl'], 0, b'{"__REALTIME_TIMESTAMP":"999750000"}\n', b'')
+        with (mock.patch.object(subprocess, 'run', side_effect=[inactive, missing, inactive, entry, inactive]) as run,
+              self.fixture.guest()):
+            slot = self.root / 'guest-build/hana/aws-hana/1.lock'
+            slot.parent.mkdir(parents=True, exist_ok=True)
+            with slot.open('a') as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                pending = supervisor.departure(directory, 1)
+                self.assertEqual(pending, receiver.CommandDeparture(True, False, {'unit_exit_observed_at': 1000}))
+                recovered = supervisor.departure(directory, 1)
+                self.assertEqual(recovered, receiver.CommandDeparture(True, False, {
+                    'unit_exit_observed_at': 1000, 'unit_exited_at': 999.75,
+                }))
+            completed = supervisor.departure(directory, 1)
+            self.assertEqual(completed, receiver.CommandDeparture(True, True, {
+                'unit_exit_observed_at': 1000, 'unit_exited_at': 999.75, 'lease_free_at': 1000,
+            }))
+        self.assertEqual(run.call_count, 5)
 
     def test_supervisor_reports_a_terminal_deadline_after_the_cgroup_and_slot_release(self) -> None:
         directory = self.paths.directory / ('c' * 64)
@@ -876,12 +1183,13 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
         expired = subprocess.CompletedProcess(['systemctl'], 0,
             'LoadState=loaded\nActiveState=failed\nControlGroup=\nJob=0\nResult=timeout\n', '')
         with mock.patch.object(subprocess, 'run', return_value=expired), self.fixture.guest():
-            slot = self.root / 'guest-slots/hana-slot1.lock'
-            slot.parent.mkdir(exist_ok=True)
+            slot = self.root / 'guest-build/hana/aws-hana/1.lock'
+            slot.parent.mkdir(parents=True, exist_ok=True)
             with slot.open('a') as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
                 self.assertFalse(supervisor.departure(directory, 1).lease_free)
-            self.assertEqual(supervisor.departure(directory, 1), receiver.CommandDeparture(True, True))
+            departure = supervisor.departure(directory, 1)
+            self.assertTrue(departure.terminated and departure.lease_free)
         outcome = supervisor.outcome(directory)
         assert isinstance(outcome, hana_protocol.HanaExecutionRefused)
         self.assertIn('could not start the build', outcome.reason)
@@ -889,6 +1197,10 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
         outcome = supervisor.outcome(directory)
         assert isinstance(outcome, hana_protocol.HanaExecutionLost)
         self.assertIn('execution deadline', outcome.reason)
+        completed = self.run_request(self.request)
+        assert isinstance(completed, hana_protocol.HanaCommandFinished)
+        _ = (directory / 'output').write_bytes(b'\n' + hana_protocol.encode_outcome(completed))
+        self.assertEqual(supervisor.outcome(directory), outcome)
 
     def test_missing_mount_changed_permit_and_boot_refuse_launch(self) -> None:
         self.supervisor.mounted_value = False

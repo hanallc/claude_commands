@@ -67,6 +67,13 @@ class ResolveTests(unittest.TestCase):
         self.assertIn("no zone is named 'Seattle'; give the IANA zone of the place", str(refused.exception))
 
 
+    def test_notice_tells_agents_to_let_the_tools_add_the_present_time(self) -> None:
+        text = zone.notice("America/Curacao", INITIAL_ZONE)
+        self.assertIn("Write no present time. Write only future times, such as an ETA. The tools add the present time.",
+                      text)
+        self.assertNotIn("Read the clock", text)
+
+
 class StoredZoneTests(unittest.TestCase):
     def test_stored_uses_the_shared_reader_for_values_and_the_default(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -229,7 +236,7 @@ class SetTests(unittest.TestCase):
 
         with self.subTest(queue="zone notice with an explicit default pull"):
             _ = self.queued().write_text(json.dumps({"zone": "zone", "text": "Zone changed", "since": "2026-11-01",
-                "reason": "offline", "pulls": [{"mac": "~/.claude", "source": str(self.checkout)}]}))
+                "reason": "offline", "pulls": [{"kind": "settings", "mac": "~/.claude", "source": str(self.checkout)}]}))
             before = len(self.log("ssh.log"))
             shown = self.run_zone()
             self.assertEqual(shown.returncode, 0, shown.stderr)
@@ -329,11 +336,24 @@ class SetTests(unittest.TestCase):
     def test_zone_uses_the_live_settings_time_limits(self) -> None:
         original_run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
         observed: dict[str, list[float | None]] = {}
+        missing_tip: list[str] = []
+
+        def subcommand(command: list[str]) -> str:
+            """Skip `git -C <checkout>` and the global options before the Git command."""
+            words = command[3:]
+            while words and words[0].startswith("-"):
+                words = words[2:] if words[0] == "-c" else words[1:]
+            return words[0] if words else ""
 
         def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             timeout = cast(float | None, options.get("timeout"))
-            if command[0] == "git" and command[3] in ("fetch", "push"):
-                observed.setdefault(command[3], []).append(timeout)
+            name = subcommand(command) if command[0] == "git" else ""
+            if name in ("fetch", "ls-remote", "push"):
+                observed.setdefault(name, []).append(timeout)
+            elif name == "cat-file" and not missing_tip:
+                # The zone fetch already has the advertised tip; report it missing once so the land fetches its SHA.
+                missing_tip.append(command[-1])
+                return subprocess.CompletedProcess(command, 1, "", f"fatal: Not a valid object name {command[-1]}")
             elif command[0] == self.env["ZONE_SSH"]:
                 observed.setdefault("ssh", []).append(timeout)
             return original_run(command, **options)
@@ -343,7 +363,8 @@ class SetTests(unittest.TestCase):
                 mock.patch.object(subprocess, "run", side_effect=run):
             status = zone.set_zone("Curacao")
         self.assertEqual(status, 0)
-        self.assertEqual(observed, {"fetch": [10, 10], "push": [10], "ssh": [10, 20]})
+        self.assertEqual(len(missing_tip), 1)
+        self.assertEqual(observed, {"fetch": [10, 10], "ls-remote": [10], "push": [10], "ssh": [10, 20]})
         self.assertIn("LIVE_SETTINGS_SAVE_ORDER=1 ", self.log("ssh.log")[0][-1])
 
     def test_a_checkout_off_main_is_refused(self) -> None:

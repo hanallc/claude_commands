@@ -11,7 +11,10 @@ from pathlib import Path
 import subprocess
 import sys
 import signal
+import tempfile
+import time
 from typing import cast, override
+import unittest
 from unittest.mock import patch
 
 from scripts.lib.helper_tree_test_support import copy_helpers
@@ -28,6 +31,7 @@ from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixtu
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.socket_test_support import ShortUnixSocket
 from scripts.lib.transcript_test_support import compressed_copy
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 BACKEND = '''import json, os, sys, socket
@@ -132,11 +136,26 @@ class ClaudeWorkerFixture:
     environment: dict[str, str]
 
 
+class ClaudeTurnWaitTests(unittest.TestCase):
+    def test_wait_uses_the_configured_poll_interval(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = (root / "direct.conf").write_text("claude_worker_poll_secs=0.25\n")
+        turn = claude_worker.ClaudeTurn("fixture", root, root, root / "prompt",
+            root / "summary", root / "log", "", "", "", "", False,
+            {"CONF_DIR": str(root), "CLAUDE_BIN": "fixture-claude"})
+        delivered = claude_worker.Delivered("fixture-native", claude_worker.TurnsNotCounted())
+        with (patch.object(claude_worker, "_status", side_effect=["busy", "idle"]),
+              patch.object(claude_worker, "_refresh_log"),
+              patch.object(time, "sleep") as delay):
+            self.assertEqual(claude_worker.wait_for_turn(turn, delivered), 0)
+        delay.assert_called_once_with(0.25)
+
+
 class NativeClaudeWorkerTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"PATH": os.environ.get("PATH", os.defpath),
-            "HERDR_BIN": "/nonexistent/herdr"}, clear=True)))
+            "HERDR_BIN": MISSING_HERDR_BIN}, clear=True)))
         super().setUp()
         _ = self.fixture
 

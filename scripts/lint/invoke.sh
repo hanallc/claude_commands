@@ -110,7 +110,23 @@ fi
 # variables and the variables that rustc dependency data names. No crate reads
 # BUILDLOG_STEP_SCOPE, so the name keeps cache keys unchanged.
 BUILDLOG_RECORD="$BUILD_HELPER_ROOT/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; BUILDLOG_STEP_SCOPE="$cgroup"; export BUILDLOG_STEP_SCOPE; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH='
+exec 2>&3 3>&-
+{ : > "$0"; } 2>/dev/null || exit 125
+cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
+if [ "${BUILDLOG_DEFER_SCOPE_SIDECAR:-0}" = 1 ]; then
+    export BUILDLOG_SCOPE_SIDECAR="$0.cgroup"
+else
+    printf "%s\n" "$cgroup" > "$0.cgroup"
+fi
+{ echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true
+export BUILDLOG_STEP_SCOPE="$cgroup"
+"$@"
+s=$?
+cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true
+cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true
+cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null
+exit $s'
 BUILDLOG_SCOPE_SH="${BUILDLOG_SCOPE_SH//@BUILD_OOM_SCORE_ADJ@/$BUILD_OOM_SCORE_ADJ}"
 source "$BUILD_HELPER_ROOT/lint/memory_gate.sh" || {
     printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2
@@ -141,7 +157,7 @@ buildlog_begin() {
     buildlog_read_context ${1+"$@"}
     buildlog_now
     BUILDLOG_START="${BUILDLOG_NOW:-}"
-    if [[ "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
+    if [[ "${OSTYPE:-}" == linux* && "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
           && -r /proc/self/cgroup ]] && command -v systemd-run >/dev/null 2>&1; then
         BUILDLOG_PEAK="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM.peak"
     fi
@@ -165,8 +181,12 @@ buildlog_step_compiles() {
 buildlog_exec() {
     local BUILDLOG_RESERVED_STEP="${BUILDLOG_RESERVED_STEP:-}"
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
-        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
-            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
+        local socket_path="${ADMISSION_SOCKET:-}" step_directory
+        if [[ -n "$socket_path" && "$socket_path" != /* ]] && step_directory=$(pwd -P); then
+            socket_path="$step_directory/$socket_path"
+        fi
+        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
+            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}" "$socket_path"
         export BUILDLOG_RESERVED_STEP
     fi
     if [[ -z "${BUILDLOG_PEAK:-}" ]]; then
@@ -174,13 +194,21 @@ buildlog_exec() {
         return
     fi
     local status=0
-    systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- \
+    systemd-run --user --scope --quiet --collect --expand-environment=no \
+        --slice="${DETACHED_RUN_SLICE:-builds.slice}" -- \
         /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@" 3>&2 2>/dev/null
     status=$?
     if [[ -e "$BUILDLOG_PEAK" ]]; then
         return $status
     fi
     "$@"
+}
+
+close_verify_exit_stderr() {
+    if [[ ${VERIFY_EXIT_STDERR_FD:-} =~ ^[1-9][0-9]+$ ]]; then
+        eval "exec $VERIFY_EXIT_STDERR_FD>&-"
+    fi
+    unset VERIFY_EXIT_STDERR_FD
 }
 
 buildlog_write_step() {
@@ -203,11 +231,21 @@ buildlog_end() {
     if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
         buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"}
     else
-        ( trap '' HUP
-          buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} & )
+        (
+            trap '' HUP
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} &
+        )
     fi
     BUILDLOG_START="" BUILDLOG_TREE="" BUILDLOG_TEST_PHASE_FILE=""
     return 0
+}
+
+# EOF on the stop pipe ends the sampler. A timeout starts the next tick.
+buildlog_wait_sample_tick() {
+    local status=0
+    IFS= read -r -t 1 _ || status=$?
+    (( status > 128 ))
 }
 
 buildlog_sample_anon() {
@@ -305,7 +343,7 @@ buildlog_sample_anon() {
                 fi
             fi
         fi
-        sleep 1
+        buildlog_wait_sample_tick || return 0
     done
 }
 
@@ -321,9 +359,11 @@ buildlog_token_phase_context() {
 }
 
 buildlog_finish_memory() {
-    local status=$1 sampler_pid=$2
+    local status=$1 sampler_pid=$2 sampler_input=$3
+    if [[ "$sampler_input" =~ ^[0123456789]+$ ]]; then
+        eval "exec $sampler_input>&-"
+    fi
     if [[ -n "$sampler_pid" ]]; then
-        kill "$sampler_pid" 2>/dev/null || true
         wait "$sampler_pid" 2>/dev/null || true
     fi
     buildlog_release_memory "$status"
@@ -357,38 +397,6 @@ buildlog_exec_with_progress() {
         buildlog_exec "$@"
 }
 
-cargo_seed_needed() {
-    [[ "${OSTYPE:-}" == linux* && -f "${BUILD_FOLDERS_SCRIPT%/*}/cargo_seed.py" ]] || return 1
-    local command="${1:-}" argument directory="${CARGO_BUILD_BUILD_DIR:-}" cwd evidence workspace target extra
-    if [[ "${command##*/}" == env ]]; then
-        shift
-        while [[ "${1:-}" == RUSTC_WRAPPER=* || "${1:-}" == RUSTC_WORKSPACE_WRAPPER=* ]]; do shift; done
-        command="${1:-}"
-        [[ "${command##*/}" == cargo ]] || return 0
-    fi
-    [[ "${command##*/}" == cargo ]] || return 1
-    for argument in "$@"; do
-        case "$argument" in
-            --) break ;;
-            --config|--config=*|--manifest-path|--manifest-path=*|--target-dir|--target-dir=*|-C|-C=*|+*) return 0 ;;
-        esac
-    done
-    if [[ -z "$directory" ]]; then
-        cwd=$(pwd -P) || return 0
-        IFS=$'\t' read -r evidence workspace target directory extra <<< "${BUILDLOG_OUTPUT_ROOTS:-}"
-        [[ -n "$evidence" && "$workspace" == "$cwd" && "$target" == /* && -z "$extra" ]] || return 0
-    fi
-    if [[ "$directory" == /* && ( -e "$directory" || -L "$directory" ) ]]; then
-        return 1
-    fi
-    return 0
-}
-
-cargo_seed_before_step() {
-    local script="${BUILD_FOLDERS_SCRIPT%/*}/cargo_seed.py"
-    "${script%/*}/py" "$script" "$@"
-}
-
 run_step_attempt() {
     buildlog_check_nested_step || return $?
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
@@ -420,7 +428,9 @@ run_step_attempt() {
         buildlog_begin "$@" || true
     fi
     BUILDLOG_PLACEMENT_PREPARED=0
-    local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0 seed_notice="" seed_checked=0
+    local sampler_pid="" sampler_input="" parent_pid=$BASHPID status=0 memory_wait=0
+    local -a BUILDLOG_SAMPLER=()
+    local BUILDLOG_SAMPLER_PID
     if buildlog_step_compiles "$@"; then
         while :; do
             buildlog_wait_for_memory "$@" || {
@@ -440,17 +450,7 @@ run_step_attempt() {
                 return 2
             fi
             if build_hold_check_local; then
-                if (( seed_checked != 0 )) || ! cargo_seed_needed "$@"; then
-                    break
-                fi
-                seed_checked=1
-                seed_notice=$(cargo_seed_before_step "$@" 2>/dev/null) || seed_notice="cargo seed: helper failed. Starting cold."
-                [[ -z "$seed_notice" ]] || printf '%s\n' "$seed_notice"
-                if build_hold_check_local; then
-                    break
-                else
-                    status=$?
-                fi
+                break
             else
                 status=$?
             fi
@@ -488,9 +488,12 @@ run_step_attempt() {
     if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then lint_prebuild_prefix; fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
-        buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
-            "$BUILDLOG_TEST_PHASE_FILE" "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@" &
-        sampler_pid=$!
+        coproc BUILDLOG_SAMPLER {
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
+                "$BUILDLOG_TEST_PHASE_FILE" "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@"
+        } >/dev/null
+        sampler_pid=$! sampler_input=${BUILDLOG_SAMPLER[1]:-}
     fi
     if [[ -n "${BUILDLOG_START:-}" ]]; then
         buildlog_now
@@ -511,7 +514,6 @@ run_step_attempt() {
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
         log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
-        [[ -z "$seed_notice" ]] || printf '%s\n' "$seed_notice" > "$log" || true
         if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
             ln -sf -- "$log" "$BUILDLOG_PEAK.progress.log"
         fi
@@ -526,7 +528,7 @@ run_step_attempt() {
         nextest_token_width "$LINT_NEXTEST_WIDTH_FILE"
         [[ -z "$LINT_NEXTEST_TOKEN_WIDTH" ]] || set -- "${@:1:4}" "$LINT_NEXTEST_TOKEN_WIDTH" "${@:6}"
     fi
-    buildlog_finish_memory "$status" "$sampler_pid"
+    buildlog_finish_memory "$status" "$sampler_pid" "$sampler_input"
     if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
         rm -f -- "$BUILDLOG_PEAK.progress.log"
     fi
@@ -615,9 +617,21 @@ sweep_after_step() {
     # rest, so the sweep never stops on a broken pipe in a removal.
     (
         trap '' HUP
-        if [[ "${DOC_COPY_LEASE_FD:-}" =~ ^[0-9]+$ ]]; then
-            eval "exec $DOC_COPY_LEASE_FD>&-"
-        fi
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        local fd
+        local -a copy_lease_fds=()
+        IFS=, read -r -a copy_lease_fds <<< "${COPIES_COMMAND_LEASE_FDS:-},${COPIES_MIRROR_LEASE_FDS:-}"
+        for fd in ${copy_lease_fds[@]+"${copy_lease_fds[@]}"} \
+            "${DOC_COPY_LEASE_FD:-}" "${NUMBERED_COPY_LOCK_FD:-}" "${COPIES_STEP_SOURCE_LOCK_FD:-}"; do
+            if [[ "$fd" =~ ^([3-9]|[1-9][0-9]+)$ ]]; then
+                eval "exec $fd>&-"
+            fi
+        done
+        unset COPIES_COMMAND_LEASE_FDS COPIES_MIRROR_LEASE_FDS
+        unset DOC_COPY_LEASE_FD NUMBERED_COPY_LOCK_FD COPIES_STEP_SOURCE_LOCK_FD
+        # A gate forces its checks, not this background sweep: sweep=off stops it.
+        # An assignment, not unset: unset can uncover an exported value below a call prefix.
+        LINT_CONFIG_FORCE=0
         TOKEN_HELD=0
         run() { run_once "$@"; }
         if command -v systemd-cat >/dev/null 2>&1; then
@@ -632,15 +646,16 @@ sweep_after_step() {
 # Mac cargo gate's names its own cause instead of a missing nextest.
 require_nextest() {
     local error
-    if ! error=$(cargo nextest --version 2>&1 >/dev/null); then
+    if ! error=$(
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        cargo nextest --version 2>&1 >/dev/null
+    ); then
         echo "cargo nextest is required${error:+: ${error%%$'\n'*}}" >&2
         exit 2
     fi
 }
 
-# The nextest width mode: trial alternates physical and logical by block, and
-# physical or logical fixes the width. The trial block length must stay in sync
-# with BLOCK_S in scripts/buildlog/width_trial.py.
+# Use the logical or physical core count for the nextest width.
 LINT_TEST_WIDTH=logical
 
 nextest_physical_cores() {
@@ -682,24 +697,14 @@ nextest_logical_cores() {
     return 0
 }
 
-nextest_width_arm() {
-    local epoch="$1"
-    if (( (epoch / 6000) % 2 == 0 )); then
-        LINT_TEST_WIDTH_ARM=physical
-    else
-        LINT_TEST_WIDTH_ARM=logical
-    fi
-}
-
 # On a host whose CARGO_MAKEFLAGS names a jobserver pool (natedev's
 # /dev/steve), a test run holds one pool token for each test thread, so test
 # threads and compile jobs share the one CPU pool. run_once runs the step
 # through nextest_tokens.py, inside the step's scope: it builds with --no-run
 # while it holds no test token, takes the tokens, and runs the tests at one
 # thread for each token. It writes that width to LINT_NEXTEST_WIDTH_FILE, and
-# run_once records the step at that width. The trial mode takes no tokens,
-# since width_trial.py names its arm by width. A host with no pool (the Mac)
-# runs at the mode's width.
+# run_once records the step at that width.
+# A host without a pool runs at the selected width.
 LINT_TEST_BUDGET_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_budget.py"
 LINT_TEST_TOKENS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_tokens.py"
 
@@ -777,7 +782,7 @@ run_nextest() {
         build_hold_wait_local || return $?
     fi
 
-    local arg arm="" width="" LINT_NEXTEST_POOL=""
+    local arg width="" LINT_NEXTEST_POOL=""
     if [[ "${NEXTEST_TEST_THREADS+x}" != x ]]; then
         for arg in "$@"; do
             case "$arg" in
@@ -792,15 +797,6 @@ run_nextest() {
         done
 
         case "$LINT_TEST_WIDTH" in
-            trial)
-                nextest_width_arm "${EPOCHSECONDS:-$(date +%s)}"
-                arm="$LINT_TEST_WIDTH_ARM"
-                ;;
-            physical|logical)
-                arm="$LINT_TEST_WIDTH"
-                ;;
-        esac
-        case "$arm" in
             physical)
                 nextest_physical_cores
                 width="${LINT_PHYSICAL_CORES:-}"
@@ -811,7 +807,7 @@ run_nextest() {
                 ;;
         esac
         if [[ -n "$width" ]]; then
-            [[ "$LINT_TEST_WIDTH" == trial ]] || nextest_token_pool
+            nextest_token_pool
             run cargo nextest run --test-threads "$width" "$@"
             return
         fi
@@ -830,13 +826,19 @@ fmt_cargo() {
     local version_file="${VERIFY_LINT_RUSTFMT_VERSION_FILE:-}"
     if [[ -n "$version_file" ]]; then
         if [[ ! -f "$version_file" ]]; then
-            cargo +nightly fmt --version > "$version_file" 2>/dev/null || : > "$version_file"
+            (
+                [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                cargo +nightly fmt --version
+            ) > "$version_file" 2>/dev/null || : > "$version_file"
         fi
         if [[ ! -s "$version_file" ]]; then
             echo "cargo +nightly fmt is required" >&2
             exit 2
         fi
-    elif ! cargo +nightly fmt --version >/dev/null 2>&1; then
+    elif ! (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        cargo +nightly fmt --version
+    ) >/dev/null 2>&1; then
         echo "cargo +nightly fmt is required" >&2
         exit 2
     fi

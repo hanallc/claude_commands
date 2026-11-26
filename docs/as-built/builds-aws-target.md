@@ -2,9 +2,11 @@
 
 ## Current model
 
-AWS runs temporary Spot boxes for merge gates, paired AWS trials, and the GPU size trial.
-Normal build jobs use `mac` and `natedev`, in that order.
-AWS has no permanent builder or build offload route.
+AWS runs temporary Spot boxes for gate jobs, paired AWS trials, and the GPU size trial.
+The configured build target order is `hana-aws,mac,natedev`.
+Hana placement has been enabled since 2026-11-17.
+The queue tries `hana-aws` first for eligible Hana check and clippy steps.
+The former permanent `aws-build` target is absent.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
 `regions` in `cloud_gate.conf` holds all 19 regions of `spot_candidate_regions`.
 The saved deployment record identifies the regions available for launch.
@@ -27,8 +29,16 @@ Older readers treat the record as delivered.
 A retry after a recipient change can send the same notice to both recipients. A duplicate notice is safer than a lost notice.
 Code older than this change still sends a pending notice after its period ends. That ends when every branch has this change.
 
+Floors from Eastern accounting days before the UTC change can overstate the November 2026 month count by at most USD 1.99.
+These floors leave the month window on December 1, 2026.
+A legacy notice ID expires when its period ends.
+The code has no special handling for these cases.
+
 `report.py` reads the AWS state folder without target registration.
 Its AWS section retains the account bill, daily gate spend, and historical builder comparisons.
+The AWS lead line uses one UTC accounting day for cost, uptime, steps, and savings.
+An explicit report date selects the UTC day with that date.
+A report without a date uses the UTC day at the report time.
 `sync.hosts.aws=aws-build` identifies historical steps.
 The report shows no synchronization status for the removed builder.
 
@@ -38,6 +48,38 @@ It expands `~` in either path.
 Deployment uses encrypted administrator credentials for resource changes.
 Gate services use the private scaler profile.
 Boxes receive signed URLs and no scaler credential file.
+
+## AWS off
+
+Two existing keys switch the two AWS machines:
+
+- `enabled` in `config/cloud_gate.conf` switches the cloud gate box.
+  With `off`, the cloud worker refuses a new gate launch and the pinned `hana-gpu` step.
+  The hourly job reads no placement scores.
+  The refusal gives the reason `cloud gates are off (cloud_gate.conf enabled=off)`.
+- `enabled` in `config/hana_aws.conf` switches the Hana box.
+  With `off`, placement and the controller give no claim and start no box, and the controller makes no AWS call for a box at rest.
+
+AWS is off when both keys are `off`.
+Then `aws-target.service` reads no account charges, and the hourly job reads no prices or quotas.
+The hourly job also skips the hours-gap check, because a bill that no charge refresh updates stays provisional.
+
+`aws_switch()` in `scripts/aws_target/config.py` is the one function that unattended code uses to read these keys.
+Each caller gives the settings of the machine that it serves.
+Unattended code decides on a key only through `aws_switch()`.
+An invalid live value counts as `off`, and a missing key or a missing live file takes the committed value.
+`hana_guest.read_settings()` also reads the Hana key, but only the image build (`hana_render.py`) uses that value, and it refuses an invalid live value.
+So no image holds a switch value that the user did not set, and the image files do not import `config.py`.
+
+With `enabled=off` in `hana_aws.conf`, the controller still observes and stops the box, unless `key_refused.json` holds the calls (see Hana lifecycle controller), when the lifecycle record shows that the box can run: a state other than `idle-stopped` or `unprovisioned`, a claim, a replacement stop duty, open Hana compute in the cost ledger, or an operation other than `observe`.
+With `enabled=off` in `cloud_gate.conf`, the gate route launches no new box, also for a retry after a Spot interruption or a box failure.
+When a gate reservation is due for cleanup, the route starts only the reconcile step, which ends that box and launches no box.
+A reservation is due for cleanup when its worker is dead, or when it has no known worker and its time is up; `cleanup_due()` in `cloud_gate.py` holds this rule.
+A live gate worker ends its own box, and with no reservation due for cleanup the route makes no AWS call.
+An error when the route starts the reconcile step prints its own line, and the route still gives the off reason.
+With `enabled=off` in `cloud_gate.conf`, `gpu_setup()` refuses the pinned `hana-gpu` queue route, which `gpu_size_trial.py` serves.
+`deploy.py` reads the Hana key through `aws_switch()` only to print the placement state, and it refuses no command.
+`aws_trial.py`, a `gpu_size_trial.py` run by hand, and quota requests do not read the switch, because a person runs them.
 
 ## AWS plan identity
 
@@ -155,7 +197,7 @@ If the template has no policy or the plan cannot resolve it, the plan prints a n
 The plan then simulates S3 without a bucket policy.
 Bucket policies added outside the stack are out of scope.
 
-To plan a merge gate update, run this command in a terminal on natedev.
+To plan a gate infrastructure update, run this command in a terminal on natedev.
 
 ```sh
 deploy.py up --workload merge-gates --plan
@@ -197,26 +239,32 @@ It applies each rendered file's mode.
 The image keeps `safety.py`, `receiver.py`, `safety.json`, `receiver.json`, and their units.
 It installs the Python closure in `scripts/aws_target/hana_image.files` under `/var/lib/hana-runtime`.
 That closure supplies the root receiver, the safety code, and the unprivileged bootstrap.
+`scripts/aws_target/hana_image.sha256` holds the source hash of that closure.
+[Hana image freshness](#hana-image-freshness) gives the rule for the hash and the runtime ABI.
 NixOS supplies `hana-tools.service`, the runner environment, the compiler version, and the approved slot settings.
 
 The NixOS build runs the renderer from its pinned `claude-commands` input.
 The NixOS image requires these integration changes.
 
-1. Update the `claude-commands` pin to include the per-run runtime change.
-2. Include the paths listed in `scripts/aws_target/hana_image.files` and these seven files in the renderer input filter.
-   - `config/build_folders.conf`
-   - `config/build_targets.conf`
-   - `config/hana_aws.conf`
-   - `scripts/aws_target/hana_image.files`
-   - `scripts/aws_target/hana_render.py`
-   - `scripts/lib/conf.py`
-   - `scripts/lib/conf_reads.py`
+1. Update the `claude-commands` pin to include runtime ABI 2 and the Hana folder changes.
+2. Use `scripts/aws_target/hana_render.files` as the renderer input filter.
 3. Install the rendered `runtime/` at `/var/lib/hana-runtime`.
-4. Append the approved roots and capacity to the rendered `runtime/config/build_folders.conf`.
-5. Put the approved `# whole:` limit directly above each capacity setting.
-6. Give the bootstrap write access to `/var/lib/hana/tmp`.
+4. Append the approved capacity block below to the rendered `runtime/config/build_folders.conf`.
+5. Create the directories below with runner ownership after the data mount.
+6. Remove the old slot, Cargo, mirror, shell, and temporary root settings and directory creation.
 7. Provide Python 3.13 or newer for the bootstrap.
-8. Remove `CONF_DIR` from `runner-environment`.
+8. Remove `CONF_DIR` and `TMPDIR` from `runner-environment`.
+
+List `~/rust`, `~/rust/hana`, `~/rust/hana/.git`, `~/rust/hana/.git/hana-payload`, and `~/build` explicitly in the directory command.
+
+```ini
+# whole: 1..
+slots.aws-hana.default_max=1
+# whole: 1..
+slots.aws-hana.hana.max=1
+# whole: 1..
+slots.aws-hana.hana.max_bytes=137438953472
+```
 
 Root and the bootstrap read the installed `build_folders.conf`.
 User data supplies the boot descriptor and signed control access.
@@ -235,16 +283,19 @@ Tool setup runs after the guard and requires the bounded data mount.
 A failed setup or missing disk cannot prevent the guard from requesting poweroff.
 The mount bounds both device discovery and mount execution through `mount_timeout_seconds`.
 
-Phase D must deliver `/run/hana-aws/work-permit.json` and `/run/hana-aws/generation` as private, root-owned files.
-The permit fields are `expires_at` (UTC epoch seconds), `generation`, and `boot_id`.
+The receiver service runs as root with `UMask=0077`.
+The receiver installs the private, root-owned record `/run/hana-aws/active-work-permit.json`.
+The record holds `expires_at` in UTC epoch seconds, `generation`, and `boot_id`.
 The boot ID must match `/proc/sys/kernel/random/boot_id`.
-The guard and watchdog only read the permit and identity files.
+The receiver uses a private temporary file and an atomic rename under the shared lock.
+The receiver acknowledges a new permit after the rename succeeds.
+The guard, watchdog, and command admission read the same record for the permit and generation.
+The receiver, guard, and watchdog ignore the legacy `work-permit.json` and `generation` files.
+A folder with only legacy permit files starts with no installed permit and expects a prior generation of zero.
 Missing, unreadable, malformed, expired, or mismatched permits grant no permission.
 `permit_max_seconds=1800` bounds one renewal window.
 A permit beyond that window grants no permission.
-Phase C reserves permission for longer steps.
-Phase D must deliver renewals through `write_permit()`.
-The writer uses a private temporary file and atomic rename.
+The controller can renew permission for longer steps.
 
 On the first read, safety records the permit's boot-clock deadline in `/run/hana-aws/permit-deadline.json`.
 An unchanged permit retains that deadline across later reads and service restarts.
@@ -274,7 +325,7 @@ The caller waits for command completion outside the lock.
 It prepares an unprivileged command with a separate slice under `hana-work.slice`.
 Both the parent slice and each command enforce `step_cpu_limit` and `step_memory_gib` from configuration.
 The initial limits are 4 vCPUs and 24 GiB RAM.
-Phase F2 must use this command path after checking the actual data mount.
+The receiver checks the actual data mount before it starts the command through this path.
 `test_hana_guest.py` tests the decisions with injected clocks and verifies rendered units when `systemd-analyze` exists.
 No safety test needs AWS or a running systemd manager.
 
@@ -283,8 +334,7 @@ No safety test needs AWS or a running systemd manager.
 `scripts/aws_target/hana_spend.py` reserves spending before it returns a guest permit.
 `HanaSpending` uses the account ledger lock for starts, renewals, lifecycle observations, and storage deletion.
 It makes no AWS call and delivers no permit to a guest.
-Phase D must deliver permits and schedule lifecycle reconciliation without an active caller.
-Placement remains disabled.
+The lifecycle controller delivers permits through signed control and reconciles the box without an active caller.
 
 `reserve_storage()` reserves the root and data volumes before provisioning.
 It checks current account caps and the Hana budget before returning a saved reservation.
@@ -302,8 +352,8 @@ Open compute exposure remains reserved after permit expiry until a lifecycle obs
 Storage remains reserved after stop and termination until volume deletion is confirmed.
 Storage estimates use a 30-day month.
 The ledger reserves the remaining storage cost for every day that a permit reaches.
-`reconcile()` records an automatic restart even when Hana placement is disabled.
-It reserves the boot guard interval and retains exposure until a confirmed stop.
+With Hana off, a record at rest gets no AWS call, a record that is not at rest (starting, stopping, interrupted, a claim, a stop duty or open compute) is still observed and stopped unless `key_refused.json` holds the calls, and a start from outside the controller is not seen.
+For an automatic restart, `reconcile()` reserves the boot guard interval and retains exposure until a confirmed stop.
 Unknown lifecycle state releases no exposure.
 Each lifecycle observation names the generation that the observer read before its request.
 An observation for an older generation changes no exposure or observation time.
@@ -312,7 +362,10 @@ An older observation cannot close a newer permit or replace a later running obse
 The fence survives controller restarts.
 Observations at the same time as the fence leave exposure unchanged.
 
-The existing `cost-ledger.json` version remains 1.
+The ledger reads versions 1 and 2 of `cost-ledger.json` and writes version 2.
+Drain old gate workers and upgrade ledger users before the first version 2 write.
+After that write, a code-only rollback to version 1 makes old reconcile code refuse the ledger.
+Keep version 2 support in all rollbacks.
 The optional `hana_compute` and `hana_storage` collections hold Hana exposure records.
 Older records have no Hana exposure when these collections are absent.
 A missing `hana_lifecycle_fence` remains absent until a fresh observation arrives.
@@ -344,6 +397,16 @@ The new rate therefore belongs to the Hana configuration.
 `aws_target.py serve` supervises bounded `tick` child processes for the existing `aws-target.service`.
 Each child attempts Hana lifecycle recovery before account charge refresh.
 Either operation can fail without suppressing the other operation.
+A refused key is the one exception.
+When AWS refuses the key itself (`KEY_REFUSED_CODES` in `aws_cli.py`, such as `AuthFailure`), the child writes `key_refused.json` in the account directory and stops.
+While that record exists, each child makes no AWS call: no lifecycle step, no charge refresh, and no stop for a running box.
+The hourly job also makes no AWS call while the record exists.
+The cloud gate route gives `key_refusal.REFUSED_REASON` without an AWS call.
+The record clears only after one child sees every AWS machine off and a later child sees one on.
+So a person sets `enabled=off` in both `cloud_gate.conf` and `hana_aws.conf`, keeps them off for at least one tick (about 10 s), then sets one to `on`.
+An unusable `enabled` value does not count as off for this rule.
+An unreadable record holds the calls, as a refusal does.
+`scripts/aws_target/key_refusal.py` owns the record.
 The supervisor continues after a failed or timed-out child.
 It releases all child-owned locks when the child exits.
 
@@ -360,7 +423,7 @@ The journal stores these lifecycle states:
 | State | Meaning |
 | --- | --- |
 | Unprovisioned | No setup has registered a deployment. |
-| Idle-stopped | A deliberate idle stop permits a later demand start. |
+| Idle-stopped | A confirmed idle or interruption recovery stop permits a later demand start. |
 | Interrupted | Only EC2 can restart the interrupted Spot instance. |
 | Stopped-unknown | An unknown stop cause forbids a manual restart. |
 | Starting | A committed claim owns the unresolved demand start. |
@@ -376,8 +439,35 @@ The controller refuses claim release while a start or provider operation remains
 Idle stop and claim creation use the same lock.
 A committed claim prevents idle stop.
 A saved idle-stop intent refuses a later claim until stop confirmation.
-A confirmed interruption takes priority over a pending idle stop.
+A confirmed interruption takes priority over a pending stop.
 The controller records `INTERRUPTED` and refuses a manual restart.
+A stopped observation with an unknown cause preserves `INTERRUPTED`.
+If the controller stops an unclaimed restart, it saves its stop decision before it calls the provider.
+The decision records the generation and whether an interruption came before the restart.
+Another running observation keeps the stop in progress.
+If the running box enters a new generation, the controller saves a new stop decision for that generation.
+After compute exposure closes, a fresh stopped observation settles the unclaimed stop decision for the same generation.
+The controller records `IDLE_STOPPED` if that decision followed an interruption.
+A stopped observation from a different generation preserves `INTERRUPTED` if the old decision followed an interruption.
+An unclaimed stop with no prior interruption ends at `STOPPED_UNKNOWN`.
+The decision applies whether the controller or the guest stops the box.
+
+The controller cannot use a saved `STOPPED_UNKNOWN` row to infer a Spot interruption from the next compute generation.
+The compute ledger records exposure times, but it lacks the last running observation and the reason for the stop.
+The exposure record does not identify a guard window or a reservation.
+The provider records lack the generation and the acceptance time of a start or stop.
+An EC2 restart and a start in the AWS console can produce the same saved records.
+
+After you confirm Hana is stopped, run `deploy.py hana-release-unknown-stop` to preview the release.
+With `--approve-release`, the command saves a stop decision and records the approval time.
+The command requires `STOPPED_UNKNOWN` and closed compute exposure in the newest ledger generation.
+A claim, pending operation, saved demand start, or replacement duty prevents approval.
+The command makes no AWS call and needs no AWS credentials.
+Hana remains in `STOPPING` and refuses claims until the controller confirms the stop.
+If the controller finds Hana running, it saves a stop decision for the running generation and stops Hana.
+The controller sets `IDLE_STOPPED` after a fresh stopped observation with closed compute exposure for the stop decision.
+Repeat the command to check whether the release waits for confirmation or is already complete.
+Later claims use the usual image, spending, and permit checks.
 
 Phase C reserves compute before the next boot identity exists through `reserve_start()`.
 `check_start()` rechecks current caps before bootstrap, start, and permit publication.
@@ -396,9 +486,10 @@ Each bootstrap, start, or publication attempt still needs accepted spending.
 A publication includes the expected prior generation and the current execution identity.
 Command permission requires a current active claim, verified boot, acknowledged permit, and accepted spending.
 Renewal retains the execution identity and advances the permit generation.
-A refused or lost publication does not extend the guest deadline.
+A failed install leaves the active permit unchanged.
+An exact replay can acknowledge the installed permit while it is fresh.
 The controller reserves exposure until stop confirmation through the Phase C ledger.
-It reconciles automatic restarts without a caller, including while placement is disabled.
+With Hana off, a record at rest gets no AWS call, a record that is not at rest (starting, stopping, interrupted, a claim, a stop duty or open compute) is still observed and stopped unless `key_refused.json` holds the calls, and a start from outside the controller is not seen.
 An automatic restart cannot reuse an interrupted execution's boot challenge.
 
 `HanaProvider.step()` defines the typed provider boundary.
@@ -407,13 +498,12 @@ Its `recover()` method reads status without repeating a mutation.
 It must distinguish a completed request from an unresolved request before reporting `MutationSettled`.
 The provider refreshes bootstrap access before a demand start.
 It must verify root receiver responses against deployment and demand-start identities.
-It must install a renewed generation and permit together before acknowledging publication.
 `hana_provider.AwsHanaProvider` supplies the concrete AWS provider.
 The controller constructs it with the scaler profile and a sanitized credential environment.
 An unprovisioned tick makes no provider call.
 `Deployment.prepare_hana` and `Deployment.hana_setup` in `deploy.py` prepare and provision a separate Hana stack through the existing deployment helpers.
 The user runs `prepare --workload hana`, then `hana-setup --approve-resources`.
-Without approval, `hana-setup` prints only its local plan.
+Without approval or `--plan`, `hana-setup` prints a local resource summary.
 The existing preparation writer, preflight verifier, encrypted admin executor, stack waiter, and progress display serve both workloads.
 The separate template is `docs/plans/builds-aws/hana-cloudformation.json`.
 The stack creates the launch template, security group, private control bucket, and scaler policy.
@@ -428,8 +518,8 @@ Setup shows a `/tune` command when the effective ceiling key is editable.
 If the configuration rejects the command, setup reports the error and the suggested ceiling.
 The suggested ceiling includes `spot_ceiling_margin` and rounds up to a cent.
 It reserves setup costs within both account and workload limits before the stack request.
-`reserve_setup()` permits only approved resource setup while placement remains disabled.
-It does not permit demand starts or guest command admission.
+`reserve_setup()` reserves compute for approved resource setup.
+Demand starts and guest command admission require their own authorization.
 Setup uses the existing stack after a launch failure.
 After all launch requests receive a refusal, prepared setup can change the ceiling on that stack.
 Setup reserves compute at the new ceiling and saves the launch template version before it attempts the next launch.
@@ -521,17 +611,38 @@ The launch template sets `DeleteOnTermination` on the root disk. AWS deletes eac
 
 ### Hana image freshness
 
-`hana_render` hashes the paths, modes, and bytes of the rendered image files.
-It adds the digest to the rendered `safety.json`.
+The image digest tells whether the box is compatible with main.
+`hana_render` hashes the paths, modes, and bytes of the rendered control files.
+These are the units, the `safety.py` and `receiver.py` entry shims, `safety.json`, `receiver.json`, and `runtime/config/build_folders.conf`.
+The digest also covers `hana_protocol.RUNTIME_ABI`.
+The image receiver refuses a manifest with another runtime ABI.
+The digest does not cover the Python source under `runtime/`. The image still installs that source.
+`hana_render` adds the digest to the rendered `safety.json`.
 Safety settings, receiver settings, the command timeout, and the slot probe settings affect the digest.
 The renderer selects overrides by the Hana alias in `hana_aws.conf` and writes plain keys.
 The renderer rejects invalid slot probe settings before it computes the digest.
-NixOS supplies the approved slot roots and capacity, compiler version, and runner environment.
+The renderer supplies `roots.build` and includes it in the digest.
+NixOS appends the approved capacity settings.
+NixOS supplies the compiler version and runner environment.
 Those NixOS settings take effect with a new image.
 
 An edit to a runtime-only file leaves the image digest unchanged.
+An edit to a file in `scripts/aws_target/hana_image.files` also leaves the image digest unchanged.
 The receiver still uses `enabled` as an independent image admission switch.
 This split requires one image replacement before the box accepts a combined payload.
+
+`scripts/aws_target/hana_image.sha256` holds the sha256 of the image file list and each listed path and its bytes.
+`test_hana_render` fails when the checked-in hash differs from the computed hash.
+After an edit to an image file, apply this rule.
+
+1. If the edit changes what the receiver accepts or does, bump `hana_protocol.RUNTIME_ABI`.
+2. Write the new hash to `scripts/aws_target/hana_image.sha256`.
+
+No check makes a writer bump the runtime ABI. The test only makes the writer decide.
+A new runtime ABI makes the deployed image stale.
+Known cost: the box can run an older receiver with the same runtime ABI until the next image.
+A receiver fix that the host does not need reaches the box only with the next image.
+An image recorded with the earlier digest formula reads as stale. It needs one replacement.
 
 `hana-image` reads the digest from the renderer output in the built image's Nix derivation closure.
 Registration requires the build derivation and the renderer output to be present in the local store.
@@ -593,6 +704,12 @@ Source uploads and result downloads have separate limits.
 Provider errors expose safe action names rather than cloud identifiers or signed URLs.
 
 The provider persists its operation before dispatch and holds a separate mutation lock.
+Existing writes store the lifecycle generation and UTC epoch seconds for dispatch, acceptance, or cancellation.
+Acceptance writes identify a direct response or a bootstrap observation.
+The scaler gives `StartInstances` one attempt.
+The provider saves a definite service refusal as `start_refusal_code` before returning the error.
+The record contains the code only.
+A later active observation takes precedence over the refusal for accounting.
 Recovery takes that lock without blocking an active mutation.
 Recovery fences an operation that has not reached dispatch.
 A late worker cannot dispatch that fenced operation.
@@ -628,15 +745,16 @@ They verify that neither the controller lock nor the ledger lock remains held du
 Regression tests cover expired bootstrap, start, and publication recovery.
 They also cover stale recovery responses, concurrent cap refusals, and interruptions during idle stops.
 
-## Removed builder: 2026-11-04
+Fixtures in `scripts/aws_target/fixtures/` supply settings for `aws_target` tests.
+The tests do not read tracked configuration.
 
-`builder-removal.json` records the removal on 2026-11-04.
+## Removed builder: 2026-11-10
+
+`builder-removal.json` records the removal. Commit `1b1fa1842` removed the target on 2026-11-10.
 The persistent `aws-build` instance, Tailscale device, and data volumes were removed.
 `routing.json` records `enabled: false`.
-The target registry contains `mac,natedev`.
-The builder configuration and offload route have been removed.
-Builder slots, warm mirrors, idle shutdown, and queue-based starts are historical features.
-Only historical cost, ownership, and teardown compatibility remain.
+The registry no longer includes the former `aws` target.
+The ledger and teardown retain historical records for the former builder.
 The foundation template has no builder instance, launch template, data volume, roles or stop action.
 The `remove-builder` command and the `down` compute stage are removed.
 The foundation template has no builder parameters or outputs, such as `EnableCompute` or `ComputeEnabled`, since 2026-11-15.
@@ -691,8 +809,8 @@ The sweep preserves boxes with live owners, even when another owner in the same 
 The sweep preserves trial folders.
 Guest expiry and the AWS expiry function remain independent termination controls.
 AWS failures can delay termination beyond the configured expiry and confirmation timeout.
-Merge gate units also use `ExecStopPost` with `cloud_gate --cleanup`.
-Trials and merge gates use the same attempt cleanup code in `cloud_gate.py`.
+Gate units also use `ExecStopPost` with `cloud_gate --cleanup`.
+Trials and gate runs use the same attempt cleanup code in `cloud_gate.py`.
 The worker installs no signal handler.
 The ledger records each worker's PID, process start identity, and attempt folder.
 Reconciliation preserves live workers and workers whose identity cannot be read.
@@ -738,9 +856,12 @@ The guest writes `finish` after the last run.
 It publishes the current stage before each run through the existing per-run log transfer.
 The final transfer includes `finish` and the last result rows.
 These transfers include `boot.log`, `gate.log`, and `timeline.log`.
+The gate box passes signed URLs to curl in private files. A transfer failure reports the stage, curl exit code, and HTTP status.
+The bootstrap removes each known signed URL and its query from the result records and logs it sends.
+Older paired candidates can send logs directly. The bootstrap cannot filter those uploads.
 The upload count and measured result fields remain unchanged.
 
-`cloud_gate.log_cloud_progress` reads stages for both paired trials and merge gates.
+`cloud_gate.log_cloud_progress` reads stages for both paired trials and gate runs.
 The progress record adds `stage`, `region`, and `zone` beside the existing fields.
 Before the first box log line, the state is `requesting` and the stage is `launch`.
 The last UTC `stage=` line supplies the stage text.
@@ -766,7 +887,7 @@ The paired trial replaces the size/start trials.
 The old size/start trial settings are removed.
 The paired trial uses the existing `cloud_gate.conf` settings.
 
-## Cloud gate region fallback
+## Cloud gate placement and region retries
 
 The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
@@ -777,18 +898,81 @@ The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
-A normal gate uses natedev after all capacity choices refuse.
+A direct gate uses natedev or `mac-linux`.
+The prepared copy wrapper can pass an AWS assignment to the gate.
+The queue offers AWS only when both the registry and the scaler settings enable it.
+The live registry has no AWS scaler entry.
+
+The queue checks slot availability and daily spending room before it grants AWS.
+The budget check counts each current grant until the worker records its booking.
+The queue reads the registry again when it returns an unused grant or consumes launch permission.
+Prepared copies can run nightly suites and named modules on AWS.
+Promotion without tests uses natedev.
+When a passing AWS gate requests type checks, natedev runs those checks.
+A gate without an assignment runs its tests on natedev.
+An AWS assignment occupies one slot under `cloud_gate_slots`.
+The route checks `enabled` in `cloud_gate.conf` before it reads deployment state.
+The worker checks both switches before it sends a launch request.
+
+The legacy slot queue sorts requests by unit rank, then by queue time.
+Grouped requests keep their unit rank and use the group start time.
+The placement pass assigns scaler requests separately.
+
+The queue supplies these paths beside the placement progress file.
+
+1. The dispatch journal
+2. The AWS cost ledger directory
+3. The AWS account settings
+4. The target registry
+
+The worker reads the account settings from the assignment.
+The caller saves and syncs its prelaunch record in the queue state directory before it consumes launch permission.
+The caller adds each service folder to the journal before it starts the worker.
+The worker holds the journal lock while it runs.
+The queue uses the exact claim, caller identity, and saved local records to settle an ended dispatch.
+If a dead caller left no reservation or launch record, the queue closes the journal with `no launch`.
+A closed journal prevents a late worker from reserving spend or starting a box.
+Queue recovery makes no AWS call.
+A booking without a saved launch request can close while the journal lock excludes workers.
+A request has one current AWS dispatch across worktrees.
+A repeat can start cleanup after the earlier caller ends if the queue grants a slot.
+An open booking can block the grant until the recovery fix lands.
+The repeat launches only after the ledger records the release and the journal confirms closure.
+The queue syncs the ledger directory before it records closure.
+If AWS might have accepted a launch, the worker keeps its first token until it confirms the result.
+An open reservation or an unconfirmed launch keeps the assignment current until local records confirm its end.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
 The retry uses the next choice in the saved launch order.
 The route keeps its cloud slot across retries.
-The route saves the interruption count and the next choice in `current.json` before each retry.
-Resume restores both values, so a crash cannot reset the retry budget.
+The route saves the interruption count and the next choice in the claim state before each retry.
+Resume restores both values under the same claim.
+A repeat with a new claim can reset the retry budget until the recovery fix lands.
 Each retry gets a new attempt ID and passes the existing spend and attempt checks.
 The worker confirms cleanup of the interrupted box and reservation before the retry.
-The final natedev fallback row includes the interruption count when retries or capacity choices end.
+The final fallback row includes the interruption count when retries or capacity choices end.
+An assigned gate exits 79 when the journal confirms no launch.
+It exits 80 if a launch remains possible and no test verdict is available.
 A complete gate failure keeps its failed result and gets no retry.
-An unconfirmed termination or another controller error retains the existing fallback behavior.
+An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
+The route reports pending settlement to the queue while the launch remains uncertain.
+A completed AWS run with open settlement keeps its verdict and prints one warning on standard error.
+The stop cleanup looks up an unknown instance by client token.
+Cleanup accepts a saved termination for the same booking, region, and set of instances.
+An empty lookup proves absence only if the lookup starts at or after the booking expiry.
+If the reconciler cannot read a launch journal, it prints the file path and keeps that booking open.
+It continues cleanup for the other bookings.
+The queue reads settlement for the exact claim from its dispatch journal.
+The queue also checks deployment and Spot quota evidence from local files.
+The worker checks the current spending caps before each fresh assigned launch.
+A wrapper that owns the placement can request settlement after status 80.
+It keeps the episode for a replacement when the journal confirms no launch.
+The wrapper preserves status 80 if the settlement request or replacement fails.
+When cleanup is due, the queue requests the reconcile service for an expired booking in the journal.
+The service uses the ledger directory and account settings from the assignment.
+The request returns before reconciliation completes.
+The queue prints one warning per attempt if the service cannot start.
+The reconciler records the confirmed end in the local ledger.
 The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
@@ -814,6 +998,17 @@ Reconciliation and the expiry sweep retain their existing end times.
 Results include `kernel_boot_at` from `/proc/stat` and `user_data_started_at` from the first user data command.
 Each timestamp is a UTC epoch time from the box.
 Results include `instance_running_at` when a cached instance identity document supplies `pendingTime`.
+The gate box gets `packages` from `config/cloud_gate.conf` at the deployment host's locked nixpkgs revision.
+The list includes bubblewrap.
+Before `guest.py` starts, the boot script runs `bwrap --ro-bind / / true` as `gate-trial`.
+Success writes `stage=bwrap ready` to the boot log.
+Failure reports that bwrap or unprivileged user namespaces do not work for `gate-trial`.
+The boot log and the boot error record include this reason.
+A failed check prevents the gate box from running tests.
+The production EXIT handler attempts to send any boot error before it requests poweroff.
+The handler requests poweroff and keeps the boot session exit status even if it cannot write the boot error record.
+Cloud gates and paired trials use this boot script.
+GPU size trials use their own boot script and prepared system.
 The live `gate_box.GUEST` program contains the bootstrap code.
 The bootstrap downloads or clones the candidate and verifies its requested tree.
 It prepares the environment and calls the candidate's `scripts.aws_target.gate_box.run_guest` entry point.
@@ -824,7 +1019,7 @@ The module time limit and process groups stop the gate.
 The bootstrap names no `merge_gate` attribute and copies no host function source.
 A paired trial uses the changed candidate's entry point to supervise both verified trees.
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
-The controller then uses the normal natedev fallback.
+The controller reports the failure to the queue.
 The result fields and transfer links keep their existing format.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
@@ -855,7 +1050,67 @@ Paired trials use this booked cost for completed gates.
 Open reservations retain `attempt_allowance_usd`.
 Admission includes these allowances when bills exist.
 An own-day bill corrects saved estimates that still include configured allowances.
-The bill remains the minimum cost for its reconciliation period.
+An unbilled day is idle only if every run exposure that starts before its end has a confirmed closure before its start.
+An expired permit or reservation still counts until the ledger confirms closure.
+The page, spending guard, and admission use the usual prices and bill carry on run days.
+After the latest bill, an unbilled idle day carries retained resource costs and unknown usage types.
+It skips usage linked to runs and uses the usual accounting for Cost Explorer fees.
+The page, spending guard, and admission use the same idle-day rule.
+The guard keeps any higher established charges.
+The ledger and hours table exclude a closed Hana exposure only when its START record has a valid `start_refusal_code`.
+A possible start or an observed acceptance in any generation of the exposure keeps the full exposure.
+Legacy cancellations and stopped states retain the full exposure when the journal has no refusal code.
+Reports keep the existing reconciliation floors.
+The account checks adjust the existing total for each qualifying UTC day inside the limit window.
+They subtract that day's existing usage and add the newest qualifying AWS amount.
+An account bill qualifies when the name, day label, and bounds match one full UTC day.
+The bill must exclude credits and give at least USD 0.01 before rounding.
+The newest read time must be valid and cannot be in the future.
+The charge file keeps each read time and amount. A legacy file without a list supplies one read.
+Known limit. Concurrent refreshes can record one USD 0.01 fee for two Cost Explorer reads.
+Within the lookback, the last `cost_explorer_unchanged_reads` reads after the UTC day ends must report the same amount.
+Reads less than `cost_explorer_interval_seconds` apart count once.
+A different amount starts a new count. The AWS service logs the day and both amounts when the day becomes unsettled.
+Outside the lookback, the latest valid amount qualifies.
+The adjustment preserves query fees and any open gate allowances or reservations already in the total.
+
+Each scheduled Cost Explorer read requests the last `cost_explorer_watch_days=45` completed UTC days.
+The watch must cover at least `cost_explorer_lookback_days=7`.
+The reader makes one scheduled query each day.
+It saves the lookback days before it saves the older days.
+It logs a save error for an older day and continues with the other days.
+The query groups costs and quantities by usage type.
+AWS charges USD 0.01 for each page of the answer.
+The 45-day answer can take more than one page.
+The ledger records the actual fee for each read.
+The watch derives the first settled amount from the first sequence of equal counted reads.
+The AWS page shows how many recorded days still match their first settled amount.
+It shows the date of the newest read in UTC and lists each day with a different current amount.
+The history keeps earlier differences when the newest read returns to the first settled amount.
+The watch sends one message for each read that finds changes that it has yet to report.
+The message goes to the session in `cost_explorer_change_recipient=bob`.
+It uses the page wording and includes one line for each changed day.
+It checks all saved days, including days outside the query range.
+After a successful send, each charge file records the reported amount.
+A write error after delivery can cause the next message to repeat that day's line.
+After a failed send, the next read collects and tries all pending changes again.
+
+The report's costs pane must call `CostLedger.accrued_cost` for the current day or month to date.
+The function returns `cost`, `limit_count`, and the cost and bill state for each UTC day in the window.
+`cost` is the ledger estimate plus the same complete-day adjustment that the guard uses.
+`limit_count` is the admission guard's value, equal to `cost` plus reserves and headroom.
+The function reports an unavailable limit count when the admission guard cannot calculate it.
+The per-day costs add up to `cost` and include separately named query fees and any rounding adjustment.
+The pane displays a counted bill as “Billed, final” only when the bill sets `provisional` to JSON `false`.
+The pane displays all other counted bills as “Billed, not final”.
+The pane displays other days as “Estimate”.
+An estimate can show the newest valid AWS amount in `aws_amount_so_far` while the day remains unsettled.
+The tooltip labels this value “AWS amount so far”.
+The pane's “Time on AWS” row reads `run_cost.hana_billed_hours` for one UTC day.
+The reader returns billed Spot hours for Hana's configured region and machine types.
+The file name, day label, and bounds must match the requested full UTC day.
+A valid bill with no matching usage gives zero hours.
+A missing or damaged bill gives no record.
 Missing cost rows contribute zero.
 The configured allowance supplies the cost when no needed bill rows exist or the S3 share has no launch count.
 The spending limits do not change.
@@ -880,16 +1135,14 @@ Run one `deploy.py up` at a time. Two runs from different state folders can save
 
 `buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
 The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
-The hourly job calls `aws_target.hourly`: the Spot snapshot, then the billed hours check.
-`python3 scripts/aws_target/aws_target.py snapshot` runs the same two steps manually.
-No systemd unit change or NixOS rebuild is required.
-The old `aws-target.service` remains disabled.
-`aws_target.py tick` reads account charges only.
+The hourly job refreshes the Spot snapshot and placement scores. It also checks billed hours.
+`python3 scripts/aws_target/aws_target.py snapshot` runs the same operations manually.
+`aws_target.py tick` reconciles the Hana lifecycle and refreshes account charges.
 `price_refresh_seconds` limits snapshot attempts to one per configured interval.
 `deploy.py up` runs the same reader with `force=True` after the stack update, so prices fill at once.
 A forced read does not move the interval, so the next hourly read still runs.
 The hourly timer starts one hour after the last run ends, so two hourly reads are always more than 3600 s apart.
-A price read is therefore never older than one hour plus the run time.
+A failed regional read can leave older values in the snapshot.
 It tries `deploy_price_fill_attempts=3` times, `deploy_price_fill_pause_s=10` seconds apart, while IAM shows the new policy.
 The deploy prints the reasons and sends no alert; a failed fill does not fail the deploy, and the hourly refresh sends the alert.
 The snapshot takes `spot-prices.lock` without blocking.
@@ -930,7 +1183,16 @@ It renders the registered `aws.snapshot_failed` text and sends it through `push_
 The message key comes from the streak's start time.
 The notice names each region and read that AWS refused. The saved failure keeps the AWS error code.
 `AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, and `not authorized` permit a notice.
-The fixed action requests `deploy.py up --workload merge-gates --approve-resources` on natedev.
+The first permission refusal files the **Allow AWS price reads** action with `deploy.py up --approve-resources` on natedev.
+The card reason says, "After 2 hours without the read, test runs on AWS can pick a region that costs more."
+The card shows **Completion: Automatic** and also has a **Done** button.
+The streak saves the action key before it files the action.
+A new streak withdraws any open action from the previous streak before it files an action for the current regions.
+It records successful action creation separately from the notice claim.
+A later permission refusal retries a failed action creation, even after the notice goes out.
+Completing the action leaves the creation record in the streak.
+A clean read saves the snapshot and ends the streak before it withdraws the open action.
+A withdrawal failure sets status 1. The next clean read or permission refusal retries the withdrawal.
 That command updates permissions but does not replace scaler credentials.
 Credential errors, timeouts, network errors, and throttling send no phone notice.
 `deploy.py apply --approve-resources` replaces the scaler key and checks its identity.
@@ -943,7 +1205,7 @@ The snapshot saves the notice claim before it calls the message process.
 The claim prevents another send for that streak after a crash.
 A crash before delivery can suppress that streak's notice.
 A normal delivery failure clears the claim for the next snapshot attempt with the same key.
-Success in every candidate region ends the streak and drops any unsent notice because no user action remains.
+A completed streak drops any unsent notice.
 A later failure starts a new streak and permits a new notice.
 `snapshot_notification_timeout_s=120` bounds message review and delivery in seconds.
 Each failure logs the region, the failed read, the error class, and a redacted reason on one line.
@@ -996,13 +1258,23 @@ The user asked for this layout on 2026-11-14 through builds. Each line has these
 The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.8xlarge`.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
 A launch row without a region ran in the home region, `region` in `aws_target.conf`.
-The next line names the cheapest merge gate by estimate.
+The next line names the cheapest gate by estimate.
 Below them, two tables show the refused requests and the launched boxes of each type and region.
 Refused requests are capacity and quota refusals.
-The last table shows billed hours / box hours for each type and region, from `run_cost.hours_checks`.
-A cell is `<billed>/<box> (<gap>)`, such as `9.2/8.8 (4%)`, with `over` when `hours_gap_over` is set.
-A type and region without a bill read shows `not billed`. Only types with hours have a row.
-An unreadable cost ledger shows a note in place of the billed hours.
+The last card asks “Did AWS bill more machine hours than we used?”
+It uses `run_cost.hours_checks` over the days with a bill in the configured window.
+When a higher bill exceeds the limit, the answer sums the displayed differences for those rows and gives their count.
+If only lower bills exceed the limit, the answer sums the displayed differences for those rows and gives their count.
+If all comparisons pass, the answer gives the total billed hours and the total recorded hours.
+If the answer is “No” and the displayed billed total is higher, a second sentence explains the limit and the Hana allowance.
+The visible table includes only higher bills that exceed the limit.
+The closed “All rows” control opens a table for every type and region with hours in the selected regions.
+The tables show billed hours, recorded hours and the signed difference to one decimal place.
+The difference subtracts the full values before rounding.
+If a marked difference or its sum rounds to zero, it shows as “less than 0.1 hours.”
+The Hana reserved column shows the hours set aside for Hana where the check uses them.
+If the bill for a row is due, the billed hours and the difference show a dash in “All rows.”
+The shared region filter includes all regions with an hours check.
 
 The AWS page shows the same tables, published by `aws_page.publish`.
 The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
@@ -1021,6 +1293,8 @@ The user approved the combined table on 2026-11-18.
 2. The first two columns show the region and its quota in vCPUs.
    The quota is Standard quota or G and VT quota for the selected types.
    The quota has a blue-gray tint and stays visible when all Show chips are off.
+   The next three columns show the requested vCPUs, request state, and request age.
+   A region without a request shows a dash in those columns.
 3. Each type header includes its vCPU count.
    When multiple values show, each type groups the Spot (USD/h), Gate (USD), or Fit (boxes) columns.
    Fit divides the region quota by the type's vCPU count and rounds down.
@@ -1030,7 +1304,7 @@ The user approved the combined table on 2026-11-18.
    A ban icon with the title `Not sold here` identifies a type that the region does not sell.
    Unavailable values show a dash with the reason where known.
 4. The Runs chips show when Cost per gate is on.
-   Merge gates, Targeted runs, and Both select the Gate estimates and the run tables.
+   Gates, Targeted runs, and Both select the Gate estimates and the run tables.
    The choice also selects the refused and launched tables.
    The billed hours table does not depend on the run choice.
    The run tables omit Spot price and estimate because the Prices and quotas card shows them.
@@ -1069,21 +1343,34 @@ It compares the billed Spot hours with the recorded box hours for each type, reg
    Its time runs from each `running` observation in the cost ledger to the next other state.
    A `running` observation with no later state counts to the window end.
    Reason: on 2026-11-08 the builder box ran 8.8 h, and the check reported its Spot hours as a gate gap.
-3. The gap ratio is `abs(billed - box) / box`.
-   A gap above `billed_hours_gap_max_ratio=0.15` in `aws_target.conf` is over.
-   Billed hours with no box hours are also over.
+3. The check counts the first exposure per generation in the configured Hana region and splits its hours at UTC midnight.
+   The check counts open exposures through check time and adds the same regional total to the upper bound for each Hana type.
+   The check uses the gate and builder hours for the original ratio comparison when the bill is below them or the Hana allowance is zero.
+   A positive allowance raises the upper limit to `(box hours + Hana exposure hours) × (1 + limit)`.
+   Both comparisons use `billed_hours_gap_max_ratio` from `aws_target.conf`.
+
+Hana exposure hours can hide that many hours from an unknown box of any configured Hana type in the region on that day.
+
 `run_cost.day_hours_checks` gives one `HoursCheck` per type, region and day in the window.
 Days run from the window start day up to, but not including, the end day, like the bill split.
 `run_cost.hours_checks` sums the days with a bill read for each type and region, for the billed hours table on the AWS page.
-`HoursCheck` holds `billed_hours`, `box_hours`, `hours_gap_ratio` and `hours_gap_over`.
-Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_hours` counts every day.
+`HoursCheck` records `billed_hours`, `box_hours`, `hana_reserved_hours`, `hours_gap_ratio`, and `hours_gap_over`.
+The gap ratio is the distance outside the range divided by the bound on that side.
+Without a bill read, the recorded and reserved hours count every day in the window.
 `aws_target.hourly` checks the last `run_cost_days` days after its price read.
 `buildlog hourly` and `aws_target.py snapshot` both call it.
-It checks the types the snapshot reads: `instance_types`, `price_compare_instance_types` and `gpu_instance_types`.
-Each type, region and day that is over sends one `aws.hours_gap` user notice.
-The key `aws-hours-gap:<type>:<region>:<day>` is saved in `hours-gap-notices.json` before delivery.
-A failed delivery removes the claim, so the next hourly run sends it again.
-A claim for a day before the window is dropped.
+The notices and the table use the same list of gate types and Hana's primary and fallback types.
+If the Hana region or type settings are unavailable, both use the gate types and a zero Hana allowance.
+For each type, region, and UTC day above the limit, the check sends a message to bob's fixed staff ID.
+The message gives the billed hours, ledger hours, gap, and limit.
+The message includes exposure hours for the region and day when a Hana allowance applies.
+It asks bob to file an investigation and add it to the list.
+The check saves the key `aws-hours-gap:<type>:<region>:<day>` in `hours-gap-notices.json` after `SENT`, `SKIPPED`, or `QUEUED`.
+After a failure or timeout, the next hourly run tries again.
+The check uses the sender's full time budget for the subprocess.
+The check uses only its claim file to suppress duplicate messages.
+The check keeps the two claims from the old phone route, which bob tracks in investigation I7.
+The check removes claims for days before the window.
 Live, 2026-11-14: the days since 2026-11-12 are within 4.5 %.
 Before that day, the box hours were 7 to 13 % above the bill.
 
@@ -1101,7 +1388,7 @@ Missing or unreadable evidence returns 2.
 A new gate ranks only variants from its deployment.
 `deploy.py up` saves the deployed `instance_types` in `gate-deployment.json`.
 A gate skips a configured type that this list does not name, and prints `Run deploy.py up`.
-When the list names no configured type, the gate falls back to natedev before any launch.
+When the list names no configured type, the gate refuses before launch.
 A manifest without the list keeps every configured type.
 An `UnauthorizedOperation` refusal skips that type for the rest of the launch while another type remains.
 `launch.json` saves the skipped types in `unauthorized_types`.
@@ -1114,22 +1401,28 @@ Failed or slow regions retain their hourly rows.
 The live read never writes `spot-prices.json`.
 `launch.json` saves `spot_price_reads`, with `region`, `seconds`, and `used` for each regional call.
 Launch and refusal rows copy this evidence into `cloud-gate-launches.jsonl`.
+Every launch, refusal, fallback, and finish row in this file includes `gate_job`.
+It uses the queue's tagged `StepJob` record with `step`, `unit`, `branch`, and `modules`.
+When the job is unknown, the field contains `{"kind":"GateJobNotRecorded"}`.
+Readers accept rows with missing or unreadable `gate_job` values.
+The controller saves the job with the attempt ID in `current.json`.
+The request and every launch history row for the attempt use that saved job.
+An attempt uses `GateJobNotRecorded` if its saved job is missing or unreadable.
 Resumed launches keep the saved ranking and evidence without another live read.
 Placement does not try a type and region whose median box time, boot included, is above `max_gate_minutes=12`.
 The user, 2026-11-14: a slow type costs more gate time than its lower price saves.
 The median uses the type's runs in that region, or its runs in all regions when the region has none.
 A type without runs is tried; `lifetime_minutes` is not a measurement.
-Placement also does not try a type in a region whose Spot quota in the hourly snapshot is below one box of that type.
-The showrunner, 2026-11-14: a region with a pending quota request must not get launch attempts.
-A G or VT type uses the G and VT quota; other types use the Standard quota.
-A quota that is missing or older than `price_max_age_seconds` does not cause a skip.
-Each skip prints `Cloud gate skips <type> in <region>`.
-When every variant is skipped, the gate falls back to natedev before a launch.
-Available variants precede variants under a capacity cooldown.
+The worker ranks alternatives by recent quota refusals, estimated live quota use, and recent zone refusals.
+The quota check adds the new box to known live gate vCPUs.
+A G or VT type uses the G and VT quota. Other types use the Standard quota.
+The check uses quotas from the hourly snapshot within `price_max_age_seconds`.
+The worker prints `Cloud gate skips <type> in <region>` for a type above the median time limit.
+If that limit removes every variant, the gate refuses before launch.
 Within each group, variants with a current price come first, ranked by the expected USD per run.
 The user, 2026-11-14: "base our spot Requests on lowest price per run".
-Equal costs follow the `instance_types` order.
-Without any current price, the configured region, type, and zone order stays.
+If any variant has a current price, equal costs and unpriced variants follow the `instance_types` order, then input order.
+If every variant lacks a current price, the worker preserves input order within each capacity group.
 That cost includes the hourly Spot price times the expected box hours and the remote region transfer charge.
 It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
 `region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.
@@ -1161,8 +1454,11 @@ Equal costs keep configured order.
 Missing or stale prices follow fresh prices.
 Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
 
-`capacity_cooldown_seconds=1800` moves recently refused capacity to the end without removing it.
+`capacity_cooldown_seconds=1800` moves recently refused capacity to the end of the launch order.
 `InsufficientInstanceCapacity`, `InsufficientSpotCapacity`, and `SpotMaxPriceTooLow` affect one region, type, and zone.
+Placement reports AWS unavailable while every deployed variant with current Spot quota room has a zone refusal in its cooldown window.
+The window includes the recorded refusal time through that time plus `capacity_cooldown_seconds`.
+Placement reads this evidence from `cloud-gate-launches.jsonl`.
 `MaxSpotInstanceCountExceeded` and `VcpuLimitExceeded` affect every variant of the region.
 Ranking reads the end of `cloud-gate-launches.jsonl` in 64 KiB blocks.
 It stops at the first row before the longer of the price-age and cooldown windows.
@@ -1191,7 +1487,9 @@ The administrator IAM policy is outside the repository and needs `servicequotas:
 Credential refusals print their message once and stop the command with a nonzero exit status.
 AWS failures still print the AWS error code and allow the next region's request.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
-The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
+The configured request is 136 Standard Spot vCPUs per gate region.
+`cloud_gate_slots=16` in `build_admission.conf` limits concurrent cloud gates in the queue.
+`slots=9` in `cloud_gate.conf` limits the module count for one paired trial.
 The same command requests G and VT Spot quota (`L-3819A6DF`) in each gate region from `regions`.
 A region in `spot_candidate_regions` only has no gate stack and gets no quota request.
 The GPU quota request uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
@@ -1364,10 +1662,10 @@ Existing configuration values remain unchanged.
 | --- | --- | --- |
 | `stack_name` | `hana-build` | Keep Hana resources separate from gate resources. |
 | `availability_zone` | `us-east-2c` | Use this zone for the first launch candidate. |
-| `ami_id` | Empty | Require the reviewed Hana safety image. |
-| `ami_owner_id` | Empty | Require the reviewed image owner. |
-| `vpc_id` | Empty | Require an explicit network. |
-| `subnet_id` | Empty | Require an explicit public subnet in the disk zone. |
+| `ami_id` | Empty | Use the reviewed image from the registration. |
+| `ami_owner_id` | Empty | Use the owner from the registration. |
+| `vpc_id` | Empty | Use the VPC from the registration. |
+| `subnet_id` | Empty | Use the subnet from the registration. |
 | `aws_timeout_s` | `10` | Bound small provider and receiver requests. |
 | `result_transfer_timeout_s` | `120` | Allow time to transfer up to 32 MiB of result JSON in either direction. |
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |
@@ -1434,8 +1732,12 @@ The copies private index includes staged, unstaged, deleted, and permitted untra
 The caller's index and refs remain unchanged.
 The existing tree key and a second private capture detect content and executable mode changes.
 Both capture paths refuse new Git links with `NestedRepository`.
-The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
-It sends no ignored files, HOME, or target output.
+The sender never sends ignored files. A build can read these files, so the source check refuses each ignored file outside `source_allowed_ignored`.
+The refusal names the first path. Remove the file or ask the user to approve a list entry.
+The sender refuses credential paths, Git links, and disallowed environment variables. It omits HOME and target output.
+The sender checks local input paths before it requests a Hana claim.
+The sender refuses the source early only if it confirms that no execution is bound.
+Hana can start if an ignored file appears after the first check. The check after adoption then refuses the file.
 
 When source preparation fails before the command starts, offload reports the cause as a typed admission refusal.
 The queue records `DoNotRetry` and the build runs locally.
@@ -1460,21 +1762,43 @@ The guest receives no AWS credentials.
 The bootstrap downloads the payload with curl and verifies its SHA-256.
 The image sets the maximum file size and `source_download_timeout_s` (120 seconds).
 `hana_source.materialize` verifies Git prerequisites, checks the advertised commit, and fetches verified objects.
-The data disk retains one bare mirror for each repository under `/var/lib/hana/mirrors`.
-The shared maker allocates mirror metadata and temporary bundle files.
-`build_slots.take_slot` supplies the only working checkout and retains its lease through the caller's context.
-The slot API provides rescue before reset, stable Cargo output, and existing capacity refusal.
-The slot's `rust-toolchain.toml` digest must equal the manifest before execution.
+The guest retains its main checkout at `~/rust/hana` on the data disk.
+The bootstrap downloads the payload inside the main checkout.
+The bootstrap extracts the runtime under `~/rust/hana/.git/hana-payload`.
+Systemd mounts that path as a bounded filesystem for each command.
+The runner stages the verified bundle in the main checkout's Git directory.
+`build_copies.take_copy` takes the assigned number under `~/build/hana/aws-hana`.
+The maker rescues source edits before reset and retains Cargo output within the configured size limit.
+The copy's `rust-toolchain.toml` digest must equal the manifest before execution.
+The shell cache lives at `~/build/hana/main/shells`.
 
 The guest must use host name `aws-hana`.
-Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots.aws-hana.hana.max_bytes`.
-The image supplies these approved values and includes Git, curl, and Python.
-The per-run runtime supplies the source, maker, slot, rescue, and configuration modules.
-The runner retains inherited slot locks through command execution.
+The image selects `roots.build` for the guest and expands `~/` against the runner's home.
+Admission requires a `# whole:` limit above each of `slots.aws-hana.hana.max` and `slots.aws-hana.hana.max_bytes`.
+The image supplies these values and includes Git, curl, and Python.
+The per-run runtime supplies the source, copy maker, rescue, and configuration modules.
+The runner retains the numbered copy lock through command execution.
+Runtime ABI 2 requires an image that probes the numbered copy lock.
 
 ## Hana result transport
 
+The command runs in a transient systemd service with `ExitType=main`.
+The runner detects Cargo exit even when a descendant keeps an output pipe open.
+When the runner observes Cargo exit, it measures the bytes pending on each pipe.
+It reads those bytes within the transport size limit, closes both pipes, and returns the Cargo status.
+The payload exits after the runner returns and the payload cleans up its temporary files.
+When the payload exits, systemd stops the service and kills remaining processes with `KillMode=control-group`.
+The receiver requires launcher exit, an empty command cgroup, and a free maker lease before it uploads the result.
+It also requires this evidence before it confirms a fence for a running command.
+The execution journal stores the systemd exit time, first free lease probe, and upload start under `observation.timing`.
+The receiver also records when it first confirms unit exit.
+After a restart, the receiver can read the journal without the original launcher object.
+The receiver retries a missing journal entry on each pass until it records the exit time or confirms departure.
+The systemd exit time is absent if the guest cannot read the matching journal entry.
+Each time uses Unix seconds on the guest.
+
 The guest sends `result.json` with both compiler output streams and the command status.
+A unit timeout takes precedence over a complete result because cleanup can still be in progress.
 The JSON limit is 32 MiB.
 The guest and sender use `result_transfer_timeout_s` for the upload and download.
 The guest uses curl for the upload and keeps the signed URL out of process arguments.
@@ -1486,6 +1810,8 @@ The receiver reads and processes the fence before the permit in every pass.
 A control step can fail during a read, a write, decoding, or validation.
 The receiver continues to process the other control requests in the same pass.
 A fence sends SIGKILL to the upload process and reaps it before the receiver acknowledges the fence.
+The fence observation includes the upload start time when the receiver has recorded it.
+During settlement, the controller saves the fence observation when it carries timing.
 The receiver records an upload attempt before the PUT and records its result before it publishes the observation.
 After a restart, the receiver records an unconfirmed upload as `HanaResultUploadFailed` and reports the loss.
 Command and fence documents and execution observations have a 64 KiB protocol limit.
@@ -1499,11 +1825,14 @@ It polls after every fence PUT attempt, including when S3 returns an error statu
 The sender retains the claim if the window ends before it confirms the fence, command termination, and lease release.
 The offload reports a loss if the transfer cannot fit, times out, or the guest cannot confirm its PUT.
 The offload requires an accepted result before it reports a build verdict.
+The offload publishes the result and saves its exit status before it attempts to report completion.
+If a record, admission report, or diagnostic fails, the offload keeps the published verdict and returns its exit status.
+An interrupt during completion reporting can change the exit status, so the caller rejects the result and repeats the run.
 
 ## Hana runtime per run
 
 The sender packages its runner files and the full or delta Git bundle in one uncompressed archive.
-`scripts/aws_target/hana_render.files` lists the Python files for the run.
+`scripts/aws_target/hana_runtime.files` lists the Python files for the run.
 The archive also holds the runner entry point, resolved config, and the runtime ABI marker.
 The existing conditional PUT sends the archive once.
 The signed GET and SHA-256 cover the entire archive.
@@ -1519,8 +1848,11 @@ The image bootstrap verifies the payload and its ABI inside the unprivileged com
 It gives the runner the verified local Git bundle.
 The runner reads the per-run shell, disk floor, Git timeout, environment rules, and maker settings.
 The bootstrap applies the image's approved roots, slot capacity, and probe timing.
+It uses the command's runtime workspace for `TMPDIR`.
 The runner uses the image's command timeout.
-The result uses the same stdout contract.
+The runner sends the reason for an expected refusal.
+If an exception escapes the runner, the entry point sends a refusal that names the exception class.
+It flushes the reply before it tries to print the traceback on the box.
 Systemd removes the per-run runtime filesystem when the unit ends.
 
 ## Hana placement adapter
@@ -1531,18 +1863,25 @@ Hana retains the configured SSH target family and uses signed control instead of
 `hana_placement_adapter.py` implements configuration policy, lifecycle evidence, exact claims, and release.
 `hana_generation.py` keeps the canonical boot identity safe for guest imports.
 
-The inactive target registration permits only the normalized Hana repository and check or clippy judgments.
+The active `hana-aws` target accepts one assigned step at a time.
+The route accepts check and lint judgments for the normalized Hana repository.
+These judgments run direct `cargo check` or `cargo clippy` commands.
 The command policy rejects repairs, builds, nextest, final steps, path overrides, and unknown wrappers.
-The active target order remains unchanged, and `enabled=off` still prevents placement.
+`enabled=on` enables the route in `hana_aws.conf`.
+The queue checks the Hana image and capacity before it assigns work.
+A pinned request uses only its requested target.
 
 Provider evidence reads lifecycle and execution records through the existing background worker.
-The stopped Hana target shares one spending preview across placement probes in the admission process.
+The adapter checks the spending preview only for an idle, stopped box.
+A ready box with a verified boot generation can pass placement without a spending preview.
+The admission process shares one stopped-box preview across placement probes.
 The preview expires after `preview_max_age_s` seconds, which defaults to two.
 Changes to the ledger, launch history, lifecycle journal, bills, or spending configuration invalidate the preview.
 The cache skips previews that use configuration recovered from Git.
 A full preview uses the account ledger lock and reads the launch history once.
 The preview gives placement evidence only.
-The controller still performs its full reservation and start checks.
+For a stopped box, the controller still performs its full reservation and start checks.
+Guest command admission requires a valid permit.
 The controller alone owns demand starts, spending reservations, and idle-stop serialization.
 One exact lifecycle claim excludes all other Hana worktrees.
 Boot generations include the deployment, demand-start token, and verified boot identity.
@@ -1551,6 +1890,16 @@ Permit renewals retain that generation.
 F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, `HanaClaimRetained`, or `HanaClaimResourcesHeld` from `claim_assigned()`.
 `HanaClaimResourcesHeld` means a resource command holds Hana and prevents a new claim.
 Only an adopted claim can request the queue's first launch authorization.
+At authorization, the queue reads the exact Hana claim and lifecycle row from local files.
+These reads take no provider locks and make no AWS calls.
+The queue checks the claim, holder, session, host, boot generation, and active permit.
+The queue also checks the estimated memory peak against the Hana memory limit.
+Before publication, the sender reports a source, holder, authorization, permit, or journal refusal with its cause.
+If the queue refuses authorization, the sender uses the queue's reason.
+The queue reports whether adoption evidence is stale or unavailable and includes the reason.
+If release fails, the sender reports pending settlement and the queue keeps the assignment.
+The runner returns the confirmed guest refusal with its original reason and records that cleanup remains unconfirmed.
+The runner also returns an accepted command result with its output and exit status while claim release remains pending.
 `release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
 An exact guest observation can settle an accepted execution that ended without a compiler result.
 The observation must confirm termination and lease release, and the sender must have issued no source update.
@@ -1565,6 +1914,18 @@ The sender reports the refusal before claim cleanup.
 The controller checks whether the holder exited in every lifecycle state, including after a Spot interruption.
 An unresolved start still requires provider recovery.
 The next Hana evidence read can remove the detached target claim.
+The admission service checks saved current assignments on each queue pass, including after a restart.
+For a dead local holder, the Hana evidence worker can replay exact terminal proof from the dispatch journal.
+The journal, guest observation, and retained claim must identify the same boot.
+The worker uses the normal settlement path to release the claim and record settlement.
+Recovery preserves a saved pending report's outcome and sends that report as settled after claim release.
+The sender checks the current source when it accepts a result.
+If fencing or claim release remains pending, the sender reports the accepted completion with `DispatchPathPending`.
+Recovery uses the result decision from the journal.
+The queue consumes the settled execution report on its loop thread and closes the assignment.
+If the service restarts after claim release, it can read the settled journal and finish the report.
+If the journal confirms command settlement and the claim is gone, recovery completes any unfinished journal write and sends the report.
+Missing proof or proof for a different dispatch keeps the assignment current.
 The queue excludes Hana for the refused build and continues in the configured candidate order.
 For a different build, the queue needs provider evidence at or after the refusal report before it can assign the same scope.
 For a pinned build, `verify.sh` prints one line with the refusal cause and exits with status 2.
@@ -1577,3 +1938,44 @@ An exact current assignment and live holder establish the `remote_waiter` hold c
 A drain preserves that waiter without granting local memory or a Cargo token.
 Unassigned callers retain the existing drain behavior.
 Phase E adds no stored shape or queue wire field.
+
+### Pinned Hana GPU nextest pilot
+
+Run the gate setup command on natedev.
+
+```sh
+python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
+```
+
+Approved gate setup removes the old `gate-probe.json` before it can change gate resources.
+An interruption or early setup failure leaves the record absent.
+When the probe ends, it saves the verdicts in a private record beside `gate-deployment.json`.
+The record includes the deployment ID, the UTC end time, and any failed checks.
+Run `deploy.py probe-status` to read the saved verdicts and record age without contacting AWS.
+The command shows verdicts only for a readable record that matches the current deployment.
+It checks the recorded regions and instance types against `gate-deployment.json`.
+
+After the GPU setup probe passes, set `hana_gpu_route_enabled=on` in `config/cloud_gate.conf`.
+The route checks the deployment record for every type in `hana_gpu_instance_types`.
+
+Run the pilot from the Hana checkout.
+
+```sh
+~/.claude/scripts/direct/verify.sh test hana_mimesis_tools --test shader_variants --target hana-gpu
+```
+
+The queue offers one Linux slot for the package and test pairs in `hana_gpu_selections`.
+`verify.sh test --target hana-gpu` omits the implicit workspace dev features.
+The executor captures the caller tree and passes the commit to the one-step GPU nextest worker.
+The worker uses the selected nextest profile and returns the exit status and both output streams.
+Cancellation in `verify.sh` stops the assigned GPU service and starts its cleanup.
+If only the runner dies, the GPU service can continue until the trial expires.
+The guest shuts down by the booking start time plus `hana_gpu_lifetime_minutes` from `config/cloud_gate.conf`.
+The gate expiry job uses the same deadline and the reservation allows 67 additional minutes for delivery and retries.
+The queue retains the claim until cleanup confirms termination or the ledger confirms that all bookings for the trial are closed.
+A settled infrastructure refusal releases the slot.
+A `HanaCommandAdmissionRefused` result prevents another attempt on the target for the same placement request.
+The queue gets a settled refusal only after the exact claim is free.
+A pinned call prints the refusal reason and exits with status 2.
+
+The `hana-aws` target handles check and clippy steps.

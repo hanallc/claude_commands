@@ -21,6 +21,7 @@ from unittest import mock
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 HOOK = Path(__file__).with_name("stop-direct-continue.py")
@@ -137,8 +138,8 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
             "owner_staff_id": SESSION,
             "working_dir": str(root),
             "main_agent": {"session_id": SESSION},
-            "phase": {"id": "1", "instance_id": "fixture-phase", "status": "active"},
-            "pass": {}, "open_phases": [],
+            "open_phases": [{"id": "1", "instance_id": "fixture-phase", "status": "active"}],
+            "pass": {},
         }), encoding="utf-8")
         config = root / "models.conf"
         _ = write_registry(config, {'claude.context': {'default': '200k'}}, replace_sections=('claude.context',))
@@ -149,7 +150,7 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
         write_text_atomic(root / "staff.json", json.dumps({"schema": 2, "rows": [row.to_json()]}))
         environment = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(root),
-            "PYTHONDONTWRITEBYTECODE": "1", "HERDR_BIN": "/nonexistent/herdr",
+            "PYTHONDONTWRITEBYTECODE": "1", "HERDR_BIN": MISSING_HERDR_BIN,
             "XDG_STATE_HOME": str(root / "state"), 
             "UNIT_HISTORY_DIR": str(history.parent), "UNIT_SYNC_WRITES": "0",
             "SCRATCH_ROOT": str(root / "scratch"),
@@ -248,7 +249,7 @@ class DirectorStopTests(unittest.TestCase):
             fixture.set_unit_type("merge")
             state_path = fixture.run / "progress_history_state.json"
             state = cast(dict[str, object], json.loads(state_path.read_text()))
-            state["phase"] = {"status": "completed"}
+            state["open_phases"] = []
             _ = state_path.write_text(json.dumps(state))
             with fixture.live_runner(staff.StaffId(SESSION)):
                 for status in ("The runner is live.", "The runner has no result yet."):
@@ -361,7 +362,7 @@ class DirectorStopTests(unittest.TestCase):
             worker_id = fixture.add_merge_worker()
             state_path = fixture.run / "progress_history_state.json"
             state = cast(dict[str, object], json.loads(state_path.read_text()))
-            state["phase"] = {"status": "completed"}
+            state["open_phases"] = []
             state["pass"] = {"test": {"status": "active", "worker_id": worker_id,
                                        "instance_id": "fixture-dispatch", "launcher_command": ["assign.sh"]}}
             _ = state_path.write_text(json.dumps(state))
@@ -382,7 +383,7 @@ class DirectorStopTests(unittest.TestCase):
                 fixture.set_unit_type("merge")
                 state_path = fixture.run / "progress_history_state.json"
                 state = cast(dict[str, object], json.loads(state_path.read_text()))
-                state["phase"] = {"status": "completed"}
+                state["open_phases"] = []
                 _ = state_path.write_text(json.dumps(state))
                 queued = fixture.queue_order(key)
                 before = queued.read_bytes()
@@ -411,6 +412,7 @@ class DirectorStopTests(unittest.TestCase):
             fixture.set_unit_type("merge")
             state_path = fixture.run / "progress_history_state.json"
             state = cast(dict[str, object], json.loads(state_path.read_text()))
+            state["open_phases"] = []
             state["phase"] = {"id": "1", "instance_id": "fixture-phase", "status": "completed"}
             _ = state_path.write_text(json.dumps(state))
             self.assert_allowed(fixture.call(last_assistant_message="— holding: queue empty"))

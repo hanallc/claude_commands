@@ -7,7 +7,8 @@ from scripts.lib import test_phase
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_protocol_v1_fixture import parse_request as decode_legacy
 
-from scripts.lint.memory_test_support import admission_policy_fixture
+from scripts.lint.memory_test_support import admission_policy_fixture, memory_gate_shell_environment
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 
 from contextlib import redirect_stderr
 from dataclasses import replace
@@ -58,6 +59,35 @@ class ProtocolTests(unittest.TestCase):
                     self.assertNotIn("permission", encoded)
                     with self.assertRaisesRegex(ValueError, "placement requires version 3"):
                         _ = wire.encode_reply(reply, version=2)
+
+    def test_placement_status_report_parses_across_service_and_client_versions(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            status_request = status_wire.PlacementStatusRequest(assignment.episode, assignment.attempt,
+                                                                include_permission=True)
+            report = placement.TerminalAttemptReport(placement.PrelaunchRefused("runner"),
+                                                     placement.DispatchPathSettled(), NOW)
+            known = status_wire.KnownPlacementStatus(assignment, placement.ClosedAssignment("runner"),
+                placement.NoProviderClaim(), placement.PermissionConsumed(NOW), report)
+            reply = status_wire.PlacementStatusReply(known)
+            encoded = wire.encode_reply(reply)
+            self.assertEqual(wire.parse_reply(encoded, status_request), reply)
+            envelope = cast(dict[str, object], json.loads(encoded))
+            status = cast(dict[str, object], cast(dict[str, object], envelope["data"])["status"])
+            # An older service sends no report: the client reads no report, so Verify keeps the lost path.
+            del status["report"]
+            older_service = wire.parse_reply(json.dumps(envelope), status_request)
+            self.assertEqual(older_service,
+                             status_wire.PlacementStatusReply(replace(known, report=placement.NoTerminalReport())))
+            # An older client reads a reply with a field it does not know.
+            status["field_from_a_newer_service"] = "ignored"
+            self.assertEqual(wire.parse_reply(json.dumps(envelope), status_request), older_service)
 
     def test_older_placement_messages_keep_absence_and_authority_as_named_states(self) -> None:
         from scripts.build_queue.test_placement import placement_request
@@ -147,7 +177,7 @@ class ProtocolTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             for place in (wire.LocalPlace(), wire.CloudPlace("aws")):
                 with self.subTest(place=place):
-                    request = replace(fixture.request(step="merge-gate"), place=place)
+                    request = replace(fixture.request(step="gate"), place=place)
                     parsed = wire.parse_request(wire.encode_request(request))
                     self.assertEqual(parsed, request)
                     assert isinstance(parsed, wire.AdmitRequest)
@@ -156,6 +186,19 @@ class ProtocolTests(unittest.TestCase):
                         envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
                         envelope["v"] = version
                         self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, request))
+
+    def test_the_owning_session_survives_the_request_wire(self) -> None:
+        with AdmissionFixture() as fixture:
+            for session in (OwningSession("fps-run"), NoOwningSession(), wire.SessionNotSent()):
+                with self.subTest(session=session):
+                    request = replace(fixture.request(), session=session)
+                    self.assertEqual(wire.parse_request(wire.encode_request(request)), request)
+            older = cast(dict[str, dict[str, object]], json.loads(wire.encode_request(
+                replace(fixture.request(), session=OwningSession("fps-run")))))
+            del older["data"]["session"]
+            parsed = wire.parse_request(json.dumps(older))
+            assert isinstance(parsed, wire.AdmitRequest)
+            self.assertEqual(parsed.session, wire.SessionNotSent())
 
     def test_placement_exchanges_preserve_identity_without_replaying_authority(self) -> None:
         from scripts.build_queue.test_placement import placement_request, coordinator_holder
@@ -224,7 +267,7 @@ class ProtocolTests(unittest.TestCase):
             assert isinstance(reply, wire.ViewReply)
             base = reply.reading
             cloud_row = wire.CloudRow(wire.Owner(700001, "10"),
-                wire.Identity("cloud-session", "cloud-worker", "merge-gate", "/private", "cloud-unit"),
+                wire.Identity("cloud-session", "cloud-worker", "gate", "/private", "cloud-unit"),
                 wire.CloudPlace("aws"), NOW - 60, NOW - 50,
                 cloud_progress.CloudProgress("running", 32, 1, NOW - 20),
                 progress_profile.ProgressCounter("modules", 7, 12), records.ReadyForAdmission())
@@ -234,7 +277,7 @@ class ProtocolTests(unittest.TestCase):
                 with self.subTest(reply=type(outcome).__name__):
                     self.assertEqual(wire.parse_reply(wire.encode_reply(outcome)), outcome)
 
-    def test_cloud_slot_wait_survives_the_reply_wire(self) -> None:
+    def test_cloud_capacity_wait_survives_the_reply_wire(self) -> None:
         reply = replace(wait_reply(records.NeedsMemory()),
             reason=wire.CloudSlotWait(9, 9), text="waits for a cloud slot: 9 of 9 in use")
         self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
@@ -317,11 +360,19 @@ class ProtocolTests(unittest.TestCase):
             line = json.dumps(encoded) + "\n"
             self.assertEqual(wire.parse_reply(line), reply)
             granted = admitted_reply()
-            transport = ScriptedTransport(fixture.clock, Exchange((line + wire.encode_reply(granted)).encode()))
+            exchange = Exchange(line.encode())
+            transport = ScriptedTransport(fixture.clock, exchange)
             waits: list[wire.Wait] = []
-            with mock.patch.object(client, "CLOCK", fixture.clock), mock.patch.object(
-                    socket, "socket", side_effect=transport.socket), redirect_stderr(io.StringIO()):
-                result = client.admit(request, waits.append, lambda: request)
+
+            def receive_wait(wait: wire.Wait) -> None:
+                waits.append(wait)
+                exchange.events.append(wire.encode_reply(granted).encode())
+
+            with (mock.patch.object(client, "CLOCK", fixture.clock),
+                  mock.patch.object(socket, "socket", side_effect=transport.socket),
+                  mock.patch.object(client, "DefaultSelector", side_effect=transport.selector),
+                  redirect_stderr(io.StringIO())):
+                result = client.admit(request, receive_wait, lambda: request)
             self.assertEqual(waits, [reply])
             self.assertEqual(result, granted)
             self.assertEqual(len(transport.requests), 1)
@@ -390,7 +441,7 @@ class ProtocolTests(unittest.TestCase):
         current["diagnostics"] = [{"kind": "ConfigurationDiagnostic", "diagnostic": "service warning"}]
         parsed = codec.parse_snapshot_value(current, records.QueueRead)
         self.assertEqual(parsed, replace(reading, diagnostics=(records.ConfigurationDiagnostic("service warning"),)))
-        step = records.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, records.MeasuredMemory(0),
+        step = records.RunningStep("owner", "worker", "gate", "/tree", GIB, records.MeasuredMemory(0),
                                 run=LiveBuildRun(123, "456", NOW - 60), started_at=NOW - 30, pid=123)
         self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(step), records.RunningStep), step)
 
@@ -405,6 +456,9 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(wire.parse_record(wire.encode_record(current), type(current)), current)
 
     def test_shell_and_protocol_share_a_version_that_includes_the_version_module(self) -> None:
+        for name, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
+            with self.subTest(name=name):
+                self.assertEqual(f"production/{name}" in admission_code.ADMISSION_CODE_PATHS, expected)
         source = Path(__file__).resolve().parents[1]
         test_modules = {"admission_protocol_v1_fixture.py", "admission_test_support.py"}
         admission_modules = {str(path.relative_to(source))
@@ -419,7 +473,8 @@ class ProtocolTests(unittest.TestCase):
                 _ = target.write_bytes((source / relative).read_bytes())
                 target.chmod((source / relative).stat().st_mode)
             before = wire.admission_code_version(scripts)
-            environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_ADMISSION_CODE_VERSION"}
+            environment = memory_gate_shell_environment()
+            _ = environment.pop("BUILDLOG_ADMISSION_CODE_VERSION", None)
             command = '''BUILDLOG_ADMISSION_CODE_VERSION="$("$4" "$3" code-version)" || exit 2
 export BUILDLOG_ADMISSION_CODE_VERSION
 source "$1"
@@ -473,7 +528,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
         with AdmissionFixture() as fixture:
             request = fixture.request()
             requests: list[wire.Request] = [request, fixture.launch(),
-                replace(request, profile=records.ProgramProfile("merge-gate", "repo", "tree", records.HistoryPeakSizing(3 * GIB, records.FirstProgramPeak(3 * GIB), 0.0))),
+                replace(request, profile=records.ProgramProfile("gate", "repo", "tree", records.HistoryPeakSizing(3 * GIB, records.FirstProgramPeak(3 * GIB), 0.0))),
                 replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",
                     records.HistoryPeakSizing(18 * GIB, records.FirstProgramPeak(18 * GIB), NOW))),
                 replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",
@@ -518,6 +573,46 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                                 _ = decode_legacy(json.dumps(envelope))
                         self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, shaped))
                         self.assertEqual(wire.parse_record(json.dumps(data), wire.AdmitRequest), shaped)
+
+    def test_priority_set_refuses_a_target_field(self) -> None:
+        request = wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor")
+        envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+        self.assertEqual(envelope["type"], "priority_set")
+        data = cast(dict[str, object], envelope["data"])
+        self.assertNotIn("target", data)
+        data["target"] = {"kind": "OneRun", "run": codec.snapshot_value(wire.RunIdentity(41, "900")),
+                          "step": "nextest"}
+        for name in ("priority_set", "priority_run_set"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "^priority applies to a unit$"):
+                envelope["type"] = name
+                _ = wire.parse_request(json.dumps(envelope))
+        del data["target"]
+        with self.assertRaisesRegex(ValueError, "^priority applies to a unit$"):
+            _ = wire.parse_request(json.dumps(envelope))
+
+    def test_verify_metadata_is_optional_and_older_decoders_ignore_it(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            old = fixture.request(step="build")
+            assert isinstance(old.profile, records.StepProfile)
+            old = replace(old, profile=replace(old.profile,
+                peak=records.ExpectedPeak(10 * GIB, "shape", 14, records.ShapeRankedPeak(14, 10))))
+            facts = records.VerifyCall("build", "verify build sample --release", 1, 1)
+            request = replace(old, identity=replace(old.identity, verify=facts))
+            encoded = wire.encode_request(request)
+            self.assertEqual(wire.parse_request(encoded), request)
+            old_message = wire.encode_request(old)
+            self.assertNotIn('"verify":', old_message)
+            self.assertEqual(wire.parse_request(old_message), old)
+            placed = placement_request(fixture)
+            placed = replace(placed, identity=replace(placed.identity, verify=facts))
+            self.assertEqual(wire.parse_request(wire.encode_request(placed)), placed)
+            for version in (1, 2):
+                previous = cast(dict[str, object], json.loads(old_message))
+                current = cast(dict[str, object], json.loads(encoded))
+                previous["v"] = current["v"] = version
+                self.assertEqual(decode_legacy(json.dumps(previous)), decode_legacy(json.dumps(current)))
 
     def test_every_reply_round_trips_and_domain_payloads_use_the_shared_codec(self) -> None:
         with AdmissionFixture() as fixture:

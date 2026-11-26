@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Literal, TypedDict
 
 from scripts.message import send as message_send, send_result, send_budget, session_send
+from scripts.production import staff
 
 class MessageSent(TypedDict):
     kind: Literal["sent"]
@@ -19,6 +20,19 @@ class MessageQueued(TypedDict):
 
 class MessageAcknowledged(TypedDict):
     kind: Literal["acknowledged"]
+    reason: str
+
+
+class MessagePreviouslySent(TypedDict):
+    kind: Literal["previously sent"]
+
+
+class MessageAccepted(TypedDict):
+    kind: Literal["accepted"]
+
+
+class MessageRejected(TypedDict):
+    kind: Literal["rejected"]
     reason: str
 
 
@@ -42,13 +56,17 @@ class MessageUnconfirmed(TypedDict):
     reason: str
 
 MessageDelivery = MessageSent | MessageQueued
-MessageSendOutcome = (MessageDelivery | MessageAcknowledged | MessageWindowSkipped
-                      | MessageKept | MessageReplaced | MessageUnconfirmed)
+MessageSendOutcome = (MessageDelivery | MessageAcknowledged | MessagePreviouslySent | MessageWindowSkipped
+                      | MessageKept | MessageReplaced | MessageUnconfirmed | MessageAccepted | MessageRejected)
 
 
 def message_was_delivered(outcome: Mapping[str, object]) -> bool:
     """Accept only a delivered send or the recipient's acknowledgement."""
-    return outcome["kind"] in {"sent", "acknowledged"}
+    return outcome["kind"] in {"sent", "acknowledged", "previously sent"}
+
+
+def message_was_accepted(outcome: MessageSendOutcome) -> bool:
+    return outcome["kind"] in {"sent", "accepted", "previously sent"}
 
 
 def _send_command() -> list[str]:
@@ -73,14 +91,28 @@ def _deliver_message(
         )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"send to {recipient} timed out after {timeout:g} seconds") from error
+    except OSError as error:
+        if "--once-per-key" in command:
+            return MessageRejected(kind="rejected", reason=str(error))
+        raise
     outcome = send_result.send_outcome(result.returncode, result.stdout)
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         parsed = outcome.header
         detail = parsed.detail
+        if "--once-per-key" in command:
+            if parsed.outcome in ("kept", "queued") and detail.startswith(message_send.DURABLE_ACCEPTANCE):
+                return MessageAccepted(kind="accepted")
+            if parsed.outcome == "skipped" and message_send.is_once_accepted_skip(detail):
+                return MessageAccepted(kind="accepted")
+            if parsed.outcome in ("failed", "refused", "held", "closed", "absent") and detail.startswith(
+                    message_send.BEFORE_ACCEPTANCE):
+                return MessageRejected(kind="rejected", reason=detail.removeprefix(message_send.BEFORE_ACCEPTANCE))
         match parsed.outcome:
             case "sent":
                 return MessageSent(kind="sent")
             case "skipped":
+                if detail == "the earlier copy has confirmed delivery":
+                    return MessagePreviouslySent(kind="previously sent")
                 if message_send.is_acknowledged_skip(detail):
                     return MessageAcknowledged(kind="acknowledged", reason=detail)
                 return MessageWindowSkipped(kind="window skipped", reason=detail)
@@ -92,7 +124,7 @@ def _deliver_message(
                 return MessageQueued(kind="queued", reason=detail)
             case "retry":
                 raise RuntimeError(f"send to {recipient} needs a retry: {detail}")
-            case "failed" | "refused" | "held" | "pending":
+            case "failed" | "refused" | "held" | "pending" | "closed" | "absent":
                 pass
     if isinstance(outcome, send_result.UnconfirmedSendOutcome):
         return MessageUnconfirmed(kind="unconfirmed", reason="send returned no confirmed outcome")
@@ -110,6 +142,8 @@ def send_message(
     machine: str = "",
     key: str = "",
     repeat_minutes: int = 0,
+    recipient_kind: staff.Kind | None = None,
+    once_per_key: bool = False,
 ) -> MessageSendOutcome:
     """Send to a session and return the observed send outcome."""
     if recipient == "user":
@@ -123,10 +157,14 @@ def send_message(
         "--summary",
         summary,
     ]
+    if recipient_kind is not None:
+        command.extend(("--recipient-kind", recipient_kind))
     if key:
         command.extend(("--key", key))
         if repeat_minutes:
             command.extend(("--repeat-minutes", str(repeat_minutes)))
+    if once_per_key:
+        command.append("--once-per-key")
     if machine:
         command.extend(("--machine", machine))
     return _deliver_message(command, recipient, text)

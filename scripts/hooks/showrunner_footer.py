@@ -18,8 +18,9 @@ from scripts.lib.user_zone import user_zone_name  # noqa: E402
 
 from scripts.production.update_registration import ReportItem as ReportItem, reports_path as reports_path
 from scripts.production.update_registration import QuestionStaff
-from scripts.production import showrunners, staff
+from scripts.production import record_store, showrunners, staff
 from scripts.agents.remote import local_machine
+from scripts.review_links import question_path
 
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
 
@@ -67,16 +68,15 @@ def targeted_instances(session_id: str) -> list[Path]:
 def production_doc(instance_dir: Path) -> Path | None:
     """Read the timer owner's document from staff."""
     owner = showrunners.owner_for_timer(instance_dir)
-    return owner.doc.path if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else None
+    return record_store.local_document(owner)
 
 
 def read_production(instance_dir: Path) -> Production | None:
     """Return a running production, or report a failed read with FooterError."""
     try:
         owner = showrunners.owner_for_timer(instance_dir)
-        if not isinstance(owner.doc, staff.LiveDoc):
+        if not isinstance(owner.doc, staff.LiveDoc) or (doc := record_store.local_document(owner)) is None:
             return None
-        doc = owner.doc.path
         lines = doc.read_text().splitlines()
         status = next((match.group(1) for line in lines if (match := STATUS.search(line))), None)
         if status != "running":
@@ -123,7 +123,8 @@ def deferred_until(names: list[str], zone: str, *, identities: QuestionStaff | N
     except (OSError, staff.StaffRefused) as error:
         print(f"questions: unavailable — {error}", file=sys.stderr)
         return None
-    now = datetime.now(ZoneInfo(zone)).replace(tzinfo=None)
+    local_zone = ZoneInfo(zone)
+    now = datetime.now(local_zone)
     afters: list[datetime] = []
     for name in names:
         try:
@@ -131,9 +132,10 @@ def deferred_until(names: list[str], zone: str, *, identities: QuestionStaff | N
         except (InputError, OSError, ValueError, RegistrationFailure, staff.StaffRefused) as error:
             print(f"questions: unavailable — {error}", file=sys.stderr)
             continue
-        afters.extend(item.timing.at for item in items
-                      if isinstance(item.timing, DeferredUntil) and item.timing.at > now)
-    return min(afters).replace(tzinfo=ZoneInfo(zone)) if afters else None
+        deadlines = (question_path.resolve_later_time(item.timing.at, local_zone) for item in items
+                     if isinstance(item.timing, DeferredUntil))
+        afters.extend(at for at in deadlines if question_path.later_active(at, now))
+    return min(afters, key=lambda at: at.timestamp(), default=None)
 
 
 def counts_line(productions: list[Production], questions: int) -> str | None:

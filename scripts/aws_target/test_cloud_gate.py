@@ -3,49 +3,66 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
-from dataclasses import asdict, replace
+from contextlib import ExitStack, closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
+from functools import cached_property, partial
+from hashlib import sha256
 from io import StringIO
 import base64
+import errno
+import faulthandler
 import fcntl
 import gzip
+import inspect
 import json
 import os
 import re
+import selectors
 import signal
 from pathlib import Path
 import subprocess
 import sys
+from tempfile import TemporaryDirectory, TemporaryFile
 import threading
 import time
 from types import SimpleNamespace
-from typing import cast, override
+from typing import BinaryIO, cast, override
+import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger, s3_presign
 from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings
-from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
-from scripts.build_queue.admission_jobs import StepJob
+from scripts.aws_target.ledger_test_support import (
+    CostFixture, account_reply, install_aws_fixture_settings, instant, numeric_settings,
+    override_fixture_settings, text_setting,
+)
+from scripts.build_queue import admission_client, admission_wire, admission_protocol as wire, cloud_progress, execution_identity, placement, progress_profile, queue_place
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_queue.test_placement import PlacementFixture, assignment_for, aws_gate_request, read_aws_gate_evidence
 from scripts.buildlog import index, store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
-from scripts.production import merge_gate as gate
+from scripts.production import change_review, gate
 from scripts.production.gate_modules import GateRefused
+from scripts.production.gate_routes import GatePlacementIncomplete, GateTookNoRun
+from scripts.direct.wait_for_test_state import wait_until
+from scripts.copies import copies
+from scripts.lib import atomic_file, conf
+from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS
+from scripts.lib.git_test_support import commit_repository
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
 from scripts.lib.process_start import Gone, Started, Unreadable, process_start
 from scripts.build_hold.build_hold_test_support import IsolatedBuildHoldTest, invoke_hold, write_holder
-from scripts.build_hold.owning_session import OwningSession, owning_session
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession, owning_session
 from scripts.build_queue import admission_records, queue_evidence
-from scripts.lib.build_steps import read_step_names
+from scripts.mac_test.claim_state import WHOLE_MAC
 from scripts.message.unit_labels import OwnerRole, UnitLabels
 
 
@@ -55,11 +72,150 @@ def service_environment(command: Sequence[str]) -> dict[str, str]:
                 for argument in command if argument.startswith('--setenv='))
 
 
-class CloudWorkerHoldTests(IsolatedBuildHoldTest):
-    def test_forwarded_worker_session_cannot_pass_another_sessions_hold(self) -> None:
-        from scripts.lib import conf
 
-        configuration = conf.read_or_repository('cloud_gate')
+TRIAL_GROUP_LEADER = """import subprocess, sys
+
+with subprocess.Popen(sys.argv[1:], stdout=subprocess.PIPE) as coordinator:
+    while chunk := coordinator.stdout.read1(65536):
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+    status = coordinator.wait()
+sys.exit(status if status >= 0 else 128 - status)
+"""
+WATCHDOG_RESULT_TIMEOUT_SECS = TEST_HANG_GUARD_SECS / 2
+
+
+def stop_trial_group(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        with suppress(ProcessLookupError):
+            send_process_group(process.pid, signal.SIGKILL)
+
+
+@dataclass(frozen=True)
+class TrialDiagnostics:
+    stderr: BinaryIO
+    worker_stacks: tuple[Path, ...]
+
+    def read(self) -> str:
+        output: list[bytes] = []
+        with suppress(OSError, ValueError):
+            output.append(os.pread(self.stderr.fileno(), 64 * 1024, 0))
+        for path in self.worker_stacks:
+            with suppress(OSError), path.open('rb') as worker:
+                output.append(worker.read(64 * 1024))
+        return b''.join(output).decode(errors='replace')
+
+
+class CloudGateFixtureWatchdog:
+    """Report a blocked test and stop the child processes before it exits."""
+
+    def __init__(self, name: str, limit_seconds: float) -> None:
+        self.name: str = name
+        self.limit_seconds: float = limit_seconds
+        self.deadline: float = float('inf')
+        self.trials: dict[subprocess.Popen[bytes], TrialDiagnostics] = {}
+        self.trials_lock: threading.Lock = threading.Lock()
+
+    @contextmanager
+    def watch(self, *, report_fd: int = 2) -> Generator[None]:
+        self.deadline = time.monotonic() + self.limit_seconds
+        watchdog = threading.Timer(self.limit_seconds, self.expire, (report_fd,))
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            yield
+        finally:
+            watchdog.cancel()
+            watchdog.join()
+
+    def expire(self, report_fd: int) -> None:
+        with self.trials_lock:
+            for process in self.trials:
+                stop_trial_group(process)
+            for process in self.trials:
+                with suppress(subprocess.TimeoutExpired):
+                    _ = process.wait(timeout=WATCHDOG_RESULT_TIMEOUT_SECS)
+            reports = [diagnostics.read() for diagnostics in self.trials.values()]
+        _ = os.write(report_fd, f'{self.name}: cloud gate fixture watchdog expired\n'.encode())
+        for report in reports:
+            _ = os.write(report_fd, report.encode())
+        faulthandler.dump_traceback(file=report_fd, all_threads=True)
+        os._exit(1)
+
+    @contextmanager
+    def trial(self, command: Sequence[str], *, reap_timeout: float,
+              worker_stacks: tuple[Path, ...] = ()) -> Generator[tuple[subprocess.Popen[bytes], TrialDiagnostics]]:
+        with TemporaryFile() as errors:
+            with self.trials_lock:
+                process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                           stderr=errors, start_new_session=True)
+                diagnostics = TrialDiagnostics(errors, worker_stacks)
+                self.trials[process] = diagnostics
+            try:
+                yield process, diagnostics
+            finally:
+                assert process.stdout is not None
+                with process.stdout, self.trials_lock:
+                    try:
+                        stop_trial_group(process)
+                        _ = process.wait(timeout=reap_timeout)
+                    finally:
+                        del self.trials[process]
+
+    def run_trial(self, command: Sequence[str], worker_stacks: tuple[Path, ...]) -> subprocess.CompletedProcess[str]:
+        started = time.monotonic()
+        remaining = max(0, self.deadline - started)
+        # Keep the group leader alive until the workers close the coordinator's stdout pipe.
+        command = [sys.executable, '-c', TRIAL_GROUP_LEADER, *command, str(started + remaining / 4)]
+        stop_at = started + remaining / 2
+        output = bytearray()
+        with (self.trial(command, reap_timeout=remaining / 4, worker_stacks=worker_stacks) as (process, diagnostics),
+              selectors.DefaultSelector() as stdout_ready):
+            assert process.stdout is not None
+            _ = stdout_ready.register(process.stdout, selectors.EVENT_READ)
+            try:
+                while True:
+                    seconds = stop_at - time.monotonic()
+                    if seconds <= 0 or not stdout_ready.select(seconds):
+                        raise subprocess.TimeoutExpired(command, remaining / 2)
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                # Serialize reaping with the watchdog's check and group stop.
+                with self.trials_lock:
+                    status = process.wait(timeout=max(0, stop_at - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                with self.trials_lock:
+                    stop_trial_group(process)
+                    with suppress(subprocess.TimeoutExpired):
+                        _ = process.wait(timeout=remaining / 4)
+                raise AssertionError('The cancellation fixture did not exit.\n'
+                                     + output.decode(errors='replace') + diagnostics.read()) from None
+            return subprocess.CompletedProcess(command, status, output.decode(errors='replace'), diagnostics.read())
+
+
+class CloudGateHangGuard(unittest.TestCase):
+    @cached_property
+    def watchdog(self) -> CloudGateFixtureWatchdog:
+        # The 600-second limit gives one test time to finish under load.
+        return CloudGateFixtureWatchdog(self.id(), TEST_HANG_GUARD_SECS)
+
+    @override
+    def run(self, result: unittest.TestResult | None = None) -> unittest.TestResult | None:
+        with self.watchdog.watch():
+            return super().run(result)
+
+
+class CloudWorkerHoldTests(CloudGateHangGuard, IsolatedBuildHoldTest):
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        install_aws_fixture_settings(cls.seed)
+
+    def test_forwarded_worker_session_cannot_pass_another_sessions_hold(self) -> None:
+        configuration = conf.read(self.scratch / 'cloud_gate.conf')
         for paired in (False, True):
             with (self.subTest(paired=paired), mock.patch.dict(os.environ,
                   {'CLAUDE_CODE_SESSION_ID': 'fixture-caller', 'CODEX_THREAD_ID': ''}),
@@ -86,6 +242,7 @@ class FakeGateAws:
         self.refusals: list[str] = []
         self.result: dict[str, object] = {}
         self.has_result: bool = True
+        self.boot_error: str = ''
         self.has_log: bool = True
         self.state: str = 'running'
         self.state_reason: dict[str, str] = {}
@@ -99,15 +256,28 @@ class FakeGateAws:
         self.launch_errors: list[subprocess.SubprocessError] = []
         self.launch_reply: dict[str, object] = {'Instances': [{'InstanceId': 'i-fixture'}]}
         self.describe_errors: list[AwsUnavailable | subprocess.TimeoutExpired] = []
-        self.read_timeouts: int = 0
+        self.read_timeouts: list[str] = []
         self.billing_pages: list[dict[str, object]] = []
         self.spot_history: dict[str, list[dict[str, object]]] = {}
+
+    def artifact_bodies(self) -> dict[str, str]:
+        objects: dict[str, str] = {}
+        if self.has_log:
+            objects['gate.log'] = self.log
+        if self.boot_error:
+            objects['boot-error.json'] = json.dumps({'error': self.boot_error}, sort_keys=True) + '\n'
+        if self.has_result:
+            objects['result.json'] = json.dumps(self.result, sort_keys=True) + '\n'
+        return objects
 
     def __call__(self, arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
         args = list(arguments)
         self.commands.append(args)
         index = args.index('--region') + 2
         service, operation = args[index:index + 2]
+        if self.read_timeouts and operation == self.read_timeouts[0]:
+            _ = self.read_timeouts.pop(0)
+            raise subprocess.TimeoutExpired(f'aws s3api {operation}', 30)
         reply: dict[str, object] = {}
         error = ''
         if operation == 'get-cost-and-usage':
@@ -130,16 +300,19 @@ class FakeGateAws:
                 raise self.launch_errors.pop(0)
             error = self.refusals.pop(0) if self.refusals else ''
             reply = self.launch_reply
+        elif operation == 'list-objects-v2':
+            prefix = args[args.index('--prefix') + 1]
+            contents = [{'Key': prefix + name, 'ETag': '"' + sha256(body.encode()).hexdigest() + '"'}
+                        for name, body in self.artifact_bodies().items()]
+            if contents:
+                reply['Contents'] = contents
         elif operation == 'get-object':
-            if self.read_timeouts:
-                self.read_timeouts -= 1
-                raise subprocess.TimeoutExpired('aws s3api get-object', 30)
             key_at = args.index('--key') + 1
             key, destination = args[key_at], Path(args[key_at + 1])
-            if key.endswith('/gate.log') and self.has_log:
-                _ = destination.write_text(self.log)
-            elif key.endswith('/result.json') and self.has_result:
-                cloud_gate.save(destination, self.result)
+            objects = self.artifact_bodies()
+            name = key.rsplit('/', 1)[-1]
+            if name in objects:
+                _ = destination.write_text(objects[name])
             else:
                 error = 'NoSuchKey'
         elif operation == 'terminate-instances':
@@ -163,7 +336,34 @@ class FakeGateAws:
         return subprocess.CompletedProcess(args, int(bool(error)), json.dumps(reply), error)
 
 
-class CloudGateTests(CostFixture):
+def aws_gate_assignment(attempt: str = 'attempt') -> gate.AwsGateAssignment:
+    return gate.AwsGateAssignment(placement.PlacementAssignment('episode', attempt,
+        placement.PlacementDestination('scaler', 'aws', 'fixture', WHOLE_MAC),
+        execution_identity.SourceKeyKnown('tree'), placement.SubmittingOwner('fixture', 1, '1'),
+        NoOwningSession(), 1.0))
+
+
+def assigned_cloud_fixture(fixture: PlacementFixture, book: ledger.CostLedger,
+                           command: Sequence[str]) -> tuple[placement.PlacementAssignment, ledger.GateDispatchBinding, Path]:
+    """Grant a real queue assignment with private AWS evidence."""
+    start = process_start(os.getpid())
+    assert isinstance(start, Started)
+    owner = fixture.fixture_owner(os.getpid(), start.start)
+    request = aws_gate_request(fixture)
+    request = replace(request, owner=placement.SubmittingOwner(fixture.server.host, owner.pid, owner.start_time),
+        run=wire.RunIdentity(owner.pid, owner.start_time),
+        constraints=replace(request.constraints, command=tuple(command)))
+    book.record_inventory(ledger.ResourceInventory(int(fixture.clock.now()), (), 'fixture', builder_removed=True))
+    _ = read_aws_gate_evidence(fixture, request)
+    assignment = assignment_for(fixture, request)
+    assert isinstance(request.local, wire.LocalAdmissionContext)
+    sidecar = Path(request.local.sidecar)
+    binding = ledger.GateDispatchBinding.read(ledger.gate_dispatch_binding_path(sidecar))
+    assert binding.directory == book.directory
+    return assignment, binding, sidecar
+
+
+class CloudGateTests(CloudGateHangGuard, CostFixture):
     now: float = 0
     book: ledger.CostLedger = ledger.CostLedger(Path())
     fake: FakeGateAws = FakeGateAws()
@@ -171,15 +371,449 @@ class CloudGateTests(CostFixture):
     request: dict[str, object] = {}
     deployment: dict[str, object] = {}
 
+    def write_scaler_binding(self, assignment: placement.PlacementAssignment) -> tuple[ledger.GateDispatchBinding, Path]:
+        claim = placement.assigned_claim_reference(assignment)
+        sidecar = self.root / 'gate-progress'
+        binding = ledger.GateDispatchBinding(claim, self.root / 'queue' / f'{claim.claim_id}.json',
+            self.state, conf.path('build_targets'), self.settings)
+        binding.publish(ledger.gate_dispatch_binding_path(sidecar))
+        return binding, sidecar
+
+    def test_scaler_assignment_consumes_once_and_retains_pending_launch(self) -> None:
+        with (PlacementFixture() as fixture,
+              mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(self.settings)}),
+              mock.patch.object(store, 'host_name', return_value=fixture.server.host)):
+            fixture.clock.epoch = self.now
+            fixture.configure(cloud_gate_slots=1)
+            assignment, binding, sidecar = assigned_cloud_fixture(fixture, self.book, ('gate.py', '--tests-only'))
+            claim = binding.claim
+            self.assertEqual(binding.account_settings, self.settings)
+
+            def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
+                self.assertEqual(message.claim, claim)
+                saved = ledger.GateDispatchJournal(binding.journal).read()
+                self.assertEqual((saved.binding, saved.holder), (binding, message.holder))
+                reply, = fixture.server.handle_request(message)
+                assert isinstance(reply, (wire.FirstAuthorization, wire.DispatchStatus)), reply
+                return reply
+
+            def launch(_repo: Path, *, attempt: cloud_gate.CloudAttempt, **_options: object) -> cloud_gate.CloudDeclined:
+                assert isinstance(attempt.dispatch, cloud_gate.AssignedCloudGate)
+                self.assertEqual(attempt.dispatch.binding, binding)
+                attempt.dispatch.journal.register(claim, attempt.dispatch.holder, self.folder)
+                booking = replace(ledger.gate_booking(cloud_gate.settings(), self.folder.name, int(self.now),
+                    ledger.instant(self.request, 'expires')), placement_claim=claim.claim_id)
+                self.assertIsInstance(self.book.reserve_gate(self.settings, booking), ledger.GateReserved)
+                cloud_gate.save(self.folder / 'launch.json', {'arguments': {'ClientToken': 'fixture'}})
+                return cloud_gate.CloudDeclined('The launch reply is unavailable')
+
+            with (mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar)}),
+                  mock.patch.object(admission_client, 'consume_permission', side_effect=consume) as authorize,
+                  mock.patch.object(admission_client, 'report_execution') as report,
+                  mock.patch.object(cloud_gate, 'run_cloud', side_effect=launch) as start_launch,
+                  mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Use the fake AWS transport'))):
+                route = partial(cloud_gate.route, self.root, mode=gate.SuiteMode.GATE, full=False,
+                                module_time_limit_s=30, assignment=assignment)
+                with self.assertRaisesRegex(gate.AwsGateLaunchPending, 'remains open'):
+                    _ = route()
+                consume_request = cast(wire.ConsumePermission, authorize.call_args.args[0])
+                replay, = fixture.server.handle_request(replace(consume_request, request_id='replay'))
+                assert isinstance(replay, wire.DispatchStatus), replay
+                self.assertIsInstance(replay.permission, placement.PermissionConsumed)
+                with self.assertRaisesRegex(gate.AwsGateLaunchPending, 'permission was consumed'):
+                    _ = route()
+                self.assertEqual(authorize.call_count, 2)
+
+            start_launch.assert_called_once()
+            report.assert_called_once()
+            sent = cast(wire.ExecutionReport, report.call_args.args[0])
+            self.assertEqual((sent.assignment, sent.claim), (assignment, claim))
+            self.assertIsInstance(sent.path, placement.DispatchPathPending)
+            self.assertEqual(sent.outcome, placement.AttemptDeclined('The launch reply is unavailable'))
+            journal = ledger.GateDispatchJournal(binding.journal)
+            holder = consume_request.holder
+            assert isinstance(holder, placement.ClaimHolderIdentity)
+            self.assertIsInstance(journal.settle(claim, holder), placement.DispatchPathPending)
+            booked, = self.book.gate_claim_reservations(claim.claim_id)
+            self.assertEqual(booked.attempt, self.folder.name)
+            self.assertEqual(booked.placement_claim, claim.claim_id)
+            self.assertIsInstance(booked.state, ledger.GateLaunchPending)
+
+    def test_assigned_worker_refuses_after_the_bill_refresh_crosses_the_cap(self) -> None:
+        attempt = ledger.text(self.request, 'attempt')
+        self.request['placement_claim'] = attempt
+        cloud_gate.save(self.folder / 'request.json', self.request)
+        booking = replace(ledger.gate_booking(cloud_gate.settings(), attempt, int(self.now),
+            ledger.instant(self.request, 'expires')), placement_claim=attempt)
+        self.assertIsInstance(self.book.reserve_gate(self.settings, booking), ledger.GateReserved)
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            reply = self.fake(arguments, **options)
+            if 'get-cost-and-usage' in arguments:
+                return subprocess.CompletedProcess(list(arguments), 0, json.dumps(account_reply(arguments, '5000')), '')
+            return reply
+
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=transport),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
+        outcome = worker.execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'fallback')
+        self.assertIn(outcome['reason'], ('daily_limit', 'monthly_limit'))
+        self.assertEqual(self.fake.launches, [])
+        self.assertTrue(any('get-cost-and-usage' in command for command in self.fake.commands))
+        self.assertFalse(any('put-object' in command for command in self.fake.commands))
+        booking, = self.book.gate_claim_reservations(attempt)
+        self.assertIsInstance(booking.state, ledger.GateAbsent)
+
+    def test_assigned_worker_rechecks_a_lower_cap_after_upload(self) -> None:
+        attempt = ledger.text(self.request, 'attempt')
+        self.request['placement_claim'] = attempt
+        cloud_gate.save(self.folder / 'request.json', self.request)
+        booking = replace(ledger.gate_booking(cloud_gate.settings(), attempt, int(self.now),
+            ledger.instant(self.request, 'expires')), placement_claim=attempt)
+        self.assertIsInstance(self.book.reserve_gate(self.settings, booking), ledger.GateReserved)
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            reply = self.fake(arguments, **options)
+            if 'put-object' in arguments:
+                numeric_settings(self.settings, {'daily_limit_usd': '0.01'})
+            return reply
+
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=transport),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
+        self.assertEqual(worker.execute(self.folder, self.request, self.deployment),
+                         {'status': 'fallback', 'reason': 'daily_limit'})
+        self.assertTrue(any('put-object' in command for command in self.fake.commands))
+        self.assertEqual(self.fake.launches, [])
+        self.assertNotIn('arguments', cloud_gate.read(self.folder / 'launch.json'))
+        booking, = self.book.gate_claim_reservations(attempt)
+        self.assertIsInstance(booking.state, ledger.GateAbsent)
+
+    def test_confirmed_scaler_decline_closes_the_booking_without_a_terminal_report(self) -> None:
+        assignment = aws_gate_assignment().assignment
+        binding, sidecar = self.write_scaler_binding(assignment)
+        first = wire.FirstAuthorization(assignment, binding.claim)
+
+        def decline(_repo: Path, *, attempt: cloud_gate.CloudAttempt, **_options: object) -> cloud_gate.CloudDeclined:
+            assert isinstance(attempt.dispatch, cloud_gate.AssignedCloudGate)
+            attempt.dispatch.journal.register(binding.claim, attempt.dispatch.holder, self.folder)
+            booking = replace(ledger.gate_booking(cloud_gate.settings(), self.folder.name, int(self.now),
+                ledger.instant(self.request, 'expires')), placement_claim=binding.claim.claim_id)
+            self.assertIsInstance(self.book.reserve_gate(self.settings, booking), ledger.GateReserved)
+            return cloud_gate.CloudDeclined('capacity')
+
+        with (mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar)}),
+              mock.patch.object(admission_client, 'consume_permission', return_value=first),
+              mock.patch.object(admission_client, 'report_execution', side_effect=wire.AdmissionUnavailable('fixture')),
+              mock.patch.object(cloud_gate, 'run_cloud', side_effect=decline),
+              self.assertRaisesRegex(gate.AwsGateTookNoRun, 'capacity')):
+            _ = cloud_gate.route(self.root, mode=gate.SuiteMode.GATE, full=False, module_time_limit_s=30,
+                                 assignment=assignment)
+        booked, = self.book.gate_claim_reservations(binding.claim.claim_id)
+        self.assertIsInstance(booked.state, ledger.GateAbsent)
+        self.assertEqual(ledger.GateDispatchJournal(binding.journal).read().state, 'no launch')
+
+    def test_scaler_permission_refusal_does_not_launch_and_closes_the_booking(self) -> None:
+        assignment = aws_gate_assignment().assignment
+        binding, sidecar = self.write_scaler_binding(assignment)
+        refusal = wire.DispatchStatus(assignment, placement.CurrentAssignment(), placement.PermissionAvailable(), 'refused')
+        with (mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar)}),
+              mock.patch.object(admission_client, 'consume_permission', return_value=refusal),
+              mock.patch.object(cloud_gate, 'run_cloud') as start_launch,
+              self.assertRaisesRegex(gate.AwsGateTookNoRun, 'permission. refused')):
+            _ = cloud_gate.route(self.root, mode=gate.SuiteMode.GATE, full=False, module_time_limit_s=30,
+                                 assignment=assignment)
+        start_launch.assert_not_called()
+        self.assertEqual(ledger.GateDispatchJournal(binding.journal).read().state, 'no launch')
+        self.assertEqual(self.book.gate_claim_reservations(binding.claim.claim_id), ())
+
+    def test_stop_cleanup_terminates_an_instance_found_by_client_token(self) -> None:
+        attempt = ledger.text(self.request, 'attempt')
+        self.request['placement_claim'] = attempt
+        cloud_gate.save(self.folder / 'request.json', self.request)
+        booking = replace(ledger.gate_booking(cloud_gate.settings(), attempt, int(self.now),
+            ledger.instant(self.request, 'expires')), placement_claim=attempt)
+        self.assertIsInstance(self.book.reserve_gate(self.settings, booking), ledger.GateReserved)
+        self.fake.launch_timeouts = 1
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.fake.commands.clear()
+        api = AwsCli('fixture', 'fixture-region', 1, execute=self.fake)
+        cleanup = ['--cleanup', str(self.folder), '--directory', str(self.state),
+                   '--sidecar', str(self.folder / 'reservation.cgroup'), '--settings', str(self.settings)]
+        with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
+              mock.patch.object(cloud_gate, 'GateWorker', wraps=partial(cloud_gate.GateWorker, clock=lambda: self.now)),
+              mock.patch.object(sys, 'argv', ['cloud_gate', *cleanup]),
+              mock.patch.object(subprocess, 'run') as schedule):
+            self.assertEqual(cloud_gate.main(), 0)
+        schedule.assert_not_called()
+        first, *_ = self.fake.commands
+        self.assertIn('describe-instances', first)
+        self.assertIn(f'Name=client-token,Values={attempt}-0', first)
+        booking, = self.book.gate_claim_reservations(attempt)
+        self.assertIsInstance(booking.state, ledger.GateTerminated)
+
+    def test_queue_reconciles_only_a_due_expired_booking(self) -> None:
+        episode = 'episode'
+        claim = execution_identity.assigned_claim_id(episode, f'{10:032x}')
+        expires = int(self.now) + 1200
+        self.request.update(attempt=claim, placement_claim=claim, expires=expires)
+        cloud_gate.save(self.folder / 'request.json', self.request)
+        booking = replace(ledger.gate_booking(cloud_gate.settings(), claim, int(self.now), expires),
+                          placement_claim=claim)
+        self.assertIsInstance(self.book.reserve_gate(self.settings, booking), ledger.GateReserved)
+        self.fake.launch_timeouts = 1
+        self.fake.has_instance = False
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.fake.commands.clear()
+        api = AwsCli('fixture', 'fixture-region', 1, execute=self.fake)
+        cleanup = ['--cleanup', str(self.folder), '--directory', str(self.state),
+                   '--sidecar', str(self.folder / 'reservation.cgroup'), '--settings', str(self.settings)]
+
+        def start_reconcile(command: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertIn('--no-block', command)
+            self.assertNotIn('--wait', command)
+            self.assertIn('--unit=cloud-gate-reconcile', command)
+            environment = cast(dict[str, str], _options['env'])
+            self.assertEqual(environment['XDG_RUNTIME_DIR'], f'/run/user/{os.getuid()}')
+            with mock.patch.object(sys, 'argv', ['cloud_gate', *command[command.index('--reconcile'):]]):
+                status = cloud_gate.main()
+            return subprocess.CompletedProcess(list(command), status, '', '')
+
+        with (mock.patch.dict(os.environ),
+              mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
+              mock.patch.object(cloud_gate, 'GateWorker', wraps=partial(cloud_gate.GateWorker, clock=lambda: self.now)),
+              mock.patch.object(time, 'time', side_effect=lambda: self.now),
+              mock.patch.object(sys, 'argv', ['cloud_gate', *cleanup]),
+              mock.patch.object(subprocess, 'run', side_effect=start_reconcile) as start):
+            _ = os.environ.pop('XDG_RUNTIME_DIR', None)
+            self.assertEqual(cloud_gate.main(), 1)
+            saved, = self.book.gate_claim_reservations(claim)
+            assert isinstance(saved.owner, ledger.GateWorkerOwner)
+            with mock.patch.object(cloud_gate, 'process_start', return_value=Gone()):
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+            start.assert_not_called()
+            self.advance(1201)
+            self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+            self.assertIsNone(cloud_gate.reconcile_expired(episode, 11))
+            with mock.patch.object(cloud_gate, 'process_start', return_value=Started(saved.owner.start)):
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+            start.assert_not_called()
+            self.fake.describe_errors = [subprocess.TimeoutExpired('describe-instances', 1)]
+            with mock.patch.object(cloud_gate, 'process_start', return_value=Gone()):
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+                start.assert_called_once()
+                self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+                start.assert_called_once()
+                self.assertIsInstance(self.book.gate_claim_reservations(claim)[0].state, ledger.GateLaunchPending)
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+                self.assertEqual(cloud_gate.settlement(episode, 10), placement.Settled())
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+                self.assertEqual(start.call_count, 2)
+        self.assertEqual(len(self.fake.commands), 3)
+        self.assertTrue(all('describe-instances' in row for row in self.fake.commands))
+
+    def test_reconcile_expired_warns_once_per_attempt_and_retries_the_start(self) -> None:
+        episode = 'reconcile-failure'
+        now = int(self.now)
+        claims = [execution_identity.assigned_claim_id(episode, f'{attempt:032x}') for attempt in (10, 11)]
+        with self.book.transaction() as state:
+            for claim in claims:
+                state.gate_reservations.append(ledger.GateReservation(
+                    claim, now - 120, now - 1, Decimal('.8'), Decimal(0), placement_claim=claim))
+        failed = subprocess.CompletedProcess(['systemd-run'], 1, '', 'Failed to connect to bus\nNo user session')
+        warnings: set[tuple[str, int]] = set()
+        with (mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': '/fixture/user'}),
+              mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(cloud_gate, '_reconcile_start_warnings', warnings),
+              mock.patch.object(time, 'time', return_value=self.now),
+              mock.patch.object(subprocess, 'run', side_effect=[failed, OSError('start refused'), failed]) as start):
+            with redirect_stderr(StringIO()) as first:
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+            self.assertEqual(first.getvalue(),
+                             'The cloud gate reconcile did not start: Failed to connect to bus No user session\n')
+            with redirect_stderr(StringIO()) as repeat:
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+            self.assertEqual(repeat.getvalue(), '')
+            with redirect_stderr(StringIO()) as next_attempt:
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 11))
+            self.assertEqual(next_attempt.getvalue(), first.getvalue())
+        self.assertEqual(start.call_count, 3)
+        self.assertEqual(start.call_args.kwargs['env']['XDG_RUNTIME_DIR'], '/fixture/user')
+        self.assertTrue(all(ledger.gate_is_open(row) for row in self.book.read_snapshot().gate_reservations))
+
+    def test_reconcile_expired_rechecks_a_booking_that_settles_before_service_start(self) -> None:
+        episode, attempt = 'settling', 12
+        claim = execution_identity.assigned_claim_id(episode, f'{attempt:032x}')
+        now = int(self.now)
+        with self.book.transaction() as state:
+            state.gate_reservations.append(ledger.GateReservation(
+                claim, now - 120, now - 1, Decimal('.8'), Decimal(0), placement_claim=claim))
+        reconcile_command = cloud_gate.reconcile_command
+
+        def after_settlement(directory: Path, *, start_only: bool = False) -> list[str]:
+            self.book.resolve_gate(claim, ledger.GateAbsent(now))
+            return reconcile_command(directory, start_only=start_only)
+
+        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(cloud_gate, 'reconcile_command', side_effect=after_settlement) as command,
+              mock.patch.object(time, 'time', return_value=self.now),
+              mock.patch.object(subprocess, 'run',
+                                side_effect=AssertionError('A settled booking must not start a service')) as start):
+            cloud_gate.reconcile_expired(episode, attempt)
+        command.assert_called_once_with(self.state, start_only=True)
+        start.assert_not_called()
+
+    def test_settlement_uses_only_the_exact_claim_and_its_retries(self) -> None:
+        episode = 'episode'
+        attempt = '0000000000000000000000000000000a'
+        claim = execution_identity.assigned_claim_id(episode, attempt)
+        now = int(self.now)
+        booking = ledger.GateReservation(claim, now, now + 60, Decimal('.8'), Decimal(0), placement_claim=claim)
+        retry = replace(booking, attempt='retry', state=ledger.GateRunning('fixture-instance'))
+        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.object(time, 'time', return_value=self.now),
+              mock.patch.object(subprocess, 'run') as start,
+              mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Settlement uses local files'))):
+            self.assertEqual(cloud_gate.settlement(episode, 10), placement.Settled())
+            with self.book.transaction() as state:
+                unrelated = replace(booking, attempt='unrelated', placement_claim='', at=now - 120, expires=now - 1)
+                state.gate_reservations.extend((booking, retry, unrelated))
+            before = self.book.path.read_bytes()
+            with mock.patch.object(ledger.CostLedger, 'locked_snapshot') as lock:
+                self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+            lock.assert_not_called()
+            self.assertEqual(self.book.path.read_bytes(), before)
+            self.book.resolve_gate(claim, ledger.GateAbsent(now))
+            self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+            self.book.resolve_gate(retry.attempt, ledger.GateTerminated(now, 'fixture-instance'))
+            self.assertEqual(cloud_gate.settlement(episode, 10), placement.Settled())
+            _ = self.book.path.write_text('unreadable')
+            self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+            self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+
+        start.assert_not_called()
+
+    def test_availability_uses_only_local_evidence(self) -> None:
+        directory = self.state
+        deployment = directory / 'gate-deployment.json'
+        quotas = directory / 'spot-prices.json'
+        region = 'us-east-2'
+        row = {'region': region, 'read_at': int(self.now), 'standard_vcpus': '16', 'gpu_vcpus': '0'}
+        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=directory),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(time, 'time', return_value=self.now),
+              mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Availability uses local files'))):
+            path = self.root / 'cloud_gate.conf'
+            override_fixture_settings(path, 'enabled=off')
+            self.assertIn('off', self.unavailable_reason())
+            override_fixture_settings(path, 'enabled=on')
+            self.assertIn('image or stack is absent', self.unavailable_reason())
+            regional = {**ledger.rows(self.deployment, 'regions')[0], 'region': region, 'image': 'fixture-image'}
+            cloud_gate.save(deployment, {**self.deployment, 'regions': [regional]})
+            self.assertIn('quota', self.unavailable_reason())
+            cloud_gate.save(quotas, {'regions': [{**row, 'read_at': 0}]})
+            self.assertIn('quota', self.unavailable_reason())
+            cloud_gate.save(quotas, {'regions': [{**row, 'standard_vcpus': '15'}]})
+            self.assertIn('quota', self.unavailable_reason())
+            cloud_gate.save(quotas, {'regions': [row]})
+            numeric_settings(self.settings, {'daily_limit_usd': '0.01'})
+            self.assertIn('daily_limit', self.unavailable_reason())
+            numeric_settings(self.settings, {'daily_limit_usd': '100', 'monthly_limit_usd': '0.01'})
+            self.assertIn('monthly_limit', self.unavailable_reason())
+            numeric_settings(self.settings, {'monthly_limit_usd': '500'})
+            with self.book.transaction() as state:
+                state.observations.clear()
+            before = self.book.path.read_bytes()
+            self.assertIsInstance(cloud_gate.availability(), cloud_gate.Available)
+            self.assertEqual(self.book.path.read_bytes(), before)
+            now = int(self.now)
+            booking = ledger.gate_booking(cloud_gate.settings(), 'fixture-booking', now,
+                                              now + cloud_gate.settings().whole('lifetime_minutes') * 60)
+            self.assertIsInstance(self.book.reserve_gate(self.settings, booking), ledger.GateReserved)
+            self.book.resolve_gate(booking.attempt, ledger.GateAbsent(now))
+            with self.book.transaction() as state:
+                state.gate_reservations.append(ledger.GateReservation('fixture', int(self.now), int(self.now) + 1200,
+                    Decimal('.8'), Decimal(0), state=ledger.GateRunning('i-fixture'),
+                    region=region, instance_type='m7a.4xlarge'))
+            self.assertIn('quota', self.unavailable_reason())
+            self.book.resolve_gate('fixture', ledger.GateAbsent(int(self.now)))
+            self.book.record_gate_quota_refusal(ledger.SpotQuotaPool(region, ledger.SpotQuotaClass.STANDARD), self.now)
+            self.assertIn('quota', self.unavailable_reason())
+
+    def unavailable_reason(self) -> str:
+        result = cloud_gate.availability()
+        assert isinstance(result, cloud_gate.Unavailable)
+        return result.reason
+
+    def test_availability_waits_for_zone_refusal_cooldowns(self) -> None:
+        directory = self.state
+        region = 'us-east-2'
+        self.advance(0.25)
+        config = self.root / 'cloud_gate.conf'
+        override_fixture_settings(config, 'instance_types=m7a.4xlarge')
+        numeric_settings(config, {'capacity_cooldown_seconds': '30'})
+        regional = {**ledger.rows(self.deployment, 'regions')[0], 'region': region, 'image': 'fixture-image'}
+        cloud_gate.save(directory / 'gate-deployment.json', {**self.deployment, 'regions': [regional]})
+        cloud_gate.save(directory / 'spot-prices.json', {'regions': [
+            {'region': region, 'read_at': int(self.now), 'standard_vcpus': '16', 'gpu_vcpus': '0'}]})
+        with self.book.transaction() as state:
+            state.observations.clear()
+        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=directory),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(time, 'time', side_effect=lambda: self.now),
+              mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Availability uses local files'))):
+            for zone in ('a', 'b'):
+                self.assertIsInstance(cloud_gate.availability(), cloud_gate.Available)
+                cloud_gate.append_launch(directory, {'time': self.now, 'result': 'refused', 'region': region,
+                    'instance_type': 'm7a.4xlarge', 'availability_zone': zone, 'error_code': 'InsufficientInstanceCapacity'},
+                    gate_job=GATE_JOB_NOT_RECORDED)
+            self.assertIn('zone refusal cooldown', self.unavailable_reason())
+            self.advance(30)
+            self.assertIn('zone refusal cooldown', self.unavailable_reason())
+            self.advance(1)
+            self.assertIsInstance(cloud_gate.availability(), cloud_gate.Available)
+
+    def test_availability_applies_the_mode_time_limit_before_zone_cooldowns(self) -> None:
+        directory = self.state
+        region = 'us-east-2'
+        fast, slow = 'm7a.4xlarge', 'm7a.8xlarge'
+        config = self.root / 'cloud_gate.conf'
+        numeric_settings(config, {'capacity_cooldown_seconds': '30'})
+        cap = conf.read(config).whole('max_gate_minutes') * 60
+        regional = {**ledger.rows(self.deployment, 'regions')[0], 'region': region, 'image': 'fixture-image'}
+        cloud_gate.save(directory / 'gate-deployment.json', {**self.deployment, 'regions': [regional]})
+        cloud_gate.save(directory / 'spot-prices.json', {'regions': [
+            {'region': region, 'read_at': int(self.now), 'standard_vcpus': '32', 'gpu_vcpus': '0'}]})
+        with self.book.transaction() as state:
+            state.observations.clear()
+        self.gate_history([(fast, region, cap), (slow, region, cap + 60)])
+        for zone in ('a', 'b'):
+            cloud_gate.append_launch(directory, {'time': self.now, 'result': 'refused', 'region': region,
+                'instance_type': fast, 'availability_zone': zone, 'error_code': 'InsufficientInstanceCapacity'},
+                gate_job=GATE_JOB_NOT_RECORDED)
+        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=directory),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(time, 'time', side_effect=lambda: self.now),
+              mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Availability uses local files'))):
+            self.assertIn('zone refusal cooldown', self.unavailable_reason())
+            self.assertIsInstance(cloud_gate.availability(gate.SuiteMode.TARGETED), cloud_gate.Available)
+            self.advance(31)
+            self.assertIsInstance(cloud_gate.availability(), cloud_gate.Available)
+
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "buildlog")})))
-        _ = write_config_fixture(self.root / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
-        _ = write_config_fixture(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
+        override_fixture_settings(self.root / "gate.conf", "gate_time_limit_factor=2")
+        override_fixture_settings(self.root / "test_times.conf", "top_runs=3\ngate_failure_log_kib=4")
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
-            'instance_types=m7a.8xlarge m7a.4xlarge\nspot_max_usd_per_hour=0.8\n'
+        override_fixture_settings(self.root / 'cloud_gate.conf',
+            '# one of: on, off\nenabled=on\n'
+            + 'instance_types=m7a.8xlarge m7a.4xlarge\nspot_max_usd_per_hour=0.8\n'
             + 'attempt_allowance_usd=0.02\nlaunch_reply_tries=2\n')
         self.now = float(instant('2026-01-15T01:00:00+00:00'))
         self.book = ledger.CostLedger(self.state)
@@ -190,7 +824,7 @@ class CloudGateTests(CostFixture):
         self.folder = self.root / 'attempt'
         self.folder.mkdir()
         _ = (self.folder / 'source.bundle').write_bytes(b'private bundle')
-        self.request = {'attempt': 'attempt', 'commit': 'commit', 'tree': 'tree', 'mode': 'merge-gate',
+        self.request = {'attempt': 'attempt', 'commit': 'commit', 'tree': 'tree', 'mode': 'gate',
             'origin': '/private/origin', 'modules': ['scripts/fixture/test_ok.py'],
             'expires': int(self.now) + 1200, 'module_time_limit_s': 1800, 'source_key': 'source/private.bundle'}
         cloud_gate.save(self.folder / 'request.json', self.request)
@@ -206,31 +840,98 @@ class CloudGateTests(CostFixture):
         with closing(sqlite3.connect(index.index_path())) as connection, connection:
             connection.execute("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s, modules_run)
-                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 32, 0, 0, 'full', 1, 1)""").close()
-        self.request['modules'] = ['scripts/fixture/test_ok.py', 'scripts/fixture/nested/test_busy.py']
-        self.fake.has_result = False
-        self.fake.log = ("Runner: 2 modules, whole machine, 32 CPUs\n"
-                         "Starting module: fixture/test_ok.py\n"
-                         "--- fixture/test_ok.py exit=1 ---\n"
-                         "Traceback (most recent call last):\nAssertionError: fixture red\n"
-                         "--- end module failure ---\n"
-                         "fixture/test_ok.py exit=1 seconds=0.50\n"
-                         "Starting module: fixture/nested/test_busy.py\n")
-        numeric_settings(self.root / "cloud_gate.conf", {"result_poll_s": "3"})
-        with mock.patch.object(time, "monotonic", side_effect=lambda: self.now):
-            outcome = self.execute()
-        self.assertEqual(outcome['status'], 'complete')
-        row = cloud_gate.outcome_result(self.folder, outcome)
-        cloud_gate.validate_result(row, self.request)
-        run = gate_box.decode_run(row['gate'])
-        self.assertFalse(run.passed)
-        self.assertIn('limit 2 s; elapsed 3.000 s; running modules: fixture/nested/test_busy.py', run.time_limit_report)
-        self.assertIn('Traceback (most recent call last):\nAssertionError: fixture red', run.time_limit_report)
-        self.assertIn('fixture/test_ok.py', run.time_limit_report)
-        self.assertEqual(run.jobs[0].returncode, 1)
-        self.assertEqual(run.jobs[1].returncode, 124)
-        self.assertTrue(self.fake.terminated)
-        self.assertEqual(ledger.mapping(row['record'])['vcpus'], 32)
+                VALUES ('normal', '2026-01-01', 'gate', 32, 32, 0, 0, 'full', 7, 1)""").close()
+        modules = ['scripts/fixture/test_ok.py', 'scripts/fixture/nested/test_busy.py']
+        log = ('Runner: 2 modules, whole machine, 32 CPUs\n'
+               'Starting module: fixture/test_ok.py\n'
+               '--- fixture/test_ok.py exit=1 ---\n'
+               'Traceback (most recent call last):\nAssertionError: fixture red\n'
+               '--- end module failure ---\n'
+               'fixture/test_ok.py exit=1 seconds=0.50\n'
+               'Starting module: fixture/nested/test_busy.py\n')
+        config = self.root / 'cloud_gate.conf'
+        for attempt in ('time-limit', 'spot-deadline', 'list-timeout', 'spot-list-timeout',
+                        'spot-during-list', 'spot-boot-log-timeout', 'ec2-recovered'):
+            with self.subTest(attempt=attempt):
+                folder = self.root / attempt
+                folder.mkdir()
+                request = {**self.request, 'attempt': attempt, 'modules': modules, 'source_key': ''}
+                cloud_gate.save(folder / 'request.json', request)
+                fake = FakeGateAws()
+                fake.has_result = False
+                fake.log = log
+                stopped = attempt in ('spot-deadline', 'spot-list-timeout', 'spot-boot-log-timeout')
+                started = self.now
+                poll_s = {'spot-during-list': '13', 'ec2-recovered': '3'}.get(attempt, '15')
+                numeric_settings(config, {'result_poll_s': poll_s, 'observe_outage_s': '10'})
+                if attempt == 'ec2-recovered':
+                    _ = config.write_text(re.sub(r'(?m)^instance_check_s=.*$', 'instance_check_s=3', config.read_text()))
+
+                def advance_to_deadline(seconds: float) -> None:
+                    if stopped:
+                        self.advance(1)
+                        fake.state = 'shutting-down'
+                        fake.state_reason = {'Code': 'Server.SpotInstanceTermination'}
+                        seconds -= 1
+                    self.advance(seconds)
+                    if attempt in ('list-timeout', 'spot-list-timeout'):
+                        fake.read_timeouts = ['list-objects-v2']
+                    if attempt == 'spot-boot-log-timeout':
+                        fake.log += 'fixture boot failed\n'
+                        fake.boot_error = 'fixture boot failed'
+                    if attempt == 'ec2-recovered' and self.now - started < 15:
+                        fake.describe_errors = [AwsUnavailable('Could not connect to the endpoint')]
+
+                def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    if (attempt == 'spot-boot-log-timeout' and self.now > started and 'get-object' in arguments
+                            and arguments[arguments.index('--key') + 1].endswith('/gate.log')):
+                        fake.read_timeouts = ['get-object']
+                    reply = fake(arguments, **options)
+                    if 'list-objects-v2' in arguments:
+                        elapsed = self.now - started
+                        if attempt == 'spot-during-list' and elapsed == 13:
+                            self.advance(2)
+                            fake.state = 'shutting-down'
+                            fake.state_reason = {'Code': 'Server.SpotInstanceTermination'}
+                        if attempt == 'ec2-recovered' and elapsed == 15:
+                            self.assertIn('describe-instances', fake.commands[-2])
+                            return subprocess.CompletedProcess(list(arguments), 255, '', 'Could not connect to the endpoint')
+                    return reply
+
+                worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=transport),
+                    self.book, self.settings, folder / 'reservation.cgroup', clock=lambda: self.now, pause=advance_to_deadline)
+                with (mock.patch.object(time, 'monotonic', side_effect=lambda: self.now),
+                      redirect_stdout(StringIO()) as output):
+                    outcome = worker.execute(folder, request, self.deployment)
+                self.assertTrue(fake.terminated)
+                self.assertFalse(fake.read_timeouts)
+                self.assertEqual(sum('list-objects-v2' in command for command in fake.commands),
+                                 {'spot-during-list': 3, 'ec2-recovered': 6}.get(attempt, 2))
+                if attempt == 'spot-boot-log-timeout':
+                    self.assertEqual(outcome, {'status': 'box-failed', 'reason': 'fixture boot failed'})
+                    downloads = [command[command.index('--key') + 1].rsplit('/', 1)[-1]
+                                 for command in fake.commands if 'get-object' in command]
+                    self.assertEqual(downloads, ['gate.log', 'boot-error.json', 'gate.log'])
+                    continue
+                if stopped or attempt == 'spot-during-list':
+                    self.assertEqual(outcome, {
+                        'status': 'interrupted', 'interruption_code': 'Server.SpotInstanceTermination',
+                        'reason': 'The instance stopped without a final result (Server.SpotInstanceTermination)'})
+                    self.assertFalse((folder / cloud_gate.RESULT_FILE).exists())
+                    continue
+                if attempt == 'ec2-recovered':
+                    self.assertEqual(output.getvalue().count('Cloud gate poll skipped:'), 5)
+                self.assertEqual(outcome['status'], 'complete')
+                row = cloud_gate.outcome_result(folder, outcome)
+                cloud_gate.validate_result(row, request)
+                run = gate_box.decode_run(row['gate'])
+                self.assertFalse(run.passed)
+                self.assertIn('limit 14 s; elapsed 15.000 s; running modules: fixture/nested/test_busy.py', run.time_limit_report)
+                self.assertIn('Traceback (most recent call last):\nAssertionError: fixture red', run.time_limit_report)
+                self.assertIn('fixture/test_ok.py', run.time_limit_report)
+                self.assertEqual(run.jobs[0].returncode, 1)
+                self.assertEqual(run.jobs[1].returncode, 124)
+                self.assertEqual(ledger.mapping(row['record'])['vcpus'], 32)
 
     def test_finished_result_wins_when_polling_crosses_the_time_limit(self) -> None:
         import sqlite3
@@ -238,27 +939,77 @@ class CloudGateTests(CostFixture):
         with closing(sqlite3.connect(index.index_path())) as connection, connection:
             connection.execute("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s, modules_run)
-                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 32, 0, 0, 'full', 1, 1)""").close()
-        self.fake.has_result = False
-        self.fake.log = "Runner: 1 modules, whole machine, 32 CPUs\nStarting module: fixture/test_ok.py\n"
-        numeric_settings(self.root / "cloud_gate.conf", {"result_poll_s": "3"})
+                VALUES ('normal', '2026-01-01', 'gate', 32, 32, 0, 0, 'full', 1, 1)""").close()
+        for arrival in ('before-poll', 'at-stop', 'at-stop-log-timeout', 'ec2-timeout', 'at-deadline',
+                        'ec2-outage-limit', 'boot-and-result'):
+            with self.subTest(arrival=arrival):
+                folder = self.root / arrival
+                folder.mkdir()
+                request = {**self.request, 'attempt': arrival, 'source_key': '', 'expires': int(self.now) + 1200}
+                cloud_gate.save(folder / 'request.json', request)
+                fake = FakeGateAws()
+                fake.has_result = False
+                fake.log = 'Runner: 1 modules, whole machine, 32 CPUs\nStarting module: fixture/test_ok.py\n'
+                fake.result = {**self.result(), 'attempt': arrival}
+                ledger.mapping(fake.result['record'])['id'] = 'gate-' + arrival
+                poll_s = 12 if arrival == 'ec2-outage-limit' else 3
+                numeric_settings(self.root / 'cloud_gate.conf', {'result_poll_s': str(poll_s), 'observe_outage_s': '10'})
+                if arrival == 'ec2-outage-limit':
+                    fake.describe_errors = [AwsUnavailable('Could not connect to the endpoint')]
+                pauses: list[float] = []
 
-        def result_arrives(seconds: float) -> None:
-            self.advance(1)
-            self.fake.has_result = True
-            self.advance(seconds - 1)
+                def result_arrives(seconds: float) -> None:
+                    self.advance(seconds)
+                    pauses.append(seconds)
+                    if arrival in ('before-poll', 'ec2-timeout', 'ec2-outage-limit', 'boot-and-result'):
+                        fake.has_result = True
+                    if arrival == 'ec2-timeout':
+                        fake.describe_errors = [subprocess.TimeoutExpired('aws ec2 describe-instances', 1)]
+                    if arrival == 'ec2-outage-limit':
+                        fake.describe_errors = [AwsUnavailable('Could not connect to the endpoint')]
+                    if arrival == 'boot-and-result':
+                        fake.boot_error = 'fixture boot failed'
+                        fake.log += 'fixture boot failed\n'
+                    if arrival in ('at-stop', 'at-stop-log-timeout'):
+                        fake.state = 'shutting-down'
+                        fake.state_reason = {'Code': 'Server.SpotInstanceTermination'}
+                    if arrival == 'at-stop-log-timeout':
+                        fake.log += 'fixture/test_ok.py exit=0 seconds=1.00\n'
 
-        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
-            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=result_arrives)
-        with mock.patch.object(time, "monotonic", side_effect=lambda: self.now):
-            outcome = worker.execute(self.folder, self.request, self.deployment)
-        self.assertEqual(outcome['status'], 'complete')
-        result = cloud_gate.outcome_result(self.folder, outcome)
-        cloud_gate.validate_result(result, self.request)
-        run = gate_box.decode_run(result['gate'])
-        self.assertTrue(run.passed, run.time_limit_report)
-        self.assertEqual(run.time_limit_report, '')
-        self.assertTrue(self.fake.terminated)
+                def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    if (arrival == 'at-stop-log-timeout' and pauses and 'get-object' in arguments
+                            and arguments[arguments.index('--key') + 1].endswith('/gate.log')
+                            and not (folder / cloud_gate.RESULT_FILE).exists()):
+                        raise subprocess.TimeoutExpired('aws s3api get-object', 1)
+                    reply = fake(arguments, **options)
+                    if pauses and not fake.terminated and 'describe-instances' in arguments:
+                        fake.has_result = True
+                    if arrival == 'at-deadline' and fake.has_result and 'list-objects-v2' in arguments:
+                        self.now = float(ledger.instant(request, 'expires'))
+                    return reply
+
+                worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=transport),
+                    self.book, self.settings, folder / 'reservation.cgroup', clock=lambda: self.now, pause=result_arrives)
+                with mock.patch.object(time, 'monotonic', side_effect=lambda: self.now):
+                    outcome = worker.execute(folder, request, self.deployment)
+                self.assertEqual(pauses, [poll_s])
+                self.assertFalse(fake.describe_errors)
+                self.assertEqual(sum('list-objects-v2' in command for command in fake.commands), 2)
+                self.assertTrue(fake.terminated)
+                if arrival == 'boot-and-result':
+                    self.assertEqual(outcome, {'status': 'box-failed', 'reason': 'fixture boot failed'})
+                    self.assertFalse((folder / cloud_gate.RESULT_FILE).exists())
+                    self.assertEqual((folder / 'gate.log').read_text(), fake.log)
+                    continue
+                self.assertEqual(outcome['status'], 'complete')
+                result = cloud_gate.outcome_result(folder, outcome)
+                cloud_gate.validate_result(result, request)
+                run = gate_box.decode_run(result['gate'])
+                self.assertTrue(run.passed, run.time_limit_report)
+                self.assertEqual(run.time_limit_report, '')
+                if arrival in ('at-stop', 'at-stop-log-timeout'):
+                    listing = next(i for i, command in reversed(list(enumerate(fake.commands))) if 'list-objects-v2' in command)
+                    self.assertTrue(all('describe-instances' in command for command in fake.commands[listing - 2:listing]))
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
@@ -266,7 +1017,7 @@ class CloudGateTests(CostFixture):
     def result(self, status: int = 0) -> dict[str, object]:
         run = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', status, 1, 'OK'),), 1, 2)
         record = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'fixture-guest', self.now,
-                                            self.now + 1, 'merge-gate')
+                                            self.now + 1, 'gate')
         return {'attempt': 'attempt', 'commit': 'commit', 'tree': 'tree', 'host': 'fixture-guest',
                 'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run), 'record': record, 'gate_s': 1.0}
 
@@ -393,7 +1144,7 @@ class CloudGateTests(CostFixture):
             self.assertFalse(east.used)
             self.assertEqual(east.prices, ())
             prices = [price for reading in reads for price in reading.prices]
-            ranked = worker.rank_variants(variants, 'merge-gate', prices)
+            ranked = worker.rank_variants(variants, 'gate', prices)
             # Every type in eu-south-2 has the live price, so all of them come before us-east-2.
             self.assertEqual([row.region for row in ranked[:8]], ['eu-south-2'] * 6 + ['us-east-2'] * 2)
             self.assertEqual((self.state / 'spot-prices.json').read_bytes(), hourly)
@@ -406,7 +1157,7 @@ class CloudGateTests(CostFixture):
 
     def test_all_live_price_failures_keep_the_hourly_order(self) -> None:
         worker, variants = self.live_price_fixture()
-        expected = worker.rank_variants(variants, 'merge-gate')
+        expected = worker.rank_variants(variants, 'gate')
         calls: list[str] = []
         def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
             if 'describe-spot-price-history' in arguments:
@@ -444,28 +1195,28 @@ class CloudGateTests(CostFixture):
             '.49' if row.region == 'eu-south-2' else '.5' for row in variants})
         text_setting(self.root / 'cloud_gate.conf', 'region_extra_gate_seconds', '{"eu-south-2": 60}')
         numeric_settings(self.root / 'cloud_gate.conf', {'gate_wait_usd_per_minute': '.01'})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].region, 'us-east-2')
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0].region, 'us-east-2')
         numeric_settings(self.root / 'cloud_gate.conf', {'gate_wait_usd_per_minute': '0'})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].region, 'eu-south-2')
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0].region, 'eu-south-2')
 
     def test_a_far_region_pays_its_own_transfer(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.48'})
         text_setting(self.root / 'cloud_gate.conf', 'region_transfer_usd', '{}')
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
         # The 0.02 USD/h saving over the 20 minute lifetime is 0.0067 USD, below the 0.01 USD transfer.
         text_setting(self.root / 'cloud_gate.conf', 'region_transfer_usd', '{"us-west-2": 0.01}')
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].region, 'us-east-2')
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0].region, 'us-east-2')
 
     def test_a_region_without_runs_adds_its_unmeasured_seconds(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.48'})
         self.gate_history([('m7a.8xlarge', 'us-east-2', 300)])
         text_setting(self.root / 'cloud_gate.conf', 'unmeasured_region_extra_seconds', '{}')
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
         # us-west-2 borrows the 300 s run: 0.48 USD/h for 360 s costs more than 0.5 USD/h for 300 s.
         text_setting(self.root / 'cloud_gate.conf', 'unmeasured_region_extra_seconds', '{"us-west-2": 60, "us-east-2": 600}')
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].region, 'us-east-2')
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0].region, 'us-east-2')
 
     def test_region_maps_refuse_a_negative_number(self) -> None:
         worker, variants = self.steering_fixture()
@@ -474,7 +1225,7 @@ class CloudGateTests(CostFixture):
             with self.subTest(key=key):
                 text_setting(self.root / 'cloud_gate.conf', key, '{"us-west-2": -1}')
                 with self.assertRaisesRegex(ValueError, key):
-                    _ = worker.rank_variants(variants, 'merge-gate')
+                    _ = worker.rank_variants(variants, 'gate')
                 text_setting(self.root / 'cloud_gate.conf', key, '{}')
 
     def test_live_price_reads_run_concurrently(self) -> None:
@@ -500,9 +1251,9 @@ class CloudGateTests(CostFixture):
     def test_variant_prices_prefer_the_cheapest_zone_and_preserve_equal_price_order(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[:4], [variants[0], variants[1], variants[6], variants[7]])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[:4], [variants[0], variants[1], variants[6], variants[7]])
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         self.assertEqual(ranked[:2], [variants[7], variants[0]])
         self.assertFalse(any('describe-spot-price-history' in command for command in self.fake.commands))
 
@@ -510,14 +1261,14 @@ class CloudGateTests(CostFixture):
         """Write finished runs (type, region, box seconds) and refused requests before each launch."""
         rows: list[dict[str, object]] = []
         for index, (size, region, box_s) in enumerate(runs):
-            row: dict[str, object] = {'attempt': f'run-{index}', 'instance_type': size, 'region': region, 'mode': 'merge-gate'}
+            row: dict[str, object] = {'attempt': f'run-{index}', 'instance_type': size, 'region': region, 'mode': 'gate'}
             rows.extend(({**row, 'time': self.now - 7200 - box_s, 'result': 'launched'},
                          {**row, 'time': self.now - 7200, 'result': 'finished', 'gate_s': box_s - 60}))
         for index, (size, region, count) in enumerate(refusals):
             for step in range(count):
-                rows.append({'attempt': f'refused-{index}', 'instance_type': size, 'region': region, 'mode': 'merge-gate',
+                rows.append({'attempt': f'refused-{index}', 'instance_type': size, 'region': region, 'mode': 'gate',
                              'time': self.now - 9000 + step * 6, 'result': 'refused', 'error_code': 'InsufficientInstanceCapacity'})
-            rows.append({'attempt': f'refused-{index}', 'instance_type': size, 'region': region, 'mode': 'merge-gate',
+            rows.append({'attempt': f'refused-{index}', 'instance_type': size, 'region': region, 'mode': 'gate',
                          'time': self.now - 9000 + count * 6, 'result': 'launched'})
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
 
@@ -530,7 +1281,7 @@ class CloudGateTests(CostFixture):
                                        for row in variants})
         self.gate_history([(first, 'us-east-2', cap - 60), (third, 'us-east-2', cap + 60)])
         with redirect_stdout(StringIO()) as output:
-            ranked = worker.rank_variants(variants, 'merge-gate')
+            ranked = worker.rank_variants(variants, 'gate')
         # us-west-2 has no runs of the third type, so it uses the type's time in us-east-2 and is skipped too.
         self.assertEqual({row.instance_type for row in ranked}, {first, second})
         self.assertEqual(ranked[0].instance_type, first)
@@ -538,20 +1289,20 @@ class CloudGateTests(CostFixture):
         # A median at the cap is still tried; a type without runs is never skipped.
         self.gate_history([(first, 'us-east-2', cap), (third, 'us-east-2', cap)])
         with redirect_stdout(StringIO()):
-            self.assertEqual(len(worker.rank_variants(variants, 'merge-gate')), len(variants))
+            self.assertEqual(len(worker.rank_variants(variants, 'gate')), len(variants))
 
     def test_a_region_whose_spot_quota_is_below_one_box_stays_in_the_order(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
         self.west_quota(31)
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         self.assertCountEqual(ranked, variants)
         self.assertCountEqual(ranked[-4:], variants[6:10])
         # One box fits at equality. An expired snapshot does not set the order.
         for west, age in ((32, 0), (0, conf.read(self.settings).whole('price_max_age_seconds') + 1)):
             with self.subTest(west=west, age=age):
                 self.west_quota(west, age=age)
-                self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+                self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
 
     def test_every_type_above_max_gate_minutes_falls_back_before_launch(self) -> None:
         cap = conf.read(self.root / 'cloud_gate.conf').whole('max_gate_minutes') * 60
@@ -571,12 +1322,12 @@ class CloudGateTests(CostFixture):
         self.variant_prices(variants, {(row.region, row.instance_type, row.zone): '.3' if row.instance_type == third else '.5'
                                        for row in variants})
         self.gate_history([(first, 'us-east-2', 300), (third, 'us-east-2', 600)])
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         self.assertEqual([row.instance_type for row in ranked[:2]], [first, first])
         # The region uses its own box time; us-west-2 has none, so it uses us-east-2's time.
         self.assertEqual({row.region for row in ranked[:4]}, {'us-east-2', 'us-west-2'})
         self.gate_history([(first, 'us-east-2', 900), (third, 'us-east-2', 600)])
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].instance_type, third)
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0].instance_type, third)
 
     def test_expected_refusals_count_only_when_wait_time_has_a_cost(self) -> None:
         worker, variants = self.steering_fixture()
@@ -585,34 +1336,34 @@ class CloudGateTests(CostFixture):
                                        for row in variants})
         self.gate_history([(first, 'us-east-2', 600), (second, 'us-east-2', 600)], [(first, 'us-east-2', 100)])
         def home_types() -> list[str]:
-            return [row.instance_type for row in worker.rank_variants(variants, 'merge-gate') if row.region == 'us-east-2']
+            return [row.instance_type for row in worker.rank_variants(variants, 'gate') if row.region == 'us-east-2']
         self.assertEqual(home_types()[:2], [first, first])
         # 50 refusals per launch, 6 s apart, at .01 USD a minute is 0.05 USD: more than the price gap.
         numeric_settings(self.root / 'cloud_gate.conf', {'gate_wait_usd_per_minute': '.01'})
         self.assertEqual(home_types()[:2], [second, second])
         # A region without refusals keeps the type first.
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], cloud_gate.GateLaunchVariant(
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], cloud_gate.GateLaunchVariant(
             'us-west-2', first, 'us-west-2a', 'us-west-2a'))
 
     def test_equal_cost_per_run_keeps_the_configured_type_order(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {})
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         types = conf.read(self.root / 'cloud_gate.conf').words('instance_types')
         self.assertEqual([row.instance_type for row in ranked if row.region == 'us-east-2'], [size for size in types for _ in range(2)])
 
     def test_absent_stale_or_invalid_prices_preserve_configured_order(self) -> None:
         worker, variants = self.steering_fixture()
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), variants)
+        self.assertEqual(worker.rank_variants(variants, 'gate'), variants)
         self.variant_prices(variants, {}, age=7201)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), variants)
+        self.assertEqual(worker.rank_variants(variants, 'gate'), variants)
         _ = (self.state / 'spot-prices.json').write_text('{')
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), variants)
+        self.assertEqual(worker.rank_variants(variants, 'gate'), variants)
 
     def test_missing_prices_follow_priced_variants_of_the_same_size(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices([variants[6]], {})
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         self.assertEqual(ranked[0], variants[6])
         self.assertEqual(ranked[1:4], [variants[0], variants[1], variants[7]])
         self.assertEqual(ranked[-4:], [variants[4], variants[5], variants[10], variants[11]])
@@ -626,11 +1377,11 @@ class CloudGateTests(CostFixture):
                 _ = (self.state / 'cloud-gate-launches.jsonl').write_text(json.dumps(dict(
                     time=self.now - 600, result='refused', region='us-west-2', instance_type='m7a.8xlarge',
                     availability_zone='us-west-2b', error_code=code)) + '\n')
-                ranked = worker.rank_variants(variants, 'merge-gate')
+                ranked = worker.rank_variants(variants, 'gate')
                 self.assertEqual(ranked[0], variants[6])
                 self.assertEqual(ranked[-1], variants[7])
         self.advance(1260)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
 
     def test_quota_refusal_does_not_cool_a_region_after_a_box_ends(self) -> None:
         worker, variants = self.steering_fixture()
@@ -644,11 +1395,11 @@ class CloudGateTests(CostFixture):
                 _ = (self.state / 'cloud-gate-launches.jsonl').write_text(json.dumps(dict(
                     time=self.now - 300, result='refused', region='us-west-2', instance_type='m7a.8xlarge',
                     availability_zone='us-west-2b', error_code=code)) + '\n')
-                ranked = worker.rank_variants(variants, 'merge-gate')
+                ranked = worker.rank_variants(variants, 'gate')
                 self.assertEqual(ranked[0], variants[7])
                 self.assertCountEqual(ranked, variants)
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
 
     def test_live_gate_vcpus_rank_a_full_region_after_regions_with_room(self) -> None:
         worker, variants = self.steering_fixture()
@@ -665,13 +1416,13 @@ class CloudGateTests(CostFixture):
                     (fits.region, fits.instance_type, fits.zone): '.2',
                     (gpu.region, gpu.instance_type, gpu.zone): '.3'})
                 self.west_quota(32, gpu_vcpus=12)
-                ranked = worker.rank_variants(variants, 'merge-gate')
+                ranked = worker.rank_variants(variants, 'gate')
                 self.assertEqual(ranked[-1], full)
                 self.assertCountEqual(ranked[:-1], [east, fits, gpu])
         self.advance(1200)
         self.variant_prices(variants, {(full.region, full.instance_type, full.zone): '.1'})
         self.west_quota(32, gpu_vcpus=12)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], full)
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], full)
 
     def test_full_gpu_quota_preserves_the_standard_variant_with_room(self) -> None:
         worker, variants = self.steering_fixture()
@@ -684,7 +1435,7 @@ class CloudGateTests(CostFixture):
             (standard.region, standard.instance_type, standard.zone): '.2',
             (gpu.region, gpu.instance_type, gpu.zone): '.1'})
         self.west_quota(32, gpu_vcpus=32)
-        self.assertEqual(worker.rank_variants([east, standard, gpu], 'merge-gate'), [standard, east, gpu])
+        self.assertEqual(worker.rank_variants([east, standard, gpu], 'gate'), [standard, east, gpu])
 
     def test_launch_quota_refusal_marks_the_class_until_live_use_drops(self) -> None:
         worker, variants = self.steering_fixture()
@@ -693,7 +1444,7 @@ class CloudGateTests(CostFixture):
         self.record_running_gate('other', west.instance_type, west.region)
         self.variant_prices(variants, {(west.region, west.instance_type, west.zone): '.1'})
         self.west_quota(256)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], west)
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], west)
         self.fake.refusals = ['MaxSpotInstanceCountExceeded']
         with mock.patch.object(time, 'time', return_value=self.now):
             self.assertEqual(worker.launch(self.folder, self.request, self.deployment), 'i-fixture')
@@ -701,15 +1452,15 @@ class CloudGateTests(CostFixture):
         self.assertEqual([command[command.index('--region') + 1] for command in launches], ['us-west-2', 'us-east-2'])
         pool = ledger.SpotQuotaPool(west.region, ledger.SpotQuotaClass.STANDARD)
         self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [ledger.GateQuotaRefusal(pool, 32, int(self.now))])
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         self.assertEqual(ranked[:6], variants[:6])
         self.assertCountEqual(ranked[6:], variants[6:])
         self.book.resolve_gate('other', ledger.GateTerminated(int(self.now) + 1, 'i-other'))
         self.advance(1)
         self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [])
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], west)
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], west)
         self.record_running_gate('replacement', west.instance_type, west.region)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], west)
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], west)
 
     def test_quota_refusal_at_zero_live_vcpus_expires_at_the_cooldown(self) -> None:
         worker, variants = self.steering_fixture()
@@ -717,14 +1468,14 @@ class CloudGateTests(CostFixture):
         east, west = variants[0], variants[7]
         variants = [east, west]
         self.variant_prices(variants, {(west.region, west.instance_type, west.zone): '.1'})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), [west, east])
+        self.assertEqual(worker.rank_variants(variants, 'gate'), [west, east])
         pool = ledger.SpotQuotaPool(west.region, ledger.SpotQuotaClass.STANDARD)
         self.book.record_gate_quota_refusal(pool, self.now)
         self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [ledger.GateQuotaRefusal(pool, 0, int(self.now))])
         self.advance(29)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), [east, west])
+        self.assertEqual(worker.rank_variants(variants, 'gate'), [east, west])
         self.advance(1)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), [west, east])
+        self.assertEqual(worker.rank_variants(variants, 'gate'), [west, east])
         self.book.resolve_gate('attempt', ledger.GateAbsent(int(self.now)))
         self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [])
 
@@ -767,10 +1518,10 @@ class CloudGateTests(CostFixture):
         worker, variants = self.steering_fixture()
         numeric_settings(self.root / 'cloud_gate.conf', {'remote_region_transfer_usd': '.005'})
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.48'})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
         # Box times of another type give the mode's median when the ranked types have no runs.
         self.gate_history([('other.8xlarge', 'us-east-2', duration) for duration in (300, 600, 900)])
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[0])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[0])
 
     def test_regions_try_home_types_and_zones_before_west_and_keep_home_transfers(self) -> None:
         self.deployment['regions'] = [{**ledger.rows(self.deployment, 'regions')[0], 'region': region, 'image': 'ami-' + suffix,
@@ -934,11 +1685,12 @@ class CloudGateTests(CostFixture):
                          {key: value for key, value in official.items() if key not in ('ImageId', 'ClientToken', 'UserData', 'TagSpecifications')})
 
     def test_poll_read_timeout_retries_and_completes(self) -> None:
-        self.fake.read_timeouts = 1
+        self.fake.read_timeouts = ['list-objects-v2', 'get-object']
         self.assertEqual(self.execute()['status'], 'complete')
+        self.assertEqual(sum('list-objects-v2' in command for command in self.fake.commands), 3)
         reads = [command[command.index('--key') + 1] for command in self.fake.commands if 'get-object' in command]
-        self.assertEqual(reads[:2], ['artifacts/attempt/gate.log', 'artifacts/attempt/gate.log'])
-        self.assertIn('artifacts/attempt/result.json', reads)
+        self.assertEqual(reads, ['artifacts/attempt/' + name
+                                for name in ('result.json', 'result.json', 'gate.log')])
         self.assertEqual(len(self.fake.launches), 1)
         self.assertTrue(self.fake.terminated)
 
@@ -959,7 +1711,7 @@ class CloudGateTests(CostFixture):
         failed = 0
         def outage(arguments: list[str]) -> bool:
             nonlocal failed
-            if 'describe-instances' not in arguments or failed == 3:
+            if 'list-objects-v2' not in arguments or failed == 3:
                 return False
             failed += 1
             self.fake.has_result = failed == 3
@@ -972,17 +1724,38 @@ class CloudGateTests(CostFixture):
         self.assertTrue(self.fake.terminated)
 
     def test_long_poll_outage_ends_the_cloud_try_after_observe_outage_s(self) -> None:
-        self.fake.has_result = False
-        started = self.now
-        def outage(arguments: list[str]) -> bool:
-            return 'describe-instances' in arguments and not self.fake.terminated
-        with redirect_stdout(StringIO()):
-            outcome = self.outage_worker(outage).execute(self.folder, self.request, self.deployment)
-        self.assertEqual(outcome['status'], 'fallback')
-        self.assertIn('Could not connect to the endpoint', str(outcome['reason']))
-        self.assertGreaterEqual(self.now - started, cloud_gate.settings().number('observe_outage_s'))
-        self.assertTrue(self.fake.terminated)
-        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
+        for operation, interval in (('describe-instances', 30), ('list-objects-v2', 2)):
+            with self.subTest(operation=operation):
+                self.fake = FakeGateAws()
+                self.fake.has_result = False
+                self.folder = self.root / operation
+                self.folder.mkdir()
+                request = {**self.request, 'attempt': operation, 'source_key': ''}
+                cloud_gate.save(self.folder / 'request.json', request)
+                started = self.now
+                failed_checks: list[float] = []
+                instance_checks: list[float] = []
+
+                def outage(arguments: list[str]) -> bool:
+                    if self.fake.terminated:
+                        return False
+                    if 'describe-instances' in arguments:
+                        instance_checks.append(self.now - started)
+                    if operation not in arguments:
+                        return False
+                    failed_checks.append(self.now - started)
+                    return True
+
+                with redirect_stdout(StringIO()), mock.patch.object(time, 'monotonic', side_effect=lambda: self.now):
+                    outcome = self.outage_worker(outage).execute(self.folder, request, self.deployment)
+                self.assertEqual(failed_checks, list(range(0, 181, interval)))
+                self.assertEqual(instance_checks, list(range(0, 181, 30)))
+                self.assertEqual(outcome['status'], 'fallback')
+                self.assertIn('Could not connect to the endpoint', str(outcome['reason']))
+                self.assertGreaterEqual(self.now - started, cloud_gate.settings().number('observe_outage_s'))
+                self.assertTrue(self.fake.terminated)
+                reservation = next(row for row in self.book.read_snapshot().gate_reservations if row.attempt == operation)
+                self.assertIsInstance(reservation.state, ledger.GateTerminated)
 
     def test_termination_repeats_through_an_outage(self) -> None:
         failed = False
@@ -1010,6 +1783,80 @@ class CloudGateTests(CostFixture):
         self.assertEqual(launches, ['us-east-2', 'us-east-2', 'us-west-2'])
         self.assertIn('Cloud gate skips us-east-2:', output.getvalue())
         self.assertEqual(self.book.read_snapshot().gate_reservations[0].region, 'us-west-2')
+
+    def test_connect_failure_after_an_uncertain_launch_keeps_the_first_token(self) -> None:
+        regional = ledger.rows(self.deployment, 'regions')[0]
+        self.deployment['regions'] = [{**regional, 'region': region} for region in ('us-east-2', 'us-west-2')]
+        self.fake.refusals = ['An error occurred (InternalFailure)', 'EndpointConnectionError']
+        self.assertEqual(self.execute()['status'], 'fallback')
+        first = cloud_gate.read(self.folder / 'launch.json')
+        self.assertEqual(first['region'], 'us-east-2')
+        self.assertEqual(self.fake.launches, [first['arguments']] * 2)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+
+        self.fake.refusals = ['InsufficientInstanceCapacity']
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(cloud_gate.read(self.folder / 'launch.json'), first)
+        self.assertEqual(self.fake.launches, [first['arguments']] * 3)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+
+        self.assertEqual(self.execute()['status'], 'complete')
+        self.assertEqual(self.fake.launches, [first['arguments']] * 4)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
+
+    def test_worker_checks_both_switches_at_the_launch_boundary(self) -> None:
+        registry = self.root / 'build_targets.conf'
+        _ = write_config_fixture(registry, 'targets=claude-aws\nkind.claude-aws=scaler\n'
+            + 'settings.claude-aws=cloud_gate.conf\nenabled.claude-aws=on\n')
+        claim = placement.ProviderClaimReference('scaler', 'claude-aws', WHOLE_MAC, 'claim', 'episode', 'attempt')
+        binding = ledger.GateDispatchBinding(claim, self.root / 'journal.json', self.book.directory, registry, self.settings)
+        dispatch = ledger.GateDispatchRecord(binding, placement.ClaimHolderIdentity('host', 1, '1'))
+        for switch in ('enabled', 'enabled.claude-aws'):
+            with self.subTest(switch=switch):
+                folder = self.root / switch
+                folder.mkdir()
+                _ = write_config_fixture(registry, 'enabled.claude-aws=on\n')
+                self.configure_gate('enabled=on\n')
+                request = {**self.request, 'attempt': folder.name, 'source_key': '', 'placement_claim': claim.claim_id}
+                cloud_gate.save(folder / 'request.json', request)
+                path = registry if '.' in switch else self.root / 'cloud_gate.conf'
+
+                def disable_at_launch(_sidecar: Path, progress: cloud_progress.CloudProgress) -> None:
+                    if progress.stage == 'launch':
+                        override_fixture_settings(path, f'{switch}=off\n')
+
+                worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+                    self.book, self.settings, folder / 'progress', clock=lambda: self.now, pause=self.advance,
+                    dispatch=dispatch)
+                with mock.patch.object(cloud_progress, 'publish', side_effect=disable_at_launch):
+                    outcome = worker.execute(folder, request, self.deployment)
+                self.assertEqual(outcome['status'], 'fallback')
+                self.assertIn('off', str(outcome['reason']))
+                self.assertEqual(self.fake.launches, [])
+                booking = next(row for row in self.book.read_snapshot().gate_reservations if row.attempt == folder.name)
+                self.assertIsInstance(booking.state, ledger.GateAbsent)
+
+    def test_worker_with_earlier_permission_makes_no_aws_call_after_scaler_removal(self) -> None:
+        registry = self.root / 'build_targets.conf'
+        _ = write_config_fixture(registry, 'targets=natedev,claude-aws\nkind.claude-aws=scaler\n'
+            + 'settings.claude-aws=cloud_gate.conf\nenabled.claude-aws=on\n')
+        self.configure_gate('enabled=on\n')
+        claim = placement.ProviderClaimReference('scaler', 'claude-aws', WHOLE_MAC, 'claim', 'episode', 'attempt')
+        journal = ledger.GateDispatchJournal(self.root / 'journal.json')
+        binding = ledger.GateDispatchBinding(claim, journal.path, self.book.directory, registry, self.settings)
+        holder = placement.ClaimHolderIdentity('host', 1, '1')
+        journal.begin(binding, holder)
+        journal.register(claim, holder, self.folder)
+        _ = registry.write_text('targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n')
+        execute = mock.Mock(side_effect=AssertionError('An absent scaler must make no AWS call'))
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=execute),
+            self.book, self.settings, self.folder / 'progress', dispatch=journal.read())
+        outcome = worker.execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'fallback')
+        self.assertIn('absent from the target registry', str(outcome['reason']))
+        execute.assert_not_called()
+        self.assertFalse((self.folder / 'launch.json').exists())
+        self.assertEqual(self.book.read_snapshot().gate_reservations, [])
 
     def test_unreachable_last_region_still_falls_back(self) -> None:
         def outage(arguments: list[str]) -> bool:
@@ -1052,7 +1899,7 @@ handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signa
 def execute(arguments, **options):
     assert handlers == {number: signal.getsignal(number) for number in handlers}
     reply = fake(arguments, **options)
-    raise_now = 'put-object' in arguments if during_launch < 0 else 'run-instances' in arguments if during_launch else 'get-object' in arguments and arguments[arguments.index('--key') + 1].endswith('/result.json')
+    raise_now = 'put-object' in arguments if during_launch < 0 else 'run-instances' in arguments if during_launch else 'list-objects-v2' in arguments
     if raise_now:
         signal.raise_signal(number)
     return reply
@@ -1104,6 +1951,64 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 self.assertEqual(other.state, ledger.GateRunning('i-other-live'))
                 self.assertNotIn('i-other-live', fake.terminated_instances)
 
+    def test_empty_launch_lookup_must_start_at_or_after_expiry(self) -> None:
+        worker = self.worker_with_pending_gate()
+        booking, = self.book.read_snapshot().gate_reservations
+        self.fake.has_instance = False
+        cloud_gate.save(self.folder / 'request.json', {'attempt': booking.attempt})
+        cloud_gate.save(self.folder / 'launch.json', {'region': 'fixture-region',
+                        'arguments': {'ClientToken': 'fixture-token'}})
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertIn('Name=client-token,Values=fixture-token', arguments)
+            self.advance(1)
+            return self.fake(arguments, **options)
+
+        worker.apis.clear()
+        worker.api = AwsCli('fixture', 'fixture-region', 1, execute=transport)
+        self.advance(booking.expires - self.now - 1)
+        self.assertFalse(cloud_gate.cleanup_folder(self.folder, worker))
+        self.assertEqual(self.now, booking.expires)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+        self.assertTrue(cloud_gate.cleanup_folder(self.folder, worker))
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+        self.assertEqual(len(self.fake.commands), 2)
+
+    def test_reconcile_skips_a_damaged_launch_journal_and_closes_the_other_booking(self) -> None:
+        worker = self.worker_with_pending_gate()
+        self.book.gate_owner('orphan', ledger.GateWorkerOwner(os.getpid(), 'fixture-start', str(self.folder)))
+        path = self.folder / 'launch.json'
+        _ = path.write_text('{"incomplete":')
+        self.record_running_gate('expired', 'm7a.8xlarge', 'fixture-region')
+        self.advance(1200)
+        with (mock.patch.object(cloud_gate, 'process_start', return_value=Gone()),
+              redirect_stderr(StringIO()) as errors):
+            worker.reconcile()
+        messages = errors.getvalue().splitlines()
+        self.assertEqual(len(messages), 1)
+        self.assertIn(str(path), messages[0])
+        states = {row.attempt: row.state for row in self.book.read_snapshot().gate_reservations}
+        self.assertIsInstance(states['orphan'], ledger.GateLaunchPending)
+        self.assertEqual(states['expired'], ledger.GateTerminated(int(self.now), 'i-expired'))
+        self.assertEqual(self.fake.terminated_instances, {'i-expired'})
+
+    def test_reconcile_skips_a_deep_launch_journal_and_closes_the_next_booking(self) -> None:
+        worker = self.worker_with_pending_gate()
+        self.book.gate_owner('orphan', ledger.GateWorkerOwner(os.getpid(), 'fixture-start', str(self.folder)))
+        path = self.folder / 'launch.json'
+        depth = 10_000
+        _ = path.write_text('{"deep":' + '[' * depth + '0' + ']' * depth + '}')
+        self.record_running_gate('expired', 'm7a.8xlarge', 'fixture-region')
+        self.advance(1200)
+        with (mock.patch.object(cloud_gate, 'process_start', return_value=Gone()),
+              redirect_stderr(StringIO()) as errors):
+            worker.reconcile()
+        self.assertIn(f'Gate cleanup could not read {path}', errors.getvalue())
+        states = {row.attempt: row.state for row in self.book.read_snapshot().gate_reservations}
+        self.assertIsInstance(states['orphan'], ledger.GateLaunchPending)
+        self.assertEqual(states['expired'], ledger.GateTerminated(int(self.now), 'i-expired'))
+        self.assertEqual(self.fake.terminated_instances, {'i-expired'})
+
     def test_reconcile_preserves_live_and_unreadable_worker_owners(self) -> None:
         worker = self.worker_with_pending_gate()
         owner = ledger.GateWorkerOwner(os.getpid(), 'fixture-start', str(self.folder))
@@ -1114,6 +2019,293 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 worker.reconcile()
         self.assertEqual(self.fake.commands, [])
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+
+    def test_reconcile_skips_a_booking_that_changes_owner_after_selection(self) -> None:
+        read = cloud_gate.read
+        for launch_form in ('recorded', 'discovered', 'absent'):
+            with self.subTest(launch_form=launch_form):
+                attempt = 'resumed-' + launch_form
+                other = 'expired-' + launch_form
+                folder = self.root / attempt
+                folder.mkdir()
+                if launch_form == 'recorded':
+                    self.record_running_gate(attempt, 'm7a.8xlarge', 'fixture-region')
+                    launch: dict[str, object] = {'instance': 'i-' + attempt}
+                else:
+                    reservation = ledger.GateReservation(attempt, int(self.now), int(self.now) + 1200,
+                                                        Decimal('.8'), Decimal('.02'))
+                    self.assertIsInstance(self.book.reserve_gate(self.settings, reservation), ledger.GateReserved)
+                    launch = {'arguments': {'ClientToken': attempt}} if launch_form == 'discovered' else {}
+                old_owner = ledger.GateWorkerOwner(101, 'old-start', str(folder))
+                new_owner = ledger.GateWorkerOwner(102, 'new-start', str(folder))
+                self.book.gate_owner(attempt, old_owner)
+                self.record_running_gate(other, 'm7a.8xlarge', 'fixture-region')
+                cloud_gate.save(folder / 'request.json', {'attempt': attempt})
+                journal = folder / 'launch.json'
+                cloud_gate.save(journal, launch)
+                self.advance(1200)
+                self.fake = FakeGateAws()
+                termination_locks: list[bool] = []
+
+                def read_launch(path: Path) -> dict[str, object]:
+                    record = read(path)
+                    if path == journal and launch_form != 'discovered':
+                        self.book.gate_owner(attempt, new_owner)
+                    return record
+
+                def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    if f'Name=client-token,Values={attempt}' in arguments:
+                        self.book.gate_owner(attempt, new_owner)
+                    if 'terminate-instances' in arguments:
+                        with (self.state / 'cost-ledger.lock').open('a') as lock:
+                            try:
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                termination_locks.append(True)
+                            else:
+                                termination_locks.append(False)
+                    return self.fake(arguments, **options)
+
+                def owner_identity(pid: int) -> Gone | Started:
+                    return Started(new_owner.start) if pid == new_owner.pid else Gone()
+
+                worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=transport),
+                    self.book, self.settings, folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+                with (mock.patch.object(cloud_gate, 'read', side_effect=read_launch),
+                      mock.patch.object(cloud_gate, 'process_start', side_effect=owner_identity),
+                      redirect_stderr(StringIO()) as errors):
+                    worker.reconcile()
+
+                self.assertEqual(self.fake.terminated_instances, {'i-' + other})
+                by_attempt = {row.attempt: row for row in self.book.read_snapshot().gate_reservations}
+                self.assertEqual(by_attempt[attempt].owner, new_owner)
+                self.assertTrue(ledger.gate_is_open(by_attempt[attempt]))
+                self.assertEqual(by_attempt[other].state, ledger.GateTerminated(int(self.now), 'i-' + other))
+                self.assertIn(f'Skipped gate cleanup for {attempt}: the booking owner changed', errors.getvalue())
+                self.assertEqual(termination_locks, [False])
+
+    def test_cleanup_refuses_resume_while_aws_terminates_the_box(self) -> None:
+        attempt = ledger.text(self.request, 'attempt')
+        self.record_running_gate(attempt, 'm7a.8xlarge', 'fixture-region')
+        cloud_gate.save(self.folder / 'request.json', self.request)
+        cloud_gate.save(self.folder / 'launch.json', {'instance': 'i-' + attempt, 'region': 'fixture-region'})
+        owner = ledger.GateWorkerOwner(os.getpid(), 'resume-start', str(self.folder))
+        resume = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        checked_resume = False
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal checked_resume
+            if 'describe-instances' in arguments:
+                self.assertIn('i-' + attempt, self.fake.terminated_instances)
+                with self.assertRaisesRegex(ledger.LedgerUnavailable, 'booking is in cleanup'):
+                    self.book.gate_owner(attempt, owner)
+                with self.assertRaisesRegex(ledger.LedgerUnavailable, 'booking is in cleanup'):
+                    _ = resume.launch(self.folder, self.request, self.deployment)
+                checked_resume = True
+            return self.fake(arguments, **options)
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=transport),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        self.assertTrue(cloud_gate.cleanup_folder(self.folder, worker))
+        self.assertTrue(checked_resume)
+        self.assertEqual(self.fake.launches, [])
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-' + attempt))
+
+    def test_paired_cleanup_accepts_a_concurrent_confirmation_for_the_same_box(self) -> None:
+        attempt = ledger.text(self.request, 'attempt')
+        self.record_running_gate(attempt, 'm7a.8xlarge', 'fixture-region')
+        cloud_gate.save(self.folder / 'request.json', self.request)
+        launch = self.folder / 'launch.json'
+        cloud_gate.save(launch, {'instance': 'i-' + attempt})
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        read = cloud_gate.read
+
+        disk_full = OSError(errno.ENOSPC, 'fixture disk full')
+        with ExitStack() as stack:
+            def confirm_after_selection(path: Path) -> dict[str, object]:
+                if path == launch:
+                    with mock.patch.object(cloud_gate, 'read', read):
+                        self.assertTrue(aws_trial.cleanup_trial(self.folder, worker))
+                    _ = stack.enter_context(mock.patch.object(ledger, 'write_text_atomic', side_effect=disk_full))
+                return read(path)
+
+            with mock.patch.object(cloud_gate, 'read', side_effect=confirm_after_selection):
+                self.assertTrue(aws_trial.cleanup_trial(self.folder, worker))
+            worker.terminate(attempt, 'i-' + attempt, ledger.GateWorkerOwner(101, 'fixture-start', str(self.folder)))
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-' + attempt))
+        calls = [command[command.index('--instance-ids') - 1] for command in self.fake.commands]
+        self.assertEqual(calls, ['terminate-instances', 'describe-instances'])
+
+    def test_cleanup_retry_syncs_pending_ledger_before_termination(self) -> None:
+        for retry_in_batch in (False, True):
+            with self.subTest(retry_in_batch=retry_in_batch):
+                self.fake = FakeGateAws()
+                attempt = 'batch' if retry_in_batch else 'direct'
+                instance = 'i-' + attempt
+                region = 'fixture-region'
+                owner = ledger.GateWorkerOwner(101, 'fixture-start', str(self.folder))
+                self.record_running_gate(attempt, 'm7a.8xlarge', region)
+                self.book.gate_owner(attempt, owner)
+                synced: list[int] = []
+                fsync = os.fsync
+                file_inode = 0
+
+                def record_sync(fd: int) -> None:
+                    fsync(fd)
+                    synced.append(os.fstat(fd).st_ino)
+
+                def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    if 'terminate-instances' in arguments:
+                        self.assertEqual(self.book.path.stat().st_ino, file_inode)
+                        self.assertEqual(synced, [file_inode, self.book.path.parent.stat().st_ino])
+                    return self.fake(arguments, **options)
+
+                worker = cloud_gate.GateWorker(AwsCli('fixture', region, 1, execute=transport),
+                    self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+                with (mock.patch.object(atomic_file, 'sync_folder', side_effect=OSError('fixture sync failed')),
+                      self.assertRaises(atomic_file.AtomicDurabilityUnconfirmed)):
+                    worker.terminate(attempt, instance, owner)
+                self.assertEqual(self.fake.commands, [])
+                saved = next(row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt)
+                self.assertIsInstance(saved.cleanup, ledger.GateCleanupPending)
+                file_inode = self.book.path.stat().st_ino
+
+                with mock.patch.object(os, 'fsync', side_effect=record_sync):
+                    if retry_in_batch:
+                        box = cloud_gate.GateTermination(attempt, ledger.GateCleanupTargets(region, (instance,)), owner)
+                        deadline = self.now + 60
+                        progress = worker.request_terminations((box,), deadline)
+                        self.assertEqual(progress, cloud_gate.GateTerminationProgress([box], False))
+                        self.assertTrue(worker.confirm_terminations(progress.pending, deadline))
+                    else:
+                        worker.terminate(attempt, instance, owner)
+                self.assertEqual(self.fake.terminated_instances, {instance})
+
+    def test_cleanup_confirmation_requires_the_same_region_and_instance_set(self) -> None:
+        self.record_running_gate('group', 'm7a.8xlarge', 'fixture-region')
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        owner = ledger.GateOwnerUnknown()
+        instances = ('i-group', 'i-extra')
+        targets = ledger.GateCleanupTargets('fixture-region', instances)
+        box = cloud_gate.GateTermination('group', targets, owner)
+        deadline = self.now + 60
+        progress = worker.request_terminations((box,), deadline)
+        self.assertEqual(progress, cloud_gate.GateTerminationProgress([box], False))
+        self.assertTrue(worker.confirm_terminations(progress.pending, deadline))
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-group', ('i-extra',)))
+        saved_calls = list(self.fake.commands)
+
+        same = replace(box, targets=replace(targets, instances=instances[::-1]))
+        self.assertEqual(worker.request_terminations((same,), deadline), cloud_gate.GateTerminationProgress([], False))
+        outcome = ledger.GateTerminated(int(self.now) + 1, 'i-group')
+        self.book.resolve_gate(box.attempt, outcome, cleanup=same.targets)
+        for different in (replace(targets, region='other-region'), replace(targets, instances=('i-group',))):
+            with self.subTest(targets=different), redirect_stderr(StringIO()):
+                self.assertEqual(worker.request_terminations((replace(box, targets=different),), deadline),
+                                 cloud_gate.GateTerminationProgress([], True))
+                with self.assertRaises(ledger.GateCleanupSuperseded):
+                    self.book.resolve_gate(box.attempt, outcome, cleanup=different)
+        self.assertEqual(self.fake.commands, saved_calls)
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-group', ('i-extra',)))
+
+    def test_reconcile_resolves_a_lost_termination_reply(self) -> None:
+        def lose_termination_reply(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            result = self.fake(arguments, **options)
+            if 'terminate-instances' in arguments:
+                raise subprocess.TimeoutExpired('terminate-instances', 1)
+            return result
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=lose_termination_reply),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        with mock.patch.object(cloud_gate, 'process_start', return_value=Started('fixture-start')):
+            self.assertEqual(worker.execute(self.folder, self.request, self.deployment)['status'], 'fallback')
+        self.assertEqual(self.fake.terminated_instances, {'i-fixture'})
+        booking, = self.book.read_snapshot().gate_reservations
+        self.assertTrue(ledger.gate_is_open(booking))
+        self.assertLess(self.now, booking.expires)
+        _ = (self.folder / 'launch.json').write_text('{')
+
+        recovered = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        with mock.patch.object(cloud_gate, 'process_start', return_value=Unreadable('fixture outage')):
+            recovered.reconcile()
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-fixture'))
+
+    def test_pending_cleanup_uses_a_ledger_version_that_old_writers_refuse(self) -> None:
+        legacy = cloud_gate.read(self.book.path)
+        cloud_gate.save(self.book.path, {**legacy, 'version': 1})
+        attempt = ledger.text(self.request, 'attempt')
+        self.record_running_gate(attempt, 'm7a.8xlarge', 'fixture-region')
+        cloud_gate.save(self.folder / 'launch.json', {'instance': 'i-' + attempt})
+        self.fake.confirm_termination = False
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+
+        self.assertFalse(cloud_gate.cleanup_folder(self.folder, worker))
+        document = cloud_gate.read(self.book.path)
+        self.assertEqual(document['version'], 2)
+        pending = ledger.mapping(ledger.rows(document, 'gate_reservations')[0]['cleanup'])
+
+        saved = self.book.path.read_bytes()
+        inode = self.book.path.stat().st_ino
+        with (mock.patch.object(ledger, 'LEDGER_VERSION', 1),
+              self.assertRaisesRegex(ledger.LedgerUnavailable, 'unsupported ledger version')):
+            self.record_running_gate('old-writer', 'm7a.8xlarge', 'fixture-region')
+        self.assertEqual(self.book.path.stat().st_ino, inode)
+        self.assertEqual(self.book.path.read_bytes(), saved)
+
+        self.record_running_gate('other', 'm7a.8xlarge', 'fixture-region')
+        document = cloud_gate.read(self.book.path)
+        self.assertEqual(document['version'], 2)
+        self.assertEqual(ledger.rows(document, 'gate_reservations')[0]['cleanup'], pending)
+
+    def test_reconcile_first_confirm_preserves_the_valid_result_time(self) -> None:
+        received_at = int(self.now)
+        confirmed_ledgers: list[bytes] = []
+        recovery = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+
+        def confirm_through_reconcile(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            reply = self.fake(arguments, **options)
+            if 'terminate-instances' in arguments:
+                self.advance(120)
+                recovery.reconcile()
+                self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                                 ledger.GateTerminated(received_at, 'i-fixture'))
+                confirmed_ledgers.append(self.book.path.read_bytes())
+                self.advance(60)
+            return reply
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=confirm_through_reconcile),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        with mock.patch.object(cloud_gate, 'process_start', return_value=Started('fixture-start')):
+            self.assertEqual(worker.execute(self.folder, self.request, self.deployment)['status'], 'complete')
+        self.assertEqual(confirmed_ledgers, [self.book.path.read_bytes()])
+
+    def test_reconcile_command_ends_an_expired_gate_and_launches_no_box(self) -> None:
+        self.record_running_gate('expired', 'm7a.8xlarge', 'us-east-2')
+        api = AwsCli('fixture', 'us-east-2', 1, execute=self.fake)
+        arguments = ['cloud_gate', '--reconcile', '--directory', str(self.state), '--settings', str(self.settings)]
+        with mock.patch.object(sys, 'argv', arguments), mock.patch.object(cloud_gate, 'AwsCli', return_value=api):
+            self.assertEqual(cloud_gate.main(), 0)
+        worker = ['cloud_gate', '--worker', str(self.folder), '--directory', str(self.state)]
+        with (mock.patch.object(sys, 'argv', worker), redirect_stderr(StringIO()) as error,
+              self.assertRaises(SystemExit) as refused):
+            _ = cloud_gate.main()
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn('--worker and --cleanup require --sidecar', error.getvalue())
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
+        operations = {command[command.index('--region') + 3] for command in self.fake.commands}
+        self.assertEqual(operations, {'terminate-instances', 'describe-instances'})
+        self.assertEqual(self.fake.launches, [])
 
     def test_reconcile_closes_the_missing_box_in_a_batch(self) -> None:
         worker, _ = self.steering_fixture()
@@ -1190,15 +2382,53 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
 
     def test_each_log_download_publishes_module_progress(self) -> None:
-        self.fake.log = ('Runner: 1 modules, whole machine, 32 CPUs\n'
-                         + 'fixture/test_ok.py exit=0 seconds=1.00\n')
-        with mock.patch.object(progress_profile, 'publish_counter', wraps=progress_profile.publish_counter) as publish:
-            self.assertEqual(self.execute()['status'], 'complete')
+        config = self.root / 'cloud_gate.conf'
+        _ = config.write_text(re.sub(r'(?m)^instance_check_s=.*$', 'instance_check_s=6', config.read_text()))
+        self.fake.has_log = False
+        self.fake.has_result = False
+        self.fake.log = 'Runner: 1 modules, whole machine, 32 CPUs\n'
+        started = self.now
+        polls: dict[float, list[str]] = {}
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            elapsed = self.now - started
+            if 'list-objects-v2' in arguments:
+                self.assertEqual(arguments[arguments.index('--prefix') + 1], 'artifacts/attempt/')
+                self.assertEqual(arguments[arguments.index('--bucket') + 1], 'fixture-bucket')
+                polls.setdefault(elapsed, []).append('list-objects-v2')
+            elif 'get-object' in arguments:
+                polls[elapsed].append(arguments[arguments.index('--key') + 1].rsplit('/', 1)[-1])
+            elif 'describe-instances' in arguments and self.fake.launches and not self.fake.terminated:
+                polls.setdefault(elapsed, []).append('describe-instances')
+            return self.fake(arguments, **options)
+
+        def advance_poll(seconds: float) -> None:
+            self.advance(seconds)
+            elapsed = self.now - started
+            self.fake.has_log = elapsed >= 2
+            if elapsed == 6:
+                self.fake.log += 'fixture/test_ok.py exit=0 seconds=1.00\n'
+            self.fake.has_result = elapsed >= 10
+
         sidecar = self.folder / 'reservation.cgroup'
-        counter = progress_profile.ProgressCounter('modules', 1, 1)
-        self.assertEqual(progress_profile.read_counter(sidecar), counter)
-        self.assertEqual(publish.call_count, 2)
-        publish.assert_has_calls([mock.call(sidecar, counter), mock.call(sidecar, counter)])
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=transport),
+            self.book, self.settings, sidecar, clock=lambda: self.now, pause=advance_poll)
+        with (mock.patch.object(time, 'monotonic', side_effect=lambda: self.now),
+              mock.patch.object(progress_profile, 'publish_counter', wraps=progress_profile.publish_counter) as publish):
+            self.assertEqual(worker.execute(self.folder, self.request, self.deployment)['status'], 'complete')
+        self.assertEqual(polls, {
+            0: ['describe-instances', 'list-objects-v2'],
+            2: ['list-objects-v2', 'gate.log'],
+            4: ['list-objects-v2'],
+            6: ['describe-instances', 'list-objects-v2', 'gate.log'],
+            8: ['list-objects-v2'],
+            10: ['list-objects-v2', 'result.json', 'gate.log'],
+        })
+        started_counter = progress_profile.ProgressCounter('modules', 0, 1)
+        finished_counter = progress_profile.ProgressCounter('modules', 1, 1)
+        self.assertEqual(progress_profile.read_counter(sidecar), finished_counter)
+        self.assertEqual(publish.call_args_list, [mock.call(sidecar, counter)
+            for counter in (started_counter, finished_counter, finished_counter)])
 
     def test_module_progress_counts_each_module_once(self) -> None:
         text = ('Runner: 2 modules, whole machine, 16 CPUs\n'
@@ -1209,6 +2439,27 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertIsInstance(cloud_gate.log_progress('Preparing tools\n'), progress_profile.NoCounter)
         self.assertIsInstance(cloud_gate.log_progress('Runner: 0 modules, whole machine, 32 CPUs\n'),
                               progress_profile.NoCounter)
+
+    def test_module_progress_counts_a_path_with_a_space(self) -> None:
+        log = ('Runner: 1 modules, whole machine, 16 CPUs\n'
+               + 'fixture/test_has space.py exit=0 seconds=1.00\n')
+        self.assertEqual(cloud_gate.log_progress(log), progress_profile.ProgressCounter('modules', 1, 1))
+
+    def test_module_progress_excludes_the_type_check(self) -> None:
+        log = ('Runner: 2 modules, whole machine, 16 CPUs\n'
+               + 'fixture/test_one.py exit=0 seconds=1.00\n'
+               + 'types/basedpyright exit=1 seconds=2.00\n')
+        self.assertEqual(cloud_gate.log_progress(log), progress_profile.ProgressCounter('modules', 1, 2))
+
+    def test_module_progress_ignores_malformed_numbers(self) -> None:
+        oversized = '9' * 5000
+        log = ('Runner: 2 modules, whole machine, 16 CPUs\n'
+               + f'Runner: {oversized} modules, whole machine, 16 CPUs\n'
+               + f'Runner: 1 modules, whole machine, {oversized} CPUs\n'
+               + 'fixture/test_one.py exit=0 seconds=1.00\n'
+               + f'fixture/test_two.py exit={oversized} seconds=1.00\n'
+               + 'fixture/test_three.py exit=0 seconds=unavailable\n')
+        self.assertEqual(cloud_gate.log_progress(log), progress_profile.ProgressCounter('modules', 1, 2))
 
     def test_each_log_download_publishes_cloud_state_and_latest_failures(self) -> None:
         self.fake.log = ('Runner: 2 modules, whole machine, 16 CPUs\n'
@@ -1233,9 +2484,9 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         expected = cloud_progress.CloudProgress('uploading', 16, 1, self.now,
             stage='uploading', region='fixture-region', zone='a')
         self.assertEqual(cloud_progress.read(sidecar), expected)
-        self.assertEqual(publish.call_args_list[-2:], [mock.call(sidecar, expected), mock.call(sidecar, expected)])
+        self.assertEqual(publish.call_args_list[-1], mock.call(sidecar, expected))
         states = [cast(cloud_progress.CloudProgress, call.args[1]).state for call in publish.call_args_list]
-        self.assertEqual(states, ['requesting', 'requesting', 'uploading', 'uploading'])
+        self.assertEqual(states, ['requesting', 'requesting', 'uploading'])
 
     def test_paired_log_uses_the_last_stage_without_changing_merge_failure_counts(self) -> None:
         boot = ('2026-11-12T13:57:00Z stage=boot\n'
@@ -1279,11 +2530,11 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         with mock.patch.object(cloud_progress, 'publish', wraps=cloud_progress.publish) as publish:
             self.assertEqual(worker.execute(self.folder, self.request, self.deployment)['status'], 'complete')
         updates = [cast(cloud_progress.CloudProgress, call.args[1]) for call in publish.call_args_list]
-        self.assertTrue(all((row.region, row.zone) == ('', '') for row in updates[:-3]))
-        self.assertEqual(updates[-3], cloud_progress.CloudProgress('requesting', 32, 0, self.now,
+        self.assertTrue(all((row.region, row.zone) == ('', '') for row in updates[:-2]))
+        self.assertEqual(updates[-2], cloud_progress.CloudProgress('requesting', 32, 0, self.now,
             stage='launch', region='us-west-2', zone='us-west-2a'))
-        self.assertTrue(all((row.region, row.zone, row.stage) == ('us-west-2', 'us-west-2a', 'round 2 of 3 base')
-                            for row in updates[-2:]))
+        final = updates[-1]
+        self.assertEqual((final.region, final.zone, final.stage), ('us-west-2', 'us-west-2a', 'round 2 of 3 base'))
         saved = cloud_gate.read(self.folder / 'launch.json')
         self.assertEqual((saved['region'], saved['zone']), ('us-west-2', 'us-west-2a'))
 
@@ -1296,7 +2547,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         with mock.patch.object(cloud_progress, 'publish', wraps=cloud_progress.publish) as publish:
             self.assertEqual(self.execute()['status'], 'complete')
         sizes = [cast(cloud_progress.CloudProgress, call.args[1]).size_vcpus for call in publish.call_args_list]
-        self.assertEqual(sizes, [32, 32, 16, 16, 16, 16, 16])
+        self.assertEqual(sizes, [32, 32, 16, 16, 16, 16])
 
     def test_instance_and_volume_tags_use_the_machine_name(self) -> None:
         self.assertEqual(self.execute()['status'], 'complete')
@@ -1353,19 +2604,46 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(choices, [('m7a.8xlarge', 'fixture-a'), ('m7a.8xlarge', 'fixture-b'),
                                    ('m7a.4xlarge', 'fixture-a'), ('m7a.4xlarge', 'fixture-b')])
         self.assertEqual(self.book.launches()[-1], {'time': self.now, 'attempt': 'attempt',
-            'instance_type': 'm7a.4xlarge', 'vcpus': 16, 'result': 'finished', 'gate_s': 1.0, 'mode': 'merge-gate', 'region': 'fixture-region'})
+            'instance_type': 'm7a.4xlarge', 'vcpus': 16, 'result': 'finished', 'gate_s': 1.0, 'mode': 'gate',
+            'region': 'fixture-region', 'gate_job': {'kind': 'GateJobNotRecorded'}})
         spends = self.book.spend_days(read_settings(self.settings), int(self.now))
         self.assertEqual(sum(day.runs for day in spends), 1)
         self.assertEqual(self.book.read_snapshot().gate_reservations[0].instance_type, 'm7a.4xlarge')
 
-    def test_targeted_run_records_mode_in_every_event(self) -> None:
-        self.request['mode'] = 'targeted-test'
+    def test_targeted_run_records_mode_and_gate_job_in_every_event(self) -> None:
+        self.request['mode'] = gate.SuiteMode.TARGETED.wire
+        job_record = {'kind': 'StepJob', 'step': 'test-affected', 'unit': '', 'branch': '', 'modules': 0}
+        self.request['gate_job'] = job_record
         cloud_gate.save(self.folder / 'request.json', self.request)
         self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture']
         self.assertEqual(self.execute()['status'], 'complete')
         rows = self.book.launches()
         self.assertEqual([row['result'] for row in rows], ['refused', 'launched', 'finished'])
-        self.assertTrue(all(row['mode'] == 'targeted-test' for row in rows))
+        self.assertTrue(all(row['mode'] == gate.SuiteMode.TARGETED.value for row in rows))
+        self.assertEqual([row['gate_job'] for row in rows], [job_record] * 3)
+
+    def test_worker_completes_when_the_request_job_is_unreadable(self) -> None:
+        jobs: tuple[tuple[str, object], ...] = (
+            ('unknown', {'kind': 'FutureGateJob'}),
+            ('damaged', {'kind': 'StepJob', 'step': 'test-all', 'modules': []}),
+        )
+        for attempt, job in jobs:
+            with self.subTest(attempt=attempt):
+                folder = self.root / attempt
+                folder.mkdir()
+                request = {**self.request, 'attempt': attempt, 'gate_job': job, 'source_key': ''}
+                cloud_gate.save(folder / 'request.json', request)
+                fake = FakeGateAws()
+                fake.result = {**self.result(), 'attempt': attempt}
+                ledger.mapping(fake.result['record'])['id'] = 'gate-' + attempt
+                worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=fake),
+                    self.book, self.settings, folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
+                with mock.patch.object(worker, 'reconcile', wraps=worker.reconcile) as reconcile:
+                    self.assertEqual(worker.execute(folder, request, self.deployment)['status'], 'complete')
+                reconcile.assert_called_once_with()
+                rows = [row for row in self.book.launches() if row['attempt'] == attempt]
+                self.assertEqual([row['result'] for row in rows], ['launched', 'finished'])
+                self.assertEqual([row['gate_job'] for row in rows], [{'kind': 'GateJobNotRecorded'}] * 2)
 
     def test_all_capacity_refusals_allow_local_fallback(self) -> None:
         self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture'] * 4
@@ -1375,7 +2653,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         rows = [ledger.mapping(cast(object, json.loads(line)))
                 for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
         self.assertEqual(len(rows), 4)
-        self.assertTrue(all(row['mode'] == 'merge-gate' for row in rows))
+        self.assertTrue(all(row['mode'] == 'gate' for row in rows))
         self.assertTrue(all(row['result'] == 'refused' for row in rows))
         self.assertEqual(output.getvalue().count('Cloud gate refused:'), 4)
 
@@ -1392,8 +2670,9 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
         evidence = cloud_gate.read(self.folder / 'launch.json')['spot_price_reads']
         self.assertEqual(rows, [{'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
-            'vcpus': 32, 'availability_zone': 'a', 'result': 'refused', 'mode': 'merge-gate', 'error_code': 'InvalidParameterValue',
-            'reason': reason, 'region': 'fixture-region', 'spot_price_reads': evidence}])
+            'vcpus': 32, 'availability_zone': 'a', 'result': 'refused', 'mode': 'gate', 'error_code': 'InvalidParameterValue',
+            'reason': reason, 'region': 'fixture-region', 'spot_price_reads': evidence,
+            'gate_job': {'kind': 'GateJobNotRecorded'}}])
         self.assertEqual(output.getvalue(), 'Cloud gate refused: m7a.8xlarge in a: InvalidParameterValue\n')
         for private in ('123456789012', 'subnet-fixture', 'i-private', 'RED'):
             self.assertNotIn(private, output.getvalue() + str(outcome))
@@ -1404,13 +2683,18 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
         evidence = cloud_gate.read(self.folder / 'launch.json')['spot_price_reads']
         self.assertEqual(rows, [{'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
-            'vcpus': 32, 'availability_zone': 'a', 'result': 'launched', 'error_code': '', 'reason': '', 'mode': 'merge-gate',
-            'region': 'fixture-region', 'spot_price_reads': evidence},
+            'vcpus': 32, 'availability_zone': 'a', 'result': 'launched', 'error_code': '', 'reason': '', 'mode': 'gate',
+            'region': 'fixture-region', 'spot_price_reads': evidence, 'gate_job': {'kind': 'GateJobNotRecorded'}},
             {'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
-             'vcpus': 32, 'result': 'finished', 'gate_s': 1.0, 'mode': 'merge-gate', 'region': 'fixture-region'}])
+             'vcpus': 32, 'result': 'finished', 'gate_s': 1.0, 'mode': 'gate', 'region': 'fixture-region',
+             'gate_job': {'kind': 'GateJobNotRecorded'}}])
         data = ledger.text(self.fake.launches[0], 'UserData')
         self.assertTrue(data.startswith('#!/bin/sh\n'))
-        links = ledger.mapping(cast(object, json.loads(data.split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0])))
+        link_rows = data.split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0]
+        links: dict[str, object] = {}
+        for line in link_rows.splitlines():
+            name, _, _, value = line.split('\t', 3)
+            links[cast(str, json.loads(name))] = cast(object, json.loads(value))
         for key in ('guest', 'request', 'source', 'log', 'result', 'boot_error'):
             parsed = urlsplit(ledger.text(links, key))
             query = parse_qs(parsed.query)
@@ -1591,6 +2875,93 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(self.execute(), {'status': 'fallback', 'reason': 'The instance stopped without a final result'})
         self.assertTrue(self.fake.terminated)
 
+    def test_a_silent_box_ends_as_unreachable_and_frees_its_place(self) -> None:
+        _ = write_config_fixture(self.root / 'build_targets.conf', f'{target_config.UNREACHABLE_WAIT_KEY}=30\n')
+        self.fake.has_result = False
+        started = self.now
+        with mock.patch.object(time, 'monotonic', side_effect=lambda: self.now):
+            outcome = self.execute()
+        self.assertEqual(outcome['status'], 'fallback')
+        self.assertRegex(str(outcome['reason']),
+                         r'^unreachable: the box sent no log for 3\d seconds \(unreachable_wait_seconds=30\)$')
+        self.assertLess(self.now - started, 40)
+        self.assertTrue(self.fake.terminated)
+
+    def test_a_box_that_keeps_sending_its_log_is_not_unreachable(self) -> None:
+        _ = write_config_fixture(self.root / 'build_targets.conf', f'{target_config.UNREACHABLE_WAIT_KEY}=30\n')
+        self.fake.has_result = False
+        started = self.now
+
+        def pause(seconds: float) -> None:
+            # The box pushes a heartbeat line each pause and its result after 90 seconds.
+            self.now += seconds
+            self.fake.log += 'heartbeat\n'
+            self.fake.has_result = self.now - started >= 90
+
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=pause)
+        with (mock.patch.object(time, 'monotonic', side_effect=lambda: self.now),
+              redirect_stdout(StringIO())):
+            outcome = worker.execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'complete')
+        self.assertGreaterEqual(self.now - started, 90)
+
+    def test_a_paired_trial_that_pauses_its_log_is_not_unreachable(self) -> None:
+        # A paired trial stops its log pushes while it measures; only the EC2 state shows that it lives.
+        _ = write_config_fixture(self.root / 'build_targets.conf', f'{target_config.UNREACHABLE_WAIT_KEY}=30\n')
+        request = self.request
+        request.update(task='paired', base={'commit': 'base', 'tree': 'base-tree'},
+                       changed={'commit': 'commit', 'tree': 'tree'}, module='fixture/test_ok.py', rounds=1)
+        sample = {'module': 'fixture/test_ok.py', 'variant': 'base', 'round': 1, 'cpu_s': 1.0,
+                  'peak_mib': 1.0, 'wall_s': 1.0, 'status': 0, 'tests': 1, 'failures': 0, 'errors': 0,
+                  'instance_type': 'm7a.8xlarge', 'box': ''}
+        self.fake.result = {**request, 'runs': [sample, {**sample, 'variant': 'changed'}], 'verdict': 'pass',
+                            'gate_s': 2.0}
+        cloud_gate.save(self.folder / 'request.json', request)
+        self.fake.has_result = False
+        started = self.now
+
+        def pause(seconds: float) -> None:
+            self.now += seconds
+            self.fake.has_result = self.now - started >= 90
+
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=pause)
+        with (mock.patch.object(time, 'monotonic', side_effect=lambda: self.now),
+              redirect_stdout(StringIO())):
+            outcome = worker.execute(self.folder, request, self.deployment)
+        self.assertEqual(outcome['status'], 'complete')
+        self.assertGreaterEqual(self.now - started, 90)
+
+    def test_time_when_s3_cannot_be_read_is_not_silence(self) -> None:
+        _ = write_config_fixture(self.root / 'build_targets.conf', f'{target_config.UNREACHABLE_WAIT_KEY}=30\n')
+        self.fake.has_result = False
+        started = self.now
+
+        def pause(seconds: float) -> None:
+            # S3 lists time out for 60 seconds; the box pushes again after S3 recovers and then sends its result.
+            self.now += seconds
+            elapsed = self.now - started
+            if elapsed < 60:
+                self.fake.read_timeouts = ['list-objects-v2']
+            elif elapsed >= 70:
+                self.fake.log += 'heartbeat\n'
+                self.fake.has_result = elapsed >= 80
+
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=pause)
+        with (mock.patch.object(time, 'monotonic', side_effect=lambda: self.now),
+              redirect_stdout(StringIO())):
+            outcome = worker.execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'complete')
+
+    def test_a_bad_unreachable_wait_launches_no_box(self) -> None:
+        _ = write_config_fixture(self.root / 'build_targets.conf', f'{target_config.UNREACHABLE_WAIT_KEY}=0\n')
+        outcome = self.execute()
+        self.assertEqual(outcome['status'], 'fallback')
+        self.assertIn(target_config.UNREACHABLE_WAIT_KEY, str(outcome['reason']))
+        self.assertEqual(self.fake.launches, [])
+
     def test_stopped_instance_reports_a_confirmed_spot_interruption(self) -> None:
         self.fake.has_result = False
         self.fake.state = 'shutting-down'
@@ -1744,6 +3115,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 run = gate.GateRun((passed,), 3, 2, executions=(failed, passed) if retried else (passed,))
                 result = self.result()
                 result['gate'] = gate_box.encode_run(run)
+                # An older box names the step merge-gate; the store keeps the new name.
                 result['record'] = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'fixture-guest',
                                                              self.now, self.now + 3, 'merge-gate')
                 _ = destination.write_text('{"interrupted":')
@@ -1762,7 +3134,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                     self.assertEqual(json.loads(gzip.decompress((buildlog / kept_result).read_bytes())), result)
                 records = [ledger.mapping(cast(object, json.loads(line))) for line in destination.read_text().splitlines()]
                 self.assertEqual([row['id'] for row in records], ['gate-attempt'])
-                self.assertEqual(records[0]['host'], 'fixture-guest')
+                self.assertEqual((records[0]['host'], records[0]['step']), ('fixture-guest', 'gate'))
                 modules = ledger.rows(records[0], 'modules')
                 if retried:
                     first, second = modules
@@ -1855,24 +3227,42 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         rows = [ledger.mapping(cast(object, json.loads(line))) for line in destination.read_bytes().splitlines()]
         self.assertEqual([row['id'] for row in rows], ['older-record', 'gate-attempt'])
 
+    def gate_checkout(self) -> Path:
+        repo = self.root / 'repo'
+        repo.mkdir()
+        _ = gate.checked_git(repo, 'init', '-q')
+        _ = commit_repository(repo, 'Fixture checkout', allow_empty=True)
+        return repo
+
     def test_remote_red_never_calls_the_local_runner(self) -> None:
+        repo = self.gate_checkout()
         remote = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 1, 1, ''),), 1, 1)
-        for mode, full in ((gate.SuiteMode.MERGE_GATE, False), (gate.SuiteMode.TARGETED_TEST, True)):
+        for mode, full in ((gate.SuiteMode.GATE, False), (gate.SuiteMode.TARGETED, True)):
             with (self.subTest(mode=mode, full=full),
-                  mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.CloudCompleted(remote)) as run,
+                  mock.patch.object(cloud_gate, 'route', return_value=remote) as run,
                   mock.patch.object(gate, 'select_affected', side_effect=AssertionError('The full suite needs no selection')),
                   mock.patch.object(gate, 'run_suites') as local):
-                self.assertEqual(gate.run_gate_suites(self.root, mode=mode, full=full), remote)
-            local.assert_not_called()
-            self.assertIsInstance(cast(object, run.call_args.kwargs['selected']), gate.AllModules)
+                self.assertEqual(gate.run_gate_suites(repo, mode=mode, full=full, target=aws_gate_assignment()), remote)
+                local.assert_not_called()
+                run.assert_called_once()
+                self.assertIsInstance(cast(object, run.call_args.kwargs['selected']), gate.AllModules)
 
-    def test_allowed_fallback_calls_the_original_local_runner(self) -> None:
-        with (mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.LocalFallback('AWS is down')),
+    def test_unassigned_gate_calls_the_local_runner(self) -> None:
+        repo = self.gate_checkout()
+        with (mock.patch.object(cloud_gate, 'run') as cloud,
               mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO())):
-            _ = gate.run_gate_suites(self.root, full=True, mode=gate.SuiteMode.TARGETED_TEST)
+            _ = gate.run_gate_suites(repo, full=True, mode=gate.SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
+        cloud.assert_not_called()
         self.assertTrue(local.call_args.kwargs['full'])
-        self.assertEqual(local.call_args.kwargs['mode'], gate.SuiteMode.TARGETED_TEST)
+        self.assertEqual(local.call_args.kwargs['mode'], gate.SuiteMode.TARGETED)
 
+    def test_an_aws_refusal_does_not_run_the_local_runner(self) -> None:
+        repo = self.gate_checkout()
+        with (mock.patch.object(cloud_gate, 'route', return_value='AWS is down'),
+              mock.patch.object(gate, 'run_suites') as local,
+              self.assertRaisesRegex(GateRefused, 'AWS is down')):
+            _ = gate.run_gate_suites(repo, full=True, mode=gate.SuiteMode.TARGETED, target=aws_gate_assignment())
+        local.assert_not_called()
 
     def test_paired_result_uses_shared_worker_and_confirms_cleanup(self) -> None:
         request = self.request
@@ -1881,7 +3271,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         sample = {'module': 'fixture/test_ok.py', 'variant': 'base', 'round': 1, 'cpu_s': 1.0,
                   'peak_mib': 1.0, 'wall_s': 1.0, 'status': 0, 'tests': 1, 'failures': 0, 'errors': 0,
                   'instance_type': 'm7a.8xlarge', 'box': ''}
-        self.fake.result = {**request, 'runs': [sample, {**sample, 'variant': 'changed'}], 'verdict': 'pass', 'gate_s': 2.0}
+        self.fake.result = {**request, 'runs': [sample, {**sample, 'variant': 'changed'}], 'verdict': 'pass',
+                            'gate_s': 2.0, 'log_error': 'The log PUT timed out'}
         cloud_gate.save(self.folder / 'request.json', request)
         reply = self.execute()
         self.assertEqual(reply['status'], 'complete')
@@ -1889,6 +3280,30 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         result = cloud_gate.outcome_result(self.folder, reply)
         self.assertTrue(all(row['box'] == 'i-fixture' for row in ledger.rows(result, 'runs')))
         self.assertNotIn('record', result)
+
+    def test_paired_worker_resume_keeps_a_missing_job(self) -> None:
+        request = {**self.request, 'task': 'paired', 'base': {'commit': 'base', 'tree': 'base-tree'},
+                   'changed': {'commit': 'commit', 'tree': 'tree'}, 'module': 'fixture/test_ok.py', 'rounds': 1}
+        cloud_gate.save(self.folder / 'request.json', request)
+        cloud_gate.save(self.folder / 'deployment.json', self.deployment)
+        cloud_gate.save(self.folder / 'launch.json', {'instance': 'i-attempt', 'region': 'fixture-region',
+                                                       'arguments': {'InstanceType': 'm7a.8xlarge'}})
+        self.record_running_gate('attempt', 'm7a.8xlarge', 'fixture-region')
+        self.fake.result = {**request, 'runs': [], 'verdict': 'error', 'gate_s': 1.0}
+        worker = cloud_gate.GateWorker(AwsCli('fixture-scaler', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
+        connection = mock.Mock(recv=mock.Mock(return_value='launch'))
+        group = CloudGroup('fixture', 1, self.now, Owner(1, 'fixture'))
+        with (mock.patch.object(cloud_gate, 'GateWorker', return_value=worker),
+              mock.patch.object(cloud_gate, 'cloud_reservation',
+                                return_value=nullcontext(cloud_gate.CloudReservation(worker.sidecar)))):
+            aws_trial.paired_module(self.folder, self.state, self.settings, connection, group=group)
+
+        self.assertEqual(cloud_gate.read(self.folder / 'outcome.json')['status'], 'complete')
+        self.assertEqual(cloud_gate.read(self.folder / 'request.json'), request)
+        self.assertEqual(self.fake.launches, [])
+        row, = self.book.launches()
+        self.assertEqual((row['result'], row['gate_job']), ('finished', {'kind': 'GateJobNotRecorded'}))
 
     def test_paired_cancellation_after_recorded_launch_cleans_before_slot_release(self) -> None:
         import multiprocessing
@@ -2268,8 +3683,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(aws_trial.trial_cost(self.book, {'uncertain'}, self.settings, int(self.now) + 2), (Decimal(0), True))
 
     def test_paired_coordinator_interrupt_and_kill_cleanup(self) -> None:
-        script = r'''import json, multiprocessing, os, signal, sys
-from collections.abc import Generator
+        script = r'''import faulthandler, multiprocessing, os, signal, sys, threading, time
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
@@ -2278,9 +3692,26 @@ from scripts.aws_target.aws_target import AwsCli
 from scripts.aws_target.test_cloud_gate import FakeGateAws
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 folder, directory, settings = map(Path, sys.argv[1:4])
-at, number = float(sys.argv[4]), int(sys.argv[5])
+at, number, before_launch = float(sys.argv[4]), int(sys.argv[5]), bool(int(sys.argv[6]))
 coordinator = os.getpid()
 barrier = multiprocessing.get_context('fork').Barrier(2)
+reserve_trial = aws_trial.reserve_trial
+paired_module = aws_trial.paired_module
+trace_at = float(sys.argv[7])
+
+def reserve(*args, **kwargs):
+    if before_launch:
+        os.kill(coordinator, number)
+    return reserve_trial(*args, **kwargs)
+
+def trace_worker(folder, *args, **kwargs):
+    with (folder / 'worker-stacks.log').open('w') as stacks:
+        faulthandler.dump_traceback_later(max(0.001, trace_at - time.monotonic()), file=stacks)
+        try:
+            paired_module(folder, *args, **kwargs)
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
 @contextmanager
 def slot(repo, sidecar, job, *, group):
     assert job == aws_trial.PAIRED_TRIAL_JOB
@@ -2293,51 +3724,54 @@ def create_api(*args, **kwargs):
     fake = FakeGateAws()
     fake.has_result = False
     def execute(arguments, **options):
+        assert not before_launch or 'run-instances' not in arguments
         reply = fake(arguments, **options)
-        if 'get-object' in arguments and arguments[arguments.index('--key') + 1].endswith('/result.json'):
+        if 'list-objects-v2' in arguments:
             turn = barrier.wait(timeout=TEST_HANG_GUARD_SECS)
             if turn == 0:
                 os.kill(coordinator, number)
             if number != signal.SIGINT:
                 os._exit(0)
-            signal.pause()
+            if not threading.Event().wait(TEST_HANG_GUARD_SECS):
+                raise AssertionError('The coordinator did not stop the worker')
         return reply
     return AwsCli('fixture', 'us-east-1', 1, execute=execute)
 with (mock.patch.object(aws_trial, 'AwsCli', side_effect=create_api),
+      mock.patch.object(aws_trial, 'reserve_trial', side_effect=reserve),
+      mock.patch.object(aws_trial, 'paired_module', side_effect=trace_worker),
       mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=slot),
       mock.patch.object(cloud_gate.GateWorker, 'charges'), mock.patch.object(cloud_gate.GateWorker, 'reconcile'),
       mock.patch.object(aws_trial.time, 'time', return_value=at)):
     raise SystemExit(aws_trial.coordinate_trial(folder, directory, settings))
 '''
-        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
-            with self.subTest(number=number):
-                cohort = self.root / ('cancel-cohort-' + str(number))
+        for number, before_launch in ((signal.SIGKILL, True), (signal.SIGINT, False),
+                                      (signal.SIGTERM, False), (signal.SIGKILL, False)):
+            with self.subTest(number=number, before_launch=before_launch):
+                cohort = self.root / f'cancel-cohort-{number}-{before_launch}'
                 cohort.mkdir()
-                for name in (str(number) + '-first', str(number) + '-second'):
+                attempts = (cohort.name + '-first', cohort.name + '-second')
+                for name in attempts:
                     folder = cohort / name
                     folder.mkdir()
                     request = {**self.request, 'attempt': name, 'task': 'paired', 'rounds': 1, 'module': name + '/test_ok.py',
                                'base': {'commit': 'base', 'tree': 'base-tree'}, 'changed': {'commit': 'commit', 'tree': 'tree'}}
                     cloud_gate.save(folder / 'request.json', request)
                     cloud_gate.save(folder / 'deployment.json', self.deployment)
-                with subprocess.Popen([sys.executable, '-c', script, str(cohort), str(self.state), str(self.settings),
-                                       str(self.now), str(number)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True, start_new_session=True) as process:
-                    try:
-                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                    except subprocess.TimeoutExpired:
-                        try:
-                            send_process_group(process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                        self.fail('The cancellation fixture did not exit.\n' + stderr)
-                self.assertEqual(process.returncode, 1 if number == signal.SIGINT else -number, stderr)
+                result = self.watchdog.run_trial([sys.executable, '-c', script, str(cohort), str(self.state),
+                    str(self.settings), str(self.now), str(number), str(int(before_launch))],
+                    tuple(cohort / name / 'worker-stacks.log' for name in attempts))
+                stdout, stderr = result.stdout, result.stderr
+                self.assertEqual(result.returncode, 1 if number == signal.SIGINT else 128 + number, stderr)
+                if before_launch:
+                    for name in attempts:
+                        self.assertTrue((cohort / name / 'released').is_file(), stderr)
+                        self.assertFalse((cohort / name / 'launch.json').exists())
+                    continue
                 api = AwsCli('fixture', 'us-east-1', 1, execute=FakeGateAws())
                 with mock.patch.object(aws_trial, 'AwsCli', return_value=api):
                     self.assertEqual(aws_trial.main(['--paired-cleanup', str(cohort)], self.settings, self.state), 0)
                 reservations = [row for row in self.book.read_snapshot().gate_reservations
-                                if row.attempt in (str(number) + '-first', str(number) + '-second')]
+                                if row.attempt in attempts]
                 self.assertEqual(len(reservations), 2)
                 self.assertTrue(all(isinstance(row.state, ledger.GateTerminated) for row in reservations),
                     repr(reservations) + stderr + repr([cloud_gate.read(path) for path in cohort.glob('*/outcome.json')]))
@@ -2350,37 +3784,562 @@ with (mock.patch.object(aws_trial, 'AwsCli', side_effect=create_api),
                     if path.name not in ('request.json', 'deployment.json'):
                         path.unlink()
 
-class CloudRouteTests(CostFixture):
+
+class CloudGateWatchdogTests(CostFixture):
+    def test_fixture_watchdog_reports_and_stops_a_blocked_trial(self) -> None:
+        worker = r'''import faulthandler, sys, threading
+
+def wait_for_watchdog():
+    with open(sys.argv[1], 'w') as stacks:
+        faulthandler.dump_traceback(file=stacks)
+    threading.Event().wait()
+
+wait_for_watchdog()
+'''
+        watchdog = CloudGateFixtureWatchdog('blocked trial', limit_seconds=2.0)
+        stacks = self.root / 'worker-stacks.log'
+        stacks.touch()
+        with (TemporaryFile() as report,
+              mock.patch.object(sys.modules[__name__], 'send_process_group', wraps=send_process_group) as stop,
+              watchdog.trial([sys.executable, '-c', worker, str(stacks)], reap_timeout=WATCHDOG_RESULT_TIMEOUT_SECS,
+                             worker_stacks=(stacks,)) as (process, _),
+              selectors.DefaultSelector() as stdout_ready):
+            assert process.stdout is not None
+            _ = stdout_ready.register(process.stdout, selectors.EVENT_READ)
+            try:
+                wait_until(lambda: 'in wait_for_watchdog' in stacks.read_text(), self.root,
+                           WATCHDOG_RESULT_TIMEOUT_SECS, watch_writes=True)
+            except TimeoutError:
+                self.fail('The blocked worker did not write its stack')
+            with mock.patch.object(os, '_exit') as exit_process, watchdog.watch(report_fd=report.fileno()):
+                self.assertTrue(stdout_ready.select(WATCHDOG_RESULT_TIMEOUT_SECS), 'The worker kept its pipe open')
+                self.assertEqual(os.read(process.stdout.fileno(), 1), b'')
+            exit_process.assert_called_once_with(1)
+            self.assertEqual(process.returncode, -signal.SIGKILL)
+            _ = report.seek(0)
+            output = report.read().decode(errors='replace')
+            self.assertIn('cloud gate fixture watchdog expired', output)
+            self.assertIn('in wait_for_watchdog', output)
+        stop.assert_called_once_with(process.pid, signal.SIGKILL)
+
+
+class GateDispatchJournalTests(unittest.TestCase):
+    def test_assigned_route_preserves_a_verdict_with_open_settlement(self) -> None:
+        assignment = aws_gate_assignment().assignment
+        claim = placement.assigned_claim_reference(assignment)
+        root = Path('/fixture')
+        binding = ledger.GateDispatchBinding(claim, root / 'journal.json', root / 'aws',
+                                             root / 'build_targets.conf', root / 'aws_target.conf')
+        dispatch = cloud_gate.AssignedCloudGate(binding, placement.ClaimHolderIdentity('fixture', 1, '1'))
+        pending = placement.DispatchPathPending('The worker\n\tstill holds the lock')
+        declined = cloud_gate.CloudDeclined('No worker verdict')
+
+        with (mock.patch.object(cloud_gate, 'begin_assigned_gate', return_value=dispatch),
+              mock.patch.object(ledger.GateDispatchJournal, 'settle', return_value=pending) as settle,
+              mock.patch.object(admission_client, 'consume_permission', return_value=wire.FirstAuthorization(assignment, claim)),
+              mock.patch.object(admission_client, 'report_execution') as report,
+              mock.patch.object(cloud_gate, 'run') as run):
+            for status in (0, 1):
+                with self.subTest(status=status), redirect_stderr(StringIO()) as errors:
+                    verdict = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', status, 1, ''),), 1, 2)
+                    run.return_value = cloud_gate.CloudCompleted(verdict)
+                    result = cloud_gate.route(root, mode=gate.SuiteMode.GATE, full=True,
+                                              module_time_limit_s=10, assignment=assignment)
+                    self.assertIs(result, verdict)
+                    self.assertEqual(errors.getvalue(), 'AWS gate settlement remains open. The worker still holds the lock\n')
+                    report.assert_called_once()
+                    sent = cast(wire.ExecutionReport, report.call_args.args[0])
+                    self.assertEqual((sent.claim, sent.outcome, sent.path),
+                                     (claim, placement.AttemptCompleted(status), pending))
+                    report.reset_mock()
+
+            run.return_value = declined
+            with redirect_stderr(StringIO()) as errors, self.assertRaises(gate.AwsGateLaunchPending) as raised:
+                _ = cloud_gate.route(root, mode=gate.SuiteMode.GATE, full=True,
+                                     module_time_limit_s=10, assignment=assignment)
+            self.assertEqual(str(raised.exception), f'{pending.reason}. {declined.reason}')
+            self.assertEqual(errors.getvalue(), '')
+            report.assert_called_once()
+            sent = cast(wire.ExecutionReport, report.call_args.args[0])
+            self.assertEqual((sent.claim, sent.outcome, sent.path),
+                             (claim, placement.AttemptDeclined(declined.reason), pending))
+            self.assertEqual(settle.call_args_list, [mock.call(claim, dispatch.holder)] * 3)
+
+    def test_assigned_route_reports_no_launch_or_an_unknown_result(self) -> None:
+        for launch_pending in (False, True):
+            with self.subTest(launch_pending=launch_pending), TemporaryDirectory() as directory:
+                root = Path(directory)
+                sidecar = root / 'progress'
+                assignment = placement.PlacementAssignment('episode', 'attempt',
+                    placement.PlacementDestination('scaler', 'aws', 'aws', WHOLE_MAC),
+                    execution_identity.SourceKeyKnown('tree'), placement.SubmittingOwner('host', 1, '1'),
+                    NoOwningSession(), 1)
+                claim = placement.assigned_claim_reference(assignment)
+                binding = ledger.GateDispatchBinding(claim, root / 'journal.json', root / 'aws', root / 'build_targets.conf', root / 'aws_target.conf')
+                binding.publish(ledger.gate_dispatch_binding_path(sidecar))
+                reports: list[wire.ExecutionReport] = []
+
+                def no_result(_repo: Path, *, dispatch: cloud_gate.AssignedCloudGate, **_options: object
+                              ) -> cloud_gate.CloudDeclined:
+                    if launch_pending:
+                        folder = root / 'worker'
+                        dispatch.journal.register(claim, dispatch.holder, folder)
+                        cloud_gate.save(folder / 'launch.json', {'arguments': {'ClientToken': 'fixture'}})
+                    return cloud_gate.CloudDeclined('No result from the worker')
+
+                def report(request: wire.ExecutionReport) -> wire.DispatchStatus:
+                    reports.append(request)
+                    return wire.DispatchStatus(assignment, placement.CurrentAssignment(), placement.PermissionConsumed(0))
+
+                with (mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar)}),
+                      mock.patch.object(admission_client, 'consume_permission',
+                                        return_value=wire.FirstAuthorization(assignment, claim)) as consume,
+                      mock.patch.object(cloud_gate, 'run', side_effect=no_result) as run,
+                      mock.patch.object(admission_client, 'report_execution', side_effect=report),
+                      self.assertRaises(GatePlacementIncomplete) as failed):
+                    _ = cloud_gate.route(root, mode=gate.SuiteMode.GATE, full=True,
+                        module_time_limit_s=10, assignment=assignment, selected=gate.ALL_MODULES,
+                        gate_job=GateJobNotRecorded())
+                self.assertEqual(failed.exception.status, 80 if launch_pending else 79)
+                consume.assert_called_once()
+                run.assert_called_once()
+                sent, = reports
+                self.assertEqual(sent.claim, claim)
+                self.assertIsInstance(sent.path, placement.DispatchPathPending if launch_pending
+                                      else placement.DispatchPathSettled)
+
+
+    def dispatch_fixture(self, root: Path) -> cloud_gate.AssignedCloudGate:
+        claim = placement.ProviderClaimReference('scaler', 'claude-aws', WHOLE_MAC, 'claim', 'episode', 'attempt')
+        binding = ledger.GateDispatchBinding(claim, root / 'queue' / 'claim.json', root / 'aws', root / 'build_targets.conf', root / 'aws_target.conf')
+        dispatch = cloud_gate.AssignedCloudGate(binding, placement.ClaimHolderIdentity('host', 1, '1'))
+        dispatch.journal.begin(binding, dispatch.holder)
+        return dispatch
+
+    def test_recovery_releases_a_booking_saved_before_worker_identity(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            dispatch = self.dispatch_fixture(root)
+            book = ledger.CostLedger(dispatch.binding.directory)
+            folder = root / 'worker'
+            dispatch.journal.register(dispatch.binding.claim, dispatch.holder, folder)
+            with book.transaction() as state:
+                state.gate_reservations.append(ledger.GateReservation(folder.name, 1, 600, Decimal(1), Decimal(1)))
+
+            self.assertIsInstance(dispatch.journal.settle(dispatch.binding.claim, dispatch.holder),
+                                  placement.DispatchPathPending)
+            self.assertIsInstance(book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+            cloud_gate.save(folder / 'request.json', {'attempt': folder.name})
+            self.assertEqual(dispatch.journal.settle(dispatch.binding.claim, dispatch.holder), 'no launch')
+            self.assertIsInstance(book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+
+    def test_worker_uses_the_ledger_named_by_the_queue(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            install_aws_fixture_settings(root)
+            dispatch = self.dispatch_fixture(root)
+            folder = root / 'worker'
+            dispatch.journal.register(dispatch.binding.claim, dispatch.holder, folder)
+            progress = folder / 'progress'
+            command = ['cloud_gate.py', '--worker', str(folder), '--sidecar', str(progress),
+                       '--placement-journal', str(dispatch.journal.path)]
+
+            def execute(registered: Path, worker: Callable[[], cloud_gate.GateWorker]) -> int:
+                self.assertEqual(registered, folder)
+                instance = worker()
+                self.assertEqual(instance.book.directory, dispatch.binding.directory)
+                self.assertEqual(instance.settings_path, dispatch.binding.account_settings)
+                return 0
+
+            different_account = root / 'different-account.conf'
+            account = str(dispatch.binding.account_settings)
+            directory = str(dispatch.binding.directory)
+            with (mock.patch.dict(os.environ, {'CONF_DIR': str(root), 'AWS_TARGET_CONFIG': str(different_account)}),
+                  mock.patch.object(cloud_gate, 'execute_gate_worker', side_effect=execute) as execute_worker):
+                worker_command = cloud_gate.gate_attempt_command('--worker', folder, dispatch.binding.directory,
+                                                                 progress, dispatch=dispatch)
+                self.assertEqual(worker_command[worker_command.index('--settings') + 1], account)
+                for rejected in (['--directory', str(root / 'different-ledger'), '--settings', account],
+                                 ['--directory', directory, '--settings', str(different_account)]):
+                    with mock.patch.object(sys, 'argv', [*command, *rejected]):
+                        self.assertEqual(cloud_gate.main(), 0)
+                        execute_worker.assert_not_called()
+                with mock.patch.object(sys, 'argv', [*command, '--directory', directory, '--settings', account]):
+                    self.assertEqual(cloud_gate.main(), 0)
+                    execute_worker.assert_called_once()
+
+    def test_ledger_directory_sync_precedes_journal_close(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            dispatch = self.dispatch_fixture(root)
+            book = ledger.CostLedger(dispatch.binding.directory)
+            folder = root / 'worker'
+            dispatch.journal.register(dispatch.binding.claim, dispatch.holder, folder)
+            cloud_gate.save(folder / 'request.json', {'attempt': folder.name})
+            with book.transaction() as state:
+                state.gate_reservations.append(ledger.GateReservation(folder.name, 1, 600, Decimal(1), Decimal(1)))
+
+            with mock.patch.object(atomic_file, 'sync_folder', side_effect=OSError('fixture ledger sync failed')):
+                self.assertIsInstance(dispatch.journal.settle(dispatch.binding.claim, dispatch.holder),
+                                      placement.DispatchPathPending)
+            self.assertIsInstance(book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+            self.assertEqual(dispatch.journal.read().state, 'prelaunch')
+
+            with mock.patch.object(ledger, 'sync_folder', side_effect=OSError('fixture ledger sync failed')) as sync:
+                self.assertIsInstance(dispatch.journal.settle(dispatch.binding.claim, dispatch.holder),
+                                      placement.DispatchPathPending)
+                sync.assert_called_once_with(book.directory)
+                self.assertEqual(dispatch.journal.read().state, 'prelaunch')
+            self.assertEqual(dispatch.journal.settle(dispatch.binding.claim, dispatch.holder), 'no launch')
+
+    def test_a_saved_closure_requires_a_new_directory_sync(self) -> None:
+        with TemporaryDirectory() as directory:
+            dispatch = self.dispatch_fixture(Path(directory))
+            journal = dispatch.journal
+            with mock.patch.object(atomic_file, 'sync_folder', side_effect=OSError('fixture directory sync failed')):
+                self.assertIsInstance(journal.settle(dispatch.binding.claim, dispatch.holder), placement.DispatchPathPending)
+            self.assertEqual(journal.read().state, 'no launch')
+
+            with mock.patch.object(ledger, 'sync_folder', wraps=atomic_file.sync_folder) as sync:
+                self.assertEqual(journal.settle(dispatch.binding.claim, dispatch.holder), 'no launch')
+                sync.assert_called_once_with(journal.path.parent)
+
+    def test_a_late_worker_cannot_start_after_local_closure(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            book = ledger.CostLedger(root / 'aws')
+            journal = ledger.GateDispatchJournal(root / 'queue' / 'claim.json')
+            claim = placement.ProviderClaimReference('scaler', 'aws', WHOLE_MAC, 'claim', 'episode', 'attempt')
+            holder = placement.ClaimHolderIdentity('host', 1, '1')
+            journal.begin(ledger.GateDispatchBinding(claim, journal.path, book.directory, root / 'build_targets.conf', root / 'aws_target.conf'), holder)
+            folder = root / 'worker'
+            journal.register(claim, holder, folder)
+            self.assertEqual(journal.read().state, 'prelaunch')
+            self.assertEqual(journal.settle(claim, holder), 'no launch')
+            self.assertEqual(journal.read().state, 'no launch')
+
+            command = ['cloud_gate.py', '--worker', str(folder), '--directory', str(book.directory),
+                       '--sidecar', str(folder / 'progress'), '--placement-journal', str(journal.path)]
+            with (mock.patch.object(sys, 'argv', command),
+                  mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('AWS client started')) as api,
+                  mock.patch.object(ledger.CostLedger, 'reserve_gate',
+                                    side_effect=AssertionError('Spend was reserved')) as reserve):
+                self.assertEqual(cloud_gate.main(), 0)
+            api.assert_not_called()
+            reserve.assert_not_called()
+            self.assertFalse(book.path.exists())
+            self.assertFalse((folder / 'launch.json').exists())
+
+
+class CloudRouteTests(CloudGateHangGuard, CostFixture):
     repo: Path = Path()
     modules: list[tuple[str, Path]] = []
     admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
+
+    def test_merge_and_nightly_preserve_aws_dispatch_status(self) -> None:
+        repo = self.repo
+        base = gate.checked_git(repo, 'rev-parse', 'HEAD')
+        _ = gate.checked_git(repo, 'update-ref', 'refs/remotes/origin/fixture', base)
+        _ = gate.checked_git(repo, 'checkout', '-qb', 'unit')
+        _ = gate.checked_git(repo, 'commit', '--allow-empty', '-qm', 'Fixture checkpoint')
+        tip = gate.checked_git(repo, 'rev-parse', 'HEAD')
+        _ = gate.checked_git(repo, 'update-ref', 'refs/remotes/origin/unit', tip)
+        _ = gate.checked_git(repo, 'checkout', '-q', 'fixture')
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image',
+            'template': 'fixture-template', 'bucket': 'fixture-bucket', 'security_group': 'fixture-group',
+            'deployment_id': 'fixture', 'revision': 'fixture', 'version': '1',
+            'subnets': [{'id': 'fixture-subnet', 'zone': 'fixture-zone'}]})
+        book = ledger.CostLedger(self.state)
+        settings_path = self.settings
+        common = ['--repo', str(repo), '--merge-branch', 'fixture', '--unit', 'fixture']
+        merge = [*common, '--unit-branch', 'unit', '--phase', '1', '--checkpoint', tip, '--previous-checkpoint', base]
+        nightly = [*common, '--nightly']
+        for command in (merge, nightly):
+            for status in (GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS):
+                with (self.subTest(nightly=command is nightly, status=status),
+                      PlacementFixture() as fixture,
+                      mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(settings_path)})):
+                    assignment, binding, sidecar = assigned_cloud_fixture(fixture, book, ('gate.py', *command))
+                    assignment_file = fixture.root / 'assignment.json'
+                    admission_wire.write_assignment(assignment_file, wire.Assignment(assignment))
+                    fake = FakeGateAws()
+                    if status == GATE_PRELAUNCH_REFUSED_STATUS:
+                        fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation'] * 20
+                    else:
+                        fake.launch_timeouts = 1
+
+                    def service(arguments: Sequence[str]) -> int:
+                        self.assertEqual(Path(arguments[arguments.index('--placement-journal') + 1]), binding.journal)
+                        with mock.patch.object(sys, 'argv', ['cloud_gate', *arguments[arguments.index('--worker'):]]):
+                            return cloud_gate.main()
+
+                    api = AwsCli('fixture', 'us-east-2', 1, execute=fake)
+                    with (fixture.serving(),
+                          mock.patch.dict(os.environ, {'BUILDLOG_PREPARED_COPY': str(repo),
+                              'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar),
+                              'BUILDLOG_PLACEMENT_FILE': str(assignment_file), 'BUILDLOG_PLACEMENT_EPISODE': assignment.episode}),
+                          mock.patch.object(store, 'host_name', return_value=fixture.server.host),
+                          mock.patch.object(gate, 'host_name', return_value=fixture.server.host),
+                          mock.patch.object(cloud_gate, 'run', wraps=partial(cloud_gate.run, service=service)),
+                          mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
+                          ExitStack() as isolated,
+                          redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
+                        for patch in (mock.patch.object(gate, 'BuildHoldWait'),
+                                      mock.patch.object(gate, 'fetch_branches'),
+                                      mock.patch.object(gate, 'gate_production', return_value=repo),
+                                      mock.patch.object(gate, 'change_review_list', return_value=(repo, None)),
+                                      mock.patch.object(change_review, 'missing', return_value=[]),
+                                      mock.patch.object(change_review, 'unit_producer', return_value=None),
+                                      mock.patch.object(gate, 'nightly_git'),
+                                      mock.patch.object(gate, 'nightly_owner', return_value='fixture'),
+                                      mock.patch.object(copies, 'standing', return_value=nullcontext(repo)),
+                                      mock.patch.object(gate, '_sweep_nightly_build_folders')):
+                            _ = isolated.enter_context(patch)
+                        nightly_red = isolated.enter_context(mock.patch.object(gate, 'nightly_red_lock',
+                            side_effect=AssertionError('AWS dispatch status must not create a nightly red result')))
+                        local = isolated.enter_context(mock.patch.object(gate, 'run_suites'))
+                        notice = isolated.enter_context(mock.patch.object(gate, 'push_nightly_result'))
+                        reader, writer = os.pipe()
+                        os.environ[copies.PREPARED_GATE_FD] = str(reader)
+                        try:
+                            with os.fdopen(writer, 'wb') as token:
+                                _ = token.write(f'{os.getpid()}\n'.encode('ascii'))
+                            actual = gate.main(command)
+                        finally:
+                            if os.environ.pop(copies.PREPARED_GATE_FD, None) is not None:
+                                os.close(reader)
+                    self.assertEqual(actual, status, output.getvalue() + errors.getvalue())
+                    self.assertTrue(fake.launches)
+                    local.assert_not_called()
+                    nightly_red.assert_not_called()
+                    if command is nightly:
+                        notice.assert_called_once()
+                        outcome = cast(object, notice.call_args.args[1])
+                        self.assertIsInstance(outcome, GatePlacementIncomplete)
+                        assert isinstance(outcome, GatePlacementIncomplete)
+                        self.assertEqual(outcome.status, status)
+                    else:
+                        notice.assert_not_called()
+                    self.assertEqual(gate.checked_git(repo, 'rev-parse', 'HEAD'), base)
+                    journal = ledger.GateDispatchJournal(binding.journal).read()
+                    booked, = book.gate_claim_reservations(binding.claim.claim_id)
+                    assert isinstance(booked.owner, ledger.GateWorkerOwner)
+                    self.assertEqual(journal.folders, (Path(booked.owner.folder),))
+                    if status == GATE_PRELAUNCH_REFUSED_STATUS:
+                        self.assertEqual(journal.state, 'no launch')
+                        self.assertIsInstance(booked.state, ledger.GateAbsent)
+                    else:
+                        self.assertEqual(journal.state, 'prelaunch')
+                        self.assertIsInstance(booked.state, ledger.GateLaunchPending)
+                    failure_file = assignment_file.with_name(assignment_file.name + CLAIM_FAILURE_SUFFIX)
+                    if status == GATE_PRELAUNCH_REFUSED_STATUS:
+                        failure = admission_wire.parse_request(failure_file.read_bytes())
+                        assert isinstance(failure, wire.ClaimFailure)
+                        self.assertEqual(failure.assignment, assignment)
+                        self.assertEqual(failure.claim, placement.assigned_claim_reference(assignment))
+                    else:
+                        self.assertFalse(failure_file.exists())
+
+    def test_named_aws_gate_sends_a_subset_with_the_box_lifetime(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        selected = gate.TreeSelection(('scripts/fixture/test_one.py',), cloud_gate.working_tree(self.repo)[0])
+        lifetime_s = cloud_gate.settings().whole('lifetime_minutes') * 60
+
+        def service(command: Sequence[str]) -> int:
+            folder = Path(command[command.index('--worker') + 1])
+            request = cloud_gate.read(folder / 'request.json')
+            self.assertEqual(request['modules'], list(selected.paths))
+            self.assertIs(request['named_modules'], True)
+            self.assertIs(request['split'], True)
+            self.assertEqual(request['module_time_limit_s'], lifetime_s)
+            cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': 'fixture'})
+            return 0
+
+        outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False, module_time_limit_s=1,
+                                 gate_job=StepJob('test-modules', modules=1), selected=selected, service=service)
+        self.assertEqual(outcome, cloud_gate.CloudDeclined('fixture'))
 
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(cloud_gate, 'account_settings_path', side_effect=lambda: Path(os.environ.get('AWS_TARGET_CONFIG', str(self.settings)))))
-        _ = write_config_fixture(self.root / 'merge_gate.conf')
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
-            'credential_file=~/.config/aws-build/credentials\n')
+        _ = write_config_fixture(self.root / 'gate.conf')
+        override_fixture_settings(self.root / 'cloud_gate.conf',
+            '# one of: on, off\nenabled=on\ncredential_file=~/.config/aws-build/credentials\n')
         self.repo = self.root / 'repo'
         folder = self.repo / 'scripts/fixture'
         folder.mkdir(parents=True)
         for name in ('test_one.py', 'test_two.py'):
             _ = (folder / name).write_text('import unittest\n')
+        runner = self.repo / 'scripts/production/gate.py'
+        runner.parent.mkdir()
+        _ = runner.write_text('from enum import Enum\n' + inspect.getsource(gate.SuiteMode))
         for args in (('init', '-q', '-b', 'fixture'), ('config', 'user.name', 'Fixture'),
                      ('config', 'user.email', 'fixture@example.invalid'), ('add', '.'), ('commit', '-qm', 'Fixture'),
                      ('remote', 'add', 'origin', '/private/origin'), ('update-ref', 'refs/remotes/origin/main', 'HEAD')):
             _ = gate.checked_git(self.repo, *args)
         self.modules = [('fixture', path) for path in sorted(folder.glob('test_*.py'))]
-        _ = self.enterContext(mock.patch.object(cloud_gate, 'discover_test_modules', return_value=self.modules))
         _ = self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state))
         self.admission = caller_admission(self, self.root, {'BUILDLOG_DIR': str(self.root / 'buildlog')})
 
-    def run_spot_route(self, interruptions: int, *, status: int = 0, one_choice: bool = False,
-                       limit_after_first: bool = False, crash_after: int | None = None,
+    def test_same_request_waits_for_the_earlier_dispatch_to_settle(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        holder = placement.ClaimHolderIdentity('host', 1, '1')
+        workers: list[Path] = []
+
+        def dispatch_for(attempt: str) -> cloud_gate.AssignedCloudGate:
+            claim = placement.ProviderClaimReference('scaler', 'claude-aws', WHOLE_MAC, attempt, 'episode', attempt)
+            binding = ledger.GateDispatchBinding(claim, self.root / f'{attempt}.json', self.state, self.root / 'build_targets.conf', self.settings)
+            dispatch = cloud_gate.AssignedCloudGate(binding, holder)
+            dispatch.journal.begin(binding, holder)
+            return dispatch
+
+        def service(command: Sequence[str]) -> int:
+            folder = Path(command[command.index('--worker') + 1])
+            workers.append(folder)
+            cloud_gate.save(folder / 'launch.json', {'arguments': {'ClientToken': folder.name}})
+            return 0
+
+        def run(repo: Path, dispatch: cloud_gate.AssignedCloudGate) -> cloud_gate.CloudDeclined | cloud_gate.CloudCompleted:
+            with mock.patch.object(cloud_gate, 'cloud_reservation',
+                                   side_effect=AssertionError('The assignment already owns the cloud slot')) as reserve:
+                outcome = cloud_gate.run(repo, mode=gate.SuiteMode.GATE, full=True,
+                                         module_time_limit_s=1800, dispatch=dispatch, service=service)
+            reserve.assert_not_called()
+            return outcome
+
+        other = self.root / 'other'
+        _ = gate.checked_git(self.repo, 'worktree', 'add', '--detach', str(other), 'HEAD')
+        earlier = dispatch_for('earlier')
+        self.assertIsInstance(run(self.repo, earlier), cloud_gate.CloudDeclined)
+        first, = workers
+        self.assertEqual(run(other, dispatch_for('while-current')),
+                         cloud_gate.CloudDeclined('The previous AWS dispatch for this gate remains current'))
+        self.assertEqual(workers, [first])
+
+        book = ledger.CostLedger(self.state)
+        with book.transaction() as state:
+            state.gate_reservations.append(ledger.GateReservation(first.name, 1, 600, Decimal(0), Decimal(0),
+                                                                  state=ledger.GateAbsent(2)))
+        self.assertEqual(earlier.journal.settle(earlier.binding.claim, holder), 'no launch')
+        self.assertIsInstance(run(other, dispatch_for('after-closure')), cloud_gate.CloudDeclined)
+        self.assertEqual(len(workers), 2)
+        self.assertNotEqual(workers[0].parent, workers[1].parent)
+
+    def test_rerun_reconciles_the_earlier_pending_booking(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), 'ended fixture')
+        book = ledger.CostLedger(self.state)
+
+        def begin(attempt: str) -> cloud_gate.AssignedCloudGate:
+            claim = placement.ProviderClaimReference('scaler', 'claude-aws', WHOLE_MAC, attempt, 'episode', attempt)
+            binding = ledger.GateDispatchBinding(claim, self.root / f'{attempt}.json', self.state,
+                                                self.root / 'build_targets.conf', self.settings)
+            dispatch = cloud_gate.AssignedCloudGate(binding, holder)
+            dispatch.journal.begin(binding, holder)
+            return dispatch
+
+        earlier = begin('earlier')
+        first_worker: list[Path] = []
+
+        def original_worker(command: Sequence[str]) -> int:
+            folder = Path(command[command.index('--worker') + 1])
+            first_worker.append(folder)
+            cloud_gate.save(folder / 'launch.json', {'arguments': {'ClientToken': 'first-token'}})
+            with book.transaction() as evidence:
+                evidence.gate_reservations.append(ledger.GateReservation(folder.name, 1, 600, Decimal(0), Decimal(1)))
+            return 1
+
+        def run(dispatch: cloud_gate.AssignedCloudGate,
+                service: Callable[[Sequence[str]], int]) -> cloud_gate.CloudDeclined | cloud_gate.CloudCompleted:
+            return cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
+                                  module_time_limit_s=1800, dispatch=dispatch, service=service)
+
+        self.assertIsInstance(run(earlier, original_worker), cloud_gate.CloudDeclined)
+        folder, = first_worker
+        calls: list[str] = []
+
+        def reconcile(command: Sequence[str]) -> int:
+            if '--cleanup' in command:
+                calls.append('cleanup')
+                self.assertEqual(command[command.index('--cleanup') + 1], str(folder))
+                self.assertEqual(command[command.index('--settings') + 1], str(self.settings))
+                self.assertEqual(command[command.index('--placement-journal') + 1], str(earlier.journal.path))
+                self.assertEqual(cloud_gate.read(folder / 'launch.json'), {'arguments': {'ClientToken': 'first-token'}})
+                if calls.count('cleanup') == 1:
+                    return 1
+                book.resolve_gate(folder.name, ledger.GateAbsent(2))
+                return 0
+            calls.append('worker')
+            self.assertIn('--worker', command)
+            self.assertEqual(earlier.journal.read().state, 'no launch')
+            return 1
+
+        self.assertEqual(run(begin('blocked'), reconcile),
+                         cloud_gate.CloudDeclined('The previous AWS dispatch for this gate remains current'))
+        self.assertEqual(calls, ['cleanup'])
+        self.assertIsInstance(run(begin('after-cleanup'), reconcile), cloud_gate.CloudDeclined)
+        self.assertEqual(calls, ['cleanup', 'cleanup', 'worker'])
+
+    def test_old_checkout_modes_reach_the_box(self) -> None:
+        runner = self.repo / 'scripts/production/gate.py'
+        source = runner.read_text()
+        _ = runner.write_text(source.replace('"gate"', '"merge-gate"').replace('"test-affected"', '"targeted-test"'))
+        _ = gate.checked_git(self.repo, 'add', '.')
+        _ = gate.checked_git(self.repo, 'commit', '-qm', 'Use the previous suite mode values')
+        head = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
+        _ = runner.write_text(source.replace('"merge-gate"', '"other-merge"').replace('"targeted-test"', '"other-targeted"'))
+        _ = gate.checked_git(self.repo, 'commit', '-qam', 'Read only the new suite mode values')
+        new_only = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
+        mapping = '{"merge-gate": cls.GATE, "targeted-test": cls.TARGETED}'
+        self.assertIn(mapping, source)
+        _ = runner.write_text(source.replace(mapping, '{}'))
+        _ = gate.checked_git(self.repo, 'commit', '-qam', 'Write the old values without reading them')
+        writes_only = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
+        for mode in gate.SuiteMode:
+            with self.subTest(mode=mode):
+                self.assertTrue(cloud_gate.accepts_suite_mode(self.repo, head, mode))
+                self.assertFalse(cloud_gate.accepts_suite_mode(self.repo, new_only, mode))
+                self.assertFalse(cloud_gate.accepts_suite_mode(self.repo, writes_only, mode))
+                self.assertIs(gate.SuiteMode(mode.wire), mode)
+                self.assertEqual(gate.SuiteMode.step(mode.wire), mode.value)
+                self.assertEqual(gate.SuiteMode.step(mode.value), mode.value)
+        self.assertEqual(gate.SuiteMode.step('gpu-size-trial'), 'gpu-size-trial')
+
+    def test_unknown_checkout_modes_do_not_start_the_cloud_service(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        runner = self.repo / 'scripts/production/gate.py'
+        source = runner.read_text()
+        _ = runner.write_text(source.replace('"gate"', '"other-gate"').replace('"test-affected"', '"other-affected"')
+                              .replace('"merge-gate"', '"other-merge"').replace('"targeted-test"', '"other-targeted"'))
+        _ = gate.checked_git(self.repo, 'add', '.')
+        _ = gate.checked_git(self.repo, 'commit', '-qm', 'Use suite mode values this code does not read')
+        for mode in gate.SuiteMode:
+            with (self.subTest(mode=mode), mock.patch.object(cloud_gate, 'AwsCli',
+                    side_effect=AssertionError('No AWS call may start'))):
+                service = mock.Mock(side_effect=AssertionError('No cloud service may start'))
+                before = len(self.fallback_rows())
+                outcome = cloud_gate.run(self.repo, full=True, mode=mode, module_time_limit_s=1800, service=service)
+                reason = f'The tested commit does not read SuiteMode value {mode.wire!r}'
+                self.assertEqual(outcome, cloud_gate.CloudDeclined(reason))
+                service.assert_not_called()
+                rows = self.fallback_rows()
+                self.assertEqual(len(rows), before + 1)
+                self.assertEqual((rows[-1]['mode'], rows[-1]['reason']), (mode.value, reason))
+                self.assertTrue(self.admission.callers_released())
+
+    def retry_fixture(self) -> CloudRouteTests:
+        fixture = CloudRouteTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        return fixture
+
+    def run_spot_route(self, interruptions: int, *, box_failures: int = 0, log_error: str = '',
+                       status: int = 0, one_choice: bool = False, limit_after_first: bool = False,
+                       switch_off_after_first: bool = False, crash_after: int | None = None,
                        crash_on_retry_save: bool = False,
-                       lower_limit_on_resume: bool = False) -> tuple[cloud_gate.LocalFallback | cloud_gate.CloudCompleted,
+                       lower_limit_on_resume: bool = False) -> tuple[cloud_gate.CloudDeclined | cloud_gate.CloudCompleted,
                                                                list[Path], list[FakeGateAws]]:
         values = cloud_gate.settings()
         size = values.words('instance_types')[0]
@@ -2422,14 +4381,20 @@ class CloudRouteTests(CostFixture):
             self.assertTrue(all(fake.terminated for fake in fakes))
             request = cloud_gate.read(folder / 'request.json')
             fake = FakeGateAws()
-            fake.has_result = len(folders) >= interruptions
-            fake.state = 'running' if fake.has_result else 'shutting-down'
+            failed_box = len(folders) < box_failures
+            fake.has_result = len(folders) >= box_failures + interruptions or (failed_box and bool(log_error))
+            if failed_box and not log_error:
+                fake.boot_error = 'The box failed at stage result upload (exit 1)'
+            fake.state = 'running' if fake.has_result or fake.boot_error else 'shutting-down'
             fake.state_reason = {'Code': 'Server.SpotInstanceTermination'}
             run = gate.GateRun(tuple(gate.GateJobResult('fixture', path.name, status, 1, '') for _, path in self.modules), 1, 1)
             row: dict[str, object] = {key: request[key] for key in ('attempt', 'commit', 'tree')}
             row.update(host='fixture-guest', verdict='pass' if run.passed else 'fail', gate=gate_box.encode_run(run), gate_s=1,
                 record=gate_box.completion_record(run, ledger.text(request, 'attempt'), ledger.text(request, 'commit'),
                     ledger.text(request, 'tree'), 'fixture-guest', now, now + 1, ledger.text(request, 'mode')))
+            if failed_box and log_error:
+                fake.has_log = False
+                row['log_error'] = log_error
             fake.result = row
             worker = cloud_gate.GateWorker(AwsCli('fixture-scaler', regions[0], 1, execute=fake), book,
                 self.settings, sidecar, clock=lambda: now)
@@ -2441,6 +4406,8 @@ class CloudRouteTests(CostFixture):
             fakes.append(fake)
             if limit_after_first:
                 self.costs({'daily_limit_usd': '0'})
+            if switch_off_after_first:
+                self.configure_gate('enabled=off')
             if len(folders) == crash_after:
                 crashed = True
                 raise SystemExit('fixture controller crash')
@@ -2451,7 +4418,7 @@ class CloudRouteTests(CostFixture):
               redirect_stdout(StringIO())):
             if crash_after is not None or crash_on_retry_save or lower_limit_on_resume:
                 with self.assertRaisesRegex(SystemExit, 'fixture controller crash'):
-                    _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                    _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                         module_time_limit_s=values.number('module_time_limit_s'), service=service)
                 self.assertTrue(self.admission.callers_released())
                 if lower_limit_on_resume:
@@ -2460,7 +4427,7 @@ class CloudRouteTests(CostFixture):
                     _ = path.write_text(re.sub(r'(?m)^spot_interruption_retries=.*$',
                         'spot_interruption_retries=' + str(limit), path.read_text()))
                 controller += 1
-            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                 module_time_limit_s=values.number('module_time_limit_s'), service=service)
         self.assertTrue(all(len(set(rows)) == 1 for rows in admissions.values()))
         self.assertTrue(self.admission.callers_released())
@@ -2471,25 +4438,39 @@ class CloudRouteTests(CostFixture):
 
     def test_spot_interruption_retries_the_next_zone_then_succeeds(self) -> None:
         self.assertGreater(cloud_gate.settings().whole('spot_interruption_retries'), 0)
-        outcome, folders, fakes = self.run_spot_route(1)
-        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
-        self.assertEqual(len(folders), 2)
-        first = cloud_gate.read(folders[0] / 'launch.json')
-        second = cloud_gate.read(folders[1] / 'launch.json')
-        self.assertEqual(second['variants'], first['variants'])
-        self.assertEqual(second['variant'], ledger.instant(first, 'variant') + 1)
-        self.assertNotEqual(second['zone'], first['zone'])
-        self.assertEqual(second['region'], first['region'])
-        self.assertEqual(len({folder.name for folder in folders}), len(folders))
-        self.assertNotEqual(fakes[0].launches[0]['ClientToken'], fakes[1].launches[0]['ClientToken'])
-        self.assertEqual(self.fallback_rows(), [])
+        for interruptions, box_failures, log_error in ((1, 0, ''), (0, 1, ''), (0, 1, 'The log PUT timed out')):
+            with self.subTest(interruptions=interruptions, box_failures=box_failures, log_error=log_error):
+                fixture = self.retry_fixture() if box_failures else self
+                outcome, folders, fakes = fixture.run_spot_route(
+                    interruptions, box_failures=box_failures, log_error=log_error)
+                self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+                self.assertEqual(len(folders), 2)
+                first = cloud_gate.read(folders[0] / 'launch.json')
+                second = cloud_gate.read(folders[1] / 'launch.json')
+                self.assertEqual(second['variants'], first['variants'])
+                self.assertEqual(second['variant'], ledger.instant(first, 'variant') + 1)
+                self.assertNotEqual(second['zone'], first['zone'])
+                self.assertEqual(second['region'], first['region'])
+                self.assertEqual(len({folder.name for folder in folders}), len(folders))
+                self.assertNotEqual(fakes[0].launches[0]['ClientToken'], fakes[1].launches[0]['ClientToken'])
+                self.assertEqual(fixture.fallback_rows(), [])
+                if box_failures:
+                    reason = 'The final log upload failed' if log_error else fakes[0].boot_error
+                    self.assertEqual(cloud_gate.read(folders[0] / 'outcome.json'),
+                                     {'status': 'box-failed', 'reason': reason})
+                if fakes[0].boot_error:
+                    calls = fakes[0].commands
+                    self.assertEqual(sum('list-objects-v2' in call for call in calls), 1)
+                    self.assertEqual([call[call.index('--key') + 1] for call in calls if 'get-object' in call],
+                                     [f'artifacts/{folders[0].name}/{name}' for name in ('boot-error.json', 'gate.log')])
+                    self.assertEqual((folders[0] / 'gate.log').read_text(), fakes[0].log)
 
     def test_spot_interruption_limit_records_one_final_fallback(self) -> None:
         retries = cloud_gate.settings().whole('spot_interruption_retries')
         expected = retries + 1
         outcome, folders, _ = self.run_spot_route(expected)
-        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
-        assert isinstance(outcome, cloud_gate.LocalFallback)
+        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+        assert isinstance(outcome, cloud_gate.CloudDeclined)
         self.assertEqual(len(folders), expected)
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
         rows = self.fallback_rows()
@@ -2500,10 +4481,34 @@ class CloudRouteTests(CostFixture):
         if expected > 2:
             self.assertNotEqual(launches[1]['region'], launches[2]['region'])
 
+        signed_url = 'https://fixture.invalid/gate.log?X-Amz-Signature=fixture'
+        for log_error in ('', f'curl PUT timed out for {signed_url}'):
+            with self.subTest(box_failures=2, log_error=log_error):
+                fixture = self.retry_fixture()
+                outcome, folders, fakes = fixture.run_spot_route(0, box_failures=2, log_error=log_error, crash_after=2)
+                self.assertEqual(len(folders), 2)
+                reason = 'The final log upload failed' if log_error else fakes[-1].boot_error
+                fallback_reason = f'The box failure retry limit is reached: {reason}'
+                self.assertEqual(outcome, cloud_gate.CloudDeclined(fallback_reason))
+                for folder in folders:
+                    self.assertEqual(cloud_gate.read(folder / 'outcome.json'), {'status': 'box-failed', 'reason': reason})
+                current = cloud_gate.read(folders[-1].parent / 'current.json')
+                self.assertEqual(current['box_failures'], 2)
+                self.assertEqual(current['spot_interruptions'], 0)
+                rows = fixture.fallback_rows()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]['reason'], fallback_reason)
+                self.assertNotIn(signed_url, (fixture.state / 'cloud-gate-launches.jsonl').read_text())
+                service = mock.Mock(side_effect=AssertionError('The box failure retry limit is reached'))
+                resumed = cloud_gate.run(fixture.repo, mode=gate.SuiteMode.GATE, full=True,
+                    module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
+                self.assertEqual(resumed, outcome)
+                service.assert_not_called()
+
     def test_spot_interruption_without_another_choice_falls_back(self) -> None:
         outcome, folders, _ = self.run_spot_route(1, one_choice=True)
         self.assertEqual(len(folders), 1)
-        self.assertEqual(outcome, cloud_gate.LocalFallback('Spot interruption on 1 attempts; No cloud capacity choice remains'))
+        self.assertEqual(outcome, cloud_gate.CloudDeclined('Spot interruption on 1 attempts; No cloud capacity choice remains'))
 
     def test_zero_spot_retries_keeps_the_first_interruption_as_the_limit(self) -> None:
         path = self.root / 'cloud_gate.conf'
@@ -2511,16 +4516,87 @@ class CloudRouteTests(CostFixture):
         expected = cloud_gate.settings().whole('spot_interruption_retries') + 1
         outcome, folders, _ = self.run_spot_route(expected)
         self.assertEqual(len(folders), expected)
-        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
-        assert isinstance(outcome, cloud_gate.LocalFallback)
+        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+        assert isinstance(outcome, cloud_gate.CloudDeclined)
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
+
+        with self.subTest(box_failures=1, interruptions=1):
+            fixture = self.retry_fixture()
+            path = fixture.root / 'cloud_gate.conf'
+            _ = path.write_text(re.sub(r'(?m)^spot_interruption_retries=.*$', 'spot_interruption_retries=0',
+                                       path.read_text()))
+            outcome, folders, _ = fixture.run_spot_route(1, box_failures=1)
+            self.assertEqual(len(folders), 2)
+            self.assertEqual(outcome, cloud_gate.CloudDeclined(
+                'Spot interruption on 1 attempts; The Spot interruption retry limit is reached'))
+            current = cloud_gate.read(folders[-1].parent / 'current.json')
+            self.assertEqual(current['box_failures'], 1)
+            self.assertEqual(current['spot_interruptions'], 1)
 
     def test_spot_retry_checks_the_spend_limit_again(self) -> None:
         outcome, folders, fakes = self.run_spot_route(1, limit_after_first=True)
         self.assertEqual(len(folders), 2)
-        self.assertEqual(outcome, cloud_gate.LocalFallback('Spot interruption on 1 attempts; daily_limit'))
+        self.assertEqual(outcome, cloud_gate.CloudDeclined('Spot interruption on 1 attempts; daily_limit'))
         self.assertEqual(fakes[1].launches, [])
         self.assertFalse((folders[1] / 'launch.json').exists())
+
+    def test_switch_off_after_an_interruption_launches_no_new_box(self) -> None:
+        for interruptions, box_failures in ((1, 0), (0, 1)):
+            with self.subTest(interruptions=interruptions, box_failures=box_failures):
+                fixture = self.retry_fixture() if box_failures else self
+                outcome, folders, fakes = fixture.run_spot_route(interruptions, box_failures=box_failures,
+                                                                 switch_off_after_first=True)
+                self.assertEqual(len(folders), 1)
+                self.assertEqual(len(fakes[0].launches), 1)
+                self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+                assert isinstance(outcome, cloud_gate.CloudDeclined)
+                self.assertTrue(outcome.reason.endswith('cloud gates are off (cloud_gate.conf enabled=off)'))
+
+    def off_route_with_gate(self, start: str, service: mock.Mock) -> cloud_gate.CloudDeclined | cloud_gate.CloudCompleted:
+        """Run the route with the switch off and one open gate whose worker has the given start."""
+        self.configure_gate('enabled=off')
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(int(time.time()), (), 'fixture', builder_removed=True))
+        self.assertIsInstance(book.reserve_gate(self.settings, ledger.GateReservation(
+            'gate-worker', int(time.time()), int(time.time()) + 1200, Decimal('.8'), Decimal('.02'))), ledger.GateReserved)
+        book.gate_owner('gate-worker', ledger.GateWorkerOwner(os.getpid(), start, str(self.root / 'gate-worker')))
+        return self.off_route(service)
+
+    def off_route(self, service: mock.Mock) -> cloud_gate.CloudDeclined | cloud_gate.CloudCompleted:
+        mode = gate.SuiteMode.GATE
+        return cloud_gate.run_cloud(self.repo, mode=mode, full=False, module_time_limit_s=1800,
+                                    service=service, attempt=cloud_gate.CloudAttempt(self.state, mode))
+
+    def test_switch_off_starts_no_reconcile_for_a_live_worker(self) -> None:
+        identity = process_start(os.getpid())
+        assert isinstance(identity, Started)
+        service = mock.Mock(return_value=0)
+        outcome = self.off_route_with_gate(identity.start, service)
+        self.assertEqual(outcome, cloud_gate.CloudDeclined('cloud gates are off (cloud_gate.conf enabled=off)'))
+        service.assert_not_called()
+
+    def test_switch_off_keeps_its_reason_when_the_reconcile_start_fails(self) -> None:
+        refused = mock.Mock(side_effect=OSError('fixture service refusal'))
+        with redirect_stderr(StringIO()) as error:
+            outcomes = [self.off_route_with_gate('dead-worker-start', refused)]
+            with mock.patch.object(ledger.CostLedger, 'read_snapshot',
+                                   side_effect=ledger.LedgerUnavailable('fixture ledger fault')):
+                outcomes.append(self.off_route(mock.Mock(return_value=0)))
+        refused.assert_called_once()
+        self.assertEqual(outcomes, [cloud_gate.CloudDeclined('cloud gates are off (cloud_gate.conf enabled=off)')] * 2)
+        self.assertEqual(error.getvalue().splitlines(), ['The cloud gate reconcile did not start: fixture service refusal',
+                                                         'The cloud gate reconcile did not start: fixture ledger fault'])
+
+    def test_switch_off_runs_only_the_reconcile_step_for_an_open_gate(self) -> None:
+        service = mock.Mock(return_value=0)
+        outcome = self.off_route_with_gate('dead-worker-start', service)
+        self.assertEqual(outcome, cloud_gate.CloudDeclined('cloud gates are off (cloud_gate.conf enabled=off)'))
+        service.assert_called_once()
+        command = cast(list[str], service.call_args.args[0])
+        self.assertEqual(command[command.index('-m') + 1:command.index('-m') + 3], ['scripts.aws_target.cloud_gate', '--reconcile'])
+        self.assertNotIn('--worker', command)
+        self.assertNotIn('--sidecar', command)
+        self.assertFalse(any(part.startswith('--property=ExecStopPost=') for part in command))
 
     def test_normal_gate_failure_does_not_retry(self) -> None:
         outcome, folders, _ = self.run_spot_route(0, status=1)
@@ -2537,12 +4613,12 @@ class CloudRouteTests(CostFixture):
         expected = retries + 1
         outcome, folders, _ = self.run_spot_route(expected, crash_after=expected)
         self.assertEqual([cloud_gate.read(folder / 'launch.json')['variant'] for folder in folders], list(range(expected)))
-        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
-        assert isinstance(outcome, cloud_gate.LocalFallback)
+        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+        assert isinstance(outcome, cloud_gate.CloudDeclined)
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
         self.assertEqual(self.fallback_rows()[-1]['reason'], outcome.reason)
         service = mock.Mock(side_effect=AssertionError('The retry budget is spent'))
-        resumed = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+        resumed = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
             module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
         self.assertEqual(resumed, outcome)
         service.assert_not_called()
@@ -2556,8 +4632,8 @@ class CloudRouteTests(CostFixture):
         expected = cloud_gate.settings().whole('spot_interruption_retries') + 1
         outcome, folders, _ = self.run_spot_route(expected, crash_after=1)
         self.assertEqual([cloud_gate.read(folder / 'launch.json')['variant'] for folder in folders], list(range(expected)))
-        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
-        assert isinstance(outcome, cloud_gate.LocalFallback)
+        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+        assert isinstance(outcome, cloud_gate.CloudDeclined)
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
         self.assertEqual(len(self.fallback_rows()), 1)
 
@@ -2565,8 +4641,8 @@ class CloudRouteTests(CostFixture):
         expected = cloud_gate.settings().whole('spot_interruption_retries') + 1
         outcome, folders, _ = self.run_spot_route(expected, crash_on_retry_save=True)
         self.assertEqual([cloud_gate.read(folder / 'launch.json')['variant'] for folder in folders], list(range(expected)))
-        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
-        assert isinstance(outcome, cloud_gate.LocalFallback)
+        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+        assert isinstance(outcome, cloud_gate.CloudDeclined)
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
 
     def test_spot_retry_checks_a_lower_limit_before_preparation_on_resume(self) -> None:
@@ -2577,7 +4653,7 @@ class CloudRouteTests(CostFixture):
         self.assertEqual(cloud_gate.settings().whole('spot_interruption_retries'), interruptions - 1)
         self.assertEqual(len(folders), interruptions)
         self.assertEqual(sum(len(fake.launches) for fake in fakes), interruptions)
-        self.assertEqual(outcome, cloud_gate.LocalFallback(
+        self.assertEqual(outcome, cloud_gate.CloudDeclined(
             f'Spot interruption on {interruptions} attempts; The Spot interruption retry limit is reached'))
         current = cloud_gate.read(folders[0].parent / 'current.json')
         pending = folders[0].parent / ledger.text(current, 'attempt')
@@ -2586,10 +4662,10 @@ class CloudRouteTests(CostFixture):
         self.assertFalse((pending / 'launch.json').exists())
 
     def test_main_commit_needs_no_bundle(self) -> None:
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        override_fixture_settings(self.root / 'cloud_gate.conf',
             'clone_url=https://example.invalid/fixture-source.git\n')
         folder = self.root / 'attempt'
-        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
+        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.GATE, 1800)
         self.assertEqual(request['tree'], gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
         self.assertEqual(request['commit'], gate.checked_git(self.repo, 'rev-parse', 'HEAD'))
         self.assertEqual(request['head'], request['commit'])
@@ -2599,13 +4675,51 @@ class CloudRouteTests(CostFixture):
         self.assertFalse((folder / 'source.bundle').exists())
         self.assertEqual(request['modules'], ['scripts/fixture/test_one.py', 'scripts/fixture/test_two.py'])
 
+    def test_all_module_request_uses_its_tree_after_a_checkout_change(self) -> None:
+        before = cloud_gate.working_tree(self.repo)
+        first = self.modules[0][1]
+        working_tree = cloud_gate.working_tree
+
+        def change_after_tree_read(repo: Path) -> tuple[str, set[str]]:
+            snapshot = working_tree(repo)
+            first.unlink()
+            return snapshot
+
+        with (self.subTest('new request'),
+              mock.patch.object(cloud_gate, 'working_tree', side_effect=change_after_tree_read)):
+            request = cloud_gate.prepare_request(self.repo, self.root / 'attempt', gate.SuiteMode.GATE, 1800)
+            self.assertFalse(first.exists())
+            self.assertEqual(request['tree'], before[0])
+            self.assertEqual(request['modules'], [str(path.relative_to(self.repo)) for _, path in self.modules])
+
+        with self.subTest('saved result'):
+            _ = gate.checked_git(self.repo, 'restore', str(first.relative_to(self.repo)))
+            folder = self._unimported_gate()
+            (self.state / 'gate-deployment.json').unlink()
+            request = cloud_gate.read(folder / 'request.json')
+            request['modules'] = [str(self.modules[1][1].relative_to(self.repo))]
+            result = cloud_gate.read(folder / cloud_gate.RESULT_FILE)
+            run = gate_box.decode_run(result['gate'])
+            partial = replace(run, jobs=run.jobs[1:], executions=run.jobs[1:])
+            result['gate'] = gate_box.encode_run(partial)
+            result['record'] = gate_box.completion_record(
+                partial, folder.name, ledger.text(request, 'commit'), before[0], 'fixture-guest', 0, 1, 'gate')
+            cloud_gate.save(folder / 'request.json', request)
+            cloud_gate.save(folder / cloud_gate.RESULT_FILE, result)
+            service = mock.Mock(side_effect=AssertionError('A saved result needs no service'))
+            with redirect_stdout(StringIO()):
+                outcome = self._run_gate_for_resume(service)
+            self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+            self.assertFalse((folder / 'imported.json').exists())
+            service.assert_not_called()
+
     def test_bundle_contains_only_the_commit_ahead_of_main(self) -> None:
         base = gate.checked_git(self.repo, 'rev-parse', 'refs/remotes/origin/main')
         _ = (self.repo / 'new-file').write_text('one new commit\n')
         _ = gate.checked_git(self.repo, 'add', 'new-file')
         _ = gate.checked_git(self.repo, 'commit', '-qm', 'New commit')
         folder = self.root / 'attempt'
-        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
+        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.GATE, 1800)
         bundle = folder / 'source.bundle'
         header = bundle.read_bytes().split(b'\n\n', 1)[0].decode()
         self.assertIn('-' + base + ' ', header)
@@ -2637,7 +4751,7 @@ class CloudRouteTests(CostFixture):
         head = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
         refs = gate.checked_git(self.repo, 'for-each-ref')
         folder = self.root / 'attempt'
-        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
+        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.GATE, 1800)
         commit = ledger.text(request, 'commit')
         self.assertNotEqual(commit, head)
         self.assertEqual(request['head'], head)
@@ -2656,6 +4770,23 @@ class CloudRouteTests(CostFixture):
         self.assertEqual(gate.checked_git(clone, 'rev-parse', 'HEAD^{tree}'), request['tree'])
         self.assertEqual((clone / 'untracked').read_text(), 'untracked file\n')
 
+    def test_request_includes_a_force_added_ignored_module(self) -> None:
+        name = 'scripts/fixture/test_ignored.py'
+        _ = (self.repo / '.git/info/exclude').write_text('/' + name + '\n')
+        _ = (self.repo / name).write_text('import unittest\n')
+        _ = gate.checked_git(self.repo, 'add', '-f', name)
+        head = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
+        index = (self.repo / '.git/index').read_bytes()
+
+        request = cloud_gate.prepare_request(self.repo, self.root / 'attempt', gate.SuiteMode.GATE, 1800)
+
+        self.assertEqual(request['modules'], [name, 'scripts/fixture/test_one.py', 'scripts/fixture/test_two.py'])
+        self.assertEqual(request['dirty_paths'], [name])
+        self.assertEqual(gate.checked_git(self.repo, 'show', ledger.text(request, 'tree') + ':' + name),
+                         'import unittest')
+        self.assertEqual(gate.checked_git(self.repo, 'rev-parse', 'HEAD'), head)
+        self.assertEqual((self.repo / '.git/index').read_bytes(), index)
+
     def test_working_tree_reads_a_same_size_edit_at_the_index_mtime(self) -> None:
         _ = gate.checked_git(self.repo, 'config', 'core.trustctime', 'false')
         source = self.repo / 'racy'
@@ -2672,13 +4803,34 @@ class CloudRouteTests(CostFixture):
         environment = {**os.environ, 'GIT_INDEX_FILE': str(self.root / 'expected-index')}
         for arguments in (('read-tree', 'HEAD'), ('add', '-A')):
             _ = subprocess.run(['git', *arguments], cwd=self.repo, env=environment,
-                               check=True, capture_output=True)
+                               check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         expected = subprocess.run(['git', 'write-tree'], cwd=self.repo, env=environment,
-                                  check=True, capture_output=True, text=True).stdout.strip()
+                                  check=True, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
         self.assertNotEqual(expected, gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
         tree, dirty = cloud_gate.working_tree(self.repo)
         self.assertIn('racy', dirty)
         self.assertEqual(tree, expected)
+
+    def test_working_tree_reads_edits_to_files_marked_to_skip(self) -> None:
+        source = self.modules[0][1]
+        name = str(source.relative_to(self.repo))
+        head = gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}')
+        original = source.read_bytes()
+        for flag in ('assume-unchanged', 'skip-worktree'):
+            with self.subTest(flag=flag):
+                _ = gate.checked_git(self.repo, 'update-index', '--' + flag, '--', name)
+                _ = source.write_text('changed working contents\n')
+                index = (self.repo / '.git/index').read_bytes()
+                try:
+                    tree, dirty = cloud_gate.working_tree(self.repo)
+                    self.assertEqual(dirty, {name})
+                    self.assertNotEqual(tree, head)
+                    self.assertEqual(gate.checked_git(self.repo, 'show', tree + ':' + name),
+                                     'changed working contents')
+                    self.assertEqual((self.repo / '.git/index').read_bytes(), index)
+                finally:
+                    _ = source.write_bytes(original)
+                    _ = gate.checked_git(self.repo, 'update-index', '--no-' + flag, '--', name)
 
     def test_targeted_selection_runs_locally_and_sends_only_selected_paths(self) -> None:
         for dirty, paths, later in ((False, ('test_one.py',), ''), (True, ('test_one.py',), ''),
@@ -2712,19 +4864,19 @@ class CloudRouteTests(CostFixture):
                         with (mock.patch.object(cloud_gate, 'save') as save,
                               mock.patch.object(gate, 'checked_git', wraps=gate.checked_git) as git):
                             with self.assertRaisesRegex(GateRefused, 'The checkout changed after the test selection'):
-                                _ = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.TARGETED_TEST, 1800,
+                                _ = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.TARGETED, 1800,
                                                        selected=selected)
                         save.assert_not_called()
                         self.assertFalse((folder / 'request.json').exists())
                         self.assertFalse(any('bundle' in call.args for call in git.call_args_list))
                         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
                         with mock.patch.object(cloud_gate, 'run_service', side_effect=AssertionError('No service may start')) as service:
-                            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                                                      module_time_limit_s=1800, selected=selected)
-                        self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
+                        self.assertEqual(outcome, cloud_gate.CloudDeclined('The checkout changed after the test selection'))
                         service.assert_not_called()
                         continue
-                    request = cloud_gate.prepare(self.repo, self.root / 'attempt', gate.SuiteMode.TARGETED_TEST, 1800,
+                    request = cloud_gate.prepare(self.repo, self.root / 'attempt', gate.SuiteMode.TARGETED, 1800,
                                                 selected=selected)
                     self.assertEqual(select.call_count, 1)
                 self.assertEqual(select.call_args.args[0], self.repo)
@@ -2748,15 +4900,15 @@ class CloudRouteTests(CostFixture):
             book.resolve_gate(folder.name, ledger.GateAbsent(now))
             return 0
         for _ in range(2):
-            _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+            _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                module_time_limit_s=1800, service=service)
         self.assertNotEqual(folders[0], folders[1])
         self.assertFalse(any((folder / 'outcome.json').exists() for folder in folders))
 
-    def _run_gate_for_resume(self, service: Callable[[Sequence[str]], int]) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
+    def _run_gate_for_resume(self, service: Callable[[Sequence[str]], int]) -> cloud_gate.CloudDeclined | cloud_gate.CloudCompleted:
         with mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('The controller must not call AWS')):
-            return cloud_gate.run_cloud(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
-                module_time_limit_s=1800, service=service, attempt=cloud_gate.CloudAttempt(self.state, gate.SuiteMode.MERGE_GATE))
+            return cloud_gate.run_cloud(self.repo, mode=gate.SuiteMode.GATE, full=False,
+                module_time_limit_s=1800, service=service, attempt=cloud_gate.CloudAttempt(self.state, gate.SuiteMode.GATE))
 
     def _finish_gate_for_resume(self, command: Sequence[str], *, status: int = 0) -> int:
         folder = Path(command[command.index('--worker') + 1])
@@ -2765,7 +4917,7 @@ class CloudRouteTests(CostFixture):
         result = {key: request[key] for key in ('attempt', 'commit', 'tree')}
         result.update(host='fixture-guest', verdict='pass' if run.passed else 'fail', gate=gate_box.encode_run(run),
             record=gate_box.completion_record(run, folder.name, ledger.text(request, 'commit'),
-                ledger.text(request, 'tree'), 'fixture-guest', 0, 1, 'merge-gate'))
+                ledger.text(request, 'tree'), 'fixture-guest', 0, 1, 'gate'))
         book = ledger.CostLedger(self.state)
         now = int(time.time())
         booked = book.reserve_gate(self.settings, ledger.GateReservation(
@@ -2792,6 +4944,69 @@ class CloudRouteTests(CostFixture):
         root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
         return root / ledger.text(cloud_gate.read(root / 'current.json'), 'attempt')
 
+    def test_incompatible_pending_gate_settles_before_a_new_attempt_runs(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
+        current = root / 'current.json'
+        book = ledger.CostLedger(self.state)
+        now = int(time.time())
+        book.record_inventory(ledger.ResourceInventory(now, (), 'fixture', builder_removed=True))
+        fake = FakeGateAws()
+        api = AwsCli('fixture-scaler', 'us-east-2', 1, execute=fake)
+        events: list[tuple[str, Path]] = []
+        confirm_cleanup = False
+
+        def leave_incompatible_request(command: Sequence[str]) -> int:
+            folder = Path(command[command.index('--worker') + 1])
+            request = cloud_gate.read(folder / 'request.json')
+            request['modules'] = ['scripts/fixture/test_one.py']
+            cloud_gate.save(folder / 'request.json', request)
+            self.assertIsInstance(book.reserve_gate(self.settings, ledger.GateReservation(
+                folder.name, now, ledger.instant(request, 'expires'), Decimal('.8'), Decimal('.02'))), ledger.GateReserved)
+            book.resolve_gate(folder.name, ledger.GateRunning('i-fixture'), instance_type='m7a.8xlarge')
+            return 0
+
+        with redirect_stdout(StringIO()):
+            self.assertIsInstance(self._run_gate_for_resume(leave_incompatible_request), cloud_gate.CloudDeclined)
+        old = root / ledger.text(cloud_gate.read(current), 'attempt')
+
+        def settle_or_run(command: Sequence[str]) -> int:
+            if '--cleanup' in command:
+                folder = Path(command[command.index('--cleanup') + 1])
+                events.append(('settle', folder))
+                self.assertEqual(folder, old)
+                self.assertIn('--unit=cloud-gate-' + old.name, command)
+                self.assertFalse(any(argument.startswith('--property=ExecStopPost=') for argument in command))
+                self.assertEqual(cloud_gate.read(current)['attempt'], old.name)
+                if not confirm_cleanup:
+                    return 0
+                worker = cloud_gate.GateWorker(api, book, self.settings, folder / 'reservation.cgroup',
+                                               clock=lambda: now)
+                return int(not cloud_gate.cleanup_folder(folder, worker))
+            folder = Path(command[command.index('--worker') + 1])
+            events.append(('run', folder))
+            rows = book.read_snapshot().gate_reservations
+            self.assertIsInstance(next(row.state for row in rows if row.attempt == old.name), ledger.GateTerminated)
+            return self._finish_gate_for_resume(command)
+
+        with (mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('The controller must not call AWS')),
+              redirect_stdout(StringIO())):
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
+                                     module_time_limit_s=1800, service=settle_or_run)
+            self.assertEqual(outcome, cloud_gate.CloudDeclined('The incompatible cloud attempt has not ended'))
+            self.assertEqual(cloud_gate.read(current)['attempt'], old.name)
+            self.assertEqual(events, [('settle', old)])
+            events.clear()
+            confirm_cleanup = True
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
+                                     module_time_limit_s=1800, service=settle_or_run)
+        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+        new = root / ledger.text(cloud_gate.read(current), 'attempt')
+        self.assertNotEqual(new, old)
+        self.assertEqual(events, [('settle', old), ('run', new)])
+        self.assertEqual(fake.terminated_instances, {'i-fixture'})
+        self.assertTrue((old / 'request.json').is_file())
+
     def test_complete_unimported_gate_resumes_without_a_service(self) -> None:
         folder = self._unimported_gate(status=1)
         (self.state / 'gate-deployment.json').unlink()
@@ -2810,6 +5025,64 @@ class CloudRouteTests(CostFixture):
         self.assertEqual([path for path in folder.parent.iterdir() if path.is_dir()], [folder])
         self.assertEqual([row['id'] for row in store.locked_rows(store.host_file('aws', 0))], ['gate-' + folder.name])
         self.assertEqual(cloud_gate.read(folder / 'imported.json')['id'], 'gate-' + folder.name)
+
+    def test_all_module_gate_refuses_a_saved_result_for_a_transient_tree(self) -> None:
+        changed = self.repo / 'transient.txt'
+        _ = changed.write_text('temporary checkout change\n')
+        folder = self._unimported_gate()
+        changed.unlink()
+        (self.state / 'gate-deployment.json').unlink()
+        service = mock.Mock(side_effect=AssertionError('A saved result needs no service'))
+        def saved_route(*_arguments: object, **_options: object) -> gate.GateRun:
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
+                                     module_time_limit_s=1800, service=service)
+            if isinstance(outcome, cloud_gate.CloudDeclined):
+                raise GateTookNoRun(outcome.reason)
+            return outcome.run
+
+        def route_changed_tree(*arguments: object, **options: object) -> gate.GateRun:
+            _ = changed.write_text('temporary checkout change\n')
+            try:
+                return saved_route(*arguments, **options)
+            finally:
+                changed.unlink()
+
+        with (mock.patch.object(cloud_gate, 'route', side_effect=route_changed_tree),
+              mock.patch.object(gate, 'run_suites') as local,
+              self.assertRaisesRegex(GateTookNoRun, 'The checkout changed after the test selection')):
+            _ = gate.run_gate_suites(self.repo, target=aws_gate_assignment())
+        local.assert_not_called()
+        self.assertFalse((folder / 'imported.json').exists())
+
+        _ = changed.write_text('temporary checkout change\n')
+        with mock.patch.object(cloud_gate, 'route', side_effect=saved_route), redirect_stdout(StringIO()):
+            run = gate.run_gate_suites(self.repo, target=aws_gate_assignment())
+        self.assertTrue(run.passed)
+        service.assert_not_called()
+        self.assertTrue((folder / 'imported.json').is_file())
+
+    def test_cloud_routes_finalize_the_gate_once(self) -> None:
+        folder = self._unimported_gate()
+        finish = mock.Mock(side_effect=self._finish_gate_for_resume)
+
+        def route(*_arguments: object, **_options: object) -> gate.GateRun:
+            outcome = self._run_gate_for_resume(finish)
+            assert isinstance(outcome, cloud_gate.CloudCompleted)
+            return outcome.run
+
+        for expected_service_calls in (0, 1):
+            finish.reset_mock()
+            with (self.subTest(expected_service_calls=expected_service_calls), redirect_stdout(StringIO()),
+                  mock.patch.object(cloud_gate, 'route', side_effect=route),
+                  mock.patch.object(gate, 'run_suites') as local,
+                  mock.patch.object(gate, 'finalize_gate', wraps=gate.finalize_gate) as finalize):
+                run = gate.run_gate_suites(self.repo, target=aws_gate_assignment())
+                self.assertTrue(run.passed)
+                self.assertTrue((folder / 'imported.json').is_file())
+                self.assertEqual(finish.call_count, expected_service_calls)
+                local.assert_not_called()
+                finalize.assert_called_once()
+                self.assertIs(run, cast(object, finalize.call_args.args[-1]))
 
     def test_complete_imported_gate_starts_a_new_attempt(self) -> None:
         folder = self._unimported_gate()
@@ -2892,8 +5165,9 @@ class CloudRouteTests(CostFixture):
         reserve = cloud_gate.cloud_reservation
 
         @contextmanager
-        def change_head(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Generator[cloud_gate.CloudReservation]:
-            with reserve(repo, sidecar, mode) as reservation:
+        def change_head(repo: Path, sidecar: Path, mode: gate.SuiteMode, *,
+                        gate_job: StepJob | GateJobNotRecorded) -> Generator[cloud_gate.CloudReservation]:
+            with reserve(repo, sidecar, mode, gate_job=gate_job) as reservation:
                 _ = gate.checked_git(repo, 'commit', '--allow-empty', '-qm', 'Fixture changed HEAD')
                 yield reservation
 
@@ -2901,7 +5175,7 @@ class CloudRouteTests(CostFixture):
         with mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=change_head):
             outcome = self._run_gate_for_resume(service)
 
-        self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed during the cloud attempt'))
+        self.assertEqual(outcome, cloud_gate.CloudDeclined('The checkout changed during the cloud attempt'))
         self.assertFalse((folder / 'imported.json').exists())
         self.assertFalse(store.host_file('aws', 0).exists())
         service.assert_not_called()
@@ -2916,9 +5190,195 @@ class CloudRouteTests(CostFixture):
         service = mock.Mock(side_effect=AssertionError('A completed gate needs no service'))
         outcome = self._run_gate_for_resume(service)
 
-        self.assertEqual(outcome, cloud_gate.LocalFallback('The result differs from the current tree'))
+        self.assertEqual(outcome, cloud_gate.CloudDeclined('The result differs from the current tree'))
         self.assertFalse(store.host_file('aws', 0).exists())
         service.assert_not_called()
+
+    def test_legacy_pending_attempt_keeps_its_unknown_job_on_fallback_and_finish(self) -> None:
+        mode = gate.SuiteMode.GATE
+        incoming_job = StepJob('integrate', unit='new-unit', branch='new-branch')
+        unknown_job = {'kind': 'GateJobNotRecorded'}
+        cloud_gate.save(self.state / 'gate-deployment.json',
+                        {'bucket': 'fixture-bucket', 'image': 'fixture-image', 'template': 'fixture-template'})
+        root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
+        folder = root / 'legacy-attempt'
+        request = cloud_gate.prepare(self.repo, folder, mode, 1800)
+        self.assertEqual(request['mode'], 'merge-gate')
+        cloud_gate.save(folder / 'request.json', {**request, 'mode': mode.value})
+        cloud_gate.save(root / 'current.json', {'attempt': folder.name, 'tree': request['tree'], 'commit': request['head'],
+            'mode': mode.value, 'full': False, 'module_time_limit_s': 1800, 'modules': 'all', 'selection_tree': 'all'})
+        cloud_gate.save(folder / 'launch.json', {'instance': 'i-fixture', 'region': 'us-east-2',
+                                                'arguments': {'InstanceType': 'm7a.8xlarge'}})
+        book = ledger.CostLedger(self.state)
+        now = int(time.time())
+        book.record_inventory(ledger.ResourceInventory(now, (), 'fixture', builder_removed=True))
+        self.assertIsInstance(book.reserve_gate(self.settings, ledger.GateReservation(
+            folder.name, now, ledger.instant(request, 'expires'), Decimal('.8'), Decimal('.02'))), ledger.GateReserved)
+        book.resolve_gate(folder.name, ledger.GateRunning('i-fixture'), instance_type='m7a.8xlarge')
+        fake = FakeGateAws()
+        run = gate.GateRun(tuple(gate.GateJobResult(suite, path.name, 0, 1, '') for suite, path in self.modules), 1, 1)
+        fake.result = {key: request[key] for key in ('attempt', 'commit', 'tree')}
+        fake.result.update(host='fixture-guest', verdict='pass', gate=gate_box.encode_run(run), gate_s=1,
+            record=gate_box.completion_record(run, folder.name, ledger.text(request, 'commit'),
+                ledger.text(request, 'tree'), 'fixture-guest', now, now + 1, mode.value))
+
+        def service(command: Sequence[str]) -> int:
+            self.assertEqual(Path(command[command.index('--worker') + 1]), folder)
+            worker_request = cloud_gate.read(folder / 'request.json')
+            self.assertEqual(worker_request['mode'], 'merge-gate')
+            self.assertNotIn('gate_job', worker_request)
+            if fake.has_result:
+                sidecar = Path(command[command.index('--sidecar') + 1])
+                worker = cloud_gate.GateWorker(AwsCli('fixture-scaler', 'us-east-2', 1, execute=fake),
+                    book, self.settings, sidecar, clock=lambda: now)
+                deployment = cloud_gate.read(folder / 'deployment.json')
+                cloud_gate.save(folder / 'outcome.json', worker.execute(folder, worker_request, deployment))
+            return 0
+
+        fake.has_result = False
+        with redirect_stdout(StringIO()):
+            first = cloud_gate.run(self.repo, mode=mode, full=False, module_time_limit_s=1800,
+                                   service=service, gate_job=incoming_job)
+            self.assertEqual(first, cloud_gate.CloudDeclined('The scaler service has no final result'))
+            fake.has_result = True
+            second = cloud_gate.run(self.repo, mode=mode, full=False, module_time_limit_s=1800,
+                                    service=service, gate_job=replace(incoming_job, unit='other-unit'))
+        self.assertIsInstance(second, cloud_gate.CloudCompleted)
+        self.assertNotIn('gate_job', cloud_gate.read(folder / 'request.json'))
+        self.assertEqual(fake.launches, [])
+        self.assertEqual([(row['attempt'], row['result'], row['gate_job']) for row in book.launches()],
+                         [(folder.name, 'fallback', unknown_job), (folder.name, 'finished', unknown_job)])
+
+    def test_commands_with_different_jobs_resume_one_box_and_keep_its_job(self) -> None:
+        mode = gate.SuiteMode.GATE
+        job_a = StepJob('integrate', unit='unit-a', branch='branch-a')
+        job_b = StepJob('integrate', unit='unit-b', branch='branch-b')
+        job_record = cast(object, json.loads(wire.encode_record(job_a)))
+        cloud_gate.save(self.state / 'gate-deployment.json', {'deployment_id': 'fixture',
+            'bucket': 'fixture-bucket', 'revision': 'fixture-revision', 'image': 'fixture-image',
+            'template': 'fixture-template', 'version': '1', 'security_group': 'fixture-group',
+            'subnets': [{'id': 'fixture-a', 'zone': 'a'}]})
+        book = ledger.CostLedger(self.state)
+        now = int(time.time())
+        book.record_inventory(ledger.ResourceInventory(now, (), 'fixture', builder_removed=True))
+        fake = FakeGateAws()
+        folders: list[Path] = []
+
+        def service(command: Sequence[str]) -> int:
+            folder = Path(command[command.index('--worker') + 1])
+            folders.append(folder)
+            request = cloud_gate.read(folder / 'request.json')
+            self.assertEqual(request['gate_job'], job_record)
+            sidecar = Path(command[command.index('--sidecar') + 1])
+            worker = cloud_gate.GateWorker(AwsCli('fixture-scaler', 'us-east-2', 1, execute=fake),
+                book, self.settings, sidecar, clock=lambda: now)
+            deployment = cloud_gate.read(folder / 'deployment.json')
+            if len(folders) == 1:
+                self.assertIsInstance(book.reserve_gate(self.settings, ledger.GateReservation(
+                    folder.name, now, ledger.instant(request, 'expires'), Decimal('.8'), Decimal('.02'))),
+                    ledger.GateReserved)
+                self.assertEqual(worker.launch(folder, request, deployment), 'i-fixture')
+            if len(folders) == 3:
+                run = gate.GateRun(tuple(gate.GateJobResult(suite, path.name, 0, 1, '') for suite, path in self.modules), 1, 1)
+                fake.result = {key: request[key] for key in ('attempt', 'commit', 'tree')}
+                fake.result.update(host='fixture-guest', verdict='pass', gate=gate_box.encode_run(run), gate_s=1,
+                    record=gate_box.completion_record(run, folder.name, ledger.text(request, 'commit'),
+                        ledger.text(request, 'tree'), 'fixture-guest', now, now + 1, mode.value))
+                result = worker.execute(folder, request, deployment)
+                self.assertEqual(result['status'], 'complete')
+                cloud_gate.save(folder / 'outcome.json', result)
+                raise OSError('The fixture lost its service connection')
+            cloud_gate.save(folder / 'outcome.json', {'status': 'pending', 'reason': 'fixture pending'})
+            return 0
+
+        no_service = mock.Mock(side_effect=AssertionError('A completed gate needs no service'))
+        with redirect_stdout(StringIO()):
+            for job, reason in ((job_a, 'fixture pending'), (job_a, 'fixture pending'),
+                                (job_b, 'The fixture lost its service connection')):
+                outcome = cloud_gate.run(self.repo, mode=mode, full=False, module_time_limit_s=1800,
+                                         service=service, gate_job=job)
+                self.assertEqual(outcome, cloud_gate.CloudDeclined(reason))
+            imported = cloud_gate.run(self.repo, mode=mode, full=False, module_time_limit_s=1800,
+                                      service=no_service, gate_job=job_a)
+
+        self.assertIsInstance(imported, cloud_gate.CloudCompleted)
+        no_service.assert_not_called()
+        folder = folders[0]
+        self.assertEqual(folders, [folder] * 3)
+        self.assertEqual([path for path in folder.parent.iterdir() if path.is_dir()], [folder])
+        self.assertTrue((folder / 'imported.json').exists())
+        self.assertEqual(len(fake.launches), 1)
+        self.assertEqual(cloud_gate.read(folder / 'request.json')['gate_job'], job_record)
+        current = cloud_gate.read(folder.parent / 'current.json')
+        self.assertEqual(current['attempt'], folder.name)
+        self.assertEqual(current['gate_job'], job_record)
+        rows = book.launches()
+        self.assertEqual([row['result'] for row in rows], ['launched', 'fallback', 'fallback', 'finished', 'fallback'])
+        self.assertTrue(all((row['attempt'], row['gate_job']) == (folder.name, job_record) for row in rows))
+
+    def test_prepare_failure_preserves_the_saved_job_for_the_next_command(self) -> None:
+        mode = gate.SuiteMode.GATE
+        job_a = StepJob('integrate', unit='unit-a')
+        job_b = StepJob('integrate', unit='unit-b')
+        recorded_job = cast(object, json.loads(wire.encode_record(job_a)))
+        unknown_job = {'kind': 'GateJobNotRecorded'}
+        root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
+        current = root / 'current.json'
+        cloud_gate.save(self.state / 'gate-deployment.json', {'deployment_id': 'fixture',
+            'bucket': 'fixture-bucket', 'revision': 'fixture-revision', 'image': 'fixture-image',
+            'template': 'fixture-template', 'version': '1', 'security_group': 'fixture-group',
+            'subnets': [{'id': 'fixture-a', 'zone': 'a'}]})
+        book = ledger.CostLedger(self.state)
+        now = int(time.time())
+        book.record_inventory(ledger.ResourceInventory(now, (), 'fixture', builder_removed=True))
+        run = gate.GateRun(tuple(gate.GateJobResult(suite, path.name, 0, 1, '') for suite, path in self.modules), 1, 1)
+
+        for legacy, expected in ((False, recorded_job), (True, unknown_job)):
+            with self.subTest(legacy=legacy), redirect_stdout(StringIO()):
+                if legacy:
+                    tree, _dirty = cloud_gate.working_tree(self.repo)
+                    cloud_gate.save(current, {'attempt': 'legacy-attempt', 'tree': tree,
+                        'commit': gate.checked_git(self.repo, 'rev-parse', 'HEAD'), 'mode': mode.value,
+                        'full': False, 'module_time_limit_s': 1800, 'modules': 'all', 'selection_tree': 'all'})
+                before = len(book.launches())
+                no_service = mock.Mock(side_effect=AssertionError('Preparation failed before the service could start'))
+                with mock.patch.object(cloud_gate, 'prepare', side_effect=OSError('fixture preparation failed')):
+                    failed = cloud_gate.run(self.repo, mode=mode, full=False, module_time_limit_s=1800,
+                                            service=no_service, gate_job=job_a)
+                self.assertEqual(failed, cloud_gate.CloudDeclined('fixture preparation failed'))
+                no_service.assert_not_called()
+                pointer = cloud_gate.read(current)
+                folder = root / ledger.text(pointer, 'attempt')
+                if legacy:
+                    self.assertEqual(folder.name, 'legacy-attempt')
+                self.assertEqual(pointer['gate_job'], expected)
+                self.assertFalse((folder / 'request.json').exists())
+                self.assertEqual(self.fallback_rows()[-1]['gate_job'], expected)
+                fake = FakeGateAws()
+
+                def service(command: Sequence[str]) -> int:
+                    self.assertEqual(Path(command[command.index('--worker') + 1]), folder)
+                    request = cloud_gate.read(folder / 'request.json')
+                    self.assertEqual(request.get('gate_job', unknown_job), expected)
+                    fake.result = {key: request[key] for key in ('attempt', 'commit', 'tree')}
+                    fake.result.update(host='fixture-guest', verdict='pass', gate=gate_box.encode_run(run), gate_s=1,
+                        record=gate_box.completion_record(run, folder.name, ledger.text(request, 'commit'),
+                            ledger.text(request, 'tree'), 'fixture-guest', now, now + 1, mode.value))
+                    sidecar = Path(command[command.index('--sidecar') + 1])
+                    worker = cloud_gate.GateWorker(AwsCli('fixture-scaler', 'us-east-2', 1, execute=fake),
+                        book, self.settings, sidecar, clock=lambda: now)
+                    deployment = cloud_gate.read(folder / 'deployment.json')
+                    with mock.patch.object(worker, 'charges'):
+                        cloud_gate.save(folder / 'outcome.json', worker.execute(folder, request, deployment))
+                    return 0
+
+                resumed = cloud_gate.run(self.repo, mode=mode, full=False, module_time_limit_s=1800,
+                                         service=service, gate_job=job_b)
+                self.assertIsInstance(resumed, cloud_gate.CloudCompleted)
+                self.assertEqual(len(fake.launches), 1)
+                rows = book.launches()[before:]
+                self.assertEqual([row['result'] for row in rows], ['fallback', 'launched', 'finished'])
+                self.assertTrue(all((row['attempt'], row['gate_job']) == (folder.name, expected) for row in rows))
 
     def test_pending_attempt_reuses_only_the_same_working_tree(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
@@ -2930,7 +5390,7 @@ class CloudRouteTests(CostFixture):
             return 0
         for content in ('first edit\n', 'first edit\n', 'second edit\n'):
             _ = self.modules[0][1].write_text(content)
-            _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+            _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                module_time_limit_s=1800, service=service)
         self.assertEqual(folders[0], folders[1])
         self.assertNotEqual(folders[1], folders[2])
@@ -2938,30 +5398,31 @@ class CloudRouteTests(CostFixture):
         tree, dirty = cloud_gate.working_tree(self.repo)
         self.assertTrue(dirty)
         selected = gate.TreeSelection(paths, tree)
-        _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+        _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                            module_time_limit_s=1800, service=service, selected=selected)
         stale = gate.TreeSelection(paths, gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
         with self.subTest(selection='different tree with a saved request'):
             count = len(folders)
-            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                                      module_time_limit_s=1800, service=service, selected=stale)
-            self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
+            self.assertEqual(outcome, cloud_gate.CloudDeclined('The checkout changed after the test selection'))
             self.assertEqual(len(folders), count)
         reserve = cloud_gate.cloud_reservation
 
         @contextmanager
-        def changed_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Generator[cloud_gate.CloudReservation]:
-            with reserve(repo, sidecar, mode) as reservation:
+        def changed_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode, *,
+                                gate_job: StepJob | GateJobNotRecorded) -> Generator[cloud_gate.CloudReservation]:
+            with reserve(repo, sidecar, mode, gate_job=gate_job) as reservation:
                 _ = self.modules[1][1].write_text('import sys\n')
                 yield reservation
 
         with (self.subTest(selection='tree changed during reservation'),
               mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=changed_reservation),
               mock.patch.object(cloud_gate, 'run_service', side_effect=AssertionError('No service may start')) as start):
-            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                                      module_time_limit_s=1800, service=service,
                                      selected=gate.TreeSelection(('scripts/fixture/test_two.py',), tree))
-        self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
+        self.assertEqual(outcome, cloud_gate.CloudDeclined('The checkout changed after the test selection'))
         start.assert_not_called()
 
     def test_both_service_types_have_stop_cleanup(self) -> None:
@@ -2989,22 +5450,33 @@ class CloudRouteTests(CostFixture):
 
     def test_service_commands_forward_only_set_owner_variables(self) -> None:
         owner = {'CODEX_THREAD_ID': 'fixture-codex', 'CLAUDE_CODE_SESSION_ID': 'fixture-claude',
-                 'CLAUDE_SESSION_NAME': 'fixture caller', 'BUILDLOG_UNIT': 'fixture-unit'}
+                 'BUILDLOG_OWNER_STAFF_ID': 'fixture-staff', 'CLAUDE_SESSION_NAME': 'fixture caller',
+                 'BUILDLOG_UNIT': 'fixture-unit'}
+        unowned = admission_records.OwnerNotGiven('systemd · fixture.service')
         for paired in (False, True):
-            for values in ({}, owner, {'CLAUDE_CODE_SESSION_ID': 'fixture-claude'}, {'BUILDLOG_UNIT': ''}):
-                with self.subTest(paired=paired, values=values), mock.patch.dict(os.environ):
+            for values, family, expected in (
+                ({}, unowned, {}), (owner, unowned, owner),
+                ({'CLAUDE_CODE_SESSION_ID': 'fixture-claude'}, unowned, {'CLAUDE_CODE_SESSION_ID': 'fixture-claude'}),
+                ({'BUILDLOG_UNIT': ''}, unowned, {}),
+                # A terminal caller names its owner, so the service request says who started it.
+                ({'BUILDLOG_UNIT': 'fixture-unit'}, admission_records.TERMINAL_OWNER,
+                 {'BUILDLOG_UNIT': 'fixture-unit', 'CLAUDE_SESSION_NAME': 'terminal'}),
+                # A state-root script of a staff member passes the staff id, so the staff link stays.
+                ({}, admission_records.StaffOwner('fixture-staff', 'impl'), {'BUILDLOG_OWNER_STAFF_ID': 'fixture-staff'}),
+            ):
+                with (self.subTest(paired=paired, values=values), mock.patch.dict(os.environ),
+                      mock.patch.object(admission_records, 'family_owner', return_value=family)):
                     for key in owner:
                         _ = os.environ.pop(key, None)
                     os.environ.update(values)
                     command = cloud_gate.service_command('scripts.aws_target.aws_trial',
                         ['--paired-worker', str(self.root / 'trial')], 'fixture', paired=paired)
                     forwarded = service_environment(command)
-                    self.assertEqual({key: value for key, value in forwarded.items() if key in owner}, values)
+                    self.assertEqual({key: value for key, value in forwarded.items() if key in owner}, expected)
                     self.assertEqual(set(forwarded) - set(owner), {'AWS_SHARED_CREDENTIALS_FILE', 'CONF_DIR'})
                     self.assertIn('--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE', command)
 
     def test_forwarded_worker_records_keep_the_callers_labels_and_unit(self) -> None:
-        _ = write_config_fixture(self.root / 'build_steps.conf', 'owned.merge-gate={unit} merge\n')
         owner = UnitLabels('fixture caller', 'fixture-production', 'fixture-unit', OwnerRole.UNIT)
         for paired in (False, True):
             for session_key in ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
@@ -3019,7 +5491,7 @@ class CloudRouteTests(CostFixture):
                     for key in (session_key, 'CLAUDE_SESSION_NAME', 'BUILDLOG_UNIT'):
                         del os.environ[key]
                     os.environ.update(forwarded)
-                    with cloud_gate.cloud_reservation(self.repo, self.root / 'worker.sidecar', gate.SuiteMode.MERGE_GATE):
+                    with cloud_gate.cloud_reservation(self.repo, self.root / 'worker.sidecar', gate.SuiteMode.GATE):
                         record, = self.admission.caller_reservations().values()
                         identity = record.queue_waiter
                         self.assertEqual((identity.get('session_id'), identity.get('session_name'), identity.get('unit')),
@@ -3028,7 +5500,6 @@ class CloudRouteTests(CostFixture):
                             identity.get('session_name', ''), record.step, record.worktree, identity['since'],
                             record.need, admission_records.ReadyForAdmission(), unit=identity.get('unit', ''))
                         self.assertEqual(queue_evidence.step_labels(step, {'fixture-owner': owner}), owner)
-                        self.assertEqual(read_step_names().for_owner(step.step, owner.unit, owner.role), 'fixture-unit merge')
 
     def test_paired_trial_admission_records_its_named_test_job(self) -> None:
         pid = os.getpid()
@@ -3088,7 +5559,7 @@ class CloudRouteTests(CostFixture):
                     row: dict[str, object] = {key: request[key] for key in ('attempt', 'commit', 'tree')}
                     row.update(host='remote-host', verdict='pass', gate=gate_box.encode_run(run), record=gate_box.completion_record(
                         run, ledger.text(request, 'attempt'), ledger.text(request, 'commit'), ledger.text(request, 'tree'),
-                        'remote-host', 0, 1, 'merge-gate'))
+                        'remote-host', 0, 1, 'gate'))
                     record = ledger.mapping(row['record'])
                     record.update(head=request['head'], dirty=bool(request['dirty_paths']), dirty_paths=request['dirty_paths'])
                     if later_edit:
@@ -3104,12 +5575,12 @@ class CloudRouteTests(CostFixture):
                 before = len(self.fallback_rows())
                 with (mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('The session must not call AWS')),
                       mock.patch.object(store, 'host_file', return_value=destination),
-                      mock.patch.dict(os.environ, {'MERGE_GATE_PASSED_DIR': str(self.root / 'passed')}),
+                      mock.patch.dict(os.environ, {'GATE_PASSED_DIR': str(self.root / 'passed')}),
                       redirect_stdout(StringIO()) as output):
-                    outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+                    outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                              module_time_limit_s=1800, service=service)
                 if changed_head:
-                    self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed during the cloud attempt'))
+                    self.assertEqual(outcome, cloud_gate.CloudDeclined('The checkout changed during the cloud attempt'))
                     self.assertFalse(destination.exists())
                     rows = self.fallback_rows()
                     self.assertEqual(len(rows), before + 1)
@@ -3136,9 +5607,38 @@ class CloudRouteTests(CostFixture):
 
     def test_absent_stack_needs_no_service_or_aws_call(self) -> None:
         service = mock.Mock(side_effect=AssertionError('An absent stack needs no service'))
-        outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+        outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                  module_time_limit_s=1800, service=service)
-        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+        service.assert_not_called()
+
+    def test_disabled_cloud_gate_skips_deployment_and_aws(self) -> None:
+        _ = (self.root / 'cloud_gate.conf').write_text('# one of: on, off\nenabled=off\n')
+        fake = FakeGateAws()
+        api = AwsCli('fixture', 'us-east-2', 1, fake)
+        service = mock.Mock(side_effect=AssertionError('A disabled cloud gate must not start a service'))
+        with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
+              mock.patch.object(cloud_gate, 'control_lock') as lock,
+              mock.patch.object(cloud_gate, 'gate_deployment') as deployment):
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
+                                     module_time_limit_s=1800, service=service)
+        reason = 'cloud gates are off (cloud_gate.conf enabled=off)'
+        self.assertEqual(outcome, cloud_gate.CloudDeclined(reason))
+        lock.assert_not_called()
+        deployment.assert_not_called()
+        service.assert_not_called()
+        self.assertEqual(fake.commands, [])
+        self.assertEqual([row['reason'] for row in self.fallback_rows()], [reason])
+
+    def test_invalid_cloud_gate_switch_falls_back_with_config_error(self) -> None:
+        _ = (self.root / 'cloud_gate.conf').write_text('# one of: on, off\nenabled=invalid\n')
+        service = mock.Mock(side_effect=AssertionError('An invalid switch must not start a service'))
+        mode = gate.SuiteMode.GATE
+        outcome = cloud_gate.run_cloud(self.repo, mode=mode, full=False, module_time_limit_s=1800,
+                                       service=service, attempt=cloud_gate.CloudAttempt(self.state, mode))
+        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+        assert isinstance(outcome, cloud_gate.CloudDeclined)
+        self.assertIn("cloud_gate.conf: enabled='invalid':", outcome.reason)
         service.assert_not_called()
 
     def test_fallback_row_write_error_keeps_the_original_fallback(self) -> None:
@@ -3146,9 +5646,9 @@ class CloudRouteTests(CostFixture):
         with (mock.patch.object(cloud_gate, 'append_launch',
                                 side_effect=PermissionError('fixture row write denied')) as append,
               redirect_stderr(StringIO()) as errors):
-            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                 module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
-        self.assertEqual(outcome, cloud_gate.LocalFallback('image or stack is absent'))
+        self.assertEqual(outcome, cloud_gate.CloudDeclined('image or stack is absent'))
         self.assertEqual(errors.getvalue(), 'Cloud gate fallback row was not written: fixture row write denied\n')
         append.assert_called_once()
         service.assert_not_called()
@@ -3166,13 +5666,14 @@ class CloudRouteTests(CostFixture):
                     cloud_gate.save(self.state / 'gate-deployment.json', dict(deployment))
                 before = len(self.fallback_rows())
                 service = mock.Mock(side_effect=AssertionError('No service may start'))
-                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                     module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
-                self.assertEqual(outcome, cloud_gate.LocalFallback('image or stack is absent'))
+                self.assertEqual(outcome, cloud_gate.CloudDeclined('image or stack is absent'))
                 rows = self.fallback_rows()
                 self.assertEqual(len(rows), before + 1)
                 self.assertEqual((rows[-1]['attempt'], rows[-1]['reason'], rows[-1]['mode']),
-                                 ('', 'image or stack is absent', gate.SuiteMode.TARGETED_TEST.value))
+                                 ('', 'image or stack is absent', gate.SuiteMode.TARGETED.value))
+                self.assertEqual(rows[-1]['gate_job'], {'kind': 'GateJobNotRecorded'})
                 self.assertIsInstance(rows[-1]['time'], (int, float))
                 service.assert_not_called()
 
@@ -3186,9 +5687,9 @@ class CloudRouteTests(CostFixture):
                   mock.patch.object(cloud_gate, phase, side_effect=error)):
                 before = len(self.fallback_rows())
                 service = mock.Mock(side_effect=AssertionError('No service may start'))
-                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                     module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
-                self.assertEqual(outcome, cloud_gate.LocalFallback(str(error)))
+                self.assertEqual(outcome, cloud_gate.CloudDeclined(str(error)))
                 rows = self.fallback_rows()
                 self.assertEqual(len(rows), before + 1)
                 self.assertEqual(rows[-1]['reason'], str(error))
@@ -3220,9 +5721,9 @@ class CloudRouteTests(CostFixture):
                         cloud_gate.save(folder / 'outcome.json', reply)
                     return 1
                 before = len(self.fallback_rows())
-                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                     module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
-                self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
+                self.assertEqual(outcome, cloud_gate.CloudDeclined(reason))
                 rows = self.fallback_rows()
                 self.assertEqual(len(rows), before + 1)
                 self.assertEqual((rows[-1]['attempt'], rows[-1]['reason']), (attempts[-1], reason))
@@ -3249,20 +5750,140 @@ class CloudRouteTests(CostFixture):
             row, = reading.cloud
             self.assertEqual(row.wait, wire.CloudSlotWait(1, reading.cloud_slots, ReservedCloudSlot()))
             folder = Path(command[command.index('--worker') + 1])
+            self.assertEqual(cloud_gate.read(folder / 'request.json')['gate_job'],
+                             json.loads(wire.encode_record(record.gate_job)))
             cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': 'capacity'})
             return 0
         with mock.patch.object(admission_client, 'admit', side_effect=record):
-            for mode in (gate.SuiteMode.MERGE_GATE, gate.SuiteMode.TARGETED_TEST):
-                outcome = cloud_gate.run(self.repo, mode=mode, full=True, module_time_limit_s=1800, service=service)
-                self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+            for mode, job in ((gate.SuiteMode.GATE, StepJob('integrate', unit='fixture', branch='integration')),
+                              (gate.SuiteMode.TARGETED, StepJob('test-all'))):
+                outcome = cloud_gate.run(self.repo, mode=mode, full=True, module_time_limit_s=1800,
+                                         service=service, gate_job=job)
+                self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
                 self.assertTrue(self.admission.callers_released())
                 request = requests[-1]
                 self.assertEqual(request.place, wire.CloudPlace('aws'))
                 self.assertEqual(request.identity.step, mode.value)
+                self.assertEqual(request.identity.job, job)
+                self.assertEqual(self.fallback_rows()[-1]['gate_job'], json.loads(wire.encode_record(job)))
                 self.assertEqual(request.owner.pid, os.getpid())
                 self.assertEqual(request.run, wire.RunIdentity(request.owner.pid, request.owner.start_time))
 
-    def test_cloud_fallback_releases_before_local_memory_admission(self) -> None:
+    def route_binding(self, assignment: placement.PlacementAssignment) -> tuple[ledger.GateDispatchBinding, Path]:
+        claim = placement.assigned_claim_reference(assignment)
+        sidecar = self.root / f'progress-{claim.claim_id}'
+        binding = ledger.GateDispatchBinding(claim, self.root / 'queue' / f'{claim.claim_id}.json',
+            self.state, conf.path('build_targets'), self.settings)
+        binding.publish(ledger.gate_dispatch_binding_path(sidecar))
+        return binding, sidecar
+
+    def test_cloud_refusal_uses_the_assigned_slot_and_closes_the_booking(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image',
+            'template': 'fixture-template', 'bucket': 'fixture-bucket', 'security_group': 'fixture-group',
+            'deployment_id': 'fixture', 'revision': 'fixture', 'version': '1',
+            'subnets': [{'id': 'fixture-subnet', 'zone': 'fixture-zone'}]})
+        target = aws_gate_assignment()
+        assignment = target.assignment
+        _ = write_config_fixture(conf.path('build_targets'),
+            'targets=aws\nkind.aws=scaler\nenabled.aws=on\nsettings.aws=cloud_gate.conf\n')
+        binding, sidecar = self.route_binding(assignment)
+        claim = binding.claim
+        journal = ledger.GateDispatchJournal(binding.journal)
+        book = ledger.CostLedger(binding.directory)
+        book.record_inventory(ledger.ResourceInventory(int(time.time()), (), 'fixture', builder_removed=True))
+        fake = FakeGateAws()
+        fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation'] * 20
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if 'run-instances' in arguments and not fake.launches:
+                folder, = journal.read().folders
+                bookings = book.gate_claim_reservations(claim.claim_id)
+                self.assertEqual(len(bookings), 1, 'The assigned claim needs one booking before launch')
+                booked, = bookings
+                self.assertEqual(booked.attempt, folder.name)
+                self.assertEqual(booked.placement_claim, claim.claim_id)
+                self.assertIsInstance(booked.state, ledger.GateLaunchPending)
+            return fake(arguments, **options)
+
+        def service(command: Sequence[str]) -> int:
+            self.assertTrue(self.admission.callers_released())
+            folder = Path(command[command.index('--worker') + 1])
+            self.assertNotEqual(folder.name, claim.claim_id)
+            self.assertEqual(journal.read().folders, (folder,))
+            request = cloud_gate.read(folder / 'request.json')
+            self.assertEqual(request['placement_claim'], claim.claim_id)
+            with mock.patch.object(sys, 'argv', ['cloud_gate', *command[command.index('--worker'):]]):
+                return cloud_gate.main()
+
+        api = AwsCli('fixture', 'us-east-2', 1, execute=transport)
+        with (mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar),
+                                          'BUILDLOG_PLACEMENT_FILE': str(self.root / 'assignment.json')}),
+              mock.patch.object(admission_client, 'consume_permission', return_value=wire.FirstAuthorization(assignment, claim)),
+              mock.patch.object(admission_client, 'report_execution') as report,
+              mock.patch.object(cloud_gate, 'run', side_effect=partial(cloud_gate.run, service=service)),
+              mock.patch.object(cloud_gate, 'cloud_reservation') as legacy,
+              mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
+              mock.patch.object(gate, 'run_suites') as local,
+              self.assertRaisesRegex(gate.AwsGateTookNoRun, 'capacity')):
+            _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED, target=target)
+        self.assertTrue(fake.launches)
+        legacy.assert_not_called()
+        local.assert_not_called()
+        report.assert_called_once()
+        sent = cast(wire.ExecutionReport, report.call_args.args[0])
+        self.assertEqual((sent.assignment, sent.claim), (assignment, claim))
+        self.assertIsInstance(sent.path, placement.DispatchPathSettled)
+        self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
+        self.assertEqual(sent.outcome, placement.PrelaunchRefused(
+            'AWS gate took no run. Spot capacity is unavailable in every configured region'))
+        self.assertEqual(journal.read().state, 'no launch')
+        booked, = book.gate_claim_reservations(claim.claim_id)
+        self.assertIsInstance(booked.state, ledger.GateAbsent)
+        self.assertTrue(self.admission.callers_released())
+
+    def test_unknown_checkout_modes_refuse_without_starting_the_cloud_service(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        runner = self.repo / 'scripts/production/gate.py'
+        source = runner.read_text()
+        _ = runner.write_text(source.replace('"gate"', '"other-gate"').replace('"test-affected"', '"other-affected"')
+                              .replace('"merge-gate"', '"other-merge"').replace('"targeted-test"', '"other-targeted"'))
+        _ = gate.checked_git(self.repo, 'add', '.')
+        _ = gate.checked_git(self.repo, 'commit', '-qm', 'Use suite mode values this code does not read')
+        for mode in gate.SuiteMode:
+            target = aws_gate_assignment(mode.value)
+            binding, sidecar = self.route_binding(target.assignment)
+            claim = binding.claim
+            with (self.subTest(mode=mode),
+                  mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar),
+                                              'BUILDLOG_PLACEMENT_FILE': str(self.root / 'assignment.json')}),
+                  mock.patch.object(cloud_gate, 'run_service', side_effect=AssertionError('No cloud service may start')) as service,
+                  mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('No AWS call may start')),
+                  mock.patch.object(admission_client, 'consume_permission', return_value=wire.FirstAuthorization(target.assignment, claim)),
+                  mock.patch.object(admission_client, 'report_execution') as report,
+                  mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO())):
+                before = len(self.fallback_rows())
+                reason = f'The tested commit does not read SuiteMode value {mode.wire!r}'
+                with self.assertRaisesRegex(GateRefused, reason):
+                    _ = gate.run_gate_suites(self.repo, full=True, mode=mode, target=target)
+                local.assert_not_called()
+                service.assert_not_called()
+                report.assert_called_once()
+                sent = cast(wire.ExecutionReport, report.call_args.args[0])
+                self.assertEqual(sent.claim, claim)
+                self.assertIsInstance(sent.path, placement.DispatchPathSettled)
+                self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
+                self.assertEqual(sent.outcome, placement.PrelaunchRefused(f'AWS gate took no run. {reason}'))
+                journal = ledger.GateDispatchJournal(binding.journal).read()
+                self.assertEqual(journal.state, 'no launch')
+                self.assertEqual(journal.folders, ())
+                book = ledger.CostLedger(binding.directory)
+                self.assertFalse(book.path.exists())
+                rows = self.fallback_rows()
+                self.assertEqual(len(rows), before + 1)
+                self.assertEqual((rows[-1]['mode'], rows[-1]['reason']), (mode.value, reason))
+                self.assertTrue(self.admission.callers_released())
+
+    def test_cloud_refusal_releases_the_cloud_slot(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
         def service(command: Sequence[str]) -> int:
             record, = self.admission.caller_reservations().values()
@@ -3270,41 +5891,31 @@ class CloudRouteTests(CostFixture):
             folder = Path(command[command.index('--worker') + 1])
             cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': 'capacity'})
             return 0
-        run = cloud_gate.run
-        def route(repo: Path, **_kwargs: object) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
-            return run(repo, mode=gate.SuiteMode.TARGETED_TEST, full=True, module_time_limit_s=1800, service=service)
-        def local(repo: Path, *_args: object, **_kwargs: object) -> gate.GateRun:
-            self.assertTrue(self.admission.callers_released())
-            with gate.gate_reservation(repo, self.root, gate.BuildHoldWait(), mode=gate.SuiteMode.TARGETED_TEST) as place:
-                record, = self.admission.caller_reservations().values()
-                self.assertGreater(record.need, 0)
-                place.status = 0
-            return gate.GateRun((), 0, 0)
-        with (mock.patch.object(cloud_gate, 'run', side_effect=route),
-              mock.patch.object(gate, 'run_suites', side_effect=local), redirect_stdout(StringIO())):
-            _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED_TEST)
+        outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=True,
+                                 module_time_limit_s=1800, service=service)
+        self.assertEqual(outcome, cloud_gate.CloudDeclined('capacity'))
         self.assertTrue(self.admission.callers_released())
 
     def test_cloud_service_error_releases_its_slot(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
-        for status_error in (False, True):
-            with (self.subTest(status_error=status_error),
-                  mock.patch.object(affected_modules, 'dirty_paths', return_value=set(),
-                                    side_effect=affected_modules.GraphError('fixture status error') if status_error else None)):
+        for tree_error in (False, True):
+            with (self.subTest(tree_error=tree_error),
+                  mock.patch.object(cloud_gate, 'working_tree', wraps=cloud_gate.working_tree,
+                                    side_effect=affected_modules.GraphError('fixture tree error') if tree_error else None)):
                 service = mock.Mock(side_effect=OSError('fixture service error'))
-                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                                          module_time_limit_s=1800, service=service)
-                self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+                self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
                 self.assertTrue(self.admission.callers_released())
-                if status_error:
-                    self.assertEqual(outcome, cloud_gate.LocalFallback('fixture status error'))
+                if tree_error:
+                    self.assertEqual(outcome, cloud_gate.CloudDeclined('fixture tree error'))
                     service.assert_not_called()
 
     def test_route_uses_installed_limit_and_handles_missing_results(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
-        outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True, module_time_limit_s=1800,
+        outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True, module_time_limit_s=1800,
                                  service=lambda _command: 0)
-        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
         self.assertTrue(self.admission.callers_released())
 
         installed = self.root / '.claude/config/aws_target.conf'
@@ -3335,7 +5946,7 @@ class CloudRouteTests(CostFixture):
                     fake.result = {key: request[key] for key in ('attempt', 'commit', 'tree')}
                     fake.result.update(host='fixture-guest', verdict='pass', gate=gate_box.encode_run(run),
                         record=gate_box.completion_record(run, ledger.text(request, 'attempt'),
-                            ledger.text(request, 'commit'), ledger.text(request, 'tree'), 'fixture-guest', now, now + 1, 'merge-gate'))
+                            ledger.text(request, 'commit'), ledger.text(request, 'tree'), 'fixture-guest', now, now + 1, 'gate'))
                     api = AwsCli('build-scaler', 'fixture-region', 1, execute=fake)
                     arguments = list(command[command.index('--worker'):])
                     with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
@@ -3347,8 +5958,8 @@ class CloudRouteTests(CostFixture):
                     'subnets': [{'id': 'fixture-a', 'zone': 'a'}]}
                 cloud_gate.save(self.state / 'gate-deployment.json', deployment)
                 with mock.patch.dict(os.environ, {'CONF_DIR': str(checkout), 'AWS_TARGET_CONFIG': str(installed)}):
-                    outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                    outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                                              module_time_limit_s=1800, service=service)
-                self.assertEqual(outcome, cloud_gate.LocalFallback('daily_limit'))
+                self.assertEqual(outcome, cloud_gate.CloudDeclined('daily_limit'))
                 self.assertEqual(fake.launches, [])
                 self.assertTrue(self.admission.callers_released())

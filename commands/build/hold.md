@@ -21,7 +21,7 @@ The command stops existing queued gates and running work outside the allow rules
 It keeps the sole holder's work, explicit keep entries and their children, user terminal work, and shared sccache work.
 Live Mac or AWS claims also keep their runs.
 Unreadable claim records prevent enforcement until those records become readable.
-Each stopped session gets one release notice to repeat its work.
+The release notifies stopped sessions.
 New natedev work waits until release.
 CI work that the service cannot stop continues if already admitted.
 Other CI requests stay queued until release.
@@ -32,11 +32,13 @@ Other CI requests stay queued until release.
 2. Add `--keep <pid>` for an additional run that must continue.
 3. Use `YYYY-MM-DDTHH:MM` instead of `HH:MM` for a later date.
 
-The command keeps existing outermost gates, CI workers, and builds that the enforcer could stop.
+The command keeps CI workers, builds that the enforcer could stop, and outermost gates that hold work.
+A gate holds work when it has a cargo child, an admission reservation, a live Mac or AWS claim, or a remote waiter.
 It publishes the hold and repeats discovery before starting the enforcer.
 The second discovery adds only processes whose boot-relative start ticks do not exceed the publication bound.
 A concurrent release ends the command without restoring the hold.
-Existing queued and running work finishes through the same keep list.
+Kept runs finish.
+A gate that only waits in the queue is not kept: it waits for the release like new work.
 New natedev work waits until explicit release.
 Each 60 seconds, the command prints `draining: N runs remain`.
 Completion prints `drained; natedev stays held until release` and returns 0.
@@ -63,7 +65,9 @@ Use a detached run for this wait.
 Release removes the caller's holder file before recording delivery state.
 Another holder keeps the target held.
 The enforcer exits after the last holder file disappears.
-Each waiting session gets one release notice.
+Release skips a recipient when it confirms that both the staff row and the session are absent.
+Release lists a missing session with a staff row under `Not reached`.
+The sender skips closed Codex workers with no route. Their next assignment resumes them.
 On `No hold cycle: broadcast this release to every session.`, use `/notify_top_level --here`.
 On `Not reached, tell them yourself: ...`, tell each named session.
 `release --resume` completes pending notices only when no holder file remains.
