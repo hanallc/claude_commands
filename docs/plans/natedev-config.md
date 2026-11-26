@@ -929,20 +929,10 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 ### Phase 26 — Test fixtures for the conf reads of X  · status: done
 
-**Depends on:** Phase 25
+#### As-built
 
-#### Work Order
+- Seven test modules write `user_zone.conf` with `write_config_fixture` in their fixture config directory. `test_change_page` writes `notify.conf` there; its SSH timeout test keeps its assertion.
+- The 22 tests that failed on X 9120438c18 pass. No code default, no config change and no weakened assertion.
+- Showrunner ruling (16:02 PST): ship X with the live reads as they are. `user_zone()` and notify `review_timeout_seconds` have no code default; a runtime with no config copy raises `conf.Unusable`.
 
-**Goal:** The 22 tests that pass on main 5a70285346 and fail on X 9120438c18 pass on X.
-
-**Spec:**
-- Cause (accounts triage, 15:57 PST): X reads `user_zone.conf` and `notify.conf` `review_timeout_seconds` through `conf`. The test fixtures of these modules do not supply them.
-- Modules: build_queue test_kill_action (4) and test_memory_feed (1); lib test_main_sync and test_waiting_rows; rebuild test_reason (7); review_links test_change_page, test_new_item (3), test_serve f023/f026 (3); worktree_delete test_perform_deletion_rerun. The test ids are in the accounts report: /session/accounts/claude-1000/-home-natepiano-worktrees-claude-accounts-worktree/8f90aab3-fd40-47ea-8d7a-2858d9c26d6e/scratchpad/triage25/report.md
-- Fix the fixtures: each fixture config directory supplies the keys that the code under test reads. Use the shared fixture helper when one exists. Do not add a code default. Do not change a config key or value in `config/`. Do not weaken an assertion.
-- Do not touch the 4 machine reds (magick on the Mac guest) or the accounts review page red.
-
-**Files:** the test modules above and their fixture helpers only.
-
-**Workers:** 1 writer. `impl` holds every file; the work is fixture edits and the tests are the files.
-
-**Acceptance gate:** each of the 22 test ids passes by name on the tip; basedpyright 0/0 on each changed file; the config key check `--base origin/main --tip HEAD` exits 0.
+**Files:** `scripts/build_queue/test_kill_action.py`, `test_memory_feed.py`; `scripts/lib/test_main_sync.py`, `test_waiting_rows.py`; `scripts/rebuild/test_reason.py`; `scripts/review_links/test_change_page.py`, `test_new_item.py`; `scripts/worktree_delete/test_perform_deletion_rerun.py`
