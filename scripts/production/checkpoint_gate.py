@@ -18,6 +18,7 @@ from typing import Literal, NamedTuple, TypedDict, cast
 
 from scripts.build_queue.first_step import FirstStepRefused, gate_targets
 from scripts.copies import copies
+from scripts.lib import build_steps
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import (
     GATE_PRELAUNCH_REFUSED_STATUS, GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS, command_program, parse_command_program,
@@ -182,23 +183,17 @@ def gate_program_start(command: Sequence[str]) -> int:
     """Skip env options and assignments before identifying the program."""
     if not command or Path(command[0]).name != "env":
         return 0
-    start = 1
-    while start < len(command):
-        word = command[start]
-        if word == "--":
-            start += 1
-            break
-        option, equals, _ = word.partition("=")
-        if option in ("--unset", "--chdir", "--argv0"):
-            start += 1 if equals else 2
-        elif option in ("--block-signal", "--default-signal", "--ignore-signal"):
-            start += 1
-        elif word in ("--ignore-environment", "--debug", "--list-signal-handling"):
-            start += 1
-        elif short := re.fullmatch(r"-[iv]*(?:([uCa])(.*))?", word):
-            start += 2 if short[1] and not short[2] else 1
-        else:
-            break
+    options, tail = build_steps.env_parts(command[1:])
+    # A split string can supply the program. Help, version, and null options run no program.
+    if {"-S", "-0"}.intersection(options) or any(
+            name.startswith(option) for option in options
+            for name in ("--split-string", "--help", "--version", "--null")):
+        return len(command)
+    start = len(command) - len(tail)
+    if start < len(command) and command[start] == "--":
+        start += 1
+    if start < len(command) and command[start] == "-":
+        start += 1
     while start < len(command) and not command[start].startswith("-") and "=" in command[start]:
         start += 1
     return start

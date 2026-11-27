@@ -59,11 +59,8 @@ SECTION = "cli.hand_made"
 # The exit status of an attempt with no program status. The record row tells it from a program exit 2.
 REFUSED_EXIT = 2
 PYTHON = re.compile(r"python[0-9.]*")
-# Short options of env and of uv run that take the next word, or the rest of their cluster, as their value.
-ENV_VALUE_LETTERS = "CSau"
+# Short uv run options that take the next word or the rest of the option as a value.
 UV_VALUE_LETTERS = "CPfipw"
-# Long options of env that take the next word as their value. env accepts a unique start of each name.
-ENV_VALUE_OPTIONS = ("--argv0", "--chdir", "--split-string", "--unset")
 # Variables that the program also gets when they are set; the model sees each one with its value.
 SHOWN_VARIABLES = frozenset({"PKG_CONFIG_PATH", "LIBCLANG_PATH", "LD_LIBRARY_PATH", "BINDGEN_EXTRA_CLANG_ARGS",
                              "CARGO_TARGET_DIR", "CC", "CXX", "NIX_CFLAGS_COMPILE", "NIX_LDFLAGS"})
@@ -296,38 +293,6 @@ def write_refusal(path: Path, written: Sequence[Path]) -> str | None:
     return None if bind is None else WRITE_REFUSAL.format(path=path, bind=bind)
 
 
-def option_names(words: Sequence[str], value_letters: str,
-                 long_value: Callable[[str, str], bool]) -> tuple[list[str], int]:
-    """The options before the first word that is not an option or an option value, and the index of that word.
-
-    The names are -x for each letter of a short cluster up to the first letter that takes a value, and --name
-    for each long option. long_value gets the name and the next word, and tells if the option takes that word.
-    """
-    names: list[str] = []
-    index = 0
-    while index < len(words) and words[index].startswith("-") and words[index] not in ("-", "--"):
-        word = words[index]
-        index += 1
-        if word.startswith("--"):
-            name, equal, _ = word.partition("=")
-            names.append(name)
-            index += 1 if not equal and long_value(name, words[index] if index < len(words) else "") else 0
-            continue
-        for position, letter in enumerate(word[1:], start=2):
-            names.append("-" + letter)
-            if letter in value_letters:
-                index += 0 if word[position:] else 1
-                break
-    return names, index
-
-
-def env_parts(words: Sequence[str]) -> tuple[list[str], Sequence[str]]:
-    """The option names of an env command and the words after them: the NAME=VALUE words, then the program."""
-    names, end = option_names(words, ENV_VALUE_LETTERS,
-                              lambda name, _next: any(option.startswith(name) for option in ENV_VALUE_OPTIONS))
-    return names, words[end:]
-
-
 def uv_option_names(words: Sequence[str]) -> set[str]:
     """The uv options before the subcommand and, for uv run, before its command.
 
@@ -338,9 +303,9 @@ def uv_option_names(words: Sequence[str]) -> set[str]:
     def long_value(_name: str, following: str) -> bool:
         return not following.startswith("-")
 
-    names, _ = option_names(words, UV_VALUE_LETTERS, long_value)
+    names, _ = build_steps.option_names(words, UV_VALUE_LETTERS, long_value)
     if "run" in words:
-        names += option_names(words[words.index("run") + 1:], UV_VALUE_LETTERS, long_value)[0]
+        names += build_steps.option_names(words[words.index("run") + 1:], UV_VALUE_LETTERS, long_value)[0]
     return set(names)
 
 
@@ -368,7 +333,7 @@ def changes_folder(argv: Sequence[str]) -> bool:
         if name == "uv" and {"--directory", "--project"} & uv_option_names(argv[index + 1:]):
             return True
         if name == "env":
-            for name in env_parts(argv[index + 1:])[0]:
+            for name in build_steps.env_parts(argv[index + 1:])[0]:
                 if name in ("-C", "-S") or any(option.startswith(name) for option in ("--chdir", "--split-string")):
                     return True
     return False
@@ -378,7 +343,7 @@ def sets_variable(argv: Sequence[str]) -> bool:
     """An env word of the command sets a variable with a NAME=VALUE word. env takes - and -- before them."""
     for index, word in enumerate(argv):
         if PurePath(word).name == "env":
-            words = [item for item in env_parts(argv[index + 1:])[1] if item not in ("-", "--")]
+            words = [item for item in build_steps.env_parts(argv[index + 1:])[1] if item not in ("-", "--")]
             if words and "=" in words[0]:
                 return True
     return False

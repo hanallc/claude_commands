@@ -1,6 +1,6 @@
 """Read the display names, prose names and descriptions of build steps."""
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import MappingProxyType
@@ -153,6 +153,44 @@ def gate_target_kind(target: str) -> Literal["natedev", "mac-linux", "aws"] | No
     if target in ("natedev", "mac-linux", "aws"):
         return target
     return None
+
+
+# Short env options that take the next word or the rest of the option as a value.
+ENV_VALUE_LETTERS = "CSau"
+# Long env options that take a value. Env accepts unique prefixes of these names.
+ENV_VALUE_OPTIONS = ("--argv0", "--chdir", "--split-string", "--unset")
+
+
+def option_names(words: Sequence[str], value_letters: str,
+                 long_value: Callable[[str, str], bool]) -> tuple[list[str], int]:
+    """Return the option names and the index of the first word after the options.
+
+    Return each letter of a short option as a name until a letter takes a value.
+    Use long_value to check if a long option takes the next word as a value.
+    """
+    names: list[str] = []
+    index = 0
+    while index < len(words) and words[index].startswith("-") and words[index] not in ("-", "--"):
+        word = words[index]
+        index += 1
+        if word.startswith("--"):
+            name, equal, _ = word.partition("=")
+            names.append(name)
+            index += 1 if not equal and long_value(name, words[index] if index < len(words) else "") else 0
+            continue
+        for position, letter in enumerate(word[1:], start=2):
+            names.append("-" + letter)
+            if letter in value_letters:
+                index += 0 if word[position:] else 1
+                break
+    return names, index
+
+
+def env_parts(words: Sequence[str]) -> tuple[list[str], Sequence[str]]:
+    """Return the env option names and the original words after them."""
+    names, end = option_names(words, ENV_VALUE_LETTERS,
+                              lambda name, _next: any(option.startswith(name) for option in ENV_VALUE_OPTIONS))
+    return names, words[end:]
 
 
 # A program that runs the script named after its options.

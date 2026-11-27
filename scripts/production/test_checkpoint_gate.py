@@ -96,6 +96,7 @@ class CheckpointGateTests(unittest.TestCase):
         output = "    FAIL [  0.1s] (1/1) bin checks::failed\n--- lib/test_gate.py exit=1 ---\n"
         for options in (
             ["--"],
+            ["--", "-"],
             ["-u", "PYTHONUNBUFFERED"],
             ["-uPYTHONUNBUFFERED"],
             ["--unset=PYTHONUNBUFFERED"],
@@ -107,8 +108,14 @@ class CheckpointGateTests(unittest.TestCase):
                 modules = frozenset({"lib/test_gate.py"})
                 self.assertEqual(checkpoint_gate.red_names(command, output), modules)
                 self.assertEqual(checkpoint_gate.only_tests(command, modules), [*command, "--module", "lib/test_gate.py"])
-        command = ["env", "-u", "PYTHONUNBUFFERED", "python3", "other.py", "-m", "scripts.production.gate"]
-        self.assertEqual(checkpoint_gate.red_names(command, output), frozenset({"checks::failed"}))
+        for command in (
+            ["env", "-u", "PYTHONUNBUFFERED", "python3", "other.py", "-m", "scripts.production.gate"],
+            ["env", "-S", "python3 other.py", *GATE],
+            ["env", "--split-string=python3 other.py", *GATE],
+            ["env", "--help", *GATE],
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(checkpoint_gate.red_names(command, output), frozenset({"checks::failed"}))
 
     def test_merge_gate_uses_the_committed_copy_for_the_initial_run_and_flake_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
