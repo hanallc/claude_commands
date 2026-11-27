@@ -486,6 +486,45 @@ class LocalReviewTests(unittest.TestCase):
                          [["1", "2", "3", "4", "5"], ["1", "2"], ["1", "2"], ["3"]])
         self.assertIn("- No, keep the partial file.", requests[1]["draft"])
 
+    def test_console_question_skips_model_for_an_unchanged_approved_draft(self) -> None:
+        title = "Retry the download?"
+        draft = f"{title}\n\n1. The download stopped.\n\nRecommended: Yes."
+        key = review.QuestionKey("demo", title)
+        runner = FakeReviewer(verdict(self.draft))
+        questions: list[str] = []
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            return question_batch(question_request(prompt), questions=questions)
+
+        with mock.patch.object(review, "structured_call", side_effect=judge) as call:
+            self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                             review.QuestionAccepted(draft))
+            call.reset_mock()
+            questions.append("What stopped the download?")
+            self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                             review.QuestionAccepted(draft))
+            call.assert_not_called()
+
+    def test_console_question_keeps_new_questions_after_a_line_changes(self) -> None:
+        title = "Retry the download?"
+        draft = f"{title}\n\n1. The download stopped.\n\nRecommended: Yes."
+        revised = draft.replace("The download stopped.", "Only part of the file is on disk.")
+        key = review.QuestionKey("demo", title)
+        runner = FakeReviewer(verdict(self.draft))
+        questions = ("How much of the file is on disk?",)
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            request = question_request(prompt)
+            return question_batch(request, questions=questions if request["draft"] == revised else ())
+
+        with mock.patch.object(review, "structured_call", side_effect=judge) as call:
+            self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                             review.QuestionAccepted(draft))
+            held = review.QuestionAwaitingFacts(revised, questions)
+            self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"), held)
+            self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"), held)
+        self.assertEqual(call.call_count, 3)
+
     def test_console_question_keeps_the_passed_title_after_two_other_lines_change(self) -> None:
         title = "## The change for your 07:15 PST Yes is ready: may it go in?"
         question = (

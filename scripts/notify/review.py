@@ -1103,6 +1103,7 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
     line_rules = question_part_digest((system_prompt, part_system_prompt, SCHEMA, PART_REVIEW_SCHEMA,
                                       CODE_RULES, PART_RULES, review_date_and_zone, context.caption_layout,
                                       sorted(CROSS_LINE_RULES)))
+    draft_fingerprint = question_part_digest((line_rules, draft.body))
     fingerprints = ({number: question_part_digest((rules, part, parts[:number - 1].count(part)))
                      for number, part in enumerate(parts, 1)} if question else {})
 
@@ -1112,6 +1113,8 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
                 saved = _object(cast(object, json.loads(path.read_text(encoding="utf-8"))))
             except FileNotFoundError:
                 saved = {}
+            if question and saved.get("approved_draft") == draft_fingerprint:
+                return Approved(draft, metadata())
             line_review = ConsoleLineReview.from_record(saved.get("line_review", {}), line_rules)
             read_verdict = part_verdict if whole else independent_verdict
             reused = {
@@ -1168,7 +1171,9 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
                 }
                 for number, verdict in latest.items() if number in fingerprints
             }
-            record = {"line_review": line_review.record(line_rules), **saved}
+            record: dict[str, object] = {"line_review": line_review.record(line_rules), **saved}
+            if question and isinstance(combined, Approved):
+                record["approved_draft"] = draft_fingerprint
             write_text_atomic(path, json.dumps(record) + "\n", new_file_mode=0o600)
             return combined
     except (OSError, ValueError) as error:
