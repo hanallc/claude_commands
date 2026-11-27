@@ -31,7 +31,7 @@ from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, Literal, cast, override
+from typing import BinaryIO, Literal, NamedTuple, cast, override
 from urllib.parse import SplitResult, parse_qs, unquote, urlsplit
 
 # Detect file changes before the first stamp, including changes during imports.
@@ -78,6 +78,34 @@ def retry_account_move(batch_id: str, member: str) -> accounts_page.Saved | acco
     if isinstance(result, stop_resume.ConsoleRetryRefused):
         return accounts_page.Refused(_retry_failure_text(result.reason))
     return accounts_page.Saved()
+
+
+class ListedKillRows(NamedTuple):
+    """Hold the Kill references of the published Builds rows; outside is a subset of listed."""
+    listed: frozenset[str]
+    outside: frozenset[str]
+
+
+def listed_kill_rows() -> ListedKillRows:
+    """Read all listed Kill references and identify the outside rows."""
+    folder = memory_files.configured_output_folder(conf.read("memory_feed"))
+    data = cast(object, json.loads((folder / memory_files.DATA_NAME).read_bytes()))
+    if not isinstance(data, dict):
+        raise ValueError("the Builds reading is not an object")
+    reading = cast(dict[str, object], data)
+    queued: set[str] = set()
+    outside: set[str] = set()
+    for table, references in (("walk", queued), ("outside_queue", outside)):
+        rows = reading.get(table, []) if table == "outside_queue" else reading.get(table)
+        if not isinstance(rows, list):
+            raise ValueError(f"the Builds reading has no {table} list")
+        for row in cast(list[object], rows):
+            if not isinstance(row, dict):
+                raise ValueError(f"the Builds reading has an invalid {table} row")
+            reference = cast(dict[str, object], row).get("kill_ref")
+            if isinstance(reference, str) and re.fullmatch(r"[0-9a-f]{64}", reference):
+                references.add(reference)
+    return ListedKillRows(frozenset(queued | outside), frozenset(outside))
 
 
 def published_console_page(root: Path, path: str) -> str:
@@ -1688,13 +1716,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         server = cast(ReviewLinksServer, self.server)
         try:
             refresh_seconds = conf.read_or_repository("review_links").number("page_refresh_seconds")
-            offers, results = server.kill_actions.options(refresh_seconds)
+            listed, outside = listed_kill_rows()
+            offers, results = server.kill_actions.options(refresh_seconds, listed)
         except (OSError, ValueError, admission.AdmissionUnavailable) as error:
             print(f"review-links build kill: {error}", file=sys.stderr)
             self.json_response(503, {"reason": "The current runs are unavailable."})
         else:
-            self.json_response(200, {"token": server.new_item_token, "offers": offers, "results": results,
-                                     "refresh_seconds": refresh_seconds})
+            snapshot: dict[str, object] = {"token": server.new_item_token, "listed": sorted(listed),
+                                           "offers": offers, "results": results, "refresh_seconds": refresh_seconds}
+            if outside:
+                snapshot["outside"] = sorted(outside)
+            self.json_response(200, snapshot)
 
     def build_kill_allowed(self, *, required_origin: bool = False) -> bool:
         if not self.same_origin(required=required_origin) or self.tailscale_refusal():
@@ -1718,16 +1750,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             body = self.rfile.read(length)
             if len(body) != length:
                 raise ValueError
-            fields = parse_qs(body.decode(), keep_blank_values=True, max_num_fields=4, errors="strict")
-            if (set(fields) != {"token", "reference", "handle", "words"}
+            fields = parse_qs(body.decode(), keep_blank_values=True, max_num_fields=5, errors="strict")
+            if (set(fields) != {"token", "reference", "handle", "words", "kill_number"}
                     or any(len(values) != 1 for values in fields.values())):
                 raise ValueError
             reference, handle = fields["reference"][0], fields["handle"][0]
             if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in (reference, handle)):
                 raise ValueError
             words = fields["words"][0]
-            if "\0" in words:
+            number = fields["kill_number"][0]
+            if "\0" in words or re.fullmatch(r"[0-9]+", number) is None:
                 raise ValueError
+            kill_number = int(number)
         except (OSError, ValueError):
             self.json_response(400, {"reason": "The Kill request is invalid or too large."})
             return
@@ -1736,7 +1770,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         server = cast(ReviewLinksServer, self.server)
         try:
-            outcome = server.kill_actions.stop(reference, handle, words)
+            outcome = server.kill_actions.stop(reference, handle, words, kill_number)
         except (OSError, ValueError, admission.AdmissionUnavailable) as error:
             print(f"review-links build kill: {error}", file=sys.stderr)
             self.json_response(503, {"reason": "The current run is unavailable."})
