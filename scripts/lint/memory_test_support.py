@@ -206,7 +206,6 @@ TEST_CONFIG_DEFAULTS = {
     "mac_test.conf": (
         "offload=on\n"
         "linux_only.hana=hana_video,hana_clerestory\n"
-        "ci_repo=hanallc/hana\n"
         "offload_exclude..claude=doc\n"
         "connect_timeout_s=6\n"
         "probe_timeout_s=15\n"
