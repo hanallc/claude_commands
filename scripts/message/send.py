@@ -5782,8 +5782,10 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                                 f"worker message delivery unconfirmed: {reason}. "
                                 + "The message may already have arrived. Do not resend it.")
                     elif isinstance(error, (herdr_types.HerdrFailure, OSError)):
+                        # When the agent exits, the post-input wait reports agent_not_running.
+                        missing_prompt_target_codes = ("pane_not_found", "agent_not_found")
                         if (not attempting_input or isinstance(error, (herdr.HerdrCommandNotStarted, herdr.AgentBlocked))
-                                or (isinstance(error, herdr_types.HerdrFailure) and error.code == "pane_not_found")):
+                                or (isinstance(error, herdr_types.HerdrFailure) and error.code in missing_prompt_target_codes)):
                             result_submission.may_have_submitted = False
                             return WorkerResultNotSubmitted("retry", reason)
                     else:
