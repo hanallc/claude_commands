@@ -374,7 +374,11 @@ def notice_kind(transport: ExecutionTransport | LocalMachine,
 
 
 def send_notice(machine: str, kind: NoticeKind, cause: Unusable | StepsWait | UnreachableMacAlert,
-                since: float, now: float) -> bool:
+                since: float, now: float, settings: conf.ConfigRead) -> bool:
+    if kind is NoticeKind.PUSH and not settings.value(
+            f"notices.{machine}", conf.on_off, default=True, recover_invalid=False,
+            host_override=conf.HostOverride.IGNORED):
+        return False
     if isinstance(cause, UnreachableMacAlert):
         return mac_idle.push_outage(cause.alert, now)
     if kind is NoticeKind.PUSH:
@@ -483,7 +487,7 @@ def watch_machine(target: Target, paths: WatchPaths, now: float, settings: conf.
         since = reading.since
     sent = not isinstance(kept, NoSavedNotice) and int(kept["since"]) == int(since) and kept["sent"]
     if not sent and now - since >= notice:
-        sent = send_notice(target.name, kind, reading.cause, since, now)
+        sent = send_notice(target.name, kind, reading.cause, since, now, settings)
     mac_idle.write_record(path, SavedNotice(since=since, sent=sent, kind=kind))
 
 

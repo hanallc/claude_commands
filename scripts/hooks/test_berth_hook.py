@@ -288,7 +288,7 @@ class BerthHookTests(unittest.TestCase):
                 code, written = self.backstop()
                 self.assertEqual(code, 0)
                 if case == "another reservation mapped":
-                    self.assertIn("a sibling phase's reservation holds every changed path", written)
+                    self.assertIn(f"the reservation is not mapped to a session: {RESERVATION}", written)
                     self.assertEqual(self.state(), AWAITING)
                 else:
                     self.assertIn(f"Active, reservation {RESERVATION}", written)
@@ -317,7 +317,7 @@ class BerthHookTests(unittest.TestCase):
         _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
         code, written = self.backstop()
         self.assertEqual(code, 0)
-        self.assertIn("still awaiting first touch", written)
+        self.assertIn(f"the reservation is not mapped to a session: {RESERVATION}", written)
         self.assertEqual(self.state(), AWAITING)
 
     def test_a_siblings_different_reservation_does_not_block_the_directors_reservation(self) -> None:
