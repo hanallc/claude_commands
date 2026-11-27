@@ -6900,6 +6900,56 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         queue.assert_called_once()
         self.assertNotIn("codex_requests", send.read_key_states()["once:codex"])
 
+    def test_keyed_codex_queue_refusal_allows_a_fresh_send_with_the_same_key(self) -> None:
+        row = self.daemon_row("thread-one")
+        started = datetime(2026, 11, 19, 6, 12, 59, tzinfo=timezone.utc)
+        with (mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}),
+              mock.patch.object(roster, "roster", return_value=self.recipient_roster([row], []))):
+            for recipient_key in ([], ["--recipient-key", "stable-staff"]):
+                key = f"review:refused:{len(recipient_key)}"
+                args = ["--to", "codex:thread-one", "--from", "test", "--key", key,
+                        "--review-delivery", "--repeat-minutes", "60", *recipient_key]
+                with (self.subTest(recipient_key=recipient_key),
+                      mock.patch.object(codex_daemon, "queue", side_effect=[
+                          codex_daemon.QueueFailed("daemon refused the request"), codex_daemon.Queued(),
+                      ]) as queue):
+                    with mock.patch.object(send, "now", return_value=started):
+                        refused = send.send(local_options([*args, "--text", f"declined {key}"]))
+                    self.assertEqual(refused, send.Result("failed", "daemon refused the request"))
+                    with mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)):
+                        sent = send.send(local_options([*args, "--text", f"new {key}"]))
+                    self.assertEqual(sent.outcome, "sent")
+                    self.assertEqual([call.args[2] for call in queue.call_args_list], [
+                        f"declined {key}\nSender native id: unavailable\nSent: 01:12 EST",
+                        f"new {key}\nSender native id: unavailable\nSent: 01:13 EST",
+                    ])
+
+    def test_keyed_codex_queue_acceptance_removes_the_request_in_the_same_write(self) -> None:
+        row = self.daemon_row("thread-one")
+        started = datetime(2026, 11, 19, 6, 12, 59, tzinfo=timezone.utc)
+        write_keys = send.write_key_states
+
+        def interrupt_after_acceptance(states: send.KeyStates) -> None:
+            write_keys(states)
+            state = states[key]
+            if state["last"].get(recipient) == started.isoformat() and recipient not in state.get("pending", {}):
+                raise KeyboardInterrupt("The send stopped after recording acceptance")
+
+        with (mock.patch.object(send, "now", return_value=started),
+              mock.patch.object(roster, "roster", return_value=self.recipient_roster([row], [])),
+              mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued())):
+            for recipient, recipient_key in (("staff:thread-one", []), ("stable-staff", ["--recipient-key", "stable-staff"])):
+                key = f"review:accepted:{recipient}"
+                options = local_options(["--to", "codex:thread-one", "--from", "test", "--text", f"body {key}",
+                                         "--key", key, "--review-delivery", *recipient_key])
+                with self.subTest(recipient=recipient):
+                    with (mock.patch.object(send, "write_key_states", side_effect=interrupt_after_acceptance),
+                          self.assertRaisesRegex(KeyboardInterrupt, "The send stopped after recording acceptance")):
+                        _ = send.send(options)
+                    state = send.read_key_states()[key]
+                    self.assertEqual(state["last"], {recipient: started.isoformat()})
+                    self.assertNotIn("codex_requests", state)
+
     def test_local_roster_is_read_once_for_every_roster_address_and_bare_name(self) -> None:
         self.staff_member("thread-one", "thread-one")
         self.session("claude-one", "claude")
