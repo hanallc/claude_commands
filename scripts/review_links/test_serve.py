@@ -6168,6 +6168,9 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_review_card_shows_only_the_unfiled_answer(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="layout-owner")
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        item = the_list.add(keeper.id, "Select a layout", owner=owner.id, source="nate", changes={})
         kind = new_item_dialog.SubmissionKind.QUESTION
         request = case.submission_request(kind, owner.id)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -6178,6 +6181,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(created.status, 200, created.body)
         sent = cast(dict[str, str], json.loads(created.body))
         key = sent["key"]
+        _ = the_list.link(keeper.id, item.id, (key,), source="nate")
         question = cache.get().records[key].source
         assert isinstance(question, review_items.QuestionSource)
         origin = review_items.submission_origin(cache.get().records[key])
@@ -6219,15 +6223,51 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn(followup.encode(), card)
         self.assertFalse(words.encode() in card, "The Waiting card repeats the filed reply.")
 
+    def test_filed_native_pair_hides_its_log_copy_and_keeps_the_unmatched_reply(self) -> None:
+        from scripts.review_links import answer_sources
+
+        case = self.review_fixture()
+        key = case.question()
+        source = review_page.build_snapshot(case.root).records[key].source
+        assert isinstance(source, review_items.QuestionSource)
+        members = staff.snapshot()
+        keeper = record_store.list_keeper(conf.read("console"), members)
+        assert keeper is not None
+        item = the_list.add(keeper.id, "Select a layout", owner=source.record.owner, source="nate", changes={})
+        _ = the_list.link(keeper.id, item.id, (key,), source="nate")
+        answered_at = datetime.now(timezone.utc)
+        unmatched = review_events.ReviewLog(answered_at - timedelta(minutes=1), source.record.owner,
+                                            "Answer: Keep the existing menu.")
+        words = "Use the compact layout."
+        record = replace(source.record, item={**source.record.item,
+            "followups": [{"followup": "Which layout works?", "reply": words, "replied_at": answered_at.isoformat()}],
+            "answered_at": answered_at.isoformat(), "review_log": review_events.encode((unmatched,))})
+        update_registration.write_question_record(record)
+        before = review_page.build_snapshot(case.root)
+        self.assertIn(words.encode(), before.body(key))
+
+        answer_sources.file_saved_question(record, members)
+        after = review_page.build_snapshot(case.root)
+        current = after.records[key]
+        handoff = current.exchange_handoff
+        assert isinstance(handoff, review_items.FiledReviewExchange)
+        self.assertFalse(handoff.answer_events)
+        self.assertTrue(current.unread_answer)
+        card = after.body(key)
+        self.assertIn(unmatched.words.encode(), card)
+        self.assertNotIn(words.encode(), card)
+        saved = the_list.load(keeper.id, item.id)
+        returned, = (entry.what for entry in saved.log if isinstance(entry.what, the_list.ReturnedAnswer))
+        self.assertEqual(returned.words, words)
+
     def test_review_answer_returns_to_the_linked_list_log_once(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="layout-owner")
         keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
         assert keeper is not None
-        item = the_list.add(keeper.id, "Select a layout", owner=owner.id, source="nate", changes={})
-        _ = the_list.park(keeper.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
         kind = new_item_dialog.SubmissionKind.QUESTION
-        request = case.submission_request(kind, owner.id)
+        request = replace(case.submission_request(kind, owner.id), page="list", request_id="r6-" + uuid4().hex,
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         self.addCleanup(cache.close)
         with (patch.object(self.server, "review_cache", cache),
@@ -6236,10 +6276,12 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(created.status, 200, created.body)
         sent = cast(dict[str, str], json.loads(created.body))
         key = sent["key"]
-        _ = the_list.link(keeper.id, item.id, (key,), source="nate")
+        item, = the_list.records(keeper.id)
+        self.assertEqual((item.number, item.reviews), (sent["list_number"], (key,)))
+        _ = the_list.park(keeper.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
         origin = review_items.submission_origin(cache.get().records[key])
         assert isinstance(origin, new_item_dialog.ReviewSubmission)
-        reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], request.request_id)
+        reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], origin.request_id)
         words = "Use the compact layout on narrow screens."
 
         def fail_receipt(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
@@ -6260,9 +6302,11 @@ class ReviewLinksServerTests(unittest.TestCase):
         destination = investigation.ListDestination(keeper.id, item.number)
         self.assertFalse(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)))
         snapshot = review_page.build_snapshot(case.root)
-        self.assertNotIn(key, {row["key"] for row in snapshot.entries})
+        self.assertIn(key, {row["key"] for row in snapshot.entries})
+        self.assertTrue(snapshot.records[key].unread_answer)
+        self.assertIn(words.encode(), snapshot.body(key))
+        self.assertEqual(snapshot.filed_item_url(case.root, key), "")
         target = review_page.report_url(destination)
-        self.assertEqual(snapshot.filed_item_url(case.root, key), target)
         page = list_page.render(case.root, include_counts=False, query="show=needs-me")
         self.assertRegex(page, rb'<tbody data-list-item[^>]*data-unread-answer="true"[^>]*><tr')
         self.assertIn(b'<small data-new-answer>New answer</small>', page)
@@ -6275,6 +6319,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(the_list.load(keeper.id, item.id), first)
         self.assertEqual(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)), {exchange})
         snapshot, _ = cache.publish_record(cache.get(), key)
+        self.assertNotIn(key, {row["key"] for row in snapshot.entries})
         self.assertEqual(snapshot.filed_item_url(case.root, key), target)
 
         read = the_list.mark_read(keeper.id, item.id, source=the_list.PAGE_SOURCE)
@@ -6290,18 +6335,32 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_proposal_reply_retry_saves_the_missing_list_receipt(self) -> None:
         case = self.review_fixture()
-        key, _ = case.decisions()
-        proposal = review_page.build_snapshot(case.root).records[key]
+        document = case.fixture.production.parent / "producer.md"
+        _ = document.write_text(f"# Producer\n- **Proposals:** {document.parent / 'producer-proposals'}\n")
+        owner = fixture_member("producer", name="layout-owner", doc=staff.LiveDoc(local_machine(), document))
         keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
         assert keeper is not None
-        item = the_list.add(keeper.id, "Select the checks", owner=proposal.owner, source="nate", changes={})
-        _ = the_list.link(keeper.id, item.id, (key,), source="nate")
+        kind = new_item_dialog.SubmissionKind.PROPOSAL
+        request = replace(case.submission_request(kind, owner.id), page="list", request_id="r6-" + uuid4().hex,
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+        sent = cast(dict[str, str], json.loads(created.body))
+        key = sent["key"]
+        item, = the_list.records(keeper.id)
+        self.assertEqual((item.number, item.reviews), (sent["list_number"], (key,)))
         with capture_sender("send_to_staff"):
             delivery, _ = review_page.submit(case.root, case.body(key, "question", "Which checks stay?"), case.status)
             assert isinstance(delivery, change_page.MessageDelivery)
             change_page.deliver(delivery, case.status)
-        question = case.status.slots(delivery.page, delivery.row).question
-        assert isinstance(question, change_page.OpenQuestion)
+        waiting = review_page.build_snapshot(case.root)
+        origin = review_items.submission_origin(waiting.records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], origin.request_id)
         words = "Keep the layout checks."
 
         def fail_receipt(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
@@ -6310,7 +6369,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             atomic_file.write_text_atomic(path, text, new_file_mode=new_file_mode)
 
         with patch.object(the_list, "write_text_atomic", side_effect=fail_receipt), redirect_stderr(StringIO()) as errors:
-            self.assertTrue(change_page.answer_item(key, words, question.question_id, case.status))
+            self.assertTrue(change_page.answer_item(reply, words, origin.reply_token, case.status))
         self.assertIn("Could not save the List receipt.", errors.getvalue())
         destination = investigation.ListDestination(keeper.id, item.number)
         first = the_list.load(keeper.id, item.id)
@@ -6320,13 +6379,14 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(answer.words, words)
         snapshot = review_page.build_snapshot(case.root)
         self.assertIn(key, {row["key"] for row in snapshot.entries})
-        self.assertFalse(snapshot.records[key].unread_answer)
-        self.assertNotIn(words.encode(), snapshot.body(key))
+        self.assertTrue(snapshot.records[key].unread_answer)
+        self.assertIn(words.encode(), snapshot.body(key))
 
-        self.assertFalse(change_page.answer_item(key, words, question.question_id, case.status))
+        self.assertFalse(change_page.answer_item(reply, words, origin.reply_token, case.status))
         self.assertEqual(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)), {exchange})
         self.assertEqual(the_list.load(keeper.id, item.id), first)
         snapshot = review_page.build_snapshot(case.root)
+        self.assertIn(key, {row["key"] for row in snapshot.entries})
         self.assertFalse(snapshot.records[key].unread_answer)
         self.assertNotIn(words.encode(), snapshot.body(key))
 
