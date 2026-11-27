@@ -1958,6 +1958,68 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIsInstance(row.report, the_list.ListReport)
         self.assertIs(row.native_question, the_list.NoQuestionItem.ORDINARY)
 
+    def test_studio_valid_route_requires_a_native_row_when_the_keeper_is_lost(self) -> None:
+        self.check_studio_question_fallback_with_an_ordinary_report("valid")
+
+    def test_studio_unavailable_route_requires_a_native_row_before_fallback(self) -> None:
+        self.check_studio_question_fallback_with_an_ordinary_report("unavailable")
+
+    def test_studio_skipped_route_requires_a_native_row_before_the_first_claim(self) -> None:
+        self.check_studio_question_fallback_with_an_ordinary_report("skipped")
+
+    def check_studio_question_fallback_with_an_ordinary_report(
+            self, route_state: Literal["valid", "unavailable", "skipped"]) -> None:
+        case = self.review_fixture()
+        keeper = fixture_member("producer", name="recovering-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        owner = fixture_member("producer", name="layout-owner")
+        retired = staff.RetiredProducer("claude:sonnet:high")
+        if route_state != "valid":
+            _ = staff.set_producer_retirement(keeper.id, retired)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        if route_state == "skipped":
+            with (redirect_stderr(StringIO()),
+                  patch.object(case.status, "write_slots", side_effect=OSError("The notice claim stopped.")) as claim):
+                review_actions.recover_submission_deliveries(case.status, review_page.PAGE_PATH)
+                claim.assert_called_once()
+        match route_state:
+            case "valid":
+                self.assertIsInstance(review_submissions.list_filing_route(saved), dict)
+            case "unavailable":
+                self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.ListFilingUnavailable)
+            case "skipped":
+                self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.NoListFiling)
+
+        # Hide the route to reproduce a move from before the Studio filing guard.
+        _ = staff.set_producer_retirement(keeper.id, staff.Active())
+        backup = route.rename(route.with_suffix(".bak"))
+        destination, = the_list.move_review_waits(case.root, staff.snapshot())
+        _ = backup.rename(route)
+        row, = the_list.records(destination.keeper, include_closed=True)
+        self.assertEqual(row.number, destination.number)
+        self.assertIsInstance(row.report, the_list.ListReport)
+        self.assertIs(row.native_question, the_list.NoQuestionItem.ORDINARY)
+
+        _ = staff.set_producer_retirement(keeper.id, retired)
+        self.assertIsNone(record_store.list_keeper(conf.read_or_repository("console"), staff.snapshot()))
+        before = route.read_bytes()
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()) as errors,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_not_called()
+        self.assertIn(f"Cannot confirm the question source for L{destination.number}.", errors.getvalue())
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+        self.assertEqual(route.read_bytes(), before)
+        self.assertEqual(the_list.records(destination.keeper, include_closed=True), [row])
+        self.assertEqual(read_new_item_notices(log), [])
+        self.assertFalse(reservation.exists())
+
     def test_studio_rechecks_an_unavailable_question_route_after_the_keeper_returns(self) -> None:
         self.check_studio_question_route_recovery(save_fallback=False)
 

@@ -1615,14 +1615,12 @@ def resolve_legacy_question_destination(
         return QuestionRoute.UNRESOLVED
     if origin.source_key in links.filed_sources or the_list.exchange_filing_started(origin.source_key):
         return QuestionRoute.UNRESOLVED
-    if studio_route is QuestionRoute.STAGED_STUDIO:
-        return studio_route
     if has_receipt and filing is the_list.QuestionFiling.HISTORY:
-        return QuestionRoute.UNRESOLVED
+        return studio_route if studio_route is QuestionRoute.STAGED_STUDIO else QuestionRoute.UNRESOLVED
     current = _linked_destinations(links.current, keys)
     if len(current) == 1:
         return ResolvedQuestionDestination(current[0], the_list.NoQuestionItem.ORDINARY)
-    return QuestionRoute.UNRESOLVED if current else QuestionRoute.NEW
+    return QuestionRoute.UNRESOLVED if current else studio_route
 
 
 def _list_exchanges(entry: list_page.ListRecord, members: staff.StaffSnapshot, zone: ZoneInfo) -> Iterator[Exchange]:
@@ -2035,6 +2033,26 @@ def file_saved_submission(scoped: new_item_dialog.ScopedSubmissionKey, members: 
         file_saved_review(review_items.submission_item(saved, members), members)
 
 
+def _confirm_list_submission_question(destination: investigation.ListDestination,
+                                      origin: the_list.NativeQuestionItem) -> None:
+    if the_list.load(destination.keeper, f"L{destination.number}").native_question != origin:
+        raise OSError(f"Cannot confirm the question source for L{destination.number}.")
+
+
+def finish_studio_question_without_keeper(record: update_registration.QuestionRecord,
+                                          save_fallback: Callable[[], None]) -> None:
+    """Check the destination and finish routing under the exchange lock."""
+    origin = _native_question_origin(record)
+    with the_list.lock_exchange_source(origin.source_key):
+        route = _resolve_current_question_destination(record, origin, studio=StudioRouteOwner.STUDIO_SEND)
+        if isinstance(route, ResolvedQuestionDestination):
+            _confirm_list_submission_question(route.destination, origin)
+        elif route in (QuestionRoute.NEW, QuestionRoute.STAGED_STUDIO):
+            save_fallback()
+        else:
+            raise OSError(f"Cannot resolve the List destination for {origin.source_key}.")
+
+
 def file_list_submission_question(record: update_registration.QuestionRecord,
                                   reservation: Path, file_row: Callable[[], investigation.ListDestination],
                                   members: staff.StaffSnapshot) -> None:
@@ -2071,8 +2089,7 @@ def file_list_submission_question(record: update_registration.QuestionRecord,
     else:
         if update_registration.pending_review_reply(record):
             raise OSError(f"Cannot file the open question on L{destination.number}.")
-    if the_list.load(destination.keeper, f"L{destination.number}").native_question != origin:
-        raise OSError(f"Cannot confirm the question source for L{destination.number}.")
+    _confirm_list_submission_question(destination, origin)
 
 
 def file_saved_investigation(record: investigation.Investigation) -> None:
