@@ -1980,6 +1980,62 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(read_new_item_notices(log), [])
         self.assertFalse(reservation.exists())
 
+    def test_studio_defers_fallback_until_the_only_linked_question_row_reads(self) -> None:
+        case = self.review_fixture()
+        keeper = fixture_member("producer", name="recovering-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        review_key = review_items.submission_review_key(saved)
+        number = the_list.add_review_item(keeper.id, "Choose a layout", owner=owner.id, producer=owner.id, unit="",
+            words=saved.words, evidence=review_page.PAGE_PATH + "#" + urlencode({"jump": review_key}),
+            review_key=review_key, source="nate via New item", reservation=self.root / "legacy-number")
+        destination = investigation.ListDestination(keeper.id, number)
+        key = f"submission/question/{saved.request_id}"
+        native = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, key)
+        exchange = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "initial",
+            list_exchange.Direction.ANSWER_TO_NATE, saved.words, the_list.now(), list_exchange.Nate.USER,
+            owner.id, list_exchange.QuestionWithoutAnswer.OPEN)
+        with the_list.lock_exchange_source(key) as source:
+            self.assertEqual(the_list.file_exchanges(source, (exchange,), "Choose a layout", linked=destination,
+                owner=owner.id, members=staff.snapshot(), submission_question=native), destination)
+            # Keep the destination proof only in the List row.
+            source.reservation.unlink()
+            source.reservation.with_suffix(".saved").unlink()
+        self.assertFalse(reservation.exists())
+        self.assertIs(the_list.exchange_reservation(key), the_list.NextNumber.AVAILABLE)
+        row, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(the_list.original_question_link(row), review_key)
+        self.assertEqual(row.native_question, native)
+
+        _ = staff.set_producer_retirement(keeper.id, staff.RetiredProducer("claude:sonnet:high"))
+        before = route.read_bytes()
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            with (patch.object(the_list, "load", side_effect=the_list.ListError("The row read failed.")) as load,
+                  redirect_stderr(StringIO()) as errors):
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                load.assert_called_once_with(keeper.id, row.id)
+            claim.assert_not_called()
+            self.assertEqual(errors.getvalue().splitlines(), [
+                f"Review first message {saved.request_id}: Incomplete List destination check for {key}: "
+                + f"{keeper.id}/{row.id}: The row read failed."])
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(route.read_bytes(), before)
+            self.assertEqual(read_new_item_notices(log), [])
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [row.id])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+        self.assertEqual(route.read_bytes(), before)
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [row])
+
     def test_studio_rechecks_an_unavailable_question_route_after_the_keeper_returns(self) -> None:
         self.check_studio_question_route_recovery(save_fallback=False)
 

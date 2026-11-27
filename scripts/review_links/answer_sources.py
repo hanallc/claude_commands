@@ -1513,10 +1513,10 @@ def _native_question_origin(record: update_registration.QuestionRecord) -> the_l
 
 def _resolve_current_question_destination(
     record: update_registration.QuestionRecord, origin: the_list.NativeQuestionItem,
-    *, studio: StudioRouteOwner = StudioRouteOwner.OTHER_WRITER,
+    *, studio: StudioRouteOwner = StudioRouteOwner.OTHER_WRITER, read: the_list.ListRead = the_list.ListRead.SKIP_INVALID,
 ) -> ResolvedQuestionDestination | QuestionRoute:
     """Read the List under the caller's question filing locks."""
-    links = _list_review_links(list_page.records(include_closed=True))
+    links = _list_review_links(list_page.records(include_closed=True, read=read))
     return resolve_legacy_question_destination(origin, links, record=record, filing=the_list.QuestionFiling.LIVE,
                                                studio=studio)
 
@@ -2039,18 +2039,39 @@ def _confirm_list_submission_question(destination: investigation.ListDestination
         raise OSError(f"Cannot confirm the question source for L{destination.number}.")
 
 
+@dataclass(frozen=True)
+class IncompleteQuestionDestinationCheck:
+    reason: str
+
+
+def _check_studio_question_destination(
+    record: update_registration.QuestionRecord, origin: the_list.NativeQuestionItem,
+) -> ResolvedQuestionDestination | investigation.NoListDestination | IncompleteQuestionDestinationCheck:
+    try:
+        route = _resolve_current_question_destination(record, origin, studio=StudioRouteOwner.STUDIO_SEND,
+                                                      read=the_list.ListRead.REQUIRE_COMPLETE)
+    except OSError as error:
+        detail = " ".join(str(error).splitlines())
+        return IncompleteQuestionDestinationCheck(f"Incomplete List destination check for {origin.source_key}: {detail}")
+    if isinstance(route, ResolvedQuestionDestination):
+        return route
+    if route in (QuestionRoute.NEW, QuestionRoute.STAGED_STUDIO):
+        return investigation.NoListDestination.ABSENT
+    return IncompleteQuestionDestinationCheck(f"Cannot resolve the List destination for {origin.source_key}.")
+
+
 def finish_studio_question_without_keeper(record: update_registration.QuestionRecord,
                                           save_fallback: Callable[[], None]) -> None:
     """Check the destination and finish routing under the exchange lock."""
     origin = _native_question_origin(record)
     with the_list.lock_exchange_source(origin.source_key):
-        route = _resolve_current_question_destination(record, origin, studio=StudioRouteOwner.STUDIO_SEND)
-        if isinstance(route, ResolvedQuestionDestination):
-            _confirm_list_submission_question(route.destination, origin)
-        elif route in (QuestionRoute.NEW, QuestionRoute.STAGED_STUDIO):
-            save_fallback()
-        else:
-            raise OSError(f"Cannot resolve the List destination for {origin.source_key}.")
+        match _check_studio_question_destination(record, origin):
+            case ResolvedQuestionDestination(destination=destination):
+                _confirm_list_submission_question(destination, origin)
+            case investigation.NoListDestination.ABSENT:
+                save_fallback()
+            case IncompleteQuestionDestinationCheck(reason=reason):
+                raise OSError(reason)
 
 
 def file_list_submission_question(record: update_registration.QuestionRecord,
