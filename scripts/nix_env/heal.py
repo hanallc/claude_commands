@@ -35,7 +35,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.lib import atomic_file, conf, nix_env
 from scripts.herdr import herdr, pane_launch
 from scripts.production import staff
-from scripts.message import send_result, session_records, session_send, sessions
+from scripts.message import send as message_send, send_result, session_records, session_send, sessions
 from scripts.message import send_budget
 if TYPE_CHECKING:
     from scripts.notify import push_texts, review
@@ -404,7 +404,7 @@ def heal_command(command: str, session_id: str, *options: str) -> str:
     return shlex.join([str(SCRIPTS / "lib/py"), str(Path(__file__).resolve()), command, "--only", session_id, *options])
 
 
-def send_alert(command: list[str], limits: HealLimits) -> tuple[send_result.Outcome | None, str]:
+def send_alert(command: list[str], limits: HealLimits) -> tuple[send_result.OutcomeHeader | None, str]:
     try:
         timeout = max(limits.alert_seconds, send_budget.user_seconds(review.user_send_seconds()))
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
@@ -412,7 +412,16 @@ def send_alert(command: list[str], limits: HealLimits) -> tuple[send_result.Outc
         return None, str(error)
     outcome = send_result.send_outcome(result.returncode, result.stdout)
     detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
-    return (outcome.header.outcome if isinstance(outcome, send_result.ConfirmedSendOutcome) else None), detail
+    return (outcome.header if isinstance(outcome, send_result.ConfirmedSendOutcome) else None), detail
+
+
+def once_accepted(header: send_result.OutcomeHeader) -> bool:
+    """A --once-per-key send that the sender holds durably: it never delivers the key again."""
+    if header.outcome == "sent":
+        return True
+    if header.outcome in ("kept", "queued"):
+        return header.detail.startswith(message_send.DURABLE_ACCEPTANCE)
+    return header.outcome == "skipped" and message_send.is_once_accepted_skip(header.detail)
 
 
 def send_push(directory: Path, limits: HealLimits, session: HealSession | PendingSession, history: HealHistory,
@@ -421,10 +430,10 @@ def send_push(directory: Path, limits: HealLimits, session: HealSession | Pendin
                              machine=socket.gethostname(), cwd=str(session.cwd), cause=alert_cause(reason))
     command = push_texts.user_send_argv(push, key=f"nix-heal-{session.session_id}")
     command.extend(["--clears-when", heal_command("sweep", session.session_id, "--check")])
-    outcome, detail = send_alert(command, limits)
-    if outcome in {"sent", "skipped", "replaced", "queued", "kept"}:
+    header, detail = send_alert(command, limits)
+    if header is not None and header.outcome in {"sent", "skipped", "replaced", "queued", "kept"}:
         history["notified"] = True
-        return True, outcome.upper()
+        return True, header.outcome.upper()
     log(directory, session, history, "push_failed", detail)
     return False, " ".join(detail.split())
 
@@ -500,10 +509,14 @@ def alert(directory: Path, limits: HealLimits, session: HealSession, history: He
                           file=sys.stderr)
             command = session_send.send_argv("--to", str(owner.id), "--from", "nix-heal",
                                              "--key", history["showrunner_alert_key"], "--once-per-key", "--text", text)
-            outcome, detail = send_alert(command, limits)
-            if outcome in {"sent", "queued", "kept", "skipped"}:
+            header, detail = send_alert(command, limits)
+            if header is not None and once_accepted(header):
                 history["notified"] = True
                 log(directory, session, history, "showrunner_alerted", owner.name)
+                return
+            if header is not None and header.outcome == "retry":
+                # An earlier sweep's send still holds the key; the next sweep asks again.
+                log(directory, session, history, "pending", f"the alert to {owner.name} is still in delivery")
                 return
             fallback = f"Could not confirm the alert to {owner.name}. {detail}"
     print(f"nix-heal: {session.session_id}: {fallback}", file=sys.stderr)

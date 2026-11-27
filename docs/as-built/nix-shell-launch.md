@@ -213,10 +213,11 @@ The message gives the cause, the raw reason, and the recovery commands.
 The healer creates a new showrunner key for each alert episode and saves it with the session state before the send.
 The send uses `--once-per-key`. A sweep stopped after the send resends with the same key, and `send.py` answers `SKIPPED` when the first copy has durable acceptance. If the save fails, the healer still sends.
 Later attempts in that episode use the saved key.
-The healer accepts `SKIPPED` as confirmation when the sender already holds or accepted the alert.
+The healer accepts only a durable receipt: `SENT`, `KEPT` or `QUEUED` with `durable acceptance.`, or `SKIPPED` with `the earlier copy has durable acceptance`.
+`RETRY` means an earlier send still holds the key: the healer logs `pending` and asks again at the next sweep, with no push.
 The healer clears the key after it confirms recovery or after a successful `retry` command.
 The journal records `showrunner_alerted` with the name of the showrunner after a confirmed send.
-If the staff record is unreadable, no showrunner owns the session, or the send lacks confirmation, the healer sends Nate the push.
+If the staff record is unreadable, no showrunner owns the session, or any other answer comes back, the healer sends Nate the push.
 The healer writes the fallback reason to stderr. The timer saves it in its run log.
 
 1. Repair the nix setup on the affected machine. Get Nate's approval before you change `/etc/nixos`.

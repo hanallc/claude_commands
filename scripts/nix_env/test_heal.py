@@ -25,7 +25,7 @@ from scripts.nix_env import heal
 from scripts.agents import stop_resume
 from scripts.herdr import herdr
 from scripts.notify import push_texts, review
-from scripts.message import sessions
+from scripts.message import send as message_send, send_result, sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.whoami import account
@@ -410,7 +410,7 @@ class HealTests(NixFixture):
             if not stopped:
                 stopped = True
                 raise SweepKilled
-            return subprocess.CompletedProcess(command, 0, "SKIPPED: fixture", "")
+            return subprocess.CompletedProcess(command, 0, f"SKIPPED: {message_send.ONCE_ACCEPTED}", "")
 
         def save_until_stopped(directory: Path, histories: dict[str, heal.HealHistory]) -> None:
             if not stopped:
@@ -422,6 +422,44 @@ class HealTests(NixFixture):
         self.assertEqual(heal.sweep(no_restart=no_restart), 0)
         self.assertEqual(len(keys), 2)
         self.assertEqual(keys[0], keys[1])
+
+    def test_an_alert_still_in_delivery_waits_for_the_next_sweep_with_no_push(self) -> None:
+        owner, unit, _ = self.showrunner_fixture()
+        session = replace(self.session, session_id=str(unit.current_session), name=unit.name)
+        _, ensure, run = self.install_sweep([session])
+        ensure.return_value = nix_env.Refused("nix_env: fixture: no nix shell")
+        answers = [(send_result.SEND_RETRY_EXIT, "RETRY: keyed delivery in progress"),
+                   (0, f"SKIPPED: {message_send.ONCE_ACCEPTED}")]
+
+        def send(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            del kwargs
+            self.assertEqual(command[2:4], ["--to", owner.id])
+            code, output = answers.pop(0)
+            return subprocess.CompletedProcess(command, code, output, "")
+
+        run.side_effect = send
+        self.assertEqual(heal.sweep(), 0)
+        history = heal.read_history(heal.state_directory())[session.session_id]
+        self.assertFalse(history["notified"])
+        self.assertEqual(self.records()[-1]["action"], "pending")
+        self.assertEqual(heal.sweep(), 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(heal.read_history(heal.state_directory())[session.session_id]["notified"])
+
+    def test_an_alert_kept_without_durable_acceptance_falls_back_to_the_push(self) -> None:
+        _, unit, _ = self.showrunner_fixture()
+        session = replace(self.session, session_id=str(unit.current_session), name=unit.name)
+        _, ensure, run = self.install_sweep([session])
+        ensure.return_value = nix_env.Refused("nix_env: fixture: no nix shell")
+
+        def send(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            del kwargs
+            return subprocess.CompletedProcess(command, 0, "KEPT: fixture" if command[3] != "user" else "SENT: fixture", "")
+
+        run.side_effect = send
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(heal.sweep(), 0)
+        self.assertEqual([cast(list[str], item.args[0])[3] for item in run.call_args_list][-1], "user")
 
     def test_a_stopped_restart_sweep_resends_with_the_saved_key(self) -> None:
         self.assert_stopped_sweep_resends_with_the_saved_key(no_restart=False)
@@ -440,11 +478,13 @@ class HealTests(NixFixture):
         directory = heal.state_directory()
         directory.mkdir()
         limits = heal.HealLimits.read()
-        for row, code, status in ((unit, 0, "SENT"), (worker, 1, "QUEUED"), (unit, 0, "KEPT"), (worker, 0, "SKIPPED")):
+        accepted = message_send.DURABLE_ACCEPTANCE + "fixture"
+        for row, code, status, detail in ((unit, 0, "SENT", "fixture"), (worker, 1, "QUEUED", accepted),
+                                          (unit, 0, "KEPT", accepted), (worker, 0, "SKIPPED", message_send.ONCE_ACCEPTED)):
             with self.subTest(kind=row.kind, status=status):
                 session = replace(self.session, session_id=str(row.current_session), name=row.name)
                 history = heal.new_history()
-                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, f"{status}: fixture", "")) as run:
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, f"{status}: {detail}", "")) as run:
                     heal.alert(directory, limits, session, history, raw, histories={session.session_id: history})
                     heal.alert(directory, limits, session, history, raw, histories={session.session_id: history})
                 run.assert_called_once()
@@ -621,9 +661,10 @@ class HealTests(NixFixture):
             del kwargs
             self.assertEqual(command[2:4], ["--to", owner.id])
             key = command[command.index("--key") + 1]
-            outcome = "SKIPPED" if key in held_keys else "KEPT"
+            output = (f"SKIPPED: {message_send.ONCE_ACCEPTED}" if key in held_keys
+                      else f"KEPT: {message_send.DURABLE_ACCEPTANCE}fixture review")
             held_keys.add(key)
-            return subprocess.CompletedProcess(command, 0, f"{outcome}: fixture review", "")
+            return subprocess.CompletedProcess(command, 0, output, "")
 
         run.side_effect = keep_for_review
         self.assertEqual(heal.sweep(), 0)
@@ -682,7 +723,7 @@ class HealTests(NixFixture):
             keys.append(key)
             if len(keys) == 1:
                 raise subprocess.TimeoutExpired(command, 1)
-            return subprocess.CompletedProcess(command, 0, "SKIPPED: already held for review", "")
+            return subprocess.CompletedProcess(command, 0, f"SKIPPED: {message_send.ONCE_ACCEPTED}", "")
 
         run.side_effect = send
         with redirect_stderr(io.StringIO()):
