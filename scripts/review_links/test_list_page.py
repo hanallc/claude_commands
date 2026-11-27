@@ -1410,26 +1410,56 @@ if(example.filterOn){
         for number in range(13, 25):
             _ = self.add(f"Check the result for team {number}", owner=staff.StaffId(f"delivery-team-{number}"))
         fresh = list_page.render(root, include_counts=False).decode()
+        for offset in (2, -8):
+            with self.subTest(offset=offset):
+                self.assert_studio_refresh_row_position(initial, fresh, offset, r'''
+ check(later.ownerLines>earlier.ownerLines,'The fresh Owner chips add a line.');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required to check refresh position.")
+    def test_browser_studio_refresh_keeps_open_row_below_the_wrapped_status(self) -> None:
+        for number in range(1, 13):
+            _ = self.add(f"Check Studio item {number}")
+        page = list_page.render(self.root / "reviews", include_counts=False).decode()
+        initial = page.replace("<head>", f"<head><script>Date.now=()=>{NOW.timestamp() * 1000};</script>", 1)
+        reason = "The reader cannot confirm the data time. " * 14
+        fresh = page.replace("data-page-facts ", f'data-page-facts data-read-error="{reason}" ', 1)
+        self.assert_studio_refresh_row_position(initial, fresh, 2, r'''
+ check(later.statusHeight>earlier.statusHeight && later.statusState==='Failed',
+  'The fresh status shows the failure on more lines.');
+ check(later.ownerLines===earlier.ownerLines,'The Owner chips keep their height.');
+''')
+
+    def assert_studio_refresh_row_position(self, initial: str, fresh: str, offset: int, verify_growth: str) -> None:
         steps = r'''
  const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
  const summary=()=>document.querySelector('[data-number="6"] .list-row');
  const header=()=>document.querySelector('.list-table thead').getBoundingClientRect();
- const ownerLines=()=>new Set([...document.querySelectorAll('[data-filter-row="owner"] button:not([hidden])')]
-  .map(chip=>chip.getBoundingClientRect().top)).size;
+ const measure=()=>{
+  const status=document.querySelector('[data-page-status]');
+  return {headerBottom:header().bottom,row:summary().getBoundingClientRect(),statusState:status.dataset.state,
+   statusHeight:status.getBoundingClientRect().height,
+   ownerLines:new Set([...document.querySelectorAll('[data-filter-row="owner"] button:not([hidden])')]
+    .map(chip=>chip.getBoundingClientRect().top)).size};
+ };
  await paint();
  summary().scrollIntoView({block:'start',behavior:'instant'});
  await paint();
- scrollBy({top:Math.floor(summary().getBoundingClientRect().top-header().bottom-2),behavior:'instant'});
+ scrollBy({top:Math.floor(summary().getBoundingClientRect().top-header().bottom-(ROW_OFFSET)),behavior:'instant'});
  await paint();
- const before=header().bottom,lines=ownerLines(),top=summary().getBoundingClientRect().top;
- check(top>=before-0.5 && top<=before+4,'The open row starts just below the table header: '+top+' vs '+before);
+ const earlier=measure(),offset=earlier.row.top-earlier.headerBottom;
+ check(earlier.row.bottom>earlier.headerBottom && Math.abs(offset-(ROW_OFFSET))<2,
+  'The open row starts at the expected offset from the header: '+offset);
  refreshMarkup=FRESH_PAGE;
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- await flush();await paint();
- check(ownerLines()>lines && header().bottom>top,'The fresh Owner chips add a line and lower the header.');
- check(recordIsOpen(summary().parentElement) && summary().getBoundingClientRect().top>=header().bottom-0.5,
-  'The open row clears the new header: '+summary().getBoundingClientRect().top+' vs '+header().bottom);
-'''.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
+ await flush();await paint();await paint();
+ const later=measure();
+ VERIFY_GROWTH
+ check(later.headerBottom>earlier.headerBottom,'The refresh grows the header.');
+ check(recordIsOpen(summary().parentElement) && later.row.top>=later.headerBottom-0.5,
+  'The open row clears the new header: '+later.row.top+' vs '+later.headerBottom);
+'''.replace('ROW_OFFSET', str(offset)).replace('VERIFY_GROWTH', verify_growth)
+        steps = steps.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
         self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial,
                                      open_number=6, window_size=(1280, 800))
 

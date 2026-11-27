@@ -3990,6 +3990,12 @@ function updateLinkedRows(rows,updates){
   delete row.dataset.listReviewVersion;
  }
 }
+function keepRowBelowHeader(update){
+ tableView.preserveRecordRowTop(()=>{
+  update();
+  measurePageActions();
+ },{topInset:()=>stuckPageActionsBottom()+content.querySelector('table').tHead.getBoundingClientRect().height});
+}
 async function refresh(_supersede=false,current=()=>true){
  const signal=listRequestSignal();
  const delivery=tableView.deliveryRequest();
@@ -4007,16 +4013,13 @@ async function refresh(_supersede=false,current=()=>true){
  const facts=pageRefreshFacts(page);
  decodeListKeys(fresh);
  refreshNeeded=false;
- tableView.preserveRecordRowTop(()=>{
-  applyListSnapshot(fresh);
-  measurePageActions();
- },{topInset:()=>stuckPageActionsBottom()+content.querySelector('table').tHead.getBoundingClientRect().height});
+ keepRowBelowHeader(()=>applyListSnapshot(fresh));
  reviewRefreshError.textContent='';
  reviewRefreshError.hidden=true;
  if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false')
   tableView.finishDeliveryWindow(delivery);
  scheduleParkExpiry(facts,requestStarted);
- return facts;
+ return {...facts,aroundStatusDraw:keepRowBelowHeader};
 }
 function applyListSnapshot(fresh){
  const field=listOwnsFocus() && content.contains(document.activeElement) ? document.activeElement : null;

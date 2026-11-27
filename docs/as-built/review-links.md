@@ -1506,6 +1506,7 @@ A refresh applies the new data immediately.
 The open row keeps its element through a refresh and takes the new summary, data and detail.
 Its focus, draft and text selection stay.
 The List measures the open row before and after an update or a save result, then scrolls by the difference.
+If the header grows during refresh, a visible row moves below it after the filters or the status line change.
 At a scroll limit, it adds space to keep the row in place.
 The List keeps the open row in place while another row changes height during an animation.
 It reserves space below the list before a row shrinks near the bottom.

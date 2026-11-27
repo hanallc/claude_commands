@@ -555,8 +555,10 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
   if(initial){last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;failure=value.failure || '';draw();}
   await frame();if(own!==request) return;
   if(held() && !status){pending={value,began,own};draw();return;}
-  last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;
-  trip=(performance.now()-began)/1000;failure=value.failure || '';reading=false;pending=null;draw();
+  const {aroundStatusDraw,...facts}=value;
+  last=facts;if(line) line.dataset.renderSeconds=facts.renderSeconds;
+  trip=(performance.now()-began)/1000;failure=facts.failure || '';reading=false;pending=null;
+  if(aroundStatusDraw) aroundStatusDraw(draw); else draw();
   }catch(error){failed(error,own);}
  }
  async function refresh(supersede=false){
