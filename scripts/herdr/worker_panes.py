@@ -1606,11 +1606,16 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     return herdr.SplitPane(ordered[-1], "down", ratio, label)
 
 
+class WorkerRunAtUse(Enum):
+    DISCOVER = "find the run for this worker"
+
+
 @herdr.pane_evidence_run()
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
                     policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT, runs: dict[str, list[str]] | None = None,
+                    run: Path | WorkerRunAtUse = WorkerRunAtUse.DISCOVER,
                     codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
                     selection: SelectedWorkerRows | Literal["by_name"] = "by_name",
                     ) -> WorkerStart:
@@ -1649,9 +1654,13 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                 if isinstance(checked, StartRefused):
                     return checked
                 policy = checked.launch
-            run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
-            if existing is not None and not isinstance(worker_dispatch_state(existing, run, held), DispatchHoldsWorker):
-                run = worker_run(owner, record=record, scanned=runs)
+            explicit_run = isinstance(run, Path)
+            if isinstance(run, WorkerRunAtUse):
+                run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
+                if existing is not None and not isinstance(worker_dispatch_state(existing, run, held), DispatchHoldsWorker):
+                    run = worker_run(owner, record=record, scanned=runs)
+            else:
+                run = run.absolute()
             if isinstance(paths, EnrolledPaths):
                 if refusal := review_run_refusal(owner, run, paths):
                     return refusal
@@ -1665,7 +1674,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
             with worker_admission.worker_operation(allowed):
                 result = _start_locked(owner, name, role, policy, account, allowed, held, codex, paths,
-                                       keep_model=keep_model, selection=target)
+                                       keep_model=keep_model, selection=target, explicit_run=explicit_run)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1715,7 +1724,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead,
                   paths: EnrolledPaths | OrdinaryWorkerOwner, *, keep_model: bool,
-                  selection: SelectedWorkers | SelectedWorkerRows) -> WorkerStart:
+                  selection: SelectedWorkers | SelectedWorkerRows, explicit_run: bool) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1826,7 +1835,13 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                         return _uncertain(current.row, f"running launch environment is unproved: {error}")
                 else:
                     if check_run:
-                        same_run = launched.environment.get("UNIT_RUN_DIR") == str(allowed.run)
+                        running_run = launched.environment.get("UNIT_RUN_DIR")
+                        same_run = running_run == str(allowed.run)
+                        parent = record.parent_of(current.row)
+                        # Keep the existing pane if it still uses the unit's open run.
+                        if (not same_run and explicit_run and parent is not None and isinstance(parent.run, staff.OpenRun)
+                                and running_run == str(parent.run.path)):
+                            same_run = not unit_runs.terminal_run(unit_runs.read_run_fields(parent.run.path))
                     expected = launch_environment(policy, account, True)
                     if isinstance(expected, StartRefused):
                         return expected
@@ -1853,7 +1868,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     launch_home = (staff.SessionHome(Path(environment["CODEX_HOME"]))
                    if policy.settings.kind == "codex" else staff.HomeUnknown())
     environment["UNIT_TEAM_ROLE"] = name.value
-    if owner.kind == "unit" or isinstance(paths, EnrolledPaths):
+    if explicit_run or owner.kind == "unit" or isinstance(paths, EnrolledPaths):
         environment["UNIT_RUN_DIR"] = str(allowed.run)
     if temporary := os.environ.get("TMPDIR"):
         environment["TMPDIR"] = temporary
