@@ -1,7 +1,6 @@
 """Fork a live conversation into a separate staff row."""
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
@@ -174,8 +173,7 @@ def _arguments(source: CloneSource, settings: models_registry.LaunchSettings, na
                   f"Messages to {source.name} are for the source session. "
                   "Wait for a request addressed to you.")
     if source.kind == "codex":
-        return ["fork", source.identity, "--model", settings.model,
-                "-c", f"model_reasoning_effort={json.dumps(settings.effort)}", "--", prompt]
+        return ["fork", source.identity, *models_registry.codex_model_arguments(settings), "--", prompt]
     launched = pane_launch.parse_claude_arguments(source.launch.arguments)
     arguments = pane_record.claude_conversation_arguments(source.identity, name,
         pane_record.ClaudeResumeSettings(settings.model, settings.effort),
@@ -263,11 +261,14 @@ def run(reference: str, name: str) -> int:
         profile: models_registry.ProducerProfile | staff.NotAClone = staff.NotAClone()
         if isinstance(source.producer_clone, staff.ProducerClone):
             configuration = models_registry.launch_configuration(os.environ)
-            settings = models_registry.launch_settings("producers", source.name, configuration=configuration)
-            if settings.kind != source.kind:
+            profiles = models_registry.parse_registry(configuration.text).get("producers", {})
+            try:
+                profile = models_registry.parse_producer_profile(profiles.get(source.name, ""))
+            except ValueError as error:
+                raise ValueError(f"invalid launch settings for producers.{source.name}: {error}") from error
+            if profile.family != source.kind:
                 raise ValueError(f"{source.name}: the registered family differs from the live conversation")
-            profiles = models_registry.parse_registry(configuration.text)["producers"]
-            profile = models_registry.parse_producer_profile(profiles[source.name])
+            settings = models_registry.producer_settings(name, *profile, configuration=configuration)
             prepared = replace(prepared, env=configuration.environment(prepared.env))
         else:
             settings = _live_settings(source, client, home)

@@ -122,6 +122,15 @@ class LaunchSettings(NamedTuple):
     service_tier: str
 
 
+def codex_model_arguments(settings: LaunchSettings) -> list[str]:
+    """Build the Codex arguments for model, effort, and service tier."""
+    arguments = ["--model", settings.model] if settings.model else []
+    arguments.extend(("-c", f"model_reasoning_effort={json.dumps(settings.effort)}"))
+    if settings.service_tier:
+        arguments.extend(("-c", f"service_tier={json.dumps(settings.service_tier)}"))
+    return arguments
+
+
 def claude_model(model: str, environment: Mapping[str, str], *, timeout: float | None = None) -> str:
     """Resolve a model with the selected launch account's catalog."""
     try:
@@ -539,18 +548,23 @@ def save_registry(registry: Path, before: str, after: str, description: str, *,
     return SavedRegistry(result, changed, RegistryPublication.SHARED)
 
 
-def _producer_candidate(name: str, family: str, model: str, effort: str) -> tuple[Path, str, str, LaunchSettings]:
-    path = registry_path()
-    before = registry_text(path)
+def _producer_candidate(name: str, family: str, model: str, effort: str, *,
+                        configuration: LaunchModelConfiguration | None = None) -> tuple[Path, str, str, LaunchSettings]:
+    if configuration is None:
+        path = registry_path()
+        before = registry_text(path)
+    else:
+        path, before = configuration.path, configuration.text
     after = registry_rows.replay(before, [registry_rows.RowChange("producers", name, f"{name}={family}:{model}:{effort}")], False)
     settings = launch_settings("producers", name,
                                configuration=LaunchModelConfiguration(path, after, tuple(registry_rows.records(after))))
     return path, before, after, settings
 
 
-def producer_settings(name: str, family: str, model: str, effort: str) -> LaunchSettings:
+def producer_settings(name: str, family: str, model: str, effort: str, *,
+                      configuration: LaunchModelConfiguration | None = None) -> LaunchSettings:
     """Validate one producer's candidate settings without a write."""
-    return _producer_candidate(name, family, model, effort)[3]
+    return _producer_candidate(name, family, model, effort, configuration=configuration)[3]
 
 
 def store_producer(name: str, family: str, model: str, effort: str) -> LaunchSettings:

@@ -11,7 +11,7 @@ from typing import Literal, cast, final, override
 from unittest.mock import ANY, Mock, call, patch
 
 from scripts.accounts import accounts
-from scripts.agents import member_account, pane_record, shutdown, shutdown_record, stop_resume
+from scripts.agents import member_account, pane_record, restart, shutdown, shutdown_record, stop_resume
 from scripts.herdr import herdr, pane_launch
 from scripts.lib import conf, copy_record, models_registry, scratch, session_folder
 from scripts.lib.test_models_registry import write_registry
@@ -93,17 +93,18 @@ class CloneCommandTests(StaffTestCase):
 
     def source(self, kind: Literal["claude", "codex"], home: Path, args: list[str], *,
                footer: str = "", clone_home: Path | None = None, implicit_account: bool = False,
-               clone_uses_explicit_account: bool = False, identity: str = SOURCE) -> None:
+               clone_uses_explicit_account: bool = False, identity: str = SOURCE,
+               fork_identity: str = FORK, fork_options: tuple[str, ...] = ()) -> None:
         key = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"
         account = {"HOME": str(home.parent)} if implicit_account else {key: str(home)}
         clone_account = {key: str(clone_home or home)} if clone_home or clone_uses_explicit_account else account
         origin = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "source-start", {**account, "STAFF_ID": SOURCE})
-        fork = herdr.NativeAgentProcess(herdr.PaneSessionReport(FORK), "fork-start", clone_account)
+        fork = herdr.NativeAgentProcess(herdr.PaneSessionReport(fork_identity), "fork-start", clone_account)
 
         def foreground_launch(pane: str, _kind: str) -> herdr.ForegroundLaunch:
             if pane == PANE:
                 return herdr.ForegroundLaunch(origin, 42, str(self.folder), args)
-            return herdr.ForegroundLaunch(fork, 43, str(self.folder), [kind])
+            return herdr.ForegroundLaunch(fork, 43, str(self.folder), [kind, *fork_options])
 
         _ = self.enterContext(patch.object(self.client, "foreground_launch", side_effect=foreground_launch))
         cast(Mock, self.processes).return_value = sessions.SessionProcesses((42,) if kind == "claude" else ())
@@ -200,6 +201,51 @@ class CloneCommandTests(StaffTestCase):
         self.assertEqual(arguments[arguments.index("--model") + 1], "claude-sonnet-4-6")
         self.assertEqual(arguments[arguments.index("--effort") + 1], "medium")
         self.assert_producer_resume(clone.name, "claude-sonnet-4-6", "medium")
+
+    def test_codex_producer_clone_uses_the_same_model_arguments_on_fork_and_resume(self) -> None:
+        producer = staff.ensure("producer", name="morty", runtime_id=THIRD,
+                                worktree=staff.PresentWorktree("natedev", self.folder))
+        registry = self.root / "models.conf"
+        profile = "codex:gpt-test:high"
+        saved_options = ("--sandbox", "read-only", "-c", 'notify=["/fixture/notify"]')
+        cases = (
+            ("fast", "", "fast"),
+            ("flex", "fast", "flex"),
+            ("", "", ""),
+        )
+        with patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+                                     "MODELS_CONFIG_TIER_ONLY": "1"}):
+            for index, (shared, source_override, tier) in enumerate(cases, start=1):
+                with self.subTest(shared=shared, source_override=source_override):
+                    name = f"morty-copy-{index}"
+                    identity = f"019b3a40-4250-7000-8000-00000000021{index}"
+                    _ = write_registry(registry, {"producers": {producer.name: profile}, "producers.options": {
+                        "codex_service_tier": shared or None, f"codex_service_tier.{producer.name}": source_override or None,
+                    }})
+                    self.source("codex", self.clone_scratch / ".codex4", ["codex"], identity=producer.current_session,
+                                fork_identity=identity, fork_options=("--model", "old-model", "-c",
+                                    'model_reasoning_effort="low"', "-c", 'service_tier="default"', *saved_options))
+                    cast(Mock, self.native).return_value = identity
+                    cast(Mock, self.native).side_effect = None
+                    cast(Mock, self.client.tab_sessions).return_value = [
+                        herdr.TabSession(PANE, producer.name, "workspace", producer.current_session)]
+                    self.assertEqual(shutdown.main(["clone", producer.name, name]), 0)
+                    clone = staff.initial_snapshot().by_current_session(identity)
+                    assert clone is not None
+                    self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"][name], profile)
+                    saved = pane_record.publication_for_session(identity)
+                    assert saved is not None
+                    launched = cast(Mock, self.launch).call_args
+                    assert launched is not None
+                    fork_arguments = cast(list[str], launched.args[4])
+                    fork_settings = fork_arguments[2:fork_arguments.index("--")]
+                    resume_arguments = stop_resume.resume_arguments(pane_record.resume_launch(saved.entry))
+                    expected = ["--model", "gpt-test", "-c", 'model_reasoning_effort="high"']
+                    if tier:
+                        expected.extend(("-c", f'service_tier="{tier}"'))
+                    self.assertEqual(resume_arguments, ["resume", identity, *expected, *saved_options])
+                    self.assertEqual(restart.producer_launch(clone), ("codex", {}, ["resume", identity, *expected]))
+                    self.assertEqual(fork_settings, expected)
 
     def assert_producer_resume(self, name: str, model: str, effort: str) -> None:
         home = self.clone_scratch / ".claude4"
