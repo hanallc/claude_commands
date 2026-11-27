@@ -8820,7 +8820,6 @@ class RowTabTests(StaffTestCase):
                 herdr.json_object(process, "test foreground process")["name"] = kind
             return payload
 
-        start_note = "herdr fixture:p0: pane is starting\n"
         for kind, arguments_arrive in (("claude", True), ("claude", False), ("codex", False)):
             with (self.subTest(kind=kind, arguments_arrive=arguments_arrive),
                   patch.dict(os.environ, config_environment(configuration)),
@@ -8831,11 +8830,11 @@ class RowTabTests(StaffTestCase):
                 starting = self.client.scan_row_panes(record, [dict(pane)])
                 self.assertEqual(starting.found, {})
                 self.assertEqual(starting.unknown, [herdr.StartingPane("p0", "t0")])
-                self.assertEqual(errors.getvalue(), start_note)
+                self.assertEqual(errors.getvalue(), "")
                 with redirect_stderr(io.StringIO()) as retained:
                     self.assertFalse(herdr.check_target(row.current_session, action="keys", client=self.client,
                         place=herdr.HerdrPlace("fixture", "p0"), pane_info=pane))
-                self.assertIn("pane is starting; target retained", retained.getvalue())
+                self.assertEqual(retained.getvalue(), "")
 
                 if arguments_arrive:
                     self.client.missing_argv.clear()
@@ -8846,13 +8845,13 @@ class RowTabTests(StaffTestCase):
                 if arguments_arrive:
                     self.assertEqual(observed.found, {row.id: [pane]})
                     self.assertEqual(observed.unknown, [])
-                    self.assertEqual(errors.getvalue(), start_note)
+                    self.assertEqual(errors.getvalue(), "")
                 else:
                     self.assertEqual(observed.found, {})
                     reason = "agent argv is unavailable" + (". Foreground programs are codex" if kind == "codex" else "")
                     self.assertEqual(observed.unknown, [herdr.UnknownPane("p0", "t0", reason)])
-                    self.assertEqual(errors.getvalue(), start_note
-                        + f"herdr fixture:p0 tab t0: pane evidence is unknown: {reason}; row placement retained\n")
+                    self.assertEqual(errors.getvalue(),
+                        f"herdr fixture:p0 tab t0: pane evidence is unknown: {reason}; row placement retained\n")
 
     def test_transfer_continues_for_a_proved_tab_and_keeps_an_unknown_tab(self) -> None:
         unknown = dict(self.client.tabs[2])

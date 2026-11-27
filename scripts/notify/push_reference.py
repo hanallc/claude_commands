@@ -30,7 +30,6 @@ class NoReference(TypedDict):
 
 PushReference = QuestionReference | NoReference
 NO_REFERENCE: NoReference = {"kind": "none"}
-UNREADABLE_QUESTION_REPORT = "pushover: Cannot read Question "
 
 
 def read_reference(value: object) -> PushReference:
@@ -148,7 +147,7 @@ def admission_reference(text_id: str, question: str = "", forwarded: str = "", *
                 return reference
             opening = read_question(path)
         except (OSError, ValueError):
-            # The delivery owner reports a failed read when it binds the push.
+            # The delivery owner checks whether it can bind the push.
             return reference
         if opening.status != "open":
             raise ValueError(f"question closed: {path}")

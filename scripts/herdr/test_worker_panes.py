@@ -4172,7 +4172,7 @@ class WorkerPaneTests(StaffTestCase):
             ready.id: worker_panes.OpenWorker(ready, "w1:p2", "terminal-w1:p2", herdr.AgentStatus.IDLE),
             absent.id: worker_panes.ClosedWorker(absent),
         })
-        self.assertEqual(errors.getvalue(), "herdr agents:w1:p1: pane is starting\n")
+        self.assertEqual(errors.getvalue(), "")
 
     def test_starting_pane_without_a_launch_record_leaves_absence_unproved(self) -> None:
         starting, ready = self.worker("starting"), self.worker("ready")

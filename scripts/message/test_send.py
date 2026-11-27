@@ -1142,24 +1142,6 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         claim.assert_not_called()
         run.assert_not_called()
 
-    def test_unreadable_forwarded_question_report_reaches_the_sender(self) -> None:
-        path = self.root / "missing-question.md"
-        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
-        options = send.parse(self.decision_arguments("--push-reference", json.dumps(reference)))
-        self.assertEqual(options.reference, reference)
-        message = send.Message(send.USER, "hana", "Choose the layout", "Details", options.key)
-        assert isinstance(options.action, (ActionRequired, NoActionRequired))
-        warning = f"pushover: Cannot read Question {str(path)!r}.\n"
-        with (mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", warning)),
-              redirect_stderr(io.StringIO()) as errors):
-            result = send.user(message, options.need, options.action, options.timeout,
-                               text_id=options.text_id, values=options.values, reference=options.reference)
-        self.assertEqual((result.outcome, errors.getvalue()), ("sent", warning))
-        with (mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", warning)),
-              redirect_stderr(io.StringIO()) as errors):
-            result = send.remote(message, "natedev", options)
-        self.assertEqual((result.outcome, errors.getvalue()), ("sent", warning))
-
     def test_forwarded_reference_reads_a_local_question_even_on_an_ssh_receive(self) -> None:
         path = self.question_file()
         reference = {"kind": "question", "path": str(path), "since": "2026-11-03T12:00"}

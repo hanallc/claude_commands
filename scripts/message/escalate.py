@@ -519,12 +519,7 @@ def deliver(held: HeldMessage, key: str) -> str:
         command.extend(["--push-reference", json.dumps(held.reference)])
     done = subprocess.run(command, capture_output=True, text=True, check=False,
                           timeout=send_budget.user_seconds(review.user_send_seconds()))
-    if done.returncode == 0:
-        for line in done.stderr.splitlines():
-            if line.startswith(push_reference.UNREADABLE_QUESTION_REPORT):
-                print(line, file=sys.stderr)
-        return ""
-    return " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"
+    return "" if done.returncode == 0 else " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"
 
 
 def forward_review_hold(held: HeldMessage, reason: str, entry_key: str) -> list[str]:
@@ -585,14 +580,14 @@ def due(now: float) -> list[Settled]:
             if held.reference["kind"] == "question":
                 try:
                     opening = push_reference.read_question(Path(held.reference["path"]))
-                except (OSError, ValueError) as error:
-                    settled.append(Settled(f"{path.stem}: NOT sent: {error}", True))
-                    continue
-                reason = ("question closed" if opening.status == "closed" else
-                          "question reopened" if opening.since != held.reference["since"] else "")
-                if reason:
-                    settled.append(discard_script_hold(path, held, reason))
-                    continue
+                except (OSError, ValueError):
+                    pass
+                else:
+                    reason = ("question closed" if opening.status == "closed" else
+                              "question reopened" if opening.since != held.reference["since"] else "")
+                    if reason:
+                        settled.append(discard_script_hold(path, held, reason))
+                        continue
             if (path.stem == "five-hour-codex" or isinstance(held.owner, KnownCodexAccount)) and isinstance(identity, UnknownCodexAccount):
                 continue
             if (isinstance(identity, KnownCodexAccount)

@@ -400,18 +400,19 @@ class EscalateTests(unittest.TestCase):
             push_reference.QuestionReference(kind="question", path=str(path), since="opening"))
         self.assertEqual(admitted[0].text_id, "decision.choices")
 
-    def test_successful_question_delivery_relays_the_unreadable_question_warning(self) -> None:
+    def test_unreadable_question_hold_delivers_without_warning(self) -> None:
         path = self.question_file()
-        warning = f"pushover: Cannot read Question {str(path)!r}.\n"
-        with (patch.object(escalate, "STATE", self.root / "state"), patch.object(escalate, "schedule")):
+        with (patch.object(escalate, "STATE", self.root / "state"), patch.object(escalate, "schedule"),
+              patch.object(escalate, "workers_home", return_value=self.root / "workers"),
+              patch.object(escalate, "codex_account", return_value=UnknownCodexAccount(self.root, "offline")),
+              redirect_stderr(io.StringIO()) as errors):
             self.assertTrue(escalate.hold("choice", self.decision_push(), 0, question=str(path)))
-            held = escalate.read(escalate.held_path("choice"))
-            assert isinstance(held, escalate.RegisteredHold)
-            done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user\n",
-                                               "other transport output\n" + warning)
-            with patch.object(subprocess, "run", return_value=done), redirect_stderr(io.StringIO()) as errors:
-                self.assertEqual(escalate.deliver(held, "choice"), "")
-        self.assertEqual(errors.getvalue(), warning)
+            path.unlink()
+            done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user\n", "")
+            with patch.object(subprocess, "run", return_value=done) as run:
+                self.assertEqual(escalate.due(10**12), [escalate.Settled("choice: sent to the user", False)])
+            run.assert_called_once()
+        self.assertEqual(errors.getvalue(), "")
 
     def test_question_hold_closes_once_when_the_question_closes_or_reopens(self) -> None:
         for status, since, reason in (("closed", "opening", "question closed"),

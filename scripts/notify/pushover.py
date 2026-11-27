@@ -621,7 +621,10 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
             if _can_keep(push):
                 _ = silence.end_if_past(deliver=lambda kept: post_kept(kept, keys_file, post))
             with silence.locked():
-                _ = question_pushes.bind_locked(identity, emergency=push["priority"] == "2", allow_unreadable=True)
+                try:
+                    _ = question_pushes.bind_locked(identity, emergency=push["priority"] == "2")
+                except question_pushes.QuestionOpeningUnreadable:
+                    pass
                 return _deliver_here(push, identity, keys_file, post, locked=True)
         except question_pushes.SettledQuestion as error:
             print(f"pushover: replaced: {error}")
@@ -701,6 +704,7 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     reference = push.get("reference", push_reference.NO_REFERENCE)
     text_id = push["text_id"]
     reason = ""
+    confirmed_open = False
     identity = silence.push_identity(push)
     title, message = push["title"], push["message"]
     if text_id and not any(entry.id == text_id for entry in push_texts.catalog()):
@@ -718,6 +722,7 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
         if reference["kind"] == "question":
             try:
                 reason = question_pushes.settled(reference)
+                confirmed_open = not reason
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 log(push["source"], push["priority"], push["title"], push["message"],
                     f"anomaly: question record {reference['path']}: {error}",
@@ -734,7 +739,7 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     priority = decision_priority.priority(need, push.get("due", ""))
 
     def post_once(url: str, data: bytes) -> tuple[int, bytes]:
-        if priority == "2" and reference["kind"] == "question":
+        if priority == "2" and confirmed_open:
             question_pushes.bind_released_emergency_locked(identity)
         silence.mark_post_started(push)
         return post(url, data)

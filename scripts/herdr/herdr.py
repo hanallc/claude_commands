@@ -1677,6 +1677,11 @@ class PaneSessionsStarting:
 
 
 @dataclass(frozen=True)
+class PaneSessionsWithoutArguments(PaneSessionsStarting):
+    """The starting agent has no readable arguments."""
+
+
+@dataclass(frozen=True)
 class PaneSessionsChanging:
     """The pane or its agent changed during the scan."""
 
@@ -2518,7 +2523,7 @@ class Herdr:
                     if snapshot is not None:
                         _ = snapshot.replies.pop((self.session, arguments), None)
                     _ = run.sessions.pop(key, None)
-                    return PaneSessionsStarting(error.pid)
+                    return PaneSessionsWithoutArguments(error.pid)
                 sessions: PaneSessions = (frozenset() if isinstance(observed, NoForegroundAgent)
                                           else frozenset({observed.session_id}))
                 if not sessions and foreground == shell:
@@ -2563,7 +2568,7 @@ class Herdr:
                 unread = (StartingPane(identity, tab) if isinstance(sessions, PaneSessionsStarting)
                           else UnknownPane(identity, tab, sessions.reason))
                 unknown.append(unread)
-                if isinstance(sessions, PaneSessionsChanging):
+                if isinstance(sessions, (PaneSessionsChanging, PaneSessionsWithoutArguments)):
                     continue
                 if isinstance(sessions, PaneSessionsUnknown):
                     if launches is None:
@@ -4447,7 +4452,9 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
             if isinstance(composer, ComposerInput) and composer.text.strip() and not composer.contains(text):
                 raise HerdrFailure(f"would overwrite unsaved input in session {target}", "wrong_target")
         return True
-    except (_ForegroundArgvStarting, CodexPaneStarting):
+    except _ForegroundArgvStarting:
+        return False
+    except CodexPaneStarting:
         return retain(f"{PANE_STARTING}; target retained")
     except CodexTerminalInputUnavailable:
         raise

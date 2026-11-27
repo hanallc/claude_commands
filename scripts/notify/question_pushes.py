@@ -42,6 +42,10 @@ class SettledQuestion(ValueError):
     """The Question opening no longer accepts a push."""
 
 
+class QuestionOpeningUnreadable(OSError):
+    """The Question read could not prove an opening for retirement."""
+
+
 def directory() -> Path:
     return silence.state_dir() / "question-pushes"
 
@@ -116,30 +120,27 @@ def retire_copies(identity: PushIdentity, *, emergency: bool) -> str:
     return transport.retire_question_copies(identity, emergency=emergency)
 
 
-def _opening_unreadable(reference: push_reference.QuestionReference, *, allow_unreadable: bool) -> bool:
+def _require_opening(reference: push_reference.QuestionReference) -> None:
     try:
         reason = settled(reference)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        if not allow_unreadable:
-            raise
-        return True
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise QuestionOpeningUnreadable(str(error)) from error
     if reason:
         raise SettledQuestion(reason)
-    return False
 
 
-def bind_locked(identity: PushIdentity, *, emergency: bool, allow_unreadable: bool = False) -> Binding:
+def bind_locked(identity: PushIdentity, *, emergency: bool) -> Binding:
     """Record the active binding before the caller keeps or posts the push."""
     question = identity.question
     assert question is not None
     reference = question.reference
+    _require_opening(reference)
     path = binding_path(identity.sender, identity.key)
     previous = read_binding(path)
-    unreadable = _opening_unreadable(reference, allow_unreadable=allow_unreadable)
     if previous is not None and previous.identity != identity:
         _ = _retire_binding_locked(path, previous.identity, emergency=previous.emergency)
         previous = None
-        unreadable = _opening_unreadable(reference, allow_unreadable=allow_unreadable)
+        _require_opening(reference)
     released_path = _released_binding_path(identity)
     released = read_binding(released_path) is not None
     bound = Binding(identity, emergency or released or (previous is not None and previous.emergency))
@@ -147,8 +148,6 @@ def bind_locked(identity: PushIdentity, *, emergency: bool, allow_unreadable: bo
         _write_binding(path, bound)
     if released:
         released_path.unlink()
-    if unreadable:
-        print(f"{push_reference.UNREADABLE_QUESTION_REPORT}{reference['path']!r}.", file=sys.stderr)
     return bound
 
 

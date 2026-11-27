@@ -4769,16 +4769,6 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
     return original
 
 
-def report_unreadable_questions(stderr: str) -> str:
-    remaining: list[str] = []
-    for line in stderr.splitlines(keepends=True):
-        if line.startswith(push_reference.UNREADABLE_QUESTION_REPORT):
-            print(line, end="", file=sys.stderr)
-        else:
-            remaining.append(line)
-    return "".join(remaining)
-
-
 def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False,
          text_id: str = "", values: tuple[str, ...] = (), due: str = "",
          reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False,
@@ -4806,7 +4796,6 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
     if remote_forward:
         command[2:2] = ["--ssh-forwarded-reference"]
     code, out, err = run(command, "", timeout)
-    err = report_unreadable_questions(err)
     if code == 6:
         failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, held=True, text_id=text_id, sender=message.sender))
         return Result("held", "not sent, failed review: " + (err.removeprefix("pushover: not sent: ").strip() or "review failed"), failed)
@@ -4982,8 +4971,6 @@ def remote(message: Message, host: str, options: Options) -> Result:
             first_attempt = previous is None
             state["once_remote"] = destination
     code, out, err = run(command, message.text, send_budget.remote_seconds(options.timeout))
-    if message.to == USER:
-        err = report_unreadable_questions(err)
     receiver, err = recipient_report(err)
     error_lines = err.splitlines()
     repeat_guard_held = REPEAT_GUARD_REPORT in error_lines
