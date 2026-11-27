@@ -385,7 +385,7 @@ class LocalReviewTests(unittest.TestCase):
         def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
             request = question_request(prompt)
             requests.append(request)
-            if len(requests) == 2:
+            if len(requests) == 3:
                 return review.StructuredCall("opus", review.ModelTimeout())
             return question_batch(request, parts=[
                 PartVerdictJSON(number=int(number), questions=[],
@@ -394,11 +394,11 @@ class LocalReviewTests(unittest.TestCase):
             ])
 
         with mock.patch.object(review, "structured_call", side_effect=judge):
-            for attempt in ("first review", "unchanged draft"):
-                with self.subTest(attempt=attempt):
+            for calls in (1, 2):
+                with self.subTest(calls=calls):
                     self.assertEqual(review.review_question(key, question, runner=guide, console_kind="question"),
                                      review.QuestionReviewFailed(question, (), (failure,)))
-                    self.assertEqual(len(requests), 1)
+                    self.assertEqual(len(requests), calls)
             revised_title = "Finish the download?"
             revised = question.replace(title, revised_title).replace(point, "The connection stopped the download.")
             key = replace(key, text=revised_title)
@@ -407,19 +407,22 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.review_question(key, revised, runner=guide, console_kind="question"),
                              review.QuestionReviewFailed(revised, (), (failure,)))
             final = revised.replace(recommend, final_recommend)
-            self.assertEqual(review.review_question(key, final, runner=guide, console_kind="question"),
-                             review.QuestionAccepted(final))
+            final_spacing = final.replace("\n\n", "\n \n", 1)
+            for text, calls in ((final, 5), (final, 5), (final_spacing, 6)):
+                with self.subTest(text=text, calls=calls):
+                    self.assertEqual(review.review_question(key, text, runner=guide, console_kind="question"),
+                                     review.QuestionAccepted(text))
+                    self.assertEqual(len(requests), calls)
 
         self.assertEqual([list(request["parts"]) for request in requests],
-                         [["1", "2", "3", "4", "5"], ["1", "2"], ["1", "2"], ["3"]])
-        self.assertIn("- No, keep the partial file.", requests[1]["draft"])
+                         [["1", "2", "3", "4", "5"], [], ["1", "2"], ["1", "2"], ["3"], []])
+        self.assertIn("- No, keep the partial file.", requests[2]["draft"])
 
     def test_console_question_checks_an_unchanged_recommendation_against_a_revised_fact(self) -> None:
         title = "Retry the download?"
         recommendation = "Recommended: Yes. You get the full file."
         draft = f"{title}\n\n1. A partial file is on disk.\n\n{recommendation}"
         revised = draft.replace("A partial file is on disk.", "You get the full file.")
-        revised_spacing = revised.replace("\n\n", "\n \n", 1)
         key = review.QuestionKey("demo", title)
         runner = FakeReviewer(verdict(self.draft))
         failure = review.RuleFailure("console-standard-2", "You get the full file.")
@@ -428,35 +431,19 @@ class LocalReviewTests(unittest.TestCase):
         def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
             request = question_request(prompt)
             requests.append(request)
-            failures = (
-                [review.RuleFailureRecord(rule=failure.rule, quote=failure.quote)]
-                if request["draft"] in (revised, revised_spacing) else []
-            )
+            failures = [review.RuleFailureRecord(rule=failure.rule, quote=failure.quote)] if request["draft"] == revised else []
             return question_batch(request, failures=failures)
 
-        held = review.QuestionReviewFailed(revised, (), (failure,))
         with mock.patch.object(review, "structured_call", side_effect=judge):
-            for text, expected, calls in (
-                    (draft, review.QuestionAccepted(draft), 1),
-                    (revised, held, 2),
-                    (revised, held, 2),
-                    (revised_spacing, replace(held, question=revised_spacing), 3)):
-                with self.subTest(text=text, calls=calls):
-                    self.assertEqual(review.review_question(key, text, runner=runner, console_kind="question"),
-                                     expected)
-                    self.assertEqual(len(requests), calls)
-
-            # Keep only the passing part verdicts to reproduce a file from before this change.
-            cache_path, = (review.state_path() / "question-verdicts").glob("*.json")
-            saved = cast(dict[str, object], json.loads(cache_path.read_text()))
-            parts_only = {fingerprint: record for fingerprint, record in saved.items()
-                          if record == {"questions": [], "failed_rules": []}}
-            _ = cache_path.write_text(json.dumps(parts_only))
-            self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"),
-                             held)
             self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
                              review.QuestionAccepted(draft))
-        self.assertEqual([list(request["parts"]) for request in requests], [["1", "2", "3"], ["2"], [], [], ["2"]])
+            self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"),
+                             review.QuestionReviewFailed(revised, (), (failure,)))
+            self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"),
+                             review.QuestionReviewFailed(revised, (), (failure,)))
+            self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                             review.QuestionAccepted(draft))
+        self.assertEqual([list(request["parts"]) for request in requests], [["1", "2", "3"], ["2"], [], ["2"]])
 
     def test_console_question_rechecks_clock_times_after_a_date_or_zone_change(self) -> None:
         title = "Retry the download?"

@@ -1006,7 +1006,9 @@ def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, 
             if not whole:
                 if not pending and draft_fingerprint in saved:
                     draft_verdict = part_verdict(_object(saved[draft_fingerprint]), draft)
-                    return combine_question_verdicts(draft, [draft_verdict, *reused.values()], metadata())
+                    cached = combine_question_verdicts(draft, [draft_verdict, *reused.values()], metadata())
+                    if isinstance(cached, Approved):
+                        return cached
                 fields = json.dumps({"draft": draft.body, "parts": pending}, ensure_ascii=False)
                 draft_prompt = f"{review_date_and_zone}\nConsole text kind: question\n{fields}"
             answer = ask(schema, prompt, draft_prompt)
@@ -1037,7 +1039,7 @@ def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, 
             if isinstance(combined, Failed):
                 return combined
             verdicts_by_fingerprint = {fingerprints[number]: verdict for number, verdict in latest.items()}
-            if not whole:
+            if not whole and isinstance(combined, Approved):
                 verdicts_by_fingerprint[draft_fingerprint] = draft_verdict
             saved = {
                 fingerprint: {
