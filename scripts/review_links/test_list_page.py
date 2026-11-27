@@ -1297,6 +1297,86 @@ if(example.filterOn){
 </script>'''
         self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the short Studio layout.")
+    def test_browser_short_studio_keeps_two_rows_visible_and_filters_reachable(self) -> None:
+        producers = tuple(staff.StaffRow(identity, "producer", name, staff.StaffRoot(), current_session=identity)
+                          for identity, name in ((OWNER.id, "first"), (OTHER.id, "second")))
+        members = staff.StaffSnapshot((MORTY, DWIGHT, *producers))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
+            member.to_json() for member in members.rows]}))
+        for number in range(1, 9):
+            _ = self.add(f"Check Studio item {number}")
+        markup = list_page.render(self.root / "reviews", include_counts=False)
+        page = page_frame.with_owner(markup, "studio", MORTY, members, new_item_dialog.render)
+        probe = b'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const box=element=>element.getBoundingClientRect();
+ const hit=element=>{
+  const {left,top,width,height}=box(element);
+  return element.contains(document.elementFromPoint(left+width/2,top+height/2));
+ };
+ try{
+  frameElement.style.width='800px';frameElement.style.height='320px';
+  await paint();
+  const filters=document.querySelector('[data-page-top-controls]');
+  const tabs=filters.querySelectorAll('.studio-tabs button');
+  const search=filters.querySelector('#list-search');
+  const unread=filters.querySelector('#list-unread');
+  const heading=document.querySelector('.list-table thead');
+  const [first,second]=document.querySelectorAll('.list-table .list-row');
+  check(innerWidth===800 && innerHeight===320 && tabs.length===5 && box(search).top>=box(tabs[0]).bottom,
+   'Five Producer tabs put Search on its own line at 800 x 320 px.');
+  check(filters.scrollHeight>filters.clientHeight,'The filters have their own scroll area.');
+  first.scrollIntoView({block:'start',behavior:'instant'});
+  await paint();
+  check(hit(heading.querySelector('button')) && box(first).top>=box(heading).bottom-1 && box(second).bottom<=innerHeight,
+   'The table header and two full rows fit below the frozen top: '+JSON.stringify([box(heading),box(first),box(second)]));
+  const pageScroll=scrollY;
+  for(const control of [search,filters.querySelector('#filter-owner-all'),filters.querySelector('#filter-show-all'),unread]){
+   control.focus();await paint();
+   check(document.activeElement===control && hit(control),'The filter takes focus and stays visible: '+control.id);
+  }
+  check(filters.scrollTop>0 && scrollY===pageScroll,'Focus scrolls the filters within the frozen top.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required to check refresh position.")
+    def test_browser_studio_refresh_keeps_open_row_below_the_grown_header(self) -> None:
+        root = self.root / "reviews"
+        for number in range(1, 13):
+            _ = self.add(f"Check Studio item {number}")
+        initial = list_page.render(root, include_counts=False).decode()
+        for number in range(13, 25):
+            _ = self.add(f"Check the result for team {number}", owner=staff.StaffId(f"delivery-team-{number}"))
+        fresh = list_page.render(root, include_counts=False).decode()
+        steps = r'''
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const summary=()=>document.querySelector('[data-number="6"] .list-row');
+ const header=()=>document.querySelector('.list-table thead').getBoundingClientRect();
+ const ownerLines=()=>new Set([...document.querySelectorAll('[data-filter-row="owner"] button:not([hidden])')]
+  .map(chip=>chip.getBoundingClientRect().top)).size;
+ await paint();
+ summary().scrollIntoView({block:'start',behavior:'instant'});
+ await paint();
+ scrollBy({top:Math.floor(summary().getBoundingClientRect().top-header().bottom-2),behavior:'instant'});
+ await paint();
+ const before=header().bottom,lines=ownerLines(),top=summary().getBoundingClientRect().top;
+ check(top>=before-0.5 && top<=before+4,'The open row starts just below the table header: '+top+' vs '+before);
+ refreshMarkup=FRESH_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();await paint();
+ check(ownerLines()>lines && header().bottom>top,'The fresh Owner chips add a line and lower the header.');
+ check(recordIsOpen(summary().parentElement) && summary().getBoundingClientRect().top>=header().bottom-0.5,
+  'The open row clears the new header: '+summary().getBoundingClientRect().top+' vs '+header().bottom);
+'''.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
+        self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial,
+                                     open_number=6, window_size=(1280, 800))
+
     def test_studio_lists_linked_items_with_states_and_missing_records(self) -> None:
         closed = self.add("Close this check", number=210)
         missing = self.add("Remove this fixture record", number=406)
@@ -1505,15 +1585,16 @@ if(example.filterOn){
             for size in studio_page.SIZES:
                 _ = (avatars / folder / f"02-{size}.webp").write_bytes(b"RIFF")
 
-        def page() -> str:
-            return list_page.render(self.root / "reviews", include_counts=False).decode()
+        def page(render_seconds: str) -> str:
+            return re.sub(r'data-render-seconds="[^"]+"', f'data-render-seconds="{render_seconds}"',
+                          list_page.render(self.root / "reviews", include_counts=False).decode(), count=1)
 
         with patch.object(studio_page, "choice", side_effect=min):
-            initial = page()
+            initial = page("0.20").replace("<head>", f"<head><script>Date.now=()=>{NOW.timestamp() * 1000};</script>", 1)
         added = self.add("A new item for dwight", number=2)
         _ = the_list.update(MORTY.id, added.id, {"producer": DWIGHT.id}, source="morty")
         with patch.object(studio_page, "choice", side_effect=max):
-            fresh = page()
+            fresh = page("0.76")
         self.assertIn(f'src="{studio_page.AVATAR_PATH}/{DWIGHT.id}/02-128.webp"', fresh)
         steps = r'''
  const tab=value=>document.querySelector('[data-filter-row="producer"] [data-filter-value="'+value+'"]');
@@ -1525,16 +1606,18 @@ if(example.filterOn){
  const shown=pictures();
  const frozen=document.querySelector('.page-top');
  const status=frozen.querySelector('[data-page-status]');
+ const renderTime=status.querySelector('[data-status-render]');
+ check(!renderTime.hidden && renderTime.textContent==='render 0.20 s','The first status shows its render time.');
  check(shown.includes('/01-128.webp') && !shown.includes('/02-'),'The first render shows picture 01.');
  check(tab('staff:'+DWIGHT).dataset.filterCount==='0' && tab('all').dataset.filterCount==='1',
   'The first render counts one item.');
  refreshMarkup=FRESH_PAGE;
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await flush();
- await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
  check(document.querySelector('[data-number="2"]'),'The refresh shows the new row.');
- check(frozen===document.querySelector('.page-top') && frozen.contains(status) && status.dataset.state!=='Failed',
-  'The refresh keeps the frame and updates its status.');
+ check(frozen===document.querySelector('.page-top') && frozen.contains(status) && !renderTime.hidden &&
+  renderTime.textContent==='render 0.76 s','The retained status displays the fresh render time.');
  check(pictures()===shown,'The refresh keeps each picture src and srcset on screen.');
  check(tab('staff:'+DWIGHT).dataset.filterCount==='1' && tab('staff:'+DWIGHT).querySelector('b').textContent==='1'
   && tab('all').dataset.filterCount==='2','The refresh updates the tab counts.');
