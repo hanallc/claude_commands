@@ -37,7 +37,7 @@ Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/agents/shutdown.py`.
 All lifecycle scripts use `scripts/agents/`.
 
-`agents clone NAME --as NEW` forks a live conversation on the source machine.
+`agents clone NAME NEW_NAME` forks a live conversation on the source machine.
 Use a staff name, saved launch name, staff ID, or native session ID.
 The command refuses a saved launch name that matches multiple sessions on this machine.
 The command requires one proved pane and opens the clone after its source tab on the same Herdr server.

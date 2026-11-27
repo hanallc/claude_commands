@@ -129,6 +129,14 @@ class CloneCommandTests(StaffTestCase):
         assert call is not None
         return cast(herdr.PreparedAgentEnvironment, call.args[2])
 
+    def test_clone_refuses_the_removed_as_option(self) -> None:
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic), self.assertRaises(SystemExit) as failure:
+            _ = shutdown.main(["clone", "alpha", "--as", "alpha-copy"])
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("unrecognized arguments: --as", diagnostic.getvalue())
+        cast(Mock, self.launch).assert_not_called()
+
     def test_claude_clone_uses_live_settings_and_admits_an_ordinary_session(self) -> None:
         home = self.clone_scratch / ".claude4"
         unit = staff.ensure("unit", name="unit", parent=staff.ReportsTo(self.owner.id), runtime_id=THIRD,
@@ -138,7 +146,7 @@ class CloneCommandTests(StaffTestCase):
         transcript.parent.mkdir(parents=True)
         data = json.dumps({"type": "assistant", "message": {"model": "fable"}, "effort": "high"}) + "\n"
         _ = transcript.write_text(data)
-        self.assertEqual(shutdown.main(["clone", "alpha", "--as", "alpha-copy"]), 0)
+        self.assertEqual(shutdown.main(["clone", "alpha", "alpha-copy"]), 0)
         environment = {"CLAUDE_CONFIG_DIR": str(home)}
         cast(Mock, self.prepare).assert_called_once_with(str(self.folder), environment, ANY)
         prepared = self.launched_environment()
@@ -179,7 +187,7 @@ class CloneCommandTests(StaffTestCase):
         transcript.parent.mkdir(parents=True)
         _ = transcript.write_text(json.dumps({"type": "turn_context", "payload": {
             "model": "gpt-6", "effort": "high"}}) + "\n")
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 0)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 0)
         prepared = self.launched_environment()
         self.assertEqual(prepared.env, {"CODEX_HOME": str(home)})
         cast(Mock, self.launch).assert_called_once_with("fixture", herdr.ForkTab(PANE, "alpha-copy"),
@@ -190,7 +198,7 @@ class CloneCommandTests(StaffTestCase):
 
     def test_codex_clone_passes_the_live_ultra_effort(self) -> None:
         self.source("codex", self.clone_scratch / ".codex", ["codex"], footer="gpt-6.1-sol ultra")
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 0)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 0)
         call = cast(Mock, self.launch).call_args
         assert call is not None
         self.assertIn('model_reasoning_effort="ultra"', cast(list[str], call.args[4]))
@@ -199,7 +207,7 @@ class CloneCommandTests(StaffTestCase):
         self.source("claude", self.clone_scratch / ".claude", ["claude"], footer="Opus 4.8 high")
         diagnostic = io.StringIO()
         with redirect_stderr(diagnostic):
-            self.assertEqual(shutdown.main(["clone", "only-a-tab-label", "--as", "alpha-copy"]), 2)
+            self.assertEqual(shutdown.main(["clone", "only-a-tab-label", "alpha-copy"]), 2)
         self.assertIn("Use the native session ID", diagnostic.getvalue())
         cast(Mock, self.launch).assert_not_called()
         cast(Mock, self.client_factory).assert_not_called()
@@ -220,23 +228,23 @@ class CloneCommandTests(StaffTestCase):
         pane_record.write("second-server", other)
         diagnostic = io.StringIO()
         with redirect_stderr(diagnostic):
-            self.assertEqual(shutdown.main(["clone", "bob", "--as", "alpha-copy"]), 2)
+            self.assertEqual(shutdown.main(["clone", "bob", "alpha-copy"]), 2)
         self.assertIn("several saved sessions match", diagnostic.getvalue())
         cast(Mock, self.launch).assert_not_called()
         pane_record.record_path("second-server").unlink()
-        self.assertEqual(shutdown.main(["clone", "bob", "--as", "alpha-copy"]), 0)
+        self.assertEqual(shutdown.main(["clone", "bob", "alpha-copy"]), 0)
         call = cast(Mock, self.launch).call_args
         assert call is not None
         self.assertEqual(cast(list[str], call.args[4])[:3], ["--resume", THIRD, "--fork-session"])
 
     def test_clone_refuses_an_existing_staff_name_before_launch(self) -> None:
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "ALPHA"]), 2)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "ALPHA"]), 2)
         cast(Mock, self.launch).assert_not_called()
         self.assertEqual(staff.initial_snapshot().rows, (self.owner,))
 
     def test_clone_refuses_a_stopped_source_before_launch(self) -> None:
         with patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()):
-            self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+            self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 2)
         cast(Mock, self.launch).assert_not_called()
         self.assertEqual(staff.initial_snapshot().rows, (self.owner,))
 
@@ -244,7 +252,7 @@ class CloneCommandTests(StaffTestCase):
         self.source("claude", self.clone_scratch / ".claude4", ["claude"], footer="Opus 4.8 high")
         cast(Mock, self.native).side_effect = None
         cast(Mock, self.native).return_value = SOURCE
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 2)
         self.assertEqual(staff.initial_snapshot().rows, (self.owner,))
         cast(Mock, self.remember).assert_not_called()
 
@@ -252,18 +260,18 @@ class CloneCommandTests(StaffTestCase):
         self.source("claude", self.clone_scratch / ".claude4", ["claude"], footer="Opus 4.8 high")
         cast(Mock, self.processes).return_value = sessions.SessionProcesses((42, 44))
         cast(Mock, self.place).side_effect = [herdr.HerdrPlace("fixture", PANE), herdr.HerdrPlace("fixture", "w1:p9")]
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 2)
         cast(Mock, self.launch).assert_not_called()
 
     def test_clone_uses_the_proved_server_instead_of_the_shared_server(self) -> None:
         self.source("claude", self.clone_scratch / ".claude4", ["claude"], footer="Opus 4.8 high")
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 0)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 0)
         cast(Mock, self.client_factory).assert_called_once_with("fixture")
 
     def test_clone_refuses_unproved_source_placement(self) -> None:
         self.source("claude", self.clone_scratch / ".claude4", ["claude"], footer="Opus 4.8 high")
         cast(Mock, self.place).return_value = herdr.UnprovedHerdrPlacement("cannot prove the source placement")
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 2)
         cast(Mock, self.client_factory).assert_not_called()
         cast(Mock, self.launch).assert_not_called()
 
@@ -271,7 +279,7 @@ class CloneCommandTests(StaffTestCase):
         self.source("claude", self.clone_scratch / ".claude4", ["claude", "--effort", "high"], footer="Opus 4.8")
         diagnostic = io.StringIO()
         with redirect_stderr(diagnostic):
-            self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+            self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 2)
         self.assertIn("cannot prove the current effort", diagnostic.getvalue())
         cast(Mock, self.launch).assert_not_called()
 
@@ -281,7 +289,7 @@ class CloneCommandTests(StaffTestCase):
         self.source("claude", home, ["claude"], footer="Opus 4.8 high", clone_home=wrong)
         cast(Mock, self.prepare).side_effect = None
         cast(Mock, self.prepare).return_value = herdr.PreparedAgentEnvironment(self.folder, {"CLAUDE_CONFIG_DIR": str(wrong)})
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 2)
         self.assertEqual(self.launched_environment().env["CLAUDE_CONFIG_DIR"], str(home))
         self.assertEqual(staff.initial_snapshot().rows, (self.owner,))
         cast(Mock, self.publication).assert_not_called()
@@ -292,7 +300,7 @@ class CloneCommandTests(StaffTestCase):
         cast(Mock, self.prepare).side_effect = None
         cast(Mock, self.prepare).return_value = herdr.PreparedAgentEnvironment(
             self.folder, {"HOME": "/another/home", "CLAUDE_CONFIG_DIR": str(home), "PATH": "/bin"})
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 0)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 0)
         prepared = self.launched_environment()
         self.assertEqual(prepared.env, {"HOME": str(home.parent), "PATH": "/bin"})
         self.assertIn("CLAUDE_CONFIG_DIR", prepared.unset_environment)
@@ -305,7 +313,7 @@ class CloneCommandTests(StaffTestCase):
         home = self.clone_scratch / ".claude"
         self.source("claude", home, ["claude"], footer="Opus 4.8 high", implicit_account=True,
                     clone_uses_explicit_account=True)
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 2)
         self.assertEqual(staff.initial_snapshot().rows, (self.owner,))
         cast(Mock, self.publication).assert_not_called()
         cast(Mock, self.client.close_terminal_pane).assert_called_once_with(FORK_PANE, "fixture-terminal")
@@ -313,12 +321,12 @@ class CloneCommandTests(StaffTestCase):
     def test_clone_refuses_reserved_message_addresses(self) -> None:
         for name in ("user", "USER", "staff:alpha", "session:alpha", "codex:alpha", "uds:alpha", "worker:alpha"):
             with self.subTest(name=name):
-                self.assertEqual(shutdown.main(["clone", SOURCE, "--as", name]), 2)
+                self.assertEqual(shutdown.main(["clone", SOURCE, name]), 2)
         cast(Mock, self.launch).assert_not_called()
 
     def test_source_and_clone_names_resolve_to_separate_native_addresses(self) -> None:
         self.source("claude", self.clone_scratch / ".claude4", ["claude"], footer="Opus 4.8 high")
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 0)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 0)
         entries = [
             roster.RosterEntry("natedev", "claude", "freestanding", name, "idle",
                                roster.Messageable(f"session:{identity}"), str(self.folder),
@@ -341,7 +349,7 @@ class CloneCommandTests(StaffTestCase):
             return herdr.ForkLaunched(FORK_PANE, herdr.PromptSubmissionNotRequired(), "fixture-terminal")
 
         cast(Mock, self.launch).side_effect = competing_writer
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 2)
         record = staff.initial_snapshot()
         self.assertIsNotNone(record.by_current_session(THIRD))
         self.assertIsNone(record.by_current_session(FORK))
@@ -360,7 +368,7 @@ class CloneCommandTests(StaffTestCase):
     def test_clone_removes_its_launch_and_terminal_when_staff_rejects_admission(self) -> None:
         self.source("claude", self.clone_scratch / ".claude", ["claude"], footer="Opus 4.8 high")
         with patch.object(staff, "create_session", side_effect=staff.StaffRefused("name taken")):
-            self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+            self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 2)
         cast(Mock, self.publication).assert_called_once()
         self.assertIsNone(pane_record.publication_for_session(FORK))
         cast(Mock, self.client.close_terminal_pane).assert_called_once_with(FORK_PANE, "fixture-terminal")
@@ -368,7 +376,7 @@ class CloneCommandTests(StaffTestCase):
     def test_clone_does_not_admit_staff_if_the_launch_cannot_be_saved(self) -> None:
         self.source("claude", self.clone_scratch / ".claude", ["claude"], footer="Opus 4.8 high")
         cast(Mock, self.publication).side_effect = OSError("launch file unavailable")
-        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 2)
         self.assertEqual(staff.initial_snapshot().rows, (self.owner,))
         cast(Mock, self.client.close_terminal_pane).assert_called_once_with(FORK_PANE, "fixture-terminal")
 
@@ -382,7 +390,7 @@ class CloneCommandTests(StaffTestCase):
 
         diagnostic = io.StringIO()
         with patch.object(staff, "create_session", side_effect=lose_reply), redirect_stderr(diagnostic):
-            self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+            self.assertEqual(shutdown.main(["clone", SOURCE, "alpha-copy"]), 2)
         self.assertIn("staff admission is unconfirmed", diagnostic.getvalue())
         self.assertIsNotNone(staff.initial_snapshot().by_current_session(FORK))
         self.assertIsNotNone(pane_record.publication_for_session(FORK))
