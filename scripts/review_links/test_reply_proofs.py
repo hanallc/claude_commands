@@ -130,7 +130,7 @@ class ReplyProofTests(unittest.TestCase):
         cache = review_page.ReviewSnapshotCache(move.review_root, start_worker=False, initialize_on_start=True)
         self.addCleanup(cache.close)
         self.assertTrue(question.path.read_bytes() == legacy)
-        self.assertFalse(reply_proofs.move_journal_path().exists())
+        self.assertFalse(reply_proofs.read_move_report())
         saved = question.submission
         self.assertFalse(reply_proofs.path_for(saved.details.proof_identity(saved.id)).exists())
 
@@ -138,6 +138,99 @@ class ReplyProofTests(unittest.TestCase):
         question = self._archive_legacy_question_in_former_store()
         (question.backup / ".git" / "HEAD").unlink()
         self._assert_move_skips_archived_question(question)
+
+    def test_dry_run_and_journal_name_the_skipped_backup(self) -> None:
+        question = self._archive_legacy_question_in_former_store()
+        journal = reply_proofs.move_journal_path()
+        with redirect_stdout(StringIO()) as preview:
+            self.assertEqual(review_submissions.main(["move-reply-proofs", "--dry-run"]), 0)
+        self.assertEqual(len(preview.getvalue().splitlines()), 3)
+
+        head = question.backup / ".git" / "HEAD"
+        saved_head = head.read_bytes()
+        head.unlink()
+        with redirect_stdout(StringIO()) as preview:
+            self.assertEqual(review_submissions.main(["move-reply-proofs", "--dry-run"]), 0)
+        self.assertTrue(preview.getvalue().splitlines()[3:] == [str(question.backup)])
+        self.assertFalse(journal.parent.exists())
+
+        self._assert_move_skips_archived_question(question)
+        entry = json.dumps({"skipped_backup": str(question.backup)})
+        self.assertTrue(journal.read_text().splitlines() == [entry])
+        self.assertEqual(journal.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(tuple(journal.parent.iterdir()), (journal,))
+        self._assert_move_skips_archived_question(question)
+        self.assertTrue(journal.read_text().splitlines() == [entry])
+
+        _ = head.write_bytes(saved_head)
+        with redirect_stdout(StringIO()) as preview:
+            self.assertEqual(review_submissions.main(["move-reply-proofs", "--dry-run"]), 0)
+        self.assertEqual(len(preview.getvalue().splitlines()), 3)
+        self._assert_startup_moves_archived_question(question, question.path.read_bytes())
+        self.assertEqual(journal.read_text().splitlines().count(entry), 1)
+
+    def test_startup_syncs_a_skip_line_after_journal_sync_fails(self) -> None:
+        question = self._archive_legacy_question_in_former_store()
+        (question.backup / ".git" / "HEAD").unlink()
+        journal = reply_proofs.move_journal_path()
+        root = review_link.review_root()
+        sync = os.fsync
+
+        def fail_journal_sync(descriptor: int) -> None:
+            if journal.exists() and os.path.samestat(os.fstat(descriptor), journal.stat()):
+                raise OSError("Cannot sync the journal.")
+            sync(descriptor)
+
+        with (patch.object(os, "fsync", side_effect=fail_journal_sync),
+              self.assertRaisesRegex(OSError, "Cannot start Review links")):
+            _ = review_page.ReviewSnapshotCache(root, start_worker=False, initialize_on_start=True)
+
+        line = json.dumps({"skipped_backup": str(question.backup)}).encode() + b"\n"
+        self.assertTrue(journal.read_bytes() == line)
+        synced: list[Path] = []
+
+        def observe_sync(descriptor: int) -> None:
+            sync(descriptor)
+            status = os.fstat(descriptor)
+            for path in (journal, journal.parent):
+                if os.path.samestat(status, path.stat()):
+                    synced.append(path)
+
+        with patch.object(os, "fsync", side_effect=observe_sync):
+            self._assert_move_skips_archived_question(question)
+        self.assertEqual(synced, [journal, journal.parent])
+        self.assertTrue(journal.read_bytes() == line)
+
+    def test_startup_removes_a_torn_skip_line_after_the_backup_recovers(self) -> None:
+        question = self._archive_legacy_question_in_former_store()
+        _ = question.path.write_bytes(question.clean)
+        head = question.backup / ".git" / "HEAD"
+        saved_head = head.read_bytes()
+        head.unlink()
+        journal = reply_proofs.move_journal_path()
+        root = review_link.review_root()
+        write = os.write
+
+        def short_journal_write(descriptor: int, data: bytes) -> int:
+            if journal.exists() and os.path.samestat(os.fstat(descriptor), journal.stat()):
+                return write(descriptor, data[:len(data) // 2])
+            return write(descriptor, data)
+
+        with (patch.object(os, "write", side_effect=short_journal_write),
+              self.assertRaisesRegex(OSError, "Cannot start Review links")):
+            _ = review_page.ReviewSnapshotCache(root, start_worker=False, initialize_on_start=True)
+        torn = journal.read_bytes()
+        self.assertTrue(bool(torn) and not torn.endswith(b"\n"))
+
+        _ = head.write_bytes(saved_head)
+        with redirect_stdout(StringIO()) as preview:
+            self.assertEqual(review_submissions.main(["move-reply-proofs", "--dry-run"]), 0)
+        self.assertEqual(len(preview.getvalue().splitlines()), 3)
+        self.assertTrue(journal.read_bytes() == torn)
+
+        cache = review_page.ReviewSnapshotCache(root, start_worker=False, initialize_on_start=True)
+        self.addCleanup(cache.close)
+        self.assertEqual(journal.stat().st_size, 0)
 
     def test_dry_run_and_startup_name_the_backup_when_git_log_fails(self) -> None:
         question = self._archive_legacy_question_in_former_store()
@@ -214,6 +307,7 @@ class ReplyProofTests(unittest.TestCase):
         question = self._archive_legacy_question_in_former_store(local_checkout=True)
         shutil.rmtree(question.document.parent)
         self._assert_move_skips_archived_question(question)
+        self.assertFalse(reply_proofs.move_journal_path().exists())
 
     def test_move_uses_the_enclosing_git_checkout_for_production_history(self) -> None:
         question = self._archive_legacy_question_in_former_store(local_checkout=True)

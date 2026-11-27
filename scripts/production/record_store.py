@@ -12,6 +12,7 @@ import sys
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
 from io import StringIO
@@ -331,6 +332,20 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None,
     yield from folders
 
 
+_skipped_production_backups: ContextVar[set[Path]] = ContextVar("_skipped_production_backups")
+
+
+@contextmanager
+def collect_skipped_production_backups() -> Generator[set[Path]]:
+    """Collect backup paths that Git did not recognize during this scan."""
+    paths: set[Path] = set()
+    scope = _skipped_production_backups.set(paths)
+    try:
+        yield paths
+    finally:
+        _skipped_production_backups.reset(scope)
+
+
 def _backup_issue_folders(owner: staff.StaffId, doc: Path, sources: list[Path] | None, *,
                           review_scan: bool = False) -> tuple[Path, ...]:
     backup = production_backup_checkout(owner)
@@ -343,7 +358,13 @@ def _backup_issue_folders(owner: staff.StaffId, doc: Path, sources: list[Path] |
         try:
             if sources is not None:
                 _ = _history_inputs(backup, backup / relative, sources)
-            return _read_folder_log(backup, relative, doc, review_scan=review_scan) or ()
+            folders = _read_folder_log(backup, relative, doc, review_scan=review_scan)
+            if folders is None:
+                skipped = _skipped_production_backups.get(None)
+                if skipped is not None:
+                    skipped.add(backup)
+                return ()
+            return folders
         except (git_files.GitFilesError, ValueError) as error:
             raise OSError(f"{doc}: cannot find backup history: {error}") from error
 

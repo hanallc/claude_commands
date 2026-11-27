@@ -2953,6 +2953,7 @@ class ProofMoveNoteFailure(OSError):
 class ProofMoveReport:
     summary: reply_proofs.ProofMoveSummary
     refusals: tuple[ProofMoveNoteFailure, ...]
+    skipped_backups: tuple[Path, ...]
 
 
 def _is_proposal_header(issue: Issue) -> bool:
@@ -3044,10 +3045,12 @@ def _run_reply_proof_move(discovery: staff.StaffSnapshot | LocalProofMove, *, dr
     run = reply_proofs.ProofMoveRun(dry_run, record_store.configured_review_vaults)
     run.check_backup_location()
     lock = atomic_file.existing_writer_lock(review_later.path().with_suffix(".lock")) if run.dry_run else review_later.locked()
-    with lock:
+    with lock, record_store.collect_skipped_production_backups() as skipped:
         run.check_journal()
         refusals = _move_reply_proofs(discovery, run)
-        return ProofMoveReport(run.summary(), refusals)
+        skipped_backups = tuple(sorted(skipped))
+        run.record_skipped_backups(skipped_backups)
+        return ProofMoveReport(run.summary(), refusals, skipped_backups)
 
 
 def _move_reply_proofs(discovery: staff.StaffSnapshot | LocalProofMove,
@@ -3126,6 +3129,8 @@ def main(argv: list[str]) -> int:
     if dry_run:
         print(f"{result.outside_git} notes not in git")
         print(f"{result.open_items} open items")
+        for path in report.skipped_backups:
+            print(path)
     for refusal in report.refusals:
         print(refusal, file=sys.stderr)
     return int(bool(report.refusals))
