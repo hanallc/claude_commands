@@ -2248,6 +2248,46 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(the_list.records(keeper.id, include_closed=True), [original, other])
         self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
 
+    def test_studio_publishes_the_reserved_row_after_another_item_links(self) -> None:
+        for reservation_format in ("numeric", "typed"):
+            with self.subTest(reservation_format=reservation_format):
+                case = self.review_fixture()
+                keeper = self.configure_list_keeper()
+                owner = fixture_member("producer", name="layout-owner")
+                request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                                  page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+                saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+                reservation = review_submissions.list_filing_reservation(saved)
+                destination = investigation.ListDestination(keeper.id, 1)
+                pending, = review_submissions.pending_initial_deliveries(case.root)
+                restarted = change_page.DeliveryStatus(case.root)
+                with new_item_notice_log(self.root, keeper.id) as log:
+                    with (patch.object(the_list, "_save", side_effect=OSError("The row write stopped.")),
+                          redirect_stderr(StringIO()) as errors):
+                        review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                    self.assertIn("The row write stopped.", errors.getvalue())
+                    self.assertEqual(reservation.read_text(), destination.encode() + "\n")
+                    self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
+                    self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+                    self.assertEqual(read_new_item_notices(log), [])
+                    if reservation_format == "numeric":
+                        _ = reservation.write_text("1\n")
+                    other = the_list.add(keeper.id, "Other item", owner=owner.id, source="nate", changes={})
+                    other = the_list.link(keeper.id, other.id, (review_items.submission_review_key(saved),), source="nate")
+                    self.assertEqual(other.number, 2)
+
+                    review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                    review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                item, linked = the_list.records(keeper.id, include_closed=True)
+                self.assertEqual(the_list.review_reservation(reservation), destination)
+                self.assertEqual(item.number, destination.number)
+                self.assertEqual(item.native_question, the_list.NativeQuestionItem(
+                    the_list.QuestionItemKind.FROM_NATE, f"submission/question/{saved.request_id}"))
+                self.assertEqual(linked, other)
+                notice, = read_new_item_notices(log)
+                self.assertEqual(notice["rows"], [item.id, other.id])
+                self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
     def test_studio_claim_accepts_exchange_readback_through_an_alias(self) -> None:
         case = self.review_fixture()
         keeper = self.configure_list_keeper()
