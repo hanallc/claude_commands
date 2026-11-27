@@ -678,13 +678,16 @@ let itemRequest=null;
 const measured=new Map(),mounted=new Map(),windowGaps=[];
 const resize=typeof ResizeObserver==='function' ? new ResizeObserver(()=>scheduleWindow()) : null;
 function preserveRecordRowTop(update,{topInset}={}){
- const before=visibleRecordRow(openItem),key=openItem?.dataset.key;
- const top=before?.getBoundingClientRect().top;
- const wasClear=topInset && top!==undefined && top>=topInset()-0.5 && top<innerHeight;
+ const before=visibleRecordRow(openItem)?.getBoundingClientRect(),key=openItem?.dataset.key;
+ const oldInset=topInset?.();
+ const wasVisible=before && oldInset!==undefined && before.bottom>oldInset && before.top<innerHeight;
  const result=update();
  const after=visibleRecordRow(openItem);
- if(top!==undefined && after && key===openItem.dataset.key)
-  trackRecordRowDuringMotion(after,wasClear ? Math.max(top,topInset()) : top,rowMotion);
+ if(before && after && key===openItem.dataset.key){
+  const newInset=wasVisible ? topInset() : oldInset;
+  const top=newInset>oldInset ? Math.max(before.top,newInset) : before.top;
+  trackRecordRowDuringMotion(after,top,rowMotion);
+ }
  return result;
 }
 /** @typedef {{key: string, index: string, offset: number}} LogPosition */
