@@ -84,9 +84,10 @@ class PushIdentity:
 
     @property
     def state_slot(self) -> str:
-        """Select the user's saved send within a message key."""
-        reference = NO_REFERENCE if self.question is None else self.question.reference
-        return "user-push:" + json.dumps([self.sender, reference], sort_keys=True)
+        """Share the unbound window for a key, as with its Pushover tag."""
+        if self.question is None:
+            return "user-push:unbound"
+        return "user-push:" + json.dumps([self.sender, self.question.reference], sort_keys=True)
 
 
 @dataclass(frozen=True)
