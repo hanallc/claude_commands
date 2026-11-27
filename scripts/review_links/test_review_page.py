@@ -99,14 +99,40 @@ async function readyReviewCard(row){
   throw new Error('The card body did not load: '+row.dataset.key);
  return recordDetails(row).querySelector('[data-review-form]');
 }
-function nextReviewRefresh(){
- const content=document.querySelector('[data-review]');
- return new Promise(resolve=>content.addEventListener('review-refreshed',resolve,{once:true}));
+"""
+
+FIXTURE_REFRESH_SCRIPT = r"""
+let fixtureRefresh;
+function trackFixtureRefresh(load){
+ return (...args)=>(fixtureRefresh=load(...args));
 }
-async function showReview(){
- const refreshed=nextReviewRefresh();
- dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- await refreshed;
+async function waitForFixtureRefresh(trigger){
+ fixtureRefresh=undefined;
+ trigger();
+ if(!await fixtureRefresh) throw new Error('The requested Review refresh did not apply.');
+}
+function showReview(){
+ return waitForFixtureRefresh(()=>dispatchEvent(
+  new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'})));
+}
+let onSaveRefresh;
+function nextSaveRefresh(){
+ return new Promise((resolve,reject)=>{
+  const timeout=setTimeout(()=>{
+   onSaveRefresh=undefined;
+   reject(new Error('The Review save did not request a refresh.'));
+  },8000);
+  onSaveRefresh=refresh=>{
+   clearTimeout(timeout);
+   refresh.then(resolve,reject);
+  };
+ });
+}
+function refreshAfterSave(pageRefresh){
+ const notify=onSaveRefresh;
+ onSaveRefresh=undefined;
+ if(notify) notify(waitForFixtureRefresh(()=>pageRefresh.refresh(true)));
+ else void pageRefresh.refresh(true);
 }
 """
 
@@ -159,7 +185,7 @@ def browser_markup(root: Path, *, show: str = 'open') -> str:
     return browser_pages(review_page.build_snapshot(root), (show,))[show]
 
 
-def browser_pages(snapshot: review_page.ReviewSnapshot, shows: Sequence[str]) -> dict[str, str]:
+def browser_pages(snapshot: review_page.ReviewSnapshot, shows: Sequence[str], *, track_refresh: bool = False) -> dict[str, str]:
     bodies = {key:snapshot.body(key).decode() for key in snapshot.records}
     bridge = r"""
 const fixtureFetch=fetch,fixtureBodies=FIXTURE_BODIES;
@@ -182,13 +208,21 @@ window.fetch=async(url,options={})=>{
  return {ok:true,json:async()=>fixtureIndexResponse,text:async()=>text};
 };
 """.replace('FIXTURE_BODIES',json.dumps(bodies).replace('</','<\\/'))
-    script = '<script>' + BODY_READY_SCRIPT + bridge + '</script><script>'
-    return {show: snapshot.render(show=show).decode().replace('<script>', script, 1) for show in shows}
+    refresh_script = FIXTURE_REFRESH_SCRIPT if track_refresh else ''
+    script = '<script>' + BODY_READY_SCRIPT + refresh_script + bridge + '</script><script>'
+    pages = {show: snapshot.render(show=show).decode().replace('<script>', script, 1) for show in shows}
+    if track_refresh:
+        return {show: (page.replace('createPageRefresh(refresh,()=>content.dataset.refreshSeconds)',
+                                    'createPageRefresh(trackFixtureRefresh(refresh),()=>content.dataset.refreshSeconds)')
+                       .replace('if(!pendingSaves.size) void pageRefresh.refresh(true);',
+                                'if(!pendingSaves.size) refreshAfterSave(pageRefresh);'))
+                for show, page in pages.items()}
+    return pages
 
 
 class ReviewPageTests(unittest.TestCase):
     fixture: test_change_page.ChangePageTests = test_change_page.ChangePageTests("runTest")
-    browser_command: ClassVar[Callable[..., object] | None] = None
+    browser_session: ClassVar[tuple[Callable[..., object], ExitStack] | None] = None
     root: Path = Path()
     status: change_page.DeliveryStatus = change_page.DeliveryStatus(Path())
 
@@ -249,7 +283,8 @@ class ReviewPageTests(unittest.TestCase):
             + "status.reading_delay_seconds=1\nstatus.review.age_limit_seconds=45\n")
         _ = write_config_fixture(config / "review_links.conf",
             "review_words_rows=4\nlater_soon_minutes=60\nlater_morning=09:00\n"
-            + "later_week_day=Monday\nlater_week_time=09:00\npark_time_step_minutes=15\n")
+            + "later_week_day=Monday\nlater_week_time=09:00\npark_time_step_minutes=15\n"
+            + "frame_retry_seconds=2\ncard_fade_out_ms=450\ncard_fade_in_ms=600\n")
         self.root = self.fixture.root
         _ = change_page.console_folder(self.root)
         self.status = change_page.DeliveryStatus(self.root)
@@ -3237,26 +3272,31 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
 
     @classmethod
     def firefox(cls) -> Callable[..., object]:
-        if cls.browser_command is not None:
-            return cls.browser_command
+        if cls.browser_session is not None:
+            return cls.browser_session[0]
         with ExitStack() as startup:
             send = startup.enter_context(cls.start_firefox())
-            _ = startup.callback(setattr, cls, 'browser_command', None)
+            _ = startup.callback(setattr, cls, 'browser_session', None)
             session = startup.pop_all()
         cls.addClassCleanup(session.close)
 
         def command(name: str, **parameters: object) -> object:
             try:
                 return send(name, **parameters)
-            except (OSError, ValueError, OverflowError, AssertionError) as error:
-                try:
-                    session.close()
-                except Exception as cleanup_error:
-                    error.add_note(f'Firefox cleanup failed: {cleanup_error}')
+            except Exception as error:
+                cls.discard_firefox(error)
                 raise
 
-        cls.browser_command = command
+        cls.browser_session = command, session
         return command
+
+    @classmethod
+    def discard_firefox(cls, error: Exception) -> None:
+        if cls.browser_session is not None:
+            try:
+                cls.browser_session[1].close()
+            except Exception as cleanup_error:
+                error.add_note(f'Firefox cleanup failed: {cleanup_error}')
 
     @classmethod
     @contextmanager
@@ -3341,12 +3381,24 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
 
     @contextmanager
     def firefox_commands(self, url: str) -> Generator[Callable[..., object]]:
+        def window_handle(result: object, field: str) -> str:
+            handle = cast(dict[str, object], result).get(field) if isinstance(result, dict) else None
+            if not isinstance(handle, str) or not handle:
+                raise AssertionError(f'Firefox returned an invalid window handle: {result!r}')
+            return handle
+
         def open_tab(send: Callable[..., object]) -> str:
-            original = cast(dict[str, str], send('WebDriver:GetWindowHandle'))['value']
-            tab = cast(dict[str, str], send('WebDriver:NewWindow', type='tab'))
-            _ = send('WebDriver:SwitchToWindow', handle=tab['handle'])
-            _ = send('WebDriver:Navigate', url=url)
-            return original
+            try:
+                original = window_handle(send('WebDriver:GetWindowHandle'), 'value')
+                tab = window_handle(send('WebDriver:NewWindow', type='tab'), 'handle')
+                if tab == original:
+                    raise AssertionError('Firefox returned the original window as the new tab.')
+                _ = send('WebDriver:SwitchToWindow', handle=tab)
+                _ = send('WebDriver:Navigate', url=url)
+                return original
+            except Exception as error:
+                self.discard_firefox(error)
+                raise
 
         send = self.firefox()
         opened = send, open_tab(send)
@@ -3362,9 +3414,33 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
             yield command
         finally:
             send, original = opened
-            if send is type(self).browser_command:
+            if self.browser_session is not None and send is self.browser_session[0]:
                 _ = send('WebDriver:CloseWindow')
                 _ = send('WebDriver:SwitchToWindow', handle=original)
+
+    def test_invalid_new_window_reply_discards_the_firefox_session(self) -> None:
+        @contextmanager
+        def start_firefox() -> Generator[Callable[..., object]]:
+            try:
+                yield send
+            finally:
+                stopped.append(True)
+
+        def send(name: str, **_parameters: object) -> object:
+            calls.append(name)
+            if name == 'WebDriver:GetWindowHandle':
+                return {'value': 'original'}
+            return {}
+
+        calls: list[str] = []
+        stopped: list[bool] = []
+        with patch.object(type(self), 'browser_session', None), patch.object(type(self), 'start_firefox', start_firefox):
+            with self.assertRaisesRegex(AssertionError, 'invalid window handle'):
+                with self.firefox_commands('about:blank'):
+                    self.fail('An invalid tab must not open.')
+            self.assertEqual(stopped, [True])
+            self.assertIsNone(self.browser_session)
+            self.assertEqual(calls, ['WebDriver:GetWindowHandle', 'WebDriver:NewWindow'])
 
     def run_browser_probe(self, handler: type[BaseHTTPRequestHandler], complete: threading.Event,
                           route: str = '/') -> None:
@@ -4289,7 +4365,8 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
                     'Validating':validating_keys, 'doneKey':done_key,
                     'waitingInvestigation':waiting_investigation, 'waitingChange':waiting_change,
                     'all':open_keys+validating_keys+[waiting_investigation, waiting_change]}
-        pages = browser_pages(review_page.build_snapshot(self.root), [show for show, _ in review_page.SHOWS])
+        pages = browser_pages(review_page.build_snapshot(self.root), [show for show, _ in review_page.SHOWS],
+                              track_refresh=True)
         setup = r"""<script>
 const nativeFetch=fetch,nativeTimeout=setTimeout;
 let reviewClock=1794907200000;
@@ -4584,7 +4661,7 @@ window.fetch=async(url,options)=>{
    filterControl.ownerId(selectedOwner())===questionOwner && selectedOwner().textContent==='page-owner 0';
   const question=document.querySelector('[data-type="question"]');question.querySelector('.list-toggle').click();await readyReviewCard(question);
   const form=recordDetails(question).querySelector('[data-review-form]');form.elements.feedback.value='Use this layout.';
-  const saved=nextReviewRefresh();form.querySelector('[value="answer"]').click();await saved;
+  const saved=nextSaveRefresh();form.querySelector('[value="answer"]').click();await saved;
   check(hasEmptyOwnerSelection() && !question.isConnected && count('all').textContent==='0',
     'A save removes the completed question from the Owner and Show counts.');
   await showReview();
@@ -4610,7 +4687,8 @@ window.fetch=async(url,options)=>{
         deadline = datetime(2099, 1, 1, tzinfo=user_zone())
         review_later.save(f'investigation/{parked.owner}/{parked.id}', deadline)
         _ = review_page.submit(self.root, self.body('page-owner/C1', 'works'), self.status)
-        pages = browser_pages(review_page.build_snapshot(self.root), [show for show, _ in review_page.SHOWS])
+        pages = browser_pages(review_page.build_snapshot(self.root), [show for show, _ in review_page.SHOWS],
+                              track_refresh=True)
         setup = r"""<script>
 const nativeFetch=fetch,nativeTimeout=setTimeout;
 window.setInterval=()=>0;window.clearInterval=()=>{};
@@ -4699,7 +4777,7 @@ window.fetch=async(url,options)=>{
   const row=document.querySelector('[data-list-item][data-type="question"]');
   row.querySelector('.list-toggle').click();await readyReviewCard(row);
   const form=recordDetails(row).querySelector('form');form.elements.feedback.value='Use the first layout.';
-  const saved=nextReviewRefresh();
+  const saved=nextSaveRefresh();
   form.requestSubmit(form.querySelector('[value="answer"]'));await saved;
   check(counts('[data-filter-row="show"] [data-filter-value]')==='0|0|0|0|0','A save removes the completed entry from all Show counts.');
   await showReview();
@@ -8070,7 +8148,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(hidden && review.datase
             done = self.investigation()
             _ = investigation.mark_read(done.owner, done.id)
         snapshot = review_page.build_snapshot(self.root)
-        source = browser_pages(snapshot, ('open',))['open']
+        source = browser_pages(snapshot, ('open',), track_refresh=True)['open']
         setup = r"""<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, original=MARKUP;
 window.setInterval=()=>0;window.clearInterval=()=>{};
@@ -8156,15 +8234,6 @@ window.fetch=async(_url,options={})=>{
   check(recordDetails(fresh).querySelector('form').elements.row.value===fresh.dataset.key &&
     recordDetails(fresh).querySelector('form').elements.token.value.endsWith('-refreshed'),'F018: refresh supplies the row and token');
   const [initialTarget,other]=rows().filter(row=>row.dataset.type==='change');
-  const afterRefresh=()=>new Promise((resolve,reject)=>{
-   const review=document.querySelector('[data-review]');
-   const refreshed=()=>{clearTimeout(timeout);resolve();};
-   const timeout=nativeTimeout(()=>{
-    review.removeEventListener('review-refreshed',refreshed);
-    reject(new Error('Review did not refresh after the refusal.'));
-   },8000);
-   review.addEventListener('review-refreshed',refreshed,{once:true});
-  });
   const liveRow=key=>rows().find(row=>row.dataset.key===key);
   other.querySelector('.list-toggle').click();
   let otherForm=await readyReviewCard(other);
@@ -8173,7 +8242,7 @@ window.fetch=async(_url,options={})=>{
   check(leavingNow(other),'The row starts to leave before the response.');
   let releaseBody;
   heldBody={key:other.dataset.key,ready:new Promise(resolve=>{releaseBody=resolve;})};
-  let refreshed=afterRefresh();rejected.refuse('Fixture older refusal');await refreshed;
+  let refreshed=nextSaveRefresh();rejected.refuse('Fixture older refusal');await refreshed;
   const returnedOther=liveRow(other.dataset.key);
   otherForm=await readyReviewCard(returnedOther);
   const retainedWorks=otherForm.querySelector('[value="works"]');
@@ -8191,7 +8260,7 @@ window.fetch=async(_url,options={})=>{
   }
   check(visibleStatus('Not saved: Fixture older refusal'),'A refused row shows the reason.');
   rejected=holdPost();works().click();
-  refreshed=afterRefresh();rejected.refuse('Fixture newer refusal');await refreshed;
+  refreshed=nextSaveRefresh();rejected.refuse('Fixture newer refusal');await refreshed;
   check(!visibleStatus('Not saved: Fixture older refusal'),'A later refusal replaces the previous reason.');
   const targetKey=initialTarget.dataset.key;
   liveRow(targetKey).querySelector('.list-toggle').click();
@@ -8204,7 +8273,7 @@ window.fetch=async(_url,options={})=>{
   const form=recordDetails(target).querySelector('form'),savedResponse=holdPost();
   form.requestSubmit(form.querySelector('[value="works"]'));
   check(leavingNow(target),'A save starts the departure before the response.');
-  refreshed=afterRefresh();savedResponse.save();
+  refreshed=nextSaveRefresh();savedResponse.save();
   await flush();
   check(!form.querySelector('[data-send-status]').textContent,'The saved row shows no action status.');
   const status=document.querySelector('[data-hidden-action-status]');
@@ -8218,7 +8287,7 @@ window.fetch=async(_url,options={})=>{
   choose('list-show','all');
   const allTarget=rows().find(row=>row.dataset.type==='change' && row!==target);allTarget.querySelector('.list-toggle').click();await readyReviewCard(allTarget);
   const allForm=recordDetails(allTarget).querySelector('form');
-  refreshed=afterRefresh();allForm.requestSubmit(allForm.querySelector('[value="works"]'));await refreshed;
+  refreshed=nextSaveRefresh();allForm.requestSubmit(allForm.querySelector('[value="works"]'));await refreshed;
   check(allTarget.hidden,'F010: the saved row leaves All');
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   const reopened=liveRow(target.dataset.key);
@@ -8338,7 +8407,7 @@ window.fetch=async(_url,options={})=>{
   check(leavingNow(fresh),'Later starts the departure before the response');
   check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='0' &&
     filterControl.ownerId(selectedOwner())===retained.owner,'Later updates the count and keeps the owner while the request runs');
-  refreshed=afterRefresh();laterResponse.save();await refreshed;
+  refreshed=nextSaveRefresh();laterResponse.save();await refreshed;
   check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')==='2026-11-30T14:00:00.000Z',
     'The first click sends the deadline for the new day');
   check(fresh.hidden,'Later removes the question from the page');
@@ -8354,7 +8423,7 @@ window.fetch=async(_url,options={})=>{
     'F081: a successful save and unmount discard the submitted draft.');
   answerForm.elements.later.value='';
   answerForm.requestSubmit(answerForm.querySelector('[value="later"]'));await flush();
-  refreshed=afterRefresh();answerForm.requestSubmit(answerForm.querySelector('[value="answer"]'));await flush();
+  refreshed=nextSaveRefresh();answerForm.requestSubmit(answerForm.querySelector('[value="answer"]'));await flush();
   check(!answerForm.querySelector('[data-send-status]').textContent,
     'F023: Answer leaves no action status after an empty Later.');
   await refreshed;
@@ -8369,7 +8438,9 @@ window.fetch=async(_url,options={})=>{
   check(window.posts.at(-1).get('outcome')==='question' && recordIsOpen(pending) &&
     Number(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent)===initialCount-1,
     'Ask question keeps the row open and updates the count before the response');
-  refreshed=afterRefresh();questionResponse.save();await refreshed;
+  const heldRefresh=showReview().then(()=>false,error=>error.message==='The requested Review refresh did not apply.');
+  refreshed=nextSaveRefresh();questionResponse.save();await refreshed;
+  check(await heldRefresh,'A later save refresh does not satisfy the refresh that the pending save held.');
   const sent=liveRow(pendingKey);
   if(recordIsOpen(sent)) sent.querySelector('.list-toggle').click();
   const revision=pending.dataset.updated;
