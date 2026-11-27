@@ -5748,11 +5748,12 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     raise herdr_types.HerdrFailure(f"worker is {status.value}")
 
             submission = herdr.TrackedPromptSubmission(check_message_status)
+            result_submission = herdr.TrackedPromptSubmission(require_idle)
 
             if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                 wait_for_idle = receipt.wait_for_idle and state.status == herdr.AgentStatus.WORKING
                 can_prompt = state.status.idle or wait_for_idle
-                on_submission = require_idle
+                on_submission = result_submission
             else:
                 wait_for_idle = False
                 can_prompt = state.status in ordinary_states
@@ -5782,11 +5783,12 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                                 + "The message may already have arrived. Do not resend it.")
                     elif isinstance(error, (herdr_types.HerdrFailure, OSError)):
                         if not attempting_input or isinstance(error, (herdr.HerdrCommandNotStarted, herdr.AgentBlocked)):
+                            result_submission.may_have_submitted = False
                             return WorkerResultNotSubmitted("retry", reason)
                     else:
                         raise
-                else:
-                    if isinstance(receipt, WorkerResultSubmission) and attempting_input:
+                finally:
+                    if isinstance(receipt, WorkerResultSubmission) and result_submission.may_have_submitted:
                         _ = receipt.at_boundary(time.time(), transcript)
                 if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                     try:

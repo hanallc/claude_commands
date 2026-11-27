@@ -643,14 +643,15 @@ def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
     details = tuple(dict.fromkeys((*completion.details, *pending)))
     completion = replace(completion, details=details, recording_done=recording_done, pending_diagnostics=())
     progress_history.save_hook_completion(run, instance, completion)
+    ready_to_finish = closed and completion.recording_done
+    has_done = completion.outcome in (TurnOutcome.DONE, TurnOutcome.LATE_DONE)
+    if ready_to_finish and has_done:
+        detached_runs.stage_worker_stop_results(run, row, instance)
     if stopped:
         _defer_stopped_diagnostics(hold, run, row.id)
     elif isinstance(pane, worker.CloseCompletedPane):
         _ = pass_notices.deliver_diagnostics(run, instance)
-    if closed and completion.recording_done:
-        has_done = completion.outcome in (TurnOutcome.DONE, TurnOutcome.LATE_DONE)
-        if has_done:
-            detached_runs.stage_worker_stop_results(run, row, instance)
+    if ready_to_finish:
         progress_history.save_hook_completion(run, instance, replace(completion, finished=True))
         pending = worker.pending_done_path(run, row.id)
         if worker_lifecycle.read_json_object(pending).get("instance") == instance:

@@ -4903,6 +4903,28 @@ class WorkerCommandTests(unittest.TestCase):
         self.append_stop_recovery_turn_end(row, saved["submitted_at"] + 1)
         self.assertIsInstance(self.receipt(), worker.DispatchSubmitted)
 
+    def test_stop_recovery_uses_a_turn_end_after_the_prompt_times_out(self) -> None:
+        row, _, _ = self.save_stop_canceled_worker_runs()
+        parked, _ = self.detached_record(row, "parked-stop")
+        parked.unlink()
+        path, _ = self.detached_record(row, "unreceived-stop")
+        record = cast(detached_runs.RunRecord, cast(object, worker_lifecycle.read_json_object(path)))
+        record["delivery"] = detached_runs.PARKED_WORKER_RESULT
+        atomic_file.write_text_atomic(path, json.dumps(record))
+
+        def time_out_during_input(*_args: object, **_kwargs: object) -> None:
+            self.append_stop_recovery_turn_end(row, time.time())
+            raise herdr_types.HerdrFailure("herdr agent prompt: no answer after 10 s")
+
+        with patch.object(self.fixture.world, "_prompt", side_effect=time_out_during_input):
+            result = detached_runs.deliver(record, detached_runs.command_result(record))
+        self.assertTrue(result.startswith(detached_runs.UNCONFIRMED_WORKER_RESULT), result)
+        receipt = self.receipt()
+        assert isinstance(receipt, worker.DispatchWaitingForRuns)
+        self.assertEqual(receipt.runs, ("unreceived-stop",))
+        self.append_stop_recovery_turn_end(row, time.time() + 1)
+        self.assertIsInstance(self.receipt(), worker.DispatchSubmitted)
+
     def test_done_stages_the_stop_result_before_saving_finished(self) -> None:
         row, pane, instance = self.save_stop_canceled_worker_runs()
         other, _ = self.detached_record(row, "unreceived-stop")
@@ -4932,6 +4954,21 @@ class WorkerCommandTests(unittest.TestCase):
         pass_notices.retry(self.run_dir)
         alerts = [text for text in self.agent.notices if "Detached run: parked-stop\n" in text]
         self.assertEqual(len(alerts), 1)
+
+    def test_done_delivers_the_stop_result_with_the_diagnostics(self) -> None:
+        row, pane, _ = self.save_stop_canceled_worker_runs()
+        other, _ = self.detached_record(row, "unreceived-stop")
+        other.unlink()
+        self.agent.complete(pane)
+
+        self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
+        alerts = [text for text in self.agent.notices if "Detached run: parked-stop\n" in text]
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("Result: STOPPED (exit 143)", alerts[0])
+
+        _ = self.finish(kind=turn_end.EventKind.RUN_FINISHED)
+        pass_notices.retry(self.run_dir)
+        self.assertEqual([text for text in self.agent.notices if "Detached run: parked-stop\n" in text], alerts)
 
     def test_answer_recovers_an_interrupted_result_turn_before_assignment(self) -> None:
         row, pane, path, assign_next = self.ended_pass_with_result("interrupted", "already delivered: late-result")
