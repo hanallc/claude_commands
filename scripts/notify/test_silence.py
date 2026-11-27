@@ -128,7 +128,8 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
             self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
             delivery, = [cast(dict[str, list[str]], json.loads(line)) for line in posted.read_text().splitlines()]
             self.assertEqual(delivery["title"], [results[-1].title])
-            self.assertTrue(delivery["message"][0].startswith(results[-1].message + "\n"))
+            self.assertEqual(results[-1].message, "")
+            self.assertEqual(delivery["message"], ["Sent by: nightly · Template: nightly.result"])
             self.assertEqual(silence.read_kept(), [])
             self.assertIsNone(silence.read_state())
 
