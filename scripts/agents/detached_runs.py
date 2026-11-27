@@ -158,6 +158,7 @@ class RunRecord(StopFields):
     push_retries: NotRequired[int]
     push_alert_delivery: NotRequired[str]
     push_alert_attempted: NotRequired[Literal[True]]
+    push_alert_missing_director_reported: NotRequired[Literal[True]]
     # Set when the run ended without its supervisor: "supervisor gone".
     completion_pending: NotRequired[bool]
     ended: NotRequired[str]
@@ -321,6 +322,7 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                     and all(key not in raw or raw[key] is True
                             for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded",
                                         "blocked_notice_accepted", "push_alert_attempted", "pane_submit_failure_counted",
+                                        "push_alert_missing_director_reported",
                                         "slice_cleanup_pending", "slice_leftovers",
                                         "completion_after_slice_cleanup", "ended_pass_result_released"))
                     and ("pane_dispatch_id" not in raw or isinstance(pane_dispatch, str)
@@ -914,7 +916,11 @@ class OrphanReapResult:
                     if _needs_completion(current):
                         _ = _replay_completion(path, current, pane_wait=pane_wait)
                 current = _read_record(path)
-                if current.get("push_alert_delivery") or _needs_push_retry(current):
+                if pane_wait == CompletionPaneWait.READY_NOW:
+                    if _needs_push_retry(current):
+                        _stage_push_alert(path)
+                    _resume_orphan_result(path, replay_completion=_needs_completion(current))
+                elif current.get("push_alert_delivery") or _needs_push_retry(current):
                     _alert_failed_push(path, check_receipt=True)
             except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
                 print(" ".join(str(error).splitlines()), file=sys.stderr)
@@ -1049,6 +1055,8 @@ def _replay_completion(path: Path, record: RunRecord, *,
             if not _unconfirmed_pass_result(record):
                 return CompletionReplay.RETRY
         if _cancels_pass(record) and delivery in ("", ORPHAN_RESULT_PENDING):
+            if pane_wait == CompletionPaneWait.READY_NOW:
+                return CompletionReplay.RETRY
             delivery = _complete_stopped_run(path, record)
             if delivery is CompletionReplay.RETRY or _worker_result_pending(delivery):
                 return CompletionReplay.RETRY
@@ -1061,7 +1069,7 @@ def _replay_completion(path: Path, record: RunRecord, *,
                 if pending_close(staff.StaffId(record["staff_id"]), Path(record["session_dir"])):
                     return CompletionReplay.CLOSE_PENDING
         elif _retired_worker_result(record):
-            if _result_push_failed(deliver(record, command_result(record))):
+            if pane_wait == CompletionPaneWait.READY_NOW or _result_push_failed(deliver(record, command_result(record))):
                 return CompletionReplay.RETRY
         else:
             if delivery == ORPHAN_RESULT_PENDING:
@@ -1082,6 +1090,8 @@ def _replay_completion(path: Path, record: RunRecord, *,
         if _needs_pane_input_retry(current) or (
                 current.get("completion_pending") is True
                 and current.get("delivery", "").startswith(UNCONFIRMED_WORKER_RESULT)):
+            return CompletionReplay.RETRY
+        if pane_wait == CompletionPaneWait.READY_NOW and current.get("pane_dispatch_id") != "":
             return CompletionReplay.RETRY
         return _settle_completion_diagnostics(path, current)
     except (Exception, SystemExit) as error:
@@ -1244,7 +1254,7 @@ def _complete_worker_dispatch(record: RunRecord, pane_wait: CompletionPaneWait) 
 
 
 # Keep the record lock at its path until the record is gone.
-_RUN_FILES = ("{}.log", "{}.completion.lock", ".{}.delivery.lock", ".{}.transport.lock", ".{}.alert.lock",
+_RUN_FILES = ("{}.log", "{}.completion.lock", ".{}.delivery.lock", ".{}.transport.lock", ".{}.alert.lock", ".{}.retry.lock",
               ".{}.blocked-notice.lock", "{}.stop-staged",
               "{}" + CONFIRMED_STOP_SUFFIX, "{}" + PENDING_STOP_SUFFIX,
               "{}" + process_stop.RUN_SLICE_RECORD_SUFFIX, "{}.json", "{}.record.lock", "{}.scope-stop.lock")
@@ -2638,7 +2648,11 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
 def _deliver(record: RunRecord, result: CommandResult, *, pane_wait: CompletionPaneWait = CompletionPaneWait.ALLOW,
              ) -> str | ConfirmedPaneResult:
     delivery = _prepare_result_delivery(record, result, pane_wait=pane_wait)
-    return delivery.complete() if isinstance(delivery, PreparedResultRelay) else delivery
+    if isinstance(delivery, PreparedResultRelay):
+        if pane_wait == CompletionPaneWait.READY_NOW:
+            return _save_delivery(delivery.path, RESULT_RELAY_PENDING, if_current=record.get("delivery", ""))
+        return delivery.complete()
+    return delivery
 
 
 @dataclass(frozen=True)
@@ -2925,10 +2939,10 @@ def _prepare_result_delivery(record: RunRecord, result: CommandResult, *,
             if failed_pane_attempt:
                 follow_up = _check_pane_attempt(path, current_record, membership)
                 if _read_record(path).get("push_alert_delivery"):
-                    if isinstance(input_lock, AcquireWorkerInputLock):
-                        _ = after_unlock.callback(_send_staged_push_alert, path, check_receipt=True)
-                    else:
+                    if not isinstance(input_lock, AcquireWorkerInputLock):
                         _resume_result_after_unlock(input_lock, path)
+                    elif pane_wait == CompletionPaneWait.ALLOW:
+                        _ = after_unlock.callback(_send_staged_push_alert, path, check_receipt=True)
                 if follow_up is PaneAttemptFollowUp.RECEIPT_FOUND:
                     return f"already delivered: {record['run_id']}"
                 if follow_up is PaneAttemptFollowUp.BUSY:
@@ -3136,17 +3150,20 @@ def _needs_external_result_delivery(record: RunRecord) -> bool:
             or delivery == WORKER_BLOCKED_RESULT and not record.get("blocked_notice_accepted"))
 
 
-def _resume_orphan_result(path: Path) -> None:
-    """Start a detached sender if the supervisor has ended."""
+def _resume_orphan_result(path: Path, *, replay_completion: bool = False) -> None:
+    """Start a detached retry if the supervisor has ended."""
     record = _read_record_if_present(path)
-    if (record is None or not (record.get("push_alert_delivery") or _needs_external_result_delivery(record))
+    if (record is None or not (replay_completion or record.get("push_alert_delivery")
+                              or _needs_external_result_delivery(record))
             or _supervisor_alive(path, record)):
         return
     script = Path(__file__).resolve()
+    command = [str(script.parents[1] / "lib/py"), str(script), "deliver-deferred", str(path)]
+    if replay_completion:
+        command.append("--complete")
     try:
         with Path(record["log"]).open("ab") as log:
-            _ = subprocess.Popen([str(script.parents[1] / "lib/py"), str(script), "deliver-deferred", str(path)],
-                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                  start_new_session=True)
     except OSError as error:
         print(f"detached_runs: {path.stem}: could not start result delivery: {error}", file=sys.stderr)
@@ -3213,6 +3230,12 @@ def _send_failed_push_alert(path: Path, record: RunRecord, *, check_receipt: boo
             owner = unit_runs.run_owner(fields, membership)
             director = owner if isinstance(owner, staff.StaffRow) else membership.owner_of(record["staff_id"])
             if director is None or director.kind not in ("unit", "showrunner"):
+                with record_lock(path):
+                    current = _read_record(path)
+                    if current.get("push_alert_missing_director_reported"):
+                        return
+                    current["push_alert_missing_director_reported"] = True
+                    write_text_atomic(path, json.dumps(current, indent=2, sort_keys=True))
                 raise worker_admission.RunOwnerUnavailable(lookup_error or f"{state_path}: no director staff row")
             with staff.supplied_snapshot(membership):
                 alert = send.send(send.parse(["--to", str(director.id), "--from", "detached-runs",
@@ -3407,19 +3430,45 @@ def command_deliver(args: argparse.Namespace) -> int:
 
 
 def command_deliver_deferred(args: argparse.Namespace) -> int:
-    """Send the external messages that a worker hook left pending."""
+    """Continue delivery after the supervisor has ended."""
     path = Path(str(getattr(args, "record", "")))
     record = _read_record_if_present(path)
     if record is None or record["status"] != "finished" or _supervisor_alive(path, record):
         return 0
-    if _needs_external_result_delivery(record):
-        _ = deliver(record, command_result(record))
-    _send_staged_push_alert(path, check_receipt=True)
-    current = _read_record_if_present(path)
-    if current is not None and (current.get("push_alert_delivery") or _needs_push_retry(current)
-                                or current.get("delivery") == RESULT_RELAY_PENDING):
-        _ = _retry_result_delivery(path)
+    with path.with_name(f".{path.stem}.retry.lock").open("a") as claim:
+        try:
+            fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        _continue_orphan_result(path, replay_completion=bool(getattr(args, "complete", False)))
     return 0
+
+
+def _continue_orphan_result(path: Path, *, replay_completion: bool) -> None:
+    try:
+        record = _read_record_if_present(path)
+        if record is None:
+            return
+        if replay_completion and _needs_completion(record):
+            _ = _finish_record(path, record)
+            record = _read_record_if_present(path)
+            if record is None:
+                return
+        if _needs_external_result_delivery(record):
+            _ = deliver(record, command_result(record))
+        _send_staged_push_alert(path, check_receipt=True)
+        current = _read_record_if_present(path)
+        # The director owns the result after accepting the alert for a failed prompt.
+        if current is None or (_failed_pane_attempt(current) and current.get("push_alert_attempted")):
+            return
+    except (Exception, SystemExit) as error:
+        detail = " ".join(str(error).splitlines())
+        print(f"detached_runs: {path.stem}: deferred result delivery failed: {detail}", file=sys.stderr)
+    saved = _retry_result_delivery(path)
+    if replay_completion and saved is not SupervisedResultPruned.REMOVED:
+        delivery = saved.get("delivery", "")
+        if delivery and not _worker_result_pending(delivery) and _needs_completion(saved):
+            _ = _finish_record(path, saved)
 
 
 def deliver_in_fresh_process(record_path: Path) -> int:
@@ -3859,8 +3908,9 @@ def main(argv: list[str] | None = None) -> int:
     delivery = verbs.add_parser("deliver", help="deliver one recorded result from the current code tree")
     _ = delivery.add_argument("record")
     delivery.set_defaults(handler=command_deliver)
-    deferred = verbs.add_parser("deliver-deferred", help="send external messages staged by a worker hook")
+    deferred = verbs.add_parser("deliver-deferred", help="continue delivery after the supervisor ends")
     _ = deferred.add_argument("record")
+    _ = deferred.add_argument("--complete", action="store_true")
     deferred.set_defaults(handler=command_deliver_deferred)
     stop = verbs.add_parser("stop", help="stop a running command; its supervisor delivers the stopped result")
     _ = stop.add_argument("--reason", required=True, help="the Stop reason line of the result")

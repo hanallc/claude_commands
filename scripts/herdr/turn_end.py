@@ -1592,9 +1592,10 @@ def _handle_locked(event: WorkerEvent,
                 excluded = instance if notice_handled_here and directory == run else ""
                 pass_notices.retry(directory, exclude_instance=excluded)
 
-        _ = after_unlock.callback(retry_notices)
-        for directory in dict.fromkeys(directory for directory, _ in archived_stops):
-            _defer_stopped_diagnostics(hold, directory, row.id)
+        if not ready_now:
+            _ = after_unlock.callback(retry_notices)
+            for directory in dict.fromkeys(directory for directory, _ in archived_stops):
+                _defer_stopped_diagnostics(hold, directory, row.id)
         late: TurnOutcome | NoLateDone = NoLateDone.UNRECORDED
         if event.kind == EventKind.TURN_END and not isinstance(event.native_stop, dict) and marker != stage:
             late = _recover_replaced_stops(event, row, parent, run, instance, marker, archived_stops, after_unlock)
@@ -1681,6 +1682,8 @@ def _handle_locked(event: WorkerEvent,
                 return TurnOutcome.RETRY_EVIDENCE
         if not instance:
             return ignore_turn("no active dispatch or recoverable completion exists")
+        if ready_now:
+            return TurnOutcome.RETRY_EVIDENCE
         if isinstance(stopped, progress_history.HookCompletion) and recorded_stop:
             if passed.get("status") == "canceled":
                 receipt = progress_history.stopped_pass_receipt(run, passed)

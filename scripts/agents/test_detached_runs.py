@@ -6632,6 +6632,37 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(saved["delivery"], record.get("delivery"))
         self.assertNotIn("delivered_at", saved)
 
+    def test_retry_reports_a_missing_director_once_per_result(self) -> None:
+        row = self.fixture.worker()
+        record = self.record(row, "missing-alert-director")
+        path = Path(record["log"]).with_suffix(".json")
+        failure = detached_runs.FAILED_RESULT_PUSH + "fixture refusal"
+        record.update(status="finished", exit_code=7, delivery=failure, push_alert_delivery=failure)
+        write_text_atomic(path, json.dumps(record))
+        self.assertIsNotNone(staff.retire(row.id))
+        state_path = self.run_dir / unit_runs.STATE_FILE
+        director_state = state_path.read_text()
+        write_text_atomic(state_path, "{")
+        retries = 0
+
+        def restore_director(_seconds: float) -> None:
+            nonlocal retries
+            retries += 1
+            self.assertEqual(worker_lifecycle.read_json_object(path)["push_alert_delivery"], failure)
+            if retries == 3:
+                write_text_atomic(state_path, director_state)
+
+        with (patch.object(time, "sleep", new=restore_director),
+              patch.object(send, "send", return_value=send.Result("sent", "director received the alert")) as alert,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            _ = detached_runs._retry_result_delivery(path)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(retries, 3)
+        self.assertEqual(errors.getvalue().count("anomaly:"), 1)
+        alert.assert_called_once()
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertIs(saved["push_alert_attempted"], True)
+        self.assertNotIn("push_alert_delivery", saved)
+
     def test_result_delivery_matrix(self) -> None:
         all_owners = ("worker", "director", "retired", "self-stop")
         relay_owners = ("worker", "director", "retired")
@@ -7452,6 +7483,40 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(spawn.call_args.args[0][2], "supervise")
         delay.assert_called_once_with(5)
 
+    def test_start_leaves_an_older_alert_for_a_detached_process(self) -> None:
+        director = self.fixture.parent
+        record = self.record(director, "older-alert")
+        path = Path(record["log"]).with_suffix(".json")
+        failure = detached_runs.FAILED_RESULT_PUSH + "fixture refusal"
+        record.update(status="finished", pid=DEAD_PID, exit_code=7, delivery=failure)
+        write_text_atomic(path, json.dumps(record))
+        relay = self.record(director, "older-relay")
+        relay.update(status="finished", pid=DEAD_PID, exit_code=7, completion_pending=True, pane_dispatch_id="",
+                     delivery=detached_runs.ORPHAN_RESULT_PENDING)
+        relay_path = Path(relay["log"]).with_suffix(".json")
+        write_text_atomic(relay_path, json.dumps(relay))
+
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": director.current_session}),
+              patch.object(treekey, "tree_key", return_value="private-tree"),
+              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
+              patch.object(send, "send", return_value=send.Result("sent", "director received the message")) as push):
+            self.assertEqual(detached_runs.main(["start", "--session-dir", str(self.run_dir), "--", "true"]), 0)
+            push.assert_not_called()
+            self.assertEqual(worker_lifecycle.read_json_object(path)["push_alert_delivery"], failure)
+            self.assertEqual(worker_lifecycle.read_json_object(relay_path)["delivery"], detached_runs.RESULT_RELAY_PENDING)
+            supervisor, alert_helper, relay_helper = spawn.call_args_list
+            self.assertEqual(supervisor.args[0][2], "supervise")
+            for helper, expected in ((alert_helper, [str(path)]), (relay_helper, [str(relay_path), "--complete"])):
+                self.assertTrue(helper.kwargs["start_new_session"])
+                argv = cast(list[str], helper.args[0])
+                self.assertEqual(argv[2:], ["deliver-deferred", *expected])
+                self.assertEqual(detached_runs.main(argv[2:]), 0)
+        self.assertEqual(push.call_count, 2)
+        self.assertNotIn("push_alert_delivery", worker_lifecycle.read_json_object(path))
+        saved_relay = worker_lifecycle.read_json_object(relay_path)
+        self.assertEqual(saved_relay["delivery"], "sent: director received the message")
+        self.assertIs(saved_relay["completion_pending"], False)
+
     def test_a_failed_completion_event_keeps_other_orphans_and_retries_next_pass(self) -> None:
         row = self.fixture.worker(family="codex")
         records = [self.record(row, name) for name in ("first-result", "second-result")]
@@ -8204,6 +8269,41 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.notices), 1)
         self.assertIn("worker pane is closed", self.notices[0][1])
         self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], "sent: holder received the result")
+
+    def test_deferred_delivery_retries_when_the_reopened_pane_is_not_ready(self) -> None:
+        row, stage, record, path = self.prepare_holder_pass("closed")
+        record.update(pid=DEAD_PID, completion_pending=True, delivery=detached_runs.WORKER_READINESS_PENDING)
+        write_text_atomic(path, json.dumps(record))
+        with patch.object(subprocess, "Popen") as spawn:
+            _ = turn_end.run_finished(row.id, stage.completion_id)
+        spawn.assert_called_once()
+        argv = cast(list[str], spawn.call_args.args[0])
+        self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], detached_runs.RESULT_RELAY_PENDING)
+
+        pane = "w1:p2"
+        self.fixture.world.add(row, pane, family="codex")
+        read_readiness = self.fixture.world.readiness
+        ready = False
+
+        def readiness(target: str) -> herdr.WorkerReadiness:
+            if target == pane and not ready:
+                return {"agent_status": herdr.AgentStatus.DONE, "interactive_ready": False}
+            return read_readiness(target)
+
+        def make_ready(_seconds: float) -> None:
+            nonlocal ready
+            self.assertFalse(ready)
+            self.assertEqual(self.inputs, [])
+            self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], detached_runs.WORKER_READINESS_PENDING)
+            ready = True
+
+        with (patch.object(self.fixture.world, "readiness", new=readiness),
+              patch.object(time, "sleep", side_effect=make_ready) as delay):
+            self.assertEqual(detached_runs.main(argv[2:]), 0)
+        delay.assert_called_once_with(5)
+        self.assertEqual(len(self.inputs), 1)
+        self.assertEqual(self.notices, [])
+        self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], f"sent: worker {row.name} at {pane}")
 
     def test_supervisor_counts_a_herdr_timeout_with_no_receipt(self) -> None:
         self.check_prompt_without_receipt(subprocess.TimeoutExpired("herdr agent prompt", 10), through_herdr=True)
