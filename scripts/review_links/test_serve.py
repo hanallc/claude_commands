@@ -7092,6 +7092,30 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(list(the_list.feedback_requests(saved)), [request])
         self.assertEqual(the_list.feedback_requests(saved)[request].state, "sent")
 
+    def test_studio_later_retry_reports_saved_delivery_failure(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        request = send_hold.new_hold_id()
+        body = case.body(key, "later", "Wait for the desktop check.") + "&" + urlencode({
+            "revision": shown[1].decode(), "later": until.isoformat(), "request": request})
+        headers = {review_page.DELIVERY_RESULT_HEADER: "1"}
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        with (patch.object(change_page, "send_to_staff", side_effect=RuntimeError("The owner is offline.")) as send,
+              patch.object(change_page, "alert_delivery_failures", return_value=True) as alert):
+            status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(status, 200, reply)
+            self.assertIn(b"Delivery failed: The owner is offline.", reply)
+            saved = the_list.load(row.keeper, row.item.id)
+            self.assertEqual(the_list.feedback_requests(saved)[request].state, "alerted")
+            status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(status, 200, reply)
+            self.assertIn(b"Delivery failed: The owner did not receive the Later notice.", reply)
+        send.assert_called_once()
+        alert.assert_called_once()
+
     def test_studio_later_returns_the_same_delivery_from_submit_and_cache(self) -> None:
         case, key, row = self.filed_studio_team_question()
         cache = self.server.review_cache

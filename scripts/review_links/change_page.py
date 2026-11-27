@@ -281,6 +281,7 @@ class StoredUserAnswer(TypedDict):
     question_id: NotRequired[str]
     question_text: NotRequired[str]
     scoped_reply: NotRequired[ScopedReplyCommand]
+    studio_answer: NotRequired[Literal[True]]
 
 
 @dataclass(frozen=True)
@@ -3045,7 +3046,8 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
         return deliver_page_question(delivery, status)
     tracked_review = False
     page = delivery.page
-    confirm = isinstance(page, ReviewMessagePage) and bool(page.saved.get("submission_request"))
+    studio_answer = isinstance(page, UserQuestionPage) and page.saved.get("studio_answer", False)
+    confirm = studio_answer or (isinstance(page, ReviewMessagePage) and bool(page.saved.get("submission_request")))
     tries, pause = 0, 0.0
     with status.locked():
         slots = status.slots(delivery.page, delivery.row)
@@ -3093,6 +3095,9 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
         failures = (send_with_retries(SENDER, delivery.recipients, outbound.text, tries, pause,
                                        key=key, confirm=confirm) if delivery.recipients
                     else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
+        if studio_answer and any(isinstance(failure, UnconfirmedDelivery) for failure in failures):
+            status.release_owned_claims((delivery.attempt,))
+            return DeliveryUnconfirmed()
         failures = [replace(failure, error=outbound.redact(failure.error)) for failure in failures]
     result = (FailedDelivery(delivery.attempt, delivery.page.review_list, delivery.row, failures[-1].error)
               if failures else NoFailedDelivery())

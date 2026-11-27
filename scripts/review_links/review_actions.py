@@ -312,7 +312,9 @@ def studio_question_action(item: review_items.ReviewItem, record: update_registr
         'question': item.title, 'answer': words if action == 'answer' else '', 'message': message, 'kind': action,
     }
     opened: change_page.NoQuestion | change_page.OpenQuestion = change_page.NoQuestion()
-    if action == 'question':
+    if action == 'answer':
+        saved['studio_answer'] = True
+    else:
         identity = secrets.token_hex(4)
         saved['question_id'] = identity
         saved['question_text'] = words.strip()

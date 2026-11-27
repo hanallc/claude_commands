@@ -180,6 +180,7 @@ class RegistrationTests(RegistrationFixture):
             key = case.question()
             for words in ('Check the old case.', 'Check the new case.'):
                 delivery, _ = review_page.submit(case.root, case.body(key, 'question', words), case.status)
+                assert isinstance(delivery, change_page.MessageDelivery)
                 change_page.deliver(delivery, case.status)
             item = next(item for item in review_items.read(case.root) if item.key == key)
             assert isinstance(item.source, review_items.QuestionSource)

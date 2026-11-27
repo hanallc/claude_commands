@@ -94,6 +94,7 @@ class ReviewRepairsTests(unittest.TestCase):
         for key,action in cases:
             with self.subTest(action=action):
                 delivery,_ = review_page.submit(self.case.root,self.case.body(key,action,'Keep these words.'),self.case.status)
+                assert isinstance(delivery, (change_page.MessageDelivery, change_page.NoMessageDelivery))
                 change_page.deliver(delivery,self.case.status)
                 item = next(item for item in review_items.read(self.case.root) if item.key == key)
                 self.assertEqual(item.state,review_items.ReviewState.DONE)
@@ -121,6 +122,7 @@ class ReviewRepairsTests(unittest.TestCase):
                 raise RuntimeError('fixture send failed')
 
         with patch.object(change_page,'send_to_staff',side_effect=send):
+            assert isinstance(delivery, change_page.MessageDelivery)
             change_page.deliver(delivery,self.case.status)
         self.assertEqual(len(calls),4)
         self.assertEqual(targets, [producer.id] * 3 + [runner.id])
@@ -192,6 +194,7 @@ class ReviewRepairsTests(unittest.TestCase):
                     waiting = next(item for item in review_items.read(case.root) if item.key == key)
                     self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
                     delivery, _ = review_page.submit(case.root, case.body(key, action, 'Use the new case.'), case.status)
+                    assert isinstance(delivery, change_page.MessageDelivery)
                     change_page.deliver(delivery, case.status)
                     updated = next(item for item in review_items.read(case.root) if item.key == key)
                     expected = review_items.ReviewState.WAITING if action == 'question' else review_items.ReviewState.DONE
@@ -241,6 +244,7 @@ class ReviewRepairsTests(unittest.TestCase):
                     self.assertEqual(len(messages), 1)
                     self.assertIn(expected_text, messages[0][2])
                     self.assertNotIn(excluded_text, messages[0][2])
+                    assert isinstance(old, change_page.MessageDelivery)
                     change_page.deliver(old, case.status)
                     change_page.recover_pending(restarted)
                     self.assertEqual(tuple(case.fixture.messages), messages)
@@ -396,6 +400,7 @@ class ReviewRepairsTests(unittest.TestCase):
                         _ = self.wfile.write(content)
                         self.wfile.flush()
                     finally:
+                        assert isinstance(saved.delivery, (change_page.MessageDelivery, change_page.NoMessageDelivery))
                         delivery = change_page.finish_verdict_cleanup(saved.delivery, case.status)
                         change_page.deliver(delivery, case.status)
                     return

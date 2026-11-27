@@ -231,6 +231,7 @@ class InvestigationTests(unittest.TestCase):
                     key = f'investigation/{report.owner}/{report.id}'
                     if wait == 'question':
                         old, _ = review_page.submit(case.root, case.body(key, 'question', 'Check the old case.'), case.status)
+                        assert isinstance(old, change_page.MessageDelivery)
                         change_page.deliver(old, case.status)
                     delivery, _ = review_page.submit(case.root, case.body(key, 'question', 'Check the replacement case.'), case.status)
                     assert isinstance(delivery, change_page.MessageDelivery)

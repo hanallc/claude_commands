@@ -2018,13 +2018,16 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
         item = the_list.load(delivery.keeper, delivery.identity)
         feedback = the_list.feedback_requests(item).get(delivery.request)
         if feedback is not None:
-            if feedback.state == "sent" and (feedback.action is the_list.ReportVerdict.NOT_FIXED or (
-                    feedback.action == "park" and feedback.origin is the_list.PageNoticeOrigin.STUDIO)):
-                return change_page.DeliveryConfirmed()
-            if feedback.state == "alerted" and feedback.action is the_list.ReportVerdict.NOT_FIXED:
-                source = the_list.folder(delivery.keeper) / f"{item.id}.md"
-                return change_page.FailedDelivery(feedback.request, source, item.id,
-                                                  "The owner or producer did not receive Not fixed.")
+            repair = feedback.action is the_list.ReportVerdict.NOT_FIXED
+            studio_later = feedback.action == "park" and feedback.origin is the_list.PageNoticeOrigin.STUDIO
+            if repair or studio_later:
+                if feedback.state == "sent":
+                    return change_page.DeliveryConfirmed()
+                if feedback.state == "alerted":
+                    source = the_list.folder(delivery.keeper) / f"{item.id}.md"
+                    reason = ("The owner or producer did not receive Not fixed." if repair
+                              else "The owner did not receive the Later notice.")
+                    return change_page.FailedDelivery(feedback.request, source, item.id, reason)
     return outcome
 
 
@@ -3142,18 +3145,31 @@ async function loadStudioQuestion(item,card,view){
   if(card.dataset.loaded==='loading') delete card.dataset.loaded;
  }
 }
+const studioLaterRequests=new Map();
 function bindStudioQuestion(item,card,form,view){
  const showNotice=text=>showActionFailure(card.querySelector('[data-send-status]'),text);
- let laterRequest;
  const send=async(data,button)=>{
   if(view.openItem!==item || cardSubmitBlocked(form,view.rowFading(item.dataset.key))) return;
   const action=data.get('outcome'),key=item.dataset.key;
+  const draftKey=reviewFormKey(form),requestKey=JSON.stringify([key,draftKey]);
+  let laterRequest=studioLaterRequests.get(requestKey);
   if(action==='later' && data.get('feedback').trim()){
-   const intent=data.toString();
-   if(laterRequest?.intent!==intent) laterRequest={intent,id:heldFetch.newId()};
+   const until=data.get('later'),preset=button.dataset.laterPreset;
+   const fields=new URLSearchParams(data);
+   // Use the preset name to find its original deadline.
+   if(preset) fields.set('later',preset);
+   const intent=fields.toString();
+   if(laterRequest?.intent!==intent){
+    laterRequest={intent,id:heldFetch.newId(),until};
+    studioLaterRequests.set(requestKey,laterRequest);
+   }
+   data.set('later',laterRequest.until);
    data.set('request',laterRequest.id);
   }
-  const draftKey=reviewFormKey(form), submittedDraft=rememberReviewDraft(form);
+  const clearLaterRequest=()=>{
+   if(studioLaterRequests.get(requestKey)===laterRequest) studioLaterRequests.delete(requestKey);
+  };
+  const submittedDraft=rememberReviewDraft(form);
   const hold=holdCard(item,hidden=>{if(hidden) view.applyAction();});
   const resultItem=view===tableView ? item : rowIn(content,key);
   const submission=resultItem && tableView.startAction(resultItem);
@@ -3166,7 +3182,7 @@ function bindStudioQuestion(item,card,form,view){
    sending:()=>setCardSubmitting(form,true),
    confirmedSave:()=>{
     saved=true;
-    if(action==='later') laterRequest=undefined;
+    if(action==='later' || action==='answer') clearLaterRequest();
     if(reviewDrafts.get(draftKey)===submittedDraft) reviewDrafts.delete(draftKey);
    },
    saved:result=>{
@@ -3180,7 +3196,7 @@ function bindStudioQuestion(item,card,form,view){
    },
    failed:reason=>showNotice('Not saved: '+reason),
    undone:message=>{
-    if(action==='later') laterRequest=undefined;
+    if(action==='later') clearLaterRequest();
     showNotice(message);form.elements.feedback.focus({preventScroll:true});
    },
    displayFailed:()=>showNotice('Saved; the item could not refresh.'),

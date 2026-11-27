@@ -3180,6 +3180,76 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         self.assertEqual(saved.state, the_list.ItemState.WORKING)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_studio_answer_keeps_pending_delivery_for_recovery(self) -> None:
+        item = self.studio_team_question()
+        with (patch.object(change_page, "send_to_staff", return_value="pending") as send,
+              self.studio_review_server() as origin):
+            self.open_studio_review_fixture(origin, "#show=questions")
+            self.studio_review_check(r"""
+ const item=row(1);
+ item.querySelector('.list-toggle').click();
+ const readForm=()=>recordDetails(item).querySelector('[data-studio-question-card] [data-review-form]');
+ await until(readForm);
+ const answer=readForm();
+ answer.elements.feedback.value='Use the wide layout.';
+ answer.querySelector('[value="answer"]').click();
+ await until(()=>!recordIsOpen(item));
+ const status=document.querySelector('[data-hidden-action-status]');
+ check(!status.hidden && status.textContent.includes('Saved. The sender has not confirmed delivery.'),
+  'The row reports that the answer saved and delivery is unconfirmed.');
+""")
+        saved = the_list.load(MORTY.id, item.id)
+        exchange, = saved.filed_exchanges
+        assert isinstance(exchange.answer, list_exchange.ExchangeAnswer)
+        self.assertEqual(exchange.answer.text, "Use the wide layout.")
+        keys = {cast(str, call.kwargs["key"]) for call in send.call_args_list}
+        self.assertEqual(len(keys), 1)
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        with patch.object(change_page, "send_to_staff", return_value="skipped") as recover:
+            change_page.recover_question_answers(status)
+            change_page.recover_question_answers(status)
+        recover.assert_called_once()
+        self.assertEqual({cast(str, recover.call_args.kwargs["key"])}, keys)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_studio_later_reuses_short_preset_after_lost_responses(self) -> None:
+        item = self.studio_team_question()
+        with (patch.object(change_page, "send_to_staff", return_value=None) as send,
+              self.studio_review_server() as origin):
+            self.open_studio_review_fixture(origin, "#show=questions")
+            self.studio_review_check(r"""
+ const item=row(1);
+ item.querySelector('.list-toggle').click();
+ const readForm=()=>recordDetails(item).querySelector('[data-studio-question-card] [data-review-form]');
+ await until(readForm);
+ const form=readForm(),notice=form.querySelector('[data-send-status]');
+ const toggle=form.querySelector('[data-later-toggle]'),soon=form.querySelector('[data-later-preset="soon"]');
+ const post=window.fetch.bind(window),requests=[];
+ let now=Date.now();Date.now=()=>now;
+ window.fetch=async (url,init)=>{
+  if(init?.method!=='POST' || !new URL(url,location.href).pathname.endsWith('/review.html')) return post(url,init);
+  const drop=requests.length<2;
+  requests.push(String(init.body));
+  const response=await post(url,init);
+  if(!response.ok) throw new Error('The request failed with HTTP '+response.status+'.');
+  if(drop) throw new Error('The fixture lost the response.');
+  return response;
+ };
+ form.elements.feedback.value='Wait for the desktop check.';
+ toggle.click();soon.click();
+ await until(()=>!form.dataset.sending && !notice.hidden);
+ check(requests.length===2 && requests[0]===requests[1],'The browser retries the first POST once.');
+ now+=1000;
+ toggle.click();soon.click();
+ await until(()=>!recordIsOpen(item) || !form.dataset.sending && !notice.hidden);
+ check(requests.length===3 && requests[2]===requests[0],'Later sends the original deadline and request ID.');
+ check(!recordIsOpen(item),'The confirmed reply closes the row.');
+""")
+        send.assert_called_once()
+        notice, = the_list.feedback_requests(the_list.load(MORTY.id, item.id)).values()
+        self.assertEqual((notice.state, notice.form_words), ("sent", "Wait for the desktop check."))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_overlay_keeps_question_delivery_failure_after_form_reload(self) -> None:
         item = self.studio_team_question()
         source = self.add("Read the linked question", number=2)
