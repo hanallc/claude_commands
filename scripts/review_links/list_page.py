@@ -1651,7 +1651,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         sections = ''
         if can_read:
             sections = panel_questions(item, local_today, unread_answers) + waiting_feedback_form(
-                entry, form_secret(reading.root), "", unread=True, mark=TopPriorityMark.HIDDEN)
+                entry, form_secret(reading.root), "", members, unread=True, mark=TopPriorityMark.HIDDEN)
         saved["detail_html"] = detail_panel(entry, sections, local_today, names,
                                             unread_answers if can_read else frozenset(), progress)
     if has_detail:
