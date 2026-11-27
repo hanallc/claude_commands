@@ -847,28 +847,54 @@ def shadow(root):
         graph_for_files = affected.graph_for_files
 
         def interleave(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
-                       cached: dict[str, affected.SourceFacts], *, worktree: bool) -> affected.SourceGraph:
+                       cached: dict[str, affected.SourceFacts], *, worktree: bool,
+                       run: affected.SelectionRun | None = None) -> affected.SourceGraph:
             with (mock.patch.object(affected, "graph_for_files", graph_for_files),
                   mock.patch.object(ast, "parse", wraps=ast.parse) as parse,
                   mock.patch.object(affected, "write_fact_cache", wraps=affected.write_fact_cache) as write,
                   mock.patch.object(fcntl, "flock", wraps=fcntl.flock) as lock):
                 reader = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
             self.assertEqual(reader, expected)
+            assert reader.run is not None
+            self.assertIs(reader.run.lock, affected.FactCacheLock.BUSY_SNAPSHOT)
+            self.assertEqual((reader.run.cache_hits, reader.run.cache_misses), (11, 1))
             self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list], [subject])
             attempts = [call for call in lock.call_args_list if call.args[1] == fcntl.LOCK_EX | fcntl.LOCK_NB]
             self.assertEqual(len(attempts), 1)
             write.assert_not_called()
             self.assertEqual(self.cache_file().read_bytes(), before)
-            return graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree)
+            return graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree, run=run)
 
         with mock.patch.object(affected, "graph_for_files", side_effect=interleave) as graph:
             writer = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
         graph.assert_called_once()
         self.assertEqual(writer, expected)
+        assert writer.run is not None
+        self.assertIs(writer.run.lock, affected.FactCacheLock.PUBLISHED)
         facts = affected.read_fact_cache(self.cache_file())
         self.assertIsNotNone(facts)
         assert facts is not None
         self.assertIn(self.git("rev-parse", f"HEAD:{subject}"), facts)
+
+    def test_selection_run_counts_cold_and_warm_facts(self) -> None:
+        self.add_test("checks/test_reader.py", "VALUE = 1\n")
+        self.certify()
+        self.write("scripts/checks/test_reader.py", "VALUE = 2\n")
+        _ = self.commit()
+        cold = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        warm = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        self.assertIsInstance(cold, affected.AffectedSelection)
+        self.assertEqual(warm, cold)
+        assert cold.run is not None and warm.run is not None
+        self.assertEqual((cold.run.cache_hits, cold.run.cache_misses), (9, 2))
+        self.assertIs(cold.run.lock, affected.FactCacheLock.PUBLISHED)
+        self.assertEqual((warm.run.cache_hits, warm.run.cache_misses), (11, 0))
+        self.assertIs(warm.run.lock, affected.FactCacheLock.TAKEN)
+        self.assertEqual(warm.run.extraction_s, 0)
+        for run in (cold.run, warm.run):
+            self.assertGreaterEqual(run.cache_read_s, 0)
+            self.assertGreaterEqual(run.graph_s, 0)
+            self.assertGreaterEqual(run.other_s, 0)
 
     def test_deleted_blob_is_pruned_and_new_targets_resolve_cached_facts(self) -> None:
         self.write("scripts/component/test_caller.py", "import test_future_subject\n")
@@ -1251,8 +1277,9 @@ def shadow(root):
         graph_for_files = affected.graph_for_files
 
         def without_base_imports(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
-                                 cached: dict[str, affected.SourceFacts], *, worktree: bool) -> affected.SourceGraph:
-            graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree)
+                                 cached: dict[str, affected.SourceFacts], *, worktree: bool,
+                                 run: affected.SelectionRun | None = None) -> affected.SourceGraph:
+            graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree, run=run)
             return graph if worktree else replace(graph, imports={})
 
         with mock.patch.object(affected, "graph_for_files", side_effect=without_base_imports):
@@ -1356,7 +1383,7 @@ def shadow(root):
         blob = self.git("rev-parse", "HEAD:scripts/checks/test_reader.py")
         facts = cache[blob]
         cache[blob] = replace(facts, scan_scopes=(*facts.scan_scopes, affected.ScanScope("", (), (), (), ())))
-        affected.write_fact_cache(cache_path, cache, None, set(cache))
+        self.assertTrue(affected.write_fact_cache(cache_path, cache, None, set(cache)))
         with mock.patch.object(ast, "parse", side_effect=AssertionError("warm cache parsed source")):
             result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
         self.assertEqual(result, expected)
@@ -1372,6 +1399,9 @@ def shadow(root):
         self.assertIsInstance(result, affected.FullSuite)
         assert isinstance(result, affected.FullSuite)
         self.assertIn("scripts/checks/test_deleted.py", result.reason)
+        assert result.run is not None
+        self.assertGreater(result.run.cache_misses, 0)
+        self.assertGreaterEqual(result.run.graph_s, 0)
 
     def test_optimized_selection_matches_baseline(self) -> None:
         self.write("scripts/component/deleted.py", "VALUE = 1\n")

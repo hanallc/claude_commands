@@ -1639,8 +1639,14 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int, selec
         print(f"full suite: {selection.reason}", flush=True)
         return
     when = datetime.fromisoformat(selection.base.at).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
+    details = ""
+    if (run := selection.run) is not None:
+        selection_s = run.total_s
+        details = (f" (cache {run.cache_hits} hits, {run.cache_misses} misses; read {run.cache_read_s:.1f} s, "
+                   + f"extract {run.cache_misses} files {run.extraction_s:.1f} s, graph {run.graph_s:.1f} s, "
+                   + f"other {run.other_s:.1f} s; lock {run.lock.value})")
     print(f"affected: {len(selection.modules)} of {total} modules (base {selection.base.commit[:12]}, {when}), "
-          + f"{len(selection.changed_files)} changed files, selected in {selection_s:.1f} s", flush=True)
+          + f"{len(selection.changed_files)} changed files, selected in {selection_s:.1f} s{details}", flush=True)
     if len(selection.modules) <= 10:
         print(", ".join(f"{path.parent.name}/{path.name}" for path in selection.modules) or "(none)", flush=True)
 
