@@ -1425,7 +1425,7 @@ For a List window Send, the server uses the recipient's producer.
 Send reads the producer map from disk without Git recovery.
 For legacy submissions other than questions, the server can send the notice after it saves a reason to skip the List row.
 An unavailable map or a retired producer can cause that fallback.
-For a question, Send and recovery recheck the keeper before they use the Review-only fallback.
+For a question, Send and recovery require a missing keeper and no existing List destination before they use the Review-only fallback.
 A retired producer leaves a question filing pending when it still requires a List row.
 The command saves its draft ID and recipient before the POST.
 While the result is uncertain, a retry sends the saved ID and recipient before any routing checks for a new filing.
@@ -2317,7 +2317,10 @@ Send and restart recovery file the question with the stable request key from the
 They keep the original keeper and number for a reserved row.
 They check the current keeper under the question filing locks for an unreserved route.
 If a keeper is active, they file the question and verify the native source in the saved row before claiming the notice.
-If no keeper is active, they save the Review-only fallback before claiming the notice.
+If no keeper is active, they resolve the existing destination under the filing locks.
+If they find a row, they verify its saved native source before claiming the notice.
+If they confirm the question has no destination, they save the Review-only fallback before claiming the notice.
+A failed or unresolved destination check leaves the notice pending.
 The fallback preserves the route for recovery if the keeper returns before the claim.
 The pending delivery marker remains if row verification or fallback saving fails.
 A reply to the native question or a Studio follow-up changes the item from **Working** to **Answered**.

@@ -491,7 +491,8 @@ def _question_filing_retry(saved: review_submissions.SavedSubmission, fields: di
     return review_submissions.ListFilingUnavailable(reason)
 
 
-def _refresh_studio_question_route(saved: review_submissions.SavedSubmission, reservation: Path,
+def _refresh_studio_question_route(saved: review_submissions.SavedSubmission,
+                                   record: update_registration.QuestionRecord, reservation: Path,
                                    route: review_submissions.ListFilingRoute | review_submissions.ListFilingUnavailable
                                    | review_submissions.NoListFiling, members: staff.StaffSnapshot
                                    ) -> review_submissions.ListFilingRoute | review_submissions.NoListFiling:
@@ -503,11 +504,17 @@ def _refresh_studio_question_route(saved: review_submissions.SavedSubmission, re
         raise OSError(f"Cannot read the reserved List route for {saved.id}.")
     keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
     if keeper is None:
-        if not isinstance(route, review_submissions.NoListFiling):
+        def save_fallback() -> None:
+            if isinstance(route, review_submissions.NoListFiling):
+                return
             reason = "The List has no active producer."
             fields = _read_question_filing_fields(path)
             atomic_file.write_text_atomic(path, json.dumps({**fields, "skipped": reason}) + "\n", new_file_mode=0o600)
             print(f"Review List filing {saved.id}: {reason}", file=sys.stderr)
+
+        finish_without_keeper = cast(Callable[[update_registration.QuestionRecord, Callable[[], None]], None],
+                                     import_module("scripts.review_links.answer_sources").finish_studio_question_without_keeper)
+        finish_without_keeper(record, save_fallback)
         return review_submissions.NoListFiling()
     if isinstance(route, dict) and route["keeper"] == keeper.id:
         return route
@@ -539,7 +546,7 @@ def _ensure_studio_question_filing(saved: review_submissions.SavedSubmission,
                 and reservation.with_name("first-message.json").is_file()):
             return
         members = staff.snapshot()
-        route = _refresh_studio_question_route(saved, reservation, saved_route, members)
+        route = _refresh_studio_question_route(saved, record, reservation, saved_route, members)
         if isinstance(route, review_submissions.NoListFiling):
             return
         file_question = cast(Callable[[update_registration.QuestionRecord, Path,
