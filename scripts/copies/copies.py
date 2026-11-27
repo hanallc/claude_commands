@@ -2466,10 +2466,13 @@ def reconcile_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) 
 
 def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:
     """Build the remote command with one mirror identity."""
-    arguments = [action, "--path", mirror.path, "--owner", mirror.owner]
+    mirror_word = (shlex.quote(mirror.path) if mirror.path.startswith("/")
+                   else quote_shell_path_parts(mirror.path))
+    arguments = ["--owner", mirror.owner]
     for option, value in (("--repository", mirror.repository.name), ("--session", mirror.session)):
         arguments.extend([f"{option}={value}"] if value.startswith("-") else [option, value])
-    return "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py " + shlex.join([*arguments, *tail])
+    return ("~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py "
+            + f"{shlex.quote(action)} --path {mirror_word} " + shlex.join([*arguments, *tail]))
 
 
 def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: list[str]) -> list[str]:
@@ -2487,18 +2490,31 @@ def remote_use_command(mirror: RemoteMirror, command: str) -> str:
     return remote_copies_command("mirror-use", mirror, "--", "sh", "-c", command)
 
 
-def mirror_probe_setup(path: str) -> str:
+def quote_shell_path_parts(path: str) -> str:
+    """Quote each path component so the process selector skips the shell."""
+    return "/".join("'" + part.replace("'", "'\"'\"'") + "'" for part in path.split("/"))
+
+
+def mac_mirror_shell_path(path: str) -> str:
+    """Quote a mirror path below the Mac home folder."""
+    return '"$HOME"/' + quote_shell_path_parts(path)
+
+
+def mirror_probe_setup(path: str, *, encode_path: bool = False) -> str:
     """Create a marked probe copy through the registered remote kind."""
+    argument = path.encode().hex() if encode_path else path
+    decode = "bytes.fromhex(sys.argv[1]).decode()" if encode_path else "sys.argv[1]"
     program = "\n".join((
         "import sys",
         "from scripts.copies import copies",
-        "copies.probe_remote_folder(sys.argv[1])",
+        f"copies.probe_remote_folder({decode})",
     ))
-    relative = path.removeprefix("~/")
-    mark = shlex.quote(str(Path(relative) / floor_claims.MIRROR_MARK))
-    shell_mark = mark if Path(relative).is_absolute() else '"$HOME"/' + mark
+    mark = Path(path.removeprefix("~/")) / floor_claims.MIRROR_MARK
+    shell_mark = shlex.quote(str(mark))
+    if not mark.is_absolute():
+        shell_mark = mac_mirror_shell_path(str(mark)) if encode_path else '"$HOME"/' + shell_mark
     return ("test -f " + shell_mark + ' || "$HOME"/.claude/scripts/lib/py -c ' + shlex.quote(program) + " " +
-            shlex.quote(path) + " || exit 1")
+            shlex.quote(argument) + " || exit 1")
 
 
 def mark_mirror(tree: Path, owner: str, repo: str, session: str, **extra: object) -> None:

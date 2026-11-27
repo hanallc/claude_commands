@@ -1814,7 +1814,7 @@ def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1
     if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
-    return copies.mirror_probe_setup(remote_mirror(repository, target, slot)) + "\n" + _MAC_DISK_PROBE
+    return copies.mirror_probe_setup(remote_mirror(repository, target, slot), encode_path=True) + "\n" + _MAC_DISK_PROBE
 
 
 def parse_probe(output: str) -> ProbeResult:
@@ -2207,7 +2207,7 @@ def probe_mac_host(controller: ProcessController, config: eligibility.SshProbeSe
     if setup_mirrors:
         root = mac_mirror_root()
         for index, mirror in enumerate(setup_mirrors):
-            setup = copies.mirror_probe_setup(f"{root.relative}/{mirror}")
+            setup = copies.mirror_probe_setup(f"{root.relative}/{mirror}", encode_path=True)
             script.extend((f"if ( {setup} ); then", f"printf 'mirror_setup={index}\\tready\\n'",
                            "else", f"printf 'mirror_setup={index}\\tfailed\\n'", "fi"))
     script.append(_MAC_DISK_PROBE)
@@ -2551,8 +2551,12 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
     """
     if any(word == "--target-dir" or word.startswith("--target-dir=") for word in request.nextest_words):
         return "echo mac_cleanup=skipped"
+    from scripts.copies import copies
+
     budget = config.values.get(f"mac_budget_gib.{repository.name}", config.default_target_budget_gib)
-    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    mirror = remote_mirror(repository, request.target, request.slot)
+    mirror_word = copies.mac_mirror_shell_path(mirror)
+    target = copies.mac_mirror_shell_path(f"{mirror}/target")
     program = (
         'import sys; from scripts.lint import sweep; from scripts.lib import conf; '
         'config = conf.read("lint"); '
@@ -2561,13 +2565,13 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
     )
     floor = shlex.quote(f"{config.free_floor_gib:g}")
     return (
-        f'{{ if cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))}; then '
+        f'{{ if cd {mirror_word}; then '
         + 'trim_started=$(date +%s); '
         + f'if LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
-        + f'-B -c {shlex.quote(program)} "$HOME"/{target} >/dev/null 2>&1; then '
+        + f'-B -c {shlex.quote(program)} {target} >/dev/null 2>&1; then '
         + 'trim_status=0; else trim_status=$?; fi; '
         + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
-        + f'if trim_size=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+        + f'if trim_size=$(du -sk {target} 2>/dev/null); then '
         + 'trim_size=${trim_size%%[[:space:]]*}; '
         + f'over_budget=$(awk -v size="$trim_size" -v budget={shlex.quote(budget)} '
         + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
@@ -2579,9 +2583,9 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
         + 'else free_gib=; fi; '
         + f'if awk -v free="$free_gib" -v floor={floor} '
         + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-        + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+        + f'if size_kib=$(du -sk {target} 2>/dev/null); then '
         + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-        + f'if rm -rf -- "$HOME"/{target}; then '
+        + f'if rm -rf -- {target}; then '
         + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
         + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi; "
         + "else echo mac_cleanup=$?; fi; } 2>/dev/null"
@@ -2701,6 +2705,24 @@ def report_fetch(folder: FetchFolder, result: FetchResult) -> None:
     print(f"mac_test: nothing fetched: {reason}")
 
 
+def fetch_size_command(repository: KnownRepository, target: str, slot: int, folder: FetchFolder) -> str:
+    """Check the fetch folder and report its size in KiB."""
+    mirror = remote_mirror(repository, target, slot)
+    if target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
+        from scripts.copies import copies
+
+        mirror_word = copies.quote_shell_path_parts(mirror)
+    else:
+        mirror_word = shlex.quote(mirror)
+    quoted = shlex.quote(folder.value)
+    return (
+        f"cd {mirror_word} && if [ -d {quoted} ]; then "
+        + f"if size=$(du -sk {quoted}); then "
+        + "printf 'fetch_kib=%s\\nrc=0\\n' \"${size%%[[:space:]]*}\"; else exit 1; fi; "
+        + "else printf 'fetch=missing\\nrc=0\\n'; fi"
+    )
+
+
 def fetch_folder(
     controller: ProcessController,
     config: OffloadConfig,
@@ -2729,14 +2751,7 @@ def fetch_folder(
                     entry.unlink()
         if destination.exists() or destination.is_symlink() or partial.exists() or partial.is_symlink():
             return FetchFailed("the fetched destination already exists")
-        quoted = shlex.quote(folder.value)
-        size_command = (
-            f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-            + f"if [ -d {quoted} ]; then "
-            + f"if size=$(du -sk {quoted}); then "
-            + "printf 'fetch_kib=%s\\nrc=0\\n' \"${size%%[[:space:]]*}\"; else exit 1; fi; "
-            + "else printf 'fetch=missing\\nrc=0\\n'; fi"
-        )
+        size_command = fetch_size_command(repository, request.target, request.slot, folder)
         size = controller.capture([*ssh_prefix(config), size_command], CommandTimeLimit(config.probe_timeout_s))
         if not isinstance(size, CommandOutput) or size.status != 0:
             return FetchFailed("the Mac folder size could not be read")

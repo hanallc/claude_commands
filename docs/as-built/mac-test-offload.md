@@ -593,6 +593,13 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   The claim watcher uses `ALL_MIRRORS` for the host activity check and the saved mirror for the read-only release check.
   The command selector uses `pgrep` for mirror command paths.
   The working-directory selector uses `lsof` and `awk`.
+
+  Mac control scripts quote each mirror path component separately.
+  The copy command quotes each relative path component on all targets.
+  Leased child processes receive plain paths so the selector can count them.
+  The probe child receives a hex path because it can run outside a claim while the watcher checks the same mirror.
+  Rsync requires its own claim, and a kept claim blocks new claims for that repository during observation.
+
   The stopped-work check includes processes with the exact start fence file open on descriptor 8 in the leftover count.
   The fence check supplies PIDs only to the count.
   The mirror command and working-directory selectors supply PIDs to TERM and KILL.

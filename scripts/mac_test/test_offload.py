@@ -2060,7 +2060,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(probe[: len(ssh_arguments)], ssh_arguments)
         probe_script = probe[len(ssh_arguments)]
         for fragment in (
-            ".local/state/mac-test/test-mirror/hana",
+            "'.local'/'state'/'mac-test'/'test-mirror'/'hana'",
             'df -g "$HOME"',
             "hostname -s",
         ):
@@ -2080,7 +2080,8 @@ class OffloadCommandTests(OffloadCommandFixture):
                    or self.environment.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}")
         receiver_argument = (
             "--rsync-path=~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-receive "
-            + shlex.join(["--path", ".local/state/mac-test/test-mirror/hana", "--owner", "verify",
+            + "--path '.local'/'state'/'mac-test'/'test-mirror'/'hana' "
+            + shlex.join(["--owner", "verify",
                           "--repository", "hana", "--session", session, "--", "rsync"])
         )
         self.assertEqual(
