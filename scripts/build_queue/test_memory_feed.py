@@ -3371,19 +3371,16 @@ const refresh = createPageRefresh(tick);
         self.assertTrue(all("between steps" in row["detail"] for row in swap.rows if row["kind"] == "owner"))
         self.assertTrue(all(row.get("title_kind") == "staff" for row in swap.rows if row["kind"] == "owner"))
 
-    def test_swap_keeps_a_running_detached_tool_out_of_ended_swap(self) -> None:
+    def test_swap_leaves_detached_tool_scope_remainder_unclassified(self) -> None:
         gib = admission_records.GIB
         self.host_swap(8 * gib, 4 * gib)
         builds = self.cgroup("builds.slice", 4 * gib)
         detached = "builds.slice/builds-detached.slice"
         _ = self.cgroup(detached, 4 * gib)
-        _ = self.cgroup(detached + "/tool.slice", 4 * gib)
-        child = self.cgroup(detached + "/tool.slice/cargo.scope", gib)
-        tool_scope = self.cgroup(detached + "/tool.slice/tool.scope", 3 * gib)
-        _ = (child / "cgroup.events").write_text("populated 1\n")
-        _ = (tool_scope / "cgroup.events").write_text("populated 1\n")
-        tool = admission_records.RunningStep("tool-owner", "tool owner", "between steps", str(tool_scope), 0,
-            admission_records.UnownedSliceMemory(gib, cgroup=str(tool_scope), pid=700001), pid=700001)
+        parent = self.cgroup(detached + "/tool.scope", 4 * gib)
+        child = self.cgroup(detached + "/tool.scope/cargo.scope", gib)
+        tool = admission_records.RunningStep("tool-owner", "tool owner", "between steps", str(parent), 0,
+            admission_records.UnownedSliceMemory(gib, cgroup=str(parent), pid=700001), pid=700001)
         cargo = reservation_reading().view.running[0]
         memory = cargo.measured
         assert isinstance(memory, admission_records.MeasuredMemory)
@@ -3394,11 +3391,9 @@ const refresh = createPageRefresh(tick);
             swap = memory_feed.read_swap((tool, cargo), {}, 6, names)
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual(swap, baseline)
-        ended, = (row for row in swap.rows if row["name"] == "Left by runs that ended")
-        self.assertEqual(ended["bytes"], 0)
-        unregistered, = (row for row in swap.rows if row["name"] == "tool")
-        self.assertEqual(unregistered["bytes"], 3 * gib)
-        owner, = (row for row in swap.rows if row["kind"] == "owner" and row["name"] != "tool")
+        remainder, = (row for row in swap.rows if row["kind"] == "ungrouped")
+        self.assertEqual((remainder["name"], remainder["bytes"]), ("Unclassified groups", 3 * gib))
+        owner, = (row for row in swap.rows if row["kind"] == "owner")
         self.assertEqual(owner["bytes"], gib)
         self.assertEqual(swap.builds_ci, 4 * gib)
 

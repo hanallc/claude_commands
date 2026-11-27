@@ -2086,9 +2086,12 @@ def swap_pool(path: Path) -> SwapPool:
 class SwapReadingPass:
     """Read each selected cgroup counter once for one host reading."""
 
-    def __init__(self, owners: Mapping[Path, SwapOwner]) -> None:
+    def __init__(self, owners: Mapping[Path, SwapOwner], running_groups: set[Path]) -> None:
         self.owners: Mapping[Path, SwapOwner] = owners
         self.owner_ancestors: set[Path] = {parent for owner in owners for parent in owner.parents}
+        # A running child also shows that its enclosing scope is active.
+        self.running_groups: set[Path] = running_groups | {
+            parent for group in running_groups for parent in group.parents if parent.name.endswith(".scope")}
         self.counters: dict[Path, int | SwapUnavailable] = {}
         self.rows: dict[tuple[SwapPool, str], SwapRow] = {}
         self.agent_counts: Counter[SwapPool] = Counter()
@@ -2125,7 +2128,7 @@ class SwapReadingPass:
                 child_total += total
                 ended += child_ended
             if isinstance(counter, int):
-                return counter, ended + max(0, counter - child_total)
+                return counter, ended + self.ended_remainder(path, counter - child_total)
             return child_total, ended
         self.build_leaf_seen = True
         if not isinstance(counter, int) or counter <= 0:
@@ -2137,13 +2140,18 @@ class SwapReadingPass:
             return counter, 0
         return counter, counter if any(event.split() == ["populated", "0"] for event in events) else 0
 
+    def ended_remainder(self, path: Path, remainder: int) -> int:
+        if remainder <= 0 or path in self.running_groups or not self.running_groups.isdisjoint(path.parents):
+            return 0
+        return remainder
+
     def ended_build_swap(self) -> SwapRow | None:
         if not self.build_leaf_seen or not self.build_swap_readable:
             return None
         # See Documentation/admin-guide/cgroup-v2.rst, "Memory Ownership" and "No Internal Process Constraint".
         # A charge stays with the cgroup that allocated it.
         # A cgroup that enables memory for its children has no processes of its own.
-        # Use the swap in empty leaves and the positive parent remainders from this pass.
+        # Use the swap in empty leaves and the positive remainders outside the running groups.
         ended = sum(self.ended_build_rows.values())
         for key, amount in self.ended_build_rows.items():
             row = self.rows[key]
@@ -2230,7 +2238,7 @@ class SwapReadingPass:
             charged = sum(self.visit(child) for child in children)
             if isinstance(counter, int):
                 remainder = counter - charged
-                ended_swap = max(0, remainder) if in_builds else 0
+                ended_swap = self.ended_remainder(path, remainder) if in_builds else 0
                 if path in self.owners:
                     owner = self.owners[path]
                     self.add(str(path), owner.name, path, staff_names.parts_text(owner.detail), remainder,
@@ -2295,10 +2303,11 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
               ) -> SwapReading | SwapUnavailable:
     """Account for host swap in two pools, with disjoint cgroup owners and an explicit difference in each pool."""
     owners: dict[Path, SwapOwner] = {}
+    running_groups: set[Path] = set()
     builds = gate.builds_slice_cgroup()
     for step in steps:
         memory = step.measured
-        if not isinstance(memory, admission_records.MeasuredMemory) or gate.detached_tool_memory(memory, builds):
+        if not isinstance(memory, admission_records.MeasuredMemory):
             continue
         source = memory.anonymous_source
         path: Path
@@ -2308,7 +2317,10 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
             path = Path(memory.cgroup)
         else:
             continue
-        if path.is_relative_to(CGROUP) and path.name not in SWAP_OWNER_SLICES:
+        if not path.is_relative_to(CGROUP):
+            continue
+        running_groups.add(path)
+        if path.name not in SWAP_OWNER_SLICES and not gate.detached_tool_memory(memory, builds):
             identity = step_labels(step, labels)
             name = step_text(step, names, labels=labels)
             detail = staff_names.text_parts(staff_names.StaffReference(identity.session))
@@ -2323,7 +2335,7 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
             elif isinstance(memory, admission_records.CompilerServiceMemory):
                 name = SWAP_NAMES["compiler"]
             _ = owners.setdefault(path, SwapOwner(name, detail, identity, title_kind))
-    reading = SwapReadingPass(owners)
+    reading = SwapReadingPass(owners, running_groups)
     for child in reading.children(CGROUP):
         _ = reading.visit(child)
     host_reads = 0
