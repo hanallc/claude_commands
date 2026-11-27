@@ -451,12 +451,12 @@ def close(key: str) -> bool:
         if isinstance(held, HeldMessage) and held.outcome == "sent" and held.need == "blocked":
             reference = held.reference if isinstance(held, RegisteredHold) else push_reference.NO_REFERENCE
             identity = push_reference.PushIdentity(JOB, user_key(key), reference)
-            arguments = (["question-push-clear", identity.sender, identity.key,
-                          json.dumps(identity.question.reference), "--emergency"]
-                         if identity.question is not None
-                         else ["retire", "--to", "user", "--from", identity.sender, "--key", identity.key])
+            command = (session_send.send_argv("question-push-clear", identity.sender, identity.key,
+                                             json.dumps(identity.question.reference), "--emergency", send_script=SEND)
+                       if identity.question is not None
+                       else push_texts.user_retire_argv(identity.sender, identity.key, send_script=SEND))
             try:
-                done = subprocess.run(session_send.send_argv(*arguments, send_script=SEND),
+                done = subprocess.run(command,
                                       capture_output=True, text=True, check=False, timeout=60)
                 problem = "" if done.returncode == 0 else (
                     failure_detail(done, lines=1)).replace("\n", "; ")
