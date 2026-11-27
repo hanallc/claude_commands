@@ -9,10 +9,13 @@ a list either inline as `[a, b]` or as `- item` lines below its key. Obsidian wr
 from __future__ import annotations
 
 import fnmatch
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
+from io import StringIO
 import re
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 ALL_FIELDS: frozenset[str] = frozenset()
 FENCE = "---"
@@ -33,37 +36,199 @@ class Issue(NamedTuple):
         return next(iter(self.fields.get(key, [])), "")
 
 
+@dataclass(frozen=True)
+class IssueFieldValue:
+    """A field value and the start of its unchanged source text."""
+
+    text: str = field(repr=False)
+    start: int
+
+
+def _plain_value(raw: str, start: int) -> IssueFieldValue:
+    text = raw.lstrip()
+    start += len(raw) - len(text)
+    text = text.rstrip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        inner = text[1:-1].lstrip()
+        start += len(text) - len(inner) - 1
+        text = inner.rstrip()
+    if link := WIKI_LINK.match(text):
+        part = "alias" if link["alias"] else "target"
+        value = link[part].lstrip()
+        start += link.start(part) + len(link[part]) - len(value)
+        text = value.rstrip()
+    return IssueFieldValue(text, start)
+
+
 def plain(value: str) -> str:
     """A value without its quotes and the brackets of a wiki link."""
-    text = value.strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
-        text = text[1:-1].strip()
-    link = WIKI_LINK.match(text)
-    return (link["alias"] or link["target"]).strip() if link else text
+    return _plain_value(value, 0).text
+
+
+def _field_values(raw: str, start: int) -> list[IssueFieldValue]:
+    text = raw.lstrip()
+    start += len(raw) - len(text)
+    text = text.rstrip()
+    if text.startswith("[") and not text.startswith("[["):
+        items = text.lstrip("[]")
+        start += len(text) - len(items)
+        values: list[IssueFieldValue] = []
+        for item in items.rstrip("[]").split(","):
+            value = _plain_value(item, start)
+            if value.text:
+                values.append(value)
+            start += len(item) + 1
+        return values
+    value = _plain_value(text, start)
+    return [value] if value.text else []
 
 
 def values(raw: str) -> list[str]:
     """The values one `key: value` line holds: an inline list's items, or the one plain value."""
-    text = raw.strip()
-    if text.startswith("[") and not text.startswith("[["):
-        items = [plain(item) for item in text.strip("[]").split(",")]
-        return [item for item in items if item]
-    one = plain(text)
-    return [one] if one else []
+    return [value.text for value in _field_values(raw, 0)]
+
+
+@dataclass(frozen=True)
+class IssueField:
+    """One field declaration and its values, including continuation lines."""
+
+    values: list[IssueFieldValue] = field(default_factory=list)
+
+
+def located_header_fields(lines: Iterable[str], keys: frozenset[str] = ALL_FIELDS, *,
+                          start: int = 0) -> dict[str, list[IssueField]]:
+    """Read declarations in order and keep the source position of each value."""
+    fields: dict[str, list[IssueField]] = {}
+    active = IssueField()
+    selected = False
+    for source in lines:
+        line = source.rstrip("\r\n")
+        if (item := ITEM.match(line)) and selected:
+            active.values.extend(_field_values(item["value"], start + item.start("value")))
+        elif found := FIELD.match(line):
+            key = found["key"]
+            selected = not keys or key in keys
+            if selected:
+                active = IssueField(_field_values(found["value"], start + found.start("value")))
+                fields.setdefault(key, []).append(active)
+        start += len(source)
+    return fields
+
+
+def decoded_header_fields(fields: dict[str, list[IssueField]]) -> dict[str, list[str]]:
+    """Use the last declaration of each field."""
+    return {key: [value.text for value in declarations[-1].values] for key, declarations in fields.items()}
 
 
 def header_fields(lines: list[str], keys: frozenset[str] = ALL_FIELDS) -> dict[str, list[str]]:
     """Decode only the requested fields from one header."""
+    return decoded_header_fields(located_header_fields(lines, keys))
+
+
+@dataclass(frozen=True)
+class IssueHeaderSource:
+    """The exact lines of a leading header, with its fences."""
+
+    opening: str = ""
+    lines: tuple[str, ...] = field(default=(), repr=False)
+    closing: str = ""
+
+    def located_fields(self, keys: frozenset[str] = ALL_FIELDS) -> dict[str, list[IssueField]]:
+        return located_header_fields(self.lines, keys, start=len(self.opening))
+
+    def decoded_fields(self, keys: frozenset[str] = ALL_FIELDS) -> dict[str, list[str]]:
+        return decoded_header_fields(self.located_fields(keys)) if self.closing else {}
+
+
+def read_issue_header(stream: Iterator[str]) -> IssueHeaderSource:
+    """Read through the closing fence. Leave the body unread."""
+    return _read_header(stream, lambda line: line.strip() == FENCE)
+
+
+def read_numbered_header(stream: Iterator[str]) -> IssueHeaderSource:
+    """Read the header of a numbered record from a stream that splits at LF."""
+    return _read_header(stream, lambda line: line.rstrip("\r\n") == FENCE)
+
+
+def _read_header(stream: Iterator[str], is_fence: Callable[[str], bool]) -> IssueHeaderSource:
+    opening = next(stream, "")
+    if not is_fence(opening):
+        return IssueHeaderSource()
+    lines: list[str] = []
+    for line in stream:
+        if is_fence(line):
+            return IssueHeaderSource(opening, tuple(lines), line)
+        lines.append(line)
+    return IssueHeaderSource(opening, tuple(lines))
+
+
+def issue_text_header(text: str) -> IssueHeaderSource:
+    return read_issue_header(StringIO(text, newline=""))
+
+
+@dataclass(frozen=True)
+class NumberedFieldValue:
+    """A decoded numbered field and its encoded source position."""
+
+    text: str = field(repr=False)
+    encoded: str = field(repr=False)
+    start: int
+
+
+@dataclass(frozen=True)
+class LocatedNumberedNote:
+    fields: dict[str, NumberedFieldValue]
+    body: str = field(repr=False)
+
+    def decoded_fields(self) -> dict[str, str]:
+        return {key: value.text for key, value in self.fields.items()}
+
+
+def decode_numbered_field(value: str) -> str:
+    decoded = cast(object, json.loads(value))
+    if not isinstance(decoded, str):
+        raise ValueError("invalid field")
+    return decoded
+
+
+def encoded_numbered_header_values(header: IssueHeaderSource, keys: frozenset[str]) -> dict[str, list[str]]:
+    """Find encoded values in selected numbered fields before validating the record."""
     fields: dict[str, list[str]] = {}
-    key = ""
-    for line in lines:
-        if (item := ITEM.match(line)) and key:
-            fields[key].extend(values(item["value"]))
-        elif found := FIELD.match(line):
-            key = found["key"] if not keys or found["key"] in keys else ""
-            if key:
-                fields[key] = values(found["value"])
+    for line in header.lines:
+        key, separator, value = line.partition(": ")
+        if separator and key in keys:
+            fields.setdefault(key, []).append(value)
     return fields
+
+
+class DuplicateNumberedField(ValueError):
+    """A numbered record declares the same header field twice."""
+
+
+def numbered_header_fields(header: IssueHeaderSource) -> dict[str, NumberedFieldValue]:
+    """Decode numbered header strings and keep their source positions."""
+    if header.opening.rstrip("\r\n") != FENCE or header.closing.rstrip("\r\n") != FENCE:
+        raise ValueError("missing frontmatter")
+    fields: dict[str, NumberedFieldValue] = {}
+    offset = len(header.opening)
+    for source in header.lines:
+        key, separator, value = source.rstrip("\r\n").partition(": ")
+        if not separator:
+            raise ValueError("invalid field")
+        if key in fields:
+            raise DuplicateNumberedField("duplicate numbered field")
+        fields[key] = NumberedFieldValue(decode_numbered_field(value), value, offset + len(key) + len(separator))
+        offset += len(source)
+    return fields
+
+
+def located_numbered_note(text: str) -> LocatedNumberedNote:
+    """Read a numbered record without changing its line endings."""
+    stream = StringIO(text, newline="\n")
+    fields = numbered_header_fields(read_numbered_header(stream))
+    if stream.readline() not in ("\n", "\r\n"):
+        raise ValueError("missing blank line after frontmatter")
+    return LocatedNumberedNote(fields, stream.read())
 
 
 def frontmatter(path: Path, *, sources: list[Path] | None = None,
@@ -73,16 +238,13 @@ def frontmatter(path: Path, *, sources: list[Path] | None = None,
     if sources is not None:
         sources.append(path)
     try:
-        with path.open(encoding="utf-8") as stream:
-            if stream.readline().strip() == FENCE:
-                lines: list[str] = []
-                for line in stream:
-                    if line.strip() == FENCE:
-                        fields = header_fields(lines, keys)
-                        if select is None:
-                            return fields
-                        return header_fields(lines) if select(Issue(path, fields)) else {}
-                    lines.append(line)
+        with path.open(encoding="utf-8", newline="") as stream:
+            header = read_issue_header(stream)
+            if header.closing:
+                fields = header.decoded_fields(keys)
+                if select is None:
+                    return fields
+                return header.decoded_fields() if select(Issue(path, fields)) else {}
     except (OSError, UnicodeError):
         if sources is not None:
             raise

@@ -9,25 +9,24 @@ try:
 except FileNotFoundError:
     pass
 
-import json
 import os
 import re
 import shutil
 import stat
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from scripts.lib import atomic_file  # noqa: E402
 from scripts.production import investigation, log_backup, record_store, showrunners, staff, unit_lookup  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
 from scripts.production.proposals_folder import issues_folder  # noqa: E402
-from scripts.review_links import new_item_dialog, review_later  # noqa: E402
+from scripts.review_links import new_item_dialog, reply_proofs, reply_tokens, review_later  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.production.update_registration import QuestionStaff
@@ -59,41 +58,20 @@ def can_hold_questions(document: Path) -> bool:
     )
 
 
-def hash_move_header(header: bytes, kind: new_item_dialog.SubmissionKind,
-                     submission: new_item_dialog.ReviewSubmission) -> bytes:
-    """Replace the token in the native submission field."""
-    question = kind == new_item_dialog.SubmissionKind.QUESTION
-    field_name = b"registration" if question else b"review_submission"
-    match = re.search(rb"(?m)^" + field_name + rb": ([^\r\n]*)", header)
-    if match is None:
-        raise TidyRefused("The moving record has no submission field.")
-    value = cast(object, json.loads(match[1]))
-    registration: dict[str, object] = {}
-    if question and isinstance(value, dict):
-        registration = cast(dict[str, object], value)
-        value = registration.get("review_submission")
-    elif not question and isinstance(value, str):
-        value = cast(object, json.loads(value))
-    if not isinstance(value, dict):
-        raise TidyRefused("The moving record has invalid submission fields.")
-    fields = cast(dict[str, object], value)
-    hashed = new_item_dialog.hashed_submission_fields(fields, submission)
-    if hashed is fields:
-        return header
-    if question:
-        registration["review_submission"] = hashed
-        encoded = json.dumps(registration, ensure_ascii=False)
-    else:
-        encoded = json.dumps(json.dumps(hashed), ensure_ascii=False)
-    return header[:match.start(1)] + encoded.encode() + header[match.end(1):]
+@dataclass(frozen=True)
+class PreparedReviewNote:
+    """The destination note and any proof to save before publication."""
+
+    content: bytes = field(repr=False)
+    proof: reply_proofs.NoteProof = field(default_factory=reply_proofs.NoteProof, repr=False)
+    fields: tuple[str, ...] = ()
 
 
-def _header_end(content: bytes, path: Path) -> int:
-    start = content.index(b"\n") + 1
-    fence = re.search(rb"(?m)^---\r?$", content[start:])
-    if fence is None:
-        raise TidyRefused(f"{path}: the record has no closing header fence")
-    return start + fence.start()
+def _prepare_review_note(content: bytes, kind: new_item_dialog.SubmissionKind) -> PreparedReviewNote:
+    layout = (reply_proofs.ProofNoteLayout.QUESTION if kind == new_item_dialog.SubmissionKind.QUESTION
+              else reply_proofs.ProofNoteLayout.SUBMISSION)
+    removal = reply_proofs.prepare_note_removal(content.decode(), layout)
+    return PreparedReviewNote(removal.content.encode(), removal.proof, removal.fields)
 
 
 @dataclass(frozen=True)
@@ -108,35 +86,68 @@ class ReviewRecordMove:
     kind: new_item_dialog.SubmissionKind
     submission: new_item_dialog.ReviewSubmission
     source_digest: str
-    content: bytes
-    legacy_content: bytes = field(repr=False)
+    note: PreparedReviewNote
+    accepted_target: bytes = field(repr=False)
+    source_content: bytes = field(repr=False)
+    source_fields: tuple[str, ...]
 
     @classmethod
     def plan(cls, source: Path, target: Path, source_owner: staff.StaffId, owner: staff.StaffId, identity: str,
              kind: new_item_dialog.SubmissionKind, submission: new_item_dialog.ReviewSubmission) -> ReviewRecordMove:
-        field = b"production_id" if kind == new_item_dialog.SubmissionKind.QUESTION else b"owner"
-        value = owner.encode() if field == b"production_id" else b'"' + owner.encode() + b'"'
+        field = "production_id" if kind == new_item_dialog.SubmissionKind.QUESTION else "owner"
+        value = owner if field == "production_id" else f'"{owner}"'
         content = source.read_bytes()
-        end = _header_end(content, source)
-        header, count = re.subn(rb"(?m)^" + field + rb": [^\r\n]*", field + b": " + value, content[:end])
+        text = content.decode()
+        _, end = reply_proofs.note_header_bounds(text)
+        header, count = re.subn(rf"(?m)^{field}: [^\r\n]*", f"{field}: {value}", text[:end])
         if count != 1:
             raise TidyRefused(f"{source}: the record has no unique owner field")
-        hashed_header = hash_move_header(header, kind, submission)
-        legacy_content = header + content[end:] if hashed_header != header else b""
+        accepted_target = (header + text[end:]).encode()
+        note = _prepare_review_note(accepted_target, kind)
         return cls(source.resolve(), target.parent.resolve() / target.name, source_owner, owner, identity, kind,
-                   submission, sha256(content).hexdigest(), hashed_header + content[end:], legacy_content)
+                   submission, sha256(content).hexdigest(), note, accepted_target, content, note.fields)
 
     def keep_target(self, content: bytes, submission: new_item_dialog.ReviewSubmission) -> ReviewRecordMove:
-        """Keep changes to the destination and replace any legacy token."""
-        end = _header_end(content, self.target)
-        hashed = hash_move_header(content[:end], self.kind, submission) + content[end:]
-        return replace(self, content=hashed, legacy_content=content if hashed != content else b"")
+        """Keep changes to the destination and carry over proof for the same wait."""
+        note = _prepare_review_note(content, self.kind)
+        proof = note.proof
+        if (isinstance(proof.reply, reply_tokens.MissingReplyProof)
+                and submission.reply_wait_revision == self.submission.reply_wait_revision):
+            proof = replace(proof, reply=self.note.proof.reply)
+        if isinstance(proof.request, reply_proofs.NoStaffQuestionRequest):
+            proof = replace(proof, request=self.note.proof.request)
+        return replace(self, submission=submission, note=replace(note, proof=proof), accepted_target=content)
+
+    def _matches_target(self, content: bytes) -> bool:
+        if content in (self.note.content, self.accepted_target):
+            return True
+        if self.note.proof == reply_proofs.NoteProof():
+            return False
+        try:
+            candidate = _prepare_review_note(content, self.kind)
+            return (candidate.content, candidate.proof) == (self.note.content, self.note.proof)
+        except (TidyRefused, ValueError):
+            return False
 
     def check_collision(self, occupied: set[Path]) -> None:
         if self.source == self.target or occupied - {self.target} or (os.path.lexists(self.target) and not (
                 self.target.is_file() and not self.target.is_symlink()
-                and self.target.read_bytes() in (self.content, self.legacy_content or self.content))):
+                and self._matches_target(self.target.read_bytes()))):
             raise TidyRefused(f"{self.identity}: ID collision in {self.owner}'s store; kept {self.source}")
+
+    @contextmanager
+    def publish_proofs(self) -> Generator[None]:
+        proof = self.note.proof
+        with ExitStack() as publications:
+            if not isinstance(proof.reply, reply_tokens.MissingReplyProof):
+                identity = self.submission.proof_identity(self.identity)
+                _ = publications.enter_context(
+                    reply_proofs.publishing(identity, reply_proofs.NoteProof(reply=proof.reply), moving=True))
+            if not isinstance(proof.request, reply_proofs.NoStaffQuestionRequest):
+                staff_question = reply_proofs.StaffQuestionIdentity(self.owner, self.identity)
+                _ = publications.enter_context(
+                    reply_proofs.publishing(staff_question, reply_proofs.NoteProof(request=proof.request), moving=True))
+            yield
 
     @contextmanager
     def publish_record(self, numbers: record_store.LockedRecordNumbers) -> Generator[None]:
@@ -144,15 +155,15 @@ class ReviewRecordMove:
         with numbers.write(self.target, self.identity, self.owner, new_record=not exists):
             if exists:
                 self.check_collision(set())
-                if self.legacy_content and self.target.read_bytes() == self.legacy_content:
+                if self.target.read_bytes() != self.note.content:
                     mode = stat.S_IMODE(self.target.stat().st_mode)
-                    atomic_file.write_bytes_atomic(self.target, self.content, mode=mode)
+                    atomic_file.write_bytes_atomic(self.target, self.note.content, mode=mode)
                 atomic_file.sync_folder(self.target.parent)
                 atomic_file.sync_folder(self.target.parent.parent)
                 yield
                 return
             mode = stat.S_IMODE(self.source.stat().st_mode)
-            with atomic_file.prepared_replacement(self.target, self.content, mode=mode) as temporary:
+            with atomic_file.prepared_replacement(self.target, self.note.content, mode=mode) as temporary:
                 try:
                     os.link(temporary, self.target)
                 except FileExistsError as error:
@@ -191,30 +202,40 @@ class ReviewRecordMove:
         return review_submissions.SubmissionMove(
             self.identity, self.kind, recipient, request_id, self.submission.request_digest,
             self.target, original, self.owner, self.source, self.source_owner,
-            review_submissions.MoveContentDigests(self.source_digest, sha256(self.content).hexdigest()),
+            review_submissions.MoveContentDigests(self.source_digest, sha256(self.note.content).hexdigest()),
             browser_token_digest=browser_token_digest,
             has_capture_intent=isinstance(self.submission.capture_intent, new_item_dialog.DeferredCaptureIntent))
 
     def apply(self, numbers: record_store.LockedRecordNumbers, later: Path, journal: Path,
-              destination: SubmissionMove) -> None:
+              destination: SubmissionMove, run: reply_proofs.ProofMoveRun) -> None:
         from scripts.review_links import review_submissions
 
         folder = journal.parent
         receipt, pending = folder / "receipt.json", folder / "pending.json"
         moves_later = self.kind != new_item_dialog.SubmissionKind.QUESTION
-        with (self.publish_record(numbers),
-              record_store.keep_file_on_error(receipt),
-              record_store.keep_file_on_error(pending),
-              record_store.keep_file_on_error(self.source),
-              record_store.keep_file_on_error(later) if moves_later else nullcontext()):
-            review_submissions._write_location(receipt, destination)  # pyright: ignore[reportPrivateUsage]
-            pending.unlink(missing_ok=True)
-            atomic_file.sync_folder(folder)
-            if moves_later:
-                review_later.move_locked(later, f"investigation/{self.source_owner}/{self.identity}",
-                                        f"investigation/{self.owner}/{self.identity}")
-            self.source.unlink()
-            atomic_file.sync_folder(self.source.parent)
+        run.backup(self.source, self.source_content, self.source_fields)
+        target_fields: tuple[str, ...] = ()
+        if self.target.is_file():
+            original_target = self.target.read_bytes()
+            target_fields = _prepare_review_note(original_target, self.kind).fields
+            run.backup(self.target, original_target, target_fields)
+        with self.publish_proofs():
+            run.record_rewrite((self.source, self.source_fields), (self.target, target_fields))
+            with (self.publish_record(numbers),
+                  record_store.keep_file_on_error(receipt),
+                  record_store.keep_file_on_error(pending),
+                  record_store.keep_file_on_error(self.source),
+                  record_store.keep_file_on_error(later) if moves_later else nullcontext()):
+                if self.target.read_bytes() != self.note.content:
+                    raise OSError("Cannot verify the transferred Review note.")
+                review_submissions._write_location(receipt, destination)  # pyright: ignore[reportPrivateUsage]
+                pending.unlink(missing_ok=True)
+                atomic_file.sync_folder(folder)
+                if moves_later:
+                    review_later.move_locked(later, f"investigation/{self.source_owner}/{self.identity}",
+                                            f"investigation/{self.owner}/{self.identity}")
+                self.source.unlink()
+                atomic_file.sync_folder(self.source.parent)
         _finish_move(journal)
 
 
@@ -229,6 +250,7 @@ def recover_review_moves(root: Path) -> None:
     from scripts.production import update_registration as questions
     from scripts.review_links import review_submissions as submissions
 
+    run = reply_proofs.ProofMoveRun(False, record_store.configured_review_vaults)
     for journal in submissions.pending_submission_moves(root):
         try:
             move = submissions._read_request_file(journal, journal.parent.name)  # pyright: ignore[reportPrivateUsage]
@@ -261,16 +283,16 @@ def recover_review_moves(root: Path) -> None:
                     if isinstance(move.digests, submissions.MissingMoveDigests):
                         raise TidyRefused(f"{move.id}: the move has missing content digests; kept both copies")
                     target_content = move.path.read_bytes()
-                    if sha256(target_content).hexdigest() != move.digests.destination:
-                        if plan.source_digest != move.digests.source:
-                            raise TidyRefused(f"{move.id}: both copies changed; kept both copies")
+                    if sha256(target_content).hexdigest() == move.digests.destination:
+                        plan = replace(plan, accepted_target=target_content)
+                    elif plan.source_digest == move.digests.source:
                         plan = plan.keep_target(target_content, target.details)
-                    elif plan.content != target_content:
-                        atomic_file.write_bytes_atomic(move.path, plan.content)
+                    elif target_content != plan.note.content or plan.note.proof == reply_proofs.NoteProof():
+                        raise TidyRefused(f"{move.id}: both copies changed; kept both copies")
                 numbers = (questions.question_numbers() if move.kind == new_item_dialog.SubmissionKind.QUESTION
                            else investigation.investigation_numbers())
                 with numbers as locked:
-                    plan.apply(locked, later, journal, move)
+                    plan.apply(locked, later, journal, move, run)
         except (TidyRefused, OSError, ValueError, investigation.InvestigationError, questions.RegistrationFailure) as error:
             print(f"Review move {journal}: {error}", file=sys.stderr)
 
@@ -325,7 +347,9 @@ def apply_review_moves(moves: list[ReviewRecordMove], parent_doc: Path, identiti
     from scripts.review_links import review_submissions
 
     owner = moves[0].owner
-    with investigation.investigation_numbers() as investigation_numbers, questions.question_numbers() as question_numbers:
+    run = reply_proofs.ProofMoveRun(False, record_store.configured_review_vaults)
+    with (investigation.investigation_numbers() as investigation_numbers,
+          questions.question_numbers() as question_numbers):
         occupied: dict[tuple[record_store.RecordKind, str], set[Path]] = {}
         if any(move.kind == new_item_dialog.SubmissionKind.QUESTION for move in moves):
             for record in questions.question_records_for_document(parent_doc, identities, strict=True):
@@ -345,7 +369,7 @@ def apply_review_moves(moves: list[ReviewRecordMove], parent_doc: Path, identiti
             review_submissions._write_location(journal, destination)  # pyright: ignore[reportPrivateUsage]
             atomic_file.sync_folder(journal.parent.parent)
             numbers = question_numbers if move.kind == new_item_dialog.SubmissionKind.QUESTION else investigation_numbers
-            move.apply(numbers, later, journal, destination)
+            move.apply(numbers, later, journal, destination, run)
 
 
 def tidy(production_name: str, document: Path | None = None, *, identities: QuestionStaff | None = None) -> list[Path]:

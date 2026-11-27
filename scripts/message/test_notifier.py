@@ -28,6 +28,7 @@ from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib import user_zone
 from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 SCRIPT = Path(__file__).with_name("notifier.sh")
@@ -53,6 +54,7 @@ class NotifierTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(self.root / "config/user_zone.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, fixture_zsh_environment())))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.owned = OwnedTestProcesses()
@@ -144,15 +146,16 @@ class NotifierTests(unittest.TestCase):
         launched = self.root / "drain.argv"
         launcher = self.launcher_dir / "systemd-run"
         _ = launcher.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {shlex.quote(str(launched))}\n')
-        config = self.root / "selected.conf"
+        config = self.root / "selected"
+        _ = write_config_fixture(config / "user_zone.conf")
         with mock.patch.dict(os.environ, {"NOTIFIER_REPEAT_STATE": str(pending),
-                                         "SEND_REPEAT_CONFIG": str(config), "XDG_STATE_HOME": str(self.root / "xdg")}):
+                                         "CONF_DIR": str(config), "XDG_STATE_HOME": str(self.root / "xdg")}):
             _ = self.successful("tick")
             _ = self.successful("tick")
         arguments = launched.read_text().splitlines()
         self.assertIn("--no-block", arguments)
         self.assertIn("SEND_REPEAT_STATE=" + str(pending), arguments)
-        self.assertIn("SEND_REPEAT_CONFIG=" + str(config), arguments)
+        self.assertIn("CONF_DIR=" + str(config), arguments)
         self.assertIn("XDG_STATE_HOME=" + str(self.root / "xdg"), arguments)
         self.assertEqual(arguments[-2:], [str(self.fake_send), "repeat-notices"])
         self.assertIn("notices", arguments)
@@ -172,6 +175,7 @@ class NotifierTests(unittest.TestCase):
         command = ["zsh", str(SCRIPT), *args]
         environment = self.owned.environment({
             **os.environ,
+            "CONF_DIR": os.environ.get("CONF_DIR", str(self.root / "config")),
             "NOTIFIER_STATE_DIR": str(self.state_dir),
             "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
             "NOTIFIER_SEND": str(self.fake_send),
@@ -181,13 +185,8 @@ class NotifierTests(unittest.TestCase):
             "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
         })
         if not process_boundary_for_case(self) and "SHOWN_ZONE" not in environment:
-            config = environment.get("USER_ZONE_CONF") or str(
-                Path(user_zone.__file__).resolve().parents[2] / "config/user_zone.conf")
-            if not Path(config).is_absolute():
-                config = str(Path.cwd() / config)
             try:
-                with mock.patch.object(user_zone, "CONF", config):
-                    zone = invoke_cli(user_zone, user_zone.main, [], environment, self.root)
+                zone = invoke_cli(user_zone, user_zone.main, [], environment, self.root)
             except Exception:
                 # The shell ignores helper failures and uses the machine zone.
                 environment["SHOWN_ZONE"] = ""

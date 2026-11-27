@@ -16,6 +16,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast, override
 from unittest import mock
 from scripts.lib.file_module import load_file_module
+from scripts.lint.memory_test_support import write_config_fixture
 
 if TYPE_CHECKING:
     from scripts.notify import review, pushover
@@ -97,7 +98,10 @@ class PushGateTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.root)})))
+        _ = write_config_fixture(self.root / "notify.conf", "pushover.max_source_chars=80\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(self.root), "NOTIFY_STATE_DIR": str(self.root),
+        })))
         _ = self.enterContext(mock.patch.object(time, "time", return_value=2000.0))
 
     def marker(self, *, stamp: float = 1999.0, action: str | None = "Choose retry.") -> Path:

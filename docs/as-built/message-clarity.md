@@ -260,7 +260,7 @@ The gate permits only an exact match. A missing template id or failed gate check
   Sent by: hana · Template: auto_mode.refused
   ```
 
-  - `Sent by` is `sender_name(source)`: the source on one line, at most 80 characters. A `send.py in <session>` source (`send.py`'s `default_sender()`) shows only the session; any other source (`stall-watch`, `rca`, `natedev`, `build-followups`, `send.py`, or the parent command line when there is no `--source`) shows as it is.
+  - `Sent by` shows the source on one line. `notify.pushover.max_source_chars` limits the sender name and the parent command to 80 characters. The parent command is the source when the command has no `--source` option. A source of the form `send.py in <session>` shows the session name.
   - `Template` is the `--text-id`, or `none (free text)` for a push with no text id.
   - The footer always fits in 1024 characters: a long message is cut at the end first, never the footer.
   - An empty sender is refused: nothing is posted, the log outcome is `refused before sending: no sender`, and the exit is 2.

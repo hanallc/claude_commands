@@ -55,6 +55,7 @@ from scripts.herdr import pane_launch
 from scripts.herdr import message_proof as _message_proof
 from scripts.agents import worker_lifecycle
 from scripts.lib import conf, models_registry, operation_deadline, script_prompts, session_folder
+from scripts.lib.agent_program import is_agent_process, is_claude_process as is_claude_process, is_codex_process as is_codex_process
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -5628,30 +5629,6 @@ def _foreground_arguments(process: dict[str, object]) -> list[str]:
     return [json_text(value, "foreground process argument") for value in cast(list[object], arguments)]
 
 
-def _is_agent_process(arguments: Sequence[str], kind: str) -> bool:
-    if not arguments:
-        return False
-    executable = Path(arguments[0]).name
-    if executable == kind:
-        return True
-    # The npm installations run a specific script through node, not a bare executable.
-    script = arguments[1] if len(arguments) > 1 else ""
-    return executable in {"node", "nodejs"} and (
-        kind == "claude" and script.endswith("/@anthropic-ai/claude-code/cli.js")
-        or kind == "codex" and script.endswith("/@openai/codex/bin/codex.js")
-    )
-
-
-def is_claude_process(arguments: Sequence[str]) -> bool:
-    """The argv is a Claude Code process, native or through node."""
-    return _is_agent_process(arguments, "claude")
-
-
-def is_codex_process(arguments: Sequence[str]) -> bool:
-    """The argv is a Codex process, native or through node."""
-    return _is_agent_process(arguments, "codex")
-
-
 class _StartupProcessGone(Exception):
     """The process has exited or is absent from the process snapshot."""
 
@@ -5871,7 +5848,7 @@ def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIde
                         belongs_to_agent = False
                 if not belongs_to_agent:
                     arguments = reader.arguments(pid)
-                    belongs_to_agent = _is_agent_process(arguments, kind)
+                    belongs_to_agent = is_agent_process(arguments, kind)
                     if not belongs_to_agent:
                         commands.append(arguments[0] if arguments else str(pid))
                 if belongs_to_agent:
@@ -7006,6 +6983,9 @@ class PreparedAgentEnvironment:
     directory: Path
     env: dict[str, str]
     unset_environment: frozenset[str] = NO_ENVIRONMENT_REMOVALS
+    model_configuration: models_registry.LaunchModelConfiguration | models_registry.FreshLaunchConfiguration = (
+        models_registry.FRESH_LAUNCH_CONFIGURATION
+    )
     claude_home: pane_launch.ImplicitClaudeHome | pane_launch.SelectedClaudeAccount = pane_launch.SelectedClaudeAccount.USE_SELECTION
 
 
@@ -7165,7 +7145,11 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
     launched_at = datetime.now(timezone.utc)
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":
-        agent_arguments = models_registry.claude_arguments(agent_arguments, prepared.env)
+        configuration = prepared.model_configuration
+        if not isinstance(configuration, models_registry.UnreadableLaunchModelConfiguration):
+            model_environment = (configuration.environment(prepared.env)
+                                 if isinstance(configuration, models_registry.LaunchModelConfiguration) else prepared.env)
+            agent_arguments = models_registry.claude_arguments(agent_arguments, model_environment)
         try:
             home = Path(prepared.env.get("HOME") or Path.home())
             configured = prepared.env.get("CLAUDE_CONFIG_DIR")

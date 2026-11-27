@@ -151,7 +151,7 @@ class PaneWorld(herdr.Herdr):
         _ = write_config_fixture(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
         _ = write_config_fixture(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
-        for name in ("detached_runs.conf", "postmaster.conf"):
+        for name in ("detached_runs.conf", "postmaster.conf", "user_zone.conf"):
             _ = write_config_fixture(config / name)
         registry = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {
@@ -1658,11 +1658,13 @@ class WorkerPaneTests(StaffTestCase):
     def test_resume_uses_the_pane_folder_only_for_codex(self) -> None:
         for family in ("codex", "claude"):
             with self.subTest(family=family):
-                _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
+                _ = write_registry(self.root / "conf/models.conf", {
+                    "assignments": {"direct": family}, "compact_windows": {"worker": "200k"}})
                 first = self.start("folder-" + family)
                 self.assertIsInstance(first, worker_panes.OpenWorker)
                 assert isinstance(first, worker_panes.OpenWorker)
                 self.assertNotIn("--cd", self.world.requests[-1][1])
+                first_arguments = self.world.requests[-1][1]
                 self.world.end_agent(first.pane)
                 resumed = self.start(first.row.name)
                 self.assertIsInstance(resumed, worker_panes.OpenWorker)
@@ -1673,9 +1675,33 @@ class WorkerPaneTests(StaffTestCase):
                 if family == "codex":
                     self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
                     self.assertEqual(arguments[arguments.index("--cd") + 1], str(self.root))
+                    self.assertNotIn("--autocompact", first_arguments)
+                    self.assertNotIn("--autocompact", arguments)
                 else:
                     self.assertEqual(arguments[:2], ["--resume", str(first.row.current_session)])
                     self.assertNotIn("--cd", arguments)
+                    for launch in (first_arguments, arguments):
+                        self.assertEqual(launch.count("--autocompact"), 1)
+                        self.assertEqual(launch[launch.index("--autocompact") + 1], "200k")
+
+    def test_parked_launch_keeps_saved_settings_and_uses_the_worker_compact_window(self) -> None:
+        _ = write_registry(self.root / "conf/models.conf", {"compact_windows": {"worker": "200k"}})
+        for family in ("claude", "codex"):
+            with self.subTest(family=family):
+                row = self.worker(f"parked-{family}", family=family)
+                parked_pass: dict[str, object] = {
+                    "status": "active",
+                    "parked_completion_id": "fixture-pass",
+                    "delivery": {"completion_id": "fixture-pass"},
+                    "parked_launch": {"thread": row.current_session, "family": family, "model": "saved-model",
+                                      "effort": "medium", "sandbox": "read-only", "permission": "acceptEdits"},
+                }
+                policy = worker_panes.parked_launch_policy(row, parked_pass)
+                assert isinstance(policy, worker_panes.LaunchPolicy)
+                self.assertEqual(policy.settings, models_registry.LaunchSettings(family, "saved-model", "medium", ""))
+                self.assertEqual((policy.sandbox, policy.permission), ("read-only", "acceptEdits"))
+                expected_window = ("--autocompact", "200k") if family == "claude" else ()
+                self.assertEqual(policy.compact_window, expected_window)
 
     def test_claude_launch_ignores_the_codex_compaction_limit(self) -> None:
         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}})

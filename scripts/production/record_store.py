@@ -14,18 +14,19 @@ from collections.abc import Callable, Collection, Generator, Iterable, Iterator,
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from io import StringIO
 from itertools import chain
 from pathlib import Path
 from threading import Lock
 from typing import NamedTuple, cast
 
-from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
+from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, existing_writer_lock, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
-from scripts.lib import git_files
+from scripts.lib import conf, git_files
 from scripts.lib.showrunner_state import state_root as state_root
 from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
-from scripts.production.issues import ALL_FIELDS, Issue, header_fields, source_paths
+from scripts.production.issues import ALL_FIELDS, Issue, source_paths
 from scripts.production.production_doc import (
     Refusal, document_history_file, former_live_documents, legacy_document_path,
     production_backup_checkout, production_field,
@@ -49,9 +50,23 @@ class RecordKind(StrEnum):
         return self.value[0].upper()
 
 
-def morty_ids(members: staff.StaffSnapshot) -> list[staff.StaffId]:
-    """Return the staff ID of each active producer named morty. Each caller decides what zero or two IDs mean."""
-    return [row.id for row in staff.active(members, "producer") if row.name == "morty"]
+def configured_list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Read the producer that owns the List."""
+    configured = settings.origin("page.list.owner", str)
+    if isinstance(configured, conf.UnavailableValue):
+        return None
+    row = members.by_id(staff.StaffId(configured.value))
+    return row if row is not None and row.kind == "producer" else None
+
+
+def list_keeper(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Find the active producer that owns the List."""
+    row = configured_list_producer(settings, members)
+    if (row is None or row.id not in members.rows_by_id or row.id in members.pending_retire
+            or isinstance(row.exited, staff.Exited) or isinstance(row.doc, staff.WrappedDoc)
+            or isinstance(row.worktree, staff.RemovedWorktree)):
+        return None
+    return row
 
 
 def record_owner(kind: RecordKind, issue: Issue, legacy_owner: str) -> staff.StaffId:
@@ -442,6 +457,83 @@ def stored_paths(folders: Iterable[Path], *, strict: bool = False,
                 raise
 
 
+def _configured_vault(stem: str, key: str) -> Iterator[Path]:
+    settings = conf.read(stem)
+    if not settings.repository_allowed:
+        try:
+            _ = settings.source.stat()
+        except FileNotFoundError:
+            return
+    yield Path(settings.text(key)).expanduser().resolve()
+
+
+@dataclass(frozen=True)
+class ReviewScanFolder:
+    path: Path
+    recursive: bool
+
+
+def _review_scan_entries(folder: Path) -> tuple[os.DirEntry[str], ...]:
+    with os.scandir(folder) as stream:
+        return tuple(stream)
+
+
+def configured_review_vaults() -> tuple[Path, ...]:
+    return (*_configured_vault("staff", "producer_folder_root"), *_configured_vault("issue_score", "vault_root"))
+
+
+def local_review_paths(extra_roots: Iterable[Path] = ()) -> Iterator[Path]:
+    """Scan configured vaults, native stores, and registered or explicit stores."""
+    vaults = configured_review_vaults()
+    state = state_root()
+    native = owner_state_paths(state, "questions", "investigations", "proposals", strict=True)
+    archives = owner_state_paths(state, "archive", strict=True)
+    registrations = owner_state_paths(state / "review-folders", *(kind.value + ".json" for kind in RecordKind), strict=True)
+    registered = (folder for registration in registrations for folder in _registered_folders(registration))
+    stores = tuple(dict.fromkeys(path.expanduser().resolve() for path in chain(native, registered, extra_roots)))
+    pending = [
+        *(ReviewScanFolder(path, False) for path in stores),
+        *(ReviewScanFolder(path, True) for path in (*archive_folders(stores), *(path.resolve() for path in archives))),
+        *(ReviewScanFolder(path, True) for path in vaults),
+    ]
+    visited: set[ReviewScanFolder] = set()
+    notes: set[Path] = set()
+    while pending:
+        folder = pending.pop()
+        if folder in visited:
+            continue
+        visited.add(folder)
+        try:
+            entries = _review_scan_entries(folder.path)
+        except FileNotFoundError:
+            continue
+        for entry in entries:
+            try:
+                if folder.recursive and entry.name != ".git" and entry.is_dir(follow_symlinks=False):
+                    pending.append(ReviewScanFolder(Path(entry.path), True))
+                    continue
+                if not entry.name.endswith(".md") or not entry.is_file(follow_symlinks=False):
+                    continue
+            except FileNotFoundError:
+                continue
+            path = Path(entry.path)
+            if path not in notes:
+                notes.add(path)
+                yield path
+
+
+@dataclass(frozen=True)
+class VanishedReviewNote:
+    """A writer removed the note before the migration could read it."""
+
+
+def read_note_for_proof_move(path: Path) -> str | VanishedReviewNote:
+    try:
+        return path.read_text(encoding="utf-8", newline="")
+    except FileNotFoundError:
+        return VanishedReviewNote()
+
+
 def read_header(path: Path, *, sources: list[Path] | None = None, keys: frozenset[str] = ALL_FIELDS,
                 select: Callable[[Issue], bool] | None = None, strict: bool = False) -> dict[str, list[str]]:
     """Read a header. A source collector requires readable files."""
@@ -456,16 +548,14 @@ def read_header(path: Path, *, sources: list[Path] | None = None, keys: frozense
 def number_fields(path: Path, keys: frozenset[str]) -> Issue:
     """Read every byte and report a file that cannot supply its fields."""
     try:
-        first, _, tail = path.read_text(encoding="utf-8").partition("\n")
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise OSError(f"Cannot read record {path}: {error}") from error
-    if first.strip() == "---":
-        header: list[str] = []
-        for line in tail.split("\n"):
-            if line.strip() == "---":
-                return Issue(path, header_fields(header, keys))
-            header.append(line)
-    return Issue(path, {})
+    return record_text_fields(path, text, keys)
+
+
+def record_text_fields(path: Path, text: str, keys: frozenset[str] = ALL_FIELDS) -> Issue:
+    return Issue(path, issues.issue_text_header(text).decoded_fields(keys))
 
 
 def _sequence_path(kind: RecordKind) -> Path:
@@ -633,14 +723,20 @@ class LockedRecordNumbers:
 
     @contextmanager
     def write(self, path: Path, identity: str, owner: staff.StaffId, *,
-              folder: Path | None = None, new_record: bool = False,
+              folder: Path | None = None, new_record: bool = False, preview: bool = False,
               before_write: Callable[[], None] = lambda: None) -> Generator[None]:
-        """Read the registry before the callback. Reserve the ID before publication."""
+        """Check the registry and reserve the ID unless this is a preview."""
         try:
             root = (path.parent if folder is None else folder).resolve()
             ceiling = self.number(identity)
             registry = _folder_registry(owner, self.kind)
             folders = _registered_folders(registry)
+            if preview:
+                _ = _file_bytes(registry)
+                if not new_record:
+                    _ = _file_bytes(path)
+                yield
+                return
             with keep_file_on_error(registry):
                 before_write()
                 if ceiling > self.high_water:
@@ -667,11 +763,14 @@ class LockedRecordNumbers:
 
 
 @contextmanager
-def record_numbers(kind: RecordKind, read_id: Callable[[Path], str]) -> Generator[LockedRecordNumbers]:
+def record_numbers(kind: RecordKind, read_id: Callable[[Path], str], *,
+                   existing_only: bool = False) -> Generator[LockedRecordNumbers]:
     """Hold one sequence lock across its checks and native publication."""
     path = _sequence_path(kind)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with exclusive(path.with_suffix(".lock")):
+    if not existing_only:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    with existing_writer_lock(lock_path) if existing_only else exclusive(lock_path):
         yield LockedRecordNumbers(kind, read_id, _read_high_water(path))
 
 
@@ -747,9 +846,8 @@ def section(name: str) -> str:
 
 
 def lines_with_endings(text: str) -> list[str]:
-    """Split at LF and keep each line ending."""
-    *lines, tail = text.split("\n")
-    return [*(line + "\n" for line in lines), *([tail] if tail else [])]
+    """Split at CR or LF and keep each line ending."""
+    return list(StringIO(text, newline=""))
 
 
 def has_line_break(text: str) -> bool:
@@ -802,24 +900,32 @@ class NumberedRecords:
         return self.folder() / ".next-number"
 
     def require_list_keeper(self) -> None:
-        keepers = morty_ids(staff.snapshot())
-        if self.collection != "list" or self.prefix != "L" or keepers != [self.owner]:
-            raise self.error_type("only morty's List folder can allocate List numbers")
+        keeper = list_keeper(conf.read_or_repository("console"), staff.snapshot())
+        if keeper is None:
+            raise self.error_type("The List keeper is unavailable.")
+        if self.collection != "list" or self.prefix != "L" or keeper.id != self.owner:
+            raise self.error_type(f"only {keeper.name}'s List folder can allocate List numbers")
 
     @contextmanager
     def list_allocation(self) -> Generator[None]:
         """Check the keeper before creating or locking its folder."""
         with staff.supplied_snapshot(staff.snapshot()):
             self.require_list_keeper()
-            with self.locked():
+            root = state_root()
+            root.mkdir(parents=True, exist_ok=True)
+            with exclusive(root / ".list-allocation.lock"), self.locked(check=self.require_list_keeper):
                 yield
+
+    def _list_folders(self) -> Iterator[Path]:
+        for owner in state_root().iterdir():
+            if owner.is_dir() and not owner.is_symlink():
+                folder = owner / self.collection
+                if not folder.is_symlink():
+                    yield folder
 
     def _previous_numbers(self) -> Iterator[int]:
         """Read record names and the migration log, including closed records."""
-        for owner in state_root().iterdir():
-            if not owner.is_dir() or owner.is_symlink():
-                continue
-            folder = owner / self.collection
+        for folder in self._list_folders():
             try:
                 names = [path.name for path in folder.iterdir()]
             except FileNotFoundError:
@@ -841,8 +947,7 @@ class NumberedRecords:
                 if identity != name and self.valid_id(identity):
                     yield int(identity[len(self.prefix):])
 
-    def _saved_next_number(self) -> int:
-        path = self.counter_path()
+    def _saved_next_number(self, path: Path) -> int:
         if path.is_symlink():
             raise self.error_type(f"{path}: expected a regular counter file")
         try:
@@ -856,7 +961,11 @@ class NumberedRecords:
     def next_number(self) -> int:
         """Read the next number under the store lock."""
         self.require_list_keeper()
-        number = self._saved_next_number() or max(self._previous_numbers(), default=0) + 1
+        counter = self.counter_path()
+        saved = self._saved_next_number(counter)
+        former = (self._saved_next_number(folder / counter.name) for folder in self._list_folders()
+                  if folder != counter.parent)
+        number = max(saved or max(self._previous_numbers(), default=0) + 1, max(former, default=0))
         while os.path.lexists(self.path(f"{self.prefix}{number}")):
             number += 1
         return number
@@ -881,20 +990,15 @@ class NumberedRecords:
             raise self.error_type(f"{identity}: no {self.noun} for owner {self.owner}") from None
         except UnicodeDecodeError as error:
             raise self.invalid(identity, error) from None
+        return self.parse_text(identity, text)
+
+    def parse_text(self, identity: str, text: str) -> RecordText:
         try:
-            if not text.startswith("---\n"):
-                raise ValueError("missing frontmatter")
-            header, body = text[4:].split("\n---\n\n", 1)
-            fields: dict[str, str] = {}
-            for line in header.split("\n"):
-                key, value = line.split(": ", 1)
-                decoded = cast(object, json.loads(value))
-                if not isinstance(decoded, str) or key in fields:
-                    raise ValueError("invalid field")
-                fields[key] = decoded
-            if fields["id"] != identity:
+            note = issues.located_numbered_note(text)
+            record = RecordText(note.decoded_fields(), note.body)
+            if record.fields["id"] != identity:
                 raise ValueError("record ID differs from the selected ID")
-            return RecordText(fields, body)
+            return record
         except (ValueError, KeyError) as error:
             raise self.invalid(identity, error) from None
 
@@ -902,16 +1006,13 @@ class NumberedRecords:
         """Read one header field before loading the record body or log."""
         try:
             with (self.path(identity) if path is None else path).open(encoding="utf-8", newline="\n") as stream:
-                if stream.readline() != "---\n":
+                if stream.readline().rstrip("\r\n") != "---":
                     raise ValueError("missing frontmatter")
                 for line in stream:
-                    if line.rstrip("\n") == "---":
+                    if line.rstrip("\r\n") == "---":
                         break
                     if line.startswith(name+": "):
-                        value = cast(object, json.loads(line[len(name)+2:]))
-                        if isinstance(value, str):
-                            return value
-                        raise ValueError("invalid field")
+                        return issues.decode_numbered_field(line[len(name)+2:])
             raise ValueError("missing "+name)
         except FileNotFoundError:
             raise self.error_type(f"{identity}: no {self.noun} for owner {self.owner}") from None

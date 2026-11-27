@@ -13,7 +13,8 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.production import add_unit
-from scripts.production import autocompact
+from scripts.lib import autocompact
+from scripts.lib.test_models_registry import write_registry
 from scripts.agents import inventory
 from scripts.accounts import accounts
 from scripts.message import sessions
@@ -169,9 +170,14 @@ class AddUnitAccountsTests(AddUnitTestCase):
         self.assertEqual(self.pane_environment()["CLAUDE_CODE_REMOTE_MEMORY_DIR"], str(Path(self.env["HOME"]) / ".claude"))
 
     def test_new_named_unit_passes_selected_account_variables(self) -> None:
+        self.write_agent_config()
+        _ = write_registry(self.agent_config, {"compact_windows": {"unit": "250k"}}, update=True)
         directory = self.prepare_unit_account("claude3")
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
+        arguments = self.agent_arguments()
+        self.assertEqual(arguments.count("--autocompact"), 1)
+        self.assertEqual(arguments[arguments.index("--autocompact") + 1], "250k")
 
     def test_explicit_unit_account_move_passes_prepared_account_variables(self) -> None:
         directory = self.prepare_unit_account("claude3")
@@ -193,6 +199,8 @@ class AddUnitAccountsTests(AddUnitTestCase):
         self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
 
     def test_resume_autocompact_is_recorded_and_passed_to_claude(self) -> None:
+        self.write_agent_config()
+        _ = write_registry(self.agent_config, {"compact_windows": {"unit": "250k"}}, update=True)
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",

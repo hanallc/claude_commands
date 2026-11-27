@@ -36,7 +36,6 @@ from scripts.test_times import task_cpu
 
 
 STAGE_START = Struct("d")
-OUTPUT_REPLAY_LIMIT_BYTES = 1024 * 1024
 
 
 class MeasuredTest(TypedDict):
@@ -328,11 +327,12 @@ def main(argv: list[str] | None = None) -> int:
     request = parser.parse_args(argv, namespace=CostArguments())
     try:
         timeout_s = task_cpu.measurement_timeout_s()
+        replay_limit = conf.read("test_times").whole("module_cost.max_output_replay_bytes")
     except conf.Unusable as error:
         print(f"module_cost: {error}", file=sys.stderr, flush=True)
         return 1
     timeout_message = ""
-    with child_output(sys.stdout) as stdout, child_output(sys.stderr) as stderr:
+    with child_output(sys.stdout, replay_limit) as stdout, child_output(sys.stderr, replay_limit) as stderr:
         try:
             status = start_supervisor(request, timeout_s, stdout, stderr)
         except task_cpu.MeasurementTimeout as error:
@@ -344,14 +344,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 @contextmanager
-def child_output(stream: TextIO) -> Generator[TextIO]:
+def child_output(stream: TextIO, replay_limit: int) -> Generator[TextIO]:
     """Copy a limited snapshot and preserve the child's write offset."""
     stream.flush()
     with TemporaryFile(mode="w+", encoding="utf-8", errors="backslashreplace") as output:
         yield output
         descriptor = output.fileno()
         size = os.fstat(descriptor).st_size
-        limit = min(size, OUTPUT_REPLAY_LIMIT_BYTES)
+        limit = min(size, replay_limit)
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         offset = 0
         ends_with_newline = True

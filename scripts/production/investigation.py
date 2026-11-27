@@ -15,7 +15,9 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager, nullco
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from enum import StrEnum
+from enum import Enum, StrEnum
+from importlib import import_module
+from io import StringIO
 from pathlib import Path
 from typing import cast, override
 
@@ -24,8 +26,8 @@ from scripts.console_text import check as console_text
 from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_routing, delivery_state, record_store, staff
-from scripts.production.issues import Issue
-from scripts.review_links import new_item_dialog, reply_tokens, review_events
+from scripts.production.issues import Issue, header_fields, located_numbered_note
+from scripts.review_links import new_item_dialog, reply_proofs, reply_tokens, review_events
 from scripts.review_links.review_events import ReviewLog
 from scripts.production.record_store import state_root as state_root
 
@@ -47,6 +49,56 @@ class InvestigationKind(StrEnum):
     BUG = "bug"
 
 
+class InvestigationPurpose(StrEnum):
+    INVESTIGATE = "investigate"
+    LIST_INVESTIGATION = "List investigation"
+    BUG_REPORT = "bug report"
+    MOVING_LEGACY_BUG = "moving legacy bug"
+    ENHANCEMENT = "enhancement"
+
+
+_filing_purpose: ContextVar[InvestigationPurpose] = ContextVar(
+    "filing_purpose", default=InvestigationPurpose.INVESTIGATE)
+
+
+@contextmanager
+def file_for_list(purpose: InvestigationPurpose) -> Generator[None]:
+    """Keep the selected report type when the submission uses the investigation store."""
+    token = _filing_purpose.set(purpose)
+    try:
+        yield
+    finally:
+        _filing_purpose.reset(token)
+
+
+@dataclass(frozen=True)
+class ListDestination:
+    """The List row that owns the report workflow."""
+
+    keeper: staff.StaffId
+    number: int
+
+
+class NoListDestination(Enum):
+    ABSENT = "still on Review"
+
+
+class CliFilingOutput(StrEnum):
+    PENDING = "awaiting native ID output"
+    NONE = ""
+
+
+def _read_list_destination(raw: str) -> ListDestination | NoListDestination:
+    if not raw:
+        return NoListDestination.ABSENT
+    data = cast(object, json.loads(raw))
+    match data:
+        case [str(keeper), int(number)] if keeper and number > 0:
+            return ListDestination(staff.StaffId(keeper), number)
+        case _:
+            raise InvestigationError("invalid List destination")
+
+
 @dataclass(frozen=True)
 class Investigation:
     id: str
@@ -62,6 +114,21 @@ class Investigation:
     waiting_why: str = ""
     kind: InvestigationKind = InvestigationKind.INVESTIGATION
     submission: new_item_dialog.SubmissionOrigin = new_item_dialog.NoReviewSubmission()
+    list_destination: ListDestination | NoListDestination = NoListDestination.ABSENT
+    purpose: InvestigationPurpose = InvestigationPurpose.INVESTIGATE
+    cli_output: CliFilingOutput = CliFilingOutput.NONE
+
+    @property
+    def belongs_on_list(self) -> bool:
+        return (self.purpose is not InvestigationPurpose.INVESTIGATE
+                or isinstance(self.list_destination, ListDestination))
+
+    @property
+    def submission_scope(self) -> str:
+        if isinstance(self.submission, new_item_dialog.ReviewSubmission):
+            return new_item_dialog.submission_key(new_item_dialog.SubmissionKind(self.kind.value), self.owner,
+                                                  self.id, self.submission.request_id)
+        return ""
 
     @property
     def source_owner(self) -> staff.StaffId:
@@ -84,13 +151,19 @@ class Investigations(record_store.NumberedRecords):
 
     @override
     @contextmanager
-    def locked(self, *, check: Callable[[], object] | None = None) -> Generator[None]:
+    def locked(self, *, check: Callable[[], object] | None = None, existing_only: bool = False) -> Generator[None]:
         path = self.lock_path().resolve()
         held = _held_recipients.get()
         if path in held:
             if check is not None:
                 _ = check()
             yield
+            return
+        if existing_only:
+            with atomic_file.existing_writer_lock(path):
+                if check is not None:
+                    _ = check()
+                yield
             return
         with super().locked():
             token = _held_recipients.set(held | {path})
@@ -134,8 +207,26 @@ def folder(owner: staff.StaffId) -> Path:
     return _store(owner).folder()
 
 
+def _header_lines(path: Path) -> list[str]:
+    """Decode the header without reading the body as text."""
+    try:
+        with path.open("rb") as stream:
+            if stream.readline().decode("utf-8").strip() == "---":
+                lines: list[str] = []
+                for raw in stream:
+                    line = raw.decode("utf-8").rstrip("\r\n")
+                    if line.strip() == "---":
+                        return lines
+                    lines.append(line)
+    except (OSError, UnicodeError) as error:
+        raise OSError(f"Cannot read record {path}: {error}") from error
+    return []
+
+
 def _record_id(path: Path, *, strict: bool = False) -> str:
-    fields = record_store.read_header(path, keys=frozenset(("id", "owner")), strict=strict)
+    keys = frozenset(("id", "owner"))
+    fields = (header_fields(_header_lines(path), keys) if strict
+              else record_store.read_header(path, keys=keys))
     issue = Issue(path, fields)
     identity = issue.value("id")
     return identity if re.fullmatch(r"I[1-9][0-9]*", identity) else ""
@@ -145,8 +236,9 @@ def _seed_id(path: Path) -> str:
     return _record_id(path, strict=True)
 
 
-def investigation_numbers() -> AbstractContextManager[record_store.LockedRecordNumbers]:
-    return record_store.record_numbers(record_store.RecordKind.INVESTIGATION, _seed_id)
+def investigation_numbers(*, existing_only: bool = False) -> AbstractContextManager[record_store.LockedRecordNumbers]:
+    return record_store.record_numbers(record_store.RecordKind.INVESTIGATION, _seed_id,
+                                       existing_only=existing_only)
 
 
 def review_record_ids(owner: staff.StaffId, *, strict: bool = False) -> Iterator[tuple[Path, str]]:
@@ -170,6 +262,10 @@ def _record_path(store: Investigations, identity: str, *, strict: bool = True) -
     if not paths:
         raise InvestigationError(f"{identity}: no investigation for owner {store.owner}")
     return paths[0]
+
+
+def review_record_path(owner: staff.StaffId, identity: str) -> Path:
+    return _record_path(_store(owner), identity)
 
 
 def load(owner: staff.StaffId, identity: str, *, sources: list[Path] | None = None) -> Investigation:
@@ -225,6 +321,8 @@ def _load(store: Investigations, identity: str, path: Path, *, sources: list[Pat
         recorded_owner = record_store.record_owner(record_store.RecordKind.INVESTIGATION, header, store.owner)
         if isinstance(submission, new_item_dialog.ReviewSubmission):
             _ = new_item_dialog.request_recipient(new_item_dialog.SubmissionKind(kind.value), submission.request_id)
+            proof = reply_proofs.read(submission.proof_identity(fields["id"]))
+            submission = submission.with_reply_proof(proof.reply)
         if recorded_owner != store.owner:
             raise ValueError("record identity differs from its path")
         question, answer = record_store.split_section(body, int(fields["question_length"]), "Answer")
@@ -232,7 +330,9 @@ def _load(store: Investigations, identity: str, path: Path, *, sources: list[Pat
                              InvestigationState(fields["state"]), fields["filed"], fields["answered"],
                              fields["read"], question, answer, review_events.decode(fields.get("review_log", "")),
                              review_events.waiting_why(fields.get("waiting_why", "")), kind,
-                             submission)
+                             submission, _read_list_destination(fields.get("list_destination", "")),
+                             InvestigationPurpose(fields.get("purpose", InvestigationPurpose.INVESTIGATE)),
+                             CliFilingOutput(fields.get("cli_output", "")))
         if not item.title.strip() or record_store.has_line_break(item.title):
             raise ValueError("title must have one line")
         for name, value, required in (
@@ -278,14 +378,28 @@ def _save(store: Investigations, item: Investigation, path: Path,
               "filed": item.filed, "answered": item.answered, "read": item.read,
               "question_length": str(len(item.question)), "review_log": review_events.encode(item.log),
               "waiting_why": item.waiting_why, "kind": item.kind}
+    publication = nullcontext()
     if isinstance(item.submission, new_item_dialog.ReviewSubmission):
+        if not new_record:
+            _require_moved(store, item.id, path)
+        if new_record:
+            identity = item.submission.proof_identity(item.id)
+            publication = reply_proofs.publishing(identity, reply_proofs.NoteProof(reply=item.submission.reply_proof))
         fields["review_submission"] = json.dumps(new_item_dialog.stored_submission(item.submission))
+    if item.purpose is not InvestigationPurpose.INVESTIGATE:
+        fields["purpose"] = item.purpose
+    destination = item.list_destination
+    if isinstance(destination, ListDestination):
+        fields["list_destination"] = json.dumps((destination.keeper, destination.number))
+    if item.cli_output is CliFilingOutput.PENDING:
+        fields["cli_output"] = item.cli_output
     body = f"{item.question}{ANSWER_SECTION}{item.answer}"
     with investigation_numbers() if numbers is None else nullcontext(numbers) as sequence:
         with sequence.write(path, item.id, store.owner, folder=store.folder(), new_record=new_record,
                             before_write=before_write):
             try:
-                store.write(item.id, fields, body, path=path, new_record=new_record)
+                with publication:
+                    store.write(item.id, fields, body, path=path, new_record=new_record)
             except record_store.ReusedReviewRecord:
                 return read_review_record(path)
     return item
@@ -294,14 +408,15 @@ def _save(store: Investigations, item: Investigation, path: Path,
 def write_review_submission(path: Path, item: Investigation, details: new_item_dialog.ReviewSubmission) -> None:
     """Update the submission fields while the caller holds the record lock."""
     store = _store(item.owner)
-    _write_submission_fields(store, item.id, path, new_item_dialog.stored_submission(details))
+    _require_moved(store, item.id, path)
+    text = path.read_text(encoding="utf-8", newline="")
+    _write_submission_fields(store, item.id, path, new_item_dialog.stored_submission(details), text)
 
 
 def _write_submission_fields(store: Investigations, identity: str, path: Path,
-                             fields: dict[str, object]) -> None:
+                             fields: dict[str, object], text: str) -> None:
     """Replace the submission field without rewriting the rest of the note."""
-    with path.open(encoding="utf-8", newline="") as stream:
-        lines = record_store.lines_with_endings(stream.read())
+    lines = list(StringIO(text, newline="\n"))
     for index, line in enumerate(lines[1:], 1):
         if line.rstrip("\r\n") == "---":
             break
@@ -309,37 +424,58 @@ def _write_submission_fields(store: Investigations, identity: str, path: Path,
             newline = line[len(line.rstrip("\r\n")):]
             lines[index] = "review_submission: " + json.dumps(json.dumps(fields), ensure_ascii=False) + newline
             with investigation_numbers() as numbers, numbers.write(path, identity, store.owner, folder=store.folder()):
-                atomic_file.write_text_atomic(path, "".join(lines))
+                atomic_file.write_locked_atomic(path, "".join(lines))
             return
     raise InvestigationError(f"{path}: the Review submission field is missing")
 
 
-def renew_reply_proof(path: Path, item: Investigation, proof: reply_tokens.ReplyTokenProof) -> None:
-    """Replace the proof under the Investigation lock."""
-    store = _store(item.owner)
-    fields, _ = store.read(item.id, path=path)
-    value = cast(dict[str, object], json.loads(fields["review_submission"]))
-    _write_submission_fields(store, item.id, path, new_item_dialog.renewed_submission_fields(value, proof))
+def _require_moved(store: Investigations, identity: str, path: Path) -> None:
+    raw = store.field(identity, "review_submission", path=path)
+    if raw and reply_proofs.has_legacy_submission(cast(dict[str, object], json.loads(raw))):
+        raise InvestigationError("Move the reply proof before editing this note.")
 
 
-def scrub_reply_token(path: Path, owner: staff.StaffId, identity: str) -> bool:
-    store = _store(owner)
-    with store.locked():
-        fields, _ = store.read(identity, path=path)
+def move_reply_proof(path: Path, *, run: reply_proofs.ProofMoveRun) -> int:
+    store = _store(review_owner(path))
+    with store.locked(existing_only=run.dry_run):
+        text = record_store.read_note_for_proof_move(path)
+        if isinstance(text, record_store.VanishedReviewNote):
+            return 0
+        fields = located_numbered_note(text).decoded_fields()
+        identity = fields.get("id", "")
+        if not store.valid_id(identity):
+            raise InvestigationError("Invalid investigation ID.")
         raw = fields.get("review_submission", "")
         if not raw:
-            return False
-        value = cast(dict[str, object], json.loads(raw))
-        details = new_item_dialog.read_submission(value)
-        updated = new_item_dialog.hashed_submission_fields(value, details)
-        if updated is value:
-            return False
-        _write_submission_fields(store, identity, path, updated)
-        return True
+            return 0
+        header = Issue(path, {"owner": [fields["owner"]]} if "owner" in fields else {})
+        if record_store.record_owner(record_store.RecordKind.INVESTIGATION, header, store.owner) != store.owner:
+            raise InvestigationError("The selected investigation changed.")
+        removal = reply_proofs.prepare_note_removal(text, reply_proofs.ProofNoteLayout.SUBMISSION)
+        if not removal.fields:
+            return 0
+        details = new_item_dialog.read_submission(removal.submission)
+        proof_id = details.proof_identity(identity)
+
+        def write(changed: str) -> None:
+            with investigation_numbers(existing_only=run.dry_run) as numbers, numbers.write(
+                    path, identity, store.owner, folder=store.folder(), preview=run.dry_run):
+                if not run.dry_run:
+                    atomic_file.write_locked_atomic(path, changed)
+
+        return run.apply(path, text, removal, [(proof_id, removal.proof)], write,
+                         open_item=fields["state"] in (InvestigationState.OPEN, InvestigationState.ANSWER_READY))
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _filing_title(title: str) -> str:
+    normalized = title.strip()
+    if not normalized or record_store.has_line_break(title):
+        raise InvestigationError("title must have one nonempty line")
+    return normalized
 
 
 def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = "",
@@ -347,8 +483,7 @@ def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = 
          submission: new_item_dialog.SubmissionOrigin = _NO_REVIEW_SUBMISSION,
          before_write: Callable[[str, Path], None] = lambda _id, _path: None) -> Investigation:
     """File an Investigation with the next number on this machine."""
-    if not title.strip() or record_store.has_line_break(title):
-        raise InvestigationError("title must have one nonempty line")
+    _ = _filing_title(title)
     if not question.strip():
         raise InvestigationError("question must not be empty")
     reason = review_events.require_waiting_why(waiting_why)
@@ -360,7 +495,7 @@ def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = 
         names: set[str] = set()
         while True:
             item = Investigation(identity, owner, title, InvestigationState.OPEN, _now(), "", "", question, "",
-                                 log, reason, kind, submission)
+                                 log, reason, kind, submission, purpose=_filing_purpose.get())
             path = record_store.free_record_path(store.path(identity), names)
             try:
                 saved = _save(store, item, path, numbers, new_record=True,
@@ -372,6 +507,58 @@ def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = 
             if saved is not item:
                 before_write(saved.id, path)
             return saved
+
+
+@dataclass(frozen=True)
+class CliFilingWords:
+    title: str
+    question: str
+    waiting_why: str
+
+
+def _cli_filing_words(title: str, question: str, reason: str) -> CliFilingWords:
+    return CliFilingWords(_filing_title(title), question, review_events.waiting_why(reason))
+
+
+@contextmanager
+def cli_filing(owner: staff.StaffId, title: str, question: str, reason: str
+               ) -> Generator[tuple[Path, Investigation]]:
+    """Resume an unfinished CLI filing with the same words."""
+    reason = review_events.require_waiting_why(reason)
+    requested = _cli_filing_words(title, question, reason)
+    store = _store(owner)
+    with store.locked():
+        roots = record_store.known_folders(record_store.RecordKind.INVESTIGATION, owner, strict=True)
+        for path in record_store.stored_paths(roots, strict=True):
+            header = _header_lines(path)
+            fields = header_fields(header, frozenset({
+                "id", "purpose", "review_submission", "list_destination", "cli_output",
+            }))
+            identity = Issue(path, fields).value("id")
+            if (not store.valid_id(identity)
+                    or fields.get("purpose") != [InvestigationPurpose.LIST_INVESTIGATION]
+                    or fields.get("review_submission")
+                    or (fields.get("list_destination")
+                        and fields.get("cli_output") != [CliFilingOutput.PENDING])):
+                continue
+            try:
+                report = _load(store, identity, path)
+            except (OSError, InvestigationError) as error:
+                raw_title = next((line.removeprefix("title: ") for line in header if line.startswith("title: ")), "null")
+                stored_title = cast(object, json.loads(raw_title))
+                if not isinstance(stored_title, str) or _filing_title(stored_title) == requested.title:
+                    raise
+                print(f"investigation: {path}: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
+                continue
+            if _cli_filing_words(report.title, report.question, report.waiting_why) == requested:
+                break
+        else:
+            with file_for_list(InvestigationPurpose.LIST_INVESTIGATION):
+                report = file(owner, title, question, waiting_why=reason)
+            path = _record_path(store, report.id)
+        yield path, report
+        current = read_review_record(path)
+        _ = _save(store, replace(current, cli_output=CliFilingOutput.NONE), path)
 
 
 def answer(owner: staff.StaffId, identity: str, text: str, *, question_id: str = '') -> Investigation:
@@ -466,6 +653,60 @@ def _prepare_answer(store: Investigations, identity: str, text: str, question_id
     return save
 
 
+class ListFilingMode(Enum):
+    NEW_REPORT = "new report"
+    MOVE_BUG = "move and close the old Bug"
+    MOVE_WAIT = "move and keep the native reply open"
+
+
+def file_on_list(path: Path, write_list_item: Callable[[Investigation], ListDestination], *,
+                 mode: ListFilingMode = ListFilingMode.NEW_REPORT) -> Investigation:
+    """Keep the native evidence and commit the List destination under the source lock."""
+    store = _store(review_owner(path))
+    with store.locked():
+        item = read_review_record(path)
+        if isinstance(item.list_destination, ListDestination) or (mode is not ListFilingMode.NEW_REPORT and
+                                                                  item.state == InvestigationState.READ):
+            return item
+        if mode is ListFilingMode.MOVE_WAIT and item.state != InvestigationState.OPEN:
+            return item
+        if mode is ListFilingMode.MOVE_BUG and item.purpose is InvestigationPurpose.INVESTIGATE:
+            # Prevent Review actions before the List row becomes visible.
+            item = _save(store, replace(item, purpose=InvestigationPurpose.MOVING_LEGACY_BUG), path)
+        destination = write_list_item(item)
+        if (mode is ListFilingMode.NEW_REPORT and item.purpose is InvestigationPurpose.LIST_INVESTIGATION
+                and isinstance(item.submission, new_item_dialog.NoReviewSubmission)):
+            item = replace(item, cli_output=CliFilingOutput.PENDING)
+        if mode is not ListFilingMode.NEW_REPORT:
+            moment = datetime.now(timezone.utc)
+            stamp = moment.isoformat()
+            event = ReviewLog(moment, "nate", f"moved to List item {destination.number}")
+            item = replace(item, log=(*item.log, event))
+            if mode is ListFilingMode.MOVE_BUG:
+                item = replace(item, state=InvestigationState.READ, answered=item.answered or stamp, read=stamp)
+        return _save(store, replace(item, list_destination=destination), path)
+
+
+def list_destination_has_submission(destination: ListDestination, scope: str) -> bool:
+    """Check the saved report reference at the List destination."""
+    store = record_store.NumberedRecords(destination.keeper, "list", "L", "list item", InvestigationError)
+    fields, _ = store.read(f"L{destination.number}")
+    reference = cast(object, json.loads(fields.get("report", "null")))
+    match reference:
+        case [str(), str(), str(), str(saved_scope)]:
+            return saved_scope == scope
+        case _:
+            return False
+
+
+def list_evidence_record(key: str) -> Investigation:
+    """Read the original report for its List details."""
+    kind, owner, identity = key.split("/")
+    if kind != "investigation":
+        raise InvestigationError("invalid List report evidence key")
+    return load(staff.StaffId(owner), identity)
+
+
 def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
               check: Callable[[], object] | None = None) -> Investigation:
     """Mark an answer read once; accept an exact repeat without writing."""
@@ -475,6 +716,8 @@ def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
         item = _load(store, identity, path)
         if item.state == InvestigationState.READ:
             return item
+        if item.belongs_on_list:
+            raise InvestigationError("Open the report on the List.")
         if item.state != InvestigationState.ANSWER_READY:
             raise InvestigationError(f"{identity}: cannot read an investigation in state {item.state}")
         item = replace(item, state=InvestigationState.READ, read=_now(),
@@ -493,6 +736,8 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str, 
     with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
+        if item.belongs_on_list:
+            raise InvestigationError("Open the report on the List.")
         replace_wait = (item.state == InvestigationState.OPEN and action == 'question'
                         and isinstance(new_reply_proof, reply_tokens.ReplyTokenProof)
                         and isinstance(item.submission, new_item_dialog.ReviewSubmission))
@@ -507,7 +752,7 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str, 
             submission = item.submission
             if isinstance(submission, new_item_dialog.ReviewSubmission):
                 proof = new_reply_proof if isinstance(new_reply_proof, reply_tokens.ReplyTokenProof) else reply_tokens.mint()
-                submission = submission.with_reply_proof(proof)
+                submission = submission.next_reply_wait(item.id, proof)
             item = replace(item,state=InvestigationState.OPEN,answered='',read='',log=(*item.log,event),
                            waiting_why=review_events.require_waiting_why(words),submission=submission)
         else:
@@ -522,6 +767,8 @@ def record_review_log(owner: staff.StaffId, identity: str, words: str, *,
     with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
+        if item.belongs_on_list:
+            raise InvestigationError("Open the report on the List.")
         event = ReviewLog(datetime.now(timezone.utc), 'nate', words)
         _ = _save(store, replace(item, log=review_events.append(item.log, event)), path)
 
@@ -532,6 +779,8 @@ def change_waiting(record: Investigation, action: str, words: str, *, check: Cal
     with store.locked(check=check):
         path = _record_path(store, record.id)
         item = _load(store, record.id, path)
+        if item.belongs_on_list:
+            raise InvestigationError("Open the report on the List.")
         if item.submission != record.submission or item.state != InvestigationState.OPEN:
             raise InvestigationError("The selected investigation changed.")
         now = datetime.now(user_zone())
@@ -585,7 +834,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise InvestigationError("owner has no staff row")
             owner = target.id
         if command == "file":
-            print(file(owner, cast(str, args.title), cast(str, args.question), waiting_why=cast(str, args.waiting_why)).id)
+            file_report = cast(Callable[[staff.StaffId, str, str, str, staff.StaffSnapshot], AbstractContextManager[str]],
+                               import_module("scripts.production.the_list").file_cli_investigation)
+            with file_report(owner, cast(str, args.title), cast(str, args.question), cast(str, args.waiting_why),
+                             record) as identity:
+                print(identity, flush=True)
         elif command == "answer":
             _ = answer(owner, cast(str, args.id), cast(str, args.text))
         elif command == "read":
