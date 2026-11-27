@@ -3505,6 +3505,22 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.layouts["w1:t1"], expected)
         self.assertEqual(self.world.closed, [])
 
+    def test_open_balances_the_layout_with_a_free_slot_after_the_operation_deadline(self) -> None:
+        self.assertIsInstance(self.start("first"), worker_panes.OpenWorker)
+        before = len(self.world.layout_changes)
+        layout = worker_panes._layout_after_open  # pyright: ignore[reportPrivateUsage]
+
+        def layout_after_deadline(parent: staff.StaffId, evidence: worker_panes.PaneEvidence, seconds: float) -> None:
+            with worker_lifecycle.operation_deadline(deadline=0.0):
+                layout(parent, evidence, seconds)
+
+        with (patch.object(worker_panes, "_layout_after_open", side_effect=layout_after_deadline),
+              redirect_stderr(io.StringIO()) as notes):
+            result = self.start("second")
+        self.assertIsInstance(result, worker_panes.OpenWorker, notes.getvalue())
+        self.assertGreater(len(self.world.layout_changes), before, notes.getvalue())
+        self.assertEqual(notes.getvalue(), "")
+
     def test_open_waits_for_the_layout_slot_and_succeeds_if_it_stays_busy(self) -> None:
         self.assertIsInstance(self.start("first"), worker_panes.OpenWorker)
         tab = "w1:t1"
