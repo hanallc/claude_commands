@@ -897,8 +897,8 @@ LEGACY_PART_REVIEW_SCHEMA = part_review_schema(SCHEMA["properties"]["questions"]
 CONSOLE_PART_REVIEW_SCHEMA = part_review_schema(CONSOLE_QUESTIONS)
 
 QUESTION_QUOTE_INSTRUCTIONS = (
-    "For each question, give its text and an exact quote from the line that needs the answer. "
-    "For a split draft, ask only about lines in the requested parts."
+    "For each question, give its text and an exact quote that includes the line that needs the answer. "
+    "A question about the full draft can quote a heading or lines from several parts."
 )
 
 PART_REVIEW_INSTRUCTIONS = (
@@ -1222,7 +1222,6 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
                     if not isinstance(cached, Approved):
                         return cached
                 return result
-            question_sources: dict[ConsoleReviewQuestion, list[int]] = {}
             if whole:
                 record = _object(answer.value)
                 if record.keys() != SCHEMA["properties"].keys():
@@ -1243,11 +1242,6 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
                 if response.keys() != {"draft", "parts"} or record.keys() != {"questions", "failed_rules"}:
                     raise ValueError("The reviewer returned invalid draft and part verdicts.")
                 draft_verdict = part_verdict(record, draft)
-                for item in draft_verdict.questions:
-                    numbers = [number for number, part in pending.items() if item.quote in part["text"]]
-                    if numbers:
-                        question_sources[item] = numbers
-                draft_verdict = replace(draft_verdict, questions=tuple(question_sources))
                 reported = read_part_verdicts(response["parts"], pending, draft)
             latest = reused | reported
             combined, line_review, kept_questions = combine_question_verdicts(
@@ -1270,9 +1264,11 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
             record: dict[str, object] = {"line_review": line_review.record(line_rules), **saved}
             if key.console_title:
                 record["console_title"] = key.console_title
-            if question_sources:
-                record["draft_question_parts"] = sorted({fingerprints[number] for item in kept_questions
-                    for number in question_sources.get(item, ())})
+            held_draft_questions = set(draft_verdict.questions).intersection(kept_questions)
+            if held_draft_questions:
+                record["draft_question_parts"] = sorted(
+                    fingerprints[number] for number, part in pending.items()
+                    if any(item.quote in part["text"] for item in held_draft_questions))
             if question and isinstance(combined, Approved):
                 record["approved_draft"] = draft_fingerprint
             write_text_atomic(path, json.dumps(record) + "\n", new_file_mode=0o600)

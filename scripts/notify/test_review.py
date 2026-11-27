@@ -562,6 +562,27 @@ class LocalReviewTests(unittest.TestCase):
             ConsoleQuestionJSON(text=text, quote="Only part of the file is on disk."))
         self.assertEqual(outcome, review.QuestionAwaitingFacts(draft, (text,)))
 
+    def test_console_question_keeps_a_quote_on_the_choices_heading(self) -> None:
+        title = "Retry the download?"
+        draft = f"{title}\n\nChoices:\n- Yes, retry.\n- No, stop."
+        key = review.QuestionKey("demo", title)
+        runner = FakeReviewer(verdict(self.draft))
+        text = "What happens to the partial file if you stop?"
+        asked = ConsoleQuestionJSON(text=text, quote="Choices:")
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            return question_batch(question_request(prompt), questions=[asked])
+
+        with mock.patch.object(review, "structured_call", side_effect=judge):
+            self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                             review.QuestionAwaitingFacts(draft, (text,)))
+
+    def test_console_question_keeps_a_quote_across_parts_when_a_fact_changes(self) -> None:
+        text = "Will retrying replace the partial file?"
+        draft, outcome = self.review_question_after_fact_change(ConsoleQuestionJSON(
+            text=text, quote="Only part of the file is on disk.\n\nRecommended: Yes."))
+        self.assertEqual(outcome, review.QuestionAwaitingFacts(draft, (text,)))
+
     def test_console_question_rechecks_a_new_title_already_in_the_body(self) -> None:
         from scripts.console_text import check as console_text
 
