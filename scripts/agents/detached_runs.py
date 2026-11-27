@@ -1567,13 +1567,12 @@ def _result_push_failed(delivery: str) -> bool:
 
 
 def _needs_push_retry(record: RunRecord) -> bool:
-    return (_can_alert_failed_push(record)
+    return (record["status"] == "finished" and _has_unreported_push_failure(record)
             and not _pane_submission_not_started(record.get("delivery", "")))
 
 
-def _can_alert_failed_push(record: RunRecord) -> bool:
-    return (record["status"] == "finished" and not record.get("push_alert_attempted")
-            and _result_push_failed(record.get("delivery", "")))
+def _has_unreported_push_failure(record: RunRecord) -> bool:
+    return not record.get("push_alert_attempted") and _result_push_failed(record.get("delivery", ""))
 
 
 def _pane_submission_not_started(delivery: str) -> bool:
@@ -2744,14 +2743,18 @@ def _prepare_result_delivery(record: RunRecord, result: CommandResult, *,
             return _save_delivery(path, f"already delivered: {record['run_id']}")
         if isinstance(member, RunOwnerUnavailable) and (
                 not self_stop or membership.by_id(staff.StaffId(record["staff_id"])) is not None):
-            if _result_push_failed(saved) and not _pane_submission_not_started(saved):
+            if saved and not _worker_result_pending(saved):
                 return saved
-            if (not self_stop and current_record["status"] == "finished"
-                    and (not saved or _worker_result_pending(saved))
-                    and (saved != ORPHAN_RESULT_PENDING or "exit_code" in current_record)):
-                return _save_delivery(path, FAILED_RESULT_PUSH + member.reason, if_current=saved, stage_push_alert=True)
+            failed_push = _result_push_failed(saved) and not _pane_submission_not_started(saved)
+            if not self_stop and isinstance(result, CompletedCommand):
+                failure = saved if failed_push else FAILED_RESULT_PUSH + member.reason
+                return _save_delivery(path, failure, if_current=saved, stage_push_alert=True)
+            if failed_push:
+                return saved
             print(f"anomaly: {member.reason}", file=sys.stderr)
-            return _save_delivery(path, "finished: worker retired")
+            delivery = ("finished: worker retired" if self_stop
+                        else "nothing delivered: the supervisor ended before it reported an exit status")
+            return _save_delivery(path, delivery, if_current=saved)
         checkpoint = UNCONFIRMED_RESULT_PUSH + "the send did not record an outcome"
         if _result_push_failed(saved):
             checkpoint += f" after {saved}"
@@ -3058,7 +3061,7 @@ def _save_delivery(path: Path, delivery: str, *, if_current: str | None = None, 
         if _result_delivery_accepted(delivery):
             _ = record.pop("push_alert_delivery", None)
         record["delivery"] = delivery
-        if stage_push_alert and _can_alert_failed_push(record) and not record.get("push_alert_delivery"):
+        if stage_push_alert and _has_unreported_push_failure(record) and not record.get("push_alert_delivery"):
             record["push_alert_delivery"] = delivery
         if _needs_pane_input_retry(record) or _awaits_pane_receipt(record):
             record["completion_pending"] = True
@@ -3222,8 +3225,8 @@ def _resume_orphan_result(path: Path, *, replay_completion: bool = False) -> Non
 def _stage_push_alert(path: Path, *, expected: str | None = None) -> None:
     with _delivery_lock(path), record_lock(path):
         current = _read_record(path)
-        if ((expected is None or current.get("delivery") == expected)
-                and _can_alert_failed_push(current) and not current.get("push_alert_delivery")):
+        if (current["status"] == "finished" and (expected is None or current.get("delivery") == expected)
+                and _has_unreported_push_failure(current) and not current.get("push_alert_delivery")):
             current["push_alert_delivery"] = current.get("delivery", "")
             write_text_atomic(path, json.dumps(current, indent=2, sort_keys=True))
 

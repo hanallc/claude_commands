@@ -7545,6 +7545,48 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.inputs), 1)
         self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], f"sent: worker {row.name} at {pane}")
 
+    def test_reap_preserves_the_alert_when_the_supervisor_exits_after_worker_retirement(self) -> None:
+        row = self.fixture.worker()
+        record = self.record(row, "retirement-before-finished")
+        record["pid"] = DEAD_PID
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+
+        def deliver_then_exit(target: Path) -> int:
+            saved = worker_lifecycle.read_json_object(target)
+            self.assertEqual((saved["status"], saved["exit_code"]), ("running", 7))
+            self.assertIsNotNone(staff.retire(row.id))
+            _ = deliver_in_fixture(target)
+            raise SystemExit("supervisor exited after delivery")
+
+        with (patch.object(detached_runs, "_run", return_value=7),
+              patch.object(detached_runs, "scope_prefix", return_value=[]),
+              patch.object(detached_runs, "deliver_in_fresh_process", new=deliver_then_exit),
+              contextlib.redirect_stderr(io.StringIO())):
+            with self.assertRaisesRegex(SystemExit, "supervisor exited after delivery"):
+                _ = detached_runs.main(["supervise", str(path)])
+
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["status"], "running")
+        self.assertEqual(saved.get("push_alert_delivery"), saved["delivery"])
+
+        refusal = send.RefusedRelayRequest("failed", "director is unavailable")
+        accepted = send.Result("sent", "director received the alert")
+        with (patch.object(send, "send", side_effect=[refusal, accepted]) as alert,
+              patch.object(subprocess, "Popen") as spawn, contextlib.redirect_stderr(io.StringIO())):
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [path.stem])
+            self.assertEqual(detached_runs.prune_finished(path.parent), [])
+            self.assertTrue(Path(record["log"]).is_file())
+            spawn.assert_called_once()
+            argv = cast(list[str], spawn.call_args.args[0])
+            self.assertEqual(detached_runs.main(argv[2:]), 0)
+        self.assertEqual(alert.call_count, 2)
+        options = cast(send.Options, alert.call_args.args[0])
+        self.assertEqual(options.to, self.fixture.parent.id)
+        self.assertIn("exit 7", options.text or "")
+        self.assertIs(worker_lifecycle.read_json_object(path)["push_alert_attempted"], True)
+        self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
+
     def test_supervisor_alerts_the_director_when_a_busy_worker_retires(self) -> None:
         row = self.fixture.worker(family="codex")
         pane = "w1:p1"
