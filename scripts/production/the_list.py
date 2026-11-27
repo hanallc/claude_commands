@@ -2760,7 +2760,12 @@ def _exchange_path(key: str) -> Path:
 
 
 def exchange_reservation(key: str) -> ExchangeDestination | NextNumber:
-    return _exchange_reservation(_exchange_path(key))
+    reservation = _exchange_path(key)
+    journal = reservation.parent.parent / ".list-exchange-allocation"
+    allocation = _read_exchange_allocation(journal)
+    if isinstance(allocation, ExchangeAllocation) and allocation.digest == reservation.name:
+        return ExchangeDestination(allocation.destination, True)
+    return _exchange_reservation(reservation)
 
 
 def exchange_filing_started(key: str) -> bool:
@@ -2842,17 +2847,31 @@ def confirmed_exchanges(key: str, destination: investigation.ListDestination,
     return frozenset(exchange for exchange in exchanges if _exchange_receipt_line(destination, exchange) in receipt)
 
 
-def _recover_exchange_allocation(store: record_store.NumberedRecords, journal: Path) -> None:
+@dataclass(frozen=True)
+class ExchangeAllocation:
+    digest: str
+    destination: investigation.ListDestination
+
+
+def _read_exchange_allocation(journal: Path) -> ExchangeAllocation | NextNumber:
     try:
         value = journal.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return
+        return NextNumber.AVAILABLE
     saved = re.fullmatch(r"([a-f0-9]{64}) ([^ /\n]+)/L([1-9][0-9]*)\n", value)
     if saved is None:
         raise ListError(f"{journal}: invalid exchange allocation")
     digest, keeper, number_text = saved.groups()
     destination = investigation.ListDestination(staff_id(keeper, "List keeper"), int(number_text))
-    reservation = journal.parent / ".list-exchanges" / digest
+    return ExchangeAllocation(digest, destination)
+
+
+def _recover_exchange_allocation(store: record_store.NumberedRecords, journal: Path) -> None:
+    allocation = _read_exchange_allocation(journal)
+    if isinstance(allocation, NextNumber):
+        return
+    destination = allocation.destination
+    reservation = journal.parent / ".list-exchanges" / allocation.digest
     previous = _exchange_reservation(reservation)
     if isinstance(previous, ExchangeDestination) and previous != ExchangeDestination(destination, True):
         raise ListError(f"{journal}: the exchange already has a different reservation")
@@ -3183,6 +3202,10 @@ class ReservedReportNumber:
     number: int
 
 
+class NewReportItem(Enum):
+    ALLOCATE = "allocate a report without selecting a linked item"
+
+
 def reserve_moved_report(keeper: staff.StaffId, evidence_key: str) -> ReservedReportNumber:
     """Select the number for a source marker before the source writer runs."""
     store = _store(keeper)
@@ -3202,14 +3225,23 @@ def reserve_moved_report(keeper: staff.StaffId, evidence_key: str) -> ReservedRe
 
 def file_report(keeper: staff.StaffId, report: ListReport, title: str, *, owner: ItemOwner,
                 producer: staff.StaffId, unit: str, source: str,
-                reservation: Path | NextNumber | ReservedReportNumber = NextNumber.AVAILABLE,
+                reservation: Path | NextNumber | ReservedReportNumber | investigation.ListDestination |
+                             NewReportItem = NextNumber.AVAILABLE,
                 state: ItemState = ItemState.NEW,
                 retry: ReportRetry = ReportRetry.KEEP) -> int:
     """File a report once, or add its evidence to an existing linked List item."""
     store = _store(keeper)
     with _list_allocation(store):
         reserved = reserved_review_number(reservation) if isinstance(reservation, Path) else reservation
-        if isinstance(reserved, ReservedReportNumber):
+        if isinstance(reserved, investigation.ListDestination):
+            if reserved.keeper != keeper:
+                raise ListError("The report destination has a different List keeper.")
+            reserved = reserved.number
+            candidates = (load(keeper, f"L{reserved}"),)
+        elif isinstance(reserved, NewReportItem):
+            reserved = NextNumber.AVAILABLE
+            candidates = ()
+        elif isinstance(reserved, ReservedReportNumber):
             reserved = reserved.number
             candidates = records(keeper, include_closed=True)
         elif isinstance(reserved, int) and store.path(f"L{reserved}").is_file():

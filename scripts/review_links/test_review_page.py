@@ -5382,13 +5382,14 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         scanned = review_items.read(self.root)
         self.assertTrue(self.status.answer_question(delivery.page, delivery.row, question.question_id, 'The log is clear.'))
         _ = investigation.answer(report.owner, report.id, 'The service starts.')
+        filed = the_list.records(keeper.id)
         with patch.object(review_items, 'read', return_value=scanned):
             self.assertEqual(the_list.move_review_waits(self.root, staff.snapshot()), [])
-        self.assertEqual(the_list.records(keeper.id), [])
+        self.assertEqual(the_list.records(keeper.id), filed)
         current = {item.key: item for item in review_items.read(self.root)}
         for identity in (key, review_items.investigation_record_key(report)):
             self.assertEqual(current[identity].state, review_items.ReviewState.OPEN)
-            self.assertFalse(review_items.on_list(current[identity]))
+            self.assertFalse(any(review_items.list_move_event(event) for event in current[identity].log))
 
     def test_migrated_investigation_reply_stays_on_the_list(self) -> None:
         keeper = fixture_member('producer', name='morty')

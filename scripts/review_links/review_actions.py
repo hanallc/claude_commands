@@ -97,8 +97,6 @@ def migrate_report_words(item: review_items.ReviewItem) -> str:
                     break
         proof = source.row.get(change_review.CHECK, '').strip()
         return proof or item.title
-    if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
-        return source.record.item['text']
     if isinstance(source, review_items.ProposalSource):
         original = proposal_issue.read_issue(source.record.path)
         body = original.partition('\n---\n')[2].strip() if original.startswith('---\n') else original.strip()
@@ -124,6 +122,11 @@ def move_wait_to_list(root: Path, item: review_items.ReviewItem, members: staff.
         except FileNotFoundError:
             return investigation.NoListDestination.ABSENT
         return moved.list_destination
+    if isinstance(original, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
+        move = cast(Callable[[Path, review_items.ReviewItem, staff.StaffSnapshot, staff.StaffId],
+                             investigation.ListDestination | investigation.NoListDestination],
+                    import_module("scripts.review_links.answer_sources").move_question_wait)
+        return move(root, item, members, original.record.owner)
 
     route = the_list.report_route(item.owner, members)
     reservation = the_list.reserve_moved_report(route.keeper, item.key)
@@ -137,8 +140,6 @@ def move_wait_to_list(root: Path, item: review_items.ReviewItem, members: staff.
             raise ReviewWaitEnded()
         kind = the_list.ReportKind.VALIDATION if current.state == review_items.ReviewState.VALIDATING else {
             review_items.ReviewType.CHANGE: the_list.ReportKind.CHANGE,
-            review_items.ReviewType.QUESTION: the_list.ReportKind.QUESTION,
-            review_items.ReviewType.RESPONSE: the_list.ReportKind.QUESTION,
             review_items.ReviewType.PROPOSAL: the_list.ReportKind.PROPOSAL,
             review_items.ReviewType.EFFICIENCY: the_list.ReportKind.EFFICIENCY,
         }[current.type]
@@ -475,27 +476,26 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
     key = review_items.submission_review_key(saved)
     evidence = REVIEW_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
     words = saved.words
+    reservation = review_submissions.list_filing_reservation(saved)
+
+    def file_row() -> investigation.ListDestination:
+        number = the_list.add_review_item(route["keeper"], review_submissions.submission_title(words),
+                                          owner=route["owner"], producer=route["producer"], unit=route["unit"],
+                                          words=words, evidence=evidence, review_key=key, source=route["source"],
+                                          reservation=reservation)
+        return investigation.ListDestination(route["keeper"], number)
+
     try:
-        number = the_list.add_review_item(route["keeper"], review_submissions.submission_title(words), owner=route["owner"],
-                                          producer=route["producer"], unit=route["unit"], words=words, evidence=evidence,
-                                          review_key=key, source=route["source"],
-                                          reservation=review_submissions.list_filing_reservation(saved))
+        if isinstance(record, update_registration.QuestionRecord):
+            file_question = cast(Callable[[update_registration.QuestionRecord, Path,
+                                           Callable[[], investigation.ListDestination], staff.StaffSnapshot], None],
+                                 import_module("scripts.review_links.answer_sources").file_list_submission_question)
+            with update_registration.wrap_question_locks(record.owner):
+                file_question(record, reservation, file_row, staff.snapshot())
+        else:
+            _ = file_row()
     except the_list.RetiredListProducer as error:
         review_submissions.skip_list_filing(saved, str(error))
-        return
-    if isinstance(record, update_registration.QuestionRecord):
-        if not saved.path.is_file():
-            raise OSError(f"Cannot find the saved question {saved.id}.")
-        origin = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE,
-                                             f"submission/question/{saved.request_id}")
-        destination = investigation.ListDestination(route["keeper"], number)
-        file_question = cast(Callable[[update_registration.QuestionRecord, the_list.NativeQuestionItem,
-                                       investigation.ListDestination,
-                                       staff.StaffSnapshot], None],
-                             import_module("scripts.review_links.answer_sources").file_list_submission_question)
-        file_question(record, origin, destination, staff.snapshot())
-        if the_list.load(destination.keeper, f"L{number}").native_question != origin:
-            raise OSError(f"Cannot confirm the question source for L{number}.")
 
 
 def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus, *,
