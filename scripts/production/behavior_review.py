@@ -190,15 +190,17 @@ Never call `write_stdin`. Do not start interactive or background commands.
 If a search times out, split its input into smaller groups and search each group.
 
 The checker's code root is `{checker_root}`.
-Use this command to import the checker modules.
-Add your record reads after the imports and before `PY`.
+Use this command to check the import paths.
+Add your record reads to the Python argument after the imports.
 
 ```sh
-(cd -- {checker_root_shell} && timeout --kill-after=1s 20s ./scripts/lib/py --isolated -B - <<'PY'
+(cd -- {checker_root_shell} && timeout --kill-after=1s 20s ./scripts/lib/py --isolated -B -c '
+from inspect import getfile
 from scripts.lib.transcripts import transcript_lines
 from scripts.production import update_registration
-PY
-)
+print(getfile(transcript_lines))
+print(getfile(update_registration))
+')
 ```
 
 Use these sources:

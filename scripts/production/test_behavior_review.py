@@ -164,17 +164,12 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("`with contextlib.closing(transcript_lines(Path(path))) as lines:`", prompt)
 
         _ = self.write(self.repo / "scripts/__init__.py", 'raise ImportError("The checked repo supplied scripts.")\n')
+        temp = self.root / "read-only-temp"
+        temp.mkdir()
+        temp.chmod(0o555)
+        self.addCleanup(temp.chmod, 0o755)
         command = prompt.split("```sh\n", 1)[1].split("\n```", 1)[0]
-        imports, end, suffix = command.partition("\nPY\n")
-        self.assertIn("from scripts.lib.transcripts import transcript_lines", imports)
-        self.assertIn("from scripts.production import update_registration", imports)
-        self.assertTrue(end)
-        check_paths = (
-            "\nfrom inspect import getfile\n"
-            "print(getfile(transcript_lines))\n"
-            "print(getfile(update_registration))"
-        )
-        result = self.run_in_repo("env", f"PYTHONPATH={self.repo}", "bash", "-c", imports + check_paths + end + suffix)
+        result = self.run_in_repo("env", f"TMPDIR={temp}", f"PYTHONPATH={self.repo}", "zsh", "-fc", command)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [str(checker_root / "scripts/lib/transcripts.py"),
                                                       str(checker_root / "scripts/production/update_registration.py")])

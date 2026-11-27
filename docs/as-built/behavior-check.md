@@ -22,6 +22,7 @@ A clear record names the saved reviewer reply.
 The reviewer filters transcript files before parsing them.
 The prompt gives the checker's absolute code root and paths to the transcript reader and question record code.
 The reviewer starts isolated Python from the checker's code root before it imports the checker modules.
+It passes the imports to Python with `-c` so the shell needs no temporary file.
 The reviewer runs each command in one tool call without `write_stdin`.
 The gate checks each changed test for no user decision or a verified request from Nate.
 The check accepts typed Claude turns, sent List Tell feedback from Nate, and Nate's saved List or Question answers.
