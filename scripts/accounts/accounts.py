@@ -54,7 +54,7 @@ from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts  # noqa: E402
-from scripts.whoami import note_file  # noqa: E402
+from scripts.whoami import note_file, run_out  # noqa: E402
 from scripts.whoami import usage_store  # noqa: E402
 from scripts.accounts import refusals  # noqa: E402
 from scripts.accounts import moves, worker_names, role_map, session_state  # noqa: E402
@@ -4858,6 +4858,207 @@ class StatusReading:
     live_claude_accounts: frozenset[tuple[str, str]] = frozenset()
 
 
+@dataclass(frozen=True)
+class _RecordedRoleSelection:
+    role: str
+    account: note_file.NumberedAccountLabel
+    at: datetime
+    source: note_file.NumberedAccountLabel | run_out.UnknownMoveSource
+
+
+def _role_selections(lines: Sequence[str]) -> tuple[_RecordedRoleSelection, ...]:
+    selections: list[_RecordedRoleSelection] = []
+    for line in lines:
+        try:
+            decoded = worker_names.journal_entry(cast(object, json.loads(line)))
+            if not isinstance(decoded, dict):
+                continue
+            fields = cast(dict[str, object], decoded)
+            role = fields.get("group", fields.get("role"))
+            if role == "unit":
+                role = "units"
+            if not isinstance(role, str) or role not in (*CLAUDE_GROUPS, CODEX_ROLE):
+                continue
+            label = fields.get("account_label", fields.get("label"))
+            stamp = fields.get("at")
+            if not isinstance(label, str) or not isinstance(stamp, str):
+                continue
+            account = note_file.parse_account_label(label)
+            at = datetime.fromisoformat(stamp)
+        except ValueError:
+            continue
+        if isinstance(account, note_file.NumberedAccountLabel) and at.tzinfo is not None:
+            source_field = fields.get("source_account")
+            source = note_file.parse_account_label(source_field) if isinstance(source_field, str) else run_out.UnknownMoveSource()
+            if not isinstance(source, note_file.NumberedAccountLabel) or source.tool != account.tool:
+                source = run_out.UnknownMoveSource()
+            selections.append(_RecordedRoleSelection(role, account, at, source))
+    # Stable sorting keeps journal order when selections have the same time.
+    return tuple(sorted(selections, key=lambda selection: selection.at))
+
+
+def _recorded_move_source(
+    selection: _RecordedRoleSelection, history: Sequence[moves.MoveProgress],
+) -> note_file.NumberedAccountLabel | run_out.UnknownMoveSource:
+    """Use the first valid source from a matching batch in the selection window."""
+    for move in history:
+        if move.group == selection.role and move.target == selection.account.label and selection.at <= move.started:
+            label, _, reason = move.reason.partition(" ")
+            if move.cause in ("auto", "refusal") and reason.startswith(("at ", "refused: ")):
+                source = note_file.parse_account_label(label)
+                if isinstance(source, note_file.NumberedAccountLabel) and source != selection.account:
+                    return source
+    return run_out.UnknownMoveSource()
+
+
+def _inherited_move_source(
+    arrival: _RecordedRoleSelection, selections: Sequence[_RecordedRoleSelection],
+) -> note_file.NumberedAccountLabel | run_out.UnknownMoveSource:
+    if arrival.role not in CLAUDE_GROUPS:
+        return run_out.UnknownMoveSource()
+    groups = GroupAccounts()
+    for selection in selections:
+        if selection is arrival:
+            break
+        if selection.role in CLAUDE_GROUPS and selection.role != arrival.role:
+            groups[selection.role] = selection.account.label
+    inherited = group_label(groups, arrival.role)
+    if isinstance(inherited, str):
+        account = note_file.parse_account_label(inherited)
+        if isinstance(account, note_file.NumberedAccountLabel):
+            return account
+    return run_out.UnknownMoveSource()
+
+
+def _role_arrivals(history: Sequence[moves.MoveProgress], selections: Sequence[_RecordedRoleSelection],
+                   now: datetime) -> tuple[run_out.RoleArrival, ...]:
+    """Use account changes in the role history as arrivals."""
+    by_role: dict[str, list[_RecordedRoleSelection]] = {}
+    for selection in selections:
+        if selection.at <= now:
+            by_role.setdefault(selection.role, []).append(selection)
+
+    batches = sorted((move for move in history if move.started <= now), key=lambda move: move.started)
+    arrivals: list[run_out.RoleArrival] = []
+    for role, role_selections in by_role.items():
+        index = len(role_selections) - 1
+        destination = role_selections[index].account
+        while index > 0 and role_selections[index - 1].account == destination:
+            index -= 1
+        arrival = role_selections[index]
+        window = batches
+        if index + 1 < len(role_selections):
+            end = role_selections[index + 1].at
+            window = [move for move in batches if move.started < end]
+        source = arrival.source
+        if isinstance(source, run_out.UnknownMoveSource):
+            source = _recorded_move_source(arrival, window)
+        if isinstance(source, run_out.UnknownMoveSource):
+            source = (role_selections[index - 1].account if index > 0 else _inherited_move_source(arrival, selections))
+        if source != destination:
+            arrivals.append(run_out.RoleArrival(role, source, destination, arrival.at))
+    return tuple(arrivals)
+
+
+def read_role_arrivals(history: Sequence[moves.MoveProgress], now: datetime) -> tuple[run_out.RoleArrival, ...]:
+    """Read the role selections that explain the current assignments."""
+    path = roles_history_file()
+    try:
+        with path.open(encoding="utf-8") as source:
+            fcntl.flock(source.fileno(), fcntl.LOCK_SH)
+            recovery = path.with_name(f".{path.name}.workers")
+            try:
+                lines = recovery.read_text(encoding="utf-8").splitlines()
+            except FileNotFoundError:
+                lines = source.readlines()
+    except (OSError, UnicodeError):
+        return ()
+    return _role_arrivals(history, _role_selections(lines), now)
+
+
+def weekly_rate_reading(row: StatusRow) -> tuple[run_out.Reading | run_out.WeeklyReadingUnavailable, datetime | note_file.NoResetKnown]:
+    reset = row.resets_at if isinstance(row.resets_at, datetime) else note_file.NoResetKnown()
+    current = (run_out.Reading(row.read_at, 100 - row.weekly_left_percent)
+               if isinstance(row.read_at, datetime) and isinstance(row.weekly_left_percent, (int, float))
+               else run_out.WeeklyReadingUnavailable())
+    return current, reset
+
+
+@dataclass(frozen=True)
+class AccountUsageRateInputs:
+    """The status and history used to calculate rates at one time."""
+
+    now: datetime
+    lookback: timedelta
+    rows: Mapping[str, StatusRow]
+    histories: Mapping[str, list[run_out.Reading]]
+    source_resets: Mapping[str, datetime]
+    arrivals: Mapping[str, tuple[run_out.RoleArrival, ...]]
+
+
+@dataclass(frozen=True)
+class ReadStoredAccountUsageRates:
+    """The caller has no status or history for this calculation."""
+
+
+READ_STORED_ACCOUNT_USAGE_RATES = ReadStoredAccountUsageRates()
+
+
+def read_account_usage_rate_inputs(rows: Sequence[StatusRow], now: datetime, *,
+                                   account_config: conf.ConfigRead,
+                                   role_arrivals: Sequence[run_out.RoleArrival]) -> AccountUsageRateInputs:
+    latest: dict[str, run_out.RoleArrival] = {}
+    for arrival in role_arrivals:
+        if arrival.at <= now and (arrival.role not in latest or latest[arrival.role].at <= arrival.at):
+            latest[arrival.role] = arrival
+    arrivals = {
+        row.label: tuple(arrival for role in row.selected_roles if (arrival := latest.get(role)) is not None
+                         and arrival.destination.label == row.label)
+        for row in rows
+    }
+    resets = {row.label: row.resets_at for row in rows if isinstance(row.resets_at, datetime)}
+    resets.update({row.label: row.stored_weekly_reset for row in rows
+                   if isinstance(row.stored_weekly_reset, datetime)})
+    return AccountUsageRateInputs(now, timedelta(minutes=account_config.whole("rate.lookback_minutes")),
+                                  {row.label: row for row in rows}, run_out.read_readings(run_out.READINGS_LOG),
+                                  resets, arrivals)
+
+
+def _stored_claude_rate_rows(now: datetime, account_config: conf.ConfigRead,
+                            arrivals: Sequence[run_out.RoleArrival]) -> tuple[StatusRow, ...]:
+    usage = usage_store.load()
+    directories: dict[ClaudeGroup, Path] = {}
+    if arrivals:
+        try:
+            with role_map.stored_role_map():
+                groups = group_accounts()
+        except role_map.RoleMapUnavailable:
+            groups = GroupAccounts()
+        directories, _ = _claude_role_directories(groups)
+    return tuple(
+        replace(_status_row(status, usage.get(usage_store.key("Claude", status.login)), now, (),
+                            account_config=account_config),
+                selected_roles=tuple(group for group, directory in directories.items() if status.config_dir == directory))
+        for status in account_statuses()
+    )
+
+
+def account_usage_rate(label: str, now: datetime, *, account_config: conf.ConfigRead,
+                       inputs: AccountUsageRateInputs | ReadStoredAccountUsageRates = READ_STORED_ACCOUNT_USAGE_RATES,
+                       ) -> run_out.PageUsageRate:
+    """Calculate the rate for an account from its weekly reading and role history."""
+    if isinstance(inputs, ReadStoredAccountUsageRates):
+        arrivals = read_role_arrivals(moves.read_move_progress(), now)
+        rows = _stored_claude_rate_rows(now, account_config, arrivals)
+        inputs = read_account_usage_rate_inputs(rows, now, account_config=account_config, role_arrivals=arrivals)
+    row = inputs.rows.get(label)
+    if row is None:
+        return run_out.NoUsageRate()
+    current, reset = weekly_rate_reading(row)
+    return run_out.page_usage_rate(label, current, inputs.now, lookback=inputs.lookback, histories=inputs.histories,
+                                   current_reset=reset, source_resets=inputs.source_resets, arrivals=inputs.arrivals[label])
+
+
 class StatusAccountDocument(TypedDict):
     label: str
     color: NotRequired[str]
@@ -6062,6 +6263,25 @@ def _status_workers_account() -> CodexWorkersAccount:
     return selected_workers
 
 
+def _claude_role_directories(groups: GroupAccounts) -> tuple[dict[ClaudeGroup, Path], list[AccountsError | str]]:
+    directories: dict[ClaudeGroup, Path] = {}
+    problems: list[AccountsError | str] = []
+    for group in CLAUDE_GROUPS:
+        if group == "producers" and group not in groups:
+            if "showrunners" in directories:
+                directories[group] = directories["showrunners"]
+            continue
+        label = group_label(groups, group)
+        if isinstance(label, GroupNotConfigured):
+            problems.append(f"accounts: {group} has no account; run accounts.py move {group} <claudeN>")
+        elif _label_is(label, "claude"):
+            try:
+                directories[group] = _claude_role_selection(group, label).dir
+            except AccountsError as error:
+                problems.append(error)
+    return directories, problems
+
+
 def _read_status(source: UsageSource, *, detail: bool, include_models: bool = False,
                  account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> StatusReading:
     """One table row per account folder, then one line for each thing wrong in a folder.
@@ -6108,25 +6328,11 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
             _observe_status_problem(_role_problem(error, tuple(str(note_file.note_path(status.label)) for status in [*statuses, *codex])))
         groups = GroupAccounts()
         codex = [replace(status, role=NO_VALUE) for status in codex]
-    group_directories: dict[ClaudeGroup, Path] = {}
-    for group in CLAUDE_GROUPS:
-        if group == "producers" and group not in groups:
-            if "showrunners" in group_directories:
-                group_directories[group] = group_directories["showrunners"]
-            continue
-        label = group_label(groups, group)
-        if isinstance(label, GroupNotConfigured):
-            error = f"accounts: {group} has no account; run accounts.py move {group} <claudeN>"
-            role_problems.append(error)
-            _observe_status_problem(_role_problem(error, ()))
-        if isinstance(label, str) and _label_is(label, "claude"):
-            try:
-                group_directories[group] = _claude_role_selection(group, label).dir
-            except AccountsError as error:
-                role_problems.append(error)
-                _observe_status_problem(_role_problem(error, tuple(str(note_file.note_path(status.label)) for status in statuses)))
-                # The folder's status reports its unreadable note without selecting it.
-                continue
+    group_directories, directory_problems = _claude_role_directories(groups)
+    for problem in directory_problems:
+        role_problems.append(problem)
+        paths = tuple(str(note_file.note_path(status.label)) for status in statuses) if isinstance(problem, AccountsError) else ()
+        _observe_status_problem(_role_problem(problem, paths))
     all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
     rows = tuple(
         replace(row, roles=(status.role,) if status.role in (CODEX_ROLE, "spare") else (),
@@ -6297,6 +6503,7 @@ class DiagnosticStream(io.StringIO):
 
 @role_map.role_map_command
 def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = False, include_models: bool = False,
+                include_upcoming_move_lines: bool = True,
                 account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> StatusReading:
     """Read each account once; retain diagnostics before any later failure."""
     account_config = read_account_settings(account_config)
@@ -6309,7 +6516,8 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
         with (redirect_stderr(held), role_map.observe_map_reads(_observe_map_provenance),
               role_map.stored_role_map() if isinstance(source, StoredUsageOnly) else nullcontext()):
             reading = _with_upcoming_moves(_read_status(
-                source, detail=detail, include_models=include_models, account_config=account_config))
+                source, detail=detail, include_models=include_models, account_config=account_config),
+                include_lines=include_upcoming_move_lines)
     except BaseException:
         diagnostics.retain_raw(held.getvalue(), delivered=tty)
         if not isinstance(enclosing, StatusDiagnostics):
@@ -6342,7 +6550,7 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 
-def _read_upcoming_moves() -> UpcomingMoves:
+def _read_upcoming_moves(*, include_lines: bool = True) -> UpcomingMoves:
     try:
         if not role_map.is_role_map_host():
             lines = role_map.read_role_map().upcoming_moves or (
@@ -6352,6 +6560,8 @@ def _read_upcoming_moves() -> UpcomingMoves:
         first_entries: dict[next_moves.NextMoveGroup, next_moves.NextMove] = {}
         for entry in entries:
             _ = first_entries.setdefault(entry.group, entry)
+        if not include_lines:
+            return UpcomingMoves((), FirstNextMoveEntries(first_entries))
         upcoming = next_moves.render_next_moves(entries)
         lines = ("Upcoming moves: none",) if upcoming == "nothing set up" else ("Upcoming moves:", *upcoming.splitlines())
         return UpcomingMoves(lines, FirstNextMoveEntries(first_entries))
@@ -6367,8 +6577,8 @@ def _upcoming_move_lines() -> tuple[str, ...]:
     return _read_upcoming_moves().lines
 
 
-def _with_upcoming_moves(reading: StatusReading) -> StatusReading:
-    upcoming = _read_upcoming_moves()
+def _with_upcoming_moves(reading: StatusReading, *, include_lines: bool = True) -> StatusReading:
+    upcoming = _read_upcoming_moves(include_lines=include_lines)
     return replace(reading, upcoming_moves=upcoming.lines, first_next_moves=upcoming.first)
 
 

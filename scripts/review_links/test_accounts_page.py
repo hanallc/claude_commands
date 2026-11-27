@@ -28,7 +28,7 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results, newer_script_reload_results
-from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity, role_map, worker_names
+from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity, role_map
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.agents import remote, shutdown_record, stop_resume
 from scripts.agents.test_support import write_machine_config
@@ -668,7 +668,7 @@ window.fetch=(path,options)=>{
         self.assertIn('Next request: claude3 on mac, Fri 11-20', card)
         self.assertNotIn("fixture@example.invalid", card)
         self.assertNotIn("<button", card)
-        status.assert_called_once_with(source=accounts.StoredUsageOnly(), include_models=True)
+        status.assert_called_once_with(source=accounts.StoredUsageOnly(), include_models=True, include_upcoming_move_lines=False)
 
     def test_login_card_uses_configured_tones_and_the_user_zone(self) -> None:
         reading = self.login_card_reading()
@@ -2108,11 +2108,12 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
         row = replace(status_row("claude2"), selected_roles=("units",), weekly_left_percent=100)
         reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
         with (patch.object(accounts, "read_status", return_value=reading),
-              patch.object(moves, "read_move_progress", return_value=(move,)),
+              patch.object(moves, "read_move_progress", return_value=(move,)) as read_moves,
               patch.object(run_out, "read_readings", return_value={"claude1": readings}),
-              patch.object(worker_names, "role_history_lines", wraps=worker_names.role_history_lines) as read_history):
+              patch.object(accounts, "roles_history_file", return_value=path) as history_path):
             markup = accounts_page.page().decode()
-        read_history.assert_called_once_with(path)
+        read_moves.assert_called_once_with()
+        history_path.assert_called_once_with()
         self.assertIn('title="Last known good: units used 12.0%/hour on claude1 until Sun 11-15 14:50 UTC.">12.0%</td>',
                       markup)
         self.assertIn(">Sun 11-15 23:20 UTC</time>", markup)
@@ -3276,7 +3277,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                         page = accounts_page.page().decode()
                     source: object = status.call_args.kwargs["source"]  # pyright: ignore[reportAny]
                     self.assertIsInstance(source, accounts.StoredUsageOnly)
-                    status.assert_called_once_with(source=accounts.StoredUsageOnly(), include_models=True)
+                    status.assert_called_once_with(source=accounts.StoredUsageOnly(), include_models=True, include_upcoming_move_lines=False)
                     self.assertIn("<div data-accounts>", page)
                     self.assertIn(console_theme.CSS, page)
                     self.assertIn(page_frame.STYLE, page)

@@ -221,6 +221,15 @@ class RunOutTests(unittest.TestCase):
         self.assertEqual(rate.points_per_hour, 24)
         self.assertEqual((rate.usage.first_reading_at, rate.usage.last_reading_at), (START, now))
 
+    def test_page_rate_without_a_rise_after_reset_or_a_prior_rate_is_unavailable(self) -> None:
+        lookback = timedelta(minutes=45)
+        now = START + timedelta(minutes=10)
+        readings = [Reading(START, 40), Reading(now, 40)]
+        rate = run_out.page_usage_rate("claude1", readings[-1], now, lookback=lookback,
+                                      histories={"claude1": readings}, current_reset=START + run_out.WEEK,
+                                      source_resets={}, arrivals=())
+        self.assertEqual(rate, run_out.NoUsageRate())
+
     def test_page_rate_sums_only_roles_with_a_same_tool_rate(self) -> None:
         lookback = timedelta(minutes=40)
         now = START + timedelta(minutes=4)

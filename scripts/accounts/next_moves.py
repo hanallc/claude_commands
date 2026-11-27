@@ -22,6 +22,7 @@ from uuid import uuid4
 from scripts.accounts import role_map
 from scripts.lib import conf
 from scripts.lib.conf import UseConfiguredValue
+from scripts.whoami import run_out
 
 
 class NextMoveError(ValueError):
@@ -143,12 +144,14 @@ class GroupHoldResolver(Protocol):
     def group_half_point_hold(self, group: role_map.ClaudeGroup, now: datetime) -> ResolvedHold: ...
 
 
+class AccountUsageRateReader(Protocol):
+    def account_usage_rate(self, label: str, now: datetime, *, account_config: conf.ConfigRead) -> run_out.PageUsageRate: ...
+
+
 def account_pace(label: str, now: datetime, *,
                  account_config: conf.ConfigRead) -> PaceEstimate | NoUsablePace:
-    from scripts.whoami import run_out
-
-    readings = run_out.read_readings(run_out.READINGS_LOG).get(label, [])
-    rate = run_out.hourly_usage_rate(readings, now, account_config=account_config)
+    reader = cast(AccountUsageRateReader, cast(object, import_module("scripts.accounts.accounts")))
+    rate = reader.account_usage_rate(label, now, account_config=account_config)
     if isinstance(rate, run_out.NoUsageRate):
         return NoUsablePace()
     return PaceEstimate(rate.points_per_hour)

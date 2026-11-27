@@ -9,6 +9,7 @@ from collections.abc import Generator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import math
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import ANY, patch
@@ -18,7 +19,7 @@ from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.whoami import run_out, usage_store
+from scripts.whoami import agent_accounts, run_out, usage_store
 from scripts.whoami import quota_alert
 
 NOW = datetime(2026, 10, 17, tzinfo=timezone.utc)
@@ -255,6 +256,9 @@ class NextMovesTests(unittest.TestCase):
 
     def test_fallback_hold_uses_the_selected_account_and_keeps_its_clock(self) -> None:
         with self.watch_fixture() as fixture:
+            pace_minutes = 30
+            _ = write_config_fixture(conf.path("accounts"), f"half_point_pace_minutes={pace_minutes}\n")
+            hold_minutes = math.ceil(pace_minutes / 2)
             _ = fixture.groups()
             fixture.reading("main@example.invalid", 0)
             fixture.reading(watch_tests.TARGET_LOGIN, 80)
@@ -262,7 +266,7 @@ class NextMovesTests(unittest.TestCase):
                                              fallback_targets=("claude3",))
             with (patch.object(next_moves, "account_pace", return_value=next_moves.PaceEstimate(2)) as pace,
                   patch.object(next_moves, "render_time", return_value=watch_tests.NOW)):
-                self.assertIn("else claude3, hold half a point (≈15 min)", next_moves.list_next_moves())
+                self.assertIn(f"else claude3, hold half a point (≈{hold_minutes} min)", next_moves.list_next_moves())
                 pace.assert_called_once_with("claude1", watch_tests.NOW, account_config=ANY)
                 pace.reset_mock()
                 _ = refusal_watch.run_auto_moves(watch_tests.NOW)
@@ -270,7 +274,7 @@ class NextMovesTests(unittest.TestCase):
                 _ = refusal_watch.run_auto_moves(watch_tests.NOW + timedelta(minutes=1))
                 self.assertEqual(pace.call_count, 1)
             self.assertEqual(next_moves.read_next_moves(), (entry,))
-            later = watch_tests.NOW + timedelta(minutes=15)
+            later = watch_tests.NOW + timedelta(minutes=hold_minutes)
             fixture.reading(watch_tests.SOURCE_LOGIN, 0, at=later)
             fixture.reading("main@example.invalid", 0, at=later)
             fixture.reading(watch_tests.TARGET_LOGIN, 80, at=later)
@@ -624,33 +628,44 @@ class NextMovesTests(unittest.TestCase):
                 _ = next_moves.decode_next_moves(document)
 
     def test_half_point_duration_keeps_the_callers_settings_after_a_live_change(self) -> None:
-        account_config = conf.read("accounts")
         path = conf.path("accounts")
-        contents = path.read_text()
-        if not path.write_text(contents.replace("hold_default_minutes=40", "hold_default_minutes=99")):
-            self.fail("The hold configuration fixture is empty")
+        default = 48
+        _ = write_config_fixture(path, f"hold_default_minutes={default}\n")
+        account_config = conf.read("accounts")
+        _ = write_config_fixture(path, "hold_default_minutes=99\n")
         with (patch.object(next_moves, "account_pace", return_value=next_moves.NoUsablePace()),
               patch.object(conf, "read", side_effect=AssertionError("hold read the configuration again"))):
             resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW,
                                                 account_config=account_config)
-        self.assertEqual(resolved, next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+        self.assertEqual(resolved, next_moves.ResolvedHold(default, next_moves.NoUsablePace()))
 
     def test_half_point_hold_reads_current_settings_for_the_named_request(self) -> None:
+        default = 48
+        _ = write_config_fixture(conf.path("accounts"), f"hold_default_minutes={default}\n")
         with (patch.object(conf, "read", wraps=conf.read) as reads,
               patch.object(next_moves, "account_pace", return_value=next_moves.NoUsablePace())):
             resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW,
                                                 account_config=UseConfiguredValue.CURRENT)
-        self.assertEqual(resolved, next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+        self.assertEqual(resolved, next_moves.ResolvedHold(default, next_moves.NoUsablePace()))
         reads.assert_called_once_with("accounts")
+
+    def save_weekly_pace_reading(self, left: float, reset: datetime) -> accounts.AccountStatus:
+        login = "fixture-pace@example.invalid"
+        usage = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
+            left=left, at=NOW.isoformat(), resets=reset.isoformat()))
+        usage_store.write({usage_store.key("Claude", login): usage})
+        return accounts.AccountStatus("~/.claude1", self.home / ".claude1", True, True, True,
+                                      "claude1", login, "", (), (), accounts.McpServerDifferences())
 
     def test_half_point_duration_uses_selected_accounts_recent_rate(self) -> None:
         path = self.home / "pace.jsonl"
         lookback = 45
+        pace_minutes = 41
         config = conf.path("accounts")
-        _ = write_config_fixture(config, f"rate.lookback_minutes={lookback}\n")
+        _ = write_config_fixture(config, f"rate.lookback_minutes={lookback}\nhalf_point_pace_minutes={pace_minutes}\n")
         account_config = conf.read(config)
         ages = range(lookback, -1, -15)
-        for recent, expected in ((1.0, 30), (0.7, 43)):
+        for recent in (1.0, 0.7):
             with self.subTest(recent=recent):
                 samples = [("claude1", age, 51 - recent * (lookback - age) / 60) for age in ages]
                 samples += [("claude2", age, 80 - (lookback - age) / 3) for age in ages]
@@ -658,19 +673,48 @@ class NextMovesTests(unittest.TestCase):
                 _ = path.write_text("\n".join(json.dumps({"account": label,
                     "at": (NOW - timedelta(minutes=age)).isoformat(), "remaining": left})
                     for label, age, left in samples))
-                resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW,
-                                                   account_config=account_config)
-                self.assertEqual(resolved.minutes, expected)
+                status = self.save_weekly_pace_reading(51 - recent * lookback / 60, NOW + timedelta(days=1))
+                with patch.object(accounts, "account_statuses", return_value=[status]):
+                    resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW,
+                                                       account_config=account_config)
+                self.assertEqual(resolved.minutes, math.ceil(pace_minutes / recent))
                 assert isinstance(resolved.source, next_moves.PaceEstimate)
                 self.assertAlmostEqual(resolved.source.points_per_hour, recent)
 
     def test_unusable_pace_uses_the_named_default_and_fixed_holds_do_not_read_history(self) -> None:
-        self.assertEqual(next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW),
-                         next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+        """Nate: "you should use the last hour just as we do on the accounts page - it's obvious"."""
+        default = 48
+        lookback = 60
+        _ = write_config_fixture(conf.path("accounts"), f"hold_default_minutes={default}\nrate.lookback_minutes={lookback}\n")
+        status = self.save_weekly_pace_reading(60, NOW + timedelta(days=1))
         readings = [run_out.Reading(NOW - timedelta(minutes=5), 39), run_out.Reading(NOW, 40)]
-        with patch.object(run_out, "read_readings", return_value={"claude1": readings}):
+        with patch.object(accounts, "account_statuses", return_value=[status]):
             self.assertEqual(next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW),
-                             next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+                             next_moves.ResolvedHold(default, next_moves.NoUsablePace()))
+            with patch.object(run_out, "read_readings", return_value={"claude1": readings}):
+                self.assertEqual(next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW),
+                                 next_moves.ResolvedHold(default, next_moves.NoUsablePace()))
         with patch.object(run_out, "read_readings", side_effect=AssertionError("fixed hold read pace")):
             self.assertEqual(next_moves.resolve_hold(next_moves.FixedHold(7.5), "claude1", NOW),
                              next_moves.ResolvedHold(7.5, next_moves.FixedHold(7.5)))
+
+    def test_half_point_hold_uses_the_page_rate_after_a_weekly_reset(self) -> None:
+        lookback, pace_minutes, default = 60, 42, 48
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n"
+                                 + f"half_point_pace_minutes={pace_minutes}\nhold_default_minutes={default}\n")
+        settings = conf.read("accounts")
+        reset = NOW + timedelta(weeks=1, minutes=-6)
+        status = self.save_weekly_pace_reading(60, reset)
+        row = accounts.StatusRow("claude1", "claude", status.folder, status.login, (), 60, reset,
+                                 accounts.StatusUnavailable(), "", False, NOW, agent_accounts.UsageReadOutcome.OK,
+                                 accounts.StatusUnavailable(), stored_weekly_reset=reset)
+        history = [run_out.Reading(NOW - timedelta(minutes=5), 39), run_out.Reading(NOW, 40)]
+        with (patch.object(accounts, "account_statuses", return_value=[status]),
+              patch.object(run_out, "read_readings", return_value={"claude1": history})):
+            inputs = accounts.read_account_usage_rate_inputs((row,), NOW, account_config=settings, role_arrivals=())
+            rate = accounts.account_usage_rate("claude1", NOW, account_config=settings, inputs=inputs)
+            hold = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW, account_config=settings)
+        assert isinstance(rate, run_out.PartialWindowRate)
+        self.assertEqual(rate.points_per_hour, 12.0)
+        self.assertEqual(hold, next_moves.ResolvedHold(math.ceil(pace_minutes / rate.points_per_hour),
+                                                      next_moves.PaceEstimate(rate.points_per_hour)))

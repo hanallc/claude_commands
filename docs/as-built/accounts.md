@@ -511,8 +511,10 @@ A dry run treats the expired reading as unavailable and makes no live read.
 A changed head loses its old hold and notice state.
 `FixedHold` carries a duration; `HalfPointHold` requests a pace-based duration.
 `ResolvedHold` keeps the duration and its source.
-The half-point estimate uses the selected account's hourly usage rate.
-That rate includes usage by all groups that share the account.
+The half-point hold uses the selected account's rate from the Accounts page.
+The rate includes usage from all groups on that account.
+It can use partial readings after a weekly reset or an account move.
+It can also use the last known rate from a moved role's prior account.
 The default estimate is 40 minutes when no usable pace exists.
 The duration stays with the started hold rather than changing on each pass.
 
@@ -777,7 +779,7 @@ An empty account with a current reading shows a dash and the tooltip **The weekl
 If the rate is missing, both cells show a dash with an explanation.
 If the quota lasts until the reset, **empty at** shows a dash with that explanation.
 The page shows times in the user's time zone.
-The Claude expiry push and the half-point hold still use the whole-window rate.
+The Claude expiry push still uses the whole-window rate.
 
 The Roles table has one row per role.
 It shows the selected account for each role.

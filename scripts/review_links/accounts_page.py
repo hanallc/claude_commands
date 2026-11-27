@@ -16,12 +16,12 @@ import sys
 import time
 from typing import Literal, TypedDict, cast
 
-from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity, worker_names
+from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity
 from scripts.agents import shutdown_record
 from scripts.production import staff
 from scripts.lib import atomic_file, conf, file_lock, waiting_rows
 from scripts.review_links import change_page, console_theme, page_frame, page_version, review_link
-from scripts.whoami import agent_accounts, mac_fallback_token, note_file, quota_alert, run_out, token_expiry
+from scripts.whoami import agent_accounts, mac_fallback_token, quota_alert, run_out, token_expiry
 # The alias keeps the module apart from this page's quota_state() path function.
 from scripts.whoami import quota_state as worker_quota_state
 
@@ -589,108 +589,6 @@ def _account_login_title(login: str) -> str:
     return login or fallback
 
 
-@dataclass(frozen=True)
-class RecordedRoleSelection:
-    role: str
-    account: note_file.NumberedAccountLabel
-    at: datetime
-    source: note_file.NumberedAccountLabel | run_out.UnknownMoveSource
-
-
-def _role_selections(lines: Sequence[str]) -> tuple[RecordedRoleSelection, ...]:
-    selections: list[RecordedRoleSelection] = []
-    for line in lines:
-        try:
-            decoded = cast(object, json.loads(line))
-            if not isinstance(decoded, dict):
-                continue
-            fields = cast(dict[str, object], decoded)
-            role = fields.get("group", fields.get("role"))
-            if role == "unit":
-                role = "units"
-            if not isinstance(role, str) or role not in (*accounts.CLAUDE_GROUPS, accounts.CODEX_ROLE):
-                continue
-            label = fields.get("account_label", fields.get("label"))
-            stamp = fields.get("at")
-            if not isinstance(label, str) or not isinstance(stamp, str):
-                continue
-            account = note_file.parse_account_label(label)
-            at = datetime.fromisoformat(stamp)
-        except ValueError:
-            continue
-        if isinstance(account, note_file.NumberedAccountLabel) and at.tzinfo is not None:
-            source_field = fields.get("source_account")
-            source = note_file.parse_account_label(source_field) if isinstance(source_field, str) else run_out.UnknownMoveSource()
-            if not isinstance(source, note_file.NumberedAccountLabel) or source.tool != account.tool:
-                source = run_out.UnknownMoveSource()
-            selections.append(RecordedRoleSelection(role, account, at, source))
-    # Stable sorting keeps journal order when selections have the same time.
-    return tuple(sorted(selections, key=lambda selection: selection.at))
-
-
-def _recorded_move_source(
-    selection: RecordedRoleSelection, history: Sequence[moves.MoveProgress],
-) -> note_file.NumberedAccountLabel | run_out.UnknownMoveSource:
-    """Use the first valid source from a matching batch in the selection window."""
-    for move in history:
-        if move.group == selection.role and move.target == selection.account.label and selection.at <= move.started:
-            label, _, reason = move.reason.partition(" ")
-            if move.cause in ("auto", "refusal") and reason.startswith(("at ", "refused: ")):
-                source = note_file.parse_account_label(label)
-                if isinstance(source, note_file.NumberedAccountLabel) and source != selection.account:
-                    return source
-    return run_out.UnknownMoveSource()
-
-
-def _inherited_move_source(
-    arrival: RecordedRoleSelection, selections: Sequence[RecordedRoleSelection],
-) -> note_file.NumberedAccountLabel | run_out.UnknownMoveSource:
-    if arrival.role not in accounts.CLAUDE_GROUPS:
-        return run_out.UnknownMoveSource()
-    groups = accounts.GroupAccounts()
-    for selection in selections:
-        if selection is arrival:
-            break
-        if selection.role in accounts.CLAUDE_GROUPS and selection.role != arrival.role:
-            groups[selection.role] = selection.account.label
-    inherited = accounts.group_label(groups, arrival.role)
-    if isinstance(inherited, str):
-        account = note_file.parse_account_label(inherited)
-        if isinstance(account, note_file.NumberedAccountLabel):
-            return account
-    return run_out.UnknownMoveSource()
-
-
-def _role_arrivals(history: Sequence[moves.MoveProgress], selections: Sequence[RecordedRoleSelection],
-                   now: datetime) -> tuple[run_out.RoleArrival, ...]:
-    """Use account changes in the role history as arrivals."""
-    by_role: dict[str, list[RecordedRoleSelection]] = {}
-    for selection in selections:
-        if selection.at <= now:
-            by_role.setdefault(selection.role, []).append(selection)
-
-    batches = sorted((move for move in history if move.started <= now), key=lambda move: move.started)
-    arrivals: list[run_out.RoleArrival] = []
-    for role, role_selections in by_role.items():
-        index = len(role_selections) - 1
-        destination = role_selections[index].account
-        while index > 0 and role_selections[index - 1].account == destination:
-            index -= 1
-        arrival = role_selections[index]
-        window = batches
-        if index + 1 < len(role_selections):
-            end = role_selections[index + 1].at
-            window = [move for move in batches if move.started < end]
-        source = arrival.source
-        if isinstance(source, run_out.UnknownMoveSource):
-            source = _recorded_move_source(arrival, window)
-        if isinstance(source, run_out.UnknownMoveSource):
-            source = (role_selections[index - 1].account if index > 0 else _inherited_move_source(arrival, selections))
-        if source != destination:
-            arrivals.append(run_out.RoleArrival(role, source, destination, arrival.at))
-    return tuple(arrivals)
-
-
 def _usage_rate_title(rate: run_out.PageUsageRate, zone: tzinfo) -> str:
     def stamp(at: datetime) -> str:
         return at.astimezone(zone).strftime(quota_alert.WEEKLY_EMPTY_FORMAT)
@@ -731,12 +629,10 @@ def _weekly_empty_cell(run_out_time: run_out.WeeklyRunOut, zone: tzinfo) -> str:
 def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, list[accounts.BoardRow]],
                     labels: dict[str, accounts.BoardSpan], alerts: Mapping[str, QuotaAlert],
                     colors: Mapping[str, str],
-                    arrivals: Mapping[str, Sequence[run_out.RoleArrival]]) -> str:
-    histories = run_out.read_readings(run_out.READINGS_LOG)
-    lookback = timedelta(minutes=conf.read("accounts").whole("rate.lookback_minutes"))
-    source_resets = {row.label: row.resets_at for row in reading.rows if isinstance(row.resets_at, datetime)}
-    source_resets.update({row.label: row.stored_weekly_reset for row in reading.rows
-                          if isinstance(row.stored_weekly_reset, datetime)})
+                    role_arrivals: Sequence[run_out.RoleArrival]) -> str:
+    settings = conf.read("accounts")
+    rate_inputs = accounts.read_account_usage_rate_inputs(reading.rows, reading.checked_at, account_config=settings,
+                                                         role_arrivals=role_arrivals)
     rows: list[str] = []
     values: list[SortValues] = []
     labels_in_row_order: list[str] = []
@@ -762,12 +658,8 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
         reset_count_text = (
             '<span class="next-muted" title="Claude does not give this count to our tools.">—</span>'
             if row.tool == "claude" else DASH if reset_count is None else str(reset_count))
-        reset = row.resets_at if isinstance(row.resets_at, datetime) else note_file.NoResetKnown()
-        current = (run_out.Reading(row.read_at, 100 - row.weekly_left_percent)
-                   if isinstance(row.read_at, datetime) and isinstance(row.weekly_left_percent, (int, float))
-                   else run_out.WeeklyReadingUnavailable())
-        forecast = run_out.page_usage_rate(label, current, reading.checked_at, lookback=lookback, histories=histories,
-                                           current_reset=reset, source_resets=source_resets, arrivals=arrivals.get(label, ()))
+        current, reset = accounts.weekly_rate_reading(row)
+        forecast = accounts.account_usage_rate(label, reading.checked_at, account_config=settings, inputs=rate_inputs)
         empty = run_out.weekly_run_out(forecast, reset, current, reading.checked_at)
         empty_text = _weekly_empty_cell(empty, reading.zone)
         rate = None if isinstance(forecast, run_out.NoUsageRate) else forecast.points_per_hour
@@ -1061,17 +953,7 @@ def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | No
     selected = {row.label: row.selected_roles for row in reading.rows}
     colors = accounts.role_colors()
     samples = role_activity.read(reading.checked_at)
-    latest_arrivals: dict[str, run_out.RoleArrival] = {}
-    for arrival in role_arrivals:
-        if arrival.at <= reading.checked_at and (arrival.role not in latest_arrivals
-                or latest_arrivals[arrival.role].at <= arrival.at):
-            latest_arrivals[arrival.role] = arrival
-    arrivals_by_account: dict[str, list[run_out.RoleArrival]] = {
-        row.label: [arrival for role in row.selected_roles if (arrival := latest_arrivals.get(role)) is not None
-                    and arrival.destination.label == row.label]
-        for row in reading.rows
-    }
-    return (_accounts_table(reading, rows_by_account, labels, alerts or {}, colors, arrivals_by_account)
+    return (_accounts_table(reading, rows_by_account, labels, alerts or {}, colors, role_arrivals)
             + _roles_table(reading, groups, labels, selected, lines[-1], colors, samples))
 
 
@@ -1422,7 +1304,7 @@ def logins_board(reading: accounts.StatusReading) -> str:
 
 def page() -> bytes:
     """Read the stored accounts status, then render the page."""
-    reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
+    reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True, include_upcoming_move_lines=False)
     try:
         cleared = cleared_quotas(quota_state(review_link.review_root()))
         alerts = active_quotas(accounts.weekly_quotas(reading.rows), quota_alert_settings(), cleared)
@@ -1430,13 +1312,9 @@ def page() -> bytes:
         reading = replace(reading, notes=(*reading.notes, str(error)))
         alerts = {}
     history = moves.read_move_progress()
-    try:
-        selections = _role_selections(worker_names.role_history_lines(accounts.roles_history_file()))
-    except (OSError, UnicodeError):
-        selections = ()
     body = (moves_board(history, reading.checked_at, reading.zone, retryable=_retryable_members(history, reading))
             + logins_board(reading)
-            + board(reading, alerts, role_arrivals=_role_arrivals(history, selections, reading.checked_at))
+            + board(reading, alerts, role_arrivals=accounts.read_role_arrivals(history, reading.checked_at))
             + models_board(reading) + tokens_board(reading))
     settings = conf.read("review_links")
     refresh_seconds = settings.number("page_refresh_seconds")
