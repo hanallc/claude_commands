@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import io
 import json
 import os
@@ -19,7 +19,7 @@ from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.notify import review
 from scripts.production import (
-    behavior_check, behavior_review, record_store, session_staff, staff, the_list, update_registration, worker,
+    behavior_check, behavior_request, behavior_review, record_store, session_staff, staff, the_list, update_registration, worker,
 )
 from scripts.review_links import list_draft, question_record, review_events
 
@@ -103,6 +103,11 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def typed_turn(self, text: str) -> dict[str, object]:
         return {"type": "user", "origin": {"kind": "human"}, "turnOrigin": "human", "promptSource": "typed",
                 "timestamp": "2026-11-25T23:30:00-08:00", "message": {"role": "user", "content": text}}
+
+    def queued_turn(self, text: str, *, origin: str = "human", human_turn: bool = True) -> dict[str, object]:
+        return {"type": "attachment", "timestamp": "2026-11-26T07:30:00+00:00", "attachment": {
+            "type": "queued_command", "origin": {"kind": origin}, "humanTurn": human_turn,
+            "prompt": text, "timestamp": "2026-11-25T23:30:00-08:00"}}
 
     def transcript(self, *turns: dict[str, object]) -> Path:
         path = self.home / ".claude/projects/fixture/conversation.jsonl"
@@ -235,6 +240,24 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             with self.subTest(case=case):
                 finding = self.verify_requested(self.transcript(turn), quote)
                 self.assertIsInstance(finding, expected)
+
+    def test_transcript_verifies_queued_human_attachment(self) -> None:
+        sidechain = {**self.queued_turn(MOVE_QUOTE), "isSidechain": True}
+        source = self.transcript(self.queued_turn(MOVE_REQUEST), sidechain)
+        self.assertEqual(behavior_request.verified_dates(source, {MOVE_REQUEST, MOVE_QUOTE}),
+                         {MOVE_REQUEST: date(2026, 11, 25)})
+
+    def test_transcript_rejects_queued_attachment_from_peer(self) -> None:
+        source = self.transcript(self.queued_turn(MOVE_REQUEST, origin="peer"))
+        self.assertEqual(behavior_request.verified_dates(source, {MOVE_REQUEST}), {})
+
+    def test_transcript_rejects_queued_attachment_without_human_turn(self) -> None:
+        source = self.transcript(self.queued_turn(MOVE_REQUEST, human_turn=False))
+        self.assertEqual(behavior_request.verified_dates(source, {MOVE_REQUEST}), {})
+
+    def test_transcript_rejects_pasted_content_in_queued_attachment(self) -> None:
+        source = self.transcript(self.queued_turn(f"<pasted_content>\n{MOVE_REQUEST}\n</pasted_content>"))
+        self.assertEqual(behavior_request.verified_dates(source, {MOVE_REQUEST}), {})
 
     def test_only_sent_list_tell_feedback_from_nate_verifies(self) -> None:
         store, item = self.new_list_record()

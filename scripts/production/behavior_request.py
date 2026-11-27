@@ -83,6 +83,10 @@ def typed_turn(row: object) -> Iterator[NateWords]:
                 case _:
                     return
         words = "\n".join(parts)
+    yield from nate_words(words, stamp)
+
+
+def nate_words(words: str, stamp: str) -> Iterator[NateWords]:
     if (re.search(rf"<(?:pasted_content|{catch_up.GENERATED_TAGS})(?:\s|>)", words, flags=re.I)
             or words.lstrip().startswith(catch_up.GENERATED_PREFIXES)):
         return
@@ -92,6 +96,20 @@ def typed_turn(row: object) -> Iterator[NateWords]:
         return
     if moment.utcoffset() is not None:
         yield NateWords(words, moment)
+
+
+def queued_turn(row: object) -> Iterator[NateWords]:
+    if not isinstance(row, dict):
+        return
+    fields = cast(dict[str, object], row)
+    attachment = fields.get("attachment")
+    if fields.get("type") != "attachment" or fields.get("isSidechain") or not isinstance(attachment, dict):
+        return
+    command = cast(dict[str, object], attachment)
+    if (command.get("type") == "queued_command" and command.get("origin") == {"kind": "human"}
+            and command.get("humanTurn") is True and isinstance(words := command.get("prompt"), str)
+            and isinstance(stamp := command.get("timestamp"), str)):
+        yield from nate_words(words, stamp)
 
 
 def transcript_words(path: Path) -> Iterator[NateWords]:
@@ -107,6 +125,7 @@ def transcript_words(path: Path) -> Iterator[NateWords]:
             except (ValueError, UnicodeError):
                 continue
             yield from typed_turn(row)
+            yield from queued_turn(row)
 
 
 def list_words(path: Path, keeper: staff.StaffId) -> Iterator[NateWords]:
