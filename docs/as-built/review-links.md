@@ -2435,7 +2435,6 @@ The Studio uses the same row and **Working** badge for questions and other work.
 Migration keeps open questions waiting for Nate and Nate's questions with an unread answer.
 It closes questions Nate already answered and logs “Closed when questions became items”.
 Migration uses the saved List acknowledgment to keep old answers read.
-Review keeps a pending sent question visible until the List saves a confirmed receipt.
 
 New questions and answers use the same writer after the source saves.
 The writer keeps the source key, exchange ID, and question and reply origins.
@@ -2488,7 +2487,8 @@ A retry keeps the saved answer entry and its read state.
 Old bindings keep their encoded form for receipt checks.
 Migration rewrites verified bindings in place and issues receipts after the new List data is durable.
 An unverified Investigation binding remains visible in Review and requires a separate repair.
-Review uses the exchange on the saved List item even if the save receipt is missing.
+Review hides a sent question filed from a List item when its answer is durable in that item's log.
+Review requires a confirmed receipt for every other handoff.
 Review reads the List file without taking the writer lock.
 A failed pending exchange read leaves that card in Review.
 A unique reply digest can verify a moved log event.
