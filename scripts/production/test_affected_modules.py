@@ -214,6 +214,26 @@ shutil.copytree(factory() / "config", destination)
             ("scan.child", (), (affected.ScanPattern(root, "child", False),)),
         ))
 
+    def test_deep_defaults_keep_facts_and_select_the_config_reader(self) -> None:
+        template = ('from scripts.lib import conf\n'
+                    + 'def read(value={negations}conf.read("deep_setting")):\n'
+                    + '    return value\n')
+        path = "scripts/checks/test_reader.py"
+        shallow = template.format(negations="not ")
+        expected = affected.extract_facts(shallow, path)
+        self.assertEqual(expected.config_reads, frozenset({"deep_setting"}))
+        self.add_test("checks/test_reader.py", shallow)
+        for depth in (988, 1800):
+            with self.subTest(depth=depth):
+                source = template.format(negations="not " * depth)
+                self.assertEqual(affected.extract_facts(source, path), expected)
+                self.write(path, source)
+                self.write("config/deep_setting.conf", "value=before\n")
+                self.certify()
+                self.write("config/deep_setting.conf", "value=after\n")
+                _ = self.commit()
+                self.assertEqual(self.selection().modules, (self.repo / path,))
+
     def test_extraction_releases_ast_nodes(self) -> None:
         original_parse = ast.parse
         functions: list[ref[ast.expr]] = []
