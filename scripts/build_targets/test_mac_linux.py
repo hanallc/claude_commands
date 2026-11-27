@@ -1534,6 +1534,12 @@ fi
         self.assertIsInstance(mac_linux.settlement(episode, 23), placement.Pending)
 
         mac_linux.reconcile_guest_end(episode, 23)
+        self.assertIsInstance(mac_linux.settlement(episode, 23), placement.Pending)
+        self.assertEqual(self.trace.read_text().splitlines(), ['fence'])
+
+        delay = conf.read('mac_test').number('unreachable_backoff_s')
+        with patch.object(mac_linux, 'time', return_value=time.time() + delay + 1):
+            mac_linux.reconcile_guest_end(episode, 23)
         self.assertEqual(mac_linux.settlement(episode, 23), placement.Settled())
         self.assert_guest_clean('fence', 'fence')
         path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
@@ -2044,14 +2050,30 @@ fi
                  'armed': armed.to_record()}
         _ = journal.write_text(json.dumps(saved) + '\n', encoding='utf-8')
         delay = conf.read('mac_test').number('unreachable_backoff_s')
-        offload.write_backoff(time.time() + delay, mac_linux.TARGET, strict=True)
+        now = time.time()
         self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
 
         failed = subprocess.CompletedProcess(['ssh'], 255, '', 'ssh: connect to host fixture-mac port 22: Connection timed out')
-        with patch.object(mac_linux, 'run_guest_ssh', return_value=failed) as ssh, redirect_stderr(io.StringIO()):
+        held = subprocess.CompletedProcess(['ssh'], mac_linux.GUEST_END_PENDING_STATUS, '',
+                                          'The guest run lock is still held.\n')
+        ended = subprocess.CompletedProcess(['ssh'], 0, 'ended\n', '')
+        with (patch.object(mac_linux, 'run_guest_ssh', side_effect=[failed, held, ended]) as ssh,
+              patch.object(mac_linux, 'time', return_value=now) as clock, redirect_stderr(io.StringIO())):
             mac_linux.reconcile_guest_end(episode, attempt)
-        self.assertEqual(ssh.call_count, 0, 'The end-proof check used SSH during guest backoff.')
-        self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+            self.assertIs(eligibility.read_backoff(now + delay - 1, mac_linux.TARGET), eligibility.ACTIVE_BACKOFF)
+            mac_linux.reconcile_guest_end(episode, attempt)
+            self.assertEqual(ssh.call_count, 1, 'The end-proof check used SSH during guest backoff.')
+            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+
+            clock.return_value = now + delay + 1
+            mac_linux.reconcile_guest_end(episode, attempt)
+            self.assertEqual(ssh.call_count, 2)
+            self.assertFalse(eligibility.backoff_path(mac_linux.TARGET).exists())
+            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+
+            mac_linux.reconcile_guest_end(episode, attempt)
+            self.assertEqual(ssh.call_count, 3)
+            self.assertEqual(mac_linux.settlement(episode, attempt), placement.Settled())
 
     def test_reconcile_unproven_does_not_warn_for_an_existing_submission(self) -> None:
         attempt = 23
