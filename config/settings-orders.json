@@ -9,7 +9,8 @@
     "head_stall_alert_minutes": 9
   },
   "build_targets": {
-    "enabled.mac-linux": 22
+    "enabled.mac-linux": 22,
+    "notices.mac": 28
   },
   "cloud_gate": {
     "hana_gpu_route_enabled": 3
@@ -17,6 +18,9 @@
   "console": {
     "page.accounts.owner": 7,
     "page.aws.owner": 10
+  },
+  "gate": {
+    "gate_time_limit_factor": 5
   },
   "hana_aws": {
     "source_allowed_ignored": 1
@@ -29,9 +33,6 @@
     "free_floor_gib": 27,
     "offload": 21,
     "probe_timeout_s": 26
-  },
-  "gate": {
-    "gate_time_limit_factor": 5
   },
   "send": {
     "review_hold": 16,
