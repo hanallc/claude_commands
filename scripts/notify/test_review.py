@@ -465,7 +465,7 @@ class LocalReviewTests(unittest.TestCase):
         def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
             request = question_request(prompt)
             requests.append(request)
-            if len(requests) == 2:
+            if len(requests) == 3:
                 return review.StructuredCall("opus", review.ModelTimeout())
             return question_batch(request, parts=[
                 PartVerdictJSON(number=int(number), questions=[],
@@ -474,8 +474,11 @@ class LocalReviewTests(unittest.TestCase):
             ])
 
         with mock.patch.object(review, "structured_call", side_effect=judge):
-            self.assertEqual(review.review_question(key, question, runner=guide, console_kind="question"),
-                             review.QuestionReviewFailed(question, (), (failure,)))
+            for calls in (1, 2):
+                with self.subTest(calls=calls):
+                    self.assertEqual(review.review_question(key, question, runner=guide, console_kind="question"),
+                                     review.QuestionReviewFailed(question, (), (failure,)))
+                    self.assertEqual(len(requests), calls)
             revised_title = "Finish the download?"
             revised = question.replace(title, revised_title).replace(point, "The connection stopped the download.")
             key = replace(key, text=revised_title)
@@ -484,12 +487,16 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.review_question(key, revised, runner=guide, console_kind="question"),
                              review.QuestionReviewFailed(revised, (), (failure,)))
             final = revised.replace(recommend, final_recommend)
-            self.assertEqual(review.review_question(key, final, runner=guide, console_kind="question"),
-                             review.QuestionAccepted(final))
+            final_spacing = final.replace("\n\n", "\n \n", 1)
+            for text, calls in ((final, 5), (final, 5), (final_spacing, 6)):
+                with self.subTest(text=text, calls=calls):
+                    self.assertEqual(review.review_question(key, text, runner=guide, console_kind="question"),
+                                     review.QuestionAccepted(text))
+                    self.assertEqual(len(requests), calls)
 
         self.assertEqual([list(request["parts"]) for request in requests],
-                         [["1", "2", "3", "4", "5"], ["1", "2"], ["1", "2"], ["3"]])
-        self.assertIn("- No, keep the partial file.", requests[1]["draft"])
+                         [["1", "2", "3", "4", "5"], [], ["1", "2"], ["1", "2"], ["3"], []])
+        self.assertIn("- No, keep the partial file.", requests[2]["draft"])
 
     def test_console_question_skips_model_for_an_unchanged_approved_draft(self) -> None:
         title = "Retry the download?"
