@@ -164,6 +164,7 @@ class UnboundRoleLaunchRun:
     """The review run can use its creation claim before it has a recorder."""
 
     directory: Path
+    slot: WorkerName
 
 
 def dispatch_run_fields(parent: StaffId, run: Path | UnboundRoleLaunchRun, *,
@@ -174,13 +175,15 @@ def dispatch_run_fields(parent: StaffId, run: Path | UnboundRoleLaunchRun, *,
     directory = run.directory.absolute() if isinstance(run, UnboundRoleLaunchRun) else run
     try:
         fields = unit_runs.read_run_fields(directory)
-        if isinstance(run, UnboundRoleLaunchRun) and not fields and not (
-                directory / unit_runs.STATE_FILE).exists(follow_symlinks=False):
+        if isinstance(run, UnboundRoleLaunchRun):
             from scripts.astra import design_roles
 
-            claim = design_roles.pending_review_run_owner(directory)
-            if not isinstance(claim, unit_runs.RunOwnerUnrecorded):
-                fields[unit_runs.OWNER_FIELD] = claim
+            claim = design_roles.pending_review_run_claim(directory)
+            if isinstance(claim, design_roles.ReviewRunClaim):
+                if claim.slot != run.slot or claim.parent != parent:
+                    return AdmissionRefused(f"{directory}: the launch does not match the reviewer creation claim")
+                if not fields and not (directory / unit_runs.STATE_FILE).exists(follow_symlinks=False):
+                    fields[unit_runs.OWNER_FIELD] = claim.parent
         _ = pass_recorder.resolve_run_owner(directory, fields, record)
     except (OSError, ValueError, staff.StaffUnreadable) as error:
         return AdmissionRefused(str(error))
@@ -1717,6 +1720,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     owner = record.by_id(parent)
     if owner is None or owner.kind not in ("unit", "showrunner"):
         return AdmissionRefused("only a unit or showrunner can admit a worker")
+    if isinstance(dispatch_run, UnboundRoleLaunchRun) and (dispatch_run.slot != name or role != "astra-reviewer"):
+        return AdmissionRefused("the launch does not match the reviewer creation claim")
     try:
         paths = enrolled_worker_owner(owner)
         if isinstance(paths, EnrolledPaths) and (refusal := review_role_refusal(owner, role)):

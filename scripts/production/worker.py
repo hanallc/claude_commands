@@ -2501,7 +2501,7 @@ def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
     if isinstance(target, worker_panes.StaffWorker):
         dispatch_run = target.dispatch_run
     elif directory := os.environ.get(design_roles.DURABLE_ROLE_LAUNCH_RUN_ENV):
-        dispatch_run = worker_panes.UnboundRoleLaunchRun(Path(directory))
+        dispatch_run = worker_panes.UnboundRoleLaunchRun(Path(directory), target.name)
     else:
         dispatch_run = worker_panes.HolderRun.CURRENT
     with staff.row_operation(target.parent):

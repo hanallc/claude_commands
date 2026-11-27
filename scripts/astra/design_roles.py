@@ -46,7 +46,6 @@ ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
 DESIGNER_SANDBOX = 'danger-full-access'
 DURABLE_ROLE_LAUNCH_RUN_ENV = 'UNIT_DURABLE_ROLE_LAUNCH_RUN'
-_REVIEW_RUN_OWNER_FILE = 'review-run-owner'
 
 
 class AstraCensusProjection(Protocol):
@@ -185,11 +184,23 @@ class DesignPlacement:
 
 
 @dataclass(frozen=True)
+class ReviewRunClaim:
+    slot: staff.WorkerName
+    parent: staff.StaffId
+
+
+@dataclass(frozen=True)
+class ReviewRunUnclaimed:
+    """An older review or a phase-bound role has no review run claim."""
+
+
+@dataclass(frozen=True)
 class RoleInstance:
     role: Role
     name: str
     lifecycle: Lifecycle
     assignment_claim: str = ""
+    review_run_claim: ReviewRunClaim | ReviewRunUnclaimed = ReviewRunUnclaimed()
 
 
 @dataclass(frozen=True)
@@ -443,6 +454,13 @@ def _decode_design(design_id: str, fields: dict[str, object], *,
         lifecycle = _lifecycle(_object(entry.get('lifecycle')))
         name = '' if isinstance(lifecycle, HeldWorker) and lifecycle.staff_id else _text(entry, 'name')
         instance = RoleInstance(role, name, lifecycle, claim)
+        if 'review_run_claim' in entry:
+            fields_claim = _object(entry['review_run_claim'])
+            slot = staff.WorkerName.parse(_text(fields_claim, 'slot'))
+            if role != 'reviewer' or (isinstance(lifecycle, RoleNotOpened) and slot.value != name):
+                raise RoleRefused('review run claim does not match its reviewer slot')
+            instance = replace(instance, review_run_claim=ReviewRunClaim(
+                slot, staff.StaffId(_text(fields_claim, 'parent'))))
         instances.append(replace(instance, name=instance_name(instance)))
     if {instance.role for instance in instances} != {'designer', 'reviewer'}:
         raise RoleRefused('design must record both role slots')
@@ -487,6 +505,8 @@ def _design_fields(design: HeldDesign) -> dict[str, object]:
         entry: dict[str, object] = {'role': role.role, 'lifecycle': lifecycle, 'assignment_claim': role.assignment_claim}
         if not isinstance(role.lifecycle, HeldWorker) or not role.lifecycle.staff_id:
             entry['name'] = role.name
+        if isinstance(role.review_run_claim, ReviewRunClaim):
+            entry['review_run_claim'] = {'slot': role.review_run_claim.slot.value, 'parent': role.review_run_claim.parent}
         roles.append(entry)
     fields['roles'] = roles
     return fields
@@ -757,19 +777,30 @@ def submitted_review(reply: Path, run: Path) -> None:
 
 def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> SubmittedRoleTurn:
     """Submit through assign.sh and let the hook save the reply."""
+    instance = _instance(design, role)
+    record = staff.snapshot()
+    parent = worker_parent(design, role, record)
+    name = instance_name(instance, record)
     if isinstance(design.binding, DesignBoundToPhase):
         run, phase = Path(design.binding.run_directory), design.binding.phase
     else:
         run, phase = design_directory(design.placement.design_id), 'astra-review'
-        state = worker_lifecycle.read_worker_state(run / 'progress_history_state.json')
+        state = unit_runs.read_run_fields(run)
         if not state:
-            _recorder_command(['start-run', '--session-dir', str(run), '--working-dir', design_repository(design)])
+            _require_review_run_director(run, instance, parent, record)
+            director = parent.current_session
+            env = dict(os.environ)
+            if env.get('CODEX_THREAD_ID') != director:
+                _ = env.pop('CODEX_THREAD_ID', None)
+            env['CLAUDE_CODE_SESSION_ID'] = director
+            _recorder_command(['start-run', '--session-dir', str(run), '--working-dir', design_repository(design),
+                               '--main-session-id', director], env=env)
+            state = unit_runs.read_run_fields(run)
+        if state.get(unit_runs.OWNER_FIELD) != parent.id:
+            raise RoleRefused(f'{run}: the run is not owned by {parent.id}')
         if phase not in recorder_state.open_phase_ids(state):
             _recorder_command(['start-phase', '--session-dir', str(run), '--phase-id', phase,
                                '--phase-title', 'Held Astra review'])
-    instance = _instance(design, role)
-    name = instance_name(instance)
-    parent = worker_parent(design, role, staff.snapshot())
     result = _assign_command(['--role', 'review' if role == 'reviewer' else 'implement',
         '--target', 'durable-design-role', '--policy', 'astra-' + role,
         '--session-dir', str(run), '--parent', str(parent.id), '--to', name,
@@ -786,6 +817,15 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
                 raise RoleRefused(refusal) from error
         raise RoleRefused(refusal)
     return SubmittedRoleTurn(reply, run)
+
+
+def _require_review_run_director(run: Path, instance: RoleInstance, parent: staff.StaffRow,
+                                 record: staff.StaffSnapshot) -> None:
+    claim = instance.review_run_claim
+    owner = claim.parent if isinstance(claim, ReviewRunClaim) else parent.id
+    if owner != parent.id or parent.current_session != staff.runtime_id():
+        raise RoleRefused('only the review run parent may submit its first turn')
+    _ = pass_recorder.resolve_run_owner(run, {unit_runs.OWNER_FIELD: owner}, record)
 
 
 def _assign_command(arguments: list[str], *, env: Mapping[str, str] = os.environ) -> subprocess.CompletedProcess[str]:
@@ -907,30 +947,28 @@ def _begin_creation(design: HeldDesign, role: Role, claim: str, parent: staff.St
     directory = design_directory(design_id)
     with _lock(directory):
         current = read_design(design_id)
-        if current != design or _instance(current, role).lifecycle != RoleNotOpened(claim, 'not_started'):
+        instance = _instance(current, role)
+        if current != design or instance.lifecycle != RoleNotOpened(claim, 'not_started'):
             raise RoleRefused('RoleNeedsRecovery: thread creation claim changed')
-        if isinstance(current.binding, DesignUnbound):
-            write_text_atomic(directory / _REVIEW_RUN_OWNER_FILE, parent + '\n')
         updated = _set_lifecycle(current, role, RoleNotOpened(claim, 'outcome_unknown'))
+        if isinstance(current.binding, DesignUnbound):
+            review_claim = ReviewRunClaim(staff.WorkerName.parse(instance.name), parent)
+            updated = replace(updated, roles=tuple(replace(value, review_run_claim=review_claim)
+                              if value.role == role else value for value in updated.roles))
         _save(updated)
         return updated
 
 
-def pending_review_run_owner(directory: Path) -> staff.StaffId | unit_runs.RunOwnerUnrecorded:
-    """Read the owner of an unbound review during pane creation."""
-    unrecorded = unit_runs.RunOwnerUnrecorded('no pending review run owner')
-    if directory.parent != state_root().absolute():
-        return unrecorded
-    try:
-        owner = (directory / _REVIEW_RUN_OWNER_FILE).read_text(encoding='utf-8').strip()
-    except FileNotFoundError:
-        return unrecorded
+def pending_review_run_claim(directory: Path) -> ReviewRunClaim | ReviewRunUnclaimed:
+    """Read the reviewer slot and its parent during pane creation."""
+    if directory.parent != state_root().absolute() or not (directory / 'design.json').is_file():
+        return ReviewRunUnclaimed()
     design = read_design(directory.name)
     _check_host(design)
-    if (owner and isinstance(design.binding, DesignUnbound)
-            and _instance(design, 'reviewer').lifecycle == RoleNotOpened('pane-start', 'outcome_unknown')):
-        return staff.StaffId(owner)
-    return unrecorded
+    reviewer = _instance(design, 'reviewer')
+    if isinstance(design.binding, DesignUnbound) and reviewer.lifecycle == RoleNotOpened('pane-start', 'outcome_unknown'):
+        return reviewer.review_run_claim
+    return ReviewRunUnclaimed()
 
 
 def recover(instance_id: str) -> HeldDesign:
@@ -984,6 +1022,9 @@ def resume(instance_id: str, prompt_file: str | Path) -> SubmittedRoleTurn:
             raise RoleRefused('RoleNeedsRecovery: binding transition is incomplete')
         _idle(design)
         _validate_binding(design.binding, design_repository(design), role)
+        if isinstance(design.binding, DesignUnbound) and not (directory / unit_runs.STATE_FILE).exists():
+            record = staff.snapshot()
+            _require_review_run_director(directory, instance, worker_parent(design, role, record), record)
         generation = design.placement.generation
     prompt, reply = _prompt(design, role, Path(prompt_file).read_text(encoding='utf-8'))
     with _lock(directory):

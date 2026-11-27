@@ -33,6 +33,7 @@ from scripts.direct import progress_history, recorder_state
 from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record
 from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld, idle_transcript, prepare_recorder_history
+from scripts.lib import unit_runs
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
@@ -142,7 +143,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual(rebound, design)
         self.assertEqual(errors.getvalue(), "")
 
-    def test_another_holder_reuses_dispatches_and_ends_the_recorded_worker(self) -> None:
+    def test_another_holder_reopens_and_ends_the_recorded_worker(self) -> None:
         parent = self.panes.command_case.fixture.parent
         owner = staff.snapshot().parent_of(parent)
         if owner is None:
@@ -164,8 +165,13 @@ class HeldRolePaneTests(HeldRolePaneCase):
                     self.assertEqual(reopened, design)
                     self.assertEqual(staff.snapshot().find(kind="worker", parent=other.id), [])
                     self.assertEqual(len(self.panes.world.launches), len(self.panes.world.closed) + 1)
+                    if bound:
+                        reply = self.panes.resume(reopened, role)
+                        self.assertIn("The work is complete.", reply.read_text())
+                if not bound:
                     reply = self.panes.resume(reopened, role)
                     self.assertIn("The work is complete.", reply.read_text())
+                with patch.dict(os.environ, {"CODEX_THREAD_ID": str(other.current_session)}):
                     ended = design_roles.end(design.placement.design_id + "/" + role)
                     if bound:
                         self.assertEqual(self.panes.recorder_commands, [])
@@ -173,6 +179,49 @@ class HeldRolePaneTests(HeldRolePaneCase):
                                       design_roles.RoleEnded)
                 self.assertIsNone(staff.by_id(instance.lifecycle.staff_id))
                 self.assertEqual(staff.snapshot().find(kind="worker"), [])
+
+    def test_unbound_launch_refuses_another_slot_or_parent(self) -> None:
+        parent = self.panes.command_case.fixture.parent
+        other = fixture_member("unit", name="another-holder", parent=parent.parent)
+        self.panes.world.add(other, "w1:p-other")
+        with stop_once(design_roles, "_assign_command", when="before"), self.assertRaises(InjectedStop):
+            _ = self.panes.open("reviewer", bound=False)
+        path, = design_roles.state_root().glob("*/design.json")
+        run = path.parent
+        reviewer = design_roles.read_design(run.name).roles[1]
+        cases = ((parent, "unrelated-reviewer"), (other, reviewer.name))
+        for holder, name in cases:
+            with self.subTest(holder=holder.name, name=name):
+                if holder == other:
+                    write_text_atomic(run / "review-run-owner", str(other.id) + "\n")
+                result = self.panes.assign(["--role", "review", "--target", "durable-design-role",
+                    "--policy", "astra-reviewer", "--new-worker", name, "--session-dir", str(run),
+                    "--phase", "astra-review", "--parent", str(holder.id)],
+                    env=dict(os.environ, CODEX_THREAD_ID=str(holder.current_session),
+                             UNIT_DURABLE_ROLE_LAUNCH_RUN=str(run)))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("the launch does not match the reviewer creation claim", result.stderr)
+                self.assertEqual(self.panes.world.launches, [])
+
+    def test_unbound_first_dispatch_requires_the_claiming_parent(self) -> None:
+        parent = self.panes.command_case.fixture.parent
+        other = fixture_member("unit", name="another-holder", parent=parent.parent)
+        transcript = Path.home() / ".codex/sessions" / f"{other.current_session}.jsonl"
+        write_text_atomic(transcript, json.dumps({"type": "turn_context", "payload": {"model": "fixture"}}) + "\n")
+        design = self.panes.open("reviewer", bound=False)
+        run = design_roles.design_directory(design.placement.design_id)
+
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": str(other.current_session)}):
+            with self.assertRaisesRegex(design_roles.RoleRefused, "only the review run parent"):
+                _ = self.panes.resume(design, "reviewer")
+        self.assertEqual(design_roles.read_design(run.name), design)
+        self.assertEqual(list((run / "prompts").glob("*")), [])
+        self.assertFalse((run / unit_runs.STATE_FILE).exists())
+        self.assertEqual(self.panes.recorder_commands, [])
+
+        reply = self.panes.resume(design, "reviewer")
+        self.assertIn("The work is complete.", reply.read_text())
+        self.assertEqual(unit_runs.read_run_fields(run)[unit_runs.OWNER_FIELD], parent.id)
 
     def test_durable_dispatch_records_both_astra_policies_through_the_recorder(self) -> None:
         from scripts.direct import progress_history
