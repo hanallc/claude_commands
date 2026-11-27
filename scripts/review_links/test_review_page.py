@@ -27,7 +27,7 @@ from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, conf_reads, urgency
 from scripts.lib import user_zone as user_zone_config
-from scripts.lib.process_group import run_process_group, stop_process_group
+from scripts.lib.process_group import stop_process_group
 from scripts.lib.user_zone import user_zone
 import unittest
 from dataclasses import replace
@@ -3367,7 +3367,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
                 _ = send('WebDriver:SwitchToWindow', handle=original)
 
     def run_browser_probe(self, handler: type[BaseHTTPRequestHandler], complete: threading.Event,
-                          *, route: str = '/') -> None:
+                          route: str = '/') -> None:
         with ThreadingHTTPServer(('127.0.0.1', 0), handler) as server:
             thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
             thread.start()
@@ -3715,19 +3715,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                with tempfile.TemporaryDirectory() as profile:
-                    done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', profile,
-                        '--window-size', '1440,900', '--screenshot', str(Path(profile)/'page.png'),
-                        f'http://127.0.0.1:{server.server_port}/console/?page=review'],
-                        timeout=45)
-                self.assertEqual(done.returncode, 0, done.stderr)
-            finally:
-                server.shutdown()
-                thread.join(TEST_HANG_GUARD_SECS)
+        self.run_browser_probe(Probe, complete, route='/console/?page=review')
         self.assertEqual(results, [[]])
         self.assertEqual(review_requests, [(503, review_page.PAGE_PATH), (200, review_page.PAGE_PATH)])
 
@@ -8216,7 +8204,7 @@ window.fetch=async(_url,options={})=>{
   const form=recordDetails(target).querySelector('form'),savedResponse=holdPost();
   form.requestSubmit(form.querySelector('[value="works"]'));
   check(leavingNow(target),'A save starts the departure before the response.');
-  savedResponse.save();
+  refreshed=afterRefresh();savedResponse.save();
   await flush();
   check(!form.querySelector('[data-send-status]').textContent,'The saved row shows no action status.');
   const status=document.querySelector('[data-hidden-action-status]');
@@ -8229,8 +8217,8 @@ window.fetch=async(_url,options={})=>{
   check(rows().every(row=>!recordIsOpen(row)),'no next card opens');
   choose('list-show','all');
   const allTarget=rows().find(row=>row.dataset.type==='change' && row!==target);allTarget.querySelector('.list-toggle').click();await readyReviewCard(allTarget);
-  const allForm=recordDetails(allTarget).querySelector('form');allForm.requestSubmit(allForm.querySelector('[value="works"]'));
-  await new Promise(resolve=>nativeTimeout(resolve,1000));
+  const allForm=recordDetails(allTarget).querySelector('form');
+  refreshed=afterRefresh();allForm.requestSubmit(allForm.querySelector('[value="works"]'));await refreshed;
   check(allTarget.hidden,'F010: the saved row leaves All');
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   const reopened=liveRow(target.dataset.key);
@@ -8350,8 +8338,7 @@ window.fetch=async(_url,options={})=>{
   check(leavingNow(fresh),'Later starts the departure before the response');
   check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='0' &&
     filterControl.ownerId(selectedOwner())===retained.owner,'Later updates the count and keeps the owner while the request runs');
-  laterResponse.save();
-  await new Promise(resolve=>nativeTimeout(resolve,1000));
+  refreshed=afterRefresh();laterResponse.save();await refreshed;
   check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')==='2026-11-30T14:00:00.000Z',
     'The first click sends the deadline for the new day');
   check(fresh.hidden,'Later removes the question from the page');
@@ -8367,10 +8354,10 @@ window.fetch=async(_url,options={})=>{
     'F081: a successful save and unmount discard the submitted draft.');
   answerForm.elements.later.value='';
   answerForm.requestSubmit(answerForm.querySelector('[value="later"]'));await flush();
-  answerForm.requestSubmit(answerForm.querySelector('[value="answer"]'));await flush();
+  refreshed=afterRefresh();answerForm.requestSubmit(answerForm.querySelector('[value="answer"]'));await flush();
   check(!answerForm.querySelector('[data-send-status]').textContent,
     'F023: Answer leaves no action status after an empty Later.');
-  await new Promise(resolve=>nativeTimeout(resolve,1000));
+  await refreshed;
   choose('list-show','open');choose('list-search','','input');choose('list-owner','');
   document.querySelector('[data-filter-row="type"] [data-filter-value="all"]').click();
   const pending=rows().find(row=>row.dataset.number==='page-owner/c3'),pendingKey=pending.dataset.key;
@@ -8382,8 +8369,7 @@ window.fetch=async(_url,options={})=>{
   check(window.posts.at(-1).get('outcome')==='question' && recordIsOpen(pending) &&
     Number(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent)===initialCount-1,
     'Ask question keeps the row open and updates the count before the response');
-  questionResponse.save();
-  await new Promise(resolve=>nativeTimeout(resolve,1000));
+  refreshed=afterRefresh();questionResponse.save();await refreshed;
   const sent=liveRow(pendingKey);
   if(recordIsOpen(sent)) sent.querySelector('.list-toggle').click();
   const revision=pending.dataset.updated;
@@ -8672,16 +8658,14 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace("EXPECTED", json.dumps(expected).replace('</', '<\\/'))
-        markup = browser_markup(self.root).replace('</body>', probe + '</body>')
+        markup = browser_pages(snapshot, ('open',))['open'].replace('</body>', probe + '</body>')
         self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_uses_the_shared_status_with_the_real_loader(self) -> None:
         _ = self.question()
         _ = self.investigation()
-        markup = browser_markup(self.root)
-        with patch.object(conf, 'directory', return_value=self.fixture.temporary / 'config'):
-            assert_status_states(self, markup, 15)
+        assert_status_states(self, browser_markup(self.root), 15, run_probe=self.run_browser_probe)
 
 
 if __name__ == '__main__':

@@ -7,7 +7,7 @@ import re
 import tempfile
 import threading
 import unittest
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -139,7 +139,9 @@ def firefox_probe_results(page: bytes, *, window_size: tuple[int, int] | None = 
 
 
 def assert_status_states(case: unittest.TestCase, markup: str, period_seconds: float,
-                         reading: dict[str, object] = NO_DATA_FILE, failed_markup: str = "") -> None:
+                         reading: dict[str, object] = NO_DATA_FILE, failed_markup: str = "", *,
+                         run_probe: Callable[[type[BaseHTTPRequestHandler], threading.Event, str], None] | None = None
+                         ) -> None:
     """Run the complete page with its loader and its configured request period."""
     setup = r'''<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, intervals=new Map();
@@ -432,19 +434,22 @@ window.fetch=async(url,options={})=>{
         def log_message(self, format: str, *args: object) -> None:
             pass
 
-    with tempfile.TemporaryDirectory() as temporary, ThreadingHTTPServer(('127.0.0.1', 0), BrowserProbe) as server:
-        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
-        thread.start()
-        try:
-            profile = Path(temporary) / 'profile'
-            profile.mkdir()
-            done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                                      '--window-size', '1600,900',
-                                      '--screenshot', str(Path(temporary) / 'page.png'),
-                                      f'http://127.0.0.1:{server.server_port}/?page={identity}'],
-                                     timeout=45)
-            case.assertEqual(done.returncode, 0, done.stderr)
-        finally:
-            server.shutdown()
-            thread.join(TEST_HANG_GUARD_SECS)
+    if run_probe is not None:
+        run_probe(BrowserProbe, complete, f"/?page={identity}")
+    else:
+        with tempfile.TemporaryDirectory() as temporary, ThreadingHTTPServer(('127.0.0.1', 0), BrowserProbe) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+            thread.start()
+            try:
+                profile = Path(temporary) / 'profile'
+                profile.mkdir()
+                done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                                          '--window-size', '1600,900',
+                                          '--screenshot', str(Path(temporary) / 'page.png'),
+                                          f'http://127.0.0.1:{server.server_port}/?page={identity}'],
+                                         timeout=45)
+                case.assertEqual(done.returncode, 0, done.stderr)
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
     case.assertEqual(results, [[]], 'The real page loader must complete every status check.')
