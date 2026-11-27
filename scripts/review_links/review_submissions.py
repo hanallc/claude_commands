@@ -3098,8 +3098,11 @@ def _proof_move_header(path: Path) -> Issue:
 
 
 def _require_legacy_transfers_finished(root: Path) -> None:
-    for journal in pending_submission_moves(root):
-        move = _read_request_file(journal, journal.parent.name)
+    with record_store.review_scan_input(conf.path("review_links")):
+        attachments = _attachment_root(root)
+    for journal in record_store.owner_state_paths(attachments, "move.json", review_scan=True):
+        with record_store.review_scan_input(journal):
+            move = _read_request_file(journal, journal.parent.name)
         if isinstance(move, SubmissionMove):
             for path in (move.source, move.path):
                 try:
@@ -3116,8 +3119,8 @@ def _require_legacy_transfers_finished(root: Path) -> None:
 def _question_proof_roots(members: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[Path, ...]]:
     question = record_store.RecordKind.QUESTION
     return {
-        owner: record_store.known_folders(question, owner, document=record_store.local_document(row), strict=True)
-        for owner, row in record_store.store_owners(question, members, strict=True).items()
+        owner: record_store.known_folders(question, owner, document=record_store.local_document(row), review_scan=True)
+        for owner, row in record_store.store_owners(question, members, review_scan=True).items()
         if owner
     }
 
@@ -3160,11 +3163,7 @@ def _move_reply_proofs(discovery: staff.StaffSnapshot | LocalProofMove,
             return _question_proof_roots(discovery)
         if staff.is_owner():
             return authority_roots()
-        try:
-            members = staff.local_snapshot()
-        except staff.StaffUnreadable:
-            members = staff.StaffSnapshot(())
-        return _question_proof_roots(members)
+        return _question_proof_roots(record_store.local_review_staff())
 
     extra_roots = discovery.extra_roots if isinstance(discovery, LocalProofMove) else ()
     refusals: list[ProofMoveNoteFailure] = []
@@ -3192,6 +3191,8 @@ def _move_reply_proofs(discovery: staff.StaffSnapshot | LocalProofMove,
                 _ = investigation.move_reply_proof(path, run=run)
             else:
                 raise reply_proofs.ProofMoveRefusal("Cannot identify the kind of note.")
+        except record_store.ReviewScanRefusal:
+            raise
         except (OSError, ValueError, KeyError, RecursionError, Refusal,
                 update_registration.RegistrationFailure, update_registration.InputError) as error:
             failure = ProofMoveNoteFailure(path, error)
@@ -3212,7 +3213,7 @@ def main(argv: list[str]) -> int:
     dry_run = cast(bool, options.dry_run)
     try:
         report = _run_reply_proof_move(discovery, dry_run=dry_run)
-    except (ProofMoveNoteFailure, reply_proofs.ProofMoveRefusal) as error:
+    except (ProofMoveNoteFailure, reply_proofs.ProofMoveRefusal, record_store.ReviewScanRefusal) as error:
         print(error, file=sys.stderr)
         return 1
     except (OSError, ValueError, update_registration.RegistrationFailure):

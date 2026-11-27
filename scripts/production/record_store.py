@@ -79,12 +79,17 @@ def _folder_registry(owner: str, kind: str) -> Path:
     return state_root() / "review-folders" / (owner or ".unowned") / (kind + ".json")
 
 
-def _registered_folders(path: Path) -> tuple[Path, ...]:
+def _registered_folders(path: Path, *, review_scan: bool = False) -> tuple[Path, ...]:
     try:
-        folders = cast(list[str], json.loads(path.read_text(encoding="utf-8")))
+        with review_scan_input(path, enabled=review_scan, missing_ok=True):
+            folders = cast(object, json.loads(path.read_text(encoding="utf-8")))
+            if review_scan and (not isinstance(folders, list) or not all(
+                    isinstance(folder, str) and folder for folder in cast(list[object], folders))):
+                raise ValueError("Expected a list of store paths.")
+            return tuple(Path(folder) for folder in cast(list[str], folders))
     except FileNotFoundError:
-        return ()
-    return tuple(Path(folder) for folder in folders)
+        pass
+    return ()
 
 
 def review_folders(owner: staff.StaffId, kind: str) -> tuple[Path, ...]:
@@ -250,37 +255,41 @@ def _stamps_match(stamps: Mapping[Path, FileStamp]) -> bool:
         return False
 
 
-def _read_folder_history(doc: Path) -> tuple[Path, ...] | None:
-    return _read_folder_log(doc.parent, doc.name, doc)
+def _read_folder_history(doc: Path, *, review_scan: bool) -> tuple[Path, ...] | None:
+    return _read_folder_log(doc.parent, doc.name, doc, review_scan=review_scan)
 
 
-def _read_folder_log(repository: Path, relative: str, doc: Path) -> tuple[Path, ...] | None:
-    try:
-        result = subprocess.run(["git", "-C", str(repository), "--literal-pathspecs",
-                                 "log", "--all", "--follow", "--format=", "--no-ext-diff",
-                                 "--no-textconv", "-p", "--", relative], capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise OSError(f"Cannot read folder history for {doc}: {error}") from error
-    if result.returncode != 0:
-        if "not a git repository" not in result.stderr:
+def _read_folder_log(repository: Path, relative: str, doc: Path, *, review_scan: bool) -> tuple[Path, ...] | None:
+    with review_scan_input(repository, enabled=review_scan):
+        try:
+            result = subprocess.run(["git", "-C", str(repository), "--literal-pathspecs",
+                                     "log", "--all", "--follow", "--format=", "--no-ext-diff",
+                                     "--no-textconv", "-p", "--", relative], capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise OSError(f"Cannot read folder history for {doc}: {error}") from error
+        if result.returncode != 0:
+            if "not a git repository" in result.stderr:
+                return None
             raise OSError(f"Cannot read folder history for {doc}: {result.stderr.strip()}")
-        return None
     prefix = f"- **{PROPOSALS_FIELD}:**"
     folders: list[Path] = []
-    for line in result.stdout.split("\n"):
-        if line.startswith(("+" + prefix, "-" + prefix)):
-            if (folder := issues_folder(doc, lines=[line[1:]])) is not None:
-                folders.append(folder)
+    with review_scan_input(doc, enabled=review_scan):
+        for line in result.stdout.split("\n"):
+            if line.startswith(("+" + prefix, "-" + prefix)):
+                if (folder := issues_folder(doc, lines=[line[1:]])) is not None:
+                    folders.append(folder)
     return tuple(folders)
 
 
-def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) -> Iterator[Path]:
+def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None,
+                             review_scan: bool = False) -> Iterator[Path]:
     """Reuse successful Git history until a repository input changes."""
     doc = legacy_document_path(doc)
     if os.environ.get("GIT_DIR"):
-        yield from _read_folder_history(doc) or ()
+        yield from _read_folder_history(doc, review_scan=review_scan) or ()
         return
-    resolved = doc.resolve()
+    with review_scan_input(doc, enabled=review_scan):
+        resolved = doc.resolve()
     query = doc.absolute()
     environment = tuple(sorted((key, value) for key, value in os.environ.items()
                                if key.startswith("GIT_") or key in ("HOME", "PATH", "XDG_CONFIG_HOME")))
@@ -295,10 +304,11 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) ->
             yield from cached.folders
             return
 
-    root = next((folder for folder in resolved.parents
-                 if (folder / ".git").exists() or (folder / "HEAD").is_file() and (folder / "objects").is_dir()), None)
-    if root is None or root.name == ".git" and (root / "objects").is_dir():
-        return
+    with review_scan_input(resolved.parent, enabled=review_scan):
+        root = next((folder for folder in resolved.parents
+                     if (folder / ".git").exists() or (folder / "HEAD").is_file() and (folder / "objects").is_dir()), None)
+        if root is None or root.name == ".git" and (root / "objects").is_dir():
+            return
     stamps: dict[Path, FileStamp] = {}
     command_includes = any(key.startswith("GIT_CONFIG_KEY_") and value.lower().startswith(("include.", "includeif."))
                            or key == "GIT_CONFIG_PARAMETERS" and re.search(r"\binclude(?:if)?\.", value, re.IGNORECASE)
@@ -309,7 +319,7 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) ->
         except (OSError, RuntimeError, ValueError):
             # Git still reports the original result or error when metadata cannot be stamped.
             pass
-    folders = _read_folder_history(doc)
+    folders = _read_folder_history(doc, review_scan=review_scan)
     if folders is None:
         return
     if stamps and _stamps_match(stamps):
@@ -321,34 +331,52 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) ->
     yield from folders
 
 
-def _backup_issue_folders(owner: staff.StaffId, doc: Path, sources: list[Path] | None) -> tuple[Path, ...]:
+def _backup_issue_folders(owner: staff.StaffId, doc: Path, sources: list[Path] | None, *,
+                          review_scan: bool = False) -> tuple[Path, ...]:
     backup = production_backup_checkout(owner)
     if sources is not None:
         sources.append(backup / ".git")
-    if not backup.is_dir():
-        return ()
-    try:
-        relative = Path(BACKUP_DOCUMENT_DIRECTORY) / doc.name
-        if sources is not None:
-            _ = _history_inputs(backup, backup / relative, sources)
-        return _read_folder_log(backup, relative.as_posix(), doc) or ()
-    except (git_files.GitFilesError, ValueError) as error:
-        raise OSError(f"{doc}: cannot find backup history: {error}") from error
+    relative = (Path(BACKUP_DOCUMENT_DIRECTORY) / doc.name).as_posix()
+    with review_scan_input(backup, enabled=review_scan):
+        if not backup.is_dir():
+            return ()
+        try:
+            if sources is not None:
+                _ = _history_inputs(backup, backup / relative, sources)
+            return _read_folder_log(backup, relative, doc, review_scan=review_scan) or ()
+        except (git_files.GitFilesError, ValueError) as error:
+            raise OSError(f"{doc}: cannot find backup history: {error}") from error
+
+
+def _document_rename_paths(document: Path, owner: staff.StaffId, sources: list[Path] | None, *,
+                           review_scan: bool) -> tuple[Path, ...]:
+    with review_scan_input(document, enabled=review_scan):
+        try:
+            checkout = git_files.locate(document.parent)
+        except git_files.NotACheckout:
+            return ()
+        history = document_history_file(checkout, owner)
+    if sources is not None:
+        sources.append(history)
+    with review_scan_input(history, enabled=review_scan):
+        return former_live_documents(history)
 
 
 def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path] = (),
                   *, document: Path | None = None, strict: bool = False,
                   include_history: bool = True, require_document: bool = True,
-                  require_existing_document: bool = False, sources: list[Path] | None = None) -> tuple[Path, ...]:
+                  require_existing_document: bool = False, sources: list[Path] | None = None,
+                  review_scan: bool = False) -> tuple[Path, ...]:
     """Return current and former store roots. Use stored_paths to include their archives."""
     configured_roots = tuple(current)
     roots = list(configured_roots)
+    registry = _folder_registry(owner, kind)
     if sources is not None:
-        sources.append(_folder_registry(owner, kind))
+        sources.append(registry)
     try:
-        roots.extend(review_folders(owner, kind))
+        roots.extend(_registered_folders(registry, review_scan=review_scan))
     except (OSError, ValueError):
-        if strict:
+        if strict or review_scan:
             raise
     if kind is RecordKind.QUESTION and owner:
         roots.append(default_question_folder(owner))
@@ -357,52 +385,45 @@ def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path
     if document is not None and kind is not RecordKind.INVESTIGATION:
         require_existing = strict and require_existing_document
         try:
-            read_document = require_existing or document.parent.is_dir()
+            with review_scan_input(document.parent, enabled=review_scan):
+                read_document = require_existing or document.parent.is_dir()
         except OSError:
-            if strict and require_document:
+            if review_scan or strict and require_document:
                 raise
             read_document = False
         if read_document:
             if not configured_roots or kind is RecordKind.PROPOSAL or not require_document:
                 try:
-                    if (configured := issues_folder(document)) is not None:
-                        roots.append(configured)
+                    with review_scan_input(document, enabled=review_scan, missing_ok=not require_existing):
+                        if (configured := issues_folder(document)) is not None:
+                            roots.append(configured)
                 except FileNotFoundError:
                     if require_existing:
                         raise
                 except OSError:
-                    if strict and require_document:
+                    if review_scan or strict and require_document:
                         raise
             if include_history:
                 try:
-                    history: tuple[Path, ...] = ()
-                    if owner:
-                        try:
-                            checkout = git_files.locate(document.parent)
-                        except git_files.NotACheckout:
-                            pass
-                        else:
-                            history_file = document_history_file(checkout, owner)
-                            if sources is not None:
-                                sources.append(history_file)
-                            history = former_live_documents(history_file)
+                    history = _document_rename_paths(document, owner, sources, review_scan=review_scan) if owner else ()
                     if history and document in history:
-                        roots.extend(historical_issue_folders(history[0], sources=sources))
+                        roots.extend(historical_issue_folders(history[0], sources=sources, review_scan=review_scan))
                         for path in history:
-                            roots.extend(_backup_issue_folders(owner, path, sources))
+                            roots.extend(_backup_issue_folders(owner, path, sources, review_scan=review_scan))
                     else:
-                        roots.extend(historical_issue_folders(document, sources=sources))
+                        roots.extend(historical_issue_folders(document, sources=sources, review_scan=review_scan))
                         if owner and legacy_document_path(document) != document:
-                            roots.extend(_backup_issue_folders(owner, document, sources))
+                            roots.extend(_backup_issue_folders(owner, document, sources, review_scan=review_scan))
                 except (OSError, UnicodeError, git_files.MissingReferencedGitDirectory):
-                    if strict and require_document:
+                    if review_scan or strict and require_document:
                         raise
     resolved: dict[Path, None] = {}
     for path in roots:
         try:
-            resolved[path.resolve()] = None
+            with review_scan_input(path, enabled=review_scan):
+                resolved[path.resolve()] = None
         except (OSError, RuntimeError):
-            if strict:
+            if strict or review_scan:
                 raise
     return tuple(resolved)
 
@@ -458,19 +479,63 @@ def stored_paths(folders: Iterable[Path], *, strict: bool = False,
 
 
 def _configured_vault(stem: str, key: str) -> Iterator[Path]:
-    settings = conf.read(stem)
-    if not settings.repository_allowed:
-        try:
-            _ = settings.source.stat()
-        except FileNotFoundError:
-            return
-    yield Path(settings.text(key)).expanduser().resolve()
+    path = conf.path(stem)
+    with review_scan_input(path):
+        settings = conf.read(stem)
+        if not isinstance(settings.settings, dict):
+            if not settings.settings.missing or not _review_input_absent(path):
+                raise OSError("Cannot read the vault configuration.")
+            if not settings.repository_allowed:
+                return
+        value = settings.text(key, recover_invalid=False)
+        if not value:
+            raise ValueError("Expected a vault path.")
+        vault = Path(value).expanduser()
+    yield _resolve_review_root(vault)
 
 
 @dataclass(frozen=True)
 class ReviewScanFolder:
     path: Path
     recursive: bool
+
+
+class ReviewScanRefusal(OSError):
+    """A discovery input that the reply proof move cannot read."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"{str(path)!r}: Cannot read the Review discovery input.")
+
+
+def _review_input_absent(path: Path) -> bool:
+    try:
+        _ = path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+@contextmanager
+def review_scan_input(path: Path, *, enabled: bool = True, missing_ok: bool = False) -> Generator[None]:
+    """Refuse a failed discovery read and omit the data from its error."""
+    try:
+        yield
+    except ReviewScanRefusal:
+        raise
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        if not enabled:
+            raise
+        if missing_ok and isinstance(error, (FileNotFoundError, staff.StaffAbsent)) and _review_input_absent(path):
+            return
+        refused = error.path if isinstance(error, git_files.UnreadableGitFiles) else path
+        raise ReviewScanRefusal(refused) from None
+
+
+def _resolve_review_root(path: Path) -> Path:
+    with review_scan_input(path):
+        return path.expanduser().resolve()
 
 
 def _review_scan_entries(folder: Path) -> tuple[os.DirEntry[str], ...]:
@@ -482,18 +547,35 @@ def configured_review_vaults() -> tuple[Path, ...]:
     return (*_configured_vault("staff", "producer_folder_root"), *_configured_vault("issue_score", "vault_root"))
 
 
+def local_review_staff() -> staff.StaffSnapshot:
+    """Read the local staff record for Review discovery."""
+    members = staff.StaffSnapshot(())
+    with review_scan_input(staff.record_path(), missing_ok=True):
+        members = staff.local_snapshot()
+    return members
+
+
+def _local_document_store_folders() -> Iterator[Path]:
+    """Find current and former stores for local production documents."""
+    for row in local_review_staff().rows:
+        if (document := local_document(row)) is not None:
+            yield from known_folders(RecordKind.QUESTION, row.id, document=document, review_scan=True)
+
+
 def local_review_paths(extra_roots: Iterable[Path] = ()) -> Iterator[Path]:
-    """Scan configured vaults, native stores, and registered or explicit stores."""
+    """Scan vaults and native, registered, declared, or explicit stores."""
     vaults = configured_review_vaults()
     state = state_root()
-    native = owner_state_paths(state, "questions", "investigations", "proposals", strict=True)
-    archives = owner_state_paths(state, "archive", strict=True)
-    registrations = owner_state_paths(state / "review-folders", *(kind.value + ".json" for kind in RecordKind), strict=True)
-    registered = (folder for registration in registrations for folder in _registered_folders(registration))
-    stores = tuple(dict.fromkeys(path.expanduser().resolve() for path in chain(native, registered, extra_roots)))
+    native = owner_state_paths(state, "questions", "investigations", "proposals", review_scan=True)
+    archives = owner_state_paths(state, "archive", review_scan=True)
+    registrations = owner_state_paths(state / "review-folders", *(kind.value + ".json" for kind in RecordKind),
+                                      review_scan=True)
+    registered = (folder for registration in registrations for folder in _registered_folders(registration, review_scan=True))
+    stores = tuple(dict.fromkeys(_resolve_review_root(path) for path in
+                                 chain(native, registered, _local_document_store_folders(), extra_roots)))
     pending = [
         *(ReviewScanFolder(path, False) for path in stores),
-        *(ReviewScanFolder(path, True) for path in (*archive_folders(stores), *(path.resolve() for path in archives))),
+        *(ReviewScanFolder(path, True) for path in (*archive_folders(stores), *map(_resolve_review_root, archives))),
         *(ReviewScanFolder(path, True) for path in vaults),
     ]
     visited: set[ReviewScanFolder] = set()
@@ -503,10 +585,9 @@ def local_review_paths(extra_roots: Iterable[Path] = ()) -> Iterator[Path]:
         if folder in visited:
             continue
         visited.add(folder)
-        try:
+        entries: tuple[os.DirEntry[str], ...] = ()
+        with review_scan_input(folder.path, missing_ok=True):
             entries = _review_scan_entries(folder.path)
-        except FileNotFoundError:
-            continue
         for entry in entries:
             try:
                 if folder.recursive and entry.name != ".git" and entry.is_dir(follow_symlinks=False):
@@ -516,6 +597,8 @@ def local_review_paths(extra_roots: Iterable[Path] = ()) -> Iterator[Path]:
                     continue
             except FileNotFoundError:
                 continue
+            except OSError:
+                raise ReviewScanRefusal(Path(entry.path)) from None
             path = Path(entry.path)
             if path not in notes:
                 notes.add(path)
@@ -574,31 +657,37 @@ def _read_high_water(path: Path) -> int:
         raise OSError(f"Cannot read the ID sequence {path}: {error}") from error
 
 
-def owner_state_paths(root: Path, *names: str, strict: bool) -> Iterator[Path]:
+def owner_state_paths(root: Path, *names: str, strict: bool = False, review_scan: bool = False) -> Iterator[Path]:
     """List the named paths below each directory in the state root."""
+    parents: tuple[Path, ...] = ()
     try:
-        parents = tuple(root.iterdir())
+        with review_scan_input(root, enabled=review_scan, missing_ok=True):
+            parents = tuple(root.iterdir())
     except FileNotFoundError:
         return
     except OSError:
-        if strict:
+        if strict or review_scan:
             raise
         return
     for parent in parents:
         for name in names:
             path = parent / name
             try:
-                _ = path.stat()
-            except (FileNotFoundError, NotADirectoryError):
+                with review_scan_input(path, enabled=review_scan, missing_ok=True):
+                    try:
+                        _ = path.stat()
+                    except NotADirectoryError:
+                        continue
+                    yield path
+            except FileNotFoundError:
                 continue
             except OSError:
-                if strict:
+                if strict or review_scan:
                     raise
-                continue
-            yield path
 
 
-def store_owners(kind: RecordKind, members: staff.StaffSnapshot | None = None, *, strict: bool = False
+def store_owners(kind: RecordKind, members: staff.StaffSnapshot | None = None, *, strict: bool = False,
+                 review_scan: bool = False
                  ) -> dict[staff.StaffId, staff.StaffRow | None]:
     """Find staff and former staff with local stores."""
     root = state_root()
@@ -606,10 +695,10 @@ def store_owners(kind: RecordKind, members: staff.StaffSnapshot | None = None, *
     if members is not None:
         owners.update((row.id, row) for row in members.rows
                       if kind is not RecordKind.PROPOSAL or row.kind in ("showrunner", "producer"))
-    for path in owner_state_paths(root / "review-folders", kind.value + ".json", strict=strict):
+    for path in owner_state_paths(root / "review-folders", kind.value + ".json", strict=strict, review_scan=review_scan):
         _ = owners.setdefault(staff.StaffId("" if path.parent.name == ".unowned" else path.parent.name), None)
     if kind in (RecordKind.QUESTION, RecordKind.INVESTIGATION):
-        for path in owner_state_paths(root, kind.value + "s", "archive", strict=strict):
+        for path in owner_state_paths(root, kind.value + "s", "archive", strict=strict, review_scan=review_scan):
             _ = owners.setdefault(staff.StaffId(path.parent.name), None)
     return owners
 
