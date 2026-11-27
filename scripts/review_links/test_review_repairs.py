@@ -357,7 +357,8 @@ class ReviewRepairsTests(unittest.TestCase):
                 if self.path == '/action':
                     cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
                     saved = cache.save(body.decode(), case.status)
-                    result: dict[str, object] = {'answer': saved.answer, 'version': saved.version}
+                    result: dict[str, object] = {'answer': saved.answer, 'words_saved': saved.words_saved,
+                                                 'version': saved.version}
                     if isinstance(saved.item, review_items.ReviewItem):
                         later = saved.item.times.later
                         result.update(state=saved.item.state, later=0 if isinstance(later, review_items.NoLaterTime)

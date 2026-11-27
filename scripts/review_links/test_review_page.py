@@ -562,10 +562,11 @@ window.fetch=(url,options)=>{
   if(!button) throw new Error('The action is missing.');
   form.requestSubmit(button);
   await until(()=>!form.dataset.sending,'The save did not finish.');
-  const copy=content.querySelector('[data-unsaved-review-key="'+CSS.escape(key)+'"] textarea');
-  if(expected==='cleared' && (field.value || copy))
+  const copy=()=>content.querySelector('[data-unsaved-review-key="'+CSS.escape(key)+'"] textarea');
+  if(expected==='retained') await until(copy,'The acknowledgement did not show the draft after the fade.');
+  if(expected==='cleared' && (field.value || copy()))
    failures.push('The confirmed words clear from the field and the notice.');
-  if(expected==='retained' && copy?.value!==words)
+  if(expected==='retained' && copy()?.value!==words)
    failures.push('The acknowledgement leaves the words in the notice.');
   if(expected==='unconfirmed' && (!field.isConnected || field.value!==words ||
     !form.querySelector('[data-send-status]').textContent.includes('Could not confirm the save.')))
@@ -715,6 +716,7 @@ window.fetch=(url,options)=>{
    if(recovered.elements.feedback.value!==words) failures.push('The form restores the refused words.');
    recovered.requestSubmit(recovered.querySelector('[value="read"]'));
    await until(()=>toast()?.getAnimations().length,'The retry did not request a hold.');
+   await until(notice,'The retry did not show the draft after the fade.');
    if(notice()?.querySelector('textarea')?.value!==words)
     failures.push('The notice keeps the words until the retry is confirmed.');
    toast().getAnimations()[0].finish();
@@ -7285,7 +7287,18 @@ window.fetch=async(url)=>{
             change_review.Visible(f'Change {number}', 'Read the diff', 'Check the result')
             for number in range(4, 9)
         ]), datetime.now(user_zone()).date(), '', fixture.production, record=staff.snapshot())
-        self.assertEqual(save_notice_failures(browser_markup(self.root).encode(), 'works'), [[]])
+        # The shared probe supplies a save response for both List and Review.
+        review_save = r'''<script>
+const fixtureSave=window.fetch;
+window.fetch=async(url,options)=>{
+ const response=await fixtureSave(url,options);
+ if(options?.method!=='POST' || !response.ok) return response;
+ const result=await response.json();
+ return {...response,json:async()=>({...result,words_saved:false})};
+};
+</script>'''
+        markup = browser_markup(self.root).replace('<head>', '<head>'+review_save, 1)
+        self.assertEqual(save_notice_failures(markup.encode(), 'works'), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_card_actions_fade_and_slide(self) -> None:
@@ -7394,6 +7407,33 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  check(!copy(panel),'The summary copy disappears when the fade ends.');
  check(redraws===1,'The deferred redraw runs once after the fade.');
  observer.disconnect();
+ const bottomFade=async words=>{
+  scrollTo(0,document.scrollingElement.scrollHeight);await frame();
+  const last=rows().at(-1),lastForm=await openCard(last);
+  lastForm.elements.feedback.value=words;
+  scrollTo(0,document.scrollingElement.scrollHeight);await frame();
+  send(lastForm);
+  const key=motionKey(last),clip=copy(key),exit=clip.getAnimations()[0];
+  scrollTo(0,document.scrollingElement.scrollHeight);await frame();
+  const bottom=scrollY,position=top(clip);
+  check(near(bottom,document.scrollingElement.scrollHeight-innerHeight),'The paused fade is at the page bottom.');
+  return {key,exit,stays:()=>near(top(clip),position) && scrollY===bottom};
+ };
+ const words='Keep the words from the bottom of Review.';
+ const first=await bottomFade(words),notice=document.querySelector('[data-review-notice]');
+ const draft=()=>document.querySelector('[data-unsaved-review-key="'+CSS.escape(first.key)+'"]');
+ showReviewDraftNotice(first.key,notice);
+ await frame();
+ check(!draft() && first.stays(),'Inserting a draft copy waits until the fade ends.');
+ first.exit.finish();await first.exit.finished;await frame();
+ check(draft()?.previousElementSibling===notice && draft().querySelector('textarea').value===words,
+  'The draft copy shows after the Review notice when the fade ends.');
+ const second=await bottomFade('');
+ hideReviewDraftNotice(first.key);
+ await frame();
+ check(draft() && second.stays(),'Removing a draft copy waits until the fade ends.');
+ second.exit.finish();await second.exit.finished;await frame();
+ check(!draft(),'The draft copy disappears after the fade.');
 """)
 
     def last_owner_card_markup(self) -> str:

@@ -1682,6 +1682,7 @@ function installReviewBody(row,body){
 }
 const reviewDrafts=window.frameElement?.linkedReviewDrafts ?? new Map();
 const reviewFormEdits=new WeakMap();
+let presentReviewDraftCopy=update=>update();
 // Match Python str.strip() when the server checks for words.
 const blankReviewWords=/^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/;
 function bindReviewForm(form,{zone,settings,send}){
@@ -1776,13 +1777,18 @@ function restoreReviewDraft(form,draft){
  }
  recordDetails(recordFromDetail(form)).querySelectorAll('input[name=choice]').forEach(choice=>choice.checked=choice.value===draft.choice);
 }
-function drawReviewDraftNotice(record){
+function drawReviewDraftNotice(record,anchor){
  const copy=record?.notice;
  if(!copy) return;
- const words=record.edit.draft.feedback;
- copy.hidden=!words;
- showActionFailure(copy.querySelector('p'),record.message || 'Your words are unsent.');
- copy.querySelector('textarea').value=words;
+ presentReviewDraftCopy(()=>{
+  if(record.notice!==copy) return;
+  const words=record.edit.draft.feedback;
+  copy.hidden=!words;
+  showActionFailure(copy.querySelector('p'),record.message || 'Your words are unsent.');
+  const field=copy.querySelector('textarea');
+  if(field.value!==words) field.value=words;
+  if(anchor?.isConnected && copy.previousElementSibling!==anchor) anchor.after(copy);
+ });
 }
 function setReviewDraftMessage(key,message){
  const record=reviewDrafts.get(key);
@@ -1793,8 +1799,9 @@ function setReviewDraftMessage(key,message){
 function hideReviewDraftNotice(key){
  const record=reviewDrafts.get(key);
  if(!record?.notice) return;
- record.notice.remove();
+ const copy=record.notice;
  record.notice=null;
+ presentReviewDraftCopy(()=>copy.remove());
 }
 function showReviewDraftNotice(key,anchor){
  if(!reviewDraftWords(key)) return;
@@ -1811,8 +1818,7 @@ function showReviewDraftNotice(key,anchor){
   label.append(words);copy.append(status,label);
   record.notice=copy;
  }
- if(record.notice.previousElementSibling!==anchor) anchor.after(record.notice);
- drawReviewDraftNotice(record);
+ drawReviewDraftNotice(record,anchor);
 }
 async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true,present=apply=>apply(),report,missing}){
  const revision=form.elements.revision?.value,key=recordFromDetail(form).dataset.key;
@@ -2347,6 +2353,8 @@ async function afterRowAnimations(run,current=()=>true){
  while(current() && view.hasActiveRowAnimations) await view.settled();
  if(current()) return run();
 }
+// Wait for the table update and its row fades before a draft copy changes the layout.
+presentReviewDraftCopy=update=>queueMicrotask(()=>{void afterRowAnimations(update);});
 addEventListener('scroll',()=>{
  const waiting=scrollDepartures.size>0;
  for(const save of pendingSaves.values()){
