@@ -914,7 +914,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.assertEqual((push.id, push.values), ("quota.codex_workers_stay", {
             "account": "codex1", "outcome": "we're in self-actualize mode; worker work moves to claude3"}))
         self.assertEqual(push.message, "codex1 is empty; we're in self-actualize mode; worker work moves to claude3")
-        self.assertNotIn("No action needed", push.message)
+        self.assertEqual(push.action, NoActionRequired())
 
     def test_an_unreadable_role_map_names_the_units_account_in_words(self) -> None:
         _ = self.note(1, "off")
