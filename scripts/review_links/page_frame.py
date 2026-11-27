@@ -905,6 +905,7 @@ border:1px solid var(--border,#2d3748);border-radius:8px;background:var(--nav,#1
 box-shadow:0 4px 16px #0008;font:500 14px/20px system-ui,sans-serif;overflow:hidden;min-width:0}
 [data-send-undo][hidden]{display:none}
 [data-send-undo] span{min-width:0;overflow-wrap:anywhere}
+[data-send-undo-receipt] span{white-space:pre-line}
 [data-send-undo] button{flex:none;padding:4px 10px;border:0;border-radius:4px;background:none;color:var(--accent,#c2d4ff);
 font:600 14px/20px system-ui,sans-serif;cursor:pointer}
 [data-send-undo] button:is(:hover,:focus-visible){background:#fff2}
@@ -1060,8 +1061,8 @@ function trackHeldRequest(key){
  heldRequests.set(key,request);
  return request;
 }
-function showSendUndo(request,seconds,receiver){
- const {hold}=request,host=sendUndoHost();
+function sendToast(){
+ const host=sendUndoHost();
  const view=host.defaultView;
  if(!view.getSendUndoStack){
   // Install the observer in the top window so it stays active after a frame closes.
@@ -1069,15 +1070,38 @@ function showSendUndo(request,seconds,receiver){
   host.head.append(script);script.remove();
  }
  const stack=view.getSendUndoStack();
- const toast=host.createElement('div'),text=host.createElement('span'),button=host.createElement('button');
- const bar=host.createElement('div');
+ const toast=host.createElement('div'),text=host.createElement('span');
+ toast.dataset.sendUndo='';toast.append(text);stack.append(toast);
+ return {toast,text,host,view};
+}
+function fadeSendToast(toast,timing){
+ return toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
+}
+function sendReceiptText(response,result,receipt){
+ return response?.ok && result && !result.send_failure && !result.attachment_warning && receipt?.(result);
+}
+function showSendReceipt(toast,text,message,remove){
+ toast.dataset.sendUndoReceipt='';text.textContent=message;toast.hidden=false;
+ fadeSendToast(toast,{duration:6000,easing:'linear',fill:'forwards'}).finished.then(remove,remove);
+}
+async function showImmediateReceipt(request,response,receipt){
+ if(!receipt || !response.ok || request.closed) return;
+ const result=await response.clone().json().catch(()=>null);
+ const message=sendReceiptText(response,result,receipt);
+ if(!message || request.closed) return;
+ const {toast,text}=sendToast();
+ showSendReceipt(toast,text,message,()=>toast.remove());
+}
+function showSendUndo(request,seconds,receiver,receipt){
+ const {hold}=request,{toast,text,host,view}=sendToast();
+ const button=host.createElement('button'),bar=host.createElement('div');
  const sent=receiver===null ? 'Saved.' : receiver ? 'Sent to '+receiver+'.' : 'Sent.';
- toast.dataset.sendUndo='';text.textContent=receiver || receiver===null ? sent : 'Sending.';
+ text.textContent=receiver || receiver===null ? sent : 'Sending.';
  button.type='button';button.textContent='Undo';
- bar.dataset.sendUndoBar='';toast.append(text,button,bar);stack.append(toast);
+ bar.dataset.sendUndoBar='';toast.append(button,bar);
  // The Undo stays clear for the first half of the time, then fades out until the send leaves.
  const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
- const fade=toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
+ const fade=fadeSendToast(toast,timing);
  const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
  return new Promise(resolve=>{
   let done=false,removalTimer=0;
@@ -1093,6 +1117,12 @@ function showSendUndo(request,seconds,receiver){
   const reportResult=async(response,late=false,warning)=>{
    const result=await response?.clone().json().catch(()=>null);
    if(request.closed || !toast.parentNode) return;
+   const message=sendReceiptText(response,result,receipt);
+   if(message){
+    fade.cancel();
+    showSendReceipt(toast,text,(late ? 'Too late to undo. ' : '')+message,remove);
+    return;
+   }
    if(!late && !result?.send_failure && (!warning || response?.ok)){
     if(warning) warning.then(remove);
     else remove();
@@ -1139,7 +1169,7 @@ function showSendUndo(request,seconds,receiver){
   });
  });
 }
-async function heldFetch(url,init={},receiver,onHold){
+async function heldFetch(url,init={},receiver,onHold,receipt){
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
  const key=JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
@@ -1156,13 +1186,14 @@ async function heldFetch(url,init={},receiver,onHold){
  });
  if(first.headers.get('X-Send-Hold')!=='held'){
   if(!(first.status>=500)) request.finish();
+  if(receipt) await showImmediateReceipt(request,first,receipt);
   return first;
  }
  const {hold,seconds}=await first.json();
  request.hold=hold;
  let undo=false;
  if(!request.closed && seconds>0){
-  const shown=showSendUndo(request,seconds,receiver);
+  const shown=showSendUndo(request,seconds,receiver,receipt);
   onHold?.();
   undo=await shown;
  }
@@ -1174,6 +1205,7 @@ async function heldFetch(url,init={},receiver,onHold){
    if(response.headers.get('X-Send-Hold')!=='pending'){
     if(response.status!==404 || !request.expired()) request.finish();
     if(typeof undo==='function') await undo(response);
+    else if(receipt) await showImmediateReceipt(request,response,receipt);
     return response;
    }
   }catch(error){

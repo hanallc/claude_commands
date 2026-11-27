@@ -1419,22 +1419,21 @@ function bindDraft(dialog, fresh = false) {
   const recipient = recipientChips.querySelector('input:checked');
   const scheduled = isScheduled();
   const recovering = isRecovering();
-  const locked = recovering || (scheduled && !!savedItem);
-  dialog.classList.toggle('scheduled-locked', scheduled && locked);
-  words.readOnly = locked;
-  includePage.disabled = sending || locked;
-  changeAssignee.disabled = sending || locked;
-  for (const button of previews.querySelectorAll('button')) button.disabled = sending || locked;
-  for (const fieldset of form.querySelectorAll('fieldset')) fieldset.disabled = sending || locked;
+  dialog.classList.toggle('scheduled-locked', scheduled && recovering);
+  words.readOnly = recovering;
+  includePage.disabled = sending || recovering;
+  changeAssignee.disabled = sending || recovering;
+  for (const button of previews.querySelectorAll('button')) button.disabled = sending || recovering;
+  for (const fieldset of form.querySelectorAll('fieldset')) fieldset.disabled = sending || recovering;
   send.textContent = sending ? 'Sending…' : recovering ? 'Retry' : 'Send';
   laterButton.hidden = !canEditSeparateListDraft() && !['retry', 'edit-later'].includes(submittedDraft?.mode);
   laterButton.disabled = sending;
   laterButton.textContent = isEditingLater() ? 'Return to Retry' : 'Edit a separate draft';
   sentDetails.hidden = scheduled;
-  scheduledHelp.hidden = !scheduled || !!savedItem;
+  scheduledHelp.hidden = !scheduled;
   words.placeholder = scheduled ? 'Enter the instruction, start time, and repeat.' : wordsPlaceholder;
   for (const input of kindInputs) {
-   input.disabled = sending || locked || !!savedItem ||
+   input.disabled = sending || recovering || !!savedItem ||
      (input.value === 'scheduled' && awaitingEarlierSend && !isEditingLater());
   }
   send.disabled = !!savedItem || sending || !token || isEditingLater() || submittedDraft?.mode === 'screenshot-expired' ||
@@ -1644,10 +1643,10 @@ function bindDraft(dialog, fresh = false) {
   updateSend();
  }
 
- async function post(payload, {keepalive = false, hold = false, receiver} = {}) {
+ async function post(payload, {keepalive = false, hold = false, receiver, receipt} = {}) {
   const options = {method: 'POST', headers: {'Content-Type': 'application/json'},
                    body: JSON.stringify(payload), keepalive};
-  const response = await (hold ? heldFetch(endpoint, options, receiver) : fetch(endpoint, options));
+  const response = await (hold ? heldFetch(endpoint, options, receiver, undefined, receipt) : fetch(endpoint, options));
   return responseData(response, 'Could not send this item.');
  }
 
@@ -2170,18 +2169,20 @@ function bindDraft(dialog, fresh = false) {
  renewButton.addEventListener('click', () => void chooseScreenshot(true));
  omitButton.addEventListener('click', () => void chooseScreenshot(false));
 
- function showConfirmation(item) {
+ function scheduledReceipt(item) {
+  if (typeof item.id !== 'string' || !/^L[1-9][0-9]*$/.test(item.id)) return '';
+  return [item.receipt || 'Saved List item ' + item.id.slice(1) + '.',
+          ...(Array.isArray(item.readback) ? item.readback : []), item.notice_warning].filter(Boolean).join('\n');
+ }
+
+ function showAttachmentWarning(item) {
   savedItem = item;
   const saved = Boolean(item);
-  const scheduled = saved && item.id.startsWith('L');
-  confirmation.textContent = scheduled
-   ? ['Saved List item ' + item.id.slice(1) + '.', item.receipt?.replace(/ List item [1-9][0-9]*\.$/, ''),
-      ...(item.readback || []), item.notice_warning].filter(Boolean).join('\n')
-   : saved ? ['Saved ' + item.id + '.', item.attachment_warning].filter(Boolean).join('\n') : '';
+  confirmation.textContent = saved ? 'Saved ' + item.id + '.\n' + item.attachment_warning : '';
   confirmation.hidden = savedControls.hidden = !saved;
-  body.hidden = saved && !scheduled;
+  body.hidden = saved;
   sendControls.hidden = saved;
-  closeButton.hidden = Boolean(item?.attachment_warning);
+  closeButton.hidden = saved;
   updateSend();
   if (saved) done.focus();
  }
@@ -2194,7 +2195,7 @@ function bindDraft(dialog, fresh = false) {
    discardCapture();
    finishDraft();
    if (laterDraft) {
-    showConfirmation();
+    showAttachmentWarning();
     showLaterDraft();
     showSentDetails();
     startCapture();
@@ -2219,7 +2220,7 @@ function bindDraft(dialog, fresh = false) {
     Boolean(submittedDraft || awaitingEarlierSend || words.value || images.length);
   if (!keepDraft) {
    if (!returnToNative) finishDraft();
-   if (result) showConfirmation();
+   if (result) showAttachmentWarning();
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
    previews.replaceChildren();
@@ -2369,7 +2370,7 @@ function bindDraft(dialog, fresh = false) {
   let saved, usedPreview = false, posted = false;
   setError('');
   setSending(true);
-  if (!isScheduled()) hideDialog();
+  hideDialog();
   try {
    const item = await submissionPayload();
    if (submittedDraft?.payload !== item) {
@@ -2389,7 +2390,8 @@ function bindDraft(dialog, fresh = false) {
     posted = true;
     if (usedPreview && captureSession?.image?.key === item.capture_key) captureSession.sent = true;
     const receiver = !hadEarlierSend && recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
-    return post({...item, token}, {hold: item.kind !== 'scheduled', receiver: receiver || undefined});
+    return post({...item, token}, {hold: true, receiver: receiver || undefined,
+                                 receipt: item.kind === 'scheduled' ? scheduledReceipt : undefined});
    };
    let result;
    try {
@@ -2468,7 +2470,7 @@ function bindDraft(dialog, fresh = false) {
   }
   if (saved?.attachment_warning) {
    if (!dialog.open) dialog.showModal();
-   showConfirmation(saved);
+   showAttachmentWarning(saved);
    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
   } else if (saved) {
    const keepEdits = Boolean(laterDraft);
@@ -2483,14 +2485,11 @@ function bindDraft(dialog, fresh = false) {
     startCapture();
     updateSend();
     send.focus();
-   } else if (!saved.id.startsWith('L')) {
+   } else {
     close({sent: true});
     const target = dialog.isConnected ? dialog : document;
     if (!onList) target.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
     target.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
-   } else {
-    showConfirmation(saved);
-    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
    }
   } else {
    send.focus();

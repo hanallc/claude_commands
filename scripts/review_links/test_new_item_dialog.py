@@ -810,7 +810,8 @@ OWNER_OPTIONS_PROBE = r"""
         'An explicit selection enables Send and hides the notice.');
   if (__SEND_SCHEDULED__) {
    scheduledInput.click();
-   words.value = 'Check the queue. Start Fri Jan 15 2027 13:00. Repeat Daily.';
+   const instruction = 'Check the queue. Start Fri Jan 15 2027 13:00. Repeat Daily.';
+   words.value = instruction;
    words.dispatchEvent(new InputEvent('input', {bubbles:true}));
    const sendResponse = window.fetch;
    let posted;
@@ -826,19 +827,16 @@ OWNER_OPTIONS_PROBE = r"""
     }
     return sendResponse(path, options);
    };
-   const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
+   const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
    send.click();
-   await saved;
-   check(posted?.recipient_id === alternate.value && posted.words === words.value &&
+   check(!dialog.open && document.activeElement === buttons[0], 'Scheduled Send closes the dialog and restores focus.');
+   const {detail} = await created;
+   check(posted?.recipient_id === alternate.value && posted.words === instruction &&
          posted.page_recipient === 'selected' && !('capture_key' in posted),
          'Scheduled sends the selected owner and words without capture fields.');
    check(/^s1-[0-9a-f]{32}$/.test(posted?.request_id), 'Changing the kind to Scheduled creates a Scheduled draft ID.');
-   check(!hidden(dialog.querySelector('[data-saved-controls]')) && scheduledInput.checked &&
-         dialog.querySelector('#new-item-saved').textContent.includes('Saved List item 12.') &&
-         dialog.querySelector('#new-item-saved').textContent.includes('Repeats: Daily'),
-         'The confirmation shows the saved List number, repeat, and selected type.');
-   check(dialog.querySelector('#new-item-saved').textContent.includes('Producer: morty.'),
-         'The confirmation names the mapped producer.');
+   check(detail.id === 'L12' && hidden(dialog.querySelector('[data-saved-controls]')),
+         'Scheduled reports the saved item without asking for acknowledgment.');
   } else {
    dialog.querySelector('[data-kind="enhancement"] input').click();
    words.value = 'Show the next check in the row.';
@@ -985,7 +983,8 @@ RESTORED_SEND_PROBE = r"""
     choices.querySelector('[data-' + scenario + '-capture]').click();
     await ready(() => choices.hidden && !send.disabled);
    }
-   const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
+   const saved = new Promise(resolve => dialog.addEventListener(
+    kind === 'scheduled' ? 'review-item-created' : 'review-item-saved', resolve, {once:true}));
    send.click();
    await saved;
    if (captureChoice) {
@@ -1555,7 +1554,10 @@ window.fetch = async (path, options) => {
   if (item.request_id) {
    posts.push(item);
    if (shippedUnsent && item.kind === 'scheduled') {
-    if (!restored.scheduled) throw new TypeError('The Scheduled reply was lost.');
+    if (!restored.scheduled) {
+     if (options.keepalive) lostHold = hold;
+     throw new TypeError('The Scheduled reply was lost.');
+    }
     return Response.json({id:'L1'});
    }
    if (!restored && posts.length === 1) {
@@ -1644,15 +1646,15 @@ async function checkSeparateScheduledDraft() {
   sessionStorage.setItem(probeKey, JSON.stringify({...restored, scheduled:posts[0]}));
  } else {
   await waitForStep(() => send.textContent === 'Retry' && !send.disabled, 'The Scheduled Retry did not recover on reload.');
+  const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
   send.click();
-  await waitForStep(() => !dialog.querySelector('#new-item-saved').hidden, 'The Scheduled Retry did not show confirmation.');
+  const {detail} = await created;
   check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored.scheduled) &&
-        dialog.querySelector('#new-item-saved').textContent.startsWith('Saved List item 1.'),
+        detail.id === 'L1' && !dialog.open,
         'Scheduled Retry uses the same Send and confirms the saved item.');
-  check(pending().id === restored.id, 'Scheduled confirmation keeps the shipped pointer.');
-  dialog.querySelector('[data-done]').click();
+  check(pending().id === restored.id, 'Scheduled Retry keeps the shipped pointer.');
   launch.click();
-  await waitForStep(recipientsReady, 'The native draft did not open after Scheduled confirmation.');
+  await waitForStep(recipientsReady, 'The native draft did not open after Scheduled Retry.');
   check(type.checked && words.value === 'Keep the first List Send.' &&
         dialog.querySelectorAll('[data-previews] img').length === 1, 'Scheduled Retry preserves the native words and image.');
   if (send.disabled) throw new Error('The native Send is disabled.');
@@ -2390,6 +2392,82 @@ window.fetch = (path, options) => {
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_non_list_send_closes_the_dialog_at_send(self) -> None:
         self.assert_held_send("success")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_scheduled_send_closes_the_dialog_and_shows_the_fading_receipt(self) -> None:
+        script = r"""
+const failures = [], check = (ok, message) => { if (!ok) failures.push(message); };
+const host = window.top.document, nativeFetch = window.fetch;
+const page = __PAGE__, holdEnabled = __HOLD__;
+const launch = document.querySelector('[data-owner-new]'), dialog = document.querySelector('dialog');
+const words = dialog.querySelector('textarea'), send = dialog.querySelector('[type="submit"]');
+const hold = 'a'.repeat(24), heldPath = '/send-hold/' + hold;
+const saved = {id:'L12',list_key:'morty/L12',receipt:'Scheduled → cargo-liner. Producer: morty. List item 12.',
+ readback:['Starts: Fri Jan 15 2027 13:00 PST (16:00 EST)', 'Repeats: Daily']};
+let created, posts = 0;
+launch.closest('[data-page-owner]').dataset.pageOwner = page;
+document.addEventListener('review-item-created', event => { created = event.detail; });
+window.fetch = async (path, options = {}) => {
+ if (path === heldPath) return Response.json(saved);
+ if (!String(path).startsWith('/console/review/new-item')) return nativeFetch(path, options);
+ if (!options.body) return Response.json({token:'fixture',page_owner:'cargo-liner',
+  recipients:[{id:'cargo-liner',name:'cargo-liner'}]});
+ if (JSON.parse(options.body).kind !== 'scheduled') return Response.json({});
+ posts++;
+ check(new Headers(options.headers).get('X-Undo-Hold') === '1', 'Scheduled uses the shared hold.');
+ return holdEnabled ? Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}}) : Response.json(saved);
+};
+function until(test) {
+ if (test()) return Promise.resolve();
+ return new Promise((resolve, reject) => {
+  const observer = new MutationObserver(() => {
+   if (test()) { clearTimeout(deadline); observer.disconnect(); resolve(); }
+  });
+  const deadline = setTimeout(() => {
+   observer.disconnect(); reject(new Error('The Scheduled send did not reach the expected state.'));
+  }, 3000);
+  for (const body of [document.body, host.body]) observer.observe(body, {subtree:true,childList:true,attributes:true});
+ });
+}
+(async () => {
+ try {
+  launch.click();
+  await until(() => dialog.querySelector('[name="recipient_id"]:checked'));
+  dialog.querySelector('[name="kind"][value="scheduled"]').click();
+  words.value = 'Check the queue. Start Fri Jan 15 2027 13:00 PST. Repeat Daily.';
+  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+  send.click();
+  if (dialog.open) throw new Error('Scheduled Send kept the dialog open.');
+  check(document.activeElement === launch, 'Scheduled Send returns focus to New item.');
+  const toast = () => host.querySelector('[data-send-undo]');
+  let undoToast;
+  if (holdEnabled) {
+   await until(() => toast()?.querySelector('button'));
+   undoToast = toast();
+   check(undoToast.querySelector('button').textContent === 'Undo' && !created, 'Undo is available before the save.');
+   undoToast.getAnimations()[0].finish();
+  }
+  await until(() => created?.id === 'L12' && toast()?.hasAttribute('data-send-undo-receipt'));
+  const receipt = toast();
+  check(posts === 1 && !dialog.open && dialog.querySelector('[data-done]').parentElement.hidden,
+        'The save keeps the dialog closed without an acknowledgment.');
+  check(host.querySelectorAll('[data-send-undo]').length === 1 && (!undoToast || undoToast === receipt),
+        'The page uses one toast for the hold and receipt.');
+  check(receipt.querySelector('span').textContent === [saved.receipt, ...saved.readback].join('\n'),
+        'The receipt gives the item number, recipient, start and repeat.');
+  check(!receipt.hidden && !receipt.querySelector('button'), 'The receipt is visible after the Undo period.');
+  const [fade] = receipt.getAnimations();
+  check(fade?.effect.getKeyframes().at(-1).opacity === '0', 'The receipt fades out.');
+  fade.finish();
+  await until(() => !toast());
+ } catch (error) { failures.push(String(error)); }
+ await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();
+"""
+        for page, held in (("review", True), ("list", True), ("list", False)):
+            with self.subTest(page=page, held=held):
+                probe = script.replace("__PAGE__", json.dumps(page)).replace("__HOLD__", json.dumps(held))
+                self.assertEqual(firefox_probe_results(bug_fixture_page(script=probe)), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_undo_reopens_the_new_item_with_the_words(self) -> None:
