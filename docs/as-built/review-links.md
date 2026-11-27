@@ -1569,6 +1569,8 @@ An unavailable map or a retired producer can cause that fallback.
 Send and recovery use `scan_list_records` before they select a List destination for a saved source.
 The scan requires readable rows and folders, including the targets of saved links.
 The destination check and reservation use the List lock.
+New reservations save both the keeper and the number.
+Numeric reservations use the saved route or verified List evidence to identify the keeper.
 Only a complete absence check permits the Review-only fallback.
 A retired producer leaves a question filing pending when it still requires a List row.
 The command saves its draft ID and recipient before the POST.
@@ -2471,7 +2473,10 @@ The scan reads closed rows and supported legacy rows that lack a source key.
 - **Studio pending**. Other writers wait for Studio to finish its filing.
 - **Incomplete or unresolved**. Filing and the notice stay pending. Recovery logs the failure.
 
-Review moves, report filing, exchange filing, migration apply, and exchange reservation recovery also use `scan_list_records`.
+Review moves, report filing, exchange filing, and migration apply also use `scan_list_records`.
+List scans and filing checks identify a row by its resolved List folder and number.
+Aliases share one row and one folder lock.
+Retries use the keeper saved with the reservation or receipt.
 Exchange filing reads the current links under the source lock before it selects a destination.
 The fallback preserves the route for recovery if the keeper returns before the claim.
 The pending delivery marker remains if row verification or fallback saving fails.
@@ -2533,12 +2538,20 @@ The preview and migration log also list unresolved question destinations and key
 Review keeps an Investigation or native Question visible while an outgoing question needs action in Review.
 Review also keeps the card visible while a reply remains unresolved.
 Review requires matching `.saved` receipts for the verified List exchanges that cover the question and replies.
+Review hides a moved report only when its readable List row matches the source, report kind, and destination.
+Review counts and card refreshes use the same check as the table.
+Review keeps the source visible if the List row is unavailable or fails verification.
+A legacy Bug move saves its purpose and destination after the List write succeeds.
+Older pending Bug moves stay visible in Review until verification succeeds.
 An Open Change with one verified slot answer on the List can move to the List when the answerer is unknown.
 A later slot change leaves the filed reply binding and answer text intact.
 A filed question can receive an answer or close after withdrawal.
 The writer also updates read state and verified question metadata.
 The writer rereads the source under its filing lock.
 The List allocator records the destination before it advances the counter.
+Allocation recovery saves the counter and the source reservation before it removes the journal.
+Fresh creation can recover allocation metadata without reading List rows.
+Source recovery checks the complete List before it writes the reserved row.
 The writer saves pending exchanges before it writes the List item.
 A new unread Review answer adds one log entry with its words, time, and author in the same save.
 The Studio shows **New answer** under **Answers** while the reply mark remains.

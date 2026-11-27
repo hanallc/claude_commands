@@ -25,7 +25,7 @@ from scripts.lib import conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
 from scripts.production import list_exchange
-from scripts.production import change_review, delivery_state, footer_counts, record_store, repeat_rule, session_staff, staff, the_list
+from scripts.production import change_review, delivery_state, footer_counts, repeat_rule, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, page_version
@@ -276,21 +276,10 @@ def top_priority_mark(shown: TopPriority, members: staff.StaffSnapshot, item: th
     return TopPriorityMark.TOP_ITEM if producer.top_item == staff.TopItem(item.number) else TopPriorityMark.MAKE_TOP
 
 
-def list_keepers(sources: list[Path] | None = None) -> list[staff.StaffId]:
-    root = record_store.state_root()
-    if sources is not None:
-        sources.append(root)
-    try:
-        owners = sorted(root.iterdir())
-    except FileNotFoundError:
-        return []
-    return [staff.StaffId(owner.name) for owner in owners if owner.is_dir() and not owner.is_symlink()]
-
-
 def records(*, include_closed: bool = False, sources: list[Path] | None = None) -> list[ListRecord]:
     """Read the list folders even when a producer has no current staff row."""
-    found = [ListRecord(keeper, item) for keeper in list_keepers(sources)
-             for item in the_list.records(keeper, include_closed=include_closed, sources=sources)]
+    found = (ListRecord(row.keeper, row.item)
+             for row in the_list.display_list_records(include_closed=include_closed, sources=sources))
     return sorted(found, key=lambda entry: the_list.order(entry.item))
 
 
