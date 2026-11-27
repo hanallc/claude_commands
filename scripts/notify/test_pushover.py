@@ -173,7 +173,7 @@ class MacDeliveryTests(unittest.TestCase):
                     code = pushover.cancel(["--source", "Mac unit", "power supply"], asker=asker)
                 self.assertEqual((code, output.getvalue(), errors.getvalue()), (status, out, error))
                 self.assertEqual(asked, [([*silence.SSH,
-                    pushover.REMOTE + " cancel --source 'Mac unit' 'power supply'"], "")])
+                    pushover.REMOTE + " cancel --exact-tag-key --source 'Mac unit' 'power supply'"], "")])
 
     def test_unreachable_natedev_logs_the_cause_without_a_local_post(self) -> None:
         failures = ((255, "ssh: connection refused\n", "connection refused"),
@@ -372,19 +372,19 @@ class PushoverTests(unittest.TestCase):
         push: silence.KeptPush = {"source": "drawer", "key": "same key", "priority": "2", "title": "Decision",
                                   "message": "Details", "detail": "", "text_id": "decision.choices", "reference": reference}
         binding_path = question_pushes.binding_path(push["source"], push["key"])
-        expected = question_pushes.Binding(push["source"], push["key"], reference, True)
+        expected = question_pushes.Binding(push_reference.PushIdentity(push["source"], push["key"], reference), True)
         posts: list[str] = []
 
         def post(url: str, body: bytes) -> tuple[int, bytes]:
             self.assertEqual(question_pushes.read_binding(binding_path), expected)
             posts.append(url)
             if url == pushover.API_URL:
-                self.assertEqual(urllib.parse.parse_qs(body.decode())["tags"], [pushover.push_tag(expected.tag_key)])
+                self.assertEqual(urllib.parse.parse_qs(body.decode())["tags"], [pushover.push_tag(expected.identity.tag_key)])
             return 200, b'{"status":1}'
 
-        def cancel(source: str, key: str, *, exact_tag: bool) -> tuple[int, str]:
-            self.assertTrue(exact_tag)
-            return pushover.cancel(["--exact-tag-key", "--source", source, key], self.keys, post), "cancelled"
+        def cancel(identity: push_reference.PushIdentity) -> tuple[int, str]:
+            return pushover.cancel(["--exact-tag-key", "--source", identity.sender, identity.tag_key],
+                                   self.keys, post), "cancelled"
 
         status = "open"
 
@@ -411,7 +411,7 @@ class PushoverTests(unittest.TestCase):
             self.assertEqual(question_pushes.drain(), 0)
         self.assertFalse(binding_path.exists())
         self.assertEqual(send.read_queue(queued), [unrelated])
-        self.assertEqual(posts, [pushover.API_URL, pushover.CANCEL_URL.format(tag=pushover.push_tag(expected.tag_key))])
+        self.assertEqual(posts, [pushover.API_URL, pushover.CANCEL_URL.format(tag=pushover.push_tag(expected.identity.tag_key))])
 
     def test_old_question_retire_paths_preserve_the_new_opening(self) -> None:
         path = self.keys.parent / "question.md"
@@ -450,18 +450,18 @@ class PushoverTests(unittest.TestCase):
             assert isinstance(held, escalate.RegisteredHold)
             escalate.write(escalate.held_path("choice"), replace(held, outcome="sent"))
             with silence.locked():
-                binding = question_pushes.bind_locked(source, key, old, emergency=True)
+                binding = question_pushes.bind_locked(push_reference.PushIdentity(source, key, old), emergency=True)
             _ = path.write_text(path.read_text().replace('"old"', '"new"'))
             keep_copies()
             self.assertEqual(question_pushes.drain(), 0)
             self.assertEqual(send.read_queue(queue), [new_row, unbound_row])
             self.assertEqual(silence.read_kept(), [new_kept])
-            cancel.assert_called_once_with(source, binding.tag_key, exact_tag=True)
+            cancel.assert_called_once_with(binding.identity)
             with silence.locked():
-                newer = question_pushes.bind_locked(source, key, new, emergency=True)
+                newer = question_pushes.bind_locked(push_reference.PushIdentity(source, key, new), emergency=True)
 
             keep_copies()
-            self.assertEqual(send.retire_recorded_question(source, key, old)[0], 0)
+            self.assertEqual(send.retire_recorded_question(push_reference.PushIdentity(source, key, old))[0], 0)
             self.assertEqual(send.read_queue(queue), [new_row, unbound_row])
             self.assertEqual(silence.read_kept(), [new_kept])
             keep_copies()
@@ -470,22 +470,22 @@ class PushoverTests(unittest.TestCase):
             self.assertEqual(send.read_queue(queue), [new_row, unbound_row])
             self.assertEqual(silence.read_kept(), [new_kept])
             self.assertEqual(question_pushes.read_binding(question_pushes.binding_path(source, key)), newer)
-            self.assertEqual(cancel.call_count, 1)
+            self.assertEqual(cancel.call_args_list, [mock.call(binding.identity), mock.call(binding.identity)])
 
     def test_unbound_push_does_not_wait_for_question_cancellation(self) -> None:
         path = self.keys.parent / "question.md"
         _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
         reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
         with silence.locked():
-            binding = question_pushes.bind_locked("drawer", "same key", reference, emergency=True)
-        push: silence.KeptPush = {"source": binding.source, "key": binding.key, "priority": "2", "title": "Alert",
+            binding = question_pushes.bind_locked(push_reference.PushIdentity("drawer", "same key", reference), emergency=True)
+        push: silence.KeptPush = {"source": binding.identity.sender, "key": binding.identity.key, "priority": "2", "title": "Alert",
             "message": "Details", "detail": "", "text_id": "alert.blocked"}
         with mock.patch.object(send, "cancel_user_push", return_value=(3, "cancel failed")) as cancel:
             post = mock.Mock(return_value=(200, b'{"status":1}'))
             self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
             post.assert_called_once()
             cancel.assert_not_called()
-        self.assertEqual(question_pushes.read_binding(question_pushes.binding_path(binding.source, binding.key)), binding)
+        self.assertEqual(question_pushes.read_binding(question_pushes.binding_path(binding.identity.sender, binding.identity.key)), binding)
 
     def test_unbound_clear_check_cancels_the_tag_it_posted(self) -> None:
         path = self.keys.parent / "question.md"
@@ -510,9 +510,9 @@ class PushoverTests(unittest.TestCase):
 
         self.assertEqual(pushover.deliver_here({**push, "reference": reference}, self.keys, post), 0)
         self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
-        binding = question_pushes.Binding(push["source"], push["key"], reference, True)
+        binding = question_pushes.Binding(push_reference.PushIdentity(push["source"], push["key"], reference), True)
         self.assertEqual([fields["tags"] for _url, fields in calls],
-                         [[pushover.push_tag(binding.tag_key)], [pushover.push_tag(push["key"])]])
+                         [[pushover.push_tag(binding.identity.tag_key)], [pushover.push_tag(push["key"])]])
         tag = calls[-1][1]["tags"][0]
         for host in (send.machine(), "other-host"):
             with self.subTest(host=host), mock.patch.object(send, "run", side_effect=channel):
@@ -523,7 +523,35 @@ class PushoverTests(unittest.TestCase):
                 self.assertEqual(calls[-1][0], pushover.CANCEL_URL.format(tag=tag))
                 self.assertEqual(send.read_emergencies(), [])
         self.assertEqual(len(calls), 4)
-        self.assertEqual(question_pushes.read_binding(question_pushes.binding_path(binding.source, binding.key)), binding)
+        self.assertEqual(question_pushes.read_binding(question_pushes.binding_path(binding.identity.sender, binding.identity.key)), binding)
+
+    def test_manual_retire_cancels_the_unbound_tag_beside_a_question(self) -> None:
+        path = self.keys.parent / "question.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        push: silence.KeptPush = {"source": "drawer", "key": "same key", "priority": "2", "title": "Alert",
+            "message": "Details", "detail": "", "text_id": "alert.blocked"}
+        active: set[str] = set()
+
+        def post(url: str, body: bytes) -> tuple[int, bytes]:
+            if url == pushover.API_URL:
+                active.update(urllib.parse.parse_qs(body.decode())["tags"])
+            else:
+                active.discard(url.split("/")[-1].removesuffix(".json"))
+            return 200, b'{"status":1}'
+
+        def channel(argv: list[str], _stdin: str, _timeout: float) -> tuple[int, str, str]:
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                code = pushover.cancel(argv[3:], self.keys, post)
+            return code, output.getvalue(), errors.getvalue()
+
+        self.assertEqual(pushover.deliver_here({**push, "reference": reference}, self.keys, post), 0)
+        self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+        legacy_question_tag = pushover.push_tag(json.dumps([push["source"], push["key"], reference], sort_keys=True))
+        self.assertEqual(active, {legacy_question_tag, pushover.push_tag(push["key"])})
+        with mock.patch.object(send, "run", side_effect=channel), redirect_stdout(io.StringIO()):
+            self.assertEqual(send.main(["retire", "--to", "user", "--from", push["source"], "--key", push["key"]]), 0)
+        self.assertEqual(active, {legacy_question_tag})
 
     def test_silence_retries_release_after_the_question_lock_is_free(self) -> None:
         path = self.keys.parent / "question.md"
@@ -619,10 +647,39 @@ class PushoverTests(unittest.TestCase):
             self.assertEqual(send.main(["question-push-release"]), 0)
             self.assertEqual(silence.off(lambda _argv: 0), 0)
         self.assertEqual(len(accepted), 1)
-        self.assertEqual(silence.read_kept(), [{**push, "post_started": True}])
+        saved, = silence.read_kept()
+        attempt = saved.get("post_started", False)
+        self.assertTrue(attempt)
+        self.assertEqual(saved, {**push, "post_started": attempt})
         self.assertEqual(self.log_lines()[-1]["outcome"], "kept push post unconfirmed")
-        self.assertEqual(send.retire_recorded_question(push["source"], push["key"], reference)[0], 0)
+        self.assertEqual(send.retire_recorded_question(silence.push_identity(push))[0], 0)
         self.assertEqual(silence.read_kept(), [])
+
+    def test_malformed_post_reply_keeps_the_question_unconfirmed(self) -> None:
+        path = self.keys.parent / "question.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        for status, body in ((200, b'{"status":true}'), (200, b'broken'), (500, b'{"status":0}')):
+            with self.subTest(status=status, body=body), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                silence.kept_file().unlink(missing_ok=True)
+                push: silence.KeptPush = {"source": "drawer", "key": "question key", "priority": "1",
+                    "title": "Choose", "message": "Details", "detail": "", "text_id": "decision.choices",
+                    "reference": reference}
+                self.silence_on()
+                post = mock.Mock(return_value=(status, body))
+                self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+
+                def deliver(kept: silence.KeptPush) -> int:
+                    return pushover.post_kept(kept, self.keys, post)
+
+                self.assertEqual(silence.off(lambda _argv: 0, deliver), 1)
+                self.assertEqual(silence.end_if_past(deliver=deliver), 0)
+                post.assert_called_once()
+                saved, = silence.read_kept()
+                attempt = saved.get("post_started", False)
+                self.assertTrue(attempt)
+                self.assertEqual(saved, {**push, "post_started": attempt})
+                self.assertEqual(self.log_lines()[-2]["outcome"], f"unconfirmed: HTTP {status}, kept during silence")
 
     def test_question_drain_counts_inventory_time_against_the_budget(self) -> None:
         path = self.keys.parent / "question.md"
@@ -630,7 +687,7 @@ class PushoverTests(unittest.TestCase):
         reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
         with silence.locked():
             for index in range(13):
-                _ = question_pushes.bind_locked("drawer", f"key {index}", reference, emergency=False)
+                _ = question_pushes.bind_locked(push_reference.PushIdentity("drawer", f"key {index}", reference), emergency=False)
         budget = conf.read("send").number("user_cancel_timeout")
         clock = 0.0
         read_binding = question_pushes.read_binding
@@ -661,8 +718,8 @@ class PushoverTests(unittest.TestCase):
         remote: push_reference.QuestionReference = {**local, "machine": "mac"}
         with silence.locked():
             with mock.patch.object(question_pushes, "opening", return_value=push_reference.QuestionOpening("open", "opening")):
-                _ = question_pushes.bind_locked("a", "key", remote, emergency=False)
-            _ = question_pushes.bind_locked("z", "key", local, emergency=False)
+                _ = question_pushes.bind_locked(push_reference.PushIdentity("a", "key", remote), emergency=False)
+            _ = question_pushes.bind_locked(push_reference.PushIdentity("z", "key", local), emergency=False)
         _ = path.write_text(path.read_text().replace("status: open", "status: closed"))
         clock = 0.0
 
@@ -998,12 +1055,12 @@ class PushoverTests(unittest.TestCase):
     def test_array_reply_logs_http_refusal(self) -> None:
         code, _ = self.run_send(["--no-action", "t", "m"], body=b"[]")
         self.assertEqual(code, 1)
-        self.assert_log("0", "t", footed("No action needed.\nm"), "refused: HTTP 200")
+        self.assert_log("0", "t", footed("No action needed.\nm"), "unconfirmed: HTTP 200")
 
     def test_null_reply_logs_http_refusal(self) -> None:
         code, _ = self.run_send(["--no-action", "t", "m"], body=b"null")
         self.assertEqual(code, 1)
-        self.assert_log("0", "t", footed("No action needed.\nm"), "refused: HTTP 200")
+        self.assert_log("0", "t", footed("No action needed.\nm"), "unconfirmed: HTTP 200")
 
     def test_sent_log_keeps_multiline_text_after_limits(self) -> None:
         message = "first line\nsecond line"

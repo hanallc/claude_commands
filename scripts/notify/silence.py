@@ -46,11 +46,13 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import NotRequired, Protocol, TypedDict, cast
+from uuid import uuid4
 
 from scripts.lib import operation_deadline
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone, zone_label  # noqa: E402
 from scripts.notify import push_reference
+from scripts.notify.push_reference import PushIdentity
 
 PY = Path.home() / ".claude/scripts/lib/py"
 SILENCE = Path.home() / ".claude/scripts/notify/silence.py"
@@ -80,7 +82,8 @@ class SilencePolicy(str, Enum):
 
 
 class KeptPush(TypedDict):
-    post_started: NotRequired[bool]
+    post_started: NotRequired[bool | str]
+    post_rejection: NotRequired[str]
     silence_policy: NotRequired[SilencePolicy]
     reference: NotRequired[push_reference.PushReference]
     due: NotRequired[str]
@@ -180,9 +183,9 @@ def parse_push(text: str) -> KeptPush | None:
     record = cast(dict[str, object], value)
     # A line kept before pushes had a key or a text id reads as key "" and text id "" (free text).
     found = {name: record.get(name) for name in KeptPush.__annotations__
-             if name not in {"due", "need", "reference", "silence_policy", "post_started"}} | {
+             if name not in {"due", "need", "reference", "silence_policy", "post_started", "post_rejection"}} | {
         "key": record.get("key", ""), "text_id": record.get("text_id", "")}
-    for name in ("due", "need"):
+    for name in ("due", "need", "post_rejection"):
         if name in record:
             found[name] = record[name]
     if not all(isinstance(item, str) for item in found.values()):
@@ -194,7 +197,7 @@ def parse_push(text: str) -> KeptPush | None:
     result = cast(KeptPush, cast(object, found))
     if "post_started" in record:
         started = record["post_started"]
-        if not isinstance(started, bool):
+        if not isinstance(started, bool) and (not isinstance(started, str) or not started):
             return None
         result["post_started"] = started
     if "silence_policy" in record:
@@ -270,29 +273,28 @@ def keep_locked(push: KeptPush) -> Kept | NotSilent:
     record = read_state()
     if record is None or past_end(record):
         return NotSilent()
-    _ = drop_locked(push["source"], push["key"], push.get("reference", push_reference.NO_REFERENCE),
-                    pending_only=True)
+    _ = drop_locked(push_identity(push), pending_only=True)
     with kept_file().open("a", encoding="utf-8") as out:
         _ = out.write(json.dumps(push) + "\n")
     return Kept(ends(record))
 
 
-def drop_here(source: str, key: str) -> int:
-    """Remove kept pushes without a Question reference for this source and key."""
-    if not key:
-        return 0
+def push_identity(push: KeptPush) -> PushIdentity:
+    return PushIdentity(push["source"], push["key"], push.get("reference", push_reference.NO_REFERENCE))
+
+
+def drop_here(identity: PushIdentity) -> int:
+    """Remove kept copies of this push."""
     with locked():
-        return drop_locked(source, key)
+        return drop_locked(identity)
 
 
-def drop_locked(source: str, key: str, reference: push_reference.PushReference = push_reference.NO_REFERENCE, *,
-                pending_only: bool = False) -> int:
+def drop_locked(identity: PushIdentity, *, pending_only: bool = False) -> int:
     """Drop matching kept pushes while the caller holds the silence lock."""
-    if not key and (pending_only or reference["kind"] == "none"):
+    if not identity.key and (pending_only or identity.question is None):
         return 0
-    kept = read_kept(strict=reference["kind"] == "question")
-    left = [push for push in kept if (push["source"], push["key"]) != (source, key)
-            or push.get("reference", push_reference.NO_REFERENCE) != reference
+    kept = read_kept(strict=identity.question is not None)
+    left = [push for push in kept if push_identity(push) != identity
             or (pending_only and push.get("post_started", False))]
     if len(left) != len(kept):
         write_kept(left)
@@ -311,9 +313,23 @@ def mark_post_started(push: KeptPush) -> None:
     kept = read_kept(strict=True)
     if push.get("post_started", False) or push not in kept:
         raise OSError("silence: kept push is no longer pending")
-    kept[kept.index(push)]["post_started"] = True
+    attempt = uuid4().hex
+    kept[kept.index(push)]["post_started"] = attempt
     write_kept(kept)
-    push["post_started"] = True
+    push["post_started"] = attempt
+
+
+def mark_post_rejected(push: KeptPush, reason: str) -> None:
+    """Save the rejection and allow a later release to try again."""
+    kept = read_kept(strict=True)
+    if not push.get("post_started", False) or push not in kept:
+        raise OSError("silence: kept push has no saved attempt")
+    rejected: KeptPush = {**push, "post_rejection": reason}
+    del rejected["post_started"]
+    kept[kept.index(push)] = rejected
+    write_kept(kept)
+    del push["post_started"]
+    push["post_rejection"] = reason
 
 
 def ask(argv: Sequence[str], text: str) -> tuple[int, str]:
@@ -325,16 +341,19 @@ class RemoteDropFailed(OSError):
     """The notification owner did not confirm the drop."""
 
 
-def drop(source: str, key: str, system: str | None = None, asker: Ask = ask) -> int:
-    """Remove kept pushes without a Question reference on the notification owner."""
+def drop(identity: PushIdentity, system: str | None = None, asker: Ask = ask) -> int:
+    """Remove kept copies on the notification owner."""
     if not on_mac(system):
-        return drop_here(source, key)
+        return drop_here(identity)
+    arguments = ["drop", "--source", identity.sender, "--key", identity.key]
+    if identity.question is not None:
+        arguments += ["--reference", json.dumps(identity.question.reference)]
     try:
-        code, out = asker([*SSH, f"{REMOTE} {shlex.join(['drop', '--source', source, '--key', key])}"], "")
+        code, out = asker([*SSH, f"{REMOTE} {shlex.join(arguments)}"], "")
     except (OSError, subprocess.SubprocessError) as error:
-        raise RemoteDropFailed(f"silence: natedev could not drop {key}: {error}") from error
+        raise RemoteDropFailed(f"silence: natedev could not drop {identity.key}: {error}") from error
     if code != 0 or not out.strip().isdigit():
-        raise RemoteDropFailed(f"silence: natedev did not confirm the drop for {key} (exit {code})")
+        raise RemoteDropFailed(f"silence: natedev did not confirm the drop for {identity.key} (exit {code})")
     return int(out.strip())
 
 
@@ -412,7 +431,8 @@ def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, del
         for claimed in kept:
             if claimed.get("post_started", False) or claimed not in pending:
                 continue
-            push = pending[pending.index(claimed)]
+            index = pending.index(claimed)
+            push = pending[index]
             try:
                 code = deliver(push)
             except Exception:
@@ -426,7 +446,7 @@ def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, del
                 dropped += 1
             else:
                 delivered += 1
-            pending.remove(push)
+            _ = pending.pop(index)
             write_kept(pending)
         if not pending:
             kept_file().unlink(missing_ok=True)
@@ -467,7 +487,7 @@ def end_if_past(runner: Run | None = None, deliver: Deliver | None = None) -> in
     record, kept = claimed
     if record is not None:
         return release(record, kept, runner or run, deliver or post_kept, "silence ended at its end time")
-    questions = [push for push in kept if not push.get("post_started", False)
+    questions = [push for push in kept if not push.get("post_started", False) and "post_rejection" not in push
                  and push.get("reference", push_reference.NO_REFERENCE)["kind"] == "question"]
     if not questions:
         return 0
@@ -477,7 +497,7 @@ def end_if_past(runner: Run | None = None, deliver: Deliver | None = None) -> in
 def status() -> int:
     record = read_state()
     kept = read_kept()
-    unconfirmed = sum(push.get("post_started", False) for push in kept)
+    unconfirmed = sum(bool(push.get("post_started", False)) for push in kept)
     count = len(kept) - unconfirmed
     plural = "" if count == 1 else "es"
     attempts = f"; {unconfirmed} unconfirmed" if unconfirmed else ""
@@ -512,6 +532,7 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
     dropping = commands.add_parser("drop", help="remove matching kept pushes without a Question reference")
     _ = dropping.add_argument("--source", required=True)
     _ = dropping.add_argument("--key", required=True)
+    _ = dropping.add_argument("--reference", help=argparse.SUPPRESS)
     options = parser.parse_args(arguments)
     if on_mac(system):
         return remote([*SSH, f"{REMOTE} {shlex.join(arguments)}"])
@@ -537,7 +558,12 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
     if command == "off":
         return off(runner, timer=cast(str, options.timer))
     if command == "drop":
-        print(drop_here(cast(str, options.source), cast(str, options.key)))
+        try:
+            encoded = cast(str | None, options.reference)
+            reference = push_reference.read_reference(cast(object, json.loads(encoded)) if encoded else None)
+        except ValueError as error:
+            parser.error(str(error))
+        print(drop_here(PushIdentity(cast(str, options.source), cast(str, options.key), reference)))
         return 0
     return status()
 

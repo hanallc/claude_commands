@@ -18,23 +18,23 @@ from typing import Protocol, cast
 from scripts.lib import conf, operation_deadline
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.notify import push_reference, silence
+from scripts.notify.push_reference import PushIdentity
 
 
 @dataclass(frozen=True)
 class Binding:
-    source: str
-    key: str
-    reference: push_reference.QuestionReference
+    identity: PushIdentity
     emergency: bool
 
     @property
-    def tag_key(self) -> str:
-        """Give each sender, key and opening its own emergency tag."""
-        return json.dumps([self.source, self.key, self.reference], sort_keys=True)
+    def reference(self) -> push_reference.QuestionReference:
+        question = self.identity.question
+        assert question is not None
+        return question.reference
 
 
 class RetirementTransport(Protocol):
-    def retire_question_copies(self, binding: Binding) -> str: ...
+    def retire_question_copies(self, identity: PushIdentity, *, emergency: bool) -> str: ...
 
 
 class SettledQuestion(ValueError):
@@ -61,7 +61,7 @@ def read_binding(path: Path) -> Binding | None:
         source, key, emergency = fields.get("source"), fields.get("key"), fields.get("emergency")
         if (reference["kind"] == "question" and isinstance(source, str) and source and isinstance(key, str)
                 and key and isinstance(emergency, bool) and path == binding_path(source, key)):
-            return Binding(source, key, reference, emergency)
+            return Binding(PushIdentity(source, key, reference), emergency)
     raise ValueError(f"invalid Question push binding {path}")
 
 
@@ -92,44 +92,47 @@ def settled(reference: push_reference.QuestionReference) -> str:
     return "question closed" if current.status == "closed" else ""
 
 
-def retire_locked(path: Path, binding: Binding) -> str:
+def retire_locked(identity: PushIdentity, *, emergency: bool) -> str:
     """Retire the current binding under the silence lock."""
-    result = retire_copies(binding)
-    path.unlink()
+    result = retire_copies(identity, emergency=emergency)
+    binding_path(identity.sender, identity.key).unlink()
     return result
 
 
-def retire_copies(binding: Binding) -> str:
+def retire_copies(identity: PushIdentity, *, emergency: bool) -> str:
     transport = cast(RetirementTransport, cast(object, import_module("scripts.message.send")))
-    return transport.retire_question_copies(binding)
+    return transport.retire_question_copies(identity, emergency=emergency)
 
 
-def bind_locked(source: str, key: str, reference: push_reference.QuestionReference, *, emergency: bool) -> Binding:
+def bind_locked(identity: PushIdentity, *, emergency: bool) -> Binding:
     """Record the active binding before the caller keeps or posts the push."""
-    path = binding_path(source, key)
+    question = identity.question
+    assert question is not None
+    reference = question.reference
+    path = binding_path(identity.sender, identity.key)
     previous = read_binding(path)
     if reason := settled(reference):
         raise SettledQuestion(reason)
-    if previous is not None and previous.reference != reference:
-        _ = retire_locked(path, previous)
+    if previous is not None and previous.identity != identity:
+        _ = retire_locked(previous.identity, emergency=previous.emergency)
         previous = None
         if reason := settled(reference):
             raise SettledQuestion(reason)
-    bound = Binding(source, key, reference, emergency or (previous is not None and previous.emergency))
+    bound = Binding(identity, emergency or (previous is not None and previous.emergency))
     if bound != previous:
-        write_text_atomic(path, json.dumps({"source": source, "key": key, "reference": reference,
+        write_text_atomic(path, json.dumps({"source": identity.sender, "key": identity.key, "reference": reference,
                                            "emergency": bound.emergency}) + "\n")
     return bound
 
 
-def retire_matching(source: str, key: str, reference: push_reference.QuestionReference) -> str:
+def retire_matching(identity: PushIdentity, *, emergency: bool = False) -> str:
     """Retire a binding after its explicit emergency clear check passes."""
-    path = binding_path(source, key)
+    path = binding_path(identity.sender, identity.key)
     with silence.locked():
         binding = read_binding(path)
-        if binding is not None and binding.reference == reference:
-            return retire_locked(path, binding)
-        return retire_copies(Binding(source, key, reference, False))
+        if binding is not None and binding.identity == identity:
+            return retire_locked(identity, emergency=emergency or binding.emergency)
+        return retire_copies(identity, emergency=emergency)
 
 
 def report(line: str) -> None:
@@ -172,8 +175,8 @@ def _drain(question: Path | None) -> int:
             operation_deadline.check()
             reference = push.get("reference", push_reference.NO_REFERENCE)
             if reference["kind"] == "question" and wanted(reference):
-                binding = Binding(push["source"], push["key"], reference, False)
-                pending[binding.tag_key] = binding
+                identity = PushIdentity(push["source"], push["key"], reference)
+                pending[identity.tag_key] = Binding(identity, False)
     except TimeoutError:
         raise
     except (OSError, ValueError) as error:
@@ -207,9 +210,9 @@ def _drain(question: Path | None) -> int:
                         continue
                 else:
                     binding = entry
-                    current = read_binding(binding_path(binding.source, binding.key))
+                    current = read_binding(binding_path(binding.identity.sender, binding.identity.key))
                     operation_deadline.check()
-                    if current is not None and current.reference == binding.reference:
+                    if current is not None and current.identity == binding.identity:
                         continue
                 label = binding.reference["path"]
                 reason = settled(binding.reference)
@@ -218,11 +221,11 @@ def _drain(question: Path | None) -> int:
                     continue
                 terminal = True
                 if isinstance(entry, Path):
-                    report(retire_locked(entry, binding))
+                    report(retire_locked(binding.identity, emergency=binding.emergency))
                 else:
-                    dropped = silence.drop_locked(binding.source, binding.key, binding.reference)
+                    dropped = silence.drop_locked(binding.identity)
                     if dropped:
-                        report(f"retired {dropped} kept copies for {binding.source} / {binding.key}")
+                        report(f"retired {dropped} kept copies for {binding.identity.sender} / {binding.identity.key}")
         except BlockingIOError:
             continue
         except TimeoutError as error:

@@ -51,6 +51,45 @@ def read_reference(value: object) -> PushReference:
 
 
 @dataclass(frozen=True)
+class QuestionAddress:
+    machine: Literal["natedev", "mac"]
+    path: str
+    since: str
+
+    @property
+    def reference(self) -> QuestionReference:
+        result = QuestionReference(kind="question", path=self.path, since=self.since)
+        if self.machine == "mac":
+            result["machine"] = "mac"
+        return result
+
+
+@dataclass(frozen=True, init=False)
+class PushIdentity:
+    sender: str
+    key: str
+    question: QuestionAddress | None
+
+    def __init__(self, sender: str, key: str, reference: PushReference = NO_REFERENCE) -> None:
+        object.__setattr__(self, "sender", sender)
+        object.__setattr__(self, "key", key)
+        object.__setattr__(self, "question", QuestionAddress(reference.get("machine", "natedev"),
+            reference["path"], reference["since"]) if reference["kind"] == "question" else None)
+
+    @property
+    def tag_key(self) -> str:
+        """Preserve the tag encoding used by existing posts."""
+        return self.key if self.question is None else json.dumps(
+            [self.sender, self.key, self.question.reference], sort_keys=True)
+
+    @property
+    def state_slot(self) -> str:
+        """Select the user's saved send within a message key."""
+        reference = NO_REFERENCE if self.question is None else self.question.reference
+        return "user-push:" + json.dumps([self.sender, reference], sort_keys=True)
+
+
+@dataclass(frozen=True)
 class QuestionOpening:
     status: str
     since: str

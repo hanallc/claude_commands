@@ -57,7 +57,7 @@ class RegistrationTests(RegistrationFixture):
         reference = push_reference.admission_reference("decision.choices", str(record.path))
         assert reference["kind"] == "question"
         with silence.locked():
-            return question_pushes.bind_locked("Override sender", "custom key", reference, emergency=True)
+            return question_pushes.bind_locked(push_reference.PushIdentity("Override sender", "custom key", reference), emergency=True)
 
     def test_question_push_retirement_follows_terminal_writes(self) -> None:
         self.isolate_pushes()
@@ -97,8 +97,8 @@ class RegistrationTests(RegistrationFixture):
                 if binding is None:
                     cancel.assert_not_called()
                 else:
-                    cancel.assert_called_once_with(binding.source, binding.tag_key, exact_tag=True)
-                    self.assertFalse(question_pushes.binding_path(binding.source, binding.key).exists())
+                    cancel.assert_called_once_with(binding.identity)
+                    self.assertFalse(question_pushes.binding_path(binding.identity.sender, binding.identity.key).exists())
 
     def test_failed_question_push_retirement_keeps_the_saved_answer_and_retries(self) -> None:
         self.isolate_pushes()
@@ -116,7 +116,7 @@ class RegistrationTests(RegistrationFixture):
             done = self.run_command("answer", "--item", title)
             self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
             self.assertEqual(push_reference.read_question(path).status, "closed")
-            self.assertIsNotNone(question_pushes.read_binding(question_pushes.binding_path(binding.source, binding.key)))
+            self.assertIsNotNone(question_pushes.read_binding(question_pushes.binding_path(binding.identity.sender, binding.identity.key)))
             self.assertIn("Answer saved. Push retirement pending", (self.state / "notifier/notifier.log").read_text())
             self.assertEqual(question_pushes.drain(), 0)
             self.assertEqual(question_pushes.drain(), 0)
@@ -129,7 +129,7 @@ class RegistrationTests(RegistrationFixture):
         path = self.question_record_path(title)
         record = registration.read_question_record(path, self.owner_id)
         binding = self.bind_push(record)
-        binding_file = question_pushes.binding_path(binding.source, binding.key)
+        binding_file = question_pushes.binding_path(binding.identity.sender, binding.identity.key)
         identities = registration.QuestionStaff.read()
         scope = registration.question_scope(self.owner_id, identities.record)
 
@@ -145,7 +145,7 @@ class RegistrationTests(RegistrationFixture):
             self.assertEqual(question_pushes.read_binding(binding_file), binding)
             cancel.assert_not_called()
             registration.store_questions(scope, [], identities)
-            cancel.assert_called_once_with(binding.source, binding.tag_key, exact_tag=True)
+            cancel.assert_called_once_with(binding.identity)
             self.assertEqual(push_reference.read_question(path).status, "closed")
             self.assertFalse(binding_file.exists())
 
