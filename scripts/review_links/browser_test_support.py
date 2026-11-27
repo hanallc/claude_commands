@@ -517,17 +517,17 @@ NEWER_SCRIPT_PROBE = r"""<script>
   START
   if(SAVES) check(await until(()=>posts>0),'the save starts');
   if(HOLDS){
-   const held='A newer page loads when your edit ends.';
+   const shown=['Failed','Late'];
    await refresh();
-   check(line().dataset.state==='Paused' && status().includes(held),'the hold defers the reload: '+status());
-   // A held reload answers now, so a hold that outlasts the age limit stays Paused, not Late.
+   check(!shown.includes(line().dataset.state) && !/newer|reload/i.test(status()),'the hold defers the reload with no status text: '+status());
+   // A held reload answers now, so a hold that outlasts the age limit does not show Late.
    const now=Date.now,options=JSON.parse(line().dataset.statusOptions);
    Date.now=()=>now()+(options.ageLimit+5)*1000;
    await refresh();
-   check(line().dataset.state==='Paused' && status().includes(held),'a long hold stays Paused: '+status());
+   check(!shown.includes(line().dataset.state) && !/newer|reload/i.test(status()),'a long hold shows no status text: '+status());
    Date.now=now;
    // A save timeout ends the hold, so the checks above must run while the save still waits.
-   if(SAVES) check(!timedOut,'the Paused checks run before the save timeout');
+   if(SAVES) check(!timedOut,'the hold checks run before the save timeout');
    ready();
    // The end of the hold reloads the page at once. No refresh call follows.
    END
@@ -550,7 +550,7 @@ def newer_script_reload_results(page: str, *, newer: str, place: str, start: str
 
     `newer` supplies the refresh response. `place` scrolls the page and `placed` checks the open content.
     `start` sets the initial state. Use `type(field, words)` to set a draft.
-    With `holds`, verify Paused and run `end` to release the hold.
+    With `holds`, verify the held reload shows no status text, then run `end` to release the hold.
     With `saves`, wait for the save timeout to release the hold.
     """
     probe = (NEWER_SCRIPT_PROBE.replace("PLACED", placed).replace("PLACE", place).replace("START", start)

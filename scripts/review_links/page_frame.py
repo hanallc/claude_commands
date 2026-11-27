@@ -457,14 +457,14 @@ function pageHoldsInput(){
 // `page` is the fetched page, or the script version that a JSON read names (none from an older server).
 // `held` is the page's own hold, such as a save in flight; pageHoldsInput always adds the visible edit.
 // Returns refresh facts when the fresh page has another script version, else null.
-// A held reload returns only the busy reason, so the status keeps the data and answer times it has.
+// A held reload returns an empty busy reason, so the status shows no hold text and keeps its data time.
 // The page keeps the held reload and loads the newer page as soon as the hold ends.
 let pageReloadHeld=null,pageReloadListening=false;
 function reloadForNewScript(page,held=()=>false){
  const version=root=>root.querySelector('[data-page-status]')?.dataset.scriptVersion;
  const fresh=page instanceof Document ? version(page) : page,own=version(document);
  if(!fresh || !own || fresh===own){pageReloadHeld=null;return null;}
- if(held() || pageHoldsInput()){pageReloadHeld=held;listenForHoldEnd();return {busy:'A newer page loads when your edit ends.'};}
+ if(held() || pageHoldsInput()){pageReloadHeld=held;listenForHoldEnd();return {busy:''};}
  location.reload();
  return pageRefreshFacts();
 }
