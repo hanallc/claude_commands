@@ -8,6 +8,7 @@ import select
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
@@ -29,6 +30,7 @@ from scripts.herdr import herdr, turn_end, worker_panes
 from scripts.herdr.test_worker_panes import idle_transcript, live_detached_run
 from scripts.lib import conf, unit_runs
 from scripts.lint import style_review
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff, test_worker as worker_fixture, worker, worker_admission
@@ -409,7 +411,8 @@ class PaneReviewLauncherTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a+b", buffering=0) as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            _ = lock.write((json.dumps({"pid": os.getpid(), "command": command}) + "\n").encode())
+            holder = {"pid": os.getpid(), "command": command, "acquired_at": time.monotonic()}
+            _ = lock.write((json.dumps(holder) + "\n").encode())
             yield lock
 
     def release_at_contention(self, lock: BinaryIO, *, blocking_only: bool = False) -> Callable[[int | BinaryIO, int], None]:
@@ -441,6 +444,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
         parent = self.fixture.fixture.parent
         path = staff.record_path().parent / "locks" / f"astra-review-start-{parent.id}.lock"
         _ = self.fixture.fixture.staff_config(lock_seconds=0.1)
+        _ = write_config_fixture(conf.path("direct"), "pane_agent_start_seconds=1\n")
         with self.held_review_lock(path, "earlier reviewer") as lock:
             # Release an unbounded attempt so the original code can finish.
             with patch.object(fcntl, "flock", side_effect=self.release_at_contention(lock, blocking_only=True)):
@@ -448,6 +452,36 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, worker.ExitCode.REFUSED, result.stdout + result.stderr)
         self.assertIn(f"{parent.name}: reviewer startup: timed out waiting for lock", result.stderr)
         self.assertIn(f"pid {os.getpid()}: earlier reviewer", result.stderr)
+        self.assertEqual(self.fixture.agent.submitted, [])
+
+    def test_astra_start_gives_a_stalled_holder_one_full_budget(self) -> None:
+        parent = self.fixture.fixture.parent
+        path = staff.record_path().parent / "locks" / f"astra-review-start-{parent.id}.lock"
+        _ = self.fixture.fixture.staff_config(lock_seconds=30)
+        _ = write_config_fixture(conf.path("direct"), "pane_agent_start_seconds=45\n")
+        flock = fcntl.flock
+        clock = time.monotonic
+        attempts: list[int] = []
+        offset = 0
+
+        def advance_on_contention(candidate: int | BinaryIO, mode: int) -> None:
+            nonlocal offset
+            try:
+                flock(candidate, mode)
+            except BlockingIOError:
+                fd = candidate if isinstance(candidate, int) else candidate.fileno()
+                if os.path.samestat(os.fstat(fd), path.stat()):
+                    attempts.append(offset)
+                    offset += 40
+                raise
+
+        with (patch.object(time, "monotonic", side_effect=lambda: clock() + offset),
+              self.held_review_lock(path, "stalled reviewer"),
+              patch.object(fcntl, "flock", side_effect=advance_on_contention)):
+            result = self.launch_astra_review("astra-reviewer")
+        self.assertEqual(result.returncode, worker.ExitCode.REFUSED, result.stdout + result.stderr)
+        self.assertIn(f"pid {os.getpid()}: stalled reviewer", result.stderr)
+        self.assertEqual(attempts, [0, 40])
         self.assertEqual(self.fixture.agent.submitted, [])
 
     def test_durable_design_dispatch_without_a_summary_saves_the_reply_beside_the_prompt(self) -> None:
@@ -497,20 +531,31 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(self.fixture.agent.submitted, [])
 
     def test_concurrent_astra_launches_submit_all_reviews_under_one_caller(self) -> None:
+        self.check_concurrent_astra_launches(pane_duration=0)
+
+    def test_concurrent_astra_launches_allow_forty_seconds_per_pane(self) -> None:
+        self.check_concurrent_astra_launches(pane_duration=40)
+
+    def check_concurrent_astra_launches(self, *, pane_duration: int) -> None:
         program = r"""
 import fcntl
 import os
 import sys
+import time
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import patch
 
 from scripts.direct.test_assign_launcher import PaneReviewLauncherTests
 from scripts.direct import progress_history
 from scripts.herdr import herdr, turn_end
+from scripts.lib import conf
 from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 
-staff_file, name = sys.argv[1:]
+staff_file, name, clock_path = sys.argv[1:]
 flock = fcntl.flock
+monotonic = time.monotonic
 contended = False
 
 def observe_lock(fd, mode):
@@ -518,19 +563,33 @@ def observe_lock(fd, mode):
     try:
         flock(fd, mode | fcntl.LOCK_NB)
     except BlockingIOError:
-        if mode & fcntl.LOCK_EX and not contended:
+        descriptor = fd if isinstance(fd, int) else fd.fileno()
+        startup_wait = startup_path.is_file() and os.path.samestat(os.fstat(descriptor), startup_path.stat())
+        if mode & fcntl.LOCK_EX and not contended and (not clock_path or startup_wait):
             contended = True
             print("contended", file=sys.__stdout__, flush=True)
         if mode & fcntl.LOCK_NB:
             raise
         flock(fd, mode)
 
+def open_pane(*args, **kwargs):
+    if clock_path:
+        print("opening", file=sys.__stdout__, flush=True)
+        assert sys.stdin.readline() == "opened\n"
+    return world.launch_through_herdr(*args, **kwargs)
+
 with ExitStack() as cleanup:
     case = set_up_fixture(cleanup.callback, PaneReviewLauncherTests("runTest"))
     world = case.fixture.fixture.world
+    startup_path = Path(staff_file).parent / "locks" / f"astra-review-start-{case.fixture.fixture.parent_id}.lock"
+    if clock_path:
+        case.fixture.fixture.staff_config(lock_seconds=30)
+        write_config_fixture(conf.path("direct"), "pane_agent_start_seconds=45\n")
+        clock = Path(clock_path)
+        cleanup.enter_context(patch.object(time, "monotonic", lambda: monotonic() + int(clock.read_text())))
     with (patch.dict(os.environ, {"STAFF_FILE": staff_file}),
           patch.object(fcntl, "flock", side_effect=observe_lock),
-          patch.object(herdr, "launch_prepared_agent", side_effect=world.launch_through_herdr)):
+          patch.object(herdr, "launch_prepared_agent", side_effect=open_pane)):
         case.fixture.agent.finish_after = 1
         result = case.launch_astra_review(name)
         assert result.returncode == 0, result.stdout + result.stderr
@@ -552,9 +611,13 @@ with ExitStack() as cleanup:
         caller_lock = staff_file.parent / "rows" / f"{parent.id}.lock"
         names = ("review-a", "review-b", "review-c")
         env = staff.child_environment(os.environ)
+        clock = self.fixture.fixture.root / "launch-clock"
+        if pane_duration:
+            write_text_atomic(clock, "0")
         with ExitStack() as children:
             def launch(name: str) -> subprocess.Popen[str]:
-                child = subprocess.Popen([sys.executable, "-c", program, str(staff_file), name],
+                child = subprocess.Popen([sys.executable, "-c", program, str(staff_file), name,
+                                          str(clock) if pane_duration else ""],
                     cwd=ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 _ = children.enter_context(child)
                 _ = children.callback(child.kill)
@@ -569,10 +632,32 @@ with ExitStack() as cleanup:
                     self.fail(diagnostics)
                 self.assertEqual(line, message + "\n")
 
-            with self.held_review_lock(caller_lock, "unit move"):
-                peers = [launch(name) for name in names]
-                for child in peers:
+            if pane_duration:
+                first = launch(names[0])
+                receive(first, "opening")
+                waiting = [launch(name) for name in names[1:]]
+                for child in waiting:
                     receive(child, "contended")
+                peers = [first]
+                for elapsed in (pane_duration, 2 * pane_duration, 3 * pane_duration):
+                    opened = peers[-1]
+                    write_text_atomic(clock, str(elapsed))
+                    assert opened.stdin is not None
+                    _ = opened.stdin.write("opened\n")
+                    opened.stdin.flush()
+                    if waiting:
+                        streams = {child.stdout: child for child in waiting if child.stdout is not None}
+                        ready, _, _ = select.select(list(streams), [], [], 12)
+                        self.assertTrue(ready, "Expected the next reviewer to open.")
+                        next_child = streams[ready[0]]
+                        receive(next_child, "opening")
+                        waiting.remove(next_child)
+                        peers.append(next_child)
+            else:
+                with self.held_review_lock(caller_lock, "unit move"):
+                    peers = [launch(name) for name in names]
+                    for child in peers:
+                        receive(child, "contended")
             for child in peers:
                 receive(child, "active")
             self.assertEqual({row.name for row in staff.snapshot().find(kind="worker", parent=parent.id)}

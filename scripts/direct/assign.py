@@ -1035,7 +1035,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
         try:
             with staff.reviewer_startup(parent):
                 current = launch(target, policy, lock=hold, phase="astra-review")
-        except (staff.StaffRefused, worker_lifecycle.OperationDeadlineExpired) as error:
+        except (conf.Unusable, staff.StaffRefused, worker_lifecycle.OperationDeadlineExpired) as error:
             current = worker_panes.AdmissionRefused(" ".join(str(error).splitlines()))
         staff_worker.arm_launch_cleanup(cleanup, before, current)
         if not isinstance(current, worker_panes.OpenWorker):
