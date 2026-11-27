@@ -209,9 +209,13 @@ def copy_source(*arguments):
                                   else offload.UNAVAILABLE_TREE_KEY)
     return offload.CopiedTree(offload.KnownTreeKey("sent-tree"))
 
-def fetch(*arguments):
+def fetch(*arguments, fence_setup=""):
     if mode != "post-fetch-cleanup-timeout":
-        return real_fetch(*arguments)
+        return real_fetch(*arguments, fence_setup=fence_setup)
+    assert fence_setup
+    assert isinstance(controller.claim_identity, claim_state.ClaimIdentity)
+    journal = offload.pending_start_path(request.target, controller.claim_identity, scope_key=controller.claim_scope_key)
+    assert journal.is_file(), "The run settled the start fence before fetch"
     actions.append("fetch")
     return offload.Fetched(root / "fetched", 1)
 
@@ -252,10 +256,11 @@ def stream(arguments, *limits):
         if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             command = offload.start_fence_command(controller.claim_identity, request.target,
                 settle=True, scope_key=controller.claim_scope_key)
-            settled = real_run(["bash", "-c", command], capture_output=True,
-                               text=True, check=False, timeout=5)
-            assert settled.returncode == 0, settled.stderr
-            wire += settled.stdout
+            if arguments[-1].endswith(command + '\nexit "$dispatch_status"'):
+                settled = real_run(["bash", "-c", command], capture_output=True,
+                                   text=True, check=False, timeout=5)
+                assert settled.returncode == 0, settled.stderr
+                wire += settled.stdout
 
     remote_output, remote_status = wire, status
 

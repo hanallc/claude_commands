@@ -802,7 +802,7 @@ placement_once
                         self.assertEqual(treekey.tree_key(str(snapshot)), treekey.tree_key(str(checkout)))
                         self.assertEqual(copies.copy_source(snapshot), canonical)
                         if not origin:
-                            with self.assertRaisesRegex(build_folders.InvalidFolderForm, "cannot read the origin URL"):
+                            with self.assertRaisesRegex(build_folders.InvalidFolderForm, "Git could not read the origin URL: .+"):
                                 with copies.standing(self.owner, snapshot, copies.CommittedSource("HEAD")):
                                     self.fail("A numbered copy needs a Git origin.")
                         else:

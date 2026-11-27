@@ -22,7 +22,7 @@ import unittest
 from unittest import mock
 
 from scripts.copies import copies
-from scripts.lib import build_copies, build_folder_lock, build_folders, copy_record, file_lock, git_files, git_rescue, scratch, session_folder
+from scripts.lib import build_copies, build_folder_lock, build_folders, conf, copy_record, file_lock, git_files, git_rescue, scratch, session_folder
 from scripts.lib.build_copies_test_support import fixed_registration_snapshot, private_copy_config
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.git_test_support import commit_repository
@@ -452,16 +452,55 @@ class BuildCopiesTests(unittest.TestCase):
         _ = artifact.write_text("build output\n")
         (temporary / "link").symlink_to("nested/artifact")
         (nested / "link").symlink_to("../nested/artifact")
+        _ = (temporary / "42.keep").write_text("Not a numbered copy\n")
+        with build_folder_lock.folder_parent(nested, temporary, create=False) as parent:
+            descriptor = build_folder_lock.open_lock(nested, parent, create=True)
+            try:
+                build_folder_lock.mark_lock(descriptor)
+            finally:
+                os.close(descriptor)
+        rules = build_folders.FixedFolderRemovalRules.read()
         with (
             ExitStack() as leases,
+            mock.patch.object(build_folders, "_settings", side_effect=AssertionError("The scan read configuration")),
             mock.patch.object(os, "scandir", wraps=os.scandir) as scan,
             mock.patch.object(os, "stat", wraps=os.stat) as status,
             mock.patch.object(os, "lstat", wraps=os.lstat) as link_status,
         ):
-            self.assertIsNone(build_folders.hold_child_leases(temporary, leases, review_temporary=True))
+            self.assertIsNone(build_folders.hold_child_leases(temporary, leases, rules=rules, review_temporary=True))
             self.assertEqual(scan.call_count, 2)
             self.assertTrue(all(call.kwargs.get("dir_fd") is not None for call in status.call_args_list))
             link_status.assert_not_called()
+
+    def test_temporary_review_refuses_an_unverified_directory_without_path_status_calls(self) -> None:
+        temporary = self.make_temporary()
+        rules = build_folders.FixedFolderRemovalRules.read()
+        settings = conf.read_or_repository("build_folders")
+        with (
+            mock.patch.object(build_folders, "_settings", return_value=settings),
+            mock.patch.object(os, "open", side_effect=PermissionError("build root unreadable")),
+            mock.patch.object(os, "lstat", wraps=os.lstat) as link_status,
+            mock.patch.object(os, "stat", wraps=os.stat) as status,
+        ):
+            with self.assertRaisesRegex(build_folders.RemovalTreeChanged, "cannot open the build root"):
+                _ = build_folders.FixedFolderRemovalRules.read()
+            status.assert_not_called()
+            link_status.assert_not_called()
+
+        module, name = (fcntl, "fcntl") if sys.platform == "darwin" else (os, "readlink")
+        with (
+            ExitStack() as leases,
+            mock.patch.object(module, name, side_effect=PermissionError("directory path unavailable")),
+            mock.patch.object(os, "lstat", wraps=os.lstat) as link_status,
+            mock.patch.object(os, "stat", wraps=os.stat) as status,
+            mock.patch.object(os, "scandir", wraps=os.scandir) as scan,
+        ):
+            with self.assertRaisesRegex(build_folders.RemovalTreeChanged, "cannot identify the open directory"):
+                _ = build_folders.hold_child_leases(temporary, leases, rules=rules, review_temporary=True)
+            status.assert_not_called()
+            link_status.assert_not_called()
+            scan.assert_not_called()
+        self.assertTrue(temporary.is_dir())
 
     def test_inventory_refuses_a_fixed_descendant_before_reviewing_the_temporary_folder(self) -> None:
         temporary = self.make_temporary()

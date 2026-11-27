@@ -1259,11 +1259,14 @@ def _copy_is_kept(path: Path, directory: int | None = None) -> bool:
     return not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 0
 
 
-def _folder_is_kept(path: Path, directory: int | None = None) -> bool:
+def _folder_is_kept(path: Path, directory: int | None = None, *,
+                    layout: FixedFolderRemovalLayout | UseConfiguredValue = UseConfiguredValue.CURRENT) -> bool:
     if not _copy_is_kept(path, directory):
         return False
     if _DECIMAL_NAME.fullmatch(path.name) is not None:
-        return isinstance(parse_form(path), BuildCopy)
+        form = (parse_form(path) if isinstance(layout, UseConfiguredValue)
+                else parse_resolved_form(layout.source, layout.rules.build))
+        return isinstance(form, BuildCopy)
     try:
         fields = folder_lease_fields(path) if directory is None else _read_folder_lease(path, directory)
     except (OSError, ValueError):
@@ -1547,58 +1550,98 @@ def _open_directory_path(descriptor: int, requested: Path) -> Path:
     """Read the path of an open directory."""
     try:
         if sys.platform == "linux":
-            return Path(os.readlink(f"/proc/self/fd/{descriptor}"))
-        if sys.platform == "darwin":
+            path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        elif sys.platform == "darwin":
             result = fcntl.fcntl(descriptor, 50, bytes(1024))
-            return Path(os.fsdecode(result.split(b"\0", 1)[0]))
-    except OSError:
-        pass
-    return requested.resolve()
+            path = Path(os.fsdecode(result.split(b"\0", 1)[0]))
+        else:
+            raise OSError("directory paths from descriptors are unavailable")
+        if path.is_absolute() and os.fstat(descriptor).st_nlink:
+            return path
+    except OSError as error:
+        raise RemovalTreeChanged(f"{requested}: cannot identify the open directory: {error}") from error
+    raise RemovalTreeChanged(f"{requested}: cannot identify the open directory")
 
 
 def _build_root_path(root: Path) -> Path:
-    try:
-        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    except OSError:
-        return root.resolve()
-    try:
-        return _open_directory_path(descriptor, root)
-    finally:
-        os.close(descriptor)
+    """Identify the build root through an open directory, including an absent root."""
+    directory = root.absolute()
+    missing: list[str] = []
+    while True:
+        try:
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError as error:
+            if directory == directory.parent or directory.name == "..":
+                raise RemovalTreeChanged(f"{root}: cannot identify the build root") from error
+            try:
+                _ = os.readlink(directory)
+            except FileNotFoundError:
+                missing.append(directory.name)
+                directory = directory.parent
+            except OSError as link_error:
+                raise RemovalTreeChanged(f"{root}: cannot identify the build root: {link_error}") from link_error
+            else:
+                raise RemovalTreeChanged(f"{root}: the build root has a dangling symbolic link") from error
+        except OSError as error:
+            raise RemovalTreeChanged(f"{root}: cannot open the build root: {error}") from error
+        else:
+            try:
+                return _open_directory_path(descriptor, directory).joinpath(*reversed(missing))
+            finally:
+                os.close(descriptor)
+
+
+@dataclass(frozen=True)
+class FixedFolderRemovalRules:
+    """Identify configured fixed folders without reading configuration during a scan."""
+
+    build: Path
+    fixed_machines: frozenset[str]
+    lock_timing: build_folder_lock.ProbeTiming
+
+    @classmethod
+    def read(cls) -> FixedFolderRemovalRules:
+        settings = _settings()
+        if not isinstance(settings.settings, dict):
+            raise RemovalTreeChanged(f"{settings.source}: cannot read the fixed build folder rules")
+        build = _build_root_path(build_root(settings=settings))
+        fixed_machines: set[str] = set()
+        prefix = "forms.build."
+        for key in settings.settings:
+            if not key.startswith(prefix):
+                continue
+            machine = key.removeprefix(prefix)
+            with suppress(InvalidFolderForm):
+                if isinstance(build_folder_form(machine, settings=settings), FixedRepositoryBuildFolders):
+                    fixed_machines.add(machine)
+        return cls(build, frozenset(fixed_machines), _probe_timing(settings=settings))
+
+    def configured(self, path: Path) -> bool:
+        return path.parent.parent == self.build and path.name in self.fixed_machines
 
 
 @dataclass(frozen=True)
 class FixedFolderRemovalLayout:
-    """Resolve the source and build root before a removal scan."""
+    """Keep the source path and the fixed folder rules for a removal scan."""
 
     source: Path
-    build: Path
-    settings: ConfigRead
+    rules: FixedFolderRemovalRules
 
     @classmethod
-    def read(cls, source: Path) -> FixedFolderRemovalLayout:
-        settings = _settings()
-        return cls(source.parent.resolve() / source.name, build_root(settings=settings).resolve(), settings)
-
-    @classmethod
-    def from_open_parent(cls, source: Path, parent: int) -> FixedFolderRemovalLayout:
-        settings = _settings()
+    def from_open_parent(cls, source: Path, parent: int, rules: FixedFolderRemovalRules) -> FixedFolderRemovalLayout:
         directory = _open_directory_path(parent, source.parent)
-        return cls(directory / source.name, _build_root_path(build_root(settings=settings)), settings)
-
-    def configured(self, path: Path) -> bool:
-        return _is_configured_fixed_build_folder(path, self.build, settings=self.settings)
+        return cls(directory / source.name, rules)
 
     def check_leases(self, folder: Path, parent: int, entries: Iterable[str], *, original: Path) -> None:
         for name in entries:
             if name.endswith(".lease.json"):
                 source = folder / name.removesuffix(".lease.json")
                 layout = original / source.name
-                if _has_fixed_build_lease(source, parent, layout=layout, configured=self.configured(layout)):
+                if _has_fixed_build_lease(source, parent, layout=layout, configured=self.rules.configured(layout)):
                     raise FixedBuildFolderRemovalRefused(layout)
 
     def check_root(self, tree: Path, parent: int, *, legacy_stage: bool) -> None:
-        if self.configured(self.source) or _has_fixed_build_lease(
+        if self.rules.configured(self.source) or _has_fixed_build_lease(
                 self.source, parent, layout=self.source, configured=False):
             raise FixedBuildFolderRemovalRefused(self.source)
         if legacy_stage and _HIDDEN_REMOVAL.fullmatch(tree.name) is not None:
@@ -1609,8 +1652,20 @@ def require_no_fixed_build_folders(path: Path, *, include_root: bool = True, dir
                                    original_path: Path | None = None, repair_access: bool = False) -> None:
     """Refuse deletion of a fixed folder or the lease that identifies it."""
     tree = path.resolve() if dir_fd is None else path
-    layout = FixedFolderRemovalLayout.read(tree if original_path is None else original_path)
+    with ExitStack() as opened:
+        if dir_fd is None:
+            try:
+                dir_fd = opened.enter_context(build_folder_lock.open_folder_parent(tree, tree.parent, create=False))
+            except FileNotFoundError:
+                return
+        rules = FixedFolderRemovalRules.read()
+        layout = FixedFolderRemovalLayout.from_open_parent(tree if original_path is None else original_path, dir_fd, rules)
+        _require_no_fixed_build_folders_at(tree, dir_fd, layout, include_root=include_root,
+                                          legacy_stage=original_path is None, repair_access=repair_access)
 
+
+def _require_no_fixed_build_folders_at(tree: Path, parent: int, layout: FixedFolderRemovalLayout, *,
+                                       include_root: bool, legacy_stage: bool, repair_access: bool) -> None:
     def visit(folder: Path, parent: int, original: Path, *, check_form: bool) -> None:
         try:
             info = os.stat(folder.name, dir_fd=parent, follow_symlinks=False)
@@ -1618,7 +1673,7 @@ def require_no_fixed_build_folders(path: Path, *, include_root: bool = True, dir
             return
         if not stat.S_ISDIR(info.st_mode):
             return
-        if check_form and layout.configured(original):
+        if check_form and layout.rules.configured(original):
             raise FixedBuildFolderRemovalRefused(original)
         with ExitStack() as opened:
             directory = _open_removal_directory(folder, parent, info, opened, repair_access=repair_access)
@@ -1634,15 +1689,9 @@ def require_no_fixed_build_folders(path: Path, *, include_root: bool = True, dir
             for name in children:
                 visit(folder / name, directory, original / name, check_form=True)
 
-    with ExitStack() as opened:
-        if dir_fd is None:
-            try:
-                dir_fd = opened.enter_context(build_folder_lock.open_folder_parent(tree, tree.parent, create=False))
-            except FileNotFoundError:
-                return
-        if include_root:
-            layout.check_root(tree, dir_fd, legacy_stage=original_path is None)
-        visit(tree, dir_fd, layout.source, check_form=False)
+    if include_root:
+        layout.check_root(tree, parent, legacy_stage=legacy_stage)
+    visit(tree, parent, layout.source, check_form=False)
 
 
 def require_build_tree_move_allowed(path: Path) -> None:
@@ -2878,7 +2927,9 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result, *,
     review_root = path.absolute() if review_temporary else None
     with ExitStack() as leases:
         try:
-            refusal = hold_child_leases_at(path, directory, leases, FixedFolderRemovalLayout.read(path),
+            rules = FixedFolderRemovalRules.read()
+            layout = FixedFolderRemovalLayout.from_open_parent(path, directory, rules)
+            refusal = hold_child_leases_at(path, directory, leases, layout,
                                            wait=wait, held=held, repair_access=repair_access, review_root=review_root)
             current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
         except (OSError, ValueError):
@@ -2908,7 +2959,7 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result, *,
                 if not os.path.samestat(renamed, allocated) or not may_remove_folder_tree(hidden):
                     return False
                 refusal = hold_child_leases_at(
-                    hidden, directory, leases, FixedFolderRemovalLayout.read(path), wait=False, held=held,
+                    hidden, directory, leases, layout, wait=False, held=held,
                     repair_access=repair_access, review_root=review_root, legacy_stage=False)
             except (OSError, ValueError):
                 return False
@@ -3095,7 +3146,9 @@ class BuildFolderParentChanged(FileNotFoundError):
 
 def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True,
                      create: bool = False, check_parent: bool = True,
-                     transient_lock: bool = False, mark: bool = False) -> FolderRemovalLease:
+                     transient_lock: bool = False, mark: bool = False,
+                     layout: FixedFolderRemovalLayout | UseConfiguredValue = UseConfiguredValue.CURRENT
+                     ) -> FolderRemovalLease:
     """Hold the lock if it is free. The stack owns the descriptor."""
     if create and check_parent and mark:
         _reject_staged_allocation(path)
@@ -3112,12 +3165,16 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     except FileNotFoundError:
         if create and check_parent and not build_folder_lock.parent_current(path, directory):
             raise BuildFolderParentChanged(str(path.parent)) from None
-        if _folder_is_kept(path, directory):
+        if _folder_is_kept(path, directory, layout=layout):
             return KeptCopyRemovalLease()
         return UnreservedRemovalFolder()
     with ExitStack() as opened:
         _ = opened.callback(os.close, descriptor)
-        acquired = _take_lock(descriptor, fcntl.LOCK_EX, wait=wait)
+        if isinstance(layout, UseConfiguredValue):
+            acquired = _take_lock(descriptor, fcntl.LOCK_EX, wait=wait)
+        else:
+            timing = layout.rules.lock_timing if wait else build_folder_lock.NO_WAIT
+            acquired = build_folder_lock.take_lock(descriptor, fcntl.LOCK_EX, timing)
         if acquired and (mark or created):
             build_folder_lock.mark_lock(descriptor)
         if create and check_parent:
@@ -3129,7 +3186,7 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
         if not acquired:
             return RemovalLockHeld(path.with_name(path.name + ".lock"))
         lease = HeldFolderRemovalLease(path, directory, descriptor, created=created)
-        if _folder_is_kept(path, directory):
+        if _folder_is_kept(path, directory, layout=layout):
             if created:
                 _unlink_transient_lock(lease)
             return KeptCopyRemovalLease()
@@ -3210,13 +3267,14 @@ def _open_removal_directory(path: Path, parent: int, expected: os.stat_result, o
     return directory
 
 
-def hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True, check_owners: bool = False,
+def hold_child_leases(path: Path, stack: ExitStack, *, rules: FixedFolderRemovalRules,
+                      wait: bool = True, check_owners: bool = False,
                       review_temporary: bool = False,
                       inspect: Callable[[Path, set[str], set[str]], None] | None = None) -> RefusedRemovalLease | None:
     """Check child leases and inspect a folder before a claim."""
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        return hold_child_leases_at(path, parent, stack, FixedFolderRemovalLayout.from_open_parent(path, parent),
+        return hold_child_leases_at(path, parent, stack, FixedFolderRemovalLayout.from_open_parent(path, parent, rules),
                                     wait=wait, check_owners=check_owners,
                                     review_root=path.absolute() if review_temporary else None, inspect=inspect)
     finally:
@@ -3240,7 +3298,7 @@ def hold_child_leases_at(path: Path, parent: int, stack: ExitStack, layout: Fixe
             return None
         if not stat.S_ISDIR(expected.st_mode):
             return None
-        if check_form and layout.configured(original):
+        if check_form and layout.rules.configured(original):
             raise FixedBuildFolderRemovalRefused(original)
         with ExitStack() as opened:
             directory = _open_removal_directory(path, parent, expected, opened, repair_access=repair_access)
@@ -3250,7 +3308,8 @@ def hold_child_leases_at(path: Path, parent: int, stack: ExitStack, layout: Fixe
             with os.scandir(directory) as entries:
                 for entry in entries:
                     if entry.name.endswith(".keep") and _folder_is_kept(
-                            path / entry.name.removesuffix(".keep"), directory):
+                            path / entry.name.removesuffix(".keep"), directory,
+                            layout=replace(layout, source=original / entry.name.removesuffix(".keep"))):
                         return KeptCopyRemovalLease()
                     if entry.is_dir(follow_symlinks=False):
                         folders.add(entry.name)
@@ -3289,7 +3348,8 @@ def hold_child_leases_at(path: Path, parent: int, stack: ExitStack, layout: Fixe
                 key = (lock.st_dev, lock.st_ino)
                 if held is not None and key in held:
                     continue
-                lease = _hold_free_lease(path / stem, directory, stack, wait=wait)
+                lease = _hold_free_lease(path / stem, directory, stack, wait=wait,
+                                         layout=replace(layout, source=original / stem))
                 if isinstance(lease, RefusedRemovalLease):
                     return lease
                 if isinstance(lease, HeldFolderRemovalLease):
@@ -3313,8 +3373,8 @@ def hold_child_leases_at(path: Path, parent: int, stack: ExitStack, layout: Fixe
         return visit(path, parent, layout.source, check_form=False)
     except TemporaryFolderReview:
         # Check the full tree for fixed folders before publishing a review reason.
-        require_no_fixed_build_folders(path, dir_fd=parent, original_path=None if legacy_stage else layout.source,
-                                       repair_access=repair_access)
+        _require_no_fixed_build_folders_at(path, parent, layout, include_root=True,
+                                          legacy_stage=legacy_stage, repair_access=repair_access)
         raise
 
 
@@ -3354,8 +3414,10 @@ def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = Tru
                     lease = RefusedRemovalLease()
                 elif children:
                     child_locks: list[int] = []
+                    rules = FixedFolderRemovalRules.read()
+                    layout = FixedFolderRemovalLayout.from_open_parent(folder, directory, rules)
                     with suppress(FileNotFoundError):
-                        refusal = hold_child_leases_at(folder, directory, stack, FixedFolderRemovalLayout.read(folder),
+                        refusal = hold_child_leases_at(folder, directory, stack, layout,
                                                        wait=wait, probe_fds=child_locks)
                         lease = refusal if refusal is not None else replace(lease, child_locks=tuple(child_locks))
                     if probe_fds is not None:
@@ -3975,7 +4037,9 @@ def _recover_staged_folder(path: Path, directory: int, *, wait: bool,
                     _publish_lease(path, directory, _staging_identity(original))
                 elif recorded != _staging_identity(original):
                     return False
-                refusal = hold_child_leases_at(path, directory, leases, FixedFolderRemovalLayout.read(source or path),
+                rules = FixedFolderRemovalRules.read()
+                layout = FixedFolderRemovalLayout.from_open_parent(source or path, directory, rules)
+                refusal = hold_child_leases_at(path, directory, leases, layout,
                                                wait=wait, repair_access=True, legacy_stage=source is None)
                 if isinstance(refusal, RefusedRemovalLease):
                     return False

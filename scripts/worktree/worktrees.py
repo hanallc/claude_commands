@@ -1242,7 +1242,8 @@ class UnitFolderRename:
         _review_rename_copies(old)
         if not new.is_dir():
             return
-        root = build_folders.build_root()
+        rules = build_folders.FixedFolderRemovalRules.read()
+        root = old.parent.parent
         with (build_folder_lock.folder_parent(old / "output", root, create=False) as old_fd,
               build_folder_lock.folder_parent(new / "output", root, create=False) as new_fd):
             for path in sorted(old.iterdir()):
@@ -1267,7 +1268,7 @@ class UnitFolderRename:
                 if not build_folders.may_remove_folder_tree(path):
                     raise ValueError(f"{path}: a mount prevents the unit rename")
                 with ExitStack() as children:
-                    if build_folders.hold_child_leases(path, children, wait=False) is not None:
+                    if build_folders.hold_child_leases(path, children, rules=rules, wait=False) is not None:
                         raise ValueError(f"{path}: a child build folder prevents the unit rename")
                     rename_exclusive(old_fd, path.name, new_fd, path.name)
 
