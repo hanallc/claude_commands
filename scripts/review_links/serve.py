@@ -1732,10 +1732,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError:
             self.json_response(400, {"error": "Could not read the New item request."})
             return
-        self.review_item_post(server, fields, token, valid_token)
+        with ExitStack() as claims:
+            self.review_item_post(server, fields, token, valid_token, claims)
 
     def review_item_post(self, server: ReviewLinksServer, fields: dict[str, object], token: object,
-                         valid_token: bool) -> None:
+                         valid_token: bool, claims: ExitStack) -> None:
         try:
             draft = fields.get("request_id")
             list_draft_id = (draft if fields.get("page") == "list" and isinstance(draft, str)
@@ -1909,24 +1910,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                       or isinstance(details.capture_intent, new_item_dialog.DeferredCaptureIntent))
                 evidence_page = site + review_page.PAGE_PATH if has_saved_evidence else ""
                 status = server.delivery_status
-                # Concurrent Sends wait for the delivery of the same item.
                 with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
-                    delivery = review_actions.prepare_submission_delivery(
-                        saved, saved.words, status, evidence_page=evidence_page, members=created.members)
-                    outcome = self.deliver_review(server, delivery, report_outcome=True)
+                    try:
+                        delivery = review_actions.prepare_submission_delivery(
+                            saved, saved.words, status, evidence_page=evidence_page, members=created.members,
+                            claims=claims)
+                    except review_actions.SubmissionDeliveryPending:
+                        delivery = change_page.NoMessageDelivery()
                     if on_list or isinstance(request, new_item_dialog.NewItemRequest) and (
                             request.page_recipient == new_item_dialog.PageRecipient.PRODUCER):
                         number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
                         if isinstance(number, int):
                             response["list_number"] = number
-                    if (isinstance(delivery, change_page.MessageDelivery)
-                            and not isinstance(outcome, change_page.DeliveryConfirmed)):
-                        # Recovery can save the confirmation from an earlier send.
-                        message = status.metadata_page(delivery.page)
-                        if (isinstance(message, change_page.ReviewMessagePage)
-                                and message.saved.get("submission_request") == delivery.row
-                                and message.saved.get("submission_delivered")):
-                            outcome = change_page.DeliveryConfirmed()
                 if pending or (main_request is not None and main_request.page == "list"
                                and isinstance(screenshot, new_item_dialog.PageScreenshot)):
                     if review_submissions.PAGE_SCREENSHOT not in details.images:
@@ -1964,16 +1959,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(503, {"error": "Could not publish the item. Try Send again."})
             return
         respond_first = on_list or main_request is not None
-        delivery_failed = (isinstance(delivery, change_page.MessageDelivery)
-                           and not isinstance(outcome, change_page.DeliveryConfirmed))
+        claim = delivery if isinstance(delivery, change_page.MessageDelivery) else None
+        send = partial(self.deliver_review, server, delivery, report_outcome=True) if claim is not None else None
         try:
             try:
-                if delivery_failed:
-                    reason = outcome.last_error if isinstance(outcome, change_page.FailedDelivery) else (
-                        "The sender has not confirmed delivery.")
-                    self.json_response(503, {"error": f"{reason} Try Send again."})
-                elif respond_first:
-                    self.new_item_saved(response, saved.id, edited)
+                if respond_first:
+                    self.new_item_saved(response, saved.id, edited, deliver=send, claim=claim)
             finally:
                 if respond_first:
                     if ((pending or on_list) and isinstance(screenshot, new_item_dialog.PageScreenshot)
@@ -1982,8 +1973,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 if saved.kind == new_item_dialog.SubmissionKind.BUG and (
                         details.page_state is not None or (main_request is not None and main_request.page_state is not None)):
                     server.finish_bug_evidence(created, main_request, self.headers.get("Host", ""), screenshot)
-            if not respond_first and not delivery_failed:
-                self.new_item_saved(response, saved.id, edited)
+            if not respond_first:
+                self.new_item_saved(response, saved.id, edited, deliver=send, claim=claim)
         finally:
             if isinstance(details.capture_intent, new_item_dialog.DeferredCaptureIntent):
                 server.process_committed_capture(new_item_dialog.read_submission_key(saved.key), details.capture_intent,
@@ -2015,22 +2006,31 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(503, {"error": "Could not confirm the Scheduled save. Try again to recover this draft."})
             return
         claim = saved.claim
-        response = {"id": saved.id, "list_key": f"{claim.keeper}/{saved.id}",
-                    "receipt": new_item.filing_receipt(claim.assignment, saved.id), "readback": claim.readback,
-                    "notice_warning": claim.notice_warning}
-        self.new_item_saved(response, saved.id, False)
+        response: dict[str, object] = {"id": saved.id, "list_key": f"{claim.keeper}/{saved.id}",
+                                       "receipt": new_item.filing_receipt(claim.assignment, saved.id),
+                                       "readback": claim.readback, "notice_warning": claim.notice_warning}
+        send = (partial(new_item.deliver_scheduled_notices, review_link.review_root(), request.request_id)
+                if saved.pending_notices else None)
+        self.new_item_saved(response, saved.id, False, deliver=send)
 
     def pending_draft_response(self) -> None:
         self.json_response(409, {"code": "draft_pending", "error": "Retry the original Send for this draft."})
 
-    def new_item_saved(self, response: Mapping[str, object], identity: str, edited: bool) -> None:
-        if edited and "attachment_warning" not in response:
-            self.json_response(409, {
-                **response, "code": "already_filed",
-                "error": f"This item was already filed as {identity}. Any change after that Send was not sent.",
-            })
-        else:
-            self.json_response(200, response)
+    def new_item_saved(self, response: Mapping[str, object], identity: str, edited: bool, *,
+                       deliver: Callable[[], object] | None = None,
+                       claim: change_page.MessageDelivery | None = None) -> None:
+        try:
+            if edited and "attachment_warning" not in response:
+                self.json_response(409, {
+                    **response, "code": "already_filed",
+                    "error": f"This item was already filed as {identity}. Any change after that Send was not sent.",
+                })
+            else:
+                self.json_response(200, response)
+        finally:
+            if deliver is not None:
+                server = cast(ReviewLinksServer, self.server)
+                _ = server.start_new_item_delivery(deliver, claim=claim)
 
     def new_item_capture(self, capture: new_item_dialog.PageCaptureRequest, key: str) -> None:
         """Start a screenshot only for a known page on this server."""
@@ -2221,11 +2221,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             print(f"review-links review delivery retry: {error}", file=sys.stderr)
         finally:
             if isinstance(delivery, change_page.MessageDelivery):
-                try:
-                    with status.locked():
-                        _ = status.request_attempts.pop(delivery.attempt, None)
-                except Exception as error:
-                    print(f"review-links review delivery release: {error}", file=sys.stderr)
+                status.release_owned_claims((delivery.attempt,))
                 server.review_cache.invalidate()
         return change_page.DeliveryUnconfirmed()
 
@@ -2835,25 +2831,57 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.delivery_status.startup_recovery_pending.set()
 
         def recover_pending() -> None:
+            def recover(name: str, operation: Callable[[], None]) -> None:
+                try:
+                    operation()
+                except Exception as error:
+                    print(f"review-links {name} recovery: {error}", file=sys.stderr)
+
             with reply_tokens.serving(self.store_folder):
                 try:
-                    recover_changes(self.delivery_status)
-                    review_actions.recover_submission_deliveries(self.delivery_status, review_page.PAGE_PATH)
-                except (OSError, ValueError) as error:
-                    print(f"review-links delivery recovery: {error}", file=sys.stderr)
+                    recover("delivery", partial(recover_changes, self.delivery_status))
+                    recover("first message", partial(
+                        review_actions.recover_submission_deliveries, self.delivery_status, review_page.PAGE_PATH))
                 finally:
                     self.delivery_status.startup_recovery_pending.clear()
-                # A Go goes first: its resend carries the producer's next-step notice in the same message.
-                try:
-                    recover_goes(self.store_folder)
-                finally:
-                    recover_list(self.store_folder)
+                # Recover Go first because its message includes the producer's next-step notice.
+                recover("List Go", partial(recover_goes, self.store_folder))
+                recover("List feedback", partial(recover_list, self.store_folder))
+                recover("Scheduled notice", partial(new_item.recover_scheduled_notices, self.root))
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
         try:
             threading.Thread(target=self.recover_page_captures, daemon=True).start()
         except (OSError, RuntimeError) as error:
             print(f"review-links capture recovery worker: {error}", file=sys.stderr)
+
+    def start_new_item_delivery(self, deliver: Callable[[], object], *,
+                                claim: change_page.MessageDelivery | None) -> threading.Thread | None:
+        """Start delivery after the saved reply leaves the handler."""
+        def send() -> None:
+            try:
+                with reply_tokens.serving(self.store_folder):
+                    _ = deliver()
+            except (OSError, ValueError, RuntimeError) as error:
+                print(f"review-links New item notices: {error}", file=sys.stderr)
+
+        try:
+            thread = threading.Thread(target=send, daemon=True)
+            if claim is None:
+                thread.start()
+                return thread
+            status = self.delivery_status
+            # Keep the claim live while ownership moves to the delivery thread.
+            with status.locked():
+                owner = status.request_attempts.get(claim.attempt)
+                if owner is None or owner.request_thread is not threading.current_thread():
+                    return None
+                thread.start()
+                status.request_attempts[claim.attempt] = replace(owner, request_thread=thread)
+            return thread
+        except (OSError, RuntimeError) as error:
+            print(f"review-links New item notices could not start: {error}", file=sys.stderr)
+            return None
 
     def recover_page_captures(self) -> None:
         """Recover capture work from committed native submissions."""
