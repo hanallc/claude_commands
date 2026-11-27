@@ -167,7 +167,7 @@ The drain prints and flushes each completed result before it removes the entry.
 - The loader is `zsh ~/.claude/scripts/ux_style/load-ux-style.sh --guide <dir> [--tags t1,t2] [--checklist]`, the same loader the UX guide uses. It prints each rule body, then a `=== UX_CHECKLIST ===` block with one `stem — title — test` line per rule. The header name only matters for display.
 - `commands/message_style.md` runs the loader on the whole guide and confirms the rule count. `/alert_user`, `/message`, `/message_review` and the `<Notify>` section of `commands/showrunner/produce.md` load it before their first message to the user in a session.
 - Push form:
-  - The first line is `Action: <what the user does>` or `No action needed.`, with an optional `Session: <name>` line above it. Every order rule in the guide applies after these lines.
+  - The header starts with `Session: <name>` when a session is present. It includes `Action: <what the user does>` when there is an action. Every order rule in the guide applies to the body.
   - The title is under 45 characters, names what is at stake and has no fixed prefix.
   - The first 150 characters make sense on their own.
   - The header plus body is under 500 characters.
@@ -417,7 +417,7 @@ New escalate holds retain their registered template and values.
     `nate.adhoc` uses `header=False`. The fingerprint includes `header` only when it is False.
     `nate.adhoc`, `alert.blocked`, `alert.decision`, and `decision.choices` have `agent_written=True`.
     The fingerprint excludes `agent_written`. `agent_written(text_id: str) -> bool` returns False for unknown IDs.
-  - `one_line=True` (item 172, 2026-11-22): the push posts no title, so the phone shows the app name, and the message is the rendered title alone. It has no `No action needed.` line, no action line and no body; the `Sent by:` footer stays. `catalog()` refuses `one_line` on an entry with an action, a session or a body. `RenderedPush.posted_title` is empty for such a text, and `posted_body` is the line. `pushover.parse` and the `review.py texts` approval review both build the Draft from these two, so the approval judges the posted form. `pushover.fields` leaves out an empty `title`. `shown()` and `texts --ask` print `Title: none (the phone shows the app name)`. `fingerprint` includes `one_line` only when it is True. `quota.codex_next_move` and `quota.codex_workers_stay` set it.
+  - With `one_line=True` (item 172, 2026-11-22), the phone shows the app name as its title. The message shows the rendered title and the `Sent by:` footer. `catalog()` refuses `one_line` on an entry with an action, a session or a body. `RenderedPush.posted_title` is empty, and `posted_body` holds the rendered title. `pushover.parse` and `review.py texts` build the draft from these fields. `pushover.fields` leaves out an empty `title`. `shown()` and `texts --ask` print `Title: none (the phone shows the app name)`. `fingerprint` includes `one_line` only when it is True. `quota.codex_next_move` and `quota.codex_workers_stay` set it.
   - `render(id, **values)` and `render_entry(entry, values) -> RenderedPush`. An unknown id, a missing value or an extra value raises `ValueError`.
   - `user_send_argv(rendered, *, sender, machine, priority, timeout)` builds the `send.py --to user --from … --need … --text-id … --value …` argv. User-send wrappers take a rendered push, never a string.
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.
