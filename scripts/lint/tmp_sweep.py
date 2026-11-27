@@ -84,6 +84,7 @@ except FileNotFoundError:
     pass
 
 
+import ctypes
 import json
 from importlib import import_module
 import os
@@ -99,6 +100,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from errno import EACCES, ENOENT
+from functools import cache
 from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
@@ -700,6 +702,33 @@ class NoWorkerDescriptors(Enum):
     NONE = "no worker descriptors"
 
 
+KCMP_FILES = 2
+KCMP_FS = 3
+
+
+@cache
+def _kcmp_syscall() -> tuple[int, Callable[[int, int, int, int, int, int], int]] | None:
+    number = {"x86_64": 312, "aarch64": 272}.get(os.uname().machine)
+    if number is None:
+        return None
+    try:
+        syscall = ctypes.CDLL(None, use_errno=True).syscall
+    except (OSError, AttributeError):
+        return None
+    syscall.argtypes = [ctypes.c_long, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong]
+    syscall.restype = ctypes.c_long
+    return number, cast(Callable[[int, int, int, int, int, int], int], syscall)
+
+
+def _shares_leader_paths(pid: int, tid: int) -> bool:
+    """Check whether the leader and thread share the descriptor table and filesystem state."""
+    kcmp = _kcmp_syscall()
+    if kcmp is None:
+        return False
+    number, syscall = kcmp
+    return syscall(number, pid, tid, KCMP_FILES, 0, 0) == 0 and syscall(number, pid, tid, KCMP_FS, 0, 0) == 0
+
+
 def _read_process_paths(path: str, pid: int, prefix: tuple[bytes, ...], *, strict: bool,
                         ignored_fds: frozenset[int], found: list[tuple[str, int, str]],
                         unreadable: set[int], read_shared_paths: bool = True,
@@ -815,8 +844,9 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
                   worker_fds: WorkerRemovalDescriptors | NoWorkerDescriptors = NoWorkerDescriptors.NONE,
                   stop_after_first_use: bool = False,
                   ) -> ProcessUsesKnown | ProcessUsesUnavailable:
-    """Read matching paths from all live threads and report incomplete reads.
+    """Read matching paths from live processes and report incomplete reads.
 
+    Skip a thread when a complete leader read covers its paths.
     Ignore processes that end during the scan.
     Stop at the first confirmed use per process when the caller checks one folder.
     """
@@ -831,6 +861,10 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
             processes = list(entries)
     except OSError:
         return ProcessUsesIncomplete()
+    live_proc = False
+    if sys.platform == "linux" and proc.rstrip("/") == "/proc":
+        with suppress(OSError):
+            live_proc = os.readlink(os.path.join(proc, "self")) == str(os.getpid())
     strict = require_readable_user_processes
     caller_capabilities = 0
     if strict:
@@ -862,10 +896,14 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
         threaded = leader.has_other_threads()
         other_tasks = _surviving_tasks(leader, user) if threaded else ()
         read_shared_paths = True
+        leader_paths_read = False
         for task in chain((leader,), other_tasks):
             if task is UserProcessStatus.UNREADABLE:
                 incomplete.add(pid)
             if not isinstance(task, UserTask) or task.exited or (strict and not task.owned_by_user):
+                continue
+            if (task is not leader and live_proc and leader_paths_read and ignored_fds == NO_IGNORED_FDS
+                    and _shares_leader_paths(pid, int(os.path.basename(task.path)))):
                 continue
             start_ticks = -1
             if strict and not threaded and not stop_after_first_use:
@@ -876,6 +914,8 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
             read_errors = _read_process_paths(task.path, pid, path_prefix, strict=strict, ignored_fds=task_ignored_fds,
                                              found=found, unreadable=unreadable, read_shared_paths=read_shared_paths,
                                              stop_after_first_use=stop_after_first_use)
+            if task is leader:
+                leader_paths_read = not read_errors
             read_shared_paths = False
             if (start_ticks >= 0 and not read_errors and len(found) == first_path + 1
                     and found[first_path][2] == WORKS_IN):

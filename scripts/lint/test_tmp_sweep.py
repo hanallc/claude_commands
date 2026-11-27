@@ -1001,6 +1001,22 @@ class ProcessUseTests(TmpSweepCase):
         uses = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
         self.assertEqual(uses, tmp_sweep.ProcessUsesKnown([], unreadable_process_pids=(17,)))
 
+    def test_fake_proc_never_compares_kernel_resources(self) -> None:
+        (self.proc / "self").symlink_to(str(os.getpid()))
+        held = str(self.tmp / "held")
+        fake_process(self.proc, 17, fds=(held,))
+        process = self.proc / "17"
+        (process / "root").symlink_to("/")
+        (process / "exe").symlink_to(sys.executable)
+        fake_process_status(process, "S", threads=2)
+        fake_process(process / "task", 18, fds=(held,))
+        (process / "task/18/root").symlink_to("/")
+
+        with mock.patch.object(tmp_sweep, "_kcmp_syscall") as kcmp:
+            uses = tmp_sweep.process_paths(str(self.proc), str(self.tmp))
+        kcmp.assert_not_called()
+        self.assertEqual(uses, tmp_sweep.ProcessUsesKnown([(held, 17, tmp_sweep.HOLDS_FILE)] * 2))
+
     def test_process_scan_reports_a_cwd_link_owned_by_another_user(self) -> None:
         fake_caller_capabilities(self.proc)
         fake_process(self.proc, 17, cwd=str(self.tmp))
@@ -1256,6 +1272,100 @@ class ProcessUseTests(TmpSweepCase):
                 self.assertIsInstance(found, tmp_sweep.ProcessUsesKnown)
                 assert isinstance(found, tmp_sweep.ProcessUsesKnown)
                 self.assertEqual(found.paths, [(str(self.tmp / "open/file"), 25, how)])
+
+
+@unittest.skipUnless(sys.platform == "linux", "Thread path checks require Linux procfs")
+class LiveThreadPathTests(unittest.TestCase):
+    def start_thread(self, mode: str) -> tuple[int, int, Path]:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        held = write(folder / "held")
+        program = """
+import ctypes
+import os
+from pathlib import Path
+import signal
+import sys
+import threading
+
+mode, target = sys.argv[1:]
+signal.alarm(30)
+ready = threading.Event()
+hold = threading.Event()
+leader = Path(f'/proc/{os.getpid()}/stat')
+
+def worker():
+    if mode == 'cwd':
+        os.unshare(os.CLONE_FS)
+        os.chdir(os.path.dirname(target))
+    elif mode == 'fd':
+        os.unshare(os.CLONE_FILES)
+        os.open(target, os.O_RDONLY)
+    elif mode == 'exited':
+        ready.set()
+        while leader.read_text().rpartition(')')[2].split()[0] != 'Z':
+            if hold.wait(0.01):
+                return
+    print(threading.get_native_id(), flush=True)
+    hold.wait()
+
+if mode in ('shared', 'exited'):
+    os.open(target, os.O_RDONLY)
+thread = threading.Thread(target=worker)
+thread.start()
+if mode == 'exited':
+    ready.wait()
+    exit_number = {'x86_64': 60, 'aarch64': 93}[os.uname().machine]
+    ctypes.CDLL(None).syscall(exit_number, 0)
+    raise AssertionError('SYS_exit returned')
+thread.join()
+"""
+        child = self.enterContext(subprocess.Popen([sys.executable, "-IS", "-c", program, mode, str(held)],
+                                                  cwd=folder.parent, stdout=subprocess.PIPE, text=True))
+
+        def stop_child() -> None:
+            child.kill()
+            _ = child.communicate(timeout=5)
+
+        self.addCleanup(stop_child)
+        assert child.stdout is not None
+        output = cast(TextIO, child.stdout)
+        self.assertTrue(select.select([output], [], [], 10)[0], "The child did not report its thread.")
+        thread = output.readline().strip()
+        self.assertTrue(thread.isdecimal(), "The child did not report a thread ID.")
+        return child.pid, int(thread), held
+
+    def test_process_scan_reads_a_thread_with_its_own_filesystem_state(self) -> None:
+        pid, _, held = self.start_thread("cwd")
+        uses = tmp_sweep.process_paths(tmp_sweep.PROC_DIR, str(held.parent))
+        assert isinstance(uses, tmp_sweep.ProcessUsesKnown)
+        self.assertIn((str(held.parent), pid, tmp_sweep.WORKS_IN), uses.paths)
+
+    def test_process_scan_reads_a_thread_with_its_own_descriptor_table(self) -> None:
+        pid, _, held = self.start_thread("fd")
+        uses = tmp_sweep.process_paths(tmp_sweep.PROC_DIR, str(held.parent))
+        assert isinstance(uses, tmp_sweep.ProcessUsesKnown)
+        self.assertIn((str(held), pid, tmp_sweep.HOLDS_FILE), uses.paths)
+
+    @unittest.skipUnless(os.uname().machine in {"x86_64", "aarch64"}, "SYS_exit number is unknown")
+    def test_process_scan_reads_a_thread_after_its_leader_exits(self) -> None:
+        pid, _, held = self.start_thread("exited")
+        self.assertEqual(tmp_sweep.linux_process_stat(Path(tmp_sweep.PROC_DIR) / str(pid)).state, "Z")
+        uses = tmp_sweep.process_paths(tmp_sweep.PROC_DIR, str(held.parent))
+        assert isinstance(uses, tmp_sweep.ProcessUsesKnown)
+        self.assertIn((str(held), pid, tmp_sweep.HOLDS_FILE), uses.paths)
+
+    @unittest.skipUnless(os.uname().machine in {"x86_64", "aarch64"}, "The kcmp syscall number is unknown")
+    def test_process_scan_skips_a_thread_that_shares_both_resources(self) -> None:
+        pid, tid, held = self.start_thread("shared")
+        leader = f"{tmp_sweep.PROC_DIR}/{pid}"
+        read_paths = tmp_sweep._read_process_paths  # pyright: ignore[reportPrivateUsage]
+        with mock.patch.object(tmp_sweep, "_read_process_paths", wraps=read_paths) as read:
+            uses = tmp_sweep.process_paths(tmp_sweep.PROC_DIR, str(held.parent))
+        assert isinstance(uses, tmp_sweep.ProcessUsesKnown)
+        self.assertEqual(uses.paths.count((str(held), pid, tmp_sweep.HOLDS_FILE)), 1)
+        paths_read = {cast(str, call.args[0]) for call in read.call_args_list}
+        self.assertIn(leader, paths_read)
+        self.assertNotIn(f"{leader}/task/{tid}", paths_read)
 
 
 class ScratchRootTests(TmpSweepCase):

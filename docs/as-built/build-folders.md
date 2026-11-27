@@ -150,7 +150,16 @@ It checks all these paths for process use.
 
 Migration scans the sources together and checks each source again before source relocation. The scan cannot stop a process that enters the source after the scan. The pass ends with `moved N, kept in use M, kept K`. The dry run uses `would move`. Run the same command again later to move kept folders.
 
-Linux migration checks the working directory of each live thread. It checks for live threads when the thread leader is a zombie. After `EACCES`, it checks whom the working directory link in `/proc` belongs to. It also checks whether the process has a permitted capability the caller lacks. Either cause can account for the missing paths. Migration prints `not checked (hidden by the kernel): <pid> <comm>` once per hidden process. Other read errors for processes of the current user keep every candidate. An incomplete process scan keeps every candidate on either host.
+Linux migration uses `process_paths` to scan each live process and its threads.
+On the live `/proc`, the scan can skip a thread after it reads the leader without errors or ignored descriptors.
+It skips the thread only when `kcmp` confirms that it shares the leader's descriptor table and filesystem state.
+The scan reads the other threads if the leader has exited or the comparison fails.
+After `EACCES`, the scan checks the owner of the working directory link in `/proc`.
+It also checks whether the process has a permitted capability the caller lacks.
+Either check can explain why the kernel hides the paths.
+Migration prints `not checked (hidden by the kernel): <pid> <comm>` once per hidden process.
+Other read errors for processes of the current user keep every candidate.
+An incomplete process scan keeps every candidate on either host.
 
 Migration holds busy claims and copy leases through source relocation. A copy request waits for another process to release the unit allocation lock. A second request from the same process fails immediately.
 
