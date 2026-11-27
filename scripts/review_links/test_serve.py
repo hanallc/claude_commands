@@ -8534,7 +8534,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         configuration = self.root / "queue-move-conf"
         configuration.mkdir()
         _ = write_config_fixture(configuration / "build_queue.conf",
-            "move_timeout_seconds=3\nmove_request_bytes=512\nmove_highlight_seconds=2\n")
+            "move_request_bytes=512\nmove_highlight_seconds=2\n")
+        _ = write_config_fixture(configuration / "waits.conf", "# whole: 1..\nsize.fast.seconds=7\n")
         _ = write_config_fixture(configuration / "review_links.conf")
         origin = f"http://127.0.0.1:{self.port}"
         request = admission.QueueMoveRequest("1" * 32, "2" * 32, "3" * 32, admission.QueueDrop("4" * 32, "before"))
@@ -8592,11 +8593,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             status, reply = self.post(serve.QUEUE_MOVE_PATH, body, origin=origin, headers=headers)
             self.assertEqual(status, 409)
             self.assertIn(b'"reason": "The queue changed."', reply)
-            move.assert_called_once_with(request, 3)
+            move.assert_called_once_with(request, 7)
             move.reset_mock()
             status, _ = self.post(serve.QUEUE_MOVE_PATH, json.dumps(undo_content), origin=origin, headers=headers)
             self.assertEqual(status, 409)
-            move.assert_called_once_with(undo, 3)
+            move.assert_called_once_with(undo, 7)
     def test_build_kill_requires_origin_operator_token_and_bounded_body(self) -> None:
         settings = self.root.parent / "kill-config"
         settings.mkdir()

@@ -40,7 +40,7 @@ STARTED_NS = time.time_ns()
 from scripts.disks import disks_page, sessions
 from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import admission_client, admission_protocol as admission, kill_action, memory_feed, memory_files
-from scripts.lib import atomic_file, conf, scratch, session_folder
+from scripts.lib import atomic_file, conf, scratch, session_folder, waits
 from scripts.lib.file_lock import exclusive
 from scripts.lib.process_group import run_process_group
 from scripts.production import change_routing, change_review, staff, the_list, tidy_wrapped
@@ -2301,7 +2301,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             length = int(lengths[0])
             if not 0 < length <= limit or self.headers.get_all("Transfer-Encoding"):
                 raise ValueError("Invalid queue move request size.")
-            timeout = settings.number("move_timeout_seconds")
+            timeout = waits.read(waits.WaitSize.FAST).seconds
             connection = cast(socket.socket, self.connection)
             previous_timeout = connection.gettimeout()
             connection.settimeout(timeout)

@@ -3096,7 +3096,8 @@ The setting starts at `local-node-owner`.
 An empty value refuses each of these requests with HTTP 403.
 The console also checks the Tailscale address and Host.
 The JSON POST requires the same Origin and a console token.
-The console limits the request size and time with `build_queue.conf`.
+The console reads the request size limit from `build_queue.conf`.
+It reads the time limit from `size.fast.seconds` in `waits.conf`.
 
 A drop and an Undo each send a request ID, a wait ID, and an order revision.
 A drop also sends a head destination or a neighbor and side.

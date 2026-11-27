@@ -27,6 +27,9 @@ It refuses a nested verify step while the same reservation and holder (pid and s
 The memory and cargo-token entry points use the same check before waiting.
 Markers for other queues, dead holders, reused pids, and released reservations do not block a step.
 
+The Builds page and its feed read the queue move and token command limits from `config/waits.conf`.
+The feed still reads the token dump interval from `config/memory_feed.conf`.
+
 ### Installed writers and private test state
 
 Only the installed scripts under `~/.claude/scripts` may change shared build state.
