@@ -236,6 +236,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
 | `scripts/lib/build_copies.py` | read | local_snapshot, RemovedWorktree, StaffUnreadable |
+| `scripts/lib/copy_owner.py` | read | local_snapshot, by_worktree, StaffUnreadable |
 | `scripts/lib/origin_deletion.py` | read | operation_fds; retains the operation locks during the Git command |
 | `scripts/lib/python_startup/sitecustomize.py` | read | `TEST_RUNNER_FILES` lists `staff.py` for the removal guard in test checkouts. |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |

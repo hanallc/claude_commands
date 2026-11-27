@@ -151,6 +151,7 @@ class CheckpointGateTests(unittest.TestCase):
         with PlacementFixture() as fixture:
             _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=natedev\nenabled.natedev=on\n")
             _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=off\n")
+            write_gate(fixture.root, GATE, 0)
             local = local_candidate(fixture)
 
             def grant(request: admission_wire.PlacementRequest) -> admission_wire.Assignment:
@@ -179,7 +180,8 @@ class CheckpointGateTests(unittest.TestCase):
                     run.assert_called_once()
                     argv = cast(list[str], run.call_args.args[0])
                     self.assertEqual(argv[2:], ["gate-step", "--repo", str(fixture.root), "--", *GATE])
-                    self.assertEqual(copies.main(argv[2:]), 0)
+                    gate_result = run_gate_step(self, argv[2:])
+                    self.assertEqual(gate_result.returncode, 0, gate_result.stderr)
                     place.assert_called_once()
 
     def test_named_module_gate_keeps_the_parent_reservation(self) -> None:

@@ -30,7 +30,7 @@ from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, Li
 from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
-from scripts.lib import conf, copy_owner, scratch
+from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.process_stat import PROC_ROOT, process_fields
 from scripts.lib.showrunner_state import state_root
@@ -2230,6 +2230,8 @@ def request_owner(worktree: str) -> QueueCaller | OwnerNotGiven:
 
 def folder_owner(worktree: Path) -> str:
     """Read the owner from the worktree records without recovering a removal intent."""
+    from scripts.lib import copy_owner, scratch
+
     try:
         return copy_owner.recorded_owner(worktree, intent=scratch.RemovalIntentAccess.READ_ONLY)
     except (copy_owner.InvalidCopyOwner, OSError):
