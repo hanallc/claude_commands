@@ -7166,10 +7166,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(response.headers.get("content-encoding"), "gzip")
         page = gzip.decompress(response.body)
         self.assertIn(b"<title>The Studio</title>", page)
-        self.assertIn(b'<div class="studio-tabs">', page)
+        self.assertIn(b'<div data-page-top-controls><div class="studio-tab-row"><div class="studio-tabs">', page)
         self.assertIn(item.title.encode(), page)
         self.assertEqual(page.count(b'aria-label="Producer" data-filter-row="producer">'), 1)
         self.assertIn(f'data-list-path="{studio_page.PAGE_PATH}"'.encode(), page)
+        review = self.request(review_page.PAGE_PATH)
+        self.assertEqual(review.status, 200)
+        self.assertNotIn(b'<div data-page-top-controls>', review.body)
         with (patch.object(list_page, "render", side_effect=OSError("fixture read failed")),
               redirect_stderr(StringIO()) as log):
             failed = self.request(studio_page.PAGE_PATH, headers=encoding)

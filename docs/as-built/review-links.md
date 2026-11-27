@@ -271,16 +271,23 @@ Images uses the page notice if the image is deleted and the list cannot refresh.
 The shared frame freezes the title, the action area, and the status line at the top of the page.
 Review also freezes Search.
 Search sits to the right of the status above 800 px and below the status at smaller widths.
+The Studio also freezes the Producer picture tabs, Search, the Owner and Show chips, and the Unread only switch.
+The Top priority card scrolls with the table.
 The frozen top has an opaque page background.
 The content scrolls under it.
 At widths of 640 px or less, only the title stays in view.
 The action area and status line scroll with the content at these widths.
 Review Search also scrolls with the content at these widths.
+The Studio filters scroll with the content at these widths.
+In short desktop viewports, the Studio limits the filter height and lets the filters scroll inside the frozen top.
+The Studio table header sticks directly below the frozen top at all widths.
+When a refresh increases the frozen top height, the Studio keeps a visible open row below the table header.
 The action area holds the owner name and the New item button.
 The script puts the actions beside the title when they fit on one line.
 When they do not fit, the actions stay above the title.
 The frame measures the frozen top when its size changes.
 It uses this height as the page scroll padding for anchor jumps and focused rows.
+The Studio adds the table header height to the scroll padding.
 A page can add action buttons between the owner name and New item.
 `page_frame.page_action_button(action, icon, label, dialog_id)` makes one button, and pages pass it through `actions`.
 `owner_control()` and `with_owner()` take `actions`. The names `new-item` and `owner` are reserved.
@@ -1499,6 +1506,7 @@ A refresh applies the new data immediately.
 The open row keeps its element through a refresh and takes the new summary, data and detail.
 Its focus, draft and text selection stay.
 The List measures the open row before and after an update or a save result, then scrolls by the difference.
+If the header grows during refresh, a visible row moves below it after the filters or the status line change.
 At a scroll limit, it adds space to keep the row in place.
 The List keeps the open row in place while another row changes height during an animation.
 It reserves space below the list before a row shrinks near the bottom.
@@ -2310,8 +2318,7 @@ The first news request moves the saved List seen set to Studio and keeps any unr
 The Studio puts the Producer picture tabs on the left and centers the words box vertically on the right.
 When space is limited, the words box moves below the tabs and stays on the right.
 On a phone, the words box uses the full width.
-The Top priority band follows the tabs and the words box.
-The Owner and Show rows follow the band.
+The Top priority band follows the Producer picture tabs, Search, the Owner and Show chips, and the Unread only switch.
 A render failure gives a 503 page with **The Studio page is not available.** and logs `review-links studio:`.
 
 The tabs are the List Producer filter: `record_table.chip_row('Producer', ...)` with `data-filter-row="producer"`.

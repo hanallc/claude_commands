@@ -1293,8 +1293,8 @@ if(example.filterOn){
         row = '<div class="record-filter-row" role="group" aria-label="Producer" data-filter-row="producer">'
         self.assertEqual(studio.count(row), 1)
         self.assertIn('<div class="studio-tab-row"><div class="studio-tabs">' + row, studio)
-        controls = ('<div class="studio-tabs">', '<div class="record-filter-words">',
-                    '<div class="list-top-bands">', '<div data-record-filters>')
+        controls = ('<div data-page-top-controls>', '<div class="studio-tabs">', '<div class="record-filter-words">',
+                    '<div data-record-filters>', '<div class="list-top-bands">')
         positions = [studio.index(control) for control in controls]
         self.assertEqual(positions, sorted(positions))
         self.assertIn('<h1 class="page-title">The Studio</h1>', studio)
@@ -1303,6 +1303,165 @@ if(example.filterOn){
         tab = studio.split(f'data-filter-value="staff:{DWIGHT.id}"', 1)[1].split('</button>', 1)[0]
         self.assertIn(f'src="{studio_page.AVATAR_PATH}/{DWIGHT.id}/01-128.webp"', tab)
         self.assertIn('<span class="studio-name">dwight</span> <b>2</b>', tab)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the frozen Studio filters.")
+    def test_browser_studio_filters_and_table_header_follow_the_frozen_top(self) -> None:
+        for number in range(1, 25):
+            _ = self.add(f"Check Studio item {number}", number=number)
+        markup = list_page.render(self.root / "reviews", include_counts=False)
+        page = page_frame.with_owner(markup, "studio", MORTY, staff.StaffSnapshot((MORTY,)), new_item_dialog.render)
+        probe = b'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const find=selector=>document.querySelector(selector);
+ const box=element=>element.getBoundingClientRect();
+ const hit=element=>{
+  const {left,top,width,height}=box(element);
+  return element.contains(document.elementFromPoint(left+width/2,top+height/2));
+ };
+ try{
+  frameElement.style.height='800px';
+  const top=find('.page-top'), title=find('.page-heading');
+  const heading=find('.list-table thead'), row=find('[data-number="20"] .list-row');
+  const controls=['.studio-tabs button','#list-search','#filter-owner-all','#filter-show-all','#list-unread'].map(find);
+  check(controls.every(control=>top.contains(control)), 'The shared frame contains all five Studio filters.');
+  for(const width of [1440,390]){
+   frameElement.style.width=width+'px';
+   scrollTo({top:0,behavior:'instant'});
+   await paint();
+   const first=box(row).top;
+   for(const scroll of [700,980]){
+    scrollTo({top:scroll,behavior:'instant'});
+    await paint();
+    const bottom=box(width===1440 ? top : title).bottom;
+    check(innerWidth===width && scrollY===scroll && Math.abs(box(row).top-first+scroll)<1,
+     width+' px: the table rows scroll under the frame.');
+    check(Math.abs(box(heading).top-bottom)<1 && hit(heading.querySelector('button')),
+     width+' px: the table header touches the frozen top and accepts input.');
+    check(width===1440 ? controls.every(hit) : controls.every(control=>box(control).bottom<0) && hit(title),
+     width+' px: the desktop filters stay visible and the phone keeps only the title.');
+   }
+   row.scrollIntoView({block:'start',behavior:'instant'});
+   await paint();
+   check(box(row).top>=box(heading).bottom-1 && hit(row.querySelector('.list-toggle')),
+    width+' px: scrolling a row into view clears the table header.');
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the short Studio layout.")
+    def test_browser_short_studio_keeps_two_rows_visible_and_filters_reachable(self) -> None:
+        producers = tuple(staff.StaffRow(identity, "producer", name, staff.StaffRoot(), current_session=identity)
+                          for identity, name in ((OWNER.id, "first"), (OTHER.id, "second")))
+        members = staff.StaffSnapshot((MORTY, DWIGHT, *producers))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
+            member.to_json() for member in members.rows]}))
+        for number in range(1, 9):
+            _ = self.add(f"Check Studio item {number}")
+        markup = list_page.render(self.root / "reviews", include_counts=False)
+        page = page_frame.with_owner(markup, "studio", MORTY, members, new_item_dialog.render)
+        probe = b'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const box=element=>element.getBoundingClientRect();
+ const hit=element=>{
+  const {left,top,width,height}=box(element);
+  return element.contains(document.elementFromPoint(left+width/2,top+height/2));
+ };
+ try{
+  frameElement.style.width='800px';frameElement.style.height='320px';
+  await paint();
+  const filters=document.querySelector('[data-page-top-controls]');
+  const tabs=filters.querySelectorAll('.studio-tabs button');
+  const search=filters.querySelector('#list-search');
+  const unread=filters.querySelector('#list-unread');
+  const heading=document.querySelector('.list-table thead');
+  const [first,second]=document.querySelectorAll('.list-table .list-row');
+  check(innerWidth===800 && innerHeight===320 && tabs.length===5 && box(search).top>=box(tabs[0]).bottom,
+   'Five Producer tabs put Search on its own line at 800 x 320 px.');
+  check(filters.scrollHeight>filters.clientHeight,'The filters have their own scroll area.');
+  first.scrollIntoView({block:'start',behavior:'instant'});
+  await paint();
+  check(hit(heading.querySelector('button')) && box(first).top>=box(heading).bottom-1 && box(second).bottom<=innerHeight,
+   'The table header and two full rows fit below the frozen top: '+JSON.stringify([box(heading),box(first),box(second)]));
+  const pageScroll=scrollY;
+  for(const control of [search,filters.querySelector('#filter-owner-all'),filters.querySelector('#filter-show-all'),unread]){
+   control.focus();await paint();
+   check(document.activeElement===control && hit(control),'The filter takes focus and stays visible: '+control.id);
+  }
+  check(filters.scrollTop>0 && scrollY===pageScroll,'Focus scrolls the filters within the frozen top.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required to check refresh position.")
+    def test_browser_studio_refresh_keeps_open_row_below_the_grown_header(self) -> None:
+        root = self.root / "reviews"
+        for number in range(1, 13):
+            _ = self.add(f"Check Studio item {number}")
+        initial = list_page.render(root, include_counts=False).decode()
+        for number in range(13, 25):
+            _ = self.add(f"Check the result for team {number}", owner=staff.StaffId(f"delivery-team-{number}"))
+        fresh = list_page.render(root, include_counts=False).decode()
+        for offset in (2, -8):
+            with self.subTest(offset=offset):
+                self.assert_studio_refresh_row_position(initial, fresh, offset, r'''
+ check(later.ownerLines>earlier.ownerLines,'The fresh Owner chips add a line.');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required to check refresh position.")
+    def test_browser_studio_refresh_keeps_open_row_below_the_wrapped_status(self) -> None:
+        for number in range(1, 13):
+            _ = self.add(f"Check Studio item {number}")
+        page = list_page.render(self.root / "reviews", include_counts=False).decode()
+        initial = page.replace("<head>", f"<head><script>Date.now=()=>{NOW.timestamp() * 1000};</script>", 1)
+        reason = "The reader cannot confirm the data time. " * 14
+        fresh = page.replace("data-page-facts ", f'data-page-facts data-read-error="{reason}" ', 1)
+        self.assert_studio_refresh_row_position(initial, fresh, 2, r'''
+ check(later.statusHeight>earlier.statusHeight && later.statusState==='Failed',
+  'The fresh status shows the failure on more lines.');
+ check(later.ownerLines===earlier.ownerLines,'The Owner chips keep their height.');
+''')
+
+    def assert_studio_refresh_row_position(self, initial: str, fresh: str, offset: int, verify_growth: str) -> None:
+        steps = r'''
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const summary=()=>document.querySelector('[data-number="6"] .list-row');
+ const header=()=>document.querySelector('.list-table thead').getBoundingClientRect();
+ const measure=()=>{
+  const status=document.querySelector('[data-page-status]');
+  return {headerBottom:header().bottom,row:summary().getBoundingClientRect(),statusState:status.dataset.state,
+   statusHeight:status.getBoundingClientRect().height,
+   ownerLines:new Set([...document.querySelectorAll('[data-filter-row="owner"] button:not([hidden])')]
+    .map(chip=>chip.getBoundingClientRect().top)).size};
+ };
+ await paint();
+ summary().scrollIntoView({block:'start',behavior:'instant'});
+ await paint();
+ scrollBy({top:Math.floor(summary().getBoundingClientRect().top-header().bottom-(ROW_OFFSET)),behavior:'instant'});
+ await paint();
+ const earlier=measure(),offset=earlier.row.top-earlier.headerBottom;
+ check(earlier.row.bottom>earlier.headerBottom && Math.abs(offset-(ROW_OFFSET))<2,
+  'The open row starts at the expected offset from the header: '+offset);
+ refreshMarkup=FRESH_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();await paint();await paint();
+ const later=measure();
+ VERIFY_GROWTH
+ check(later.headerBottom>earlier.headerBottom,'The refresh grows the header.');
+ check(recordIsOpen(summary().parentElement) && later.row.top>=later.headerBottom-0.5,
+  'The open row clears the new header: '+later.row.top+' vs '+later.headerBottom);
+'''.replace('ROW_OFFSET', str(offset)).replace('VERIFY_GROWTH', verify_growth)
+        steps = steps.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
+        self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial,
+                                     open_number=6, window_size=(1280, 800))
 
     def test_studio_lists_linked_items_with_states_and_missing_records(self) -> None:
         closed = self.add("Close this check", number=210)
@@ -1512,15 +1671,16 @@ if(example.filterOn){
             for size in studio_page.SIZES:
                 _ = (avatars / folder / f"02-{size}.webp").write_bytes(b"RIFF")
 
-        def page() -> str:
-            return list_page.render(self.root / "reviews", include_counts=False).decode()
+        def page(render_seconds: str) -> str:
+            return re.sub(r'data-render-seconds="[^"]+"', f'data-render-seconds="{render_seconds}"',
+                          list_page.render(self.root / "reviews", include_counts=False).decode(), count=1)
 
         with patch.object(studio_page, "choice", side_effect=min):
-            initial = page()
+            initial = page("0.20").replace("<head>", f"<head><script>Date.now=()=>{NOW.timestamp() * 1000};</script>", 1)
         added = self.add("A new item for dwight", number=2)
         _ = the_list.update(MORTY.id, added.id, {"producer": DWIGHT.id}, source="morty")
         with patch.object(studio_page, "choice", side_effect=max):
-            fresh = page()
+            fresh = page("0.76")
         self.assertIn(f'src="{studio_page.AVATAR_PATH}/{DWIGHT.id}/02-128.webp"', fresh)
         steps = r'''
  const tab=value=>document.querySelector('[data-filter-row="producer"] [data-filter-value="'+value+'"]');
@@ -1530,14 +1690,20 @@ if(example.filterOn){
   return [picture.getAttribute('src'),picture.getAttribute('srcset')];
  }));
  const shown=pictures();
+ const frozen=document.querySelector('.page-top');
+ const status=frozen.querySelector('[data-page-status]');
+ const renderTime=status.querySelector('[data-status-render]');
+ check(!renderTime.hidden && renderTime.textContent==='render 0.20 s','The first status shows its render time.');
  check(shown.includes('/01-128.webp') && !shown.includes('/02-'),'The first render shows picture 01.');
  check(tab('staff:'+DWIGHT).dataset.filterCount==='0' && tab('all').dataset.filterCount==='1',
   'The first render counts one item.');
  refreshMarkup=FRESH_PAGE;
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await flush();
- await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
  check(document.querySelector('[data-number="2"]'),'The refresh shows the new row.');
+ check(frozen===document.querySelector('.page-top') && frozen.contains(status) && !renderTime.hidden &&
+  renderTime.textContent==='render 0.76 s','The retained status displays the fresh render time.');
  check(pictures()===shown,'The refresh keeps each picture src and srcset on screen.');
  check(tab('staff:'+DWIGHT).dataset.filterCount==='1' && tab('staff:'+DWIGHT).querySelector('b').textContent==='1'
   && tab('all').dataset.filterCount==='2','The refresh updates the tab counts.');
@@ -1703,7 +1869,7 @@ if(example.filterOn){
         back = "new Promise(resolve=>{addEventListener('popstate',resolve,{once:true});history.back();})"
         _ = evaluate(back)
         self.assertIs(evaluate(opened), False)
-        _ = evaluate("document.getElementById('list-search').focus()")
+        _ = evaluate("document.getElementById('list-unread').focus()")
         for key, code in (("Tab", 9), ("Enter", 13)):
             if key == "Enter":
                 self.assertIs(evaluate(f"document.activeElement==={link}"), True)
@@ -2622,8 +2788,10 @@ frame.addEventListener('load',async()=>{
     const top=target.getBoundingClientRect().top;
     check(win.getComputedStyle(frozen).position==='sticky' && Math.abs(box.top)<1 &&
      banner.getBoundingClientRect().height>=60,'the tall status line stays in the frozen top');
-    const gap=top-box.bottom;
-    check(Math.abs(gap-16)<=1,'the gap below the frozen top is '+gap+' px, expected 16 px');
+    const heading=doc.querySelector('.list-table thead').getBoundingClientRect();
+    const gap=top-heading.bottom;
+    check(Math.abs(heading.top-box.bottom)<=1 && Math.abs(gap-16)<=1,
+     'The row starts 16 px below the table header. Found '+gap+' px.');
    }
   }
   const expected=originalFilters.slice();
@@ -6982,7 +7150,8 @@ window.fetch=async(_path,options={})=>{
  row.querySelector('.list-toggle').scrollIntoView({block:'center',behavior:'instant'});
  row.querySelector('.list-toggle').click();
  unpark.focus({preventScroll:true});
- check(filter.getBoundingClientRect().bottom<0,'The focused row is below the viewport with the filters.');
+ check(SHORT_VIEWPORT ? filter.getBoundingClientRect().bottom<0 : filter.getBoundingClientRect().top>=0,
+       'The Parked filter stays visible when the frame freezes it.');
  submit('unpark');
  finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
  await flush();
