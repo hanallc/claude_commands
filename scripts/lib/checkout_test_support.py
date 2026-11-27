@@ -14,9 +14,13 @@ from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_
 
 
 SOURCE = Path(__file__).resolve().parents[2]
-# Child fixtures can model a direct launch inside an outer gate module.
-STANDALONE_TEST_STARTUP = """import sys
-sys.modules["_devtools_python_startup"]._descends_from_gate_module = lambda: False
+WITHOUT_GATE_ANCESTRY = """import sys
+startup = sys.modules["_devtools_python_startup"]
+startup._descends_from_gate_module = lambda: False
+"""
+# Model a launch outside a gate and outside an existing direct test scope.
+STANDALONE_TEST_STARTUP = WITHOUT_GATE_ANCESTRY + """
+startup._direct_test_scope_enforces_deadline = lambda unit: False
 """
 
 

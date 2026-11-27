@@ -8,6 +8,8 @@ import io
 import json
 import os
 from pathlib import Path
+from tempfile import mkdtemp
+from threading import Barrier
 from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -144,6 +146,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             code, output = self.cli("run", *args)
             self.assertEqual(code, 0, output)
             self.assertEqual(self.cli("run", *args), (0, output))
+            behavior_check.record_path(key).unlink()
+            self.assertEqual(self.cli("run", *args), (0, output))
         runner.assert_called_once()
         prompt = cast(str, runner.call_args.args[1])
         self.assertIn("Run each shell command to completion in one tool call.", prompt)
@@ -154,10 +158,13 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("Find Nate's newest words that set each affected behavior.", prompt)
         self.assertIn('Use "specified" when the change departs from those words or you cannot tell', prompt)
         self.assertEqual(behavior_check.read_record(key), behavior_check.Clear(self.folder / "completed-reply.txt"))
+        self.assertEqual(behavior_check.record_path(key).with_suffix(".run").read_text().strip(), str(self.folder))
+        self.assertFalse(list(behavior_check.record_path(key).parent.glob("*.part-*.run")))
         self.assertIn("move now", (self.folder / "tests.json").read_text())
         self.assertIn("+    assert 'wait first'", (self.folder / "code.diff").read_text())
         self.assertFalse(list(Path(self.environment["SHOWRUNNER_STATE_DIR"]).glob("*/questions/*")))
 
+        (self.folder / "review-instructions").unlink()
         self.assertEqual(self.cli("check", *args), (0, ""))
         saved = self.folder / "completed-reply.txt"
         refusal = (1, f"{key}: the saved approval has no valid proof.\n")
@@ -177,6 +184,104 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         saved.unlink()
         self.assertIn("no valid proof", self.cli("check", *args)[1])
         self.assertEqual(self.cli("status", "--key", key), refusal)
+
+    def split_range(self, shared_text: str) -> tuple[list[str], str]:
+        config = self.root / "config"
+        _ = self.write(config / "production.conf", "# whole: 1..\nreview_part_bytes=2400\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)})))
+        first = f"def test_move():\n    assert 'old {'a' * 190}'\n\ndef test_stop():\n    assert 'old {'b' * 190}'\n"
+        second = f"def test_start():\n    assert 'old {'c' * 310}'\n"
+        _ = self.write(self.repo / "test_first.py", first)
+        _ = self.write(self.repo / "test_second.py", second)
+        _ = self.write(self.repo / "shared.py", "VALUE = 'old'\n")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-m", "Set the old behavior.")
+        base = self.git("rev-parse", "HEAD").stdout.strip()
+        _ = self.write(self.repo / "test_first.py", first.replace("old", "new"))
+        _ = self.write(self.repo / "test_second.py", second.replace("old", "new"))
+        _ = self.write(self.repo / "shared.py", shared_text)
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-m", "Set the new behavior.")
+        commit = self.git("rev-parse", "HEAD").stdout.strip()
+        return self.review_range(base, commit)
+
+    def part_tests(self, folder: Path) -> list[str]:
+        rows = cast(list[dict[str, str]], json.loads((folder / "tests.json").read_text()))
+        return [row["test"] for row in rows]
+
+    def test_split_review_retries_only_the_part_with_a_blocker(self) -> None:
+        args, key = self.split_range("VALUE = 'new'\n")
+        attempts: dict[str, list[Path]] = {}
+        first_attempt = True
+        concurrent = Barrier(2, timeout=5)
+
+        def review_part(reply: Path, _prompt: str, _log: Path, **_options: object) -> int:
+            tests = self.part_tests(reply.parent)
+            test_file = tests[0].split("::", 1)[0]
+            attempts.setdefault(test_file, []).append(reply.parent)
+            if first_attempt:
+                _ = concurrent.wait()
+                if test_file == "test_second.py":
+                    _ = self.write(reply, "I could not read the diff.\nA second line.\nDONE fixture-pass\n")
+                    return 0
+            _ = self.write(reply, json.dumps([{"test": test, "finding": "none"} for test in tests]))
+            return 0
+
+        with (mock.patch.object(astra_review, "review_attempt_folder", side_effect=lambda: Path(mkdtemp(dir=self.root))),
+              mock.patch.object(astra_review, "run_review", side_effect=review_part)):
+            code, output = self.cli("run", *args)
+            self.assertEqual(code, 1, output)
+            self.assertIn("The reviewer could not complete part 2: I could not read the diff.\n", output)
+            self.assertNotIn("A second line.", output)
+            path = behavior_check.record_path(key)
+            first_pointer = path.with_suffix(".part-1.run")
+            second_pointer = path.with_suffix(".part-2.run")
+            first_folder = attempts["test_first.py"][0]
+            self.assertEqual(first_pointer.read_text().strip(), str(first_folder))
+            self.assertFalse(second_pointer.exists())
+            self.assertIs(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
+            first_attempt = False
+            self.assertEqual(self.cli("run", *args), (0, f"{key} clear\n"))
+
+        self.assertEqual(attempts["test_first.py"], [first_folder])
+        self.assertEqual(len(attempts["test_second.py"]), 2)
+        second_folder = attempts["test_second.py"][1]
+        self.assertEqual(second_pointer.read_text().strip(), str(second_folder))
+        self.assertEqual(self.part_tests(first_folder), ["test_first.py::test_move", "test_first.py::test_stop"])
+        self.assertEqual(self.part_tests(second_folder), ["test_second.py::test_start"])
+        for test_file, folder, other in (("test_first.py", first_folder, "test_second.py"),
+                                         ("test_second.py", second_folder, "test_first.py")):
+            diff = folder / "code.diff"
+            self.assertLessEqual(diff.stat().st_size + (folder / "tests.json").stat().st_size, 2400)
+            self.assertIn(test_file, diff.read_text())
+            self.assertIn("shared.py", diff.read_text())
+            self.assertNotIn(other, diff.read_text())
+        self.assertEqual(self.cli("check", *args), (0, ""))
+        self.assertEqual(self.cli("status", "--key", key), (0, f"{key} clear\n"))
+        saved = first_folder / "completed-reply.txt"
+        _ = self.write(saved, saved.read_text() + "\n")
+        self.assertIn("no valid proof", self.cli("check", *args)[1])
+        self.assertEqual(self.cli("status", "--key", key)[0], 1)
+
+    def test_split_review_indexes_a_large_shared_diff(self) -> None:
+        args, key = self.split_range(f"VALUE = '{'new' * 1500}'\n")
+
+        def review_part(reply: Path, prompt: str, _log: Path, **_options: object) -> int:
+            self.assertIn("Read the diffs for the listed tests and the files those tests exercise.", prompt)
+            folder = reply.parent
+            index = folder / "diffs" / "index.json"
+            paths = cast(dict[str, str], json.loads(index.read_text()))
+            shared, = (name for name, path in paths.items() if path == "shared.py")
+            self.assertGreater((index.parent / shared).stat().st_size, 2400)
+            self.assertFalse((folder / "code.diff").exists())
+            _ = self.write(reply, json.dumps([{"test": test, "finding": "none"} for test in self.part_tests(folder)]))
+            return 0
+
+        with (mock.patch.object(astra_review, "review_attempt_folder", side_effect=lambda: Path(mkdtemp(dir=self.root))),
+              mock.patch.object(astra_review, "run_review", side_effect=review_part) as runner):
+            self.assertEqual(self.cli("run", *args), (0, f"{key} clear\n"))
+        runner.assert_called()
+        self.assertEqual(self.cli("check", *args), (0, ""))
 
     def test_verified_requests_clear_the_range_and_list_each_quote(self) -> None:
         args, key = self.two_changed_tests()
@@ -415,15 +520,20 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                 behavior_check.record_path(key).unlink()
                 (normal_folder / "completed-reply.txt").unlink()
 
-    def test_retries_replace_unstarted_and_failed_review_attempts(self) -> None:
+    def test_retries_replace_unstarted_failed_and_stale_review_attempts(self) -> None:
         args, key = self.changed_range()
         pointer = behavior_check.record_path(key).with_suffix(".run")
-        for state in ("unstarted", "canceled", "refused"):
+        for state in ("unstarted", "canceled", "refused", "missing instructions", "different instructions"):
             with self.subTest(state=state):
                 prior = self.root / state
                 prior.mkdir()
                 _ = self.write(pointer, f"{prior}\n")
-                if state != "unstarted":
+                if state in ("missing instructions", "different instructions"):
+                    _ = self.write(prior / "completed-reply.txt", "[]")
+                    _ = self.write(prior / "review-key", key)
+                    if state == "different instructions":
+                        _ = self.write(prior / "review-instructions", "0" * 64)
+                elif state != "unstarted":
                     _ = self.write(pass_record.state_path(prior), json.dumps({"pass": {"review": {"status": state}}}))
                 behavior_check.record_path(key).unlink(missing_ok=True)
                 self.reply(CLEAR_REPLY)

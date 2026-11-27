@@ -4216,6 +4216,12 @@ with patch.object(fcntl, "flock", admission):
     def test_finish_pass_outside_a_launcher_only_cancels_an_orphan(self) -> None:
         session_dir = self.start_run("orphan", 20_000)
         self.start_phase_and_pass(session_dir, 20_010)
+        slot, passed = next(iter(self.pass_slots(session_dir).items()))
+        status = session_dir / f"{slot}_status"
+        atomic_file.write_text_atomic(status, "running\n")
+        instance = str(passed["instance_id"])
+        progress_history.save_dispatch_delivery(session_dir, instance, pass_recorder.DispatchDelivery("", instance, "",
+            actions=pass_recorder.CompletionActions(status_file=str(status))))
         unowned = self.run_unowned_command(
             "finish-pass", "--session-dir", str(session_dir), "--status", "completed", at=20_030
         )
@@ -4232,6 +4238,7 @@ with patch.object(fcntl, "flock", admission):
         )
         self.assertNotEqual(wrong_status.returncode, 0)
         self.assertIn("--status canceled", wrong_status.stderr)
+        self.assertEqual(status.read_text(), "running\n")
         canceled = self.run_unowned_command(
             "finish-pass",
             "--session-dir",
@@ -4242,6 +4249,7 @@ with patch.object(fcntl, "flock", admission):
             at=20_050,
         )
         self.assertEqual(canceled.returncode, 0, canceled.stderr)
+        self.assertEqual(status.read_text(), "error\n")
         history = (self.history_dir / "runs" / "orphan.jsonl").read_text(encoding="utf-8")
         self.assertIn('"status":"canceled"', history.replace(" ", ""))
         repeated = self.run_unowned_command(
@@ -4612,13 +4620,39 @@ with patch.object(fcntl, "flock", admission):
         self.start_phase(session, 41_010)
         self.start_slot_pass(session, "impl", "impl", 41_020, worker_name="implementer")
         self.start_slot_pass(session, "review", "review", 41_030, worker_name="review2")
+        status = session / "impl_status"
+        atomic_file.write_text_atomic(status, "running\n")
+        instance = str(self.pass_slots(session)["impl"]["instance_id"])
         with patch.dict(os.environ, {"HOME": str(self.root)}):
+            progress_history.save_dispatch_delivery(session, instance, pass_recorder.DispatchDelivery(
+                "", "", "", actions=pass_recorder.CompletionActions(status_file=str(status))))
             self.assertEqual(progress_history.cancel_worker_passes(session, stopped.id), 1)
             self.assertEqual(progress_history.cancel_worker_passes(session, stopped.id), 0)
+        self.assertEqual(status.read_text(), "error\n")
         self.assertEqual(self.pass_slots(session)["impl"]["status"], "canceled")
         self.assertEqual(self.pass_slots(session)["review"]["status"], "active")
         finished = self.pass_events("canceled-pass", "pass_finished")
         self.assertEqual([event["status"] for event in finished], ["canceled"])
+
+    def test_detached_run_stop_finalizes_the_assignment_status(self) -> None:
+        session = self.start_run("stopped-detached-pass", 41_000, staff_owned=True)
+        owner = unit_runs.run_owner(self.read_state(session), staff.local_snapshot())
+        assert isinstance(owner, staff.StaffRow)
+        stopped = fixture_worker("implementer", owner.id)
+        self.start_phase(session, 41_010)
+        prompt = session / "impl_prompt.txt"
+        atomic_file.write_text_atomic(prompt, "Review the changes.\n")
+        status = session / "impl_status"
+        with patch.dict(os.environ, {"HOME": str(self.root), progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}):
+            instance = progress_history.begin_dispatch(session, slot="impl", phase="3", role="impl",
+                worker_name=stopped.name, worker_id=stopped.id, launcher_command=["assign.sh"],
+                prompt=prompt, kind="assign", lens="")
+            self.assertEqual(status.read_text(), "running\n")
+            notice = progress_history.stop_dispatch(session, "impl", instance, stopped, owner.id,
+                run_id="detached-1", reason="The supervisor ended before the command.")
+        self.assertIsInstance(notice, progress_history.StoppedPassNotice)
+        self.assertEqual(self.pass_slots(session)["impl"]["status"], "canceled")
+        self.assertEqual(status.read_text(), "error\n")
 
     def test_invalid_launcher_arguments_leave_the_active_pass_unchanged(self) -> None:
         session = self.start_run("invalid-launcher", 41_000)
