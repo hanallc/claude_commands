@@ -1156,6 +1156,10 @@ Later presets and date Save send words from the box to the record owner.
 Mark read on an Investigation or Bug sends words from the box to the record owner.
 If delivery fails, the card keeps the words and offers **Retry**.
 The retry sends the saved message. The server also retries pending messages at startup.
+Mark read saves the delivery key in the native log with the state change.
+If the receipt is missing, Retry and startup recovery confirm the save with that request's delivery key.
+Recovery clears an unsaved Mark read delivery after it checks the native log.
+A new press can then save Mark read and send the words.
 If the box contains newer words, **Retry** keeps the card open and leaves those words in the box.
 The calendar keeps a valid future Later draft when it opens, including a draft restored after a refresh.
 Otherwise, it opens on tomorrow in the user zone, with `later_morning` as its time.
@@ -2147,12 +2151,24 @@ For a Mark read notice, the recipient is the item's producer when the notice sav
 Under the lock, each action checks the request ID against the saved actions.
 A retry of a saved action changes no item fields and saves no second notice.
 **Make top priority** writes the priority to the staff record.
-The List saves any words in a separate write after the priority changes.
-The words receipt identifies the delivery. It does not report the action result.
+Each press of **Make top priority** starts a new action.
+The List prepares the request ID, recipient, words, and delivery key before it changes priority.
+The staff writer saves the request proof and the priority in one write.
+The List uses the proof to release the prepared words for delivery.
+Recovery uses the same proof after a restart and preserves later priority changes.
+If the request did not apply, the staff writer saves a refusal under the same lock.
+The refusal prevents a delayed copy of the request from changing priority.
+A status check with a missing receipt leaves the result unknown.
+An explicit **Retry words** can prepare a missing request under the List lock and ask the staff writer to refuse it.
+If the original POST saves before Retry acquires the lock, Retry uses the saved words.
+A Retry that finds the List lock busy keeps the request unresolved.
+The server reports the final result with the request ID.
+The browser retains unresolved requests across reloads.
+The browser removes each request after confirmed delivery or a final refusal.
 **Retry words** uses the saved recipient, text, and delivery key.
 Each retry button shows the saved words and the recipients for that delivery.
 The retry leaves the current priority and any newer draft edits in place.
-The sender retries pending records at startup.
+The sender retries pending records and unconfirmed Park words at startup.
 Existing notices use their usual delivery and alert rules.
 The writer refuses a saved ID with a different action or different words.
 After an unconfirmed directory sync, the writer checks the stored record under the same lock.
@@ -2278,11 +2294,11 @@ When the item opens after a reload, the page reads the saved delivery and shows 
 It also sends to any recipient whose original send failed.
 The retry preserves the closed ask and the next-step notice state for each accepted send.
 
-At server start, the server sends each Go that has an unsent recipient again, through the same path.
-It sends only to the recipients that the message did not reach.
+At server start, the server retries each Go with an unsent message or unconfirmed words.
+It uses the saved delivery key for each affected recipient.
 It removes each record whose item shows no ask with its go id. When the item read fails, the record stays.
 It does this before the List Tell recovery, so a resend to the producer carries its next-step line in the same message.
-The List Tell recovery does not send a next-step notice whose Go record has its recipient unsent.
+The Go recovery handles its next-step notice when the recipient still has an unsent message or unconfirmed Go words.
 Only the Go path sends that notice, with the Go, also when nate presses Go during the start recovery.
 When the producer is not a Go recipient, the List Tell recovery sends the notice alone.
 

@@ -26,6 +26,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
+from enum import Enum
 from functools import partial
 from pathlib import Path
 from typing import IO, Literal, NotRequired, TypedDict, cast, overload
@@ -188,11 +189,24 @@ def scoped_reply_exchange(command: ScopedReplyCommand) -> str:
     return command.get("exchange", command.get("token_sha256", ""))
 
 
+class ReviewMarkReadProof(TypedDict):
+    """Find the native record that must hold the delivery key."""
+
+    path: str
+
+
+class ReviewMessageSaveState(Enum):
+    SAVED = "saved"
+    NOT_SAVED = "not saved"
+    UNKNOWN = "unknown"
+
+
 class ReviewActionFeedback(TypedDict):
     """Keep the result of an action while its words await confirmation."""
 
     answer: str
     delivered: bool
+    mark_read: NotRequired[ReviewMarkReadProof]
 
 
 class StoredReviewMessage(TypedDict):
@@ -1398,6 +1412,24 @@ class DeliveryStatus:
         except FileNotFoundError:
             return False
         return receipt == intent.attempt
+
+    def review_save_state(self, page: ReviewMessagePage, row: str, intent: DeliveryIntent) -> ReviewMessageSaveState:
+        """Check the receipt or the delivery key in the native Mark read log."""
+        if page.saved["saved"] or self.has_review_save_receipt(page, row, intent):
+            return ReviewMessageSaveState.SAVED
+        feedback = page.saved.get("action_feedback")
+        proof = feedback.get("mark_read") if feedback is not None else None
+        if proof is None:
+            return ReviewMessageSaveState.UNKNOWN
+        try:
+            record = investigation.read_review_record(Path(proof["path"]))
+        except FileNotFoundError:
+            return ReviewMessageSaveState.NOT_SAVED
+        key = review_delivery_key(page.review_list, row, intent.attempt)
+        if record.state is investigation.InvestigationState.READ and any(
+                event.feedback_request_id == key for event in record.log):
+            return ReviewMessageSaveState.SAVED
+        return ReviewMessageSaveState.NOT_SAVED
 
     def failed_delivery(self, page: ReviewPage, row: str) -> FailedDelivery | NoFailedDelivery:
         """Read a failure unless an earlier send may have reached the owner."""
@@ -3368,7 +3400,11 @@ def recover_review_messages(status: DeliveryStatus) -> None:
                         continue
                     if not isinstance(slots.verdict, DeliveryIntent):
                         continue
-                    if not status.has_review_save_receipt(page, row, slots.verdict):
+                    save_state = status.review_save_state(page, row, slots.verdict)
+                    if save_state is ReviewMessageSaveState.NOT_SAVED:
+                        status.clear_locked(page, row, slots, 'verdict')
+                        continue
+                    if save_state is ReviewMessageSaveState.UNKNOWN:
                         print(f'review-links recovery {path.name}: review save state unknown; message kept',
                               file=sys.stderr)
                         continue

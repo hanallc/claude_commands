@@ -2651,11 +2651,33 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.browser_failure(400, str(error), error)
             return
         except OSError as error:
-            self.browser_failure(503, "The List request could not be saved. Try again.", error)
+            if fields.get("action") == ["top"] and any(words.strip() for words in fields.get("words", ())):
+                print(f"review-links priority words save: {error}", file=sys.stderr)
+                self.json_response(503, {"priority_outcome": "unknown",
+                                         "reason": "The server has not confirmed the priority save."})
+            else:
+                self.browser_failure(503, "The List request could not be saved. Try again.", error)
             return
         saved_fields: dict[str, object] = {"detail_unavailable": True} if current is None else dict(current)
         if fixture:
             self.json_response(200, {"state": "saved", "delivery_pending": False, **saved_fields})
+            return
+        if isinstance(submission, list_page.RefusedPriorityWords):
+            self.json_response(409, {"priority_outcome": submission.value, "priority_request": fields["request"][0],
+                                     "reason": "The priority request did not save."})
+            return
+        if isinstance(submission, list_page.PriorityWordsDelivery):
+            with server.item_delivery(submission.send_pending) as check:
+                try:
+                    self.json_response(200, {"state": "saved", "delivery_pending": False, **saved_fields,
+                                             "priority_outcome": submission.outcome, "priority_request": fields["request"][0],
+                                             "words_receipt": True, "delivery": check})
+                finally:
+                    if submission.send_pending:
+                        try:
+                            list_page.deliver(submission)
+                        except OSError as error:
+                            print(f"review-links priority words delivery: {error}", file=sys.stderr)
             return
         action = fields["action"][0]
         original = submission.action if isinstance(submission, list_page.ListActionWithWords) else submission
@@ -2668,8 +2690,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         reply = {"state": state, "delivery_pending": pending, **saved_fields}
         if isinstance(submission, list_page.ListActionWithWords):
             reply["words_receipt"] = True
-            if submission.action_result_unknown:
-                reply.update(state="unknown", action_result_unknown=True)
         if current is not None and isinstance(original, list_page.ListUnparkSubmission):
             reply["unpark_outcome"] = original.response_outcome(current).value
         if self.headers.get(send_hold.REPLAY_HEADER) == "1" or repair_feedback:
@@ -2685,8 +2705,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                  if isinstance(outcome, change_page.DeliveryConfirmed)
                                  else list_page.NotFixedReceiptState.ACCEPTED)
                 reply["not_fixed_receipt"] = list_page.NotFixedReceipt(request=delivery.request, state=receipt_state)
-            more = (isinstance(submission, list_page.ListActionWithWords)
-                    and not submission.action_result_unknown and submission.words != delivery)
+            more = isinstance(submission, list_page.ListActionWithWords) and submission.words != delivery
             with server.item_delivery(more) as check:
                 if check:
                     reply["delivery"] = check
@@ -2714,13 +2733,30 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if not retry:
             server.await_item_delivery(fields.get("delivery", [""])[0])
         with server.list_store_access():
-            delivery = list_page.action_words_request(server.root, fields)
-            if isinstance(delivery, change_page.NoMessageDelivery):
-                self.json_response(200, {"words_receipt": False, "words_delivery": "absent"})
+            address = list_page.ListActionRequest.read(server.root, fields)
+            unprepared: the_list.UnpreparedPriorityWords | the_list.RefuseUnpreparedPriorityWords = (
+                the_list.UnpreparedPriorityWords.KEEP_UNKNOWN)
+            if retry and fields.get("priority-words") == ["1"]:
+                words = new_item_dialog.optional_feedback(fields.get("words", [""])[0])
+                if words:
+                    unprepared = the_list.RefuseUnpreparedPriorityWords(words)
+            notice = address.words_notice(unprepared=unprepared)
+            if not isinstance(notice, the_list.PageFeedback):
+                self.json_response(200, {"words_receipt": False, "words_delivery": "absent", "priority_outcome": "unknown"})
                 return
+            priority = notice.priority
+            if isinstance(priority, the_list.PriorityWordsRequest) and not notice.can_deliver():
+                outcome = "not_saved" if priority.save is the_list.PriorityWordsSave.NOT_SAVED else "unknown"
+                self.json_response(200, {"words_receipt": False, "words_delivery": "absent",
+                                         "priority_outcome": outcome, "priority_request": fields["request"][0]})
+                return
+            delivery = list_page.ListFeedbackDelivery(address.keeper, address.identity, notice.request)
             outcome = (list_page.deliver_with_outcome(delivery, retry_words=True) if retry
                        else list_page.words_delivery_status(delivery))
             result = words_delivery_result(outcome)
+            if isinstance(priority, the_list.PriorityWordsRequest):
+                result["priority_outcome"] = "saved"
+                result["priority_request"] = fields["request"][0]
             if not isinstance(outcome, change_page.DeliveryConfirmed):
                 item = the_list.load(delivery.keeper, delivery.identity)
                 notice = the_list.feedback_requests(item).get(delivery.request)
