@@ -6064,9 +6064,41 @@ class ReviewLinksServerTests(unittest.TestCase):
             send.assert_called_once_with(owner.id, change_page.SENDER, words)
             closed = the_list.load(keeper.id, answered.id)
             self.assertIs(closed.state, the_list.ItemState.CLOSED)
+            self.assertEqual(closed.closing_words, "Read by nate")
             self.assertEqual(the_list.unread_answer_ids(closed), frozenset())
             self.assertEqual(sum(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Closed"
                                  for entry in closed.log), 1)
+
+    def test_studio_question_moves_to_answered_after_unlink(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="layout-owner")
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = replace(case.submission_request(kind, owner.id), page="studio",
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual(created.status, 200, created.body)
+        sent = cast(dict[str, str], json.loads(created.body))
+        key = sent["key"]
+        origin = review_items.submission_origin(cache.get().records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        working, = the_list.records(keeper.id)
+        self.assertIs(working.state, the_list.ItemState.WORKING)
+        question = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE,
+                                               f"submission/question/{request.request_id}")
+        self.assertEqual(working.native_question, question)
+        _ = the_list.unlink(keeper.id, working.id, (key,), source="nate")
+        reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], request.request_id)
+        self.assertTrue(change_page.answer_item(reply, "Use the wide layout.", origin.reply_token, case.status))
+        answered, = the_list.records(keeper.id)
+        self.assertEqual((answered.id, answered.reviews, answered.native_question), (working.id, (), question))
+        self.assertIs(answered.state, the_list.ItemState.ANSWERED)
+        self.assertTrue(the_list.unread_answer_ids(answered))
 
     def working_studio_question(self, keeper: staff.StaffId, owner: staff.StaffId) -> the_list.ListItem:
         key = "submission/question/studio-workflow"
@@ -6084,7 +6116,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         item = self.working_studio_question(keeper.id, keeper.id)
         with self.assertRaisesRegex(the_list.ListError, "Only the asker can close this question"):
             _ = the_list.close(keeper.id, item.id, "Cancel the work.", source="fixture")
-        with self.assertRaisesRegex(the_list.ListError, "Use the question actions"):
+        with self.assertRaisesRegex(the_list.ListError, "You cannot set a question's state directly"):
             _ = the_list.update(keeper.id, item.id, {"state": the_list.ItemState.DONE}, source="fixture")
         prefix, token = list_page.signed_item_request(list_page.ListRecord(keeper.id, item), list_page.form_secret(self.root))
         body = urlencode({"keeper": keeper.id, "id": item.id, "request": prefix, "token": token,
@@ -6094,7 +6126,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
             code, response = self.post(studio_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
         self.assertEqual(code, 400, response)
-        self.assertIn(b"Only the asker can close this question", response)
+        self.assertIn(b"You cannot remove a question.", response)
         self.assertEqual(the_list.load(keeper.id, item.id), item)
 
     def test_question_ask_and_tell_use_their_own_signed_recipients_on_retry(self) -> None:
@@ -6112,7 +6144,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             tell, tell_token = list_page.signed_item_request(entry, secret)
         self.assertIn(b'value="question" disabled>Ask layout-producer</button>', page)
         self.assertIn(b'value="tell" disabled>Tell layout-owner</button>', page)
-        self.assertIn(b'aria-label="Your words about this item"', page)
+        self.assertIn(b'aria-label="Your words"', page)
         _ = the_list.update(keeper.id, item.id, {"producer": keeper.id}, source="fixture")
         common = {"keeper": keeper.id, "id": item.id, "until": ""}
         ask_body = urlencode({**common, "request": ask, "token": ask_token,

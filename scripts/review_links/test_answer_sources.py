@@ -20,6 +20,7 @@ from pathlib import Path
 from threading import Event, current_thread
 from typing import override
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 from scripts.console_text import check as console_text
 from scripts.lib import atomic_file
@@ -932,6 +933,35 @@ class AnswerSourceTests(unittest.TestCase):
                 fields, _ = list_draft.list_records(row.keeper, the_list.ListError).read(item.id)
                 self.assertEqual(fields.get("question_kind"), kind.value if isinstance(kind, the_list.QuestionItemKind)
                                  else None)
+                self.assertEqual(fields.get("question_source_key"), key if isinstance(kind, the_list.QuestionItemKind)
+                                 else None)
+
+    def test_morty_can_close_the_working_question_morty_asked(self) -> None:
+        key = "question/staff/morty.md"
+        exchange = list_exchange.Exchange(list_exchange.Source.STAFF_QUESTION, key, "initial",
+            list_exchange.Direction.QUESTION_TO_NATE, "Which plan?", START, KEEPER.id, list_exchange.Nate.USER,
+            list_exchange.ExchangeAnswer("Plan A.", FIRST_REPLY, list_exchange.AnswerRead.NOT_TRACKED))
+        with the_list.lock_exchange_source(key) as source:
+            row = the_list.file_exchanges(source, (exchange,), exchange.question,
+                linked=the_list.NextNumber.AVAILABLE, owner=KEEPER.id, members=MEMBERS)
+        item = the_list.load(row.keeper, f"L{row.number}")
+        self.assertIs(item.state, the_list.ItemState.WORKING)
+        with (patch.object(staff, "caller_identity", return_value=KEEPER.id),
+              patch.object(console_text, "require"), redirect_stdout(io.StringIO())):
+            self.assertEqual(the_list.main(["close", "--id", item.id, "--words", "Plan A works.",
+                                            "--source", KEEPER.name]), 0)
+        closed = the_list.load(row.keeper, item.id)
+        self.assertIs(closed.state, the_list.ItemState.CLOSED)
+        self.assertEqual(closed.closing_words, "Plan A works.")
+
+    def test_an_ordinary_item_cannot_take_the_answered_state(self) -> None:
+        changes: the_list.ItemChanges = {"state": the_list.ItemState.ANSWERED}
+        with self.assertRaisesRegex(the_list.ListError, "Only a question can be Answered"):
+            _ = the_list.add(KEEPER.id, "Check the plan", owner=OWNER.id, source="nate", changes=changes)
+        item = the_list.add(KEEPER.id, "Check the plan", owner=OWNER.id, source="nate", changes={})
+        with self.assertRaisesRegex(the_list.ListError, "Only a question can be Answered"):
+            _ = the_list.update(KEEPER.id, item.id, changes, source="nate")
+        self.assertEqual(the_list.load(KEEPER.id, item.id), item)
 
     def test_question_migration_uses_the_saved_list_acknowledgment(self) -> None:
         key = "submission/question/acknowledged"
@@ -946,6 +976,7 @@ class AnswerSourceTests(unittest.TestCase):
         with store.locked():
             fields, body = store.read(item.id)
             del fields["question_kind"]
+            del fields["question_source_key"]
             fields["state"] = the_list.ItemState.NEW.value
             body = body.removesuffix("\n").rsplit("\n", 1)[0] + "\n"
             store.write(item.id, fields, body)
@@ -1030,6 +1061,51 @@ class AnswerSourceTests(unittest.TestCase):
             "Closed", {"closing_words": "Closed when questions became items"}))
         self.assertEqual(self.migrate(apply=True)[0], 0)
         self.assertEqual(the_list.load(KEEPER.id, closed.id), closed)
+
+    def test_migration_moves_a_closed_sent_question_with_an_unread_reply_to_answered(self) -> None:
+        key = self.native("closed-linked-question", {"since": FILED, "text": "Choose a plan", "question": "Which plan?",
+            "review_id": "Q1", "review_submission": new_item_dialog.stored_submission(origin("request-1234567890")),
+            "followups": [{"followup": "Which plan?", "reply": "Plan A.", "replied_at": FIRST_REPLY.isoformat()}],
+        })
+        number = the_list.add_review_item(KEEPER.id, "Which plan?", owner=OWNER.id, producer=OWNER.id, unit="",
+            words="Which plan?", evidence="", review_key=key, source="nate via New item",
+            reservation=self.root / "list-number")
+        identity = f"L{number}"
+        closed = the_list.close(KEEPER.id, identity, "The first plan is ready.", source="nate")
+        self.assertIs(closed.state, the_list.ItemState.CLOSED)
+        inventory = answer_sources.read_exchanges(self.review, members=MEMBERS)
+        exchanges = tuple(list_exchange.FiledExchange.from_exchange(exchange) for exchange in inventory.exchanges)
+        self.assertTrue(exchanges)
+        projected = the_list.project_question_migration(closed, exchanges)
+        self.assertIs(projected.state, the_list.ItemState.ANSWERED)
+        self.assertEqual(the_list.load(KEEPER.id, identity), closed)
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        saved = the_list.load(KEEPER.id, identity)
+        self.assertIs(saved.state, the_list.ItemState.ANSWERED)
+        self.assertEqual(saved.native_question, projected.native_question)
+        self.assertEqual(the_list.unread_answer_ids(saved), the_list.unread_answer_ids(projected))
+        self.assertTrue(the_list.unread_answer_ids(saved))
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        self.assertEqual(the_list.load(KEEPER.id, identity), saved)
+
+    def test_migration_uses_the_original_request_for_a_legacy_list_question(self) -> None:
+        request = f"r6-{'1' * 32}-question-{OWNER.id}"
+        key = self.native("legacy-list-question", {"since": FILED, "text": "Choose a plan", "question": "Which plan?",
+            "review_id": "Q1", "review_submission": new_item_dialog.stored_submission(origin(request)),
+            "followups": [{"followup": "Which plan?", "reply": "Plan A.", "replied_at": FIRST_REPLY.isoformat()}],
+            "review_log": encode((ReviewLog(READ, "nate", "read"),)),
+        })
+        address = new_item_dialog.submission_key(new_item_dialog.SubmissionKind.QUESTION, OWNER.id, "Q1", request)
+        evidence = "/console/review.html?show=all#" + urlencode({"show": "open", "jump": address})
+        item = the_list.add(KEEPER.id, "Which plan?", owner=OWNER.id, source=the_list.PAGE_SOURCE,
+                            changes={"state": the_list.ItemState.WORKING, "evidence": evidence})
+        _ = the_list.link(KEEPER.id, item.id, (key,), source=the_list.PAGE_SOURCE)
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        saved = the_list.load(KEEPER.id, item.id)
+        self.assertEqual(saved.native_question, the_list.NativeQuestionItem(
+            the_list.QuestionItemKind.FROM_NATE, f"submission/question/{request}"))
+        self.assertIs(saved.state, the_list.ItemState.CLOSED)
+        self.assertFalse(the_list.unread_answer_ids(saved))
 
     def test_studio_followup_reply_moves_the_question_to_answers(self) -> None:
         key = "question/staff/asked.md"

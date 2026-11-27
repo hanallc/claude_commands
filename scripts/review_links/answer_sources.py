@@ -1785,7 +1785,7 @@ def migrate(inventory: ExchangeInventory, members: staff.StaffSnapshot, *, apply
     if apply:
         for entry in list_page.records(include_closed=True):
             item = entry.item
-            if item.question_kind is the_list.NoQuestionItem.ORDINARY and the_list.question_item_exchanges(item):
+            if the_list.project_question_migration(item) != item:
                 try:
                     the_list.migrate_question_item(entry.keeper, item.id)
                 except (OSError, ValueError) as error:

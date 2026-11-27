@@ -2414,25 +2414,27 @@ Closed staff questions without a saved answer stay outside the migration.
 
 #### Question items in the Studio
 
-The List saves a question kind for each item created by a native question.
+The List saves the question kind and native source key on a question item.
 Replies on Changes, Bugs, and Investigations keep the ordinary List workflow.
 A question to Nate starts in **Waiting for nate** and appears under **Questions**.
 **Answer question** opens the answer window in the item.
 After Nate answers, the item shows **Working** until the asker closes it.
-The asker can use `the_list close` on that question.
+The asker can use `the_list close` while that question is **Working**.
 A question Nate sends from **New item** starts in **Working**.
-The recipient's reply or a reply to **Ask question** changes the item to **Answered**.
-The item appears under **Answers** with an unread mark.
-**Mark read** sends any words beside the button to the question owner.
-It closes Nate's own question or returns a question to Nate to **Working**.
+An unread reply changes a **Working** question item to **Answered**.
+The **Answers** filter includes parked **Answered** items.
+An **Answered** item shows the words box and **Mark read** even when another question awaits a reply.
+**Mark read** saves any words beside the button for delivery to the question owner.
+It closes Nate's own question with “Read by nate” or returns a question to Nate to **Working**.
 **Tell** sends to the question owner. **Ask question** sends to the recipient named in the form.
 When the recipients differ, each button names its recipient.
 The browser keeps those words until it receives confirmation of the save.
 The saved request keeps one delivery record so a retry sends the same words only once.
-The List checks each question transition under the write lock and adds one state entry.
+The List checks question state changes when it saves the item.
 The Studio uses the same row and **Working** badge for questions and other work.
 
-Migration keeps open questions waiting for Nate and Nate's questions with an unread answer.
+Migration keeps open questions waiting for Nate.
+It moves Nate's questions with an unread reply to **Answered**, including a closed question.
 It closes questions Nate already answered and logs “Closed when questions became items”.
 Migration uses the saved List acknowledgment to keep old answers read.
 
@@ -2487,7 +2489,7 @@ A retry keeps the saved answer entry and its read state.
 Old bindings keep their encoded form for receipt checks.
 Migration rewrites verified bindings in place and issues receipts after the new List data is durable.
 An unverified Investigation binding remains visible in Review and requires a separate repair.
-Review hides a sent question filed from a List item when its answer is durable in that item's log.
+Review checks the linked destination and the matching answer in the List log when the receipt is missing.
 Review requires a confirmed receipt for every other handoff.
 Review reads the List file without taking the writer lock.
 A failed pending exchange read leaves that card in Review.
