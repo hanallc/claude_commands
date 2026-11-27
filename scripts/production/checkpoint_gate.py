@@ -12,14 +12,16 @@ from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
-from itertools import pairwise, takewhile
+from itertools import takewhile
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
 from scripts.build_queue.first_step import FirstStepRefused, gate_targets
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import GATE_PRELAUNCH_REFUSED_STATUS, GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS, command_program
+from scripts.lib.build_steps import (
+    GATE_PRELAUNCH_REFUSED_STATUS, GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS, command_program, parse_command_program,
+)
 from scripts.lib.cargo_target_config import cargo_home_folder, cargo_workspace_manifest
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.suite_runners import SUITE_MODULE
@@ -238,9 +240,8 @@ GATE_GREEN_ALONE = re.compile(r"^--- (\S+) passed on rerun alone; first run exit
 
 
 def runs_merge_gate(command: Sequence[str]) -> bool:
-    return (any(Path(word).name in GATE_SCRIPTS for word in command)
-            or ("-m", SUITE_MODULE) in pairwise(command)
-            or f"-m{SUITE_MODULE}" in command)
+    program = parse_command_program(command[gate_program_start(command):], module_name=SUITE_MODULE)
+    return isinstance(program, tuple) and program[0] in GATE_SCRIPTS
 
 
 def red_names(command: Sequence[str], output: str) -> frozenset[str]:

@@ -249,7 +249,7 @@ Each local Promote checkout must exist before the command pushes.
 For an enrolled production, use the exact staff document for live policy.
 The showrunner starts in the main checkout from `Repository`.
 The serving merge unit publishes from the integration worktree on `Merge branch`.
-Run the enrolled production's integrate jobs in item 143 test copies.
+Run the enrolled production's merge tests in item 143 test copies.
 Resolve the live LOG relative to the main checkout.
 Removal tools protect both checkouts and their branches.
 Sync refuses incoming paths that overlap the live document, LOG, or notes.

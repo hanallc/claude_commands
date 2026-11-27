@@ -30,6 +30,26 @@ TRANSFER_MARKER = 'fixture-transfer-query-marker'
 
 
 class GateBoxTests(unittest.TestCase):
+    def test_old_candidate_reads_both_wire_modes_from_its_commit(self) -> None:
+        repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = gate.checked_git(repo, 'init', '-q')
+        runner = repo / 'scripts/production/merge_gate.py'
+        runner.parent.mkdir(parents=True)
+        _ = runner.write_text('''from enum import Enum
+
+class SuiteMode(Enum):
+    MERGE_GATE = "merge-gate"
+    TARGETED_TEST = "targeted-test"
+''')
+        _ = gate.checked_git(repo, 'add', '.')
+        _ = gate.checked_git(repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+                             'commit', '-qm', 'Add the old gate layout')
+        candidate = gate.checked_git(repo, 'rev-parse', 'HEAD')
+        runner.unlink()
+        for mode in gate.SuiteMode:
+            with self.subTest(mode=mode):
+                self.assertTrue(cloud_gate.accepts_suite_mode(repo, candidate, mode))
+
     def test_paired_guest_uploads_warm_up_round_and_finish_stages_in_run_order(self) -> None:
         fixture = trial_tests.PairedTrialTests()
         self.addCleanup(fixture.doCleanups)

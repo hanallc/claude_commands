@@ -71,6 +71,27 @@ def run_gate_step(case: unittest.TestCase, argv: list[str]) -> subprocess.Comple
 
 
 class CheckpointGateTests(unittest.TestCase):
+    def test_gate_names_select_the_parser_only_at_the_command_position(self) -> None:
+        output = "    FAIL [  0.1s] (1/1) bin checks::failed\n--- lib/test_gate.py exit=1 ---\n"
+        for command in (
+            ["python3", "other.py", "-m", "scripts.production.gate"],
+            ["python3", "other.py", "-mscripts.production.gate"],
+            ["python3", "other.py", "scripts/production/gate.py"],
+            ["python3", "-m", "other.gate"],
+            ["python3", "--", "-m", "scripts.production.gate"],
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(checkpoint_gate.red_names(command, output), frozenset({"checks::failed"}))
+                self.assertEqual(checkpoint_gate.only_tests(command, frozenset({"checks::failed"})),
+                                 [*command, "-E", "test(=checks::failed)"])
+        for command in (
+            ["env", "HOME=/fixture", "python3", "scripts/production/gate.py"],
+            ["python3", "-B", "-m", "scripts.production.gate"],
+            ["python3", "-Bmscripts.production.gate"],
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(checkpoint_gate.red_names(command, output), frozenset({"lib/test_gate.py"}))
+
     def test_merge_gate_uses_the_committed_copy_for_the_initial_run_and_flake_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary).resolve()

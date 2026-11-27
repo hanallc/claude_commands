@@ -124,5 +124,5 @@ List item 180 (producer morty). Design: `/session/postmaster/run/1965ff92-8600-4
 **Files:** `scripts/notify/review.py`, `scripts/notify/test_review.py`, `scripts/notify/text_asks.py` (new), `scripts/notify/test_text_asks.py` (new), `scripts/herdr/herdr.py` and its test module, `scripts/lib/script_prompts.py` and its test module (only if needed), `config/notify.conf`, `docs/as-built/message-clarity.md`.
 
 **Acceptance gate:**
-- `targeted_test.py --repo <worktree>` passes, except a red that also fails on the base commit.
+- Run `gate.py --affected --repo <worktree>`. A failure is acceptable if it also fails on the base commit.
 - basedpyright reports zero errors, zero warnings and zero notes on each changed Python file.

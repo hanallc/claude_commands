@@ -162,10 +162,12 @@ VALUE_OPTIONS = frozenset("XW")
 LONG_VALUE_OPTIONS = frozenset({"--check-hash-based-pycs", "--init-file", "--rcfile"})
 
 
-def parse_command_program(argv: Sequence[str], *, keep_path: bool = False) -> tuple[str, Sequence[str]] | OtherCommand:
+def parse_command_program(argv: Sequence[str], *, keep_path: bool = False,
+                          module_name: str | None = None) -> tuple[str, Sequence[str]] | OtherCommand:
     """Return the program name and arguments after Python or shell interpreter options.
 
     Return OtherCommand for inline code, standard input, or a missing program.
+    If module_name is set, accept only that Python module at the -m position.
     """
     index = 0
     while index < len(argv):
@@ -178,6 +180,8 @@ def parse_command_program(argv: Sequence[str], *, keep_path: bool = False) -> tu
             index += 1
             if option == "-":
                 return OTHER_COMMAND
+            if option == "--":
+                break
             if option.startswith("--"):
                 index += 1 if option in LONG_VALUE_OPTIONS else 0
                 continue
@@ -187,7 +191,8 @@ def parse_command_program(argv: Sequence[str], *, keep_path: bool = False) -> tu
                     return OTHER_COMMAND
                 if flag == "m":
                     module = rest or (argv[index] if index < len(argv) else "")
-                    if not module or keep_path:
+                    if not module or keep_path or (module_name is not None
+                                                   and (module != module_name or name in {"bash", "sh"})):
                         return OTHER_COMMAND
                     return module.rsplit(".", 1)[-1] + ".py", argv[index + (0 if rest else 1):]
                 if flag in VALUE_OPTIONS:
