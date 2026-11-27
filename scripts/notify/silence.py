@@ -5,16 +5,15 @@ Silence keeps ordinary pushes. Priority 2 pushes and pushes with --through-silen
 `off` ends silence and posts
 the kept pushes, oldest first, as they would have gone out, and prints how many. A kept push
 with the same non-empty key from the same source replaces the older kept one, so `off` posts
-only the newest. `on` with no end lasts until `off`; --until (a time in the user's zone,
+only the newest for each Question opening or for pushes without a Question reference.
+`on` with no end lasts until `off`; --until (a time in the user's zone,
 user_zone.py) or --for (a span: 1h, 45min, 1h30min) makes a transient systemd user timer that
 runs `off --timer UNIT` then, ending only the silence that still names it. `on` again replaces the
 end. If the end passes without the timer (natedev was off), the next push or silence.py call ends
 silence as `off` does.
 
-`drop --source S --key K` removes the kept pushes with that source and non-empty key, by the rule
-that makes a newer kept push replace an older one, and prints how many it removed. `send.py retire
---to user` runs it: a retired alert, such as the alert of a fixed rca.py case, never goes out at
-silence end.
+`drop --source S --key K` removes kept pushes without a Question reference for that source and key.
+It prints the number of pushes it removed. `send.py retire --to user` calls it to remove obsolete alerts.
 
 auto_silence.py turns silence on with the auto marker when the user is idle, and ends only that
 silence when they come back; `on` replaces the marker, so a silence set by hand stays until `off`.
@@ -49,6 +48,7 @@ from pathlib import Path
 from typing import NotRequired, Protocol, TypedDict, cast
 
 from scripts.lib import operation_deadline
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone, zone_label  # noqa: E402
 from scripts.notify import push_reference
 
@@ -80,6 +80,7 @@ class SilencePolicy(str, Enum):
 
 
 class KeptPush(TypedDict):
+    post_started: NotRequired[bool]
     silence_policy: NotRequired[SilencePolicy]
     reference: NotRequired[push_reference.PushReference]
     due: NotRequired[str]
@@ -178,7 +179,8 @@ def parse_push(text: str) -> KeptPush | None:
         return None
     record = cast(dict[str, object], value)
     # A line kept before pushes had a key or a text id reads as key "" and text id "" (free text).
-    found = {name: record.get(name) for name in KeptPush.__annotations__ if name not in {"due", "need", "reference", "silence_policy"}} | {
+    found = {name: record.get(name) for name in KeptPush.__annotations__
+             if name not in {"due", "need", "reference", "silence_policy", "post_started"}} | {
         "key": record.get("key", ""), "text_id": record.get("text_id", "")}
     for name in ("due", "need"):
         if name in record:
@@ -190,6 +192,11 @@ def parse_push(text: str) -> KeptPush | None:
     except ValueError:
         return None
     result = cast(KeptPush, cast(object, found))
+    if "post_started" in record:
+        started = record["post_started"]
+        if not isinstance(started, bool):
+            return None
+        result["post_started"] = started
     if "silence_policy" in record:
         policy = record["silence_policy"]
         if not isinstance(policy, str):
@@ -263,32 +270,50 @@ def keep_locked(push: KeptPush) -> Kept | NotSilent:
     record = read_state()
     if record is None or past_end(record):
         return NotSilent()
-    _ = drop_locked(push["source"], push["key"])
+    _ = drop_locked(push["source"], push["key"], push.get("reference", push_reference.NO_REFERENCE),
+                    pending_only=True)
     with kept_file().open("a", encoding="utf-8") as out:
         _ = out.write(json.dumps(push) + "\n")
     return Kept(ends(record))
 
 
 def drop_here(source: str, key: str) -> int:
-    """Remove the kept pushes with this source and key, as a newer kept push replaces them; how many."""
+    """Remove kept pushes without a Question reference for this source and key."""
     if not key:
         return 0
     with locked():
         return drop_locked(source, key)
 
 
-def drop_locked(source: str, key: str, reference: push_reference.QuestionReference | None = None) -> int:
+def drop_locked(source: str, key: str, reference: push_reference.PushReference = push_reference.NO_REFERENCE, *,
+                pending_only: bool = False) -> int:
     """Drop matching kept pushes while the caller holds the silence lock."""
-    if not key and reference is None:
+    if not key and (pending_only or reference["kind"] == "none"):
         return 0
-    kept = read_kept(strict=reference is not None)
+    kept = read_kept(strict=reference["kind"] == "question")
     left = [push for push in kept if (push["source"], push["key"]) != (source, key)
-            or reference is not None and push.get("reference") != reference]
+            or push.get("reference", push_reference.NO_REFERENCE) != reference
+            or (pending_only and push.get("post_started", False))]
     if len(left) != len(kept):
-        temporary = kept_file().with_suffix(".tmp")
-        _ = temporary.write_text("".join(json.dumps(push) + "\n" for push in left), encoding="utf-8")
-        _ = temporary.replace(kept_file())
+        write_kept(left)
     return len(kept) - len(left)
+
+
+def write_kept(kept: list[KeptPush]) -> None:
+    if kept:
+        write_text_atomic(kept_file(), "".join(json.dumps(push) + "\n" for push in kept))
+    else:
+        kept_file().unlink(missing_ok=True)
+
+
+def mark_post_started(push: KeptPush) -> None:
+    """Save the attempt before transport while the caller holds the silence lock."""
+    kept = read_kept(strict=True)
+    if push.get("post_started", False) or push not in kept:
+        raise OSError("silence: kept push is no longer pending")
+    kept[kept.index(push)]["post_started"] = True
+    write_kept(kept)
+    push["post_started"] = True
 
 
 def ask(argv: Sequence[str], text: str) -> tuple[int, str]:
@@ -301,7 +326,7 @@ class RemoteDropFailed(OSError):
 
 
 def drop(source: str, key: str, system: str | None = None, asker: Ask = ask) -> int:
-    """Remove the kept pushes with this source and key; how many. On the Mac natedev removes them."""
+    """Remove kept pushes without a Question reference on the notification owner."""
     if not on_mac(system):
         return drop_here(source, key)
     try:
@@ -384,10 +409,10 @@ def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, del
         if only_if_off and read_state() is not None:
             return 0
         pending = read_kept()
-        for push in kept:
-            # Another release may already have posted this push since claim read it.
-            if push not in pending:
+        for claimed in kept:
+            if claimed.get("post_started", False) or claimed not in pending:
                 continue
+            push = pending[pending.index(claimed)]
             try:
                 code = deliver(push)
             except Exception:
@@ -402,9 +427,7 @@ def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, del
             else:
                 delivered += 1
             pending.remove(push)
-            temporary = kept_file().with_suffix(".tmp")
-            _ = temporary.write_text("".join(json.dumps(left) + "\n" for left in pending), encoding="utf-8")
-            _ = temporary.replace(kept_file())
+            write_kept(pending)
         if not pending:
             kept_file().unlink(missing_ok=True)
         if record is not None and record["auto"]:
@@ -444,7 +467,8 @@ def end_if_past(runner: Run | None = None, deliver: Deliver | None = None) -> in
     record, kept = claimed
     if record is not None:
         return release(record, kept, runner or run, deliver or post_kept, "silence ended at its end time")
-    questions = [push for push in kept if push.get("reference", push_reference.NO_REFERENCE)["kind"] == "question"]
+    questions = [push for push in kept if not push.get("post_started", False)
+                 and push.get("reference", push_reference.NO_REFERENCE)["kind"] == "question"]
     if not questions:
         return 0
     return release(None, questions, runner or run, deliver or post_kept, "silence release retried", only_if_off=True)
@@ -452,12 +476,16 @@ def end_if_past(runner: Run | None = None, deliver: Deliver | None = None) -> in
 
 def status() -> int:
     record = read_state()
-    count = len(read_kept())
+    kept = read_kept()
+    unconfirmed = sum(push.get("post_started", False) for push in kept)
+    count = len(kept) - unconfirmed
     plural = "" if count == 1 else "es"
+    attempts = f"; {unconfirmed} unconfirmed" if unconfirmed else ""
     if record is None:
-        print("silence off" + (f"; {count} kept push{plural} not yet delivered: run off" if count else ""))
+        print("silence off" + (f"; {count} kept push{plural} not yet delivered: run off" if count else "") + attempts)
     else:
-        print(f"silence on from {shown(datetime.fromisoformat(record['since']))} {ends(record)}; {count} push{plural} kept")
+        print(f"silence on from {shown(datetime.fromisoformat(record['since']))} {ends(record)}; {count} push{plural} kept"
+              + attempts)
     return 0
 
 
@@ -481,7 +509,7 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
     stop = commands.add_parser("off", help="end silence and post the kept pushes")
     _ = stop.add_argument("--timer", default="", help="end only the silence that names this timer")
     _ = commands.add_parser("status", help="say whether silence is on")
-    dropping = commands.add_parser("drop", help="send.py retire: remove the kept pushes with this source and key")
+    dropping = commands.add_parser("drop", help="remove matching kept pushes without a Question reference")
     _ = dropping.add_argument("--source", required=True)
     _ = dropping.add_argument("--key", required=True)
     options = parser.parse_args(arguments)

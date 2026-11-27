@@ -555,6 +555,75 @@ class PushoverTests(unittest.TestCase):
         post.assert_called_once()
         self.assertEqual(silence.read_kept(), [])
 
+    def test_unbound_clear_check_preserves_question_copies_with_the_same_key(self) -> None:
+        path = self.keys.parent / "question.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        push: silence.KeptPush = {"source": "drawer", "key": "same key", "priority": "1", "title": "Choose",
+            "message": "Details", "detail": "", "text_id": "decision.choices", "reference": reference}
+        unbound: silence.KeptPush = {**push, "reference": push_reference.NO_REFERENCE}
+        other_opening: silence.KeptPush = {**push, "reference": {**reference, "since": "earlier"}}
+        queue = send.queue_path(send.USER)
+        queue.parent.mkdir(parents=True)
+        row = {"time": "now", "from": push["source"], "to": send.USER, "key": push["key"],
+               "summary": "", "text": "Details", "reason": "fixture"}
+        bound_row = {**row, "reference": reference}
+        self.silence_on()
+
+        def channel(argv: list[str], _stdin: str, _timeout: float) -> tuple[int, str, str]:
+            if argv[0] == "ssh":
+                with redirect_stdout(io.StringIO()) as output:
+                    code = send.main(shlex.split(argv[-1].removeprefix(send.REMOTE + " ")))
+                return code, output.getvalue(), ""
+            self.assertEqual(argv[1:], [str(send.USER_CHANNEL), "cancel", "--exact-tag-key", "--source",
+                                        push["source"], push["key"]])
+            return 0, "pushover: cancelled\n", ""
+
+        for host in (send.machine(), "other-host"):
+            with self.subTest(host=host), mock.patch.object(send, "run", side_effect=channel):
+                _ = silence.kept_file().write_text("".join(json.dumps(item) + "\n"
+                    for item in (push, other_opening, unbound)))
+                _ = queue.write_text("".join(json.dumps(item) + "\n" for item in (bound_row, row)))
+                at = send.now()
+                send.record_emergency(send.Emergency(key=push["key"], sender=push["source"], check="true",
+                    machine=host, sent=at.isoformat(), expires=(at + send.emergency_lifetime()).isoformat()))
+                self.assertEqual(send.clear_check()[0], 0)
+                self.assertEqual(send.read_emergencies(), [])
+                self.assertEqual(silence.read_kept(), [push, other_opening])
+                self.assertEqual(send.read_queue(queue), [bound_row])
+        self.assertIsInstance(silence.keep_here(unbound), silence.Kept)
+        self.assertEqual(silence.read_kept(), [push, other_opening, unbound])
+
+    def test_kept_question_post_stays_saved_without_a_retry_after_timeout(self) -> None:
+        path = self.keys.parent / "question.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        push: silence.KeptPush = {"source": "drawer", "key": "question key", "priority": "1", "title": "Choose",
+            "message": "Details", "detail": "", "text_id": "decision.choices", "reference": reference}
+        self.silence_on()
+        accepted: list[bytes] = []
+
+        def post(url: str, data: bytes) -> tuple[int, bytes]:
+            self.assertEqual(url, pushover.API_URL)
+            accepted.append(data)
+            if len(accepted) == 1:
+                raise TimeoutError("reply lost after acceptance")
+            return 200, b'{"status":1}'
+
+        def deliver(kept: silence.KeptPush) -> int:
+            return pushover.post_kept(kept, self.keys, post)
+
+        self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+        with redirect_stdout(io.StringIO()), mock.patch.object(silence, "post_kept", side_effect=deliver):
+            self.assertEqual(silence.off(lambda _argv: 0), 1)
+            self.assertEqual(send.main(["question-push-release"]), 0)
+            self.assertEqual(silence.off(lambda _argv: 0), 0)
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(silence.read_kept(), [{**push, "post_started": True}])
+        self.assertEqual(self.log_lines()[-1]["outcome"], "kept push post unconfirmed")
+        self.assertEqual(send.retire_recorded_question(push["source"], push["key"], reference)[0], 0)
+        self.assertEqual(silence.read_kept(), [])
+
     def test_question_drain_counts_inventory_time_against_the_budget(self) -> None:
         path = self.keys.parent / "question.md"
         _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
