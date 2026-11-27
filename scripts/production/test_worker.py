@@ -32,7 +32,7 @@ from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import detached_run_process, detached_runs, restart_support, shutdown, stop_resume, worker_lifecycle
 from scripts.agents import pane_record
 from scripts.agents.test_support import write_machine_config
-from scripts.astra import astra_roles
+from scripts.astra import astra_roles, design_roles
 from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts
 from scripts.buildlog import treekey
@@ -2364,6 +2364,36 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("run is not owned by", errors.getvalue())
         self.assertEqual(self.fixture.world.launches, [])
         self.assertEqual(self.agent.submitted, [])
+
+    def test_durable_launch_refuses_a_run_owned_by_another_parent(self) -> None:
+        parent = self.fixture.parent
+        foreign = staff.snapshot().parent_of(parent)
+        assert foreign is not None
+        run = self.run_dir.with_name("foreign-review")
+        run.mkdir()
+        state = unit_runs.read_run_fields(self.run_dir)
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({**state, unit_runs.OWNER_FIELD: foreign.id}))
+        target = worker_panes.DurableDesignRole(parent.id, staff.WorkerName.parse("held-reviewer"), "astra-reviewer")
+
+        with patch.dict(os.environ, {design_roles.DURABLE_ROLE_LAUNCH_RUN_ENV: str(run)}):
+            result = worker.launch(target, worker_panes.launch_policy(target.role))
+
+        self.assertEqual(result, worker_panes.AdmissionRefused(f"{run}: the run is not owned by {parent.id}"))
+        self.assertEqual(self.fixture.world.launches, [])
+
+    def test_durable_launch_refuses_an_ended_run(self) -> None:
+        parent = self.fixture.parent
+        run = self.run_dir.with_name("ended-review")
+        run.mkdir()
+        state = unit_runs.read_run_fields(self.run_dir)
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({**state, "status": "completed", "finished_at": 1}))
+        target = worker_panes.DurableDesignRole(parent.id, staff.WorkerName.parse("held-reviewer"), "astra-reviewer")
+
+        with patch.dict(os.environ, {design_roles.DURABLE_ROLE_LAUNCH_RUN_ENV: str(run)}):
+            result = worker.launch(target, worker_panes.launch_policy(target.role))
+
+        self.assertEqual(result, worker_panes.AdmissionRefused(f"{run}: the run has ended dispatch admission"))
+        self.assertEqual(self.fixture.world.launches, [])
 
     def test_explicit_start_keeps_working_worker_on_policy_and_family_changes(self) -> None:
         for family in ("codex", "claude"):

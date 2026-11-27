@@ -46,6 +46,7 @@ ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
 DESIGNER_SANDBOX = 'danger-full-access'
 DURABLE_ROLE_LAUNCH_RUN_ENV = 'UNIT_DURABLE_ROLE_LAUNCH_RUN'
+_REVIEW_RUN_OWNER_FILE = 'review-run-owner'
 
 
 class AstraCensusProjection(Protocol):
@@ -873,12 +874,12 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
         design = replace(current, roles=tuple(replace(value, name=name, lifecycle=RoleNotOpened('pane-start', 'not_started'))
             if value.role == role else value for value in current.roles))
         _save(design)
-    design = _begin_creation(design, role, 'pane-start')
-    run, phase = ((Path(design.binding.run_directory), design.binding.phase) if isinstance(design.binding, DesignBoundToPhase)
-                  else (directory, 'astra-review'))
     parent = staff.snapshot().by_current_session(staff.runtime_id())
     if parent is None or parent.kind not in ('unit', 'showrunner'):
         raise RoleRefused('staff: caller: not opened: caller is not a unit or showrunner')
+    design = _begin_creation(design, role, 'pane-start', parent.id)
+    run, phase = ((Path(design.binding.run_directory), design.binding.phase) if isinstance(design.binding, DesignBoundToPhase)
+                  else (directory, 'astra-review'))
     env = dict(os.environ)
     _ = env.pop(DURABLE_ROLE_LAUNCH_RUN_ENV, None)
     if isinstance(design.binding, DesignUnbound):
@@ -900,16 +901,36 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
     return design
 
 
-def _begin_creation(design: HeldDesign, role: Role, claim: str) -> HeldDesign:
+def _begin_creation(design: HeldDesign, role: Role, claim: str, parent: staff.StaffId) -> HeldDesign:
     """Record an uncertain outcome before the worker command creates a pane."""
     design_id = design.placement.design_id
-    with _lock(design_directory(design_id)):
+    directory = design_directory(design_id)
+    with _lock(directory):
         current = read_design(design_id)
         if current != design or _instance(current, role).lifecycle != RoleNotOpened(claim, 'not_started'):
             raise RoleRefused('RoleNeedsRecovery: thread creation claim changed')
+        if isinstance(current.binding, DesignUnbound):
+            write_text_atomic(directory / _REVIEW_RUN_OWNER_FILE, parent + '\n')
         updated = _set_lifecycle(current, role, RoleNotOpened(claim, 'outcome_unknown'))
         _save(updated)
         return updated
+
+
+def pending_review_run_owner(directory: Path) -> staff.StaffId | unit_runs.RunOwnerUnrecorded:
+    """Read the owner of an unbound review during pane creation."""
+    unrecorded = unit_runs.RunOwnerUnrecorded('no pending review run owner')
+    if directory.parent != state_root().absolute():
+        return unrecorded
+    try:
+        owner = (directory / _REVIEW_RUN_OWNER_FILE).read_text(encoding='utf-8').strip()
+    except FileNotFoundError:
+        return unrecorded
+    design = read_design(directory.name)
+    _check_host(design)
+    if (owner and isinstance(design.binding, DesignUnbound)
+            and _instance(design, 'reviewer').lifecycle == RoleNotOpened('pane-start', 'outcome_unknown')):
+        return staff.StaffId(owner)
+    return unrecorded
 
 
 def recover(instance_id: str) -> HeldDesign:
