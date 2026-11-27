@@ -20,7 +20,7 @@ from threading import Lock
 from typing import NamedTuple, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
-from scripts.lib.file_lock import exclusive
+from scripts.lib.file_lock import LockResult, exclusive
 from scripts.lib import git_files
 from scripts.lib.showrunner_state import state_root as state_root
 from scripts.agents.remote import local_machine
@@ -667,12 +667,21 @@ class LockedRecordNumbers:
 
 
 @contextmanager
-def record_numbers(kind: RecordKind, read_id: Callable[[Path], str]) -> Generator[LockedRecordNumbers]:
-    """Hold one sequence lock across its checks and native publication."""
+def record_number_lock(kind: RecordKind, *, wait: bool = True) -> Generator[None]:
+    """Hold the publication lock for a record kind."""
     path = _sequence_path(kind)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with exclusive(path.with_suffix(".lock")):
-        yield LockedRecordNumbers(kind, read_id, _read_high_water(path))
+    with exclusive(path.with_suffix(".lock"), wait=wait) as result:
+        if result is LockResult.BUSY:
+            raise BlockingIOError(f"{kind} publication is in progress")
+        yield
+
+
+@contextmanager
+def record_numbers(kind: RecordKind, read_id: Callable[[Path], str]) -> Generator[LockedRecordNumbers]:
+    """Hold one sequence lock across its checks and native publication."""
+    with record_number_lock(kind):
+        yield LockedRecordNumbers(kind, read_id, _read_high_water(_sequence_path(kind)))
 
 
 def free_record_path(path: Path, reserved_names: Collection[str] = ()) -> Path:

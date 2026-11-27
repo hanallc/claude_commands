@@ -55,10 +55,9 @@ class RegistrationTests(RegistrationFixture):
 
     def bind_push(self, record: registration.QuestionRecord) -> question_pushes.Binding:
         reference = push_reference.admission_reference("decision.choices", str(record.path))
+        assert reference["kind"] == "question"
         with silence.locked():
-            binding = question_pushes.bind_locked("Override sender", "custom key", reference, emergency=True)
-        assert binding is not None
-        return binding
+            return question_pushes.bind_locked("Override sender", "custom key", reference, emergency=True)
 
     def test_question_push_retirement_follows_terminal_writes(self) -> None:
         self.isolate_pushes()
@@ -122,6 +121,33 @@ class RegistrationTests(RegistrationFixture):
             self.assertEqual(question_pushes.drain(), 0)
             self.assertEqual(question_pushes.drain(), 0)
         self.assertEqual(cancel.call_count, 2)
+
+    def test_question_push_survives_rollback_after_the_notifier_reads(self) -> None:
+        self.isolate_pushes()
+        title = "Choose the layout"
+        _ = self.run_ask(title, "Which layout should we use?")
+        path = self.question_record_path(title)
+        record = registration.read_question_record(path, self.owner_id)
+        binding = self.bind_push(record)
+        binding_file = question_pushes.binding_path(binding.source, binding.key)
+        identities = registration.QuestionStaff.read()
+        scope = registration.question_scope(self.owner_id, identities.record)
+
+        def refuse_list_write() -> None:
+            self.assertIn("\nstatus: closed\n", path.read_text())
+            self.assertEqual(question_pushes.drain(), 0)
+            raise OSError("list write refused")
+
+        with mock.patch.object(send, "cancel_user_push", return_value=(0, "cancelled")) as cancel:
+            with self.assertRaisesRegex(OSError, "list write refused"):
+                registration.store_questions(scope, [], identities, write_list=refuse_list_write)
+            self.assertEqual(push_reference.read_question(path).status, "open")
+            self.assertEqual(question_pushes.read_binding(binding_file), binding)
+            cancel.assert_not_called()
+            registration.store_questions(scope, [], identities)
+            cancel.assert_called_once_with(binding.source, binding.tag_key, exact_tag=True)
+            self.assertEqual(push_reference.read_question(path).status, "closed")
+            self.assertFalse(binding_file.exists())
 
     def test_f079_new_question_keeps_the_answer_at_a_late_collision(self) -> None:
         identities = registration.QuestionStaff.read()

@@ -274,7 +274,7 @@ def drop_here(source: str, key: str) -> int:
 
 def drop_locked(source: str, key: str, reference: push_reference.QuestionReference | None = None) -> int:
     """Drop matching kept pushes while the caller holds the silence lock."""
-    if not key:
+    if not key and reference is None:
         return 0
     kept = read_kept(strict=reference is not None)
     left = [push for push in kept if (push["source"], push["key"]) != (source, key)

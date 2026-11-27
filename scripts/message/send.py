@@ -370,6 +370,7 @@ KeyedMessage = TypedDict(
         "claude_recipient": NotRequired[QueuedClaudeMailbox],
         "send_order": NotRequired[int],
         "once_per_key": NotRequired[bool],
+        "reference": NotRequired[push_reference.PushReference],
     },
 )
 UnkeyedMessage = TypedDict(
@@ -391,6 +392,7 @@ UnkeyedMessage = TypedDict(
         "claude_recipient": NotRequired[QueuedClaudeMailbox],
         "send_order": NotRequired[int],
         "once_per_key": NotRequired[bool],
+        "reference": NotRequired[push_reference.PushReference],
     },
 )
 
@@ -1276,6 +1278,11 @@ def _queued_message(value: object) -> QueuedMessage | None:
             _ = read_sender_stamp(values["sender_native_id"])
         except ValueError:
             return None
+    if "reference" in values:
+        try:
+            values["reference"] = push_reference.read_reference(values["reference"])
+        except ValueError:
+            return None
     if key is None:
         return cast(UnkeyedMessage, cast(object, values))
     if isinstance(key, str):
@@ -1502,7 +1509,7 @@ def remove_queued_key(to: str, key: str, *,
     return removed
 
 
-def retire(to: str, sender: str, key: str, *, exact_sender: bool = False) -> int:
+def retire(to: str, sender: str, key: str, *, reference: push_reference.QuestionReference | None = None) -> int:
     """Remove obsolete messages for the selected queue owner."""
     if to == USER:
         owner, direct = USER, queue_path(USER)
@@ -1540,7 +1547,8 @@ def retire(to: str, sender: str, key: str, *, exact_sender: bool = False) -> int
                 saved = _saved_mailbox_key(entry)
                 legacy_owner = (path == direct and "stable_recipient" not in entry and "claude_recipient" not in entry
                                 and not entry["to"].startswith(("uds:", "session:", "staff:")))
-                matched = (entry["key"] == key and entry["from"] == sender if exact_sender
+                matched = (entry["key"] == key and entry["from"] == sender and entry.get("reference") == reference
+                           if reference is not None
                            else entry["key"] == key or entry["key"] is None and entry["from"] == sender)
                 if (saved == owner or legacy_owner) and matched:
                     removed += 1
@@ -1582,7 +1590,7 @@ def retire_user(sender: str, key: str) -> tuple[int, list[str]]:
 
 def retire_question_copies(binding: question_pushes.Binding) -> str:
     """Drop copies and cancel tagged repeats while the silence lock is held."""
-    removed = retire(USER, binding.source, binding.key, exact_sender=True)
+    removed = retire(USER, binding.source, binding.key, reference=binding.reference)
     dropped = silence.drop_locked(binding.source, binding.key, binding.reference)
     result = f"retired {removed} queued and {dropped} kept copies for {binding.source} / {binding.key}"
     if binding.emergency:
@@ -1685,7 +1693,7 @@ def retire_record(record: Emergency) -> tuple[int, str]:
 
 
 def retire_recorded_question(sender: str, key: str, reference: push_reference.QuestionReference) -> tuple[int, str]:
-    """Apply a passed clear check to its own Question binding."""
+    """Retire copies that belong to the specified Question opening."""
     if not silence.on_mac():
         try:
             return 0, question_pushes.retire_matching(sender, key, reference)
@@ -6426,11 +6434,13 @@ def main(argv: list[str]) -> int:
         case ["question-push-clear", sender, key, encoded]:
             try:
                 reference = push_reference.read_reference(cast(object, json.loads(encoded)))
-                if reference["kind"] == "question":
-                    print(question_pushes.retire_matching(sender, key, reference))
-                    return 0
             except (OSError, ValueError) as error:
                 print(error, file=sys.stderr)
+            else:
+                if reference["kind"] == "question":
+                    code, line = retire_recorded_question(sender, key, reference)
+                    print(line, file=sys.stderr if code else sys.stdout)
+                    return code
             return EXIT["failed"]
         case ["repeat-notices"]:
             repeat_guard.drain(Path(os.environ.get("SEND_REPEAT_STATE", str(STATE / "repeats"))), attempt_repeat_notice, now().timestamp(),
