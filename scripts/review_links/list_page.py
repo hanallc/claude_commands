@@ -2413,8 +2413,9 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
 
 
 DIALOGS = (page_frame.CONSOLE_DIALOG_ASSETS
-           + '<dialog data-list-review-dialog aria-label="Review card">'
-           + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
+           + '<dialog data-list-review-dialog aria-labelledby="list-review-title">'
+           + '<header class="list-review-heading"><h2 id="list-review-title"></h2>'
+           + '<button class="list-review-close" type="button" data-close autofocus>Close</button></header></dialog>'
            + record_table.render_inline_detail())
 
 SCHEDULE_TEMPLATES = """
@@ -2475,19 +2476,24 @@ STYLE = (record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_
          + review_page.SUBMISSION_EVIDENCE_STYLE) + '''
 [data-list-review-dialog]{position:fixed;inset:0;margin:calc(var(--page-window-top,0px) + 16px) auto auto;
 width:min(1060px,calc(100% - 48px));
-max-width:none;max-height:none;padding:0;border:1px solid var(--line);border-radius:12px;
+max-width:none;max-height:calc(100dvh - 32px - var(--page-window-top,0px));padding:0;
+border:1px solid var(--line);border-radius:12px;
 background:var(--card);color:var(--ink);overflow:hidden;box-sizing:border-box}
-[data-list-review-dialog]::backdrop{background:rgb(0 0 0 / 90%);backdrop-filter:blur(3px)}
-.list-review-close{position:absolute;top:24px;right:24px;z-index:1;margin:0;min-height:32px;padding:4px 12px;
+[data-list-review-dialog][open]{display:flex;flex-direction:column}
+[data-list-review-dialog]::backdrop{background:#0007}
+.list-review-heading{display:flex;flex:none;align-items:flex-start;justify-content:space-between;gap:12px;
+padding:12px 24px;border-bottom:1px solid var(--line)}
+.list-review-heading h2{min-width:0;max-height:25dvh;overflow:auto;overflow-wrap:anywhere;
+margin:0;font-size:17px;line-height:32px}
+.list-review-close{flex:none;margin:0;min-height:32px;padding:4px 12px;
 font-size:13px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
 [data-list-review-dialog] iframe{display:block;width:100%;height:var(--review-card-height,15rem);
-max-height:calc(100dvh - 98px - var(--page-window-top,0px));border:0}
+min-height:0;border:0}
 :root:has([data-list-review-dialog][open]){overflow:hidden}
-:root:has([data-list-review-dialog][open]) [data-list]{opacity:.35}
 :root:has([data-list-review-dialog][open][data-fullscreen]){scrollbar-gutter:auto}
 [data-list-review-dialog][data-fullscreen]{width:100vw;height:calc(100dvh - var(--page-window-top,0px));border:0;
-border-radius:0;margin:var(--page-window-top,0px) 0 0}
-[data-list-review-dialog][data-fullscreen] iframe{height:100%;max-height:none}
+max-height:none;border-radius:0;margin:var(--page-window-top,0px) 0 0}
+[data-list-review-dialog][data-fullscreen] iframe{flex:1;height:0}
 [data-record-filters] .record-filter-row button{max-width:100%;overflow-wrap:anywhere}
 .list-show-controls{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;margin-bottom:8px}
 .list-show-controls .record-filter-row{min-width:0;margin-bottom:0}
@@ -4127,7 +4133,7 @@ function applyListSnapshot(fresh){
  void loadListCounts();
 }
 const reviewDialog=document.querySelector('[data-list-review-dialog]');
-const reviewClose=reviewDialog.querySelector('button');
+const reviewTitle=reviewDialog.querySelector('#list-review-title'),reviewClose=reviewDialog.querySelector('[data-close]');
 const reviewMotion=createCardMotion(()=>content);
 const listHost=window.frameElement?.matches('iframe[data-console-page="list"],iframe[data-console-page="studio"]')
  ? window.frameElement : null;
@@ -4177,6 +4183,8 @@ function restoreReviewLink({key,selector,detail,position}){
 function showReviewCard(card){
  activeReview=card;
  card.frame.hidden=false;
+ card.scrollTop=scrollY;
+ reviewTitle.textContent=card.title;
  card.restoreHost=fitReviewDialog();
  reviewClose.disabled=card.frame.hasAttribute('data-saving');
  reviewDialog.showModal();
@@ -4191,7 +4199,10 @@ function hideReviewCard(card){
  reviewDialog.close();
  card.restoreHost();
  card.frame.hidden=true;
- if(!listHost?.hidden && document.visibilityState==='visible') restoreReviewLink(card.link);
+ if(!listHost?.hidden && document.visibilityState==='visible'){
+  scrollTo({top:card.scrollTop,behavior:'instant'});
+  restoreReviewLink(card.link);
+ }
 }
 function reopenReturnedReview(){
  if(!activeReview && returnedReviews.length) showReviewCard(returnedReviews.shift());
@@ -4235,13 +4246,21 @@ bindConsoleDialog(reviewDialog,closeReviewCard);
 document.addEventListener('click',event=>{
  const link=event.target instanceof Element && event.target.closest('a[data-list-review-card]');
  if(!link || event.defaultPrevented || event.button!==0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+ const row=recordFromDetail(link);
+ if(!row) return;
  event.preventDefault();
  const href=link.href;
  if(activeReview || [...reviewDialog.querySelectorAll('iframe[data-saving]')].some(frame=>frame.src===href)) return;
  const frame=document.createElement('iframe');
  frame.title='Review card';
  frame.src=href;
- const card={frame,link:reviewLinkPlace(link)};
+ const card={frame,link:reviewLinkPlace(link),
+  title:'L'+row.dataset.number+' · '+row.querySelector('[data-label="Item"] strong').textContent};
+ if(!recordIsOpen(row)){
+  const top=row.getBoundingClientRect().top;
+  tableView.openCard(row.dataset.key);tableView.apply();
+  scrollBy({top:row.getBoundingClientRect().top-top,behavior:'instant'});
+ }
  activeReview=card;
  frame.addEventListener('load',()=>{
   const doc=frame.contentDocument;

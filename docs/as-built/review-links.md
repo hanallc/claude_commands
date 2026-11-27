@@ -1630,7 +1630,7 @@ The address identifies the open item or the target of its link.
 Back and Forward can open an item that the table filters hide.
 Select the row again to collapse it.
 Expanding or collapsing a row preserves the table filters and sort order.
-A linked Review card opens over the expanded row.
+A linked Review card opens a window over its expanded item.
 An answer that supports **Undo** closes the card at once.
 **Undo** or a failed answer reopens the card with its draft and the result message.
 **Undo** focuses the feedback field.
@@ -1708,13 +1708,17 @@ An item without links shows no review line.
 The expanded List row repeats the line above its actions and shows each review's shown ID.
 Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
-A review ID opens one card in a dialog on the List.
+A review ID opens one card in the item window.
 A summary links to the card when exactly one review is available.
 A summary for zero or multiple available reviews is plain text.
 The List loads the card document only when the dialog opens.
 The existing Review body route supplies the title, metadata, body, and controls.
 The Review table and the dialog use the same body renderer and action code.
-The dialog places the full title above the metadata, with Close beside the title.
+The window heading shows the List item number and title, with Close beside it.
+The review card shows its own title above its metadata.
+Opening a review from the State cell expands that item.
+Close and Escape keep the item open at the same scroll position and return focus to its link.
+Review links outside a List item keep their Review page destination.
 The metadata shows the Waiting reason and urgency when available.
 The header reserves a 52 px row for the save status and Show updates.
 A revision conflict keeps the current body and draft until the user selects Show updates.

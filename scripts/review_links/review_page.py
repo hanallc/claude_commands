@@ -1686,6 +1686,7 @@ CARD_VIEW_STYLE = '''<style>
 .review-box{position:relative;box-sizing:border-box;display:flex;flex-direction:column;max-height:calc(100dvh - var(--send-undo-space,0px));padding:24px;background:var(--card)}
 .review-box-header{flex:none}
 .review-box-header h1{margin:0 0 8px;padding-right:84px;font-size:24px;white-space:pre-line;overflow-wrap:anywhere}
+:root[data-list-review-frame] .review-box-header h1{padding-right:0}
 .review-box-meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;color:var(--ink-3);font-size:13px}
 .review-box-scroll{min-height:var(--review-body-min,0px);overflow:auto;scrollbar-gutter:stable}
 :is(.review-box,.review-box-scroll){scrollbar-width:thin;
@@ -1935,6 +1936,7 @@ function report(text){
 }
 const motion=createCardMotion(()=>card);
 const boxFrame=frame?.closest('[data-list-review-dialog]') ? frame : null;
+document.documentElement.toggleAttribute('data-list-review-frame',Boolean(boxFrame));
 function fitReviewBox(){
  const box=card.firstElementChild;
  const header=box.querySelector('.review-box-header'),footer=box.querySelector('.review-box-footer');
