@@ -606,12 +606,12 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(silence.read_kept(), [])
         identity = silence.push_identity(push)
         self.assertEqual(question_pushes.read_binding(question_pushes.binding_path(identity.sender, identity.key)),
-                         question_pushes.Binding(identity, emergency=False))
+                         question_pushes.Binding(identity, emergency=True))
         _ = path.write_text(path.read_text().replace("status: open", "status: closed"))
         with (mock.patch.object(send, "cancel_user_push", return_value=(0, "cancelled")) as cancel,
               mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.keys.parent / "notifier")})):
             self.assertEqual(question_pushes.drain(path), 0)
-        cancel.assert_not_called()
+        cancel.assert_called_once_with(identity)
 
     def test_releasing_an_older_question_emergency_preserves_the_newer_one(self) -> None:
         old_path, older = self.kept_question()

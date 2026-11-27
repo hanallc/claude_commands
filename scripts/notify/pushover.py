@@ -739,8 +739,8 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     priority = decision_priority.priority(need, push.get("due", ""))
 
     def post_once(url: str, data: bytes) -> tuple[int, bytes]:
-        if priority == "2" and confirmed_open:
-            question_pushes.bind_released_emergency_locked(identity)
+        if priority == "2" and reference["kind"] == "question":
+            question_pushes.bind_released_emergency_locked(identity, confirmed_open=confirmed_open)
         silence.mark_post_started(push)
         return post(url, data)
 

@@ -157,7 +157,7 @@ def _write_binding(path: Path, binding: Binding) -> None:
     write_text_atomic(path, json.dumps(fields) + "\n")
 
 
-def bind_released_emergency_locked(identity: PushIdentity) -> None:
+def bind_released_emergency_locked(identity: PushIdentity, *, confirmed_open: bool) -> None:
     """Record repeat cancellation before posting a released emergency."""
     path = binding_path(identity.sender, identity.key)
     previous = read_binding(path)
@@ -165,6 +165,8 @@ def bind_released_emergency_locked(identity: PushIdentity) -> None:
         # Keep the active binding for the newer push.
         path = _released_binding_path(identity)
         previous = read_binding(path)
+    if previous is None and not confirmed_open:
+        return
     binding = Binding(identity, emergency=True)
     if binding != previous:
         _write_binding(path, binding)
