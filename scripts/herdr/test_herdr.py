@@ -23,14 +23,14 @@ import math
 import sys
 import tempfile
 import time
-import unittest.mock
+import unittest
 from pathlib import Path
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr_types
 from types import SimpleNamespace
 from typing import BinaryIO, Literal, NamedTuple, TextIO, cast, final, override
-from unittest.mock import Mock, call, patch
+from unittest.mock import DEFAULT, MagicMock, Mock, call, patch  # pyright: ignore[reportAny]
 
 
 from scripts.herdr import herdr, message_proof
@@ -1454,7 +1454,7 @@ class PromptSubmissionTests(unittest.TestCase):
                     if registry == "target unknown once" and events.count("target") == 1:
                         return False
                     self.assertEqual(events.count("native"), 2 if registry == "target unknown once" else 3)
-                    return cast(object, unittest.mock.DEFAULT)
+                    return cast(object, DEFAULT)
 
                 with (patch.object(self.client, "native_session", side_effect=native_session) as native,
                       patch.object(herdr, "check_target", side_effect=check_target, wraps=original_check_target) as target,
@@ -1767,7 +1767,7 @@ class PromptSubmissionTests(unittest.TestCase):
         def check_target(*_args: object, **_kwargs: object) -> object:
             if 5 <= self.elapsed < 6:
                 return False
-            return cast(object, unittest.mock.DEFAULT)
+            return cast(object, DEFAULT)
 
         with patch.object(herdr, "check_target", side_effect=check_target, wraps=original_check_target):
             outcome = self.submit()
@@ -1921,7 +1921,7 @@ class PromptSubmissionTests(unittest.TestCase):
                     if self.elapsed == 0:
                         self.screen = screen
                         return False
-                    return cast(object, unittest.mock.DEFAULT)
+                    return cast(object, DEFAULT)
 
                 with patch.object(herdr, "check_target", side_effect=check, wraps=original_check):
                     outcome = self.submit(timeout_ms=1000, text=text)
@@ -2163,7 +2163,7 @@ class PromptSubmissionTests(unittest.TestCase):
                     return [{"pane_id": "destination:p1", "terminal_id": terminal}]
 
                 def check(*_args: object, **_kwargs: object) -> object:
-                    return False if self.elapsed == 0 else cast(object, unittest.mock.DEFAULT)
+                    return False if self.elapsed == 0 else cast(object, DEFAULT)
 
                 with (patch.object(self.client, "panes", side_effect=panes),
                       patch.object(herdr.TranscriptCursor, "read_turns", read),
@@ -2180,7 +2180,7 @@ class PromptSubmissionTests(unittest.TestCase):
             if self.typed and self.working_until == 0:
                 self.working_until = 30
                 return False
-            return cast(object, unittest.mock.DEFAULT)
+            return cast(object, DEFAULT)
 
         with patch.object(herdr, "check_target", side_effect=check, wraps=original_check):
             self.assertIsInstance(self.submit(timeout_ms=16_000), herdr.PromptNotSubmitted)
@@ -2405,7 +2405,7 @@ class PromptSubmissionTests(unittest.TestCase):
                     timeouts.append(timeout)
                     return "", ""
 
-                process = unittest.mock.MagicMock(returncode=0, communicate=communicate)
+                process = MagicMock(returncode=0, communicate=communicate)
 
                 def spawn(*_args: object, **_kwargs: object) -> object:
                     self.elapsed = started_at
