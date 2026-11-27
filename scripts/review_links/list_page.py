@@ -2359,7 +2359,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                 entry, names, today, index, secret, {}, owner_cell=owner_cell, owner_sort=owner_sort,
                 search_text=SearchText(owner_search, normalize_search_text(entry.item.title), ""), parked=False,
                 open_question=False, open_ask=False, visibility=the_list.QuestionAttention(), unread_answers=frozenset(),
-                schedule=the_list.NoSchedule.UNSET, mark=TopPriorityMark.HIDDEN, hidden=True,
+                schedule=the_list.NoSchedule.UNSET, mark=TopPriorityMark.HIDDEN, routing=routing, hidden=True,
                 linked_items=linked_items_html(entry, linked_records)))
     shows = [record_table.Chip(chip.value, chip.label, chip_totals["show"][chip])
              for chip in ListChip]
