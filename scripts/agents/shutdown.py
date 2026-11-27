@@ -64,7 +64,7 @@ from scripts.herdr import herdr_types
 from scripts.agents import set_model
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
-from scripts.direct import progress_history
+from scripts.direct import progress_history, recorder_state
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.lib import process_group, process_start, conf, berth_board, git_exclude, git_files, git_merge_tree, session_move, unit_runs, build_folders, waiting_rows
 from scripts.lib.file_lock import exclusive
@@ -203,6 +203,42 @@ def _result_code(result: StopResult | ResumeResult) -> int:
     else:
         print(f"{result.session_id}: unchanged")
     return 0
+
+
+def _cancel_closed_worker_passes(row: staff.StaffRow, stopped: stop_resume.NotRunning, *, deadline: float) -> int:
+    if not isinstance(row.parent, staff.ReportsTo):
+        return _result_code(stopped)
+    name = staff.WorkerName.parse(row.name)
+    with worker_panes.worker_lock(row.parent.id, name, deadline=deadline) as hold:
+        if isinstance(hold, worker_panes.Kept):
+            return _result_code(stop_resume.StopFailed(stopped.session_id, hold.blocker))
+        with staff.row_operation(row.id):
+            record = staff.initial_snapshot()
+            current = record.by_id(row.id)
+            if current is None or not hold.owns(current) or current.current_session != stopped.session_id:
+                return _result_code(stop_resume.StopFailed(stopped.session_id, "the worker changed before pass cancellation"))
+            run = worker_panes.worker_run(current, record=record)
+            if isinstance(progress_history.active_dispatch(current.id, run), progress_history.NoActiveDispatch):
+                return _result_code(stopped)
+            backend = record.backends.get(current.id)
+            kind = backend.family if isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend)) else ""
+            # A result can restore the pane between the stop and the worker lock.
+            observed = herdr.read_conversation(stopped.session_id, kind)
+            if isinstance(observed, herdr.UnknownConversation):
+                return _result_code(stop_resume.StopUnproved(stopped.session_id, observed.reason))
+            if isinstance(observed, herdr.LiveConversation):
+                return _result_code(stop_resume.StopFailed(stopped.session_id, "the worker resumed before pass cancellation"))
+            ended = progress_history.cancel_worker_passes(run, current.id)
+            if ended:
+                passes = "pass" if ended == 1 else "passes"
+                print(f"{current.name}: ended {ended} open {passes} as canceled")
+                return 0
+            remaining = progress_history.active_dispatch(current.id, run)
+            if isinstance(remaining, progress_history.ActiveDispatchUnavailable):
+                return _result_code(stop_resume.StopFailed(stopped.session_id, remaining.reason))
+            if isinstance(remaining, progress_history.ActiveDispatch):
+                return _result_code(stop_resume.StopFailed(stopped.session_id, "an open pass is pending completion"))
+    return _result_code(stopped)
 
 
 @dataclass(frozen=True)
@@ -966,6 +1002,11 @@ def main(argv: list[str] | None = None) -> int:
         deadline = worker_lifecycle.effective_deadline()
         result = (stop_resume.stop_producer(target.id, "agents stop ran", deadline=deadline)
                   if target is not None and target.kind == "producer" else stop_resume.stop(session, deadline=deadline))
+        if isinstance(result, stop_resume.NotRunning) and row is not None and row.kind == "worker":
+            try:
+                return _cancel_closed_worker_passes(row, result, deadline=deadline)
+            except recorder_state.OldRecorderState as error:
+                return _result_code(stop_resume.StopFailed(result.session_id, str(error)))
         return max(_result_code(result), int(bool(unresolved)))
     except herdr.RebootLockBusy as error:
         print(error, file=sys.stderr)

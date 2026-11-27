@@ -28,7 +28,7 @@ from typing import Literal, cast, final, override
 from unittest.mock import patch
 
 from scripts.accounts import refusals
-from scripts.agents import detached_run_process, detached_runs, restart, shutdown_record, worker_lifecycle
+from scripts.agents import detached_run_process, detached_runs, restart, shutdown, shutdown_record, worker_lifecycle
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, pass_notices, side_pane, turn_end, worker_panes
@@ -154,6 +154,66 @@ class TurnEndTests(unittest.TestCase):
         self.case = test_worker.WorkerCommandTests("runTest")
         self.case.setUp()
         self.addCleanup(self.case.doCleanups)
+
+    def parked_worker_with_run(self) -> tuple[staff.StaffRow, Path, detached_runs.RunRecord]:
+        self.case.agent.finish_after = 1
+        _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": "codex"}}, update=True)
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        passed = worker_panes.worker_pass(row, self.case.run_dir)
+        path, record = self.case.detached_record(row, "parked-stop")
+        record.update(status="running", pid=test_worker.DETACHED_FIXTURE_DEAD_PID,
+                      pane_dispatch_id=str(passed["instance_id"]))
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.case.agent.without_done = True
+        self.case.agent.complete(pane)
+        with patch.object(detached_run_process, "supervises", return_value=True):
+            self.assertEqual(self.case.finish(), turn_end.TurnOutcome.WAITING_ON_RUNS)
+        self.assertNotIn(pane, self.case.fixture.world.locations)
+        parked = worker_panes.worker_pass(row, self.case.run_dir)
+        self.assertIsInstance(progress_history.parked_worker_launch(parked), progress_history.ParkedWorkerLaunch)
+        return row, path, record
+
+    def stop_closed_worker(self, row: staff.StaffRow) -> str:
+        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            code = shutdown.main(["stop", f"{self.case.fixture.parent.name}/{row.name}"])
+        self.assertEqual(code, 0, errors.getvalue())
+        return output.getvalue()
+
+    def test_agents_stop_cancels_a_closed_workers_parked_pass(self) -> None:
+        row, _, _ = self.parked_worker_with_run()
+        self.assertEqual(self.stop_closed_worker(row), f"{row.name}: ended 1 open pass as canceled\n")
+        passed = worker_panes.worker_pass(row, self.case.run_dir)
+        self.assertEqual(passed["status"], "canceled")
+        self.assertFalse(progress_history.parked_worker_pass(passed))
+
+    def test_result_for_a_canceled_parked_pass_does_not_restore_the_worker(self) -> None:
+        row, path, record = self.parked_worker_with_run()
+        pane = self.case.agent.submitted[-1][0]
+        _ = self.stop_closed_worker(row)
+        notices = len(self.case.agent.notices)
+        launches = len(self.case.fixture.world.launches)
+        record.update(status="finished", exit_code=0, delivery=detached_runs.PARKED_WORKER_RESULT,
+                      finished_at=datetime.now().astimezone().isoformat(timespec="microseconds"),
+                      completion_pending=True)
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        with patch.object(worker, "restore_parked_worker", return_value=False) as restore:
+            _ = self.case.finish(kind=turn_end.EventKind.RUN_FINISHED)
+        restore.assert_not_called()
+        result = worker_lifecycle.read_json_object(path)
+        self.assertEqual(result.get("delivery"), "sent: private director")
+        results = [notice for notice in self.case.agent.notices[notices:]
+                   if f"Detached run: {record['run_id']}\n" in notice]
+        self.assertEqual(len(results), 1, self.case.agent.notices[notices:])
+        self.assertTrue(results[0].startswith(f"Worker {row.name}: worker pane is closed\n"), results[0])
+        self.assertNotIn(pane, self.case.fixture.world.locations)
+        self.assertEqual(len(self.case.fixture.world.launches), launches)
+
+    def test_agents_stop_reports_unchanged_for_a_closed_worker_without_a_pass(self) -> None:
+        row = self.case.fixture.worker("closed")
+        self.assertEqual(self.stop_closed_worker(row), f"{row.current_session}: unchanged\n")
 
     def test_native_hook_inputs_complete_each_family_once_and_close_its_pane(self) -> None:
         cases = [(family, close, "current") for family in ("codex", "claude")
