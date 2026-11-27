@@ -2180,6 +2180,34 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(the_list.review_reservation(reservation), investigation.ListDestination(former.id, 1))
         self.assertEqual(len(read_new_item_notices(log)), 1)
 
+    def test_numeric_studio_reservation_keeps_its_item_after_another_item_links(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        review_actions.ensure_submission_list_item(saved.address)
+        original, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(original.number, 1)
+        reservation = review_submissions.list_filing_reservation(saved)
+        _ = reservation.write_text("1\n")
+        other = the_list.add(keeper.id, "Other item", owner=owner.id, source="nate", changes={})
+        other = the_list.link(keeper.id, other.id, (review_items.submission_review_key(saved),), source="nate")
+        self.assertEqual(other.number, 2)
+        destination = investigation.ListDestination(keeper.id, original.number)
+        linked = investigation.ListDestination(keeper.id, other.number)
+        self.assertEqual(the_list.review_reservation(reservation, source_destinations=(destination,),
+                                                     current_links=(destination, linked)), destination)
+
+        restarted = change_page.DeliveryStatus(case.root)
+        with new_item_notice_log(self.root, keeper.id) as log:
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [original.id, other.id])
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [original, other])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
     def test_studio_claim_accepts_exchange_readback_through_an_alias(self) -> None:
         case = self.review_fixture()
         keeper = self.configure_list_keeper()

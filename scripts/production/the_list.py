@@ -2645,7 +2645,7 @@ def review_reservation(
             destination = investigation.ListDestination.decode(value)
         except ValueError as error:
             raise ListError(f"{path}: invalid List reservation") from error
-        current_links = (other for other in current_links if other.number == destination.number)
+    current_links = (other for other in current_links if other.number == destination.number)
     if any(not same_destination(destination, other) for other in (*source_destinations, *current_links)):
         raise ListError(f"{path}: the List reservation conflicts with another destination")
     return destination

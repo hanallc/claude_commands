@@ -2240,10 +2240,6 @@ def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, 
                 reports[report.submission_scope].append(entry)
     projected: list[review_items.ReviewItem] = []
     for item in items:
-        if review_items.pending_list_move(item) is not investigation.NoListMove.ABSENT:
-            projected.append(replace(item, exchange_handoff=review_items.NoFiledReviewExchange.ABSENT,
-                                     moved_report=investigation.NoListDestination.ABSENT))
-            continue
         handoff = review_items.NoFiledReviewExchange.ABSENT
         key = keys.get(item.key, "")
         filed = index.get(key, ())
@@ -2268,10 +2264,15 @@ def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, 
                         history = the_list.combine_exchange_history(tuple(saved_history), pending)
                         verifier = ExchangeVerifier(item, zone, members, history)
                         handoff = verifier.review_handoff(item, key, destination, confirmed_rows)
-        candidates = reports.get(item.key, ())
-        if isinstance(source := item.source, review_items.InvestigationSource) and source.record.submission_scope:
-            candidates = (*candidates, *reports.get(source.record.submission_scope, ()))
-        moved = _moved_report(item, candidates, handoff, sources)
+        if review_items.pending_list_move(item) is investigation.NoListMove.ABSENT:
+            candidates = reports.get(item.key, ())
+            if isinstance(source := item.source, review_items.InvestigationSource) and source.record.submission_scope:
+                candidates = (*candidates, *reports.get(source.record.submission_scope, ()))
+            moved = _moved_report(item, candidates, handoff, sources)
+        else:
+            moved = investigation.NoListDestination.ABSENT
+            if isinstance(handoff, review_items.FiledReviewExchange):
+                handoff = replace(handoff, hides_card=False)
         projected.append(replace(item, exchange_handoff=handoff, moved_report=moved)
                          if handoff != item.exchange_handoff or moved != item.moved_report else item)
     return projected
