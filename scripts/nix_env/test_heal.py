@@ -355,7 +355,11 @@ class HealTests(NixFixture):
         command = cast(list[str], run.call_args.args[0])
         self.assertEqual(command[command.index("--to") + 1], owner.id)
         self.assertEqual(command[command.index("--from") + 1], "nix-heal")
-        self.assertIn("The healer does not restart sessions. A restart of the session loads its nix shell.", command[-1])
+        text = command[-1]
+        self.assertIn("The healer does not restart sessions. A restart of the session loads its nix shell.", text)
+        self.assertIn("2. Restart the session after the repair.", text)
+        self.assertNotIn(heal.heal_command("retry", session.session_id), text)
+        self.assertIn(heal.heal_command("escalate", session.session_id), text)
         ensure.assert_not_called()
         held.assert_not_called()
         actions = [(entry["action"], entry["reason"]) for entry in self.records()]

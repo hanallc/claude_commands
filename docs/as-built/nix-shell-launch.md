@@ -172,7 +172,8 @@ through the normal account launch path. Pending recoveries run before new broken
 sessions, including sessions that have left the live registry.
 
 `heal.py sweep --no-restart` never stops or starts a session and leaves a pending restart as it is.
-It alerts the owning showrunner once for each broken session, with the cause that the healer does not restart sessions.
+It alerts the owning showrunner once for each broken episode, with the cause that the healer does not restart sessions.
+The alert asks for a restart after the repair, not `retry`: the next sweep sees the healthy session and clears the episode.
 
 from server starts, pane overlays and agent-start CLI processes, including explicit
 environment overrides. Later panes cannot inherit another session's proof from

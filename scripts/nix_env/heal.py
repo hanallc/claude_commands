@@ -460,7 +460,13 @@ def alert(directory: Path, limits: HealLimits, session: HealSession, history: He
         if owner is not None:
             machine = socket.gethostname()
             escalate = heal_command("escalate", session.session_id)
-            if history["pending"]["kind"] == "none":
+            if reason == NO_RESTART_REASON:
+                instructions = (
+                    "2. Restart the session after the repair. The next sweep sees its nix shell and clears this alert.\n"
+                    f"3. Run this command on {machine} to send Nate a push if you cannot repair the setup or restart the session.\n"
+                    f"   {escalate}"
+                )
+            elif history["pending"]["kind"] == "none":
                 instructions = (
                     f"2. Run this command on {machine} after the repair.\n"
                     f"   {heal_command('retry', session.session_id)}\n"
