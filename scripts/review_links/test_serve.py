@@ -1829,7 +1829,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
             self.assertEqual(read_new_item_notices(log), [])
             _ = backup.rename(saved.path)
-            with patch.object(the_list, "_submitted_question_origin", side_effect=AssertionError("Use the locked request.")):
+            with patch.object(the_list, "_legacy_question_origin", side_effect=AssertionError("Use the locked request.")):
                 review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
         typed, = the_list.records(keeper.id)
         self.assertEqual(typed.id, item.id)

@@ -1204,6 +1204,78 @@ class AnswerSourceTests(unittest.TestCase):
     def test_migration_files_a_transferred_question_using_the_move_receipt(self) -> None:
         self.check_transferred_question_destination(reserved=False)
 
+    def test_question_resolver_keeps_the_reservation_when_a_second_item_links_the_question(self) -> None:
+        request, key, number, _ = self.transfer_linked_question(reserved=True)
+        record = update_registration.read_review_question(
+            record_store.default_question_folder(ASKER.id) / "question-after-transfer.md", ASKER.id)
+        second = the_list.add(KEEPER.id, "Duplicate link", owner=OWNER.id, source="nate", changes={})
+        current = review_items.question_record_key(record)
+        second = the_list.link(KEEPER.id, second.id, (key, current), source="nate")
+        entry = list_page.ListRecord(KEEPER.id, second)
+        links = answer_sources.ReviewListLinks(current={current: [entry]}, created={current: [entry]})
+        origin = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, f"submission/question/{request}")
+        destination = investigation.ListDestination(KEEPER.id, number)
+        self.assertEqual(answer_sources.resolve_legacy_question_destination(origin, links, record=record),
+                         answer_sources.ResolvedQuestionDestination(destination, origin))
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        self.assertEqual(the_list.load(KEEPER.id, f"L{number}").native_question, origin)
+        self.assertEqual(the_list.load(KEEPER.id, second.id), second)
+
+    def test_question_resolver_uses_the_creation_link_after_unlink_before_the_first_exchange(self) -> None:
+        request = f"r6-{'3' * 32}-question-{OWNER.id}"
+        key = self.native("unlinked-first", {"since": FILED, "text": "Which plan?", "question": "Which plan?",
+            "review_id": "Q1", "review_submission": new_item_dialog.stored_submission(origin(request)),
+            "followup": {"text": "Which plan?", "sent": FILED}})
+        number = the_list.add_review_item(KEEPER.id, "Which plan?", owner=OWNER.id, producer=OWNER.id, unit="",
+            words="Which plan?", evidence="/console/review.html#" + urlencode({"jump": key}), review_key=key,
+            source="nate via New item", reservation=self.root / "legacy-number")
+        row = the_list.unlink(KEEPER.id, f"L{number}", (key,), source="nate")
+        self.assertEqual(row.reviews, ())
+        record = update_registration.read_review_question(record_store.default_question_folder(OWNER.id) / "unlinked-first.md", OWNER.id)
+        native = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, f"submission/question/{request}")
+        links = answer_sources.ReviewListLinks(created={key: [list_page.ListRecord(KEEPER.id, row)]})
+        self.assertEqual(answer_sources.resolve_legacy_question_destination(native, links, record=record),
+            answer_sources.ResolvedQuestionDestination(investigation.ListDestination(KEEPER.id, number), native))
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        saved, = the_list.records(KEEPER.id, include_closed=True)
+        self.assertEqual((saved.id, saved.reviews, saved.native_question), (row.id, (), native))
+
+    def test_question_resolver_allows_a_new_row_without_destination_history(self) -> None:
+        request = f"r6-{'4' * 32}-question-{OWNER.id}"
+        _ = self.native("no-destination-history", {"since": FILED, "text": "Which plan?", "question": "Which plan?",
+            "review_id": "Q1", "review_submission": new_item_dialog.stored_submission(origin(request)),
+            "followup": {"text": "Which plan?", "sent": FILED}})
+        record = update_registration.read_review_question(
+            record_store.default_question_folder(OWNER.id) / "no-destination-history.md", OWNER.id)
+        native = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, f"submission/question/{request}")
+        self.assertIs(answer_sources.resolve_legacy_question_destination(native, answer_sources.ReviewListLinks(), record=record),
+                      answer_sources.QuestionRoute.NEW)
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        saved, = the_list.records(KEEPER.id, include_closed=True)
+        self.assertEqual(saved.native_question, native)
+
+    def test_question_resolver_leaves_a_receipt_without_an_original_link_unresolved(self) -> None:
+        request = f"r6-{'5' * 32}-question-{OWNER.id}"
+        key = self.native("receipt-without-original", {"since": FILED, "text": "Which plan?", "question": "Which plan?",
+            "review_id": "Q1", "review_submission": new_item_dialog.stored_submission(origin(request)),
+            "followup": {"text": "Which plan?", "sent": FILED}})
+        path = record_store.default_question_folder(OWNER.id) / "receipt-without-original.md"
+        folder = review_submissions.image_folder(origin(request)).parent
+        receipt = review_submissions.NativeSubmissionDestination("Q1", new_item_dialog.SubmissionKind.QUESTION,
+            OWNER.id, request, origin(request).request_digest, path, path, OWNER.id)
+        review_submissions._write_location(folder / "receipt.json", receipt)  # pyright: ignore[reportPrivateUsage]
+        row = the_list.add(KEEPER.id, "Link added later", owner=OWNER.id, source="nate", changes={})
+        row = the_list.link(KEEPER.id, row.id, (key,), source="nate")
+        record = update_registration.read_review_question(path, OWNER.id)
+        native = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, f"submission/question/{request}")
+        links = answer_sources.ReviewListLinks(current={key: [list_page.ListRecord(KEEPER.id, row)]})
+        self.assertIs(answer_sources.resolve_legacy_question_destination(native, links, record=record),
+                      answer_sources.QuestionRoute.UNRESOLVED)
+        status, output = self.migrate(apply=True)
+        self.assertEqual(status, 0)
+        self.assertIn("Unresolved question destinations: 1", output)
+        self.assertEqual(the_list.records(KEEPER.id, include_closed=True), [row])
+
     def transfer_linked_question(self, *, reserved: bool) -> tuple[str, str, int, Path]:
         request = f"r6-{'2' * 32}-question-{OWNER.id}"
         submission = origin(request)
@@ -1243,6 +1315,13 @@ class AnswerSourceTests(unittest.TestCase):
         request, key, number, folder = self.transfer_linked_question(reserved=reserved)
         self.assertEqual((folder / "list-number").exists(), reserved)
         self.assertTrue((folder / "moved.json").is_file())
+        record = update_registration.read_review_question(
+            record_store.default_question_folder(ASKER.id) / "question-after-transfer.md", ASKER.id)
+        original = the_list.load(KEEPER.id, f"L{number}")
+        links = answer_sources.ReviewListLinks(created={key: [list_page.ListRecord(KEEPER.id, original)]})
+        native = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, f"submission/question/{request}")
+        self.assertEqual(answer_sources.resolve_legacy_question_destination(native, links, record=record),
+            answer_sources.ResolvedQuestionDestination(investigation.ListDestination(KEEPER.id, number), native))
         dry_status, preview = self.migrate(apply=False)
         self.assertEqual(dry_status, 0)
         self.assertIn("sent-question/scoped-reply: sources=1 exchanges=1 linked=1 new-rows=0", preview)
@@ -1285,6 +1364,73 @@ class AnswerSourceTests(unittest.TestCase):
                 self.assertEqual(the_list.records(KEEPER.id, include_closed=True), [row])
                 with store.locked():
                     self.assertEqual(store.next_number(), number + 1)
+
+    def test_migration_reports_an_unresolved_keyless_row_and_files_the_next_question(self) -> None:
+        request, _, number, folder = self.transfer_linked_question(reserved=False)
+        (folder / "moved.json").unlink()
+        key = f"submission/question/{request}"
+        exchange = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "followup:1",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which plan?", START, list_exchange.Nate.USER, ASKER.id,
+            list_exchange.QuestionWithoutAnswer.OPEN)
+        store = list_draft.list_records(KEEPER.id, the_list.ListError)
+        identity = f"L{number}"
+        with store.locked():
+            fields, body = store.read(identity)
+            fields["question_kind"] = the_list.QuestionItemKind.FROM_NATE.value
+            fields["filed_exchanges"] = list_exchange.encode((list_exchange.FiledExchange.from_exchange(exchange),))
+            store.write(identity, fields, body)
+
+        valid_key = "submission/question/reserved-keyless"
+        with the_list.lock_exchange_source(valid_key) as source:
+            reserved = the_list.file_exchanges(source, (replace(exchange, source_key=valid_key),), exchange.question,
+                                              linked=the_list.NextNumber.AVAILABLE, owner=OWNER.id, members=MEMBERS)
+        with store.locked():
+            valid_fields, valid_body = store.read(f"L{reserved.number}")
+            del valid_fields["question_source_key"]
+            store.write(f"L{reserved.number}", valid_fields, valid_body)
+
+        next_key = self.native("independent-ask", {"since": FILED, "text": "Pick a route", "question": "Which route?"})
+        for apply in (False, True):
+            status, output = self.migrate(apply=apply)
+            self.assertEqual(status, 0)
+            self.assertIn("Unresolved question destinations: 1", output)
+            self.assertIn(f"{key}: no verified List destination", output)
+            self.assertIn(f"{KEEPER.id}/{identity}: cannot resolve the original question source", output)
+        self.assertEqual(store.read(identity), (fields, body))
+        self.assertEqual(the_list.load(KEEPER.id, f"L{reserved.number}").native_question,
+            the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, valid_key))
+        self.assertEqual(the_list.load(KEEPER.id, f"L{reserved.number + 1}").native_question,
+            the_list.NativeQuestionItem(the_list.QuestionItemKind.TO_NATE, next_key))
+        with store.locked():
+            self.assertEqual(store.next_number(), reserved.number + 2)
+
+    def test_migration_calls_the_same_resolver_for_planning_conversion_and_apply(self) -> None:
+        request, _, number, _ = self.transfer_linked_question(reserved=True)
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        store = list_draft.list_records(KEEPER.id, the_list.ListError)
+        identity = f"L{number}"
+        with store.locked():
+            fields, body = store.read(identity)
+            del fields["question_source_key"]
+            store.write(identity, fields, body)
+
+        _ = self.native("pending-apply", {"since": FILED, "text": "Which route?", "question": "Which route?",
+            "review_id": "Q2", "review_submission": new_item_dialog.stored_submission(origin("pending-apply-request")),
+            "followup": {"text": "Which route?", "sent": FILED}})
+        native = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, f"submission/question/{request}")
+        pending = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, "submission/question/pending-apply-request")
+        resolver = answer_sources.resolve_legacy_question_destination
+        with patch.object(answer_sources, "resolve_legacy_question_destination", wraps=resolver) as resolve:
+            inventory = answer_sources.read_exchanges(self.review, members=MEMBERS)
+            self.assertTrue(any(call.args[0] == pending for call in resolve.call_args_list))
+            self.assertEqual(inventory.keyless[0].origin, native)
+            resolve.reset_mock()
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(answer_sources.migrate(inventory, MEMBERS, apply=True), 0)
+            self.assertTrue(any(call.args[0] == native for call in resolve.call_args_list))
+            self.assertTrue(any(call.args[0] == pending for call in resolve.call_args_list))
+        self.assertEqual(the_list.load(KEEPER.id, identity).native_question, native)
+        self.assertEqual(the_list.load(KEEPER.id, f"L{number + 1}").native_question, pending)
 
     def test_question_migration_keeps_replies_read_after_legacy_park_or_close(self) -> None:
         for action in ("Park", "Close"):

@@ -19,7 +19,7 @@ import subprocess
 import sys
 import threading
 from bisect import bisect_right
-from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
@@ -813,7 +813,7 @@ def _native_question_origins(exchanges: Iterable[list_exchange.FiledExchange]) -
             if isinstance(kind := native_question_kind(exchange), QuestionItemKind)}
 
 
-def _submitted_question_origin(key: str) -> NativeQuestionItem | NoQuestionItem:
+def question_origin_from_link(key: str) -> NativeQuestionItem | NoQuestionItem:
     if not key.startswith("submission/"):
         return NoQuestionItem.ORDINARY
     try:
@@ -865,7 +865,7 @@ def _legacy_question_origin(item: ListItem) -> NativeQuestionItem | NoQuestionIt
     added = item.log[0]
     if added.source not in (PAGE_SOURCE, "nate via New item", "nate via /new_item"):
         return NoQuestionItem.ORDINARY
-    original = _submitted_question_origin(original_question_link(item))
+    original = question_origin_from_link(original_question_link(item))
     if isinstance(original, NativeQuestionItem):
         return original if original in origins else NoQuestionItem.ORDINARY
     if added.source == PAGE_SOURCE:
@@ -1642,7 +1642,7 @@ def open_asks(item: ListItem) -> tuple[Ask, ...]:
     return tuple(ask for ask in item.asks if ask.is_open)
 
 
-def _validate(item: ListItem) -> None:
+def _validate(item: ListItem, *, keyless_kind: QuestionItemKind | NoQuestionItem = NoQuestionItem.ORDINARY) -> None:
     if item.number < 1:
         raise ListError("number must be positive")
     _line(item.title, "title")
@@ -1650,7 +1650,8 @@ def _validate(item: ListItem) -> None:
     _ = staff_id(item.producer, "producer")
     _validate_unit(item.unit)
     _ = _item_state(item.state)
-    if item.state is ItemState.ANSWERED and item.native_question is NoQuestionItem.ORDINARY:
+    if (item.state is ItemState.ANSWERED and item.native_question is NoQuestionItem.ORDINARY
+            and keyless_kind is NoQuestionItem.ORDINARY):
         raise ListError("Only a question can be Answered.")
     _ = _requester(item.requested_by)
     for moment in (item.opened, item.updated, item.unread_since, item.closed):
@@ -2205,10 +2206,11 @@ def _decode_item(store: record_store.NumberedRecords, fields: dict[str, str], bo
                     exchanges, origin, _read_legacy_reply_marks(fields.get("legacy_read_replies", "[]")))
 
 
-def _checked_item(identity: str, item: ListItem) -> ListItem:
+def _checked_item(identity: str, item: ListItem, *,
+                  keyless_kind: QuestionItemKind | NoQuestionItem = NoQuestionItem.ORDINARY) -> ListItem:
     if item.id != identity or not item.log:
         raise ListError("the item number must match its path and the log must not be empty")
-    _validate(item)
+    _validate(item, keyless_kind=keyless_kind)
     return item
 
 
@@ -2770,6 +2772,16 @@ def _exchange_path(key: str) -> Path:
     return record_store.state_root() / ".list-exchanges" / hashlib.sha256(key.encode()).hexdigest()
 
 
+def exchange_reservation(key: str) -> ExchangeDestination | NextNumber:
+    return _exchange_reservation(_exchange_path(key))
+
+
+def exchange_filing_started(key: str) -> bool:
+    """Check for changes or receipts from an earlier List filing."""
+    path = _exchange_path(key)
+    return path.with_suffix(".pending").exists() or path.with_suffix(".saved").exists()
+
+
 @dataclass(frozen=True)
 class LockedExchangeSource:
     key: str
@@ -3004,35 +3016,60 @@ def _save_new_exchanges(store: record_store.NumberedRecords, number: int, title:
     return item
 
 
-def convert_legacy_question_sources(keeper: staff.StaffId, *,
-                                    reservations: Mapping[int, set[NativeQuestionItem]],
-                                    question_links: Mapping[str, set[NativeQuestionItem]]) -> None:
-    """Resolve the original source of each question that lacks a saved key."""
+@dataclass(frozen=True)
+class KeylessQuestionItem:
+    item: ListItem
+    kind: QuestionItemKind
+
+    @property
+    def candidate_origins(self) -> frozenset[NativeQuestionItem]:
+        return frozenset(origin for origin in _native_question_origins(self.item.filed_exchanges)
+                         if origin.kind is self.kind)
+
+
+def _read_keyless_question(store: record_store.NumberedRecords, identity: str, fields: dict[str, str],
+                           body: str) -> KeylessQuestionItem:
+    exchanges = list_exchange.decode(fields.get("filed_exchanges", "[]"))
+    kind = QuestionItemKind(fields["question_kind"])
+    item = _checked_item(identity, _decode_item(store, fields, body, exchanges, NoQuestionItem.ORDINARY), keyless_kind=kind)
+    return KeylessQuestionItem(item, kind)
+
+
+def question_migration_records(keeper: staff.StaffId) -> list[ListItem | KeylessQuestionItem]:
+    """Read List items and legacy question items that still need a source key."""
     store = _store(keeper)
-    paths = tuple(store.folder().glob("L*.md"))
-    if not paths:
-        return
+
+    def read(identity: str) -> ListItem | KeylessQuestionItem:
+        fields, body = store.read(identity)
+        if "question_kind" in fields and "question_source_key" not in fields:
+            try:
+                return _read_keyless_question(store, identity, fields, body)
+            except (ValueError, KeyError, TypeError) as error:
+                raise store.invalid(identity, error) from None
+        return _read_item(store, identity, fields, body)
+
+    return store.records(read)
+
+
+def convert_legacy_question_source(keeper: staff.StaffId, identity: str,
+                                   resolve: Callable[[KeylessQuestionItem], NativeQuestionItem | NoQuestionItem]) -> bool:
+    """Save the resolved source and read marks under the List lock."""
+    store = _store(keeper)
     with store.locked():
-        for path in paths:
-            identity = path.stem
-            fields, body = store.read(identity)
-            if "question_kind" not in fields or "question_source_key" in fields:
-                continue
-            exchanges = list_exchange.decode(fields.get("filed_exchanges", "[]"))
-            item = _decode_item(store, fields, body, exchanges, NoQuestionItem.ORDINARY)
-            matches = _native_question_origins(exchanges) & reservations.get(item.number, set())
-            if not matches:
-                matches = _native_question_origins(exchanges) & question_links.get(original_question_link(item), set())
-            origin = next(iter(matches)) if matches else _legacy_question_origin(item)
-            if (len(matches) > 1 or not isinstance(origin, NativeQuestionItem)
-                    or origin.kind != QuestionItemKind(fields["question_kind"])):
-                raise ListError(f"{identity}: cannot resolve the original question source.")
-            fields["question_source_key"] = origin.source_key
-            if marks := _acknowledged_replies(item):
-                fields["legacy_read_replies"] = _write_legacy_reply_marks(marks)
-            _ = _read_item(store, identity, fields, body)
-            with record_store.keep_file_on_error(path):
-                store.write(identity, fields, body)
+        fields, body = store.read(identity)
+        if "question_kind" not in fields or "question_source_key" in fields:
+            return True
+        row = _read_keyless_question(store, identity, fields, body)
+        origin = resolve(row)
+        if not isinstance(origin, NativeQuestionItem):
+            return False
+        fields["question_source_key"] = origin.source_key
+        if marks := _acknowledged_replies(row.item):
+            fields["legacy_read_replies"] = _write_legacy_reply_marks(marks)
+        _ = _read_item(store, identity, fields, body)
+        with record_store.keep_file_on_error(store.path(identity)):
+            store.write(identity, fields, body)
+        return True
 
 
 def migrate_question_item(keeper: staff.StaffId, identity: str) -> None:
