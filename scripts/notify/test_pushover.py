@@ -553,6 +553,60 @@ class PushoverTests(unittest.TestCase):
             self.assertEqual(send.main(["retire", "--to", "user", "--from", push["source"], "--key", push["key"]]), 0)
         self.assertEqual(active, {legacy_question_tag})
 
+    def kept_question(self) -> tuple[Path, silence.KeptPush]:
+        path = self.keys.parent / "question.md"
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        push: silence.KeptPush = {"source": "drawer", "key": "question key", "priority": "1", "title": "Choose",
+            "message": "Details", "detail": "", "text_id": "decision.choices", "reference": reference}
+        self.silence_on()
+        return path, push
+
+    def test_release_posts_when_a_bound_question_becomes_unreadable(self) -> None:
+        path, push = self.kept_question()
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+            path.unlink()
+            release = silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post))
+        self.assertEqual((release, post.call_count), (0, 1))
+        self.assertEqual(silence.read_kept(), [])
+
+    def test_release_posts_after_a_later_send_reads_the_same_question(self) -> None:
+        path, push = self.kept_question()
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+            _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+            replacement: silence.KeptPush = {**push, "title": "New title"}
+            self.assertEqual(pushover.deliver_here(replacement, self.keys, post), 0)
+            self.assertEqual(silence.read_kept(), [replacement])
+            path.unlink()
+            release = silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post))
+        self.assertEqual((release, post.call_count), (0, 1))
+        body = cast(bytes, post.call_args.args[1])
+        self.assertEqual(urllib.parse.parse_qs(body.decode())["title"], ["New title"])
+        self.assertEqual(silence.read_kept(), [])
+
+    def test_release_posts_while_the_question_publication_lock_is_held(self) -> None:
+        path, push = self.kept_question()
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        push["need"] = "blocked"
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+            with record_store.record_number_lock(record_store.RecordKind.QUESTION):
+                release = silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post))
+        self.assertEqual((release, post.call_count), (0, 1))
+        self.assertEqual(silence.read_kept(), [])
+        identity = silence.push_identity(push)
+        self.assertEqual(question_pushes.read_binding(question_pushes.binding_path(identity.sender, identity.key)),
+                         question_pushes.Binding(identity, emergency=True))
+        _ = path.write_text(path.read_text().replace("status: open", "status: closed"))
+        with mock.patch.object(send, "cancel_user_push", return_value=(0, "cancelled")) as cancel:
+            self.assertEqual(question_pushes.drain(path), 0)
+        cancel.assert_called_once_with(identity)
+
     def test_silence_retries_release_after_the_question_lock_is_free(self) -> None:
         path = self.keys.parent / "question.md"
         _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
@@ -569,10 +623,10 @@ class PushoverTests(unittest.TestCase):
         with (record_store.record_number_lock(record_store.RecordKind.QUESTION),
               redirect_stdout(io.StringIO())):
             self.assertEqual(silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post),
-                                        timer="fixture"), 1)
-        post.assert_not_called()
+                                        timer="fixture"), 0)
+        post.assert_called_once()
         self.assertIsNone(silence.read_state())
-        self.assertEqual(silence.read_kept(), [push])
+        self.assertEqual(silence.read_kept(), [])
 
         def deliver(kept: silence.KeptPush) -> int:
             return pushover.post_kept(kept, self.keys, post)
@@ -836,6 +890,7 @@ class PushoverTests(unittest.TestCase):
         record = cast(dict[str, object], json.loads(record_line.removeprefix("pushover: reviewed JSON: ")))
         self.assertEqual(record["reference"], expected)
 
+        _ = question_pushes.retire_matching(silence.push_identity(kept))
         path.unlink()
         remote = {**expected, "machine": "mac"}
         forwarded = ["--ssh-forwarded-reference", "--text-id", entry.id, "--push-reference", json.dumps(remote), *argv[4:]]
@@ -847,7 +902,7 @@ class PushoverTests(unittest.TestCase):
             code, form = self.run_send(forwarded)
             self.assertEqual((code, form), (0, {}))
             self.assertEqual(errors.getvalue(), f"pushover: Cannot read Question {str(path)!r}.\n")
-            opening.assert_called_with(remote)
+            opening.assert_called_once_with(remote)
             saved, = silence.read_kept()
             self.assertEqual(saved.get("reference"), remote)
             self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, posted)), 0)

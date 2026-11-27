@@ -1,6 +1,7 @@
 """Tests for held news: when it is sent to the user, when typing in a terminal stops it, and that it is sent once."""
 from __future__ import annotations
 
+import io
 import os
 import base64
 import json
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast, override
@@ -397,6 +399,19 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(admitted[0].reference,
             push_reference.QuestionReference(kind="question", path=str(path), since="opening"))
         self.assertEqual(admitted[0].text_id, "decision.choices")
+
+    def test_successful_question_delivery_relays_the_unreadable_question_warning(self) -> None:
+        path = self.question_file()
+        warning = f"pushover: Cannot read Question {str(path)!r}.\n"
+        with (patch.object(escalate, "STATE", self.root / "state"), patch.object(escalate, "schedule")):
+            self.assertTrue(escalate.hold("choice", self.decision_push(), 0, question=str(path)))
+            held = escalate.read(escalate.held_path("choice"))
+            assert isinstance(held, escalate.RegisteredHold)
+            done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user\n",
+                                               "other transport output\n" + warning)
+            with patch.object(subprocess, "run", return_value=done), redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(escalate.deliver(held, "choice"), "")
+        self.assertEqual(errors.getvalue(), warning)
 
     def test_question_hold_closes_once_when_the_question_closes_or_reopens(self) -> None:
         for status, since, reason in (("closed", "opening", "question closed"),

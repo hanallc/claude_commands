@@ -621,9 +621,7 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
             if _can_keep(push):
                 _ = silence.end_if_past(deliver=lambda kept: post_kept(kept, keys_file, post))
             with silence.locked():
-                binding = question_pushes.bind_locked(identity, emergency=push["priority"] == "2", allow_unreadable=True)
-                if binding.admitted_without_read:
-                    print(f"{push_reference.UNREADABLE_QUESTION_REPORT}{reference['path']!r}.", file=sys.stderr)
+                _ = question_pushes.bind_locked(identity, emergency=push["priority"] == "2", allow_unreadable=True)
                 return _deliver_here(push, identity, keys_file, post, locked=True)
         except question_pushes.SettledQuestion as error:
             print(f"pushover: replaced: {error}")
@@ -704,8 +702,6 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     text_id = push["text_id"]
     reason = ""
     identity = silence.push_identity(push)
-    confirmed_open = False
-    admitted_unreadable = False
     title, message = push["title"], push["message"]
     if text_id and not any(entry.id == text_id for entry in push_texts.catalog()):
         reason = f"retired template {text_id}"
@@ -720,24 +716,12 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
         if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
             reason = TOKEN_APPROVAL_REQUIRED
         if reference["kind"] == "question":
-            binding_path = question_pushes.binding_path(push["source"], push["key"])
             try:
                 reason = question_pushes.settled(reference)
-                confirmed_open = not reason
-            except BlockingIOError:
-                return 1
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 log(push["source"], push["priority"], push["title"], push["message"],
                     f"anomaly: question record {reference['path']}: {error}",
                     key=push["key"], template=push["text_id"], reference=reference)
-                if binding_path.exists() or reference.get("machine") == "mac":
-                    try:
-                        binding = question_pushes.read_binding(binding_path)
-                    except (OSError, ValueError):
-                        return 1
-                    if binding is None or binding.identity != identity or not binding.admitted_without_read:
-                        return 1
-                    admitted_unreadable = True
     if reason:
         log(push["source"], push["priority"], push["title"], push["message"], "dropped: " + reason,
             key=push["key"], template=push["text_id"], reference=reference)
@@ -750,8 +734,8 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     priority = decision_priority.priority(need, push.get("due", ""))
 
     def post_once(url: str, data: bytes) -> tuple[int, bytes]:
-        if priority == "2" and (confirmed_open or admitted_unreadable):
-            _ = question_pushes.bind_locked(identity, emergency=True, allow_unreadable=admitted_unreadable)
+        if priority == "2" and reference["kind"] == "question":
+            question_pushes.bind_released_emergency_locked(identity)
         silence.mark_post_started(push)
         return post(url, data)
 

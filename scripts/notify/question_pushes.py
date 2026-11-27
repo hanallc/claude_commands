@@ -26,7 +26,6 @@ from scripts.notify.push_reference import PushIdentity
 class Binding:
     identity: PushIdentity
     emergency: bool
-    admitted_without_read: bool = False
 
     @property
     def reference(self) -> push_reference.QuestionReference:
@@ -61,11 +60,9 @@ def read_binding(path: Path) -> Binding | None:
         fields = cast(dict[str, object], value)
         reference = push_reference.read_reference(fields.get("reference"))
         source, key, emergency = fields.get("source"), fields.get("key"), fields.get("emergency")
-        admitted_without_read = fields.get("admitted_without_read", False)
         if (reference["kind"] == "question" and isinstance(source, str) and source and isinstance(key, str)
-                and key and isinstance(emergency, bool) and isinstance(admitted_without_read, bool)
-                and path == binding_path(source, key)):
-            return Binding(PushIdentity(source, key, reference), emergency, admitted_without_read)
+                and key and isinstance(emergency, bool) and path == binding_path(source, key)):
+            return Binding(PushIdentity(source, key, reference), emergency)
     raise ValueError(f"invalid Question push binding {path}")
 
 
@@ -132,12 +129,29 @@ def bind_locked(identity: PushIdentity, *, emergency: bool, allow_unreadable: bo
         _ = retire_locked(previous.identity, emergency=previous.emergency)
         previous = None
         unreadable = _opening_unreadable(reference, allow_unreadable=allow_unreadable)
-    bound = Binding(identity, emergency or (previous is not None and previous.emergency), unreadable)
+    bound = Binding(identity, emergency or (previous is not None and previous.emergency))
     if bound != previous:
-        fields = {"source": identity.sender, "key": identity.key, "reference": reference,
-                  "emergency": bound.emergency, "admitted_without_read": bound.admitted_without_read}
-        write_text_atomic(path, json.dumps(fields) + "\n")
+        _write_binding(path, bound)
+    if unreadable:
+        print(f"{push_reference.UNREADABLE_QUESTION_REPORT}{reference['path']!r}.", file=sys.stderr)
     return bound
+
+
+def _write_binding(path: Path, binding: Binding) -> None:
+    fields = {"source": binding.identity.sender, "key": binding.identity.key,
+              "reference": binding.reference, "emergency": binding.emergency}
+    write_text_atomic(path, json.dumps(fields) + "\n")
+
+
+def bind_released_emergency_locked(identity: PushIdentity) -> None:
+    """Record repeat cancellation before posting a released emergency."""
+    path = binding_path(identity.sender, identity.key)
+    previous = read_binding(path)
+    if previous is not None and previous.identity != identity:
+        _ = retire_locked(previous.identity, emergency=previous.emergency)
+    binding = Binding(identity, emergency=True)
+    if binding != previous:
+        _write_binding(path, binding)
 
 
 def retire_matching(identity: PushIdentity, *, emergency: bool = False) -> str:

@@ -519,7 +519,12 @@ def deliver(held: HeldMessage, key: str) -> str:
         command.extend(["--push-reference", json.dumps(held.reference)])
     done = subprocess.run(command, capture_output=True, text=True, check=False,
                           timeout=send_budget.user_seconds(review.user_send_seconds()))
-    return "" if done.returncode == 0 else " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"
+    if done.returncode == 0:
+        for line in done.stderr.splitlines():
+            if line.startswith(push_reference.UNREADABLE_QUESTION_REPORT):
+                print(line, file=sys.stderr)
+        return ""
+    return " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"
 
 
 def forward_review_hold(held: HeldMessage, reason: str, entry_key: str) -> list[str]:
