@@ -14,8 +14,9 @@ import unittest
 from typing import override
 from unittest import mock
 
-from scripts.lib.checkout_test_support import (STANDALONE_TEST_STARTUP, copy_test_runner, direct_test_fixture_environment,
-                                              run_gate_test_fixture, without_user_test_manager, write_stdlib_tool)
+from scripts.lib.checkout_test_support import (STANDALONE_TEST_STARTUP, WITHOUT_GATE_ANCESTRY, copy_test_runner,
+                                              direct_test_fixture_environment, run_gate_test_fixture,
+                                              without_user_test_manager, write_stdlib_tool)
 from scripts.lib.python_startup import sitecustomize as startup
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -28,7 +29,6 @@ LIMIT_LINE = (f"stopped at the {CASE_LIMIT}-second direct test limit. "
 LIMIT_REQUEST = f"scope requested: {CASE_LIMIT}"
 FIXTURE_SCOPE = "claude-direct-test-" + "0" * 32 + ".scope"
 LIMIT_FIXTURE = STANDALONE_TEST_STARTUP + """
-startup = sys.modules["_devtools_python_startup"]
 startup._user_test_manager_available = lambda: True
 startup._adopt_direct_test_scope = lambda seconds: print(f"scope requested: {seconds}", flush=True)
 """
@@ -297,8 +297,8 @@ class GateChild(unittest.TestCase):
         properties = f"t {CASE_LIMIT * 1_000_000}\ni {signal.SIGKILL.value}\n"
         write_stdlib_tool(self.root / "busctl", f"print({properties!r}, end='')\n")
         self.environment["PATH"] = os.pathsep.join((str(self.root), self.environment["PATH"]))
-        probe = STANDALONE_TEST_STARTUP + f"""
-sys.modules["_devtools_python_startup"]._cgroup = lambda pid: "/fixture/{FIXTURE_SCOPE}"
+        probe = WITHOUT_GATE_ANCESTRY + f"""
+startup._cgroup = lambda pid: "/fixture/{FIXTURE_SCOPE}"
 """ + NESTED_TEST_PROBE
         result = self.invoke(sys.executable, "-c", NESTED_FIXTURE + f"""
 run_nested(Path({str(self.root)!r}), {shim!r}, {probe!r}, {TEST_HANG_GUARD_SECS!r}, "direct")
