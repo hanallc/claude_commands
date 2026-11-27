@@ -2938,6 +2938,62 @@ class MacConsoleTests(BuildLogIsolatedTest):
                 self.assertEqual(stderr.getvalue(), "hana_shot: cannot read the Mac lock state: invalid ioreg property list\n")
 
 
+class MacLaunchTests(HanaShotTest):
+    def capture_after_login(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        console = MAC_IOREG_NO_LOGIN.read_bytes()
+        events: list[str] = []
+
+        def read_console(_remote: str | None, _timeout: float) -> hana_shot.MacConsole:
+            return hana_shot.mac_console_state(console)
+
+        def send_alert(*_args: object, **_kwargs: object) -> bool:
+            events.append("alert")
+            return True
+
+        def login(_seconds: float) -> None:
+            nonlocal console
+            events.append("wait")
+            console = MAC_IOREG_UNLOCKED.read_bytes()
+
+        def launch(*_args: object, **_kwargs: object) -> tuple[dict[str, object], object]:
+            if hana_shot.mac_console_state(console) is hana_shot.MacConsole.LOGIN_REQUIRED:
+                raise hana_shot.Failure("Hana cannot start before console login")
+            events.append("launch")
+            self.assertEqual(self.fake.calls, [])
+            return {}, mock.Mock()
+
+        with (
+            mock.patch.object(hana_shot, "sys", mock.Mock(wraps=sys, platform="darwin", executable=sys.executable)),
+            mock.patch.object(hana_shot, "time", mock.Mock(wraps=time, sleep=login)),
+            mock.patch.object(hana_shot, "probe_mac_console", side_effect=read_console),
+            mock.patch.object(hana_shot, "launch", side_effect=launch),
+            mock.patch.object(shutil, "which", return_value=None),
+            mock.patch.object(push_texts, "send_user_push", side_effect=send_alert) as send,
+            mock.patch.object(push_texts, "user_retire_argv", return_value=[sys.executable, "-c", ""]) as retire,
+        ):
+            result = self.run_script(*arguments, "--port", str(self.port), "--launch", "--purpose", "console login")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(events, ["alert", "wait", "launch"])
+        self.assertEqual(cast(push_texts.RenderedPush, send.call_args.args[0]).id, "hana_shot.mac_locked")
+        retire.assert_called_once_with(send.call_args.kwargs["sender"], send.call_args.kwargs["key"])
+        self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 1)
+        return result
+
+    def test_shot_launch_waits_for_mac_console_login(self) -> None:
+        output = self.scratch / "shot.png"
+        _ = self.capture_after_login("shot", "--mode", "home", "--out", str(output))
+        self.assertTrue(output.is_file())
+
+    def test_views_check_launch_waits_for_mac_console_login(self) -> None:
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text('[views.home]\nmode = "home"\n')
+        with mock.patch.object(hana_shot, "brightest", return_value=0.5):
+            result = self.capture_after_login("views", "check", "--views-file", str(views_path),
+                                               "--out", str(self.scratch / "check"))
+        self.assertIn("PASS home", result.stdout)
+
+
 class RemoteTests(HanaShotTest):
     def fake_remote(self, copies: bool, system: str = "Linux") -> Path:
         """Point the fake Hana's writes at a folder standing in for the remote host, and fake scp and ssh."""

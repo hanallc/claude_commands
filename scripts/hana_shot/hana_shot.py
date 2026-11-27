@@ -12,7 +12,7 @@ from functools import partial
 import argparse
 from collections.abc import Callable, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from difflib import get_close_matches
@@ -2953,23 +2953,26 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
 @contextmanager
 def instance(port: int, launch_first: bool, shutdown_after: bool, worktree: str | None, binary: str | None, purpose: str = "", owner: str = "", *,
     hana_shot_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    capture_session: Session | Literal["no_capture"] = "no_capture",
 ) -> Generator[Brp]:
     if isinstance(hana_shot_settings, UseConfiguredValue):
         hana_shot_settings = conf.read("hana_shot")
     check_port(port, hana_shot_settings=hana_shot_settings)
-    with ExitStack() as cleanup:
+    with ExitStack() as shutdown_actions, ExitStack() as capture_cleanup:
+        if isinstance(capture_session, Session):
+            _ = capture_cleanup.callback(capture_session.close)
         process: subprocess.Popen[bytes] | None = None
         owned_folder: Path | Literal["saved_launch"] = "saved_launch"
         if launch_first:
+            if isinstance(capture_session, Session):
+                capture_session.wait_for_mac()
             state, process = launch(port, worktree, binary, purpose, owner, hana_shot_settings=hana_shot_settings)
             if shutdown_after:
                 owned_folder = Path(state["scratch"])
-                _ = cleanup.callback(shutil.rmtree, owned_folder, ignore_errors=True)
-        try:
-            yield Brp(port, settings=hana_shot_settings)
-        finally:
-            if shutdown_after:
-                shutdown(port, process, owned_folder=owned_folder, hana_shot_settings=hana_shot_settings)
+                _ = shutdown_actions.callback(shutil.rmtree, owned_folder, ignore_errors=True)
+        if shutdown_after:
+            _ = shutdown_actions.callback(shutdown, port, process, owned_folder=owned_folder, hana_shot_settings=hana_shot_settings)
+        yield capture_session.brp if isinstance(capture_session, Session) else Brp(port, settings=hana_shot_settings)
 
 
 # ---------------------------------------------------------------------------
@@ -3070,37 +3073,45 @@ def with_overrides(shot: Shot, args: Arguments, *,
     return shot
 
 
+@contextmanager
+def capture_instance(args: Arguments, *, hana_shot_settings: conf.ConfigRead) -> Generator[Session]:
+    """Use one session for the launch check and capture."""
+    session = Session(Brp(args.port, settings=hana_shot_settings), args.remote)
+    with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner,
+                  hana_shot_settings=hana_shot_settings, capture_session=session):
+        _ = session.start_capture()
+        yield session
+
+
 def run_shots(
-    brp: Brp, shots: list[Shot], out: str | None, remote: str | None, on_result: Callable[[Result], None],
+    session: Session, shots: list[Shot], out: str | None, on_result: Callable[[Result], None],
     invocation: InProgressCaptureInvocation,
 ) -> list[Result]:
-    hana_shot_settings = brp.settings
+    hana_shot_settings = session.settings
     if shots:
         invocation.shot = shots[0]
-    with closing(Session(brp, remote)) as session:
-        _ = session.start_capture()
-        sha = git_sha(Path.cwd(), hana_shot_settings=hana_shot_settings)
-        results: list[Result] = []
-        for shot, path in zip(shots, output_paths(out, [shot.label for shot in shots], hana_shot_settings=hana_shot_settings), strict=True):
-            invocation.shot = shot
-            invocation.orientation = shot.orientation
-            started_ns = time.time_ns()
-            try:
-                result = take(session, shot, path)
-            except (Refused, Failure, CaptureTimeout) as exc:
-                reason = failure_reason(exc)
-                invocation.attempts.append(failed_attempt(shot, path, reason, started_ns, str(exc)))
-                invocation.failures.append(CaptureFailure(reason, str(exc)))
-                raise
-            window = session.last_state.size if session.last_state else (0, 0)
-            timing = timing_record(result, brp.port, sha, session.frame_ms, window, remote)
-            invocation.successful_timings.append(timing)
-            invocation.attempts.append({
-                **timing, "status": "success", "image_paths": [str(result.path)],
-            })
-            on_result(result)
-            results.append(result)
-        return results
+    sha = git_sha(Path.cwd(), hana_shot_settings=hana_shot_settings)
+    results: list[Result] = []
+    for shot, path in zip(shots, output_paths(out, [shot.label for shot in shots], hana_shot_settings=hana_shot_settings), strict=True):
+        invocation.shot = shot
+        invocation.orientation = shot.orientation
+        started_ns = time.time_ns()
+        try:
+            result = take(session, shot, path)
+        except (Refused, Failure, CaptureTimeout) as exc:
+            reason = failure_reason(exc)
+            invocation.attempts.append(failed_attempt(shot, path, reason, started_ns, str(exc)))
+            invocation.failures.append(CaptureFailure(reason, str(exc)))
+            raise
+        window = session.last_state.size if session.last_state else (0, 0)
+        timing = timing_record(result, session.brp.port, sha, session.frame_ms, window, session.remote)
+        invocation.successful_timings.append(timing)
+        invocation.attempts.append({
+            **timing, "status": "success", "image_paths": [str(result.path)],
+        })
+        on_result(result)
+        results.append(result)
+    return results
 
 
 def command_shot(args: Arguments, invocation: InProgressCaptureInvocation, *,
@@ -3127,8 +3138,8 @@ def command_shot(args: Arguments, invocation: InProgressCaptureInvocation, *,
         shots = [replace(shot, hover=HoverTarget(args.hover)) for shot in shots]
     invocation.orientation = shots[0].orientation
     invocation.shot = shots[0]
-    with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp:
-        _ = run_shots(brp, shots, args.out, args.remote, report, invocation)
+    with capture_instance(args, hana_shot_settings=hana_shot_settings) as session:
+        _ = run_shots(session, shots, args.out, report, invocation)
     return 0
 
 
@@ -3421,11 +3432,7 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
         nullcontext(args.out) if args.out is not None
         else build_folders.tool_folder("hana-shot-check")
     ) as out:
-        with (
-            instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp,
-            closing(Session(brp, args.remote)) as session,
-        ):
-            _ = session.start_capture()
+        with capture_instance(args, hana_shot_settings=hana_shot_settings) as session:
             sha = git_sha(path.parent, hana_shot_settings=hana_shot_settings)
             today = datetime.now().strftime("%Y-%m-%d")
             for name, final in zip(names, output_paths(str(out), names, hana_shot_settings=hana_shot_settings), strict=True):
@@ -3470,7 +3477,7 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
                     failures.append(f"FAIL {name}: {error}")
                     print(failures[-1], file=sys.stderr)
                     continue
-                timing = timing_record(result, brp.port, sha, session.frame_ms, window, args.remote)
+                timing = timing_record(result, session.brp.port, sha, session.frame_ms, window, args.remote)
                 invocation.successful_timings.append(timing)
                 invocation.attempts.append({
                     **timing, "status": "success", "image_paths": [str(result.path)],
