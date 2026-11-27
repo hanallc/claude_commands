@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Protocol, Literal, cast, final
 
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
-from scripts.lib import conf, models_registry, nix_env, unit_runs
+from scripts.lib import conf, file_lock, models_registry, nix_env, unit_runs
 from scripts.lib.transcripts import uncompressed_path
 from scripts.whoami import quota_state
 from scripts.production import session_staff, staff, worker_admission
@@ -962,15 +962,15 @@ def transcript_turn_boundary(fields: dict[str, object]) -> bool:
     return False
 
 
-def transcript_shows_turn_end_without_result(row: staff.StaffRow, run_id: str, attempted_at: float) -> bool:
-    """Check for a later turn end and no receipt in the delivery session."""
-    backend = staff.backend(row)
-    if isinstance(backend, staff.BackendUnavailable):
+def transcript_shows_turn_end_without_result(source: Path, identity: str, run_id: str, attempted_at: float) -> bool:
+    """Check the transcript that the send recorded for a later turn end and no receipt."""
+    if not source.is_absolute() or not identity:
         return False
     marker = f"Detached run: {run_id}"
     ended = False
     try:
-        source = worker_admission.transcript_source(row, backend)
+        if file_lock.device_key(source) != identity:
+            return False
         records = worker_admission.transcript_records(
             source, boundary=worker_admission.TranscriptRecordBoundary.COMPLETE_LINES_WITH_TAIL)
         for fields in records:
@@ -984,9 +984,9 @@ def transcript_shows_turn_end_without_result(row: staff.StaffRow, run_id: str, a
             if transcript_turn_boundary(fields):
                 at = rollouts.parse_timestamp(fields.get("timestamp"))
                 ended |= at is not None and at.timestamp() > attempted_at
-    except (OSError, ValueError, OverflowError):
+        return ended and file_lock.device_key(source) == identity
+    except (OSError, ValueError, OverflowError, subprocess.SubprocessError):
         return False
-    return ended
 
 
 def _transcript_messages(row: staff.StaffRow) -> list[str] | Kept:

@@ -44,7 +44,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.production_doc import EnrolledPaths
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
-from scripts.lib import atomic_file, conf, file_lock, models_registry, process_start, unit_runs
+from scripts.lib import atomic_file, conf, file_lock, models_registry, process_group, process_start, process_stop, unit_runs
 from scripts.lib.fork_test_support import ForkChildren
 from scripts.lib.unit_runs_test_support import start_new_command
 from scripts.lib.transcript_test_support import compressed_copy
@@ -4515,7 +4515,7 @@ class WorkerCommandTests(unittest.TestCase):
             path, record = self.detached_record(row, run_id)
             record.update(pane_dispatch_id=instance, ended="supervisor gone", stop_pass_requested=True,
                           stop_reason=detached_runs.SUPERVISOR_GONE_REASON, exit_code=143, delivery=delivery,
-                          completion_pending=True)
+                          completion_pending=True, command_leader_signaled=True)
             atomic_file.write_text_atomic(path, json.dumps(record))
         self.agent.append(pane, "assistant", "The lint runs are still pending.")
         self.fixture.world.locations[pane]["agent_status"] = "idle"
@@ -4543,7 +4543,14 @@ class WorkerCommandTests(unittest.TestCase):
             path, _ = self.detached_record(row, "unreceived-stop")
             record = worker_lifecycle.read_json_object(path)
             attempted_at = time.time() - 10
-            record["worker_result_attempt"] = {"session": row.current_session, "started_at": attempted_at}
+            backend = staff.backend(row)
+            if isinstance(backend, staff.BackendUnavailable):
+                raise ValueError("fixture transcript is unavailable")
+            source = worker_admission.transcript_source(row, backend).resolve()
+            record["worker_result_attempt"] = {
+                "session": row.current_session, "started_at": attempted_at,
+                "transcript_path": str(source), "transcript_identity": file_lock.device_key(source),
+            }
             atomic_file.write_text_atomic(path, json.dumps(record))
             self.append_stop_recovery_turn_end(row, attempted_at + 1)
             result = self.command(*assign_next)
@@ -4614,7 +4621,8 @@ class WorkerCommandTests(unittest.TestCase):
         parked.unlink()
         path, record = self.detached_record(row, "unreceived-stop")
         record.update(pane_dispatch_id=instance, ended="supervisor gone", stop_pass_requested=True,
-                      stop_reason=detached_runs.SUPERVISOR_GONE_REASON, exit_code=143, completion_pending=True)
+                      stop_reason=detached_runs.SUPERVISOR_GONE_REASON, exit_code=143, completion_pending=True,
+                      command_leader_signaled=True)
         atomic_file.write_text_atomic(path, json.dumps(record))
         self.append_stop_recovery_turn_end(row, time.time() - 10)
 
@@ -4654,6 +4662,123 @@ class WorkerCommandTests(unittest.TestCase):
         stopped, = receipts
         self.assertEqual(stopped.instance_id, instance)
         self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+
+    def test_stop_recovery_reads_the_transcript_saved_at_the_send(self) -> None:
+        row, pane, instance = self.save_stop_canceled_worker_runs()
+        backend = staff.backend(row)
+        assert isinstance(backend, staff.CodexBackend)
+        source = worker_admission.transcript_source(row, backend).resolve()
+        before_result = source.read_text()
+        attempted_at = time.time() - 10
+        path, record = self.detached_record(row, "unreceived-stop")
+        record.update(pane_dispatch_id=instance, ended="supervisor gone", stop_pass_requested=True,
+                      stop_reason=detached_runs.SUPERVISOR_GONE_REASON, exit_code=143, completion_pending=True,
+                      delivery=detached_runs.UNCONFIRMED_WORKER_RESULT + "the worker transcript has no result receipt")
+        saved = {**record, "command_leader_signaled": True, "worker_result_attempt": {
+            "session": row.current_session, "started_at": attempted_at,
+            "transcript_path": str(source), "transcript_identity": file_lock.device_key(source),
+        }}
+        atomic_file.write_text_atomic(path, json.dumps(saved))
+        marker = "Detached run: unreceived-stop\nRun finished: private verification"
+        self.agent.append(pane, "user", marker)
+        self.assertIn(marker.splitlines()[0], source.read_text())
+
+        newer = source.with_name("newer-" + source.name)
+        atomic_file.write_text_atomic(newer, before_result)
+        newer_at = source.stat().st_mtime + 2
+        os.utime(newer, (newer_at, newer_at))
+        self.assertEqual(worker_admission.transcript_source(row, backend), newer)
+        self.append_stop_recovery_turn_end(row, attempted_at + 1)
+        receipt = self.receipt()
+        assert isinstance(receipt, worker.DispatchWaitingForRuns)
+        self.assertEqual(receipt.runs, ("unreceived-stop",))
+        atomic_file.write_text_atomic(source, newer.read_text())
+        receipt = self.receipt()
+        assert isinstance(receipt, worker.DispatchWaitingForRuns)
+        self.assertEqual(receipt.runs, ("unreceived-stop",))
+
+    def group_watcher_record(self, row: staff.StaffRow, instance: str,
+                             leader: process_start.Started | process_start.Gone) -> dict[str, object]:
+        path, record = self.detached_record(row, "parked-stop")
+        pid = 24680
+        record.update(status="running", pane_dispatch_id=instance, command_pid=pid, command_group=pid,
+                      command_started="100", delivery=detached_runs.PARKED_WORKER_RESULT, completion_pending=True)
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        with (patch.object(process_stop, "supported", return_value=False),
+              patch.object(process_start, "process_start", return_value=leader),
+              patch.object(os, "getpgrp", return_value=pid),
+              patch.object(os, "setsid"),
+              patch.object(process_group, "send_process_group") as send_group,
+              patch.object(detached_runs, "_group_is_live", return_value=True),
+              patch.object(detached_runs, "_wait_for_group"),
+              patch.object(detached_runs, "reap_orphans", return_value=[])):
+            self.assertEqual(detached_runs.main(["supervisor-gone", str(path)]), 0)
+        send_group.assert_called_once_with(pid, signal.SIGTERM)
+        saved = worker_lifecycle.read_json_object(path)
+        saved.update(status="finished", ended="supervisor gone")
+        atomic_file.write_text_atomic(path, json.dumps(saved))
+        return saved
+
+    def test_watcher_signaling_only_children_keeps_the_result_for_done(self) -> None:
+        row, _, instance = self.save_stop_canceled_worker_runs()
+        unconfirmed, _ = self.detached_record(row, "unreceived-stop")
+        unconfirmed.unlink()
+        saved = self.group_watcher_record(row, instance, process_start.Gone())
+        receipt = self.receipt()
+        assert isinstance(receipt, worker.DispatchWaitingForRuns)
+        self.assertEqual(receipt.runs, ("parked-stop",))
+        self.assertIs(worker.waiting_recovery(receipt), worker.CompletionRecovery.WAITING_ON_REPLY)
+        self.assertNotIn("exit_code", saved)
+        record = cast(detached_runs.RunRecord, cast(object, saved))
+        self.assertIn("Result: FAIL (no exit status)", detached_runs.result_text(record, detached_runs.command_result(record)))
+
+        scope: process_stop.RunSliceIdentity = {"unit": "fixture.slice", "path": "/fixture.slice",
+                                                "device": 4, "inode": 9}
+        path, record = self.detached_record(row, "parked-stop")
+        for live in (False, True):
+            with self.subTest(scope_leader_live=live):
+                record.update(status="running", pane_dispatch_id=instance, command_slice=scope,
+                              command_pid=24680, command_started="100", delivery=detached_runs.PARKED_WORKER_RESULT)
+                atomic_file.write_text_atomic(path, json.dumps(record))
+                with (patch.object(process_stop, "supported", return_value=True),
+                      patch.object(process_stop, "slice_has_ended", return_value=False),
+                      patch.object(process_stop, "pin_process", return_value=nullcontext(27),
+                                   side_effect=None if live else ProcessLookupError),
+                      patch.object(process_stop, "command_slice", return_value=scope),
+                      patch.object(signal, "pidfd_send_signal", create=True) as send_leader,
+                      patch.object(process_stop, "stop_slice") as stop_slice,
+                      patch.object(os, "setsid"),
+                      patch.object(detached_runs, "reap_orphans", return_value=[])):
+                    self.assertEqual(detached_runs.main(["supervisor-gone", str(path)]), 0)
+                stop_slice.assert_called_once()
+                stopped = worker_lifecycle.read_json_object(path)
+                self.assertIs(stopped["command_leader_signaled"], live)
+                stopped.update(status="finished", ended="supervisor gone")
+                atomic_file.write_text_atomic(path, json.dumps(stopped))
+                with patch.object(process_stop, "slice_has_ended", return_value=True):
+                    receipt = self.receipt()
+                if live:
+                    send_leader.assert_called_once_with(27, signal.SIGTERM)
+                    self.assertIsInstance(receipt, worker.DispatchSubmitted)
+                else:
+                    send_leader.assert_not_called()
+                    self.assertIsInstance(receipt, worker.DispatchWaitingForRuns)
+
+    def test_group_watcher_stop_recovers_the_pass_without_a_pass_stop_request(self) -> None:
+        row, _, instance = self.save_stop_canceled_worker_runs()
+        unconfirmed, _ = self.detached_record(row, "unreceived-stop")
+        unconfirmed.unlink()
+        saved = self.group_watcher_record(row, instance, process_start.Started("100"))
+        self.assertNotIn("stop_pass_requested", saved)
+        following = self.run_dir / "next-prompt.md"
+        atomic_file.write_text_atomic(following, "Start the next assignment.\n")
+        with patch.object(detached_runs, "_stopped_group_has_ended", return_value=True):
+            result = self.command("assign", "impl", str(following), "--name", row.name, "--slot", "impl", "--phase", "8",
+                                  "--kind", "assign", "--session-dir", str(self.run_dir), "--launcher-command", '["assign.sh"]')
+        self.assertEqual(result[:2], (0, "submitted\n"), result[2])
+        self.assertIs(saved.get("command_leader_signaled"), True)
+        stopped, = progress_history.stopped_pass_receipts(self.run_dir, row.id)
+        self.assertEqual(stopped.instance_id, instance)
 
     def test_answer_recovers_an_interrupted_result_turn_before_assignment(self) -> None:
         row, pane, path, assign_next = self.ended_pass_with_result("interrupted", "already delivered: late-result")
