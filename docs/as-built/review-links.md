@@ -2273,8 +2273,11 @@ Closed staff questions without a saved answer stay outside the migration.
 #### Question items in the Studio
 
 The List saves the question kind and native source key when it files a question item.
-Conversion uses the submitted question's request ID to find its saved List reservation after an owner transfer.
-Migration files the question on the reserved row and saves the native source key.
+After an owner transfer, migration uses the List reservation for the submitted question's request ID.
+Without a reservation, migration verifies the move receipt against the current question and finds the original List link.
+Migration saves the unique destination before allocation and records the native source key on the List item.
+Migration reports the question as unresolved if neither proof identifies its original List item.
+An unresolved transfer cannot allocate a List number.
 The loader reports a question item without a saved source key as a conversion error.
 Replies on Changes, Bugs, and Investigations keep the ordinary List workflow.
 A question to Nate starts in **Waiting for nate** and appears under **Questions**.
@@ -2338,9 +2341,11 @@ The native question and answer can still file when the log association remains u
 A verified exchange keeps its filed ID.
 New anonymous log exchanges use a digest of the prompt, its time, and the reply event.
 Verified Feedback replies remain in Review outside the unresolved question count.
-The preview reports each unresolved source key and its reply count.
-Review keeps an Investigation or native Question visible while an outgoing question waits or a reply remains unresolved.
-Review hides a card when verified List exchanges with matching save receipts cover every reply and the current answer.
+The preview reports each unresolved reply source and its reply count.
+The preview and migration log also list transferred questions without a verified List destination.
+Review keeps an Investigation or native Question visible while an outgoing question needs action in Review.
+Review also keeps the card visible while a reply remains unresolved.
+Review requires matching `.saved` receipts for the verified List exchanges that cover the question and replies.
 An Open Change with one verified slot answer on the List can move to the List when the answerer is unknown.
 A later slot change leaves the filed reply binding and answer text intact.
 A filed question can receive an answer or close after withdrawal.
