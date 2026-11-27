@@ -390,6 +390,44 @@ class HealTests(NixFixture):
         self.assertEqual(json.loads(state.read_text()), saved)
         self.assertEqual(run.call_count, 1)
 
+    def assert_stopped_sweep_resends_with_the_saved_key(self, no_restart: bool) -> None:
+        _, unit, _ = self.showrunner_fixture()
+        session = replace(self.session, session_id=str(unit.current_session), name=unit.name)
+        _, ensure, run = self.install_sweep([session])
+        ensure.return_value = nix_env.Refused("nix_env: fixture: no nix shell")
+        keys: list[str] = []
+        stopped = False
+        save = heal.save_history
+
+        class SweepKilled(BaseException):
+            pass
+
+        def send(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal stopped
+            del kwargs
+            keys.append(command[command.index("--key") + 1])
+            if not stopped:
+                stopped = True
+                raise SweepKilled
+            return subprocess.CompletedProcess(command, 0, "SKIPPED: fixture", "")
+
+        def save_until_stopped(directory: Path, histories: dict[str, heal.HealHistory]) -> None:
+            if not stopped:
+                save(directory, histories)
+
+        run.side_effect = send
+        with patch.object(heal, "save_history", side_effect=save_until_stopped), self.assertRaises(SweepKilled):
+            _ = heal.sweep(no_restart=no_restart)
+        self.assertEqual(heal.sweep(no_restart=no_restart), 0)
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[0], keys[1])
+
+    def test_a_stopped_restart_sweep_resends_with_the_saved_key(self) -> None:
+        self.assert_stopped_sweep_resends_with_the_saved_key(no_restart=False)
+
+    def test_a_stopped_no_restart_sweep_resends_with_the_saved_key(self) -> None:
+        self.assert_stopped_sweep_resends_with_the_saved_key(no_restart=True)
+
     def test_recovery_commands_refuse_no_restart(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit_code:
             _ = heal.main(["retry", "--only", "fixture", "--no-restart"])
@@ -406,8 +444,8 @@ class HealTests(NixFixture):
                 session = replace(self.session, session_id=str(row.current_session), name=row.name)
                 history = heal.new_history()
                 with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, f"{status}: fixture", "")) as run:
-                    heal.alert(directory, limits, session, history, raw)
-                    heal.alert(directory, limits, session, history, raw)
+                    heal.alert(directory, limits, session, history, raw, histories={session.session_id: history})
+                    heal.alert(directory, limits, session, history, raw, histories={session.session_id: history})
                 run.assert_called_once()
                 command = cast(list[str], run.call_args.args[0])
                 self.assertEqual(command[2:-1], ["--to", owner.id, "--from", "nix-heal",
@@ -441,7 +479,7 @@ class HealTests(NixFixture):
                 with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture", "")) as run,
                       patch.object(heal, "save_history", side_effect=PermissionError("fixture state is read-only")) as save,
                       redirect_stderr(io.StringIO()) as errors):
-                    heal.alert(directory, heal.HealLimits.read(), session, history, "fixture refusal")
+                    heal.alert(directory, heal.HealLimits.read(), session, history, "fixture refusal", histories={session.session_id: history})
                 run.assert_called_once()
                 save.assert_not_called()
                 command = cast(list[str], run.call_args.args[0])
@@ -463,7 +501,7 @@ class HealTests(NixFixture):
                 with (patch.object(subprocess, "run", side_effect=[
                     refusal, subprocess.CompletedProcess([], 0, "SENT: fixture", "")]) as run,
                       redirect_stderr(io.StringIO()) as errors):
-                    heal.alert(directory, limits, session, history, "fixture refusal")
+                    heal.alert(directory, limits, session, history, "fixture refusal", histories={session.session_id: history})
                 self.assertEqual(run.call_count, 2)
                 peer, push = run.call_args_list
                 self.assertIn(owner.id, cast(list[str], peer.args[0]))
@@ -483,8 +521,8 @@ class HealTests(NixFixture):
         with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead((session,))) as registry,
               patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture", "")) as run,
               redirect_stdout(io.StringIO()) as output):
-            heal.alert(directory, heal.HealLimits.read(), session, history, raw)
-            heal.alert(directory, heal.HealLimits.read(), session, history, "later refusal")
+            heal.alert(directory, heal.HealLimits.read(), session, history, raw, histories=histories)
+            heal.alert(directory, heal.HealLimits.read(), session, history, "later refusal", histories=histories)
             heal.log(directory, session, history, "skip", "session is not idle")
             heal.save_history(directory, histories)
             run.reset_mock()
@@ -531,7 +569,7 @@ class HealTests(NixFixture):
         with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead(())),
               patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture", "")) as run,
               redirect_stdout(io.StringIO()) as output):
-            heal.alert(directory, heal.HealLimits.read(), session, history, "relaunch refused")
+            heal.alert(directory, heal.HealLimits.read(), session, history, "relaunch refused", histories=histories)
             heal.save_history(directory, histories)
             peer = cast(list[str], run.call_args.args[0])
             self.assertEqual(peer[2:4], ["--to", owner.id])
@@ -690,8 +728,8 @@ class HealTests(NixFixture):
             with self.subTest(output=output):
                 history = heal.new_history()
                 with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")) as run:
-                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
-                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
+                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal", histories={self.session.session_id: history})
+                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal", histories={self.session.session_id: history})
                 self.assertTrue(history["notified"])
                 self.assertEqual(run.call_count, 1)
                 self.assertEqual(self.records(), [])
@@ -700,8 +738,8 @@ class HealTests(NixFixture):
         heal.state_directory().mkdir()
         history = heal.new_history()
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "QUEUED: diagnostic")) as run:
-            heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
-            heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
+            heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal", histories={self.session.session_id: history})
+            heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal", histories={self.session.session_id: history})
         self.assertFalse(history["notified"])
         self.assertEqual(run.call_count, 2)
         self.assertEqual([(entry["action"], entry["reason"]) for entry in self.records()],
@@ -714,7 +752,7 @@ class HealTests(NixFixture):
             with self.subTest(code=code):
                 history = heal.new_history()
                 with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")):
-                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
+                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal", histories={self.session.session_id: history})
                 self.assertFalse(history["notified"])
                 self.assertEqual((self.records()[-1]["action"], self.records()[-1]["reason"]), ("push_failed", output))
 
@@ -726,8 +764,8 @@ class HealTests(NixFixture):
             with self.subTest(code=code, output=output):
                 history = heal.new_history()
                 with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")) as run:
-                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
-                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
+                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal", histories={self.session.session_id: history})
+                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal", histories={self.session.session_id: history})
                 self.assertFalse(history["notified"])
                 self.assertEqual(run.call_count, 2)
                 self.assertEqual(self.records()[-1]["action"], "push_failed")

@@ -210,7 +210,8 @@ unchanged skip reasons do not add lines.
 
 A refused environment or failed recovery alerts the nearest showrunner above the session's staff row.
 The message gives the cause, the raw reason, and the recovery commands.
-The healer creates a new showrunner key for each alert episode. The sweep saves it with the session state after the send.
+The healer creates a new showrunner key for each alert episode and saves it with the session state before the send.
+A sweep stopped after the send resends with the same key, and the sender answers `SKIPPED`. If the save fails, the healer still sends.
 Later attempts in that episode use the saved key.
 The healer accepts `SKIPPED` as confirmation when the sender already holds or accepted the alert.
 The healer clears the key after it confirms recovery or after a successful `retry` command.

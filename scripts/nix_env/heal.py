@@ -444,12 +444,14 @@ def showrunner_owner(session_id: str) -> staff.StaffRow | None:
     return None
 
 
-def alert(directory: Path, limits: HealLimits, session: HealSession, history: HealHistory, reason: str) -> None:
+def alert(directory: Path, limits: HealLimits, session: HealSession, history: HealHistory, reason: str, *,
+          histories: dict[str, HealHistory]) -> None:
     if history["notified"]:
         return
     history["alert_reason"] = reason
     prefix = f"nix-heal-showrunner-{session.session_id}-"
-    if not history["showrunner_alert_key"].startswith(prefix):
+    new_key = not history["showrunner_alert_key"].startswith(prefix)
+    if new_key:
         history["showrunner_alert_key"] = prefix + uuid.uuid4().hex
     try:
         owner = showrunner_owner(session.session_id)
@@ -488,6 +490,14 @@ def alert(directory: Path, limits: HealLimits, session: HealSession, history: He
                 "1. Repair the nix setup for this worktree. Get Nate's approval before you change /etc/nixos.\n"
                 f"{instructions}"
             )
+            if new_key:
+                # Save the new episode key before the send: a sweep stopped after the
+                # send resends with the same key, which the sender answers SKIPPED.
+                try:
+                    save_history(directory, histories)
+                except OSError as error:
+                    print(f"nix-heal: {session.session_id}: cannot save the alert key; sending anyway. {error}",
+                          file=sys.stderr)
             command = session_send.send_argv("--to", str(owner.id), "--from", "nix-heal",
                                              "--key", history["showrunner_alert_key"], "--text", text)
             outcome, detail = send_alert(command, limits)
@@ -530,7 +540,7 @@ def request_stop(directory: Path, limits: HealLimits, session: HealSession, pend
     if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
         reason = result.reason if isinstance(result, stop_resume.StopFailed) else "no local session tab"
         log(directory, session, history, "refused", reason)
-        alert(directory, limits, session, history, reason)
+        alert(directory, limits, session, history, reason, histories=histories)
         return False
     pending["stop_request_sent"] = True
     save_history(directory, histories)
@@ -550,7 +560,7 @@ def resume_pending(directory: Path, limits: HealLimits, session: HealSession, pe
                       "waiting for a live replacement with a nix shell; relaunch will not be repeated")
             log(directory, session, history, "pending", reason)
             if still_broken or time.time() - history["restart_at"] >= limits.relaunch_seconds:
-                alert(directory, limits, session, history, reason)
+                alert(directory, limits, session, history, reason, histories=histories)
         return
     held = hold_reason()
     if held:
@@ -563,7 +573,7 @@ def resume_pending(directory: Path, limits: HealLimits, session: HealSession, pe
                 history["pending"] = NoPendingRestart(kind="none")
                 reason = "unsent shutdown request lost its original session process; restart cancelled"
                 log(directory, session, history, "refused", reason)
-                alert(directory, limits, session, history, reason)
+                alert(directory, limits, session, history, reason, histories=histories)
                 return
             if not request_stop(directory, limits, session, pending, history, histories):
                 return
@@ -571,12 +581,12 @@ def resume_pending(directory: Path, limits: HealLimits, session: HealSession, pe
         return
     if isinstance(completion, StopRefused):
         log(directory, session, history, "refused", completion.reason)
-        alert(directory, limits, session, history, completion.reason)
+        alert(directory, limits, session, history, completion.reason, histories=histories)
         return
     loaded = nix_env.ensure(session.cwd)
     if isinstance(loaded, nix_env.Refused):
         log(directory, session, history, "refused", loaded.reason)
-        alert(directory, limits, session, history, loaded.reason)
+        alert(directory, limits, session, history, loaded.reason, histories=histories)
         return
     held = hold_reason()
     if held:
@@ -598,14 +608,14 @@ def resume_pending(directory: Path, limits: HealLimits, session: HealSession, pe
             result = stop_resume.resume(session.session_id, why="nix shell heal")
         except (OSError, subprocess.TimeoutExpired) as error:
             log(directory, session, history, "refused", str(error))
-            alert(directory, limits, session, history, str(error))
+            alert(directory, limits, session, history, str(error), histories=histories)
             return
     if not isinstance(result, stop_resume.ClaudeUp):
         reason = (result.reason
                   if isinstance(result, stop_resume.ResumeFailed)
                   else "no local session tab")
         log(directory, session, history, "refused", reason)
-        alert(directory, limits, session, history, reason)
+        alert(directory, limits, session, history, reason, histories=histories)
         return
     replacement = find_session(session.session_id)
     if isinstance(replacement, Unavailable):
@@ -637,7 +647,7 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
         if replaced or now - history["restart_at"] >= interval:
             reason = "session still has no nix shell after its heal restart"
             log(directory, session, history, "refused", reason)
-            alert(directory, limits, session, history, reason)
+            alert(directory, limits, session, history, reason, histories=histories)
             return
         log(directory, session, history, "skip", f"heal restart already requested within {interval / 60:g} minutes")
         return
@@ -647,7 +657,7 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
     loaded = nix_env.ensure(session.cwd)
     if isinstance(loaded, nix_env.Refused):
         log(directory, session, history, "refused", loaded.reason)
-        alert(directory, limits, session, history, loaded.reason)
+        alert(directory, limits, session, history, loaded.reason, histories=histories)
         return
     # Loading can take minutes. Recheck both coordination and identity before
     # shutdown gets authority to stop a process.
@@ -669,7 +679,7 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
     if selected is None:
         reason = "cannot identify the session's Claude account"
         log(directory, session, history, "refused", reason)
-        alert(directory, limits, session, history, reason)
+        alert(directory, limits, session, history, reason, histories=histories)
         return
     held = hold_reason()
     if held:
@@ -690,7 +700,8 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
     resume_pending(directory, limits, session, pending, history, histories)
 
 
-def report_one(directory: Path, limits: HealLimits, session: HealSession, history: HealHistory) -> None:
+def report_one(directory: Path, limits: HealLimits, session: HealSession, history: HealHistory,
+               histories: dict[str, HealHistory]) -> None:
     """Alert the owning showrunner once about a broken session; never stop or start it."""
     observation = inspect(session)
     if isinstance(observation, Healthy):
@@ -704,7 +715,7 @@ def report_one(directory: Path, limits: HealLimits, session: HealSession, histor
     if history["notified"]:
         return
     log(directory, session, history, "refused", NO_RESTART_REASON)
-    alert(directory, limits, session, history, NO_RESTART_REASON)
+    alert(directory, limits, session, history, NO_RESTART_REASON, histories=histories)
 
 
 def sweep(only: str = "", check: bool = False, no_restart: bool = False) -> int:
@@ -762,7 +773,7 @@ def sweep(only: str = "", check: bool = False, no_restart: bool = False) -> int:
                 history = histories.setdefault(session.session_id, new_history())
                 try:
                     if no_restart:
-                        report_one(directory, limits, session, history)
+                        report_one(directory, limits, session, history, histories)
                     else:
                         heal_one(directory, limits, session, history, histories)
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
