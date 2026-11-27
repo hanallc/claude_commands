@@ -636,6 +636,34 @@ class ProducerLifecycleTests(unittest.TestCase):
         self.assertIsNone(staff.snapshot().by_id(row.id))
         self.assertIsNone(self.profile(row.name))
 
+    def test_producer_retirement_retries_receipt_cleanup_after_staff_removal(self) -> None:
+        row = self.producer("dwight")
+        _ = legacy_producer_fixture(row.id, "claude:sonnet:high")
+        receipts = pane_record.record_directory()
+        receipt = receipts / f".producer-retire-{row.id}"
+        handoff = receipts / f".producer-handoff-{row.id}"
+        handoff.parent.mkdir(parents=True, exist_ok=True)
+        _ = handoff.write_text("{}\n", encoding="utf-8")
+        unlink = Path.unlink
+
+        def fail_unlink(path: Path, missing_ok: bool = False) -> None:
+            if path == handoff:
+                raise PermissionError("fixture receipt unlink failed")
+            unlink(path, missing_ok=missing_ok)
+
+        with (patch.object(producer_lifecycle, "_machinery_stop"),
+              patch.object(staff, "require_stopped"),
+              patch.object(Path, "unlink", fail_unlink)):
+            code, output, errors = command("retire", row.name)
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("fixture receipt unlink failed", errors)
+        self.assertIsNone(staff.snapshot().by_id(row.id))
+        self.assertTrue(handoff.exists())
+        self.assertTrue(receipt.exists())
+        self.assertEqual(command("retire", row.name), (0, "dwight: retired\n", ""))
+        self.assertFalse(handoff.exists())
+        self.assertFalse(receipt.exists())
+
 
     def test_producer_retirement_can_skip_handoff_for_a_clone(self) -> None:
         row = self.producer("dwight")

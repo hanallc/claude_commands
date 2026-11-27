@@ -108,7 +108,8 @@ class EnrolledProductionShutdownTests(StaffTestCase):
             with self.subTest(branch=branch):
                 retiring = shutdown.RetiringUnit(production, unit.name, target, branch, unit)
                 with redirect_stderr(io.StringIO()) as notices:
-                    result = shutdown.retirement_remove(retiring, settings=settings)
+                    checked = shutdown.retirement_check(retiring, settings=settings)
+                    result = shutdown.retirement_remove(retiring, checked, settings=settings)
                 if kept:
                     self.assertIn("protected production", result[0])
                     self.assertEqual(notices.getvalue(), "")

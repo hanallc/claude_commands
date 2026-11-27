@@ -314,8 +314,29 @@ def _request_handoff(row: staff.StaffRow, handoff: Path, profile: models_registr
 
 
 def _clear_retirement_state(identity: staff.StaffId) -> None:
-    for operation in ("retire", "handoff"):
+    for operation in ("handoff", "retire"):
         _path(operation, identity).unlink(missing_ok=True)
+
+
+def finish_removed(reference: str, record: staff.StaffSnapshot) -> bool:
+    """Clear receipts for a producer whose staff row is gone."""
+    matches: list[staff.StaffRow] = []
+    for path in pane_record.record_directory().glob(".producer-retire-*"):
+        raw = _read(path).get("completed_row")
+        if raw is None:
+            continue
+        row = staff.StaffRow.from_json(raw)
+        if (row.kind == "producer" and path == _path("retire", row.id)
+                and record.by_id(row.id) is None and reference in (row.id, row.name, row.current_session)):
+            matches.append(row)
+    if len(matches) > 1:
+        raise ValueError(f"{reference}: several retirement receipts match; use a staff id")
+    if not matches:
+        return False
+    row = matches[0]
+    _clear_retirement_state(row.id)
+    print(f"{row.name}: retired")
+    return True
 
 
 def _showrunner(item: the_list.ListItem, record: staff.StaffSnapshot) -> staff.StaffRow | None:
@@ -377,6 +398,8 @@ def requires_handoff(row: staff.StaffRow) -> bool:
 
 
 def _finish_retirement(row: staff.StaffRow) -> int:
+    path = _path("retire", row.id)
+    _write(path, {**_read(path), "completed_row": row.to_json()})
     _ = staff.retire(row.id)
     _clear_retirement_state(row.id)
     print(f"{row.name}: retired")
