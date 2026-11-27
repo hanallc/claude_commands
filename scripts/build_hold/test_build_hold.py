@@ -2811,7 +2811,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         self.assertEqual([row["pid"] for row in self.rows()], [30])
 
     def test_merge_gate_stops_the_job_root_and_descendants_without_stopping_the_gate(self) -> None:
-        self.gate_job(("python3", "/scripts/production/merge_gate.py", "--tests-only"))
+        self.gate_job(("python3", "/scripts/production/gate.py", "--tests-only"))
         self.assert_gate_job_stopped()
 
     def test_verify_stops_the_job_root_and_descendants_without_stopping_the_gate(self) -> None:
@@ -2831,7 +2831,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         self.assertEqual([row["pid"] for row in self.rows()], [30])
 
     def test_two_build_processes_in_one_gate_job_produce_one_stop(self) -> None:
-        self.gate_job(("python3", "/scripts/production/merge_gate.py", "--tests-only"))
+        self.gate_job(("python3", "/scripts/production/gate.py", "--tests-only"))
         _ = self.process(50, "cargo", parent=20, argv=("cargo", "check"))
         signals, decisions = self.enforce_builds()
         self.assertEqual(signals[0], (20, signal.SIGTERM))

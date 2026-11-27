@@ -33,7 +33,7 @@ import subprocess
 import sys
 import tarfile
 from threading import Thread
-from time import monotonic, sleep, time
+from time import monotonic, sleep, time, time_ns
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -75,6 +75,13 @@ INNER_CONNECT_STATUS = 254
 GUEST_ACCEPTED = 'mac-linux command accepted'
 INNER_CONNECT_ERROR = re.compile(
     r'ssh: connect to host [^\s]+ port [0-9]+: Connection (?:reset by peer|refused)\r?\n?')
+SSH_CONNECT_ERROR = re.compile(
+    r'^ssh: (?:connect to host \S+ port [0-9]+: |Could not resolve hostname )'
+    + r'|^(?:Connection timed out during banner exchange'
+    + r'|(?:banner exchange: Connection to \S+ port [0-9]+: |kex_exchange_identification: (?:(?:read|write): )?)'
+    + r'(?:Broken pipe|Operation timed out|Connection (?:closed by remote host|reset by peer|timed out)))\r?$',
+    re.MULTILINE,
+)
 # Allow time for setup, cleanup, and result transfer.
 TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
@@ -634,12 +641,47 @@ def retry_guest_connect[Output: (bytes, str)](
     if not attempts:
         raise GuestConnectAttemptsFailed('the guest connect deadline expired before SSH')
     suffix = 'attempt' if attempts == 1 else 'attempts'
-    raise GuestConnectAttemptsFailed(f'{diagnostic} after {attempts} connect {suffix}')
+    raise GuestConnectionFailed(f'{diagnostic} after {attempts} connect {suffix}')
 
 
 def run_guest_ssh(command: tuple[str, ...], timeout: float) -> subprocess.CompletedProcess[str]:
+    environment = guest_ssh_environment()
+    environment['LC_ALL'] = 'C'
     return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
-                          timeout=timeout, check=False, env=guest_ssh_environment())
+                          timeout=timeout, check=False, env=environment)
+
+
+def ssh_could_not_connect(reply: subprocess.CompletedProcess[str]) -> bool:
+    return (reply.returncode == 255 and not reply.stdout
+            and SSH_CONNECT_ERROR.search(reply.stderr) is not None)
+
+
+def record_guest_probe_failure(error: BaseException) -> None:
+    from scripts.mac_test import offload
+
+    try:
+        delay = conf.read('mac_test').number('unreachable_backoff_s')
+        offload.write_backoff(time() + delay, TARGET, strict=True)
+    except (conf.Unusable, OSError) as backoff_error:
+        error.add_note(f'Cannot record the {TARGET} backoff: {backoff_error}')
+
+
+@contextmanager
+def guest_probe() -> Generator[None]:
+    """Use the same backoff for placement and background recovery."""
+    from scripts.mac_test import offload
+
+    started_ns = time_ns()
+    if isinstance(eligibility.read_backoff(time(), TARGET), eligibility.ActiveBackoff):
+        raise GuestUnavailable('guest unreachable during retry backoff')
+    try:
+        yield
+    except GuestConnectionFailed as error:
+        record_guest_probe_failure(error)
+        raise
+    else:
+        with suppress(OSError):
+            offload.record_reachable(TARGET, probe_started_ns=started_ns)
 
 
 def read_guest_main(settings: GuestSettings, *, wait_limit_seconds: float = math.inf) -> GuestMain | EmptyGuestMain:
@@ -653,16 +695,18 @@ if [ -f "$checkout/.git/HEAD" ]; then
 fi'''
     command = settings.command(shell)
     deadline = monotonic() + min(settings.unreachable_wait_seconds, wait_limit_seconds)
-    reply = retry_guest_connect(lambda remaining: run_guest_ssh(command, min(GUEST_REF_TIMEOUT_SECONDS, remaining)),
-                                deadline)
-    if reply.returncode:
-        raise GuestUnavailable(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
-    commit = reply.stdout.strip()
-    if not commit:
-        return EmptyGuestMain()
-    if re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', commit) is None:
-        raise GuestUnavailable('the guest main probe returned an invalid commit ID')
-    return GuestMain(commit)
+    with guest_probe():
+        reply = retry_guest_connect(lambda remaining: run_guest_ssh(command, min(GUEST_REF_TIMEOUT_SECONDS, remaining)),
+                                    deadline)
+        if reply.returncode:
+            failure = GuestConnectionFailed if ssh_could_not_connect(reply) else GuestUnavailable
+            raise failure(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
+        commit = reply.stdout.strip()
+        if not commit:
+            return EmptyGuestMain()
+        if re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', commit) is None:
+            raise GuestUnavailable('the guest main probe returned an invalid commit ID')
+        return GuestMain(commit)
 
 
 class ArmedGuestAttemptRecord(TypedDict):
@@ -710,7 +754,11 @@ class GuestPermissionUnknown(GuestTookNoRun):
 
 
 class GuestConnectAttemptsFailed(GuestTookNoRun):
-    """The inner SSH connection failed before the guest received a command."""
+    """The command did not connect before its deadline."""
+
+
+class GuestConnectionFailed(GuestConnectAttemptsFailed):
+    """An SSH client could not connect to one of the hosts."""
 
 
 @dataclass(frozen=True)
@@ -1119,11 +1167,21 @@ class GuestNotStartedProven:
     """The guest received no arm command or recorded a refusal before it armed."""
 
 
+def run_guest_end_probe(command: tuple[str, ...], timeout: float) -> subprocess.CompletedProcess[str]:
+    with guest_probe():
+        reply = run_guest_ssh(command, timeout)
+        if ssh_could_not_connect(reply) or inner_connect_failure(reply):
+            raise GuestConnectionFailed(reply.stderr.strip())
+        if reply.returncode == 255:
+            raise GuestUnavailable(reply.stderr.strip() or 'cleanup SSH exited 255')
+        return reply
+
+
 def recover_guest_launch(settings: GuestSettings, attempt: str) -> GuestEndProven | GuestNotStartedProven | GuestEndPending:
     command = guest_arm_command(settings, attempt, 'recover')
     try:
-        reply = run_guest_ssh(command, GUEST_CLEANUP_TIMEOUT_SECONDS)
-    except (OSError, subprocess.TimeoutExpired) as error:
+        reply = run_guest_end_probe(command, GUEST_CLEANUP_TIMEOUT_SECONDS)
+    except (GuestUnavailable, OSError, subprocess.TimeoutExpired) as error:
         return GuestEndPending(str(error) or type(error).__name__)
     if reply.returncode == 0 and reply.stdout == 'not started\n':
         return GuestNotStartedProven()
@@ -1134,6 +1192,12 @@ def recover_guest_launch(settings: GuestSettings, attempt: str) -> GuestEndProve
 
 def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
                     proof_deadline: float = math.inf) -> GuestEndProven | GuestEndPending:
+    return _prove_guest_end(settings, armed, run_guest_ssh, proof_deadline=proof_deadline)
+
+
+def _prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt,
+                     run: Callable[[tuple[str, ...], float], subprocess.CompletedProcess[str]], *,
+                     proof_deadline: float = math.inf) -> GuestEndProven | GuestEndPending:
     if settings.guest_user != armed.guest_user:
         # The run lock lives in the armed account's checkout; another account cannot prove its end.
         return GuestEndPending(f'The guest account changed from {armed.guest_user} to {settings.guest_user}.')
@@ -1142,9 +1206,8 @@ def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
         now = monotonic()
         if now >= proof_deadline:
             return GuestEndPending('The proof deadline expired before cleanup SSH.')
-        reply = run_guest_ssh(command, min(GUEST_CLEANUP_TIMEOUT_SECONDS, settings.unreachable_wait_seconds,
-                                           proof_deadline - now))
-    except (OSError, subprocess.TimeoutExpired) as error:
+        reply = run(command, min(GUEST_CLEANUP_TIMEOUT_SECONDS, settings.unreachable_wait_seconds, proof_deadline - now))
+    except (GuestUnavailable, OSError, subprocess.TimeoutExpired) as error:
         return GuestEndPending(str(error) or type(error).__name__)
     if diagnostic := inner_connect_failure(reply):
         return GuestEndConnectPending(diagnostic)
@@ -1160,7 +1223,7 @@ def prove_kept_guest_end(armed: ArmedGuestAttempt) -> GuestEndProven | GuestEndP
         settings = read_settings(conf.read('build_targets'))
     except (GuestUnavailable, OSError, ValueError) as error:
         return GuestEndPending(str(error) or type(error).__name__)
-    return prove_guest_end(settings, armed)
+    return _prove_guest_end(settings, armed, run_guest_end_probe)
 
 
 @dataclass
@@ -2214,24 +2277,15 @@ def guest_failure(tests_started: bool, reason: str) -> GuestUnavailable:
     return (GuestResultUnavailable if tests_started else GuestTookNoRun)(reason)
 
 
-def guest_probe_failure(probe: str, error: Exception) -> GuestTookNoRun:
-    from scripts.mac_test import offload
-
-    refused = GuestTookNoRun(f'the guest {probe} probe failed: {error}')
-    try:
-        delay = conf.read('mac_test').number('unreachable_backoff_s')
-        offload.write_backoff(time() + delay, TARGET, strict=True)
-    except (conf.Unusable, OSError) as backoff_error:
-        refused.add_note(f'Cannot record the {TARGET} backoff: {backoff_error}')
-    return refused
-
-
 def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundle:
     """Probe the guest main commit and omit the history already on the guest."""
     try:
         guest = read_guest_main(settings)
     except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
-        raise guest_probe_failure('main', error) from error
+        refused = GuestTookNoRun(f'the guest main probe failed: {error}')
+        for note in cast(list[str], getattr(error, '__notes__', [])):
+            refused.add_note(note)
+        raise refused from error
     if isinstance(guest, EmptyGuestMain):
         return FullBundle(BundleReason.FIRST_RUN)
     if subprocess.run(['git', 'cat-file', '-e', f'{guest.commit}^{{commit}}'], cwd=repo,
@@ -2565,7 +2619,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 try:
                     identity = read_guest_checkout(settings, repo)
                 except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
-                    raise guest_probe_failure('checkout', error) from error
+                    checkout_failure = GuestTookNoRun(f'the guest checkout probe failed: {error}')
+                    record_guest_probe_failure(checkout_failure)
+                    raise checkout_failure from error
                 settings = replace(settings, checkout_identity=identity)
                 launch = _record_guest_launch(assignment, claim, settings)
                 dispatch = GuestGateDispatch(assignment, consume_launch_permission(launch, assignment))

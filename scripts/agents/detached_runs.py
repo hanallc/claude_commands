@@ -1962,7 +1962,7 @@ def _start_refusal(run: Path) -> str:
     return ""
 
 
-SCOPE_REFUSAL = ("detached_runs: Start with systemd-run --scope or systemd-run --user --scope. "
+SCOPE_REFUSAL = ("detached_runs: Start with systemd-run --scope --collect or systemd-run --user --scope --collect. "
                  + "Use the exact option names in that order.")
 
 

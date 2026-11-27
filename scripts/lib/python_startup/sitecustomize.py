@@ -340,7 +340,7 @@ def _gate_command(pid: str) -> bool:
             entry = (cwd / item).resolve(strict=True)
             installed = Path(getpwuid(os.getuid()).pw_dir, ".claude").resolve()
             roots = (Path(__file__).resolve().parents[3], installed)
-            return (entry.name in {"gate.py", "merge_gate.py", "targeted_test.py", "merge_checkpoint.py"}
+            return (entry.name in {"gate.py", "merge_checkpoint.py"}
                     and any(entry.parent == root / "scripts/production" for root in roots))
     except (KeyError, OSError, ValueError):
         pass
@@ -348,7 +348,7 @@ def _gate_command(pid: str) -> bool:
 
 
 def _gate_identity() -> GateParent:
-    parent = os.environ.get("GATE_PARENT_PID") or os.environ.get("MERGE_GATE_PARENT_PID", "")
+    parent = os.environ.get("GATE_PARENT_PID", "")
     if not parent:
         return UnverifiedGateParent()
     if sys.platform != "linux":
@@ -378,7 +378,6 @@ def gate_parent(consume: bool = False) -> GateParent:
                 or (not isinstance(identity, UnverifiedGateParent) and _remember_gate(identity.pid)))
     if consume or not accepted:
         _ = os.environ.pop("GATE_PARENT_PID", None)
-        _ = os.environ.pop("MERGE_GATE_PARENT_PID", None)
         _ = os.environ.pop(GATE_PARENT_SOURCE_FD, None)
         if isinstance(identity, VerifiedGateParentWithDescriptor):
             os.close(identity.descriptor)
@@ -471,7 +470,7 @@ def _verified_gate() -> bool:
         readable, _, _ = select.select([running_gate], [], [], 0)
         if readable:
             return False
-        if "GATE_PARENT_PID" in os.environ or "MERGE_GATE_PARENT_PID" in os.environ:
+        if "GATE_PARENT_PID" in os.environ:
             _ = gate_parent()
         return True
     return not isinstance(gate_parent(), UnverifiedGateParent)
@@ -507,7 +506,7 @@ def _descends_from_gate_module() -> bool:
                     contents = source.read(_GATE_ENVIRONMENT_LIMIT)
                 environment = dict(item.split(b"=", 1) for item in contents.split(b"\0")[:-1] if b"=" in item)
                 parent_text = str(parent)
-                expected = environment.get(b"GATE_PARENT_PID") or environment.get(b"MERGE_GATE_PARENT_PID", b"")
+                expected = environment.get(b"GATE_PARENT_PID", b"")
                 if expected == parent_text.encode():
                     raw = environment.get(os.fsencode(GATE_PARENT_SOURCE_FD), b"")
                     if _launching_gate(parent_text, _gate_source_descriptor(os.fsdecode(raw))):
