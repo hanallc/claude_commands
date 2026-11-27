@@ -2028,8 +2028,9 @@ async function inspect(){
  unlinked.click();
  unlinked.remove();
  row().querySelector('.list-toggle').click();
- const doneScroll=win.scrollY;
- const doneLink=link('sdlc/C2'),done=await readCard(doneLink);
+ const doneLink=link('sdlc/C2');
+ doneLink.scrollIntoView({block:'nearest',behavior:'instant'});
+ const doneScroll=win.scrollY,done=await readCard(doneLink);
  check(dialog.open && done.querySelector('[data-state="Done"]'),'Done opens in the dialog.');
  check(!done.querySelector('[data-review-form]'),'The Done card has no action form.');
  const shortBody=done.querySelector('.review-box-scroll');
@@ -2495,6 +2496,153 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                 if size in ("1440,1000", "600,900"):
                     reviewed = {row["#"]: row["Verdict"] for row in change_review.review_snapshot(listing).reviewed}
                     self.assertIn("works", reviewed["C1"].casefold())
+
+    @contextmanager
+    def studio_review_server(self) -> Generator[str]:
+        root = self.root / "reviews"
+        with (patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+              started_review_server(("127.0.0.1", 0), root, initialize_review=True) as server):
+            worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            worker.start()
+            try:
+                yield f"http://127.0.0.1:{server.server_port}"
+            finally:
+                server.shutdown()
+                worker.join(5)
+
+    def open_studio_review_fixture(self, origin: str, fragment: str = "") -> None:
+        browser = self.chrome()
+        _ = browser.command("Emulation.setDeviceMetricsOverride",
+            {"width": 1440, "height": 900, "deviceScaleFactor": 1, "mobile": False}, browser.session)
+        _ = browser.command("Emulation.setEmulatedMedia",
+            {"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]}, browser.session)
+        browser.navigate(origin + studio_page.PAGE_PATH + fragment)
+
+    def studio_review_check(self, steps: str) -> None:
+        browser = self.chrome()
+        script = r"""(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const dialog=document.querySelector('[data-list-review-dialog]');
+ const row=number=>document.querySelector('[data-list-item][data-number="'+number+'"]');
+ const close=()=>dialog.querySelector('[data-close]').click();
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const until=predicate=>new Promise(resolve=>{
+  const observer=new MutationObserver(ready);
+  function ready(){if(predicate()){observer.disconnect();resolve();}}
+  observer.observe(document.body,{subtree:true,childList:true,attributes:true});ready();
+ });
+ async function open(link){
+  link.click();
+  const frame=dialog.querySelector('iframe');
+  if(!dialog.open || !frame) throw new Error('The link did not open a card.');
+  await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  return frame.contentDocument;
+ }
+ try{
+ __STUDIO_REVIEW_STEPS__
+ }catch(error){failures.push(String(error));}
+ return failures;
+})()""".replace("__STUDIO_REVIEW_STEPS__", steps)
+        result = browser.command("Runtime.evaluate",
+                                 {"expression": script, "awaitPromise": True, "returnByValue": True}, browser.session)
+        self.assertNotIn("exceptionDetails", result, result)
+        value = cast(dict[str, object], result["result"])
+        self.assertEqual(value.get("value"), [])
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_studio_evidence_opens_only_reviews_linked_to_the_item(self) -> None:
+        review = investigation.file(OWNER.id, "Find the cause", "Read the failed check.", waiting_why="Work continues.")
+        key = review_items.investigation_record_key(review)
+        with self.studio_review_server() as origin:
+            linked = review_page.PAGE_PATH + "?show=all#show=open&" + urlencode({"jump": key})
+            wrapped = "/console/" + console.place_query("review", linked)
+            unrelated = review_page.PAGE_PATH + "?" + urlencode({"item": "unrelated/I1"})
+            foreign = "https://example.invalid" + linked
+            item = self.add("Check the evidence", number=1, evidence="\n".join(
+                (origin + linked, origin + wrapped, origin + unrelated, foreign)))
+            _ = the_list.link(MORTY.id, item.id, (key,), source="morty")
+            self.open_studio_review_fixture(origin)
+            self.studio_review_check(r"""
+ const item=row(1);item.querySelector('.list-toggle').click();
+ const evidence=[...recordDetails(item).querySelectorAll('.item-links a')];
+ check(evidence.length===4,'The item shows four Evidence links.');
+ for(const link of evidence.slice(0,2)){
+  const card=await open(link);
+  check(card.querySelector('.review-box')?.dataset.key===KEY,'Evidence opens the linked review card.');
+  check(dialog.querySelector('h2').textContent==='L1 · Check the evidence','The window names the source item.');
+  close();
+  check(document.activeElement===link,'Close returns focus to the Evidence link.');
+ }
+ for(const link of evidence.slice(2)){
+  window.addEventListener('click',event=>{
+   check(!event.defaultPrevented && !dialog.open && link.target==='_blank','The unrelated URL stays direct.');
+   event.preventDefault();
+  },{once:true});
+  link.click();
+ }
+""".replace("KEY", json.dumps(key)))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_review_close_restores_the_source_row_after_refresh(self) -> None:
+        review = investigation.file(OWNER.id, "Find the cause", "Read the failed check.", waiting_why="Work continues.")
+        key = review_items.investigation_record_key(review)
+        for number in range(1, 19):
+            item = self.add(f"Item {number}", number=number)
+            if number == 10:
+                _ = the_list.link(MORTY.id, item.id, (key,), source="morty")
+        with self.studio_review_server() as origin:
+            self.open_studio_review_fixture(origin, "#" + urlencode({"sort": "#", "dir": "desc"}))
+            self.studio_review_check(r"""
+ const item=row(10),summary=item.querySelector('.list-row');
+ await until(()=>summary.querySelector('a[data-list-review-card]'));
+ scrollBy({top:summary.getBoundingClientRect().top-180,behavior:'instant'});
+ const card=await open(summary.querySelector('a[data-list-review-card]'));
+ check(!!card.querySelector('.review-box'),'The linked card is open.');
+ window.reviewClosePosition={top:summary.getBoundingClientRect().top,scroll:scrollY};
+""")
+            for number in range(19, 27):
+                _ = self.add(f"New item {number}", number=number)
+            self.studio_review_check(r"""
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await until(()=>row(26) && row(10).querySelector('a[data-list-review-card]'));
+ await paint();
+ check(dialog.open,'The refresh keeps the review window open.');
+ const item=row(10),summary=item.querySelector('.list-row'),link=summary.querySelector('a[data-list-review-card]');
+ const {top,scroll}=window.reviewClosePosition;
+ check(row(26).getBoundingClientRect().top<summary.getBoundingClientRect().top,'The new rows are above the item.');
+ close();
+ await paint();
+ const bounds=link.getBoundingClientRect();
+ check(!dialog.open && recordIsOpen(item) && document.activeElement===link,'Close focuses the source link.');
+ check(Math.abs(summary.getBoundingClientRect().top-top)<2 && scrollY>scroll,
+  'Close restores the row position in the updated table.');
+ check(bounds.top>=0 && bounds.bottom<=innerHeight,'The source link is visible.');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_review_mark_read_updates_the_item_behind_the_window(self) -> None:
+        review = investigation.file(OWNER.id, "Find the cause", "Read the failed check.", waiting_why="Work continues.")
+        key = review_items.investigation_record_key(review)
+        item = self.add("Read the linked answer", number=1)
+        _ = the_list.link(MORTY.id, item.id, (key,), source="morty")
+        with patch("scripts.review_links.answer_sources.file_saved_investigation"):
+            _ = investigation.answer(review.owner, review.id, "The timeout was too short.")
+        with self.studio_review_server() as origin:
+            self.open_studio_review_fixture(origin)
+            self.studio_review_check(r"""
+ const summary=()=>row(1).querySelector('.list-row [data-list-review-summary]');
+ await until(()=>summary()?.querySelector('a'));
+ check(summary().textContent==='1 review for you','The linked answer starts unread.');
+ const card=await open(summary().querySelector('a'));
+ const button=card.querySelector('[data-review-form] button[value="read"]');
+ button.form.requestSubmit(button);
+ await until(()=>!dialog.open && summary()?.textContent.includes('Reviews done'));
+ check(recordIsOpen(row(1)),'The item stays open after Mark read.');
+ check(summary().textContent==='Reviews done — decide: close, keep or park','The item shows the completed review.');
+""")
+        self.assertIs(investigation.load(review.owner, review.id).state, investigation.InvestigationState.READ)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_list_links_show_the_target_inside_the_console(self) -> None:

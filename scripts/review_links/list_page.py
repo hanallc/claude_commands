@@ -1326,6 +1326,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     }
     if isinstance(item.report, the_list.ListReport):
         attributes["report"] = item.report.kind.value
+    if item.reviews:
+        attributes["list-review-keys"] = json.dumps(item.reviews, ensure_ascii=False)
     if item.state is the_list.ItemState.CLOSED:
         attributes["linked-closed-item"] = ""
     keeper = names.members.by_id(entry.keeper)
@@ -4134,6 +4136,9 @@ function applyListSnapshot(fresh){
 }
 const reviewDialog=document.querySelector('[data-list-review-dialog]');
 const reviewTitle=reviewDialog.querySelector('#list-review-title'),reviewClose=reviewDialog.querySelector('[data-close]');
+const reviewPagePath=''' + json.dumps(review_page.PAGE_PATH) + r''';
+// The Studio source serves the card even after the answer moves to the List.
+const studioCardSource=''' + json.dumps(review_page.ReviewBodyView.STUDIO_QUESTION.value) + r''';
 const reviewMotion=createCardMotion(()=>content);
 const listHost=window.frameElement?.matches('iframe[data-console-page="list"],iframe[data-console-page="studio"]')
  ? window.frameElement : null;
@@ -4159,24 +4164,33 @@ function fitReviewDialog(){
 }
 function reviewLinkPlace(link){
  const row=recordFromDetail(link),href=link.getAttribute('href');
- const selector='[data-list-review-card][href="'+CSS.escape(href)+'"]';
+ const selector='a[href="'+CSS.escape(href)+'"]';
  const detail=recordDetails(row).contains(link),scope=detail ? recordDetails(row) : row;
  return {key:row.dataset.key,selector,detail,position:[...scope.querySelectorAll(selector)].indexOf(link)};
 }
-function restoreReviewLink({key,selector,detail,position}){
- const findRow=()=>content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]:not([hidden])');
+function restoreReviewLink({key,selector,detail,position},reveal=false){
+ const findRow=()=>{
+  const row=rowIn(content,key);
+  return row && !row.hidden ? row : null;
+ };
  const visibleLink=row=>{
   const scope=detail ? recordDetails(row) : row;
   const link=scope?.querySelectorAll(selector)[position];
   return link?.getClientRects().length ? link : null;
  };
+ const focus=target=>{
+  target.focus({preventScroll:true});
+  if(reveal) target.scrollIntoView({block:'nearest',inline:'nearest',behavior:'instant'});
+ };
  const row=findRow(),link=visibleLink(row);
  const target=link || row?.querySelector('.list-toggle') || content.querySelector('#list-search');
- target.focus({preventScroll:true});
+ focus(target);
  if(!link && row?.hasAttribute('data-list-review-version') && listCounts){
   void listCounts.then(()=>{
-   if(!activeReview && listOwnsFocus() && document.activeElement===target)
-    visibleLink(findRow())?.focus({preventScroll:true});
+   if(!activeReview && listOwnsFocus() && document.activeElement===target){
+    const link=visibleLink(findRow());
+    if(link) focus(link);
+   }
   });
  }
 }
@@ -4184,6 +4198,7 @@ function showReviewCard(card){
  activeReview=card;
  card.frame.hidden=false;
  card.scrollTop=scrollY;
+ card.rowTop=visibleRecordRow(rowIn(content,card.link.key))?.getBoundingClientRect().top;
  reviewTitle.textContent=card.title;
  card.restoreHost=fitReviewDialog();
  reviewClose.disabled=card.frame.hasAttribute('data-saving');
@@ -4200,8 +4215,10 @@ function hideReviewCard(card){
  card.restoreHost();
  card.frame.hidden=true;
  if(!listHost?.hidden && document.visibilityState==='visible'){
-  scrollTo({top:card.scrollTop,behavior:'instant'});
-  restoreReviewLink(card.link);
+  const currentTop=visibleRecordRow(rowIn(content,card.link.key))?.getBoundingClientRect().top;
+  const top=currentTop===undefined || card.rowTop===undefined ? card.scrollTop : scrollY+currentTop-card.rowTop;
+  scrollTo({top,behavior:'instant'});
+  restoreReviewLink(card.link,true);
  }
 }
 function reopenReturnedReview(){
@@ -4243,13 +4260,32 @@ if(listHost) new MutationObserver(()=>{
   closeReviewCard();
 }).observe(listHost,{attributes:true,attributeFilter:['hidden']});
 bindConsoleDialog(reviewDialog,closeReviewCard);
+function studioReviewCard(link,row){
+ const marked=link.hasAttribute('data-list-review-card');
+ if((!marked && !row.dataset.listReviewKeys) || !URL.canParse(link.href)) return;
+ let url=new URL(link.href);
+ if(url.origin!==location.origin) return;
+ if(!marked && url.searchParams.get('page')==='review' &&
+    /^\/console(?:\/(?:console\.html|index\.html)?)?$/.test(url.pathname)){
+  const place=url.searchParams.get('at.review');
+  if(!place || !URL.canParse(place,url)) return;
+  url=new URL(place,url);
+ }
+ if(url.origin!==location.origin || url.pathname.replace(/\.html$/,'')!==reviewPagePath.replace(/\.html$/,'')) return;
+ const fragment=new URLSearchParams(url.hash.slice(1));
+ const key=url.searchParams.get('jump') || url.searchParams.get('item') || url.searchParams.get('body') ||
+    fragment.get('jump') || fragment.get('item');
+ if(!key || (!marked && !JSON.parse(row.dataset.listReviewKeys).includes(key))) return;
+ return new URL(reviewPagePath+'?'+new URLSearchParams({body:key,view:'card',from:studioCardSource}),location.href).href;
+}
 document.addEventListener('click',event=>{
- const link=event.target instanceof Element && event.target.closest('a[data-list-review-card]');
+ const link=event.target instanceof Element && event.target.closest('a[href]');
  if(!link || event.defaultPrevented || event.button!==0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
  const row=recordFromDetail(link);
  if(!row) return;
+ const href=studioReviewCard(link,row);
+ if(!href) return;
  event.preventDefault();
- const href=link.href;
  if(activeReview || [...reviewDialog.querySelectorAll('iframe[data-saving]')].some(frame=>frame.src===href)) return;
  const frame=document.createElement('iframe');
  frame.title='Review card';

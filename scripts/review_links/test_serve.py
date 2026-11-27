@@ -6007,6 +6007,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertTrue(target.startswith(studio_page.PAGE_PATH + "#item="), target)
             result = self.request(review_page.card_url(key))
             self.assertEqual((result.status, result.headers.get("location")), (303, target))
+            card = self.request(review_page.card_url(key, studio_question=True))
+            self.assertEqual(card.status, 200, card.body)
+            self.assertIn(b"<div data-review-card ", card.body)
+            self.assertIn(b"Use the wide layout.", card.body)
+            self.assertNotIn(b"<dialog data-list-review-dialog ", card.body)
 
     def test_review_waits_for_directory_sync_and_list_commit_before_feature_closeout(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)

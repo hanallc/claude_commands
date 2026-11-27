@@ -1709,15 +1709,19 @@ The expanded List row repeats the line above its actions and shows each review's
 Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
 A review ID opens one card in the item window.
+A console URL in the item opens the same window when its Review key matches a linked review.
 A summary links to the card when exactly one review is available.
 A summary for zero or multiple available reviews is plain text.
 The List loads the card document only when the dialog opens.
 The existing Review body route supplies the title, metadata, body, and controls.
+The window uses the Studio card route to show a review whose answer has moved to the List.
+The standalone card link still redirects to the item with the filed answer.
 The Review table and the dialog use the same body renderer and action code.
 The window heading shows the List item number and title, with Close beside it.
 The review card shows its own title above its metadata.
 Opening a review from the State cell expands that item.
-Close and Escape keep the item open at the same scroll position and return focus to its link.
+Close and Escape restore the open item's position in the viewport after a refresh.
+They return focus to the source link and scroll it into view if necessary.
 Review links outside a List item keep their Review page destination.
 The metadata shows the Waiting reason and urgency when available.
 The header reserves a 52 px row for the save status and Show updates.
@@ -1739,7 +1743,7 @@ The dialog reaches the right edge of the List column, so it meets the action are
 At the console's phone breakpoint, the dialog fills the screen below the action area, including in the Studio.
 On a desktop, the List centers the dialog horizontally, 16 px below the action area.
 On a page without an action area, the phone dialog fills the screen and the desktop dialog is 16 px from the top.
-The dialog dims the List with a 90 percent black backdrop and a 3 px blur.
+The dialog dims the List with a 47 percent black backdrop.
 Switching browser tabs keeps the dialog and its draft.
 Changing console pages closes an idle dialog when it has no draft.
 The dialog preserves the List and Review addresses and filters.
