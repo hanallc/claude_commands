@@ -820,28 +820,6 @@ class ResultInputWait:
     stage: str
 
 
-@dataclass(frozen=True)
-class ResultDeliveryAfterUnlock:
-    delivery: detached_runs.WorkerResultAfterUnlock
-    worker: staff.StaffRow
-    parent: staff.StaffId
-    run: Path
-    instance: str
-    stage: str
-
-    def outcome(self) -> TurnOutcome | ResultInputWait:
-        if self.delivery.replay is detached_runs.WorkerResultReplay.WAIT_FOR_INPUT:
-            selection = worker_panes.SelectedWorkerRows(frozenset({self.worker.id}))
-            membership = staff.snapshot()
-            parent = membership.by_id(self.parent)
-            if parent is not None:
-                states = worker_panes.observe_parents([parent], membership, selection=selection)[self.parent]
-                for state in states:
-                    if isinstance(state, worker_panes.OpenWorker):
-                        return ResultInputWait(state, self.run, self.instance, self.stage)
-        return TurnOutcome.RETRY_EVIDENCE
-
-
 def _wait_for_result_input(target: ResultInputWait) -> bool:
     """Wait without the worker lock or the result delivery lock."""
     pane = target.pane.pane
@@ -878,14 +856,10 @@ def _handle_event(event: WorkerEvent, owner: staff.StaffId | WorkerByThread, *,
                   ) -> TurnOutcome:
     try:
         decision = _handle_locked(event, owner, result_pass=result_pass, retry_run=retry_run, pane_wait=pane_wait)
-        if isinstance(decision, ResultDeliveryAfterUnlock):
-            decision = decision.outcome()
         if isinstance(decision, ResultInputWait):
             if not _wait_for_result_input(decision):
                 return TurnOutcome.RETRY_EVIDENCE
             decision = _handle_locked(event, decision.pane.row.id, result_pass=result_pass, result_target=decision)
-            if isinstance(decision, ResultDeliveryAfterUnlock):
-                decision = decision.outcome()
             assert not isinstance(decision, ResultInputWait)
         if isinstance(decision, TurnDecision):
             return decision.send_notice() or decision.outcome
@@ -1525,7 +1499,7 @@ def _handle_locked(event: WorkerEvent,
                    retry_run: Path | worker_panes.HolderRun = worker_panes.HolderRun.CURRENT,
                    result_target: ResultInputWait | ResultWaitTarget = ResultWaitTarget.CURRENT,
                    pane_wait: detached_runs.CompletionPaneWait = detached_runs.CompletionPaneWait.ALLOW,
-                   ) -> TurnOutcome | TurnDecision | ResultInputWait | ResultDeliveryAfterUnlock:
+                   ) -> TurnOutcome | TurnDecision | ResultInputWait:
     """Recover completion records under the worker lock."""
     record = staff.snapshot()
     row = (record.by_current_session(event.thread_id) if isinstance(owner, WorkerByThread)
@@ -1691,8 +1665,6 @@ def _handle_locked(event: WorkerEvent,
                       if parked and not ready_now else detached_runs.ParkedWorkerDelivery.DEFER)
             replay = detached_runs.submit_finished_worker_result(
                 run, row, worker_input=worker_input, resume_parked=resume, input_lock=hold, pane_wait=pane_wait)
-            if isinstance(replay, detached_runs.WorkerResultAfterUnlock):
-                return ResultDeliveryAfterUnlock(replay, row, parent.id, run, instance, stage)
             if isinstance(replay, detached_runs.ConfirmedPaneResult):
                 if replay.ownership is detached_runs.ResultPassOwnership.CURRENT:
                     if parked and not worker.clear_result_park(row, worker_panes.ParkWaitingPass(
