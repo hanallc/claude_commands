@@ -7081,6 +7081,7 @@ class PreparedAgentEnvironment:
     env: dict[str, str]
     unset_environment: frozenset[str] = NO_ENVIRONMENT_REMOVALS
     claude_home: pane_launch.ImplicitClaudeHome | pane_launch.SelectedClaudeAccount = pane_launch.SelectedClaudeAccount.USE_SELECTION
+    worker_prepared: bool = False
 
 
 @dataclass(frozen=True)
@@ -7206,6 +7207,64 @@ def in_session_folder(prepared: PreparedAgentEnvironment, member: session_folder
     return replace(prepared, env={**prepared.env, "TMPDIR": str(folder), session_folder.FOLDER_ENV: folder.name})
 
 
+_SHELL_ENVIRONMENT = frozenset({"TERM", "COLORTERM", "PWD", "OLDPWD", "SHLVL", "_"})
+
+
+def _worker_environment_name(name: str) -> bool:
+    return name not in _SHELL_ENVIRONMENT and not name.startswith("HERDR_") and bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
+
+
+def prepare_worker_launch(prepared: PreparedAgentEnvironment, kind: Literal["claude", "codex"], arguments: list[str],
+                          row: staff.StaffRow | None, record: staff.StaffSnapshot) -> tuple[PreparedAgentEnvironment, list[str]]:
+    """Resolve the worker command and environment before the launch boundary."""
+    if kind == "claude" and row is not None:
+        prepared = in_session_folder(prepared, session_folder.member_for(row, record), row.current_session)
+    values = {key: value for key, value in child_environment(prepared.env).items() if _worker_environment_name(key)}
+    values["PYTHONPATH"] = startup_pythonpath(values.get("PYTHONPATH", ""))
+    removals = frozenset(key for key in prepared.unset_environment - values.keys() if _worker_environment_name(key))
+    implicit = prepared.claude_home
+    if kind == "claude":
+        arguments = models_registry.claude_arguments(arguments, values)
+        if "CLAUDE_CONFIG_DIR" not in values:
+            implicit = pane_launch.ImplicitClaudeHome(Path(values["HOME"]))
+            removals |= {"CLAUDE_CONFIG_DIR"}
+    return replace(prepared, env=values, unset_environment=removals, claude_home=implicit, worker_prepared=True), arguments
+
+
+def verify_worker_resume(client: Herdr, pane: str, terminal: str, spec: pane_launch.WorkerResumeSpec) -> None:
+    """Prove the replacement uses the saved resume inputs."""
+    forget_pane_evidence(client.session, pane)
+    row = client.pane_row(pane)
+    if isinstance(row, NoPane) or (terminal and row.get("terminal_id") != terminal):
+        raise pane_launch.WorkerResumeUnavailable("the worker resume terminal changed")
+    info = json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"), "worker resume process")
+    owner = _require_foreground_kind(foreground_pane_owner(info), spec.kind)
+    native = read_foreground_pane_owner(owner, row)
+    argv = owner.arguments
+    offset = 2 if Path(argv[0]).name in {"node", "nodejs"} else 1
+    if (native.current_identity != spec.session or tuple(argv[offset:]) != spec.arguments
+            or not isinstance(owner.cwd, str) or Path(owner.cwd).resolve() != spec.directory
+            or any(native.environment.get(key) != value for key, value in spec.environment.items())
+            or any(key in native.environment for key in spec.unset_environment if not key.startswith("HERDR_"))):
+        raise pane_launch.WorkerResumeUnavailable("the worker launch does not match its resume specification")
+
+
+def launch_worker_resume(client: Herdr, destination: NewTab | SplitPane | ExistingPane, spec: pane_launch.WorkerResumeSpec,
+                         timeout_ms: int, *, agent: str,
+                         agent_name: str | AgentNameSource = AgentNameSource.MEMBER_REFERENCE) -> AgentLaunched:
+    """Launch and verify the saved specification before any continuation."""
+    spec.validate()
+    home = (pane_launch.ImplicitClaudeHome(Path(spec.environment["HOME"]))
+            if spec.kind == "claude" and spec.home_mode == "implicit" else pane_launch.SelectedClaudeAccount.USE_SELECTION)
+    prepared = PreparedAgentEnvironment(spec.directory, dict(spec.environment), spec.unset_environment, home, worker_prepared=True)
+    launched = launch_prepared_agent(client.session, destination, prepared, spec.kind, list(spec.arguments),
+                                     NoOpeningPrompt(), timeout_ms, agent=agent, agent_name=agent_name, client=client)
+    if isinstance(launched.outcome, PromptNotSubmitted):
+        raise pane_launch.WorkerResumeUnavailable(launched.outcome.reason)
+    verify_worker_resume(client, launched.pane, destination.terminal if isinstance(destination, ExistingPane) else "", spec)
+    return launched
+
+
 def agent_alias_script(kind: str) -> str:
     """Clear the agent alias before the shell starts the agent."""
     return f"unalias {kind} 2>/dev/null; "
@@ -7226,8 +7285,9 @@ def launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane |
                           codex: CodexConversations | CodexLaunchRead = CodexLaunchRead.CURRENT,
                           client: Herdr | LaunchClientSource = LaunchClientSource.NEW) -> AgentLaunched:
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
-    prepared = replace(prepared, env={**prepared.env, "PYTHONPATH": startup_pythonpath(prepared.env.get("PYTHONPATH", ""))},
-                       unset_environment=prepared.unset_environment - {"PYTHONPATH"})
+    if not prepared.worker_prepared:
+        prepared = replace(prepared, env={**prepared.env, "PYTHONPATH": startup_pythonpath(prepared.env.get("PYTHONPATH", ""))},
+                           unset_environment=prepared.unset_environment - {"PYTHONPATH"})
     with reboot_lock():
         return _launch_prepared_agent(name, destination, prepared, kind, agent_arguments, opening, timeout_ms,
                                       agent=agent, reported_unknown=reported_unknown, agent_name=agent_name,
@@ -7242,7 +7302,8 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
     launched_at = datetime.now(timezone.utc)
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":
-        agent_arguments = models_registry.claude_arguments(agent_arguments, prepared.env)
+        if not prepared.worker_prepared:
+            agent_arguments = models_registry.claude_arguments(agent_arguments, prepared.env)
         try:
             home = Path(prepared.env.get("HOME") or Path.home())
             configured = prepared.env.get("CLAUDE_CONFIG_DIR")
@@ -7284,7 +7345,7 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
                 raise HerdrFailure(f"would start a second copy of running session {session_id}", "already_running")
             if isinstance(observed, UnknownConversation) and not reported_unknown:
                 conversation_note(observed)
-    if kind == "claude" and folder_member is not None:
+    if kind == "claude" and folder_member is not None and not prepared.worker_prepared:
         prepared = in_session_folder(prepared, folder_member, session_id)
     terminal = ""
     if isinstance(destination, ForkTab):

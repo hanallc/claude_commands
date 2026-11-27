@@ -44,7 +44,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.production_doc import EnrolledPaths
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
-from scripts.lib import atomic_file, conf, file_lock, models_registry, process_start, unit_runs
+from scripts.lib import atomic_file, conf, file_lock, models_registry, nix_env, process_start, unit_runs
 from scripts.lib.fork_test_support import ForkChildren
 from scripts.lib.unit_runs_test_support import start_new_command
 from scripts.lib.transcript_test_support import compressed_copy
@@ -5072,6 +5072,118 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn('model_reasoning_effort="high"', arguments)
         self.assertIn('service_tier="priority"', arguments)
         self.assertEqual(environment.get(key), f"{self.fixture.parent.current_session}.phase-8")
+
+    def test_restore_replays_the_complete_worker_resume_specification(self) -> None:
+        cases: tuple[tuple[Literal["claude", "codex"], str], ...] = (
+            ("claude", "implicit"), ("claude", "explicit"), ("codex", "implicit"), ("codex", "explicit"))
+        world = self.fixture.world
+        directory = pane_launch.record_directory()
+        key = pane_launch.BERTH_SESSION_ENV
+        old_key = "old-director.phase-8"
+        expected = f"{self.fixture.parent.current_session}.phase-8"
+        model_arguments = worker_panes.launch_arguments
+        prepare_session = herdr.prepare_session_environment
+        for kind, home_mode in cases:
+            with self.subTest(kind=kind, home=home_mode):
+                role = staff.WorkerName.parse(f"{kind}-{home_mode}")
+                settings = models_registry.LaunchSettings(kind, "opus" if kind == "claude" else "gpt-explicit",
+                                                           "high", "" if kind == "claude" else "priority")
+                policy = worker_panes.worker_policy(settings)
+                account = (accounts.NamedAccount("claude3", self.fixture.root / ".claude3")
+                           if kind == "claude" and home_mode == "explicit" else worker_panes.ConfiguredWorkerAccount.CURRENT)
+                extra = (["--add-dir", str(self.fixture.root / "docs")] if kind == "claude"
+                         else ["-c", "features.shell_snapshot=false"])
+
+                def arguments(launch: worker_panes.LaunchPolicy, identity: str, folder: Path | str) -> list[str]:
+                    return [*model_arguments(launch, identity, folder), *extra]
+
+                def prepare(identity: str, cwd: str, values: dict[str, str], unset: frozenset[str]
+                            ) -> herdr.PreparedAgentEnvironment | nix_env.Refused:
+                    if kind == "codex" and home_mode == "implicit":
+                        values = {key: value for key, value in values.items() if key != "CODEX_HOME"}
+                        unset = unset | {"CODEX_HOME"}
+                    return prepare_session(identity, cwd, values, unset)
+
+                with (patch.object(worker_panes, "launch_arguments", side_effect=arguments),
+                      patch.object(herdr, "prepare_session_environment", side_effect=prepare),
+                      patch.dict(os.environ, {"RESUME_FIXTURE_VALUE": "original"})):
+                    opened = worker_panes.start_or_resume(self.fixture.parent.id, role, "impl", account=account, policy=policy)
+                assert isinstance(opened, worker_panes.OpenWorker)
+                pane_fixtures.idle_transcript(opened.row)
+                before = pane_launch.read_worker_resume(directory, opened.row.current_session)
+                assert before is not None
+                self.assertEqual(before.home_mode, home_mode)
+                self.assertEqual(before.arguments[-2:], tuple(extra))
+                dispatch = self.phase_continuation(opened, old_key)
+                with (patch.dict(os.environ, {"RESUME_FIXTURE_VALUE": "changed"}),
+                      patch.object(herdr, "launch_prepared_agent", wraps=world.launch) as launch):
+                    self.assertIs(worker.restore(self.fixture.parent.id, only=frozenset({opened.row.id})), worker.ExitCode.OK)
+                self.assertIn(f"Continue pass {dispatch}", self.fixture.prompts()[-1][3])
+                after = cast(herdr.PreparedAgentEnvironment, launch.call_args.args[2])
+                resume = before.with_berth_session(expected)
+                actual_arguments = tuple(cast(list[str], launch.call_args.args[4]))
+                self.assertEqual((after.directory, actual_arguments, after.env, after.unset_environment),
+                                 (resume.directory, resume.arguments, dict(resume.environment), resume.unset_environment))
+                self.assertEqual(pane_launch.read_worker_resume(directory, opened.row.current_session), resume)
+                if kind == "claude" and home_mode == "implicit":
+                    self.assertEqual(after.claude_home, pane_launch.ImplicitClaudeHome(Path(before.environment["HOME"])))
+                    self.assertNotIn("CLAUDE_CONFIG_DIR", after.env)
+                if kind == "codex" and home_mode == "implicit":
+                    self.assertNotIn("CODEX_HOME", after.env)
+                    self.assertIn("CODEX_HOME", after.unset_environment)
+                self.assertEqual(after.env[key], expected)
+
+    def phase_continuation(self, opened: worker_panes.OpenWorker, saved_key: str) -> str:
+        name = opened.row.name
+        dispatch = progress_history.begin_dispatch(self.run_dir, slot=name, phase="8", role="impl",
+            worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+            prompt=self.prompt, kind="impl", lens="")
+        line = f"End your final reply with DONE {dispatch}."
+        progress_history.save_dispatch_delivery(self.run_dir, dispatch,
+            pass_recorder.DispatchDelivery(line, dispatch, str(self.reply)))
+        self.agent.append(opened.pane, "user", line)
+        world = self.fixture.world
+        world.locations[opened.pane]["agent_status"] = "idle"
+        world.processes[world.foreground[opened.pane][0]].environment[pane_launch.BERTH_SESSION_ENV] = saved_key
+        return dispatch
+
+    def test_restore_preserves_the_pass_when_worker_resume_cannot_be_verified(self) -> None:
+        world = self.fixture.world
+        directory = pane_launch.record_directory()
+        for failure in ("legacy", "launch", "publication"):
+            with self.subTest(failure=failure):
+                opened = self.opened("impl-" + failure)
+                dispatch = self.phase_continuation(opened, "old-director.phase-8")
+                before = pane_launch.read_worker_resume(directory, opened.row.current_session)
+                assert before is not None
+                prompts = self.fixture.prompts()
+                stops = len(world.stops)
+                report = worker.RestoreReport()
+                with ExitStack() as patches:
+                    if failure == "legacy":
+                        _ = patches.enter_context(patch.object(pane_launch, "read_worker_resume", return_value=None))
+                    elif failure == "launch":
+                        _ = patches.enter_context(patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                            opened.pane, herdr.PromptNotSubmitted("fixture start failed"))))
+                    else:
+                        _ = patches.enter_context(patch.object(pane_launch, "save_worker_resume",
+                                                              side_effect=OSError("fixture publication failed")))
+                    result = worker.restore(self.fixture.parent.id, only=frozenset({opened.row.id}), report=report)
+                self.assertIs(result, worker.ExitCode.UNCERTAIN)
+                self.assertIn("specification", report.failures[opened.row.id][1])
+                self.assertEqual(len(world.stops), stops + (failure != "legacy"))
+                self.assertEqual(self.fixture.prompts(), prompts)
+                self.assertEqual(pane_launch.read_worker_resume(directory, opened.row.current_session), before)
+                active = progress_history.active_dispatch(opened.row.id, self.run_dir)
+                assert isinstance(active, progress_history.ActiveDispatch)
+                self.assertEqual(active.instance_id, dispatch)
+                self.assertEqual(pane_launch.worker_resume_pending(directory, opened.row.current_session), failure != "legacy")
+                if failure == "publication":
+                    launches = len(world.launches)
+                    self.assertIs(worker.restore(self.fixture.parent.id, only=frozenset({opened.row.id})), worker.ExitCode.OK)
+                    self.assertEqual(len(world.launches), launches)
+                    self.assertFalse(pane_launch.worker_resume_pending(directory, opened.row.current_session))
+                    self.assertIn(f"Continue pass {dispatch}", self.fixture.prompts()[-1][3])
 
     def test_restore_keeps_a_working_worker_with_a_submitted_dispatch(self) -> None:
         opened = self.opened()

@@ -136,6 +136,25 @@ class LaunchEnvironmentTests(unittest.TestCase):
         entry = pane_record.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])
         self.assertEqual(entry["environment"], {})
 
+    def test_worker_resume_store_requires_complete_evidence(self) -> None:
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        spec = pane_launch.worker_resume_spec("claude", "worker-session", directory, ("--model", "opus"),
+            {"HOME": str(directory), "FIXTURE_VALUE": "kept"}, frozenset({"FIXTURE_REMOVAL"}))
+        pane_launch.save_worker_resume(directory, spec)
+        self.assertEqual(pane_launch.read_worker_resume(directory, spec.session), spec)
+        pane_launch.begin_worker_resume(directory, spec)
+        self.assertTrue(pane_launch.worker_resume_pending(directory, spec.session))
+        replacement = spec.with_berth_session("director.phase-1")
+        pane_launch.save_worker_resume(directory, replacement, previous=spec)
+        self.assertFalse(pane_launch.worker_resume_pending(directory, spec.session))
+        self.assertEqual(pane_launch.read_worker_resume(directory, spec.session), replacement)
+        (path,) = directory.rglob("*.json")
+        payload = cast(dict[str, object], json.loads(path.read_text()))
+        del payload["unset_environment"]
+        atomic_file.write_text_atomic(path, json.dumps(payload))
+        with self.assertRaisesRegex(pane_launch.WorkerResumeUnavailable, "incomplete"):
+            _ = pane_launch.read_worker_resume(directory, spec.session)
+
     def test_producer_publication_replaces_only_its_proved_binding(self) -> None:
         cases = ("control same pane", "move", "native reference", "different records", "interrupted records", "interrupted then unit write",
                  "wrong identity", "wrong backend", "wrong folder", "unread flags", "ended", "stale process",

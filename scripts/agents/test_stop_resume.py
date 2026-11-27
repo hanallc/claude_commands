@@ -5307,42 +5307,62 @@ class StopResumeTests(unittest.TestCase):
         return row, record, run
 
     def test_stopped_codex_worker_resume_rebuilds_the_current_phase_key(self) -> None:
-        row, record, run = self.phase_worker(".codex")
-        key = "CARGO_BERTH_SESSION_ID"
-        for saved in (None, "old-director.phase-phase-b"):
-            with self.subTest(saved=saved):
-                self.entry["kind"] = "codex"
-                self.entry["config_dir"] = str(self.root / ".codex")
-                self.entry["environment"] = {"CODEX_HOME": str(self.root / ".codex")}
-                if saved is not None:
-                    self.entry["environment"][key] = saved
-                pane_record.write("agents", self.entry)
-                with (patch.object(staff, "initial_snapshot", return_value=record),
-                      patch.object(worker_panes, "worker_run", return_value=run),
-                      patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
-                      patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
-                          "w1:p2", herdr.PromptSubmissionNotRequired())) as launch):
-                    result = stop_resume.resume(row.name, to="codex1")
-                self.assertIsInstance(result, stop_resume.ClaudeUp)
-                prepared = cast(herdr.PreparedAgentEnvironment, launch.call_args.args[2])
-                self.assertEqual(prepared.env.get(key), "current-director.phase-phase-b")
+        self.check_stopped_phase_worker_resume("codex")
 
     def test_stopped_claude_worker_resume_rebuilds_the_current_phase_key(self) -> None:
-        row, record, run = self.phase_worker(".claude3")
-        key = "CARGO_BERTH_SESSION_ID"
-        for saved in (None, "old-director.phase-phase-b"):
-            with self.subTest(saved=saved):
-                self.launched.clear()
-                if saved is not None:
-                    self.entry["environment"][key] = saved
-                pane_record.write("agents", self.entry)
-                with (patch.object(staff, "initial_snapshot", return_value=record),
-                      patch.object(worker_panes, "worker_run", return_value=run)):
-                    result = stop_resume.resume(row.name)
-                self.assertIsInstance(result, stop_resume.ClaudeUp)
-                command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
-                self.assertEqual([arg for arg in command if arg.startswith(key + "=")],
-                                 ["CARGO_BERTH_SESSION_ID=current-director.phase-phase-b"])
+        self.check_stopped_phase_worker_resume("claude")
+
+    def check_stopped_phase_worker_resume(self, kind: Literal["claude", "codex"]) -> None:
+        from scripts.production import worker
+
+        home = ".codex" if kind == "codex" else ".claude3"
+        row, record, run = self.phase_worker(home)
+        directory = pane_launch.record_directory()
+        key = pane_launch.BERTH_SESSION_ENV
+        account = "CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR"
+        prefix = "resume" if kind == "codex" else "--resume"
+        extra = ("--add-dir", str(self.root / "docs")) if kind == "claude" else ("-c", "features.shell_snapshot=false")
+        launch_folder = self.root / "launch"
+        launch_folder.mkdir()
+        for explicit in (False, True):
+            for saved in (None, "old-director.phase-phase-b"):
+                with self.subTest(explicit=explicit, saved=saved):
+                    values = {"HOME": str(self.root), "RESUME_FIXTURE_VALUE": "original"}
+                    if explicit:
+                        values[account] = str(self.root / home)
+                    if saved is not None:
+                        values[key] = saved
+                    spec = pane_launch.worker_resume_spec(kind, row.current_session, launch_folder,
+                        (prefix, row.current_session, *extra), values, frozenset({"RESUME_FIXTURE_REMOVAL"}))
+                    pane_launch.save_worker_resume(directory, spec)
+                    self.entry.update(kind=kind, config_dir=str(self.root / home), environment=values)
+                    pane_record.write("agents", self.entry)
+                    with (patch.dict(os.environ, {"RESUME_FIXTURE_VALUE": "changed", "RESUME_FIXTURE_REMOVAL": "present"}),
+                          patch.object(staff, "initial_snapshot", return_value=record),
+                          patch.object(worker_panes, "worker_run", return_value=run),
+                          patch.object(progress_history, "active_dispatch", return_value=progress_history.ActiveDispatch(
+                              "dispatch-b", ("assign.sh",))),
+                          patch.object(worker, "resume_receipt", return_value=worker.DispatchSubmitted()),
+                          patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                          patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                              "w1:p2", herdr.PromptSubmissionNotRequired())) as launch,
+                          patch.object(herdr, "verify_worker_resume") as verify,
+                          patch.object(self.client, "prompt") as prompt,
+                          patch.object(stop_resume, "_watch_resume")):
+                        result = stop_resume.resume(row.name)
+                    self.assertIsInstance(result, stop_resume.ClaudeUp)
+                    launch.assert_called_once()
+                    expected = spec.with_berth_session("current-director.phase-phase-b")
+                    prepared = cast(herdr.PreparedAgentEnvironment, launch.call_args.args[2])
+                    arguments = tuple(cast(list[str], launch.call_args.args[4]))
+                    self.assertEqual((prepared.directory, arguments, prepared.env, prepared.unset_environment),
+                                     (expected.directory, expected.arguments, dict(expected.environment), expected.unset_environment))
+                    verify.assert_called_once_with(self.client, "w1:p2", "w1:p2-terminal", expected)
+                    self.assertEqual(pane_launch.read_worker_resume(directory, row.current_session), expected)
+                    self.assertIn("Continue pass dispatch-b", cast(str, prompt.call_args.args[1]))
+                    if kind == "claude" and not explicit:
+                        self.assertEqual(prepared.claude_home, pane_launch.ImplicitClaudeHome(self.root))
+                        self.assertNotIn(account, prepared.env)
 
     def test_named_resume_keeps_the_saved_assignment_when_the_worker_never_received_it(self) -> None:
         from scripts.direct import progress_history

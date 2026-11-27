@@ -1664,7 +1664,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT, runs: dict[str, list[str]] | None = None,
                     codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
                     selection: SelectedWorkerRows | Literal["by_name"] = "by_name",
-                    phase: str | None = None, continuation: OpenWorker | None = None,
+                    phase: str | None = None, continuation: OpenWorker | StoppedWorker | ClosedWorker | None = None,
+                    refresh_claude_turn: bool = False,
                     ) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
@@ -1727,7 +1728,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             with worker_admission.worker_operation(allowed):
                 result = _start_locked(owner, name, role, policy, account, allowed, held, codex, paths,
                                        keep_model=keep_model, selection=target, berth_session=berth_session,
-                                       continuation=continuation)
+                                       continuation=continuation, refresh_claude_turn=refresh_claude_turn and keep_model)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1778,7 +1779,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead,
                   paths: EnrolledPaths | OrdinaryWorkerOwner, *, keep_model: bool,
                   selection: SelectedWorkers | SelectedWorkerRows, berth_session: str,
-                  continuation: OpenWorker | None) -> WorkerStart:
+                  continuation: OpenWorker | StoppedWorker | ClosedWorker | None,
+                  refresh_claude_turn: bool) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1812,7 +1814,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
         return current
     if continuation is not None and (
-            not isinstance(current, OpenWorker) or current != continuation or not current.status.idle or switching):
+            current != continuation or isinstance(current, OpenWorker) and not current.status.idle or switching):
         return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the continuation target changed before startup")
     if isinstance(paths, EnrolledPaths):
         try:
@@ -1824,6 +1826,10 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     return AdmissionRefused("the retained Codex worker launch does not prove read-only access")
         except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
             return AdmissionRefused(str(error))
+    if continuation is not None:
+        return _resume_locked(continuation, owner, policy, account, berth_session, start_seconds, deadline,
+                              client, evidence, read_evidence,
+                              refresh_claude_turn=refresh_claude_turn and continuation.row.role == staff.KnownWorkerRole(role))
     if current is None:
         pane = _interrupted_pane(owner, name.value, evidence, client)
         if isinstance(pane, (StartRefused, UncertainWorker, ProcessUnknownWorker)):
@@ -1875,36 +1881,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     return state
                 else:
                     return _uncertain(row, "retained launch proof is incomplete")
-    if isinstance(current, OpenWorker) and continuation is not None:
-        try:
-            herdr.forget_pane_evidence(client.session, current.pane)
-            info = herdr.json_object(client.result("pane", "process-info", "--pane", current.pane).get("process_info"),
-                                     "continuation process info")
-            foreground = herdr.foreground_pane_owner(info)
-            pane = client.pane_row(current.pane)
-            if (not isinstance(foreground, (herdr.ProvedCodexForeground, herdr.ProvedClaudeForeground))
-                    or foreground.kind != policy.settings.kind or isinstance(pane, herdr.NoPane)
-                    or pane.get("terminal_id") != current.terminal):
-                return _uncertain(current.row, "continuation launch is unproved")
-            launched = herdr.read_foreground_pane_owner(foreground, pane)
-            if launched.current_identity != current.row.current_session or not berth_session:
-                return _uncertain(current.row, "continuation launch identity is unproved")
-        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-            return _uncertain(current.row, f"continuation launch is unproved: {error}")
-        if launched.environment.get(phase_reservation.SESSION_ENVIRONMENT) == berth_session:
-            return current
-        settings = kept_settings(models_registry.LaunchSettings(foreground.kind, "", "", ""), foreground.arguments)
-        if not settings.model:
-            return _uncertain(current.row, "continuation model is unproved")
-        policy = replace(policy, settings=settings)
-        if isinstance(account, ConfiguredWorkerAccount):
-            from scripts.accounts import accounts
-
-            if policy.settings.kind == "codex" and (home := launched.environment.get("CODEX_HOME")):
-                account = accounts.CodexWorkersAccount("current", Path(home))
-            elif policy.settings.kind == "claude" and (home := launched.environment.get("CLAUDE_CONFIG_DIR")):
-                account = accounts.NamedAccount("current", Path(home))
-    elif isinstance(current, OpenWorker):
+    if isinstance(current, OpenWorker):
         passed = worker_pass(current.row, allowed.run)
         dispatch = worker_dispatch_state(current.row, worker_run(current.row, record=record), lock)
         if passed.get("kind") != role and isinstance(dispatch, DispatchHoldsWorker):
@@ -1951,8 +1928,6 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     environment = launch_environment(policy, account, row is not None and not switching)
     if isinstance(environment, StartRefused):
         return environment
-    launch_home = (staff.SessionHome(Path(environment["CODEX_HOME"]))
-                   if policy.settings.kind == "codex" else staff.HomeUnknown())
     environment["UNIT_TEAM_ROLE"] = name.value
     unset_environment = frozenset({"STAFF_ID"})
     if berth_session:
@@ -1965,10 +1940,6 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         environment["TMPDIR"] = temporary
     if isinstance(paths, EnrolledPaths):
         directory = paths.main
-    elif continuation is not None:
-        from scripts.worktree import worktrees
-
-        directory = worktrees.moved_launch_folder(shutdown_record.row_folder(continuation.row, record)[1])
     elif claimed := os.environ.get(CLAIMED_WORKING_DIR_ENV):
         directory = Path(claimed).resolve()
     else:
@@ -1977,11 +1948,10 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                                                unset_environment)
     if isinstance(prepared, nix_env.Refused):
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(prepared))
+    launch_home = (staff.SessionHome(Path(prepared.env["CODEX_HOME"]) if "CODEX_HOME" in prepared.env else
+                                     Path(prepared.env["HOME"]) / ".codex")
+                   if policy.settings.kind == "codex" else staff.HomeUnknown())
     if isinstance(current, OpenWorker) and not switching:
-        if continuation is not None:
-            latest = read_evidence(staff.snapshot())
-            if not any(item == current for item in latest.states):
-                return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the continuation target changed before stop")
         herdr.forget_pane_evidence(client.session, current.pane)
         if not _stop_row(current.row, client, deadline=deadline):
             return _uncertain(current.row, "agent stop is incomplete; pane retained")
@@ -2011,6 +1981,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     launch_processes: dict[str, herdr.AgentProcessIdentity] = {}
     launch_destinations: dict[str, herdr.SplitPane | herdr.ExistingPane] = {}
     first_turn_launches: dict[str, pane_launch.PaneLaunch] = {}
+    resume_specs: dict[str, pane_launch.WorkerResumeSpec] = {}
 
     def start(handoff: worker_admission.FamilyHandoff) -> str:
         del handoff
@@ -2032,7 +2003,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         identity = str(row.current_session) if row is not None and not switching else ""
         launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
         resume_policy = policy
-        if (identity and row is not None and continuation is None and keep_model and policy.settings.kind == "claude"
+        if (identity and row is not None and keep_model and policy.settings.kind == "claude"
                 and row.role == staff.KnownWorkerRole(role)):
             homes = [row.home.path] if isinstance(row.home, staff.SessionHome) else []
             if target_home := environment.get("CLAUDE_CONFIG_DIR"):
@@ -2040,8 +2011,11 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             turn = pane_record.claude_turn_settings(identity, *homes)
             resume_policy = replace(policy, settings=_claude_worker_settings(policy.settings, turn))
         arguments = launch_arguments(resume_policy, identity, directory)
+        launch_environment, arguments = herdr.prepare_worker_launch(
+            prepared, policy.settings.kind, arguments, row if identity else None, record)
+
         def launch_at(selected: herdr.SplitPane | herdr.ExistingPane) -> herdr.AgentLaunched:
-            return launch(client.session, selected, prepared, policy.settings.kind,
+            return launch(client.session, selected, launch_environment, policy.settings.kind,
                 arguments, herdr.NoOpeningPrompt(),
                 int(start_seconds * 1000), agent=name.value, agent_name=agent_name(owner, name.value))
 
@@ -2073,13 +2047,17 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
                 raise herdr_types.HerdrFailure(launched.outcome.reason)
             native = _codex_start_session(client, launched.pane)
-            entry = pane_launch.launch(launched.pane, native, str(prepared.directory),
-                prepared.env, ["codex", *arguments], kind="codex")
+            entry = pane_launch.launch(launched.pane, native, str(launch_environment.directory),
+                launch_environment.env, ["codex", *arguments], kind="codex")
             entry["name"] = name.value
             pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", entry)
             first_turn_launches[launched.pane] = entry
-            return native
-        return client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+        else:
+            native = client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+        if not isinstance(launched.outcome, herdr.PromptNotSubmitted):
+            resume_specs[launched.pane] = pane_launch.worker_resume_spec(policy.settings.kind, native, launch_environment.directory,
+                arguments, launch_environment.env, launch_environment.unset_environment)
+        return native
 
     def created_pane() -> CreatedWorkerPane | NoCreatedWorkerPane:
         launched = launches[-1]
@@ -2146,6 +2124,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         launched = launches[-1]
         if launched.pane in first_turn_launches:
             pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", first_turn_launches[launched.pane])
+        if launched.pane in resume_specs:
+            pane_launch.save_worker_resume(pane_launch.record_directory(), resume_specs[launched.pane])
     except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         if not launches:
             return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
@@ -2180,6 +2160,83 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     parent_tab = "yes" if tab and tab in fresh.parent_tabs else "no"
     return _uncertain(row,
         f"agent launch is incomplete; state={state_kind}; scan={scan_reason}; parent_tab={parent_tab}")
+
+
+def _latest_claude_resume(spec: pane_launch.WorkerResumeSpec, source: Path) -> pane_launch.WorkerResumeSpec:
+    """Keep the current Claude model and effort before a new assignment."""
+    turn = pane_record.claude_turn_settings(spec.session, source, spec.account_home)
+    if isinstance(turn, pane_record.NoClaudeTurn):
+        return spec
+    arguments = list(spec.arguments)
+    for flag, value in (("--model", turn.model), ("--effort", turn.effort)):
+        if not value:
+            continue
+        if flag in arguments:
+            arguments[arguments.index(flag) + 1] = value
+        else:
+            arguments.extend((flag, value))
+    return replace(spec, arguments=tuple(arguments))
+
+
+def _resume_locked(current: OpenWorker | StoppedWorker | ClosedWorker, owner: staff.StaffRow,
+                   policy: LaunchPolicy, account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
+                   berth_session: str, start_seconds: float, deadline: float, client: herdr.Herdr,
+                   evidence: PaneEvidence,
+                   read_evidence: Callable[[staff.StaffSnapshot], PaneEvidence], *, refresh_claude_turn: bool) -> WorkerStart:
+    row = current.row
+    directory = pane_launch.record_directory()
+    try:
+        previous = pane_launch.read_worker_resume(directory, row.current_session)
+        if previous is None:
+            return _uncertain(row, "the worker has no saved resume specification")
+        if previous.kind != policy.settings.kind or not previous.directory.is_dir():
+            return _uncertain(row, "the saved worker resume backend or directory changed")
+        spec = previous.with_berth_session(berth_session)
+        if not isinstance(account, ConfiguredWorkerAccount):
+            values = launch_environment(policy, account, True)
+            if isinstance(values, StartRefused):
+                return values
+            if values.get(spec.account_variable) != spec.environment.get(spec.account_variable):
+                spec = spec.with_account(values)
+        if spec.kind == "claude" and refresh_claude_turn:
+            spec = _latest_claude_resume(spec, previous.account_home)
+        spec.validate()
+        if isinstance(current, OpenWorker):
+            process = client.pane_agent_process(current.pane, current.terminal)
+            native = client.native_pane_process(current.pane, spec.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+            if native.current_identity != row.current_session:
+                return _uncertain(row, "the worker changed before resume")
+            if native.environment.get(pane_launch.BERTH_SESSION_ENV, "") == berth_session:
+                herdr.verify_worker_resume(client, current.pane, current.terminal, spec)
+                pane_launch.save_worker_resume(directory, spec, previous=previous)
+                return current
+            latest = read_evidence(staff.snapshot())
+            if (current not in latest.states or client.pane_agent_process(current.pane, current.terminal) != process
+                    or client.native_pane_process(current.pane, spec.kind, herdr.PROGRAM_TIMEOUT_SECONDS) != native):
+                return _uncertain(row, "the worker changed before stop")
+            pane_launch.begin_worker_resume(directory, previous)
+            if not _stop_row(row, client, deadline=deadline):
+                return _uncertain(row, "agent stop is incomplete; pane retained")
+        destination = (_destination(owner, row.name, evidence, client) if isinstance(current, ClosedWorker)
+                       else herdr.ExistingPane(current.pane, current.terminal))
+        if not isinstance(destination, (herdr.SplitPane, herdr.ExistingPane)):
+            return destination
+        if isinstance(destination, herdr.ExistingPane) and not isinstance(client.pane_activity(destination.pane), herdr.PaneAtShell):
+            return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "the worker resume pane has foreground work")
+        if not isinstance(current, OpenWorker):
+            pane_launch.begin_worker_resume(directory, previous)
+        launched = herdr.launch_worker_resume(client, destination, spec, int(start_seconds * 1000),
+                                               agent=row.name, agent_name=agent_name(owner, row.name))
+        fresh = read_evidence(staff.snapshot())
+        opened = next((state for state in fresh.states if isinstance(state, OpenWorker) and state.row.id == row.id), None)
+        if opened is None or opened.pane != launched.pane or opened.row.current_session != row.current_session:
+            return _uncertain(row, "the replacement worker pane is unproved")
+        pane_launch.save_worker_resume(directory, spec, previous=previous)
+    except (conf.Unusable, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        return _uncertain(row, f"worker resume specification: {error}")
+    _layout(owner.id, fresh)
+    return replace(opened, created_pane=CreatedWorkerPane(opened.terminal)
+                   if isinstance(destination, herdr.SplitPane) else NO_CREATED_WORKER_PANE)
 
 
 def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.StaffSnapshot) -> None:

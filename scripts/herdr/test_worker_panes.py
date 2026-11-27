@@ -376,8 +376,9 @@ class PaneWorld(herdr.Herdr):
                prepared: herdr.PreparedAgentEnvironment, kind: str, agent_arguments: list[str],
                opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
                reported_unknown: str = "",
-               agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
-        del name, opening, reported_unknown
+               agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE,
+               client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> herdr.AgentLaunched:
+        del name, opening, reported_unknown, client
         if isinstance(destination, herdr.NewTab):
             raise AssertionError("a worker must not create a tab")
         server_name = agent_name if isinstance(agent_name, str) else agent
@@ -418,10 +419,11 @@ class PaneWorld(herdr.Herdr):
         if kind == "codex" and "resume" not in agent_arguments:
             process = self.processes[pid]
             self.processes[pid] = herdr.NativeAgentProcess(herdr.LaunchArgument(process.identity.id), process.started, process.environment)
-        fixture_session(identity, staff.ClaudeBackend() if kind == "claude" else
-                        staff.CodexBackend(Path(prepared.env["CODEX_HOME"])))
+        codex_home = (Path(prepared.env["CODEX_HOME"]) if "CODEX_HOME" in prepared.env else
+                      Path(prepared.env.get("HOME", str(Path.home()))) / ".codex")
+        fixture_session(identity, staff.ClaudeBackend() if kind == "claude" else staff.CodexBackend(codex_home))
         if kind == "codex":
-            source = Path(prepared.env["CODEX_HOME"]) / "sessions" / f"{identity}.jsonl"
+            source = codex_home / "sessions" / f"{identity}.jsonl"
             if not source.read_text():
                 write_text_atomic(source, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
         if kind == "claude" and self.publish_claude_start or kind == "codex" and not isinstance(
