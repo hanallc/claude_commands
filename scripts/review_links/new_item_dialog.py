@@ -1596,10 +1596,11 @@ function bindDraft(dialog, fresh = false) {
   });
  }
 
- async function responseData(response, fallback) {
+ async function responseData(response, fallback, {unresolvedHold = false} = {}) {
   const data = await response.json().catch(() => null);
   if (!response.ok || !data) {
    const failure = new Error(data?.error || data?.reason || fallback);
+   if (unresolvedHold) throw failure;
    failure.definiteRefusal = response.status >= 400 && response.status < 500 && data?.code !== 'draft_pending';
    failure.staleToken = response.status === 403 && data?.code === 'stale_token';
    failure.screenshotExpired = response.status === 409 && data?.code === 'screenshot_expired';
@@ -1648,7 +1649,7 @@ function bindDraft(dialog, fresh = false) {
                    body: JSON.stringify(payload), keepalive};
   const response = await (hold ? heldFetch(endpoint, options, receiver, undefined, receipt, hold) : fetch(endpoint, options));
   if (!hold && receipt) await showImmediateSendReceipt(response, receipt);
-  return responseData(response, 'Could not send this item.');
+  return responseData(response, 'Could not send this item.', {unresolvedHold: hold && !!submittedDraft?.holdId});
  }
 
  function clip(value, length = 240) {
@@ -2395,7 +2396,7 @@ function bindDraft(dialog, fresh = false) {
                                  receipt: item.kind === 'scheduled' ? scheduledReceipt : undefined});
    };
    const requestId = submittedDraft.holdId;
-   const onRefusal = async () => {
+   const onResolvedRefusal = async () => {
     if (submittedDraft?.holdId === requestId) {
      const draft = {...submittedDraft, holdId: ''};
      submittedDraft = draft;
@@ -2404,7 +2405,7 @@ function bindDraft(dialog, fresh = false) {
    };
    let result;
    try {
-    result = await sendItem(requestId ? {requestId, recover: hadEarlierSend, onRefusal} : undefined);
+    result = await sendItem(requestId ? {requestId, recover: hadEarlierSend, onResolvedRefusal} : undefined);
    } catch (failure) {
     if ((onList && item.kind !== 'scheduled') || !failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);

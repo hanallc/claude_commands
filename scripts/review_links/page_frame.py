@@ -1029,6 +1029,7 @@ return ()=>document.querySelector('[data-send-undo-stack]') || createSendUndoSta
 
 HELD_SEND_SCRIPT = (f'window.heldFetch || (() => {{\nconst SEND_HOLD_PATH={json.dumps(send_hold.HOLD_PATH)},'
                     f'SEND_REQUEST_HEADER={json.dumps(send_hold.REQUEST_HEADER)},'
+                    f'HOLD_RESOLVED_HEADER={json.dumps(send_hold.RESOLVED_HEADER)},'
                     f'SEND_UNDO_STACK_SCRIPT={json.dumps(SEND_UNDO_STACK_SCRIPT)};\n') + r'''class SendUndone extends Error{
  constructor(){super('Undone. Edit and send again.');this.name='SendUndone';}
 }
@@ -1169,7 +1170,7 @@ function showSendUndo(request,seconds,receiver,receipt){
   });
  });
 }
-async function heldFetch(url,init={},receiver,onHold,receipt,{requestId,recover=false,onRefusal}={}){
+async function heldFetch(url,init={},receiver,onHold,receipt,{requestId,recover=false,onResolvedRefusal}={}){
  const headers=new Headers(init.headers);
  if(!recover) headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
@@ -1190,10 +1191,11 @@ async function heldFetch(url,init={},receiver,onHold,receipt,{requestId,recover=
   if(!keepalive) throw error;
   return post(false);
  });
+ const settled=response=>response.ok || !onResolvedRefusal || response.headers.get(HOLD_RESOLVED_HEADER)==='1';
  if(first.headers.get('X-Send-Hold')!=='held'){
-  if(first.status<500){
+  if(first.status<500 && settled(first)){
    request.finish();
-   if(!first.ok) await onRefusal?.();
+   if(!first.ok) await onResolvedRefusal?.();
   }
   if(receipt) await showImmediateSendReceipt(first,receipt,()=>request.closed);
   return first;
@@ -1212,8 +1214,10 @@ async function heldFetch(url,init={},receiver,onHold,receipt,{requestId,recover=
   try{
    const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
    if(response.headers.get('X-Send-Hold')!=='pending'){
-    if(response.status!==404 || !request.expired()) request.finish();
-    if(!response.ok) await onRefusal?.();
+    if(settled(response)){
+     if(response.status!==404 || !request.expired()) request.finish();
+     if(!response.ok) await onResolvedRefusal?.();
+    }
     if(typeof undo==='function') await undo(response);
     else if(receipt) await showImmediateSendReceipt(response,receipt,()=>request.closed);
     return response;

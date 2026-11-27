@@ -657,6 +657,10 @@ def refuse_scheduled_draft_reuse(request_id: str) -> None:
     review_submissions.refuse_scheduled_draft_reuse(request_id, load_list_draft=_load_list_draft)
 
 
+def scheduled_draft_is_filed(request_id: new_item_dialog.ScheduledDraftId) -> bool:
+    return review_submissions.draft_is_filed(request_id.value, load_list_draft=_load_list_draft)
+
+
 def submit_scheduled(request: new_item_dialog.ScheduledSubmission, *,
                      sent_at: datetime | ScheduleClock = ScheduleClock.AT_FILING) -> review_submissions.ListItemDestination:
     """File a browser Schedule and recover its receipt and notices on Retry."""

@@ -29,6 +29,7 @@ from scripts.lib.atomic_file import write_text_atomic
 HOLD_PATH = "/send-hold"
 HOLD_HEADER = "X-Undo-Hold"
 REQUEST_HEADER = "X-Undo-Request"
+RESOLVED_HEADER = "X-Send-Hold-Resolved"
 REPLAY_HEADER = "X-Undo-Replay"
 REPLAY_TICKET_HEADER = "X-Undo-Replay-Ticket"
 HOLD_FOLDER = ".review-link-holds"
@@ -222,7 +223,8 @@ class Holds:
         return self._saved(path) if path.exists() else BadFile.UNREADABLE
 
     def hold(self, path: str, headers: Mapping[str, str], body: bytes, seconds: float, *,
-             request_id: str = "", admission: HoldAdmission = HoldAdmission.CONSOLE_SEND) -> HeldFields:
+             request_id: str = "", admission: HoldAdmission = HoldAdmission.CONSOLE_SEND,
+             retry: bool = False) -> HeldFields:
         """Save a send or return its existing hold with the remaining Undo time."""
         hold_id = request_id or new_hold_id()
         if not valid_hold_id(hold_id):
@@ -246,8 +248,9 @@ class Holds:
             if existing is not BadFile.UNREADABLE:
                 if existing["state"] != "closing":
                     return {"hold": hold_id, "seconds": 0}
-                saved["due"] = time.time()
-                seconds = 0
+                if not retry:
+                    saved["due"] = time.time()
+                    seconds = 0
             if admission is HoldAdmission.STALE_SCHEDULE_TOKEN:
                 raise StaleScheduleToken
             self._write(hold_id, saved)

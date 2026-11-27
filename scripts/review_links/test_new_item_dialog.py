@@ -22,7 +22,7 @@ from scripts.console_text.test_support import accepting_console_text
 from scripts.lib.process_group import run_process_group
 from scripts.production import investigation, staff, the_list
 from scripts.review_links import (console_theme, new_item, new_item_dialog, page_frame, reply_tokens, review_page,
-                                  review_submissions, serve)
+                                  review_submissions, send_hold, serve)
 from scripts.review_links.browser_test_support import firefox_probe_results
 from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, identify_fixture_image
 
@@ -235,6 +235,7 @@ async function sendSaved() {
    await open();
    dialog.querySelector('[name="include_page"]').click();
    const attempted = [], originalFetch = window.fetch;
+   const resolved = {'X-Send-Hold-Resolved':'1'};
    window.fetch = (url, options) => {
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);
     const payload = JSON.parse(options.body);
@@ -242,14 +243,14 @@ async function sendSaved() {
     attempted.push(payload);
     if (attempted.length === 1) {
      return Promise.resolve(new Response(
-       JSON.stringify({reason:'builds has finished; choose another recipient'}), {status:409}));
+       JSON.stringify({reason:'builds has finished; choose another recipient'}), {status:409, headers:resolved}));
     }
     if (attempted.length === 2) {
-     return Promise.resolve(new Response(JSON.stringify({error:'Send is forbidden.'}), {status:403}));
+     return Promise.resolve(new Response(JSON.stringify({error:'Send is forbidden.'}), {status:403, headers:resolved}));
     }
     if (attempted.length <= 4) {
      return Promise.resolve(new Response(
-       JSON.stringify({code:'stale_token', error:'The token expired again.'}), {status:403}));
+       JSON.stringify({code:'stale_token', error:'The token expired again.'}), {status:403, headers:resolved}));
     }
     throw new Error('The dialog attempted an extra Send.');
    };
@@ -286,7 +287,8 @@ async function sendSaved() {
    let releasePreview, expireNextSend = false, failNextSend = false;
    let captureNumber = 0, restartScenario = false, filedReply = false;
    let previewGate = new Promise(resolve => { releasePreview = resolve; });
-   const json = (value, status = 200) => Promise.resolve(new Response(JSON.stringify(value), {status}));
+   const json = (value, status = 200) => Promise.resolve(new Response(JSON.stringify(value),
+    {status, headers:{'X-Send-Hold-Resolved':'1'}}));
    window.fetch = (url, options) => {
     if (url === ownerEndpoint) {
      return json({token:ownerToken, page_owner:'builds-staff', recipients:__RECIPIENTS__});
@@ -889,7 +891,8 @@ RESTORED_SEND_PROBE = r"""
     if (!original) throw new TypeError('The Send response was lost.');
     if (captureChoice && !expired) {
      expired = true;
-     return Response.json({code:'screenshot_expired', error:'The screenshot expired.'}, {status:409});
+     return Response.json({code:'screenshot_expired', error:'The screenshot expired.'},
+                          {status:409, headers:{'X-Send-Hold-Resolved':'1'}});
     }
     if (warning && payload.request_id === original.request_id) {
      return Response.json({id:'I1', attachment_warning:'The saved screenshot is missing or damaged.'});
@@ -2041,6 +2044,8 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
     class Handler(BaseHTTPRequestHandler):
         def response(self, status: int, content_type: str, body: bytes) -> None:
             self.send_response(status)
+            if self.path == ENDPOINT and self.headers.get(send_hold.REQUEST_HEADER):
+                self.send_header(send_hold.RESOLVED_HEADER, "1")
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -2418,13 +2423,21 @@ window.fetch = (path, options) => {
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_retry_recovers_a_pending_hold_after_both_replies_are_lost(self) -> None:
+        self.check_pending_hold_retry(undo=True)
+        self.check_pending_hold_retry(reload=True)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_a_retry_refused_before_the_hold_check_preserves_undo(self) -> None:
+        self.check_pending_hold_retry(undo=True, refuse_retry=True)
+
+    def check_pending_hold_retry(self, *, undo: bool = False, reload: bool = False, refuse_retry: bool = False) -> None:
         script = r"""
 const failures = [], check = (ok, message) => { if (!ok) failures.push(message); };
 const nativeFetch = window.fetch, host = window.top.document;
 const dialog = document.querySelector('dialog'), launch = document.querySelector('[data-owner-new]');
 const words = dialog.querySelector('textarea'), send = dialog.querySelector('[type="submit"]');
 const error = dialog.querySelector('.new-item-error'), toast = () => host.querySelector('[data-send-undo]');
-const undoFirst = __UNDO__, reload = __RELOAD__;
+const undoFirst = __UNDO__, reload = __RELOAD__, refuseRetry = __REFUSE__;
 const storageKey = 'test.pending-hold', earlier = JSON.parse(sessionStorage.getItem(storageKey) || 'null');
 const responses = earlier?.responses || [], saved = {id:'L1'}, holds = new Map(earlier?.holds || []);
 let original = responses[0]?.id, created, filings = 0;
@@ -2455,6 +2468,9 @@ window.fetch = async (path, options = {}) => {
  if (loseReply) {
   original ??= id;
   throw new TypeError('The hold reply was lost.');
+ }
+ if (refuseRetry && responses.length === 3) {
+  return Response.json({error:'Use the Tailscale address.'}, {status:403});
  }
  if (holds.has(id)) return Response.json({hold:id,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
  filings++;
@@ -2491,8 +2507,19 @@ function until(test) {
    return;
   }
   send.click();
+  let recovered = 2;
+  if (refuseRetry) {
+   await until(() => dialog.open && !send.disabled && error.textContent === 'Use the Tailscale address.');
+   const draft = JSON.parse(sessionStorage.getItem('console.new-item.submitted') || 'null');
+   if (draft?.holdId !== original || draft.payload.request_id !== responses[0].draft ||
+       !words.readOnly || send.textContent !== 'Retry') {
+    throw new Error('The refused Retry discarded the pending hold or draft.');
+   }
+   send.click();
+   recovered++;
+  }
   await until(() => toast()?.querySelector('button') || created);
-  check(responses[2].id === original && responses[2].draft === responses[0].draft &&
+  check(responses[recovered].id === original && responses[recovered].draft === responses[0].draft &&
         !filings && holds.size === 1, 'Retry resumes the pending hold for the same draft.');
   const button = toast()?.querySelector('button');
   if (!button) throw new Error('Retry offers no Undo for the pending hold.');
@@ -2503,7 +2530,7 @@ function until(test) {
          'Undo cancels the original hold and makes the draft editable.');
    send.click();
    await until(() => toast()?.querySelector('button'));
-   check(responses[3].id !== original, 'Send after Undo uses a new hold ID.');
+   check(responses[recovered + 1].id !== original, 'Send after Undo uses a new hold ID.');
   }
   toast().getAnimations()[0].finish();
   await until(() => created);
@@ -2513,11 +2540,9 @@ function until(test) {
  await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
 })();
 """
-        for undo, reload in ((True, False), (False, True)):
-            with self.subTest(undo=undo, reload=reload):
-                probe = (script.replace("__UNDO__", json.dumps(undo)).replace("__RELOAD__", json.dumps(reload))
-                         .replace("__WORDS__", json.dumps(SCHEDULED_RECEIPT_WORDS)))
-                self.assertEqual(firefox_probe_results(bug_fixture_page(script=probe)), [[]])
+        probe = (script.replace("__UNDO__", json.dumps(undo)).replace("__RELOAD__", json.dumps(reload))
+                 .replace("__REFUSE__", json.dumps(refuse_retry)).replace("__WORDS__", json.dumps(SCHEDULED_RECEIPT_WORDS)))
+        self.assertEqual(firefox_probe_results(bug_fixture_page(script=probe)), [[]])
 
     def test_scheduled_receipt_uses_words_the_server_accepts(self) -> None:
         zone = ZoneInfo("America/New_York")
@@ -2545,7 +2570,8 @@ window.fetch = async (path, options = {}) => {
  if (path === heldPath) {
   if (stale) {
    token = 'fresh';
-   return Response.json({code:'stale_token',error:'The token expired.'}, {status:403});
+   return Response.json({code:'stale_token',error:'The token expired.'},
+                        {status:403,headers:{'X-Send-Hold-Resolved':'1'}});
   }
   return Response.json(saved);
  }

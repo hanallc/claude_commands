@@ -1913,6 +1913,20 @@ def _draft_filing(folder: Path, *, repair_index: bool = True,
     return UnclaimedDraft()
 
 
+def draft_is_filed(request_id: str, *,
+                   load_list_draft: LoadListDraft | ListRecordCheck = ListRecordCheck.OMIT) -> bool:
+    """Check whether a Retry can recover an item that already exists."""
+    filing = _draft_filing(_request_folder(request_id), repair_index=False, load_list_draft=load_list_draft)
+    if isinstance(filing, FiledDraft):
+        return True
+    if isinstance(filing, (ClaimedDraft, NativeDraftAwaitingReceipt)):
+        destination = filing.destination
+        if isinstance(destination, NativeSubmissionDestination):
+            with _locked_request(destination.address, recovered=destination) as lookup:
+                return _saved_draft(lookup) is not None
+    return False
+
+
 @contextmanager
 def _locked_legacy_list_target(folder: Path, members: staff.StaffSnapshot | None
                                ) -> Generator[LocatedSubmission | NoNativeSubmission]:
