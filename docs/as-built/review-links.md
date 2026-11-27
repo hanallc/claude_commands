@@ -2273,14 +2273,30 @@ Closed staff questions without a saved answer stay outside the migration.
 #### Question items in the Studio
 
 The List saves the question kind and native source key when it files a question item.
-Planning, keyless conversion, and apply use the same rules to find the original List item.
+One resolver finds the List item for a staff question or a submitted question.
 
-1. Use the saved List reservation first, even if other items link to the question.
-2. Use the original request link in the creation log if there is no reservation.
-3. Use the original List link from a verified move receipt if the creation log gives no destination.
-4. Report the question as unresolved if it has destination history and these checks give no unique destination.
-5. Permit a new List number only for a question without destination history.
+1. Use the submission's List reservation or the exchange's new-item reservation, in that order.
+2. Use the question link in the List item's creation log when it identifies one item.
+3. Use a Review move marker that matches the number and source of one saved Question report.
+4. Use the original List link from a verified transfer receipt when it identifies one item.
+5. Use the exchange's saved linked-item reservation if one exists.
+6. Stop if the history requires a verified destination and the earlier steps give none.
+7. Use a unique current link if the question has no such history.
+8. Allow a new item when the question has no destination history or current link.
 
+A submitted question's native receipt counts as history during migration.
+Live filing can still use the current link or file a new item for an untransferred submission.
+An ambiguous link or a move without verified proof leaves the question unresolved.
+A Question report filed by `move-review-waits` keeps its ordinary List workflow.
+
+- `_native_question_exchanges` calls the resolver during both staff and submitted question planning.
+- `_reload_review` uses that path again during apply and live Review filing.
+- `file_saved_question` and `file_list_submission_question` use that path for live saves and recovery.
+- `_keyless_question_origin` and the final migration pass call it through `_resolved_question_origin`.
+
+Find unresolved completed questions in Review under **Done**.
+The Studio displays a keyless row as an ordinary item and logs that it needs a source key.
+The loader preserves the saved row and assigns no source.
 Apply reports unresolved keyless rows and continues with other rows.
 Replies on Changes, Bugs, and Investigations keep the ordinary List workflow.
 A question to Nate starts in **Waiting for nate** and appears under **Questions**.
