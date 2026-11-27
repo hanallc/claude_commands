@@ -1850,7 +1850,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 return DispatchSubmission.SUBMITTED
         if isinstance(started, StartAtDispatch):
             before = rows_before_launch()
-            current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
+            current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy, phase=phase)
             arm_launch_cleanup(cleanup, before, current_start)
         else:
             if not started.row.reports_to(parent) or not hold.owns(started.row):
@@ -2489,10 +2489,11 @@ def _free_name(parent: StaffId, role: WorkerRole, record: staff.StaffSnapshot) -
 def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
            policy: worker_panes.LaunchPolicy, *,
            lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+           phase: str | None = None,
            ) -> worker_panes.WorkerStart:
     """Start an explicit staff target with the supplied policy."""
     with staff.row_operation(target.parent):
-        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock)
+        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock, phase=phase)
 
 
 def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.WorkerStart:
