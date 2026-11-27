@@ -1,6 +1,7 @@
 """Apply Review actions through the existing stores and message sender."""
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import shlex
@@ -9,13 +10,14 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, tzinfo
+from functools import partial
 from importlib import import_module
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlencode
 
 from scripts.for_you.action import REVIEW_PATH
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, conf
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, investigation, proposal_issue, record_store, staff, the_list, update_registration
@@ -447,9 +449,103 @@ def submission_report_row(saved: review_submissions.SavedSubmission) -> the_list
     raise OSError(f"Cannot read the List filing for {saved.id}.")
 
 
+def _read_question_filing_fields(path: Path) -> dict[str, object]:
+    fields = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    if not isinstance(fields, dict):
+        raise OSError(f"Invalid List route at {path}.")
+    return cast(dict[str, object], fields)
+
+
+def _question_filing_retry(saved: review_submissions.SavedSubmission, fields: dict[str, object],
+                           members: staff.StaffSnapshot) -> review_submissions.ListFilingUnavailable:
+    reason = "The saved question needs a current List keeper."
+    match fields:
+        case {"owner": str(owner), "producer": str(producer), "unit": str(unit), "source": str(source)}:
+            return review_submissions.ListFilingUnavailable(reason, review_submissions.PendingProducerFiling(
+                staff.StaffId(owner), staff.StaffId(producer), unit, source))
+        case {"assignee": str(assignee)}:
+            return review_submissions.ListFilingUnavailable(reason, review_submissions.list_command_assignee(assignee))
+        case _:
+            pass
+    # Older fallback records saved only the reason. Read the assignment from the native question.
+    details = saved.details
+    if isinstance(details.assignment, new_item_dialog.ChosenAssignee):
+        recipient = members.by_id(saved.owner)
+        if recipient is None:
+            raise OSError(f"The recipient for {saved.id} is unavailable.")
+        assignee_row = review_submissions.assigned_member(details.assignment, recipient, members)
+        notice = details.notice
+        source = ("nate via /new_item" if isinstance(notice, new_item_dialog.SubmissionNotice) and notice.from_command
+                  else "nate via New item")
+        unit = assignee_row.name if assignee_row.kind == "unit" else ""
+        return review_submissions.ListFilingUnavailable(reason, review_submissions.PendingProducerFiling(
+            assignee_row.id, recipient.id, unit, source))
+    return review_submissions.ListFilingUnavailable(reason)
+
+
+def _refresh_studio_question_route(saved: review_submissions.SavedSubmission, reservation: Path,
+                                   route: review_submissions.ListFilingRoute | review_submissions.ListFilingUnavailable
+                                   | review_submissions.NoListFiling, members: staff.StaffSnapshot
+                                   ) -> review_submissions.ListFilingRoute | review_submissions.NoListFiling:
+    """Resolve the current keeper or save the Review-only fallback."""
+    path = reservation.with_name("list-filing.json")
+    if isinstance(the_list.reserved_review_number(reservation), int):
+        if isinstance(route, dict):
+            return route
+        raise OSError(f"Cannot read the reserved List route for {saved.id}.")
+    keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+    if keeper is None:
+        if not isinstance(route, review_submissions.NoListFiling):
+            reason = "The List has no active producer."
+            fields = _read_question_filing_fields(path)
+            atomic_file.write_text_atomic(path, json.dumps({**fields, "skipped": reason}) + "\n", new_file_mode=0o600)
+            print(f"Review List filing {saved.id}: {reason}", file=sys.stderr)
+        return review_submissions.NoListFiling()
+    if isinstance(route, dict) and route["keeper"] == keeper.id:
+        return route
+    if not isinstance(route, review_submissions.ListFilingUnavailable):
+        route = _question_filing_retry(saved, _read_question_filing_fields(path), members)
+    return review_submissions.retry_list_filing_route(saved, route, members)
+
+
+def _add_submission_list_row(saved: review_submissions.SavedSubmission, route: review_submissions.ListFilingRoute,
+                             reservation: Path) -> investigation.ListDestination:
+    key = review_items.submission_review_key(saved)
+    evidence = REVIEW_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
+    words = saved.words
+    keeper = route["keeper"]
+    number = the_list.add_review_item(keeper, review_submissions.submission_title(words),
+                                      owner=route["owner"], producer=route["producer"], unit=route["unit"],
+                                      words=words, evidence=evidence, review_key=key, source=route["source"],
+                                      reservation=reservation)
+    return investigation.ListDestination(keeper, number)
+
+
+def _ensure_studio_question_filing(saved: review_submissions.SavedSubmission,
+                                   record: update_registration.QuestionRecord) -> None:
+    with update_registration.wrap_question_locks(record.owner):
+        reservation = review_submissions.list_filing_reservation(saved)
+        saved_route = review_submissions.list_filing_route(saved)
+        if isinstance(saved_route, review_submissions.NoListFiling) and not (
+                reservation.with_name("list-filing.json").is_file()
+                and reservation.with_name("first-message.json").is_file()):
+            return
+        members = staff.snapshot()
+        route = _refresh_studio_question_route(saved, reservation, saved_route, members)
+        if isinstance(route, review_submissions.NoListFiling):
+            return
+        file_question = cast(Callable[[update_registration.QuestionRecord, Path,
+                                       Callable[[], investigation.ListDestination], staff.StaffSnapshot], None],
+                             import_module("scripts.review_links.answer_sources").file_list_submission_question)
+        file_question(record, reservation, partial(_add_submission_list_row, saved, route, reservation), members)
+
+
 def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
     """Finish a staged List row before claiming its notice."""
     record = saved.record
+    if isinstance(record, update_registration.QuestionRecord):
+        _ensure_studio_question_filing(saved, record)
+        return
     route = review_submissions.list_filing_route(saved)
     if isinstance(record, investigation.Investigation) and record.belongs_on_list:
         if not isinstance(record.list_destination, investigation.ListDestination):
@@ -473,30 +569,10 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
     if isinstance(route, review_submissions.ListFilingUnavailable):
         review_submissions.skip_list_filing(saved, route.reason)
         return
-    key = review_items.submission_review_key(saved)
-    evidence = REVIEW_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
-    words = saved.words
     reservation = review_submissions.list_filing_reservation(saved)
-
-    def file_row() -> investigation.ListDestination:
-        number = the_list.add_review_item(route["keeper"], review_submissions.submission_title(words),
-                                          owner=route["owner"], producer=route["producer"], unit=route["unit"],
-                                          words=words, evidence=evidence, review_key=key, source=route["source"],
-                                          reservation=reservation)
-        return investigation.ListDestination(route["keeper"], number)
-
     try:
-        if isinstance(record, update_registration.QuestionRecord):
-            file_question = cast(Callable[[update_registration.QuestionRecord, Path,
-                                           Callable[[], investigation.ListDestination], staff.StaffSnapshot], None],
-                                 import_module("scripts.review_links.answer_sources").file_list_submission_question)
-            with update_registration.wrap_question_locks(record.owner):
-                file_question(record, reservation, file_row, staff.snapshot())
-        else:
-            _ = file_row()
+        _ = _add_submission_list_row(saved, route, reservation)
     except the_list.RetiredListProducer as error:
-        if isinstance(record, update_registration.QuestionRecord):
-            raise
         review_submissions.skip_list_filing(saved, str(error))
 
 
@@ -510,11 +586,6 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
         if isinstance(located, review_submissions.NoNativeSubmission):
             return change_page.NoMessageDelivery()
         saved = located.saved()
-        if address.kind is new_item_dialog.SubmissionKind.QUESTION:
-            _ensure_list_filing(saved)
-        if not saved.awaiting_reply:
-            review_submissions.clear_initial_delivery(address)
-            return change_page.NoMessageDelivery()
         row, path = saved.request_id, saved.original_path
         if path == saved.path and saved.owner != saved.recipient_id:
             path = status.previous_submission_source(row, path)
@@ -522,10 +593,16 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
         stored = status.metadata_page(placeholder)
         slots = status.slots(placeholder, row)
         intent = slots.verdict
-        if isinstance(stored, change_page.ReviewMessagePage) and stored.saved.get('submission_request') == row:
-            if stored.saved.get('submission_delivered'):
-                review_submissions.clear_initial_delivery(address)
-                return change_page.NoMessageDelivery()
+        stored_request = isinstance(stored, change_page.ReviewMessagePage) and stored.saved.get('submission_request') == row
+        if isinstance(stored, change_page.ReviewMessagePage) and stored_request and stored.saved.get('submission_delivered'):
+            review_submissions.clear_initial_delivery(address)
+            return change_page.NoMessageDelivery()
+        if (address.kind is new_item_dialog.SubmissionKind.QUESTION
+                and not (stored_request and isinstance(intent, change_page.DeliveryIntent))):
+            _ensure_list_filing(saved)
+        if not saved.awaiting_reply:
+            review_submissions.clear_initial_delivery(address)
+            return change_page.NoMessageDelivery()
         if isinstance(intent, change_page.DeliveryIntent) and status.owns_live_claim(placeholder, row, intent.attempt):
             raise SubmissionDeliveryPending("This item is still sending.")
         saved = review_submissions.renew_legacy_reply(located)
