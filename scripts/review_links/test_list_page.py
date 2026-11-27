@@ -34,7 +34,7 @@ from scripts.console_text.test_support import accepting_console_text
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
-from scripts.lib import conf, file_lock
+from scripts.lib import atomic_file, conf, file_lock
 from scripts.lib.process_group import run_process_group, stop_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
@@ -11955,6 +11955,371 @@ window.fetch=async(path,options={})=>{
                 self.assertEqual([recipient for recipient, _ in sent],
                                  [DWIGHT.id] if action == "unschedule" else [MORTY.id, DWIGHT.id])
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_keeps_priority_words_when_both_responses_are_lost(self) -> None:
+        self.check_priority_words_in_browser("lost")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_priority_button_starts_a_new_write_after_failed_words(self) -> None:
+        self.check_priority_words_in_browser("new")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_keeps_the_priority_request_when_retry_precedes_its_save(self) -> None:
+        self.check_priority_words_in_browser("early")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_recovers_priority_words_after_the_list_sync_fails(self) -> None:
+        self.check_priority_words_in_browser("sync")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_keeps_priority_words_before_the_server_receives_the_post(self) -> None:
+        self.check_priority_words_in_browser("in-transit")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_restores_an_unresolved_priority_request_after_reload(self) -> None:
+        self.check_priority_words_in_browser("reload")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_drops_priority_words_after_a_completed_save_failure(self) -> None:
+        self.check_priority_words_in_browser("refused")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_requires_priority_save_proof(self) -> None:
+        self.check_priority_words_in_browser("invalid-response")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_retry_settles_priority_after_preparation_fails(self) -> None:
+        self.check_priority_words_in_browser("prepare-failure")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_priority_post_respects_an_earlier_retry_refusal(self) -> None:
+        self.check_priority_words_in_browser("retry-first")
+
+    def check_priority_words_in_browser(self, mode: Literal[
+            "lost", "new", "early", "refused", "sync", "in-transit", "reload",
+            "invalid-response", "prepare-failure", "retry-first"]) -> None:
+        item = self.add("Keep the original priority request", number=1)
+        second = self.add("Set a different priority", number=2)
+        root = self.root / "reviews"
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        complete = threading.Event()
+        write_started = threading.Event()
+        release_write = threading.Event()
+        original_finished = threading.Event()
+        original_post = threading.local()
+        results: list[list[str]] = []
+        probe = r"""<!doctype html><meta charset="utf-8"><iframe style="width:100%;height:95vh"></iframe><script>
+const frame=document.querySelector('iframe'),errors=[],mode='PROBE_MODE';
+async function until(condition,message){
+ for(let tries=0;tries<160;tries++){
+  if(condition()) return;
+  await new Promise(resolve=>setTimeout(resolve,25));
+ }
+ throw new Error(message);
+}
+(async()=>{
+ try{
+  await new Promise(resolve=>{
+   frame.onload=resolve;
+   frame.src='STUDIO_PATH#'+new URLSearchParams({show:'all',item:'KEEPER/L1'});
+  });
+  const win=frame.contentWindow;
+  const row=()=>frame.contentDocument.querySelector('[data-number="1"]');
+  const card=()=>win.recordDetails(row());
+  const form=()=>card().querySelector('[data-feedback-form]');
+  const retry=()=>card().querySelector('[data-words-retry] button');
+  const notice=()=>form()?.querySelector('[data-send-status]')?.textContent ?? '';
+  await until(()=>win.recordIsOpen?.(row()) && form(),'Open the item.');
+  const fetch=window.fetch.bind(window);
+  const topRequests=[],retries=[],delivered=new Set();
+  let lostStatus=false,firstTop,topStatus,checkedRefusal=false,latePost,releaseStatus,releaseRetry;
+  const beforePost=['in-transit','reload','retry-first'].includes(mode);
+  const postWins=mode==='in-transit' || mode==='reload';
+  if(mode==='early' || beforePost) frame.contentDocument.querySelector('[data-list]').dataset.requestTimeoutSeconds='1';
+  const intercept=async(path,options={})=>{
+   const url=new URL(path,win.location.href),data=options.body;
+   if(data?.get?.('action')==='top'){
+    topRequests.push(data.get('request'));
+    firstTop ??= new URLSearchParams(data);
+    if(beforePost && topRequests.length===1){
+     latePost=()=>fetch(path,{method:'POST',body:data});
+     return new Promise((_,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true}));
+    }
+    if(mode==='invalid-response'){
+     const request=topRequests.at(-1);
+     if(topRequests.length===1) return new Response('{',{status:200});
+     if(topRequests.length===2) return Response.json({priority_request:request,words_receipt:true});
+     if(topRequests.length===3)
+      return Response.json({priority_request:topRequests[0],priority_outcome:'saved',words_receipt:true});
+     await fetch(path,options);
+     return Response.json({priority_request:request,priority_outcome:'unknown',words_receipt:true});
+    }
+    const response=await fetch(path,options);
+    topStatus=response.status;
+    if(mode==='lost' || (mode==='refused' && response.status===409) ||
+       (mode==='prepare-failure' && response.status===503)) throw new Error('The action response was lost.');
+    return response;
+   }
+   if(url.searchParams.has('words-status')){
+    if(mode==='invalid-response'){
+     await new Promise(resolve=>{releaseStatus=resolve;});
+     return Response.json({priority_outcome:'unknown',priority_request:topRequests.at(-1),
+      words_receipt:true,words_delivery:'delivered'});
+    }
+    if((mode==='lost' || mode==='early' || beforePost || mode==='prepare-failure') && !lostStatus){
+     if(url.searchParams.get('request')!==topRequests[0]) throw new Error('Status changed the request.');
+     if(beforePost){
+      const response=await fetch(path,options);
+      if((await response.json()).priority_outcome!=='unknown') throw new Error('Early status settled the request.');
+     }
+     lostStatus=true;
+     throw new Error('The first status response was lost.');
+    }
+    if(['refused','new','prepare-failure','retry-first'].includes(mode)){
+     const response=await fetch(path,options);
+     const result=await response.clone().json();
+     if(result.priority_outcome==='not_saved') checkedRefusal=true;
+     if(result.words_delivery==='delivered') delivered.add(url.searchParams.get('request'));
+     return response;
+    }
+   }
+   if(data?.get?.('action')==='retry-words'){
+    if(postWins) await new Promise(resolve=>{releaseRetry=resolve;});
+    const response=await fetch(path,options);
+    const result=await response.clone().json();
+    retries.push({request:data.get('request'),result:result.words_receipt ? result.words_delivery : result.priority_outcome});
+    return response;
+   }
+   return fetch(path,options);
+  };
+  win.fetch=intercept;
+  function pressTop(){
+   const field=form().querySelector('textarea[name=words]');
+   field.value='Check this item first.';
+   field.dispatchEvent(new win.Event('input',{bubbles:true}));
+   const top=form().querySelector('[value="top"]');
+   if(!top || top.disabled) throw new Error('Make top priority is unavailable.');
+   top.click();
+  }
+  if(mode!=='invalid-response') pressTop();
+  if(mode==='invalid-response'){
+   for(const response of ['invalid JSON','a missing outcome','a different request ID','an unknown outcome']){
+    releaseStatus=undefined;
+    pressTop();
+    await until(()=>releaseStatus && notice().startsWith('Save not confirmed:'),
+     'The browser reported a save after '+response+'.');
+    releaseStatus();
+    await until(()=>retry() && notice()==='The server has not confirmed the priority save.',
+     'An unknown outcome must keep Retry words.');
+    retry().click();
+    const final=response==='an unknown outcome' ? 'delivered' : 'not_saved';
+    await until(()=>retries.at(-1)?.request===topRequests.at(-1) && retries.at(-1)?.result===final && !retry(),
+     'Retry did not reach the final result.');
+   }
+  }else if(mode==='prepare-failure' || mode==='retry-first'){
+   await until(()=>lostStatus && retry(),'The item offers Retry words.');
+   if(mode==='prepare-failure' && topStatus!==503) throw new Error('The preparation error did not return 503.');
+   retry().click();
+   await until(()=>retries.at(-1)?.result==='not_saved' && !retry() && notice().startsWith('Not saved'),
+    'Retry did not settle the unsaved priority request.');
+   if(mode==='retry-first'){
+    const delayed=await latePost();
+    if(delayed.status!==409 || (await delayed.json()).priority_outcome!=='not_saved')
+     throw new Error('The delayed POST did not respect the refusal.');
+   }
+   pressTop();
+   await until(()=>topRequests.length===2 && topStatus===200 && delivered.has(topRequests[1]) &&
+    !form()?.querySelector('[value="top"]') && !retry(),
+    'The new priority save finished.');
+   if(topRequests[0]===topRequests[1]) throw new Error('The new press reused the failed request.');
+  }else if(mode==='refused'){
+   await until(()=>topStatus===409 && checkedRefusal && !retry() && !form()?.querySelector('[value="top"]')?.disabled,
+    'The server did not acknowledge the durable refusal.');
+   const delayed=await fetch('STUDIO_PATH',{method:'POST',body:firstTop});
+   if(delayed.status!==409 || (await delayed.json()).priority_outcome!=='not_saved')
+    throw new Error('The request that failed stayed final.');
+   pressTop();
+   await until(()=>topRequests.length===2 && topStatus===200 && delivered.has(topRequests[1]) &&
+    !form()?.querySelector('[value="top"]') && !retry(),
+    'The new priority save finished.');
+   if(topRequests[0]===topRequests[1] || retry()) throw new Error('The new press reused the failed request.');
+  }else if(mode==='new'){
+   await until(()=>retry(),'The item offers Retry words.');
+   const changed=await fetch('/set-second-priority',{method:'POST'});
+   if(!changed.ok) throw new Error('The other item did not become top priority.');
+   frame.contentDocument.dispatchEvent(new win.Event('review-item-created'));
+   await until(()=>form()?.querySelector('[value="top"]') && !form().querySelector('[value="top"]').disabled,
+    'The item can become top priority again.');
+   pressTop();
+   await until(()=>topRequests.length===2 || retries.length,'The next press reached the server.');
+   if(topRequests.length!==2 || topRequests[0]===topRequests[1] || retries.length)
+    throw new Error('Make top priority must submit a new action.');
+   await until(()=>delivered.has(topRequests[1]) && !form()?.querySelector('[value="top"]'),'The second action finished.');
+  }else{
+   await until(()=>retry() && (mode==='sync' || lostStatus),'The item offers Retry words after a save error.');
+   if(mode==='sync' && topStatus!==503) throw new Error('The sync error did not return 503.');
+   if(mode==='reload'){
+    await new Promise(resolve=>{frame.onload=resolve;win.location.reload();});
+    await until(()=>win.recordIsOpen?.(row()) && retry(),'The browser did not restore the priority request.');
+    win.fetch=intercept;
+   }
+   if(mode==='early' || beforePost){
+    if(mode==='early'){
+     retry().click();
+     await until(()=>retries.length===1 && !retry()?.disabled,'The early Retry finished.');
+     if(!retry() || retries[0].result!=='unknown') throw new Error('The early Retry lost the request.');
+    }else if(postWins){
+     retry().click();
+     await until(()=>releaseRetry,'Retry did not start before the original POST.');
+    }
+    const released=await (mode==='early' ? fetch('/release-priority',{method:'POST'}) : latePost());
+    if(!released.ok) throw new Error('The original write did not finish.');
+    if(beforePost){
+     const reply=await released.json();
+     const status=new URLSearchParams(firstTop);
+     status.set('item-state',status.get('id'));
+     status.set('words-status','1');
+     status.set('delivery',reply.delivery);
+     await fetch('STUDIO_PATH?'+status);
+    }
+   }
+   if(mode==='reload'){
+    const draft=form().querySelector('textarea[name=words]');
+    draft.value='A newer draft.';
+    draft.dispatchEvent(new win.Event('input',{bubbles:true}));
+    const changed=await fetch('/set-second-priority',{method:'POST'});
+    if(!changed.ok) throw new Error('The other item did not become top priority.');
+   }
+   if(postWins) releaseRetry();else retry().click();
+   await until(()=>retries.at(-1)?.result==='delivered' && !retry(),'The saved words were sent.');
+   if(topRequests.length!==1 || retries.some(attempt=>attempt.request!==topRequests[0]))
+    throw new Error('Retry words changed the request.');
+   if(mode==='reload' && form().querySelector('textarea[name=words]').value!=='A newer draft.')
+    throw new Error('Retry words changed the newer draft.');
+  }
+ }catch(error){errors.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
+})();
+</script>""".replace("STUDIO_PATH", studio_page.PAGE_PATH).replace("KEEPER", MORTY.id).replace("PROBE_MODE", mode).encode()
+
+        settle = staff.settle_priority_request
+        writes: list[int] = []
+        first_failed = False
+        prepare_failed = False
+        write_list = cast(Callable[..., None], getattr(the_list, "_save"))
+        sync_errors = 0
+        sync = atomic_file.sync_folder
+        list_folder = the_list.folder(MORTY.id)
+
+        def save_list(store: object, current: the_list.ListItem, **options: object) -> None:
+            nonlocal prepare_failed
+            if mode == "prepare-failure" and not prepare_failed and the_list.feedback_requests(current):
+                prepare_failed = True
+                raise OSError("The List write did not start.")
+            write_list(store, current, **options)
+
+        def sync_words(folder: Path) -> None:
+            nonlocal sync_errors
+            if mode == "sync" and folder == list_folder and sync_errors < 2:
+                current = the_list.load(MORTY.id, item.id)
+                if any(notice.action == "action-words" and notice.can_deliver()
+                       for notice in the_list.feedback_requests(current).values()):
+                    sync_errors += 1
+                    raise OSError("The List folder did not sync.")
+            sync(folder)
+
+        def save_priority(key: staff.PriorityRequestKey, command: staff.ApplyPriorityRequest | staff.RefuseUnappliedPriority
+                          ) -> staff.PriorityRequestOutcome:
+            nonlocal first_failed
+            if not isinstance(command, staff.ApplyPriorityRequest):
+                return settle(key, command)
+            writes.append(command.item.number)
+            if mode == "refused" and not first_failed:
+                first_failed = True
+                raise OSError("The priority write did not start.")
+            if mode == "early":
+                original_post.writes_priority = True
+                write_started.set()
+                if not release_write.wait(TEST_HANG_GUARD_SECS):
+                    raise OSError("The probe did not release the write.")
+            return settle(key, command)
+
+        class Probe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == "/proof":
+                    self.html_response(200, probe)
+                    return None
+                return super().send_head()
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == "/results":
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                    self.json_response(200, {})
+                    complete.set()
+                elif self.path == "/set-second-priority" and mode in ("new", "reload"):
+                    _ = the_list.make_top_priority(MORTY.id, second.id)
+                    writes.append(second.number)
+                    self.json_response(200, {})
+                elif self.path == "/release-priority" and mode == "early":
+                    release_write.set()
+                    saved = write_started.is_set() and original_finished.wait(TEST_HANG_GUARD_SECS)
+                    self.json_response(200 if saved else 500, {})
+                else:
+                    try:
+                        super().do_POST()
+                    finally:
+                        if getattr(original_post, "writes_priority", False):
+                            original_finished.set()
+
+        with (patch.object(serve, "ReviewLinksHandler", Probe),
+              patch.object(review_page.ReviewSnapshotCache, "start"),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(the_list, "_save", side_effect=save_list),
+              patch.object(atomic_file, "sync_folder", side_effect=sync_words),
+              patch.object(the_list, "sync_folder", side_effect=sync_words),
+              patch.object(change_page, "send_to_staff",
+                           side_effect=[None] if mode in ("early", "refused", "sync", "prepare-failure", "retry-first")
+                           else [OSError("offline"), None]) as send,
+              patch.object(change_page, "alert_delivery_failures", return_value=False),
+              patch.object(staff, "settle_priority_request", side_effect=save_priority),
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                browser = self.firefox_view(f"http://127.0.0.1:{server.server_port}/proof", None, 1440, 900, complete)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                release_write.set()
+                complete.set()
+                server.shutdown()
+                thread.join()
+        expected = [item.number]
+        if mode == "new":
+            expected += [second.number, item.number]
+        elif mode == "reload":
+            expected.append(second.number)
+        elif mode == "refused":
+            expected.append(item.number)
+        self.assertEqual(writes, expected)
+        self.assertEqual(send.call_count, 1 if mode in ("early", "refused", "sync", "prepare-failure", "retry-first") else 2)
+        if mode == "prepare-failure":
+            self.assertTrue(prepare_failed)
+        if mode == "sync":
+            self.assertEqual(sync_errors, 2)
+            saved, = the_list.feedback_requests(the_list.load(MORTY.id, item.id)).values()
+            assert isinstance(saved.priority, the_list.PriorityWordsRequest)
+            self.assertTrue(send.call_args.kwargs["key"] == saved.priority.delivery_key.value)
+            self.assertTrue(saved.form_words in send.call_args.args[2])
+        if mode == "lost":
+            self.assertTrue(send.call_args_list[0] == send.call_args_list[1])
+        producer = staff.snapshot().by_id(MORTY.id)
+        assert producer is not None
+        self.assertEqual(producer.top_item, staff.TopItem(second.number if mode == "reload" else item.number))
+
     def test_replaying_top_priority_preserves_the_newer_item(self) -> None:
         root = self.root / "reviews"
         first = self.add("First priority")
@@ -11965,8 +12330,9 @@ window.fetch=async(path,options={})=>{
             self.assertIsInstance(list_page.deliver_with_outcome(first_send), change_page.FailedDelivery)
         _ = the_list.make_top_priority(MORTY.id, second.id)
         replay, _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
-        assert isinstance(replay, list_page.ListActionWithWords)
-        self.assertTrue(replay.action_result_unknown)
+        assert isinstance(replay, list_page.PriorityWordsDelivery)
+        self.assertFalse(replay.send_pending)
+        self.assertEqual(replay.outcome, "saved")
         with (patch.object(change_page, "send_to_staff") as send,
               patch.object(the_list, "make_top_priority", side_effect=AssertionError("Priority repeated"))):
             list_page.deliver(replay)
@@ -11980,7 +12346,7 @@ window.fetch=async(path,options={})=>{
         assert producer is not None
         self.assertEqual(producer.top_item, staff.TopItem(second.number))
 
-    def test_priority_words_retry_reports_no_receipt_after_an_interrupted_save(self) -> None:
+    def test_priority_words_recover_after_the_priority_write_and_preserve_the_newer_item(self) -> None:
         root = self.root / "reviews"
         first = self.add("First priority")
         second = self.add("Second priority")
@@ -11988,7 +12354,8 @@ window.fetch=async(path,options={})=>{
         original = cast(Callable[..., None], getattr(the_list, "_save"))
 
         def stop_notice(store: object, item: the_list.ListItem, **options: object) -> None:
-            if any(feedback.action == "action-words" for feedback in the_list.feedback_requests(item).values()):
+            if any(feedback.action == "action-words" and feedback.can_deliver()
+                   for feedback in the_list.feedback_requests(item).values()):
                 raise OSError("The words write stopped.")
             original(store, item, **options)
 
@@ -11998,10 +12365,22 @@ window.fetch=async(path,options={})=>{
         producer = staff.snapshot().by_id(MORTY.id)
         assert producer is not None
         self.assertEqual(producer.top_item, staff.TopItem(first.number))
+        prepared = the_list.action_words_notice(the_list.load(MORTY.id, first.id), fields["request"])
+        assert isinstance(prepared, the_list.PageFeedback)
+        assert isinstance(prepared.priority, the_list.PriorityWordsRequest)
+        self.assertIs(prepared.priority.save, the_list.PriorityWordsSave.PREPARED)
         _ = the_list.make_top_priority(MORTY.id, second.id)
-        with patch.object(the_list, "make_top_priority", side_effect=AssertionError("Priority repeated")):
-            retry = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
-            self.assertIsInstance(retry, change_page.NoMessageDelivery)
+        settle = staff.settle_priority_request
+        with (patch.object(staff, "settle_priority_request", wraps=settle) as native,
+              patch.object(change_page, "send_to_staff", return_value=None) as send):
+            list_page.recover_pending(root)
+            list_page.recover_pending(root)
+        native.assert_called_once()
+        self.assertIs(cast(object, native.call_args.args[1]), staff.RefuseUnappliedPriority.REQUEST)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], MORTY.id)
+        self.assertTrue(send.call_args.kwargs["key"] == prepared.priority.delivery_key.value)
+        self.assertTrue(fields["words"] in send.call_args.args[2])
         producer = staff.snapshot().by_id(MORTY.id)
         assert producer is not None
         self.assertEqual(producer.top_item, staff.TopItem(second.number))
@@ -12012,15 +12391,67 @@ window.fetch=async(path,options={})=>{
         second = self.add("Second priority")
         _ = the_list.make_top_priority(MORTY.id, second.id)
         fields = self.fields(first, "top", words="Check this item.")
-        with patch.object(staff, "set_producer_top_item", side_effect=OSError("The staff write stopped.")):
-            with self.assertRaisesRegex(OSError, "The staff write stopped"):
+
+        class StopBeforePriority(BaseException):
+            pass
+
+        with patch.object(staff, "settle_priority_request", side_effect=StopBeforePriority):
+            with self.assertRaises(StopBeforePriority):
                 _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
-        with patch.object(the_list, "make_top_priority", side_effect=AssertionError("Priority repeated")):
-            retry = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
-            self.assertIsInstance(retry, change_page.NoMessageDelivery)
+        notice = the_list.action_words_notice(the_list.load(MORTY.id, first.id), fields["request"])
+        assert isinstance(notice, the_list.PageFeedback)
+        assert isinstance(notice.priority, the_list.PriorityWordsRequest)
+        self.assertIs(notice.priority.save, the_list.PriorityWordsSave.PREPARED)
+        with patch.object(change_page, "send_to_staff") as send:
+            list_page.deliver(list_page.ListFeedbackDelivery(MORTY.id, first.id, notice.request))
+            list_page.recover_pending(root)
+            list_page.recover_pending(root)
+            replay, _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+            self.assertIs(replay, list_page.RefusedPriorityWords.NOT_SAVED)
+            with self.assertRaisesRegex(the_list.ListError, "different words"):
+                _ = list_page.save_action(root, urlencode({**fields, "words": ""}), top_priority=list_page.TopPriority.SHOWN)
+            list_page.deliver(replay)
+            send.assert_not_called()
+        attempted_again = staff.settle_priority_request(notice.priority.delivery_key,
+            staff.ApplyPriorityRequest(MORTY.id, staff.TopItem(first.number)))
+        self.assertIs(attempted_again, staff.PriorityRequestOutcome.NOT_SAVED)
+        retry = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
+        self.assertIsInstance(retry, change_page.NoMessageDelivery)
         producer = staff.snapshot().by_id(MORTY.id)
         assert producer is not None
         self.assertEqual(producer.top_item, staff.TopItem(second.number))
+
+    def test_priority_words_resolve_a_lost_remote_writer_response(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Check the remote priority result")
+        fields = self.fields(item, "top", words="Keep these words.")
+        remote_calls: list[str] = []
+
+        def remote_settle(arguments: list[str], *, input_text: str) -> str:
+            key = staff.PriorityRequestKey.read(input_text)
+            with patch.object(staff, "is_owner", return_value=True):
+                if len(arguments) > 1:
+                    remote_calls.append("apply")
+                    outcome = staff.settle_priority_request(key, staff.ApplyPriorityRequest(MORTY.id, staff.TopItem(item.number)))
+                    self.assertIs(outcome, staff.PriorityRequestOutcome.SAVED)
+                    raise staff.StaffUnreadable("The remote reply was lost.")
+                remote_calls.append("resolve")
+                return staff.settle_priority_request(key, staff.RefuseUnappliedPriority.REQUEST).value
+
+        with (patch.object(staff, "is_owner", return_value=False),
+              patch.object(staff, "_remote", side_effect=remote_settle)):
+            saved, _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+        self.assertEqual(remote_calls, ["apply", "resolve"])
+        assert isinstance(saved, list_page.PriorityWordsDelivery)
+        with patch.object(change_page, "send_to_staff", return_value=None) as send:
+            list_page.deliver(saved)
+            list_page.recover_pending(root)
+        send.assert_called_once()
+        feedback = the_list.action_words_notice(the_list.load(MORTY.id, item.id), fields["request"])
+        assert isinstance(feedback, the_list.PageFeedback)
+        assert isinstance(feedback.priority, the_list.PriorityWordsRequest)
+        self.assertTrue(send.call_args.kwargs["key"] == feedback.priority.delivery_key.value)
+        self.assertTrue(fields["words"] in send.call_args.args[2])
 
     def test_pending_park_notice_waits_for_confirmation_and_recovers(self) -> None:
         root = self.root / "reviews"

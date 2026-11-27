@@ -20,7 +20,7 @@ import sys
 import threading
 from bisect import bisect_right
 from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from enum import Enum, StrEnum
@@ -316,6 +316,22 @@ class PageNoticeOrigin(StrEnum):
     STUDIO = "Studio"
 
 
+class PriorityWordsSave(StrEnum):
+    PREPARED = "prepared"
+    SAVED = staff.PriorityRequestOutcome.SAVED.value
+    NOT_SAVED = staff.PriorityRequestOutcome.NOT_SAVED.value
+
+
+@dataclass(frozen=True)
+class PriorityWordsRequest:
+    save: PriorityWordsSave
+    delivery_key: staff.PriorityRequestKey
+
+
+class NoPriorityWordsRequest(Enum):
+    ABSENT = "no priority request"
+
+
 @dataclass(frozen=True)
 class PageFeedback:
     request: str
@@ -332,6 +348,10 @@ class PageFeedback:
     origin: PageNoticeOrigin = PageNoticeOrigin.LIST_PAGE
     carries_action_words: bool = False
     action_words_unconfirmed: bool = False
+    priority: PriorityWordsRequest | NoPriorityWordsRequest = NoPriorityWordsRequest.ABSENT
+
+    def can_deliver(self) -> bool:
+        return self.priority is NoPriorityWordsRequest.ABSENT or self.priority.save is PriorityWordsSave.SAVED
 
     def key(self) -> PageRequest:
         return PageRequest(self.request, self.action, self.words, self.form_words, self.parked_until)
@@ -345,6 +365,21 @@ class PageFeedback:
         if extra is NoAdditionalRecipient.ABSENT or extra == recipient:
             return (recipient,)
         return recipient, extra
+
+
+@dataclass(frozen=True)
+class PriorityWordsSubmission:
+    notice: PageFeedback
+    new_request: bool
+
+
+class UnpreparedPriorityWords(Enum):
+    KEEP_UNKNOWN = "keep the unprepared request unknown"
+
+
+@dataclass(frozen=True)
+class RefuseUnpreparedPriorityWords:
+    words: str
 
 
 @dataclass(frozen=True)
@@ -1954,6 +1989,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
             fields["carries_action_words"] = True
         if content.action_words_unconfirmed:
             fields["action_words_unconfirmed"] = True
+        if isinstance(content.priority, PriorityWordsRequest):
+            fields["priority"] = {"save": content.priority.save, "delivery_key": content.priority.delivery_key.value}
         return {"feedback": fields}
     if isinstance(content, QuestionRequestReceipt):
         return {"receipt": {**_request_fields(content.request), "question_id": _question_id(content.question_id)}}
@@ -2870,18 +2907,22 @@ def check_report(keeper: staff.StaffId, identity: str, verdict: ReportVerdict, w
 
 
 def make_top_priority(keeper: staff.StaffId, identity: str, *,
-                      assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
+                      assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
+                      page_request: str | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
     """Make an open item the top priority item of its producer. A producer names only its own items."""
-    item = load(keeper, identity)
-    if item.state == ItemState.CLOSED:
-        raise ListError(f"{item.id} is Closed. Only an open item can be the top priority item.")
-    if assigned_to is not AllItems.INCLUDED and item.producer != assigned_to:
-        raise ListError(f"{item.id} is assigned to another producer")
-    try:
-        _ = staff.set_producer_top_item(item.producer, staff.TopItem(item.number))
-    except (staff.StaffRefused, staff.StaffNotFound) as error:
-        raise ListError(f"{item.id}: {error}") from error
-    return item
+    with _store(keeper).locked() if page_request is not NoPageRequest.ABSENT else nullcontext():
+        item = load(keeper, identity)
+        if page_request is not NoPageRequest.ABSENT and isinstance(action_words_notice(item, page_request), PageFeedback):
+            raise ListError("this request already has different words")
+        if item.state == ItemState.CLOSED:
+            raise ListError(f"{item.id} is Closed. Only an open item can be the top priority item.")
+        if assigned_to is not AllItems.INCLUDED and item.producer != assigned_to:
+            raise ListError(f"{item.id} is assigned to another producer")
+        try:
+            _ = staff.set_producer_top_item(item.producer, staff.TopItem(item.number))
+        except (staff.StaffRefused, staff.StaffNotFound) as error:
+            raise ListError(f"{item.id}: {error}") from error
+        return item
 
 
 def _without_evidence_block(evidence: str, start: int, end: int) -> str:
@@ -4175,6 +4216,20 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
     recipient = _field_text(fields.get("recipient", ""), "feedback recipient")
     additional = _field_text(fields.get("additional_recipient", ""), "additional feedback recipient")
     origin = PageNoticeOrigin(_field_text(fields.get("origin", PageNoticeOrigin.LIST_PAGE), "feedback origin"))
+    priority: PriorityWordsRequest | NoPriorityWordsRequest = NoPriorityWordsRequest.ABSENT
+    if "priority" in fields:
+        value = fields["priority"]
+        if not isinstance(value, dict) or action != "action-words" or not recipient:
+            raise ListError("invalid priority words")
+        saved = cast(dict[str, object], value)
+        phase = saved.get("save")
+        if phase not in tuple(PriorityWordsSave):
+            raise ListError("invalid priority words save state")
+        try:
+            priority = PriorityWordsRequest(PriorityWordsSave(cast(str, phase)),
+                                            staff.PriorityRequestKey.read(saved.get("delivery_key")))
+        except staff.StaffRefused as error:
+            raise ListError("invalid priority words delivery key") from error
     return PageFeedback(request, words, state, alerted_to,
                         UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT,
                         ReportVerdict.NOT_FIXED if action == "not works" else action,
@@ -4183,7 +4238,7 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
                         additional_recipient=(staff_id(additional, "additional feedback recipient")
                                               if additional else NoAdditionalRecipient.ABSENT), origin=origin,
                         carries_action_words=fields.get("carries_action_words") is True,
-                        action_words_unconfirmed=fields.get("action_words_unconfirmed") is True)
+                        action_words_unconfirmed=fields.get("action_words_unconfirmed") is True, priority=priority)
 
 
 def _page_requests(item: ListItem) -> dict[str, PageActivity]:
@@ -4243,17 +4298,91 @@ def action_words_notice(item: ListItem, request: str) -> PageFeedback | NoPageRe
     return NoPageRequest.ABSENT
 
 
-def save_priority_words(keeper: staff.StaffId, item: ListItem, request: str, words: str) -> ListItem:
-    """Save words for the producer selected by Make top priority."""
+def _publish_priority_words(store: record_store.NumberedRecords, item: ListItem,
+                            notice: PageFeedback, previous: PageFeedback | NoPageRequest) -> ListItem:
+    if previous is NoPageRequest.ABSENT:
+        log = (*item.log, ItemChange(now(), notice, PAGE_SOURCE))
+    else:
+        log = tuple(replace(entry, what=notice) if entry.source == PAGE_SOURCE and entry.what == previous else entry
+                    for entry in item.log)
+    changed = replace(item, log=log)
+    try:
+        _save(store, changed)
+    except AtomicDurabilityUnconfirmed:
+        changed = load(store.owner, item.id)
+        if feedback_requests(changed).get(notice.request) != notice:
+            raise
+        sync_folder(store.folder())
+    return changed
+
+
+def _prepare_priority_words(store: record_store.NumberedRecords, item: ListItem,
+                            request: str, words: str) -> tuple[ListItem, PageFeedback]:
+    notice = _producer_words(item, request, item.producer, words)
+    key = staff.PriorityRequestKey(change_page.review_delivery_key(store.path(item.id), item.id, notice.request))
+    prepared = replace(notice, priority=PriorityWordsRequest(PriorityWordsSave.PREPARED, key))
+    return _publish_priority_words(store, item, prepared, NoPageRequest.ABSENT), prepared
+
+
+def _settle_priority_words(store: record_store.NumberedRecords, item: ListItem, notice: PageFeedback,
+                           command: staff.ApplyPriorityRequest | staff.RefuseUnappliedPriority) -> PageFeedback:
+    priority = notice.priority
+    if not isinstance(priority, PriorityWordsRequest) or priority.save is not PriorityWordsSave.PREPARED:
+        return notice
+    if command is staff.RefuseUnappliedPriority.REQUEST:
+        # Keep the prepared record if its writer stopped after replacing the file.
+        sync_folder(store.folder())
+    try:
+        outcome = staff.settle_priority_request(priority.delivery_key, command)
+    except OSError:
+        if command is staff.RefuseUnappliedPriority.REQUEST:
+            raise
+        # Resolve a lost writer reply under the same staff transaction lock.
+        outcome = staff.settle_priority_request(priority.delivery_key, staff.RefuseUnappliedPriority.REQUEST)
+    settled = replace(notice, priority=replace(priority, save=PriorityWordsSave(outcome.value)))
+    _ = _publish_priority_words(store, item, settled, notice)
+    return settled
+
+
+def save_priority_words(keeper: staff.StaffId, identity: str, request: str, words: str) -> PriorityWordsSubmission:
+    """Prepare the words before changing priority."""
     store = _store(keeper)
     with store.locked():
-        current = load(keeper, item.id)
-        if isinstance(action_words_notice(current, request), PageFeedback):
+        item = load(keeper, identity)
+        previous = action_words_notice(item, request)
+        if isinstance(previous, PageFeedback):
+            if previous.form_words != words:
+                raise ListError("this request already has different words")
+            settled = _settle_priority_words(store, item, previous, staff.RefuseUnappliedPriority.REQUEST)
+            return PriorityWordsSubmission(settled, new_request=False)
+        item, prepared = _prepare_priority_words(store, item, request, words)
+        command = (staff.RefuseUnappliedPriority.REQUEST if item.state is ItemState.CLOSED else
+                   staff.ApplyPriorityRequest(item.producer, staff.TopItem(item.number)))
+        settled = _settle_priority_words(store, item, prepared, command)
+        return PriorityWordsSubmission(settled, new_request=True)
+
+
+def recover_priority_words(keeper: staff.StaffId, identity: str, request: str, *,
+                           unprepared: UnpreparedPriorityWords | RefuseUnpreparedPriorityWords = UnpreparedPriorityWords.KEEP_UNKNOWN,
+                           wait: bool = False) -> PageFeedback | NoPageRequest:
+    """Resolve a priority request under the same lock as the original POST."""
+    current = action_words_notice(load(keeper, identity), request)
+    if isinstance(current, PageFeedback) and (not isinstance(current.priority, PriorityWordsRequest)
+                                               or current.priority.save is not PriorityWordsSave.PREPARED):
+        return current
+    if current is NoPageRequest.ABSENT and unprepared is UnpreparedPriorityWords.KEEP_UNKNOWN:
+        return current
+    store = _store(keeper)
+    with exclusive(store.lock_path(), wait=wait) as locked:
+        if locked is LockResult.BUSY:
             return current
-        notice = _producer_words(current, request, item.producer, words)
-        changed = replace(current, log=(*current.log, ItemChange(now(), notice, PAGE_SOURCE)))
-        _save(store, changed)
-        return changed
+        item = load(keeper, identity)
+        notice = action_words_notice(item, request)
+        if notice is NoPageRequest.ABSENT:
+            if unprepared is UnpreparedPriorityWords.KEEP_UNKNOWN:
+                return notice
+            item, notice = _prepare_priority_words(store, item, request, unprepared.words)
+        return _settle_priority_words(store, item, notice, staff.RefuseUnappliedPriority.REQUEST)
 
 
 def _previous_page_request(
@@ -4540,7 +4669,7 @@ def deliver_feedback(keeper: staff.StaffId, identity: str, request: str,
         with store.locked():
             item = load(keeper, identity)
             feedback = feedback_requests(item).get(request)
-        if feedback is None:
+        if feedback is None or not feedback.can_deliver():
             return
         words_retry = retry_words and feedback.carries_action_words
         if not (feedback.state == "pending"
@@ -4571,7 +4700,7 @@ def feedback_notice_time(item: ListItem) -> Timestamp:
     for entry in reversed(item.log):
         if entry.source != PAGE_SOURCE:
             break
-        if isinstance(entry.what, PageFeedback) and entry.what.state == "pending":
+        if isinstance(entry.what, PageFeedback) and entry.what.state == "pending" and entry.what.can_deliver():
             return entry.time
     return NoTimestamp.UNSET
 

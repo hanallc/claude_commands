@@ -9065,7 +9065,6 @@ addEventListener('DOMContentLoaded', async () => {
             self.assertIn("--next-step", message)
             with (patch.object(change_page, "send_to_staff") as retry,
                   patch.object(the_list, "give_go", side_effect=AssertionError("Go repeated"))):
-                list_page.recover_goes(self.root)
                 code, reply = self.post(go_ledger.GO_PATH, body + "&delivery-mode=status")
                 self.assertEqual((code, json.loads(reply)["words_delivery"]), (200, "unconfirmed"))
                 retry.assert_not_called()
@@ -9077,6 +9076,58 @@ addEventListener('DOMContentLoaded', async () => {
             self.assertEqual(retry.call_args_list, [initial.call_args])
             self.assertEqual(the_list.load(morty.id, item.id), saved)
         alert.assert_not_called()
+
+    def test_server_restart_resends_pending_park_and_go_words(self) -> None:
+        morty, _unit, go_item, _ask, body = self.go_fixture(waiting=True)
+        with patch.object(staff, "authority_snapshot", return_value=staff.StaffSnapshot((morty,))):
+            parked = the_list.add(morty.id, "Park with pending words", owner=morty.id, source="morty", changes={})
+        request, token = list_page.signed_item_request(list_page.ListRecord(morty.id, parked),
+                                                       list_page.form_secret(self.root))
+        park_fields = {"keeper": morty.id, "id": parked.id, "request": request, "token": token,
+                       "action": "park", "until": "delivered", "words": "Keep the parking notes."}
+        park = list_page.submit(self.root, urlencode(park_fields))
+        with patch.object(change_page, "send_to_staff", return_value="pending") as park_send:
+            self.assertIsInstance(list_page.deliver_with_outcome(park), change_page.DeliveryUnconfirmed)
+        body += "&" + urlencode({"words": "Keep the approval notes."})
+
+        def pending_morty(recipient: staff.StaffId, _sender: str, _message: str,
+                          **_options: str) -> Literal["pending"] | None:
+            return "pending" if recipient == morty.id else None
+
+        code, reply, go_send = self.post_go(body, send_error=pending_morty)
+        self.assertEqual(code, 200, reply)
+        go_id = self.go_ledger_records()[0].stem
+        go_before = the_list.load(morty.id, go_item.id)
+        park_before = the_list.load(morty.id, parked.id)
+        self.assertTrue(the_list.feedback_requests(park_before)[request].action_words_unconfirmed)
+        self.assertEqual(go_ledger.read(self.root, go_id).get("words_unconfirmed"), [morty.id])
+        finished = threading.Event()
+        recover = list_page.recover_pending
+
+        def finish_recovery(ledger: Path) -> None:
+            try:
+                recover(ledger)
+            finally:
+                finished.set()
+
+        with (patch.object(change_page, "send_to_staff", return_value=None) as send,
+              patch.object(change_page, "alert_delivery_failures") as alert,
+              patch.object(the_list, "park", side_effect=AssertionError("Park repeated")),
+              patch.object(the_list, "give_go", side_effect=AssertionError("Go repeated")),
+              patch.object(list_page, "recover_pending", side_effect=finish_recovery),
+              serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as restarted):
+            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+            self.assertEqual(restarted.store_folder, self.root)
+            list_page.recover_goes(self.root)
+            recover(self.root)
+        self.assertEqual(send.call_count, 2)
+        self.assertTrue(send.call_args_list == [go_send.call_args, park_send.call_args])
+        alert.assert_not_called()
+        self.assertEqual(the_list.load(morty.id, go_item.id), go_before)
+        park_after = the_list.load(morty.id, parked.id)
+        self.assertEqual(park_after.parked_until, park_before.parked_until)
+        self.assertFalse(the_list.feedback_requests(park_after)[request].action_words_unconfirmed)
+        self.assertFalse(go_ledger.read(self.root, go_id).get("words_unconfirmed"))
 
     def test_list_go_sends_another_producer_the_next_step_alone(self) -> None:
         bob = staff.StaffRow(staff.StaffId("fixture-bob"), "producer", "bob", staff.StaffRoot(),
