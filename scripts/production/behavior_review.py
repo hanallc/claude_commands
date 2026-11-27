@@ -208,6 +208,8 @@ Use {{"test":"ID","finding":"requested","quote":"exact words","source":"/absolut
 Use "specified" when you find words to assess and cannot return "requested".
 Use the same fields as "requested" and add "verdict" and "reason".
 1. Use "against" when the change goes against the quoted words.
+   Also use "against" when the change replaces a source, method, value or rule that the quoted words name.
+   This applies even when the words give no detail about the named item.
 2. Use "follows" when the change follows the quoted words.
 3. Use "different" when the quoted words describe a different behavior.
 4. Use "unclear" when you cannot tell how the change relates to the quoted words.

@@ -1,6 +1,7 @@
 """Verify the review command with private records and a fake reviewer."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import date, datetime, timezone
@@ -31,6 +32,15 @@ REVIEWER = "fixture-reviewer"
 MOVE_QUOTE = "Move at once. Use scripts/direct/assign.py to restart the work."
 MOVE_REQUEST = "Wait for the running step."
 MOVE_REASON = "The change makes the move wait for the current step."
+MOVE_FINDING: Mapping[str, str] = {
+    "test": "test_fixture.py::test_move",
+    "finding": "specified",
+    "quote": MOVE_QUOTE,
+    "date": "2026-11-23",
+    "change": "The move waits for the current step.",
+    "verdict": "against",
+    "reason": MOVE_REASON,
+}
 MOVE_QUESTION = update_registration.QuestionParts(
     ask="Allow a wait before an account move? (2026-11-23)",
     context="You set a rule for immediate moves and restarts. A wait lets the running build finish.",
@@ -587,11 +597,12 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             self.assertEqual(self.cli("run", *args), (0, f"{key} clear\n"))
         self.assertEqual(runner.call_count, 3)
 
-    def filed_question(self, verdict: str = "against", reason: str = MOVE_REASON,
+    def filed_question(self, finding: Mapping[str, str] = MOVE_FINDING,
+                       parts: update_registration.QuestionParts = MOVE_QUESTION,
                        ) -> tuple[list[str], str, behavior_check.Waiting, update_registration.QuestionRecord]:
         args, key = self.changed_range()
-        self.specified_move_reply(verdict, reason)
-        draft = self.question_file(MOVE_QUESTION)
+        self.specified_move_reply(finding)
+        draft = self.question_file(parts)
 
         def accept(_key: review.QuestionKey, question: str, *, console_kind: str) -> review.QuestionAccepted:
             self.assertEqual(console_kind, "question")
@@ -618,28 +629,53 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         records = update_registration.question_records_for_owner(self.producer.id, strict=True)
         self.assertEqual(len(records), 1)
         question = records[0]
-        self.assertEqual(question.item.get("parts"), MOVE_QUESTION)
-        self.assertIn(MOVE_QUOTE, (self.folder / "completed-reply.txt").read_text())
+        self.assertEqual(question.item.get("parts"), parts)
+        self.assertIn(finding["quote"], (self.folder / "completed-reply.txt").read_text())
         self.assertNotIn("scripts/direct/assign.py", question.item.get("question", ""))
         self.assertNotIn("test_move", question.item.get("question", ""))
         self.assertNotIn("test_fixture.py", question.item.get("question", ""))
         return args, key, waiting, question
 
-    def specified_move_reply(self, verdict: str = "against", reason: str = MOVE_REASON) -> None:
-        source = self.write(self.root / "decision.md", MOVE_QUOTE)
-        self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": MOVE_QUOTE,
-                                "source": str(source), "date": "2026-11-23",
-                                "change": "The move waits for the current step.", "verdict": verdict, "reason": reason}]))
+    def specified_move_reply(self, finding: Mapping[str, str] = MOVE_FINDING) -> None:
+        source = self.write(self.root / "decision.md", finding["quote"])
+        self.reply(json.dumps([{**finding, "source": str(source)}]))
 
     def test_against_verdict_files_the_author_draft(self) -> None:
-        _ = self.filed_question()
+        source_change = {
+            **MOVE_FINDING,
+            "quote": "guided by history from model-study",
+            "date": "2026-10-17",
+            "change": "The last hour of use sets the wait.",
+            "reason": "The change replaces the named source for the wait.",
+        }
+        source_question = update_registration.QuestionParts(
+            ask="Use the last hour of use to set the wait before a move? (2026-10-17)",
+            context="You said the wait uses history from model-study.",
+            items=["The change uses the last hour of use."],
+            choices=["Yes (the change goes in with the last hour of use)", "No (the change stays out)"],
+            recommend="No, because the change replaces the source you named.",
+        )
+        for case, finding, parts in (
+            ("move timing", MOVE_FINDING, MOVE_QUESTION),
+            ("wait source", source_change, source_question),
+        ):
+            with self.subTest(case=case):
+                case_root = self.root / case
+                folder = case_root / "review"
+                folder.mkdir(parents=True)
+                with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(case_root / "state")}),
+                      mock.patch.object(astra_review, "review_attempt_folder", return_value=folder),
+                      mock.patch.object(self, "folder", folder)):
+                    _ = self.filed_question(finding, parts)
 
     def test_unclear_verdict_files_the_author_draft(self) -> None:
-        _ = self.filed_question("unclear", "The words do not give a time for a move during a build.")
+        _ = self.filed_question({
+            **MOVE_FINDING, "verdict": "unclear", "reason": "The words do not give a time for a move during a build.",
+        })
 
     def assert_clear_verdict(self, verdict: str, reason: str) -> None:
         args, key = self.changed_range()
-        self.specified_move_reply(verdict, reason)
+        self.specified_move_reply({**MOVE_FINDING, "verdict": verdict, "reason": reason})
         expected = f"{key} clear\ntest_fixture.py::test_move {verdict} {reason}\n"
         with (mock.patch.object(astra_review, "run_review", return_value=0) as runner,
               mock.patch.object(update_registration, "ask") as ask):
