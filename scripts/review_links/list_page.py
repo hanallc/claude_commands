@@ -2399,15 +2399,10 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{studio_page.PAGE_PATH}?{html.escape(counts_query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    filters = ('<div class="studio-tab-row">'
-               + studio_page.tabs(producer_chips, producer_selected)
-               + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
-               + '</div><div data-record-filters>'
-               + record_table.chip_row('Owner', owner_chips, owner_selected, encode_values=True)
-               + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, show_selected)
-               + f'<label class="list-unread-switch"><input type="checkbox" role="switch" id="list-unread" value="{UNREAD_VALUE}"{check_unread}>'
-               + 'Unread only</label></div>'
-               + '<p data-hidden-action-status role="status" hidden></p></div></div>')
+    picture_row = ('<div class="studio-tab-row">'
+                   + studio_page.tabs(producer_chips, producer_selected)
+                   + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
+                   + '</div>')
     content = (STYLE + studio_page.STYLE
                + '<p data-review-refresh-error role="status" hidden></p>'
                + f'<div data-list data-list-path="{studio_page.PAGE_PATH}" data-refresh-seconds="{seconds}"'
@@ -2418,7 +2413,13 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps([entry.key for entry in closed]), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
-               + page_frame.title(studio_page.TITLE, "studio", frozen_controls=filters)
+               + page_frame.title(studio_page.TITLE, "studio", frozen_controls=picture_row)
+               + '<div data-record-filters>'
+               + record_table.chip_row('Owner', owner_chips, owner_selected, encode_values=True)
+               + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, show_selected)
+               + f'<label class="list-unread-switch"><input type="checkbox" role="switch" id="list-unread" value="{UNREAD_VALUE}"{check_unread}>'
+               + 'Unread only</label></div>'
+               + '<p data-hidden-action-status role="status" hidden></p></div></div>'
                + top_bands(top_items, today, names)
                + '<p data-missing-item role="status" hidden></p>'
                + '<template data-producer-answering-template>' + producer_answering_note(names) + '</template>'
@@ -3081,9 +3082,6 @@ function focusAfterQuestion(item){
  content.querySelector('#list-search').focus();
 }
 let ownerNameWidth=0;
-const tableHeadingSize=new ResizeObserver(([entry])=>{
- document.documentElement.style.setProperty('--studio-table-heading-height',entry.borderBoxSize[0].blockSize+'px');
-});
 function sizeListColumns(){
  const table=content.querySelector('table');
  const numberWidth=table.querySelector('.list-number-column').getBoundingClientRect().width;
@@ -3098,8 +3096,6 @@ function sizeListColumns(){
 }
 addEventListener('resize',sizeListColumns);
 function bindListControls(){
- tableHeadingSize.disconnect();
- tableHeadingSize.observe(content.querySelector('table').tHead);
  const ownerNames=content.querySelectorAll('.list-owner-name');
  ownerNameWidth=0;
  if(ownerNames.length){
@@ -3948,7 +3944,7 @@ function bindFeedbackForm(form){
       if(saved && item.hidden){
        const status=content.querySelector('[data-hidden-action-status]');
        const top=target.getBoundingClientRect().top;
-       const inset=target.closest('.page-top').getClientRects().length ? 0 : stuckPageActionsBottom()+12;
+       const inset=stuckPageActionsBottom()+12;
        if(top<inset || status.getBoundingClientRect().bottom>innerHeight)
         scrollBy({top:Math.floor(top-inset),behavior:'instant'});
       }
@@ -4095,7 +4091,7 @@ function keepRowBelowHeader(update){
  tableView.preserveRecordRowTop(()=>{
   update();
   measurePageActions();
- },{topInset:()=>stuckPageActionsBottom()+content.querySelector('table').tHead.getBoundingClientRect().height});
+ },{topInset:stuckPageActionsBottom});
 }
 async function refresh(_supersede=false,current=()=>true){
  if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh()) return;
