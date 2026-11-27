@@ -3071,7 +3071,7 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
     try:
         outbound = outbound_review_message(delivery)
     except ReportAwaitingList as error:
-        status.release_recovery_claims((delivery.attempt,))
+        status.release_owned_claims((delivery.attempt,))
         print(f"review-links delivery {delivery.row}: {error}", file=sys.stderr)
         return DeliveryUnconfirmed()
     except (OSError, ValueError) as error:
