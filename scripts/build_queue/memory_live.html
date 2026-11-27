@@ -1975,7 +1975,7 @@ function swapInRamTip(d) {
   const holds = recorded(d.memory.zram.bytes) ? used.text : 'unavailable';
   const warning = swapLimitWarning(d, display);
   return [field('Swap in RAM', d.memory.zram.text, 'title'),
-    field('', 'Memory that nothing used for some time. Linux compresses it and keeps it in RAM.', 'caption'),
+    field('', 'Idle memory that Linux compresses in RAM', 'caption'),
     ...groupRows([field('It holds', holds), field('agent sessions', agents.text),
       field('+ builds and CI', pools.builds_ci.text), field('left by runs that ended', ended.text, 'swap-ended'),
       field('+ all other programs', other.text)]),

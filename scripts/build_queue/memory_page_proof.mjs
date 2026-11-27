@@ -757,7 +757,7 @@ try {
           })()`);
           const warning = 'The swap of builds is full: 8.0 of 8.0 GiB. 7.9 GiB is left by runs that ended.';
           assert.deepEqual(shown.tip, ['Swap in RAM','8.2 GiB',
-            'Memory that nothing used for some time. Linux compresses it and keeps it in RAM.',
+            'Idle memory that Linux compresses in RAM',
             'It holds','27.2 GiB','agent sessions','12.4 GiB','+ builds and CI','8.2 GiB',
             'left by runs that ended','7.9 GiB','+ all other programs','6.6 GiB', warning]);
           assert.equal(shown.swapUsed, '27.2 / 39.0 GiB');
@@ -4680,13 +4680,7 @@ try {
               assert.ok(!alignment.rows.some(row=>/:$/.test(row.label)||/[a-z]\.$/.test(row.value)),
                 `${kind} ${key}: sentence punctuation`);
               assert.equal(alignment.htmlText,alignment.text.filter(Boolean).join('\n'));
-              for (const row of alignment.rows.filter(row => row.kind === 'caption')) {
-                if (key === 'zram') {
-                  assert.equal(row.value, 'Memory that nothing used for some time. Linux compresses it and keeps it in RAM.');
-                } else {
-                  assert.ok(row.value.length <= 44);
-                }
-              }
+              for(const row of alignment.rows) if(row.kind==='caption') assert.ok(row.value.length<=44);
               assert.equal(new Set(alignment.rows.map(row=>row.label+'  '+row.value)).size,alignment.rows.length,
                 `${kind} ${key}: a repeated row`);
               assert.ok(alignment.values.length>0,`${kind} ${key} has no value cells.`);

@@ -3297,14 +3297,10 @@ renderWalk = reading => { painted = reading; };
                         pairs.append((label, text))
                     else:
                         self.assertEqual(cell.tag, "dd")
-                        if key == "zram" and "caption" in classes:
-                            self.assertEqual(cell.text, "Memory that nothing used for some time. "
-                                             + "Linux compresses it and keeps it in RAM.")
-                        else:
-                            if "caption" in classes or "long" in classes:
-                                self.assertNotRegex(cell.text or "", r"[.!?]$")
-                            if "caption" in classes:
-                                self.assertLessEqual(len(cell.text or ""), 44)
+                        if "caption" in classes or "long" in classes:
+                            self.assertNotRegex(cell.text or "", r"[.!?]$")
+                        if "caption" in classes:
+                            self.assertLessEqual(len(cell.text or ""), 44)
                         if "program-memory" in classes:
                             self.assertEqual(len(set(pairs)), len(pairs))
                             pairs.clear()
@@ -3329,8 +3325,7 @@ renderWalk = reading => { painted = reading; };
             "[" + ", ".join(f"tipText('{key}', data)" for key in keys) + "]",
             {"cap": 31, "cap_text": "fixture", "swap": swap, "swap_by": [ended_row],
              "ram": {**RAM_FIXTURE, "zram_original_bytes": 3 * GIB}}))
-        self.assertEqual(dict(zip(keys, tips, strict=True)), {'g-builds': ['Builds  7.0 GiB', 'RAM that builds use now\nBuild tools  4.0 GiB\n+ Queued builds  3.0 GiB'], 'tools': ['Build tools  4.0 GiB', 'RAM that build tools use now\nrust-analyzer  1.0 GiB\n+ sccache  0.5 GiB\n+ Other build tools  2.5 GiB'], 'queued': ['Queued builds  3.0 GiB', 'RAM of builds the queue started'], 'g-free': ['Free RAM  30.0 GiB', 'RAM that no program holds\nBuild reserved  6.0 GiB\n+ Free  18.0 GiB\n+ System reserved  6.0 GiB'], 'reserved': ['Build reserved  6.0 GiB', 'Held for running builds to grow into'], 'room': ['Free  18.0 GiB', 'Where the next step can start\nQueue cap  31.0 GiB\n− Builds  7.0 GiB\n− Build reserved  6.0 GiB'], 'system': ['System reserved  6.0 GiB', 'RAM kept outside the queue cap\nSafety net  4.0 GiB\n+ Swap coming back  2.0 GiB'], 'safety': ['Safety net  4.0 GiB', 'RAM the queue always leaves free'], 'swap': ['Swap coming back  2.0 GiB', 'RAM held for swap that comes back\nShare held  50.0%'], 'g-else': ['Everything else  27.0 GiB', 'RAM used outside builds\nDesktop  3.0 GiB\n+ Agents  8.0 GiB\n+ Other programs  4.0 GiB\n+ Swap in RAM  1.5 GiB\n+ Kernel  1.5 GiB\n+ File and kernel cache  7.0 GiB\n+ Not attributed  2.0 GiB'], 'desktop': ['Desktop  3.0 GiB', 'RAM of the desktop session\nProtected  2.0 GiB'], 'agents': ['Agents  8.0 GiB', 'RAM of agent sessions and their tools'], 'programs': ['Other programs  4.0 GiB', 'RAM of all other programs\nfirefox  2.0 GiB\nzed  1.0 GiB\n5 smaller programs  1.0 GiB'], 'zram': ['Swap in RAM  1.5 GiB', 'Memory that nothing used for some time. '
-            + 'Linux compresses it and keeps it in RAM.\nIt holds  3.0 GiB\nagent sessions  1.0 GiB'
+        self.assertEqual(dict(zip(keys, tips, strict=True)), {'g-builds': ['Builds  7.0 GiB', 'RAM that builds use now\nBuild tools  4.0 GiB\n+ Queued builds  3.0 GiB'], 'tools': ['Build tools  4.0 GiB', 'RAM that build tools use now\nrust-analyzer  1.0 GiB\n+ sccache  0.5 GiB\n+ Other build tools  2.5 GiB'], 'queued': ['Queued builds  3.0 GiB', 'RAM of builds the queue started'], 'g-free': ['Free RAM  30.0 GiB', 'RAM that no program holds\nBuild reserved  6.0 GiB\n+ Free  18.0 GiB\n+ System reserved  6.0 GiB'], 'reserved': ['Build reserved  6.0 GiB', 'Held for running builds to grow into'], 'room': ['Free  18.0 GiB', 'Where the next step can start\nQueue cap  31.0 GiB\n− Builds  7.0 GiB\n− Build reserved  6.0 GiB'], 'system': ['System reserved  6.0 GiB', 'RAM kept outside the queue cap\nSafety net  4.0 GiB\n+ Swap coming back  2.0 GiB'], 'safety': ['Safety net  4.0 GiB', 'RAM the queue always leaves free'], 'swap': ['Swap coming back  2.0 GiB', 'RAM held for swap that comes back\nShare held  50.0%'], 'g-else': ['Everything else  27.0 GiB', 'RAM used outside builds\nDesktop  3.0 GiB\n+ Agents  8.0 GiB\n+ Other programs  4.0 GiB\n+ Swap in RAM  1.5 GiB\n+ Kernel  1.5 GiB\n+ File and kernel cache  7.0 GiB\n+ Not attributed  2.0 GiB'], 'desktop': ['Desktop  3.0 GiB', 'RAM of the desktop session\nProtected  2.0 GiB'], 'agents': ['Agents  8.0 GiB', 'RAM of agent sessions and their tools'], 'programs': ['Other programs  4.0 GiB', 'RAM of all other programs\nfirefox  2.0 GiB\nzed  1.0 GiB\n5 smaller programs  1.0 GiB'], 'zram': ['Swap in RAM  1.5 GiB', 'Idle memory that Linux compresses in RAM\nIt holds  3.0 GiB\nagent sessions  1.0 GiB'
             + '\n+ builds and CI  1.0 GiB\nleft by runs that ended  512.0 MiB\n+ all other programs  1.0 GiB'
             + '\nThe swap of builds is full: 1.0 of 1.0 GiB. 512.0 MiB is left by runs that ended.'],
             'kernel': ['Kernel  1.5 GiB', 'RAM the kernel uses for itself\nSlab, stacks, page tables  1.0 GiB\n+ Other kernel counters  0.5 GiB'], 'cache': ['File and kernel cache  7.0 GiB', 'Estimated cache outside free RAM'], 'unattributed': ['Not attributed  2.0 GiB', 'RAM without an attribution\nKernel, no counter  1.5 GiB\n+ No program name  0.5 GiB'], 'cap': ['Queue cap  31.0 GiB', 'What builds may use\nBuilds  7.0 GiB\n+ Build reserved  6.0 GiB\n+ Free  18.0 GiB'], 'budget': ['RAM  64.0 GiB', 'Memory across this machine\nBuilds  7.0 GiB\n+ Free RAM  30.0 GiB\n+ Everything else  27.0 GiB']})
