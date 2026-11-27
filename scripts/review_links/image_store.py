@@ -162,6 +162,16 @@ def read_answers(directory: Path, identity: str) -> ImageAnswers:
     return answers
 
 
+def find_answers(directory: Path, identity: str) -> ImageAnswers | None:
+    """Find a saved answer record by image ID."""
+    try:
+        if not _answers_path(directory, identity).is_symlink():
+            return read_answers(directory, identity)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def write_answers(directory: Path, answers: ImageAnswers) -> None:
     atomic_file.write_bytes_atomic(_answers_path(directory, answers["id"]), json.dumps(answers).encode(), mode=0o600)
 

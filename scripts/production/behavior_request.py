@@ -128,43 +128,35 @@ def transcript_words(path: Path) -> Iterator[NateWords]:
             yield from queued_turn(row)
 
 
-def image_approvals(item: str, keeper: staff.StaffId) -> set[tuple[str, str]]:
+def image_approval_words(item: the_list.ListItem, keeper: staff.StaffId) -> Iterator[NateWords]:
+    events = the_list.image_answer_events(item)
+    if not events:
+        return
     directory = images.images_root(review_link.review_root())
-    prefix = image_store._ANSWERS_PREFIX  # pyright: ignore[reportPrivateUsage]
     approved = images.ANSWERS["approved"]
-    approvals: set[tuple[str, str]] = set()
-    for path in directory.glob(f"{prefix}*.json"):
-        if path.is_symlink():
+    for event in events:
+        line = event.what.partition("\n")[0]
+        label, separator, _ = line.partition(": ")
+        if not separator or not label.startswith("Image "):
             continue
-        try:
-            answers = image_store.read_answers(directory, path.stem.removeprefix(prefix))
-        except (OSError, ValueError):
+        answers = image_store.find_answers(directory, label.removeprefix("Image "))
+        if answers is None or answers.get("list_item") != item.id or answers.get("list_keeper") != keeper:
             continue
-        if answers.get("list_item") != item or answers.get("list_keeper", keeper) != keeper:
-            continue
+        attempt = answers["attempts"].get(event.key)
         words = f"Image {answers['id']}: {approved}"
-        for key, attempt in answers["attempts"].items():
-            if attempt["message"].partition("\n")[0] == images.ANSWER_PREFIX + approved:
-                approvals.add((key, words))
-    return approvals
+        if (attempt is not None and attempt.get("words") == event.what and line == words
+                and attempt["message"].partition("\n")[0] == images.ANSWER_PREFIX + approved):
+            yield NateWords(words, event.time)
 
 
 def list_words(path: Path, keeper: staff.StaffId) -> Iterator[NateWords]:
     item = the_list.load(keeper, path.stem)
-    image_events: list[tuple[str, NateWords]] = []
     for event in item.log:
         feedback = event.what
         if (event.source == the_list.PAGE_SOURCE and isinstance(feedback, the_list.PageFeedback)
                 and feedback.action == "tell" and feedback.state == "sent"):
             yield NateWords(feedback.words, event.time)
-        elif (event.source == the_list._IMAGE_ANSWER_SOURCE  # pyright: ignore[reportPrivateUsage]
-              and isinstance(event, the_list._ImageAnswerChange)):  # pyright: ignore[reportPrivateUsage]
-            image_events.append((event.key, NateWords(event.what, event.time)))
-    if image_events:
-        approvals = image_approvals(item.id, keeper)
-        for key, words in image_events:
-            if (key, words.text) in approvals:
-                yield words
+    yield from image_approval_words(item, keeper)
     for question in item.questions:
         answer = question.answer
         if answer is None:

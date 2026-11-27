@@ -387,27 +387,36 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                     self.assertEqual(finding.day.isoformat(), "2026-11-23")
 
     def save_image_answer(self, item: str, identity: str, action: str, *,
-                          save_record: bool = True, different_key: bool = False) -> str:
+                          save_record: bool = True, different_key: bool = False, save_keeper: bool = True,
+                          feedback: str = "", event_words: str | None = None) -> str:
         words = f"Image {identity}: {images.ANSWERS[action]}"
+        message = images.ANSWER_PREFIX + images.ANSWERS[action]
+        if feedback:
+            words += "\n" + feedback
+            message += "\nFeedback: " + feedback
         keeper = self.producer.id
         event_key = f"review:{identity}"
         if save_record:
             directory = images.images_root(Path(self.environment["REVIEW_LINKS_ROOT"]))
             directory.mkdir(parents=True, exist_ok=True)
             key = "review:other" if different_key else event_key
-            image_store.write_answers(directory, {
+            answers: image_store.ImageAnswers = {
                 "id": identity, "owner": keeper, "registered_at": "2026-11-20T15:00:00+00:00",
-                "list_item": item, "list_keeper": keeper, "attempts": {key: {
-                    "message": images.ANSWER_PREFIX + images.ANSWERS[action],
+                "list_item": item, "attempts": {key: {
+                    "message": message,
                     "words": words, "answered": [], "recipients": [keeper], "confirmed": [keeper],
                 }},
-            })
+            }
+            if save_keeper:
+                answers["list_keeper"] = keeper
+            image_store.write_answers(directory, answers)
         moment = datetime(2026, 11, 23, 23, 5, tzinfo=timezone.utc)
+        note = words if event_words is None else event_words
         with (staff.supplied_snapshot(self.identities.record),
               mock.patch.object(the_list, "now", return_value=moment)):
-            _ = the_list.save_image_answer(keeper, item, event_key, words,
+            _ = the_list.save_image_answer(keeper, item, event_key, note,
                                            image_id=identity, approved=action == "approved")
-        return words
+        return note
 
     def test_image_approval_with_matching_record_verifies(self) -> None:
         store, item = self.new_list_record()
@@ -435,6 +444,33 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         unverified = self.save_image_answer(item, "b12345678901", "approved", different_key=True)
         self.assertEqual(behavior_request.verified_dates(store.path(item), {approved, unverified}),
                          {approved: date(2026, 11, 23)})
+
+    def test_image_approval_with_feedback_verifies_only_the_approval_line(self) -> None:
+        store, item = self.new_list_record()
+        feedback = "Keep the current layout."
+        note = self.save_image_answer(item, "a12345678901", "approved", feedback=feedback)
+        approval = note.partition("\n")[0]
+        self.assertEqual(behavior_request.verified_dates(store.path(item), {approval, feedback, note}),
+                         {approval: date(2026, 11, 23)})
+
+    def test_image_approval_claim_does_not_verify_with_a_saved_feedback_answer(self) -> None:
+        store, item = self.new_list_record()
+        claimed = f"Image b12345678901: {images.ANSWERS['approved']}"
+        _ = self.save_image_answer(item, "b12345678901", "feedback", feedback="Change the heading.",
+                                   event_words=claimed)
+        self.assertEqual(behavior_request.verified_dates(store.path(item), {claimed}), {})
+
+    def test_image_approval_with_a_different_feedback_note_does_not_verify(self) -> None:
+        store, item = self.new_list_record()
+        approval = f"Image b12345678901: {images.ANSWERS['approved']}"
+        _ = self.save_image_answer(item, "b12345678901", "approved", feedback="Keep the current layout.",
+                                   event_words=approval + "\nChange the heading.")
+        self.assertEqual(behavior_request.verified_dates(store.path(item), {approval}), {})
+
+    def test_image_approval_without_a_saved_keeper_does_not_verify(self) -> None:
+        store, item = self.new_list_record()
+        claimed = self.save_image_answer(item, "b12345678901", "approved", save_keeper=False)
+        self.assertEqual(behavior_request.verified_dates(store.path(item), {claimed}), {})
 
     def test_an_unverified_request_requires_a_question(self) -> None:
         args, key = self.changed_range()

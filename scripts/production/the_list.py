@@ -3790,6 +3790,12 @@ def image_list_keeper(identity: str) -> staff.StaffId:
     return keeper
 
 
+def image_answer_events(item: ListItem) -> tuple[_ImageAnswerChange, ...]:
+    """Read typed Images page answers from the List log."""
+    return tuple(event for event in item.log
+                 if isinstance(event, _ImageAnswerChange) and event.source == _IMAGE_ANSWER_SOURCE)
+
+
 def save_image_answer(keeper: staff.StaffId, identity: str, key: str, words: str, *,
                       image_id: str, approved: bool) -> staff.StaffId:
     """Save the answer before delivery. Return the producer for this answer."""
