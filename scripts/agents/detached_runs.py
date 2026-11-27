@@ -886,6 +886,10 @@ ENDED_PASS_RESULT_QUEUED = "queued: the director has a notice for the ended pass
 INTERRUPTED_PASS_DELIVERY = "interrupted pass result: "
 
 
+def _confirmed_orphan_was_superseded(record: Mapping[str, object]) -> bool:
+    return type(record.get("exit_code")) is int and record.get("delivery") == SUPERSEDED_ORPHAN_DELIVERY
+
+
 class CompletionPaneWait(StrEnum):
     ALLOW = "allow the completion event to wait for input readiness"
     READY_NOW = "submit only when the pane can accept input now"
@@ -1006,10 +1010,11 @@ def _reap_orphans_locked(runs: Path, worker: str = "", *, only: Path | None = No
                 if record.get("pending_hold_stop_requests") or not _orphaned(path, record, now):
                     continue
                 record = _recover_staged_pane_stop(path, record)
-                newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
-                            and other.get("staff_id") == record["staff_id"]
-                            and _number(other.get("started_at"), 0.0) > record["started_at"]
-                            for _, other in records)
+                newer = "exit_code" not in record and any(
+                    other.get("worker") == record["worker"] and other.get("command") == record["command"]
+                    and other.get("staff_id") == record["staff_id"]
+                    and _number(other.get("started_at"), 0.0) > record["started_at"]
+                    for _, other in records)
                 if not record.get("delivery"):
                     if _cancels_pass(record):
                         if newer:
@@ -1058,6 +1063,10 @@ def _replay_completion(path: Path, record: RunRecord, *,
     """Keep an unresolved completion available for the next event."""
     delivery = record.get("delivery", "")
     try:
+        if _confirmed_orphan_was_superseded(record):
+            _ = _save_delivery(path, ORPHAN_RESULT_PENDING, if_current=delivery)
+            record = _read_record(path)
+            delivery = record.get("delivery", "")
         if _result_push_failed(delivery) and not _pane_submission_not_started(delivery):
             if _result_pass_changed(record):
                 return CompletionReplay.HANDLED
@@ -1162,7 +1171,7 @@ def _complete_stopped_run(path: Path, record: RunRecord) -> str | Literal[Comple
         return _save_delivery(path, f"finished: the pane pass {result.outcome}")
     if isinstance(result, worker_panes.Kept):
         print(f"detached_runs: {record['run_id']}: kept the pane pass: {result.blocker}", file=sys.stderr)
-    if record.get("orphan_result_superseded"):
+    if record.get("orphan_result_superseded") and "exit_code" not in record:
         return _save_delivery(path, SUPERSEDED_ORPHAN_DELIVERY)
     return deliver(record, command_result(record))
 
@@ -1283,7 +1292,8 @@ def _keeps_finished_result(record: Mapping[str, object], *, owner_gone: bool) ->
         return True
     if owner_gone and record.get("push_alert_attempted") is True:
         return False
-    return bool(record.get("completion_pending")) or _worker_result_pending(str(record.get("delivery", "")))
+    return (bool(record.get("completion_pending")) or _worker_result_pending(str(record.get("delivery", "")))
+            or _confirmed_orphan_was_superseded(record))
 
 
 def _prune_finished_locked(runs: Path) -> list[str]:
@@ -1621,6 +1631,8 @@ def _unconfirmed_pass_result(record: RunRecord) -> bool:
 
 
 def _needs_completion(record: RunRecord) -> bool:
+    if _confirmed_orphan_was_superseded(record):
+        return True
     return ((not _result_push_failed(record.get("delivery", "")) or _needs_pane_input_retry(record)
              or _unconfirmed_pass_result(record))
             and bool(record.get("completion_pending") or _retired_worker_result(record)))

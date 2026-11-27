@@ -7590,6 +7590,54 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIs(worker_lifecycle.read_json_object(path)["push_alert_attempted"], True)
         self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
 
+    def test_reap_delivers_the_confirmed_result_even_when_a_newer_run_exists(self) -> None:
+        row = self.fixture.worker()
+        older = self.record(row, "older-confirmed-result")
+        older.update(pid=DEAD_PID, exit_code=7)
+        newer = self.record(row, "newer-without-result")
+        newer.update(pid=DEAD_PID, started_at=older["started_at"] + 1)
+        path = Path(older["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(older))
+        write_text_atomic(Path(newer["log"]).with_suffix(".json"), json.dumps(newer))
+        self.assertIsNotNone(staff.retire(row.id))
+
+        def accept_alert(options: send.Options) -> send.Result:
+            self.assertEqual(options.to, self.fixture.parent.id)
+            self.assertIn(path.stem, options.text or "")
+            self.assertIn("exit 7", options.text or "")
+            self.assertNotIn(path.stem, detached_runs.prune_finished(path.parent))
+            self.assertTrue(path.is_file())
+            self.assertTrue(Path(older["log"]).is_file())
+            return send.Result("sent", "director received the alert")
+
+        with (patch.object(send, "send", side_effect=accept_alert) as alert,
+              patch.object(subprocess, "Popen") as spawn, contextlib.redirect_stderr(io.StringIO())):
+            self.assertCountEqual(detached_runs.reap_orphans(str(self.run_dir)), [path.stem, newer["run_id"]])
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        alert.assert_called_once()
+        spawn.assert_not_called()
+        self.assertIn(path.stem, detached_runs.prune_finished(path.parent))
+
+    def test_reap_recovers_a_confirmed_result_previously_marked_superseded(self) -> None:
+        row = self.fixture.worker()
+        record = self.record(row, "confirmed-result-marked-superseded")
+        record.update(pid=DEAD_PID, status="finished", exit_code=0, completion_pending=False,
+                      ended="supervisor gone", delivery=detached_runs.SUPERSEDED_ORPHAN_DELIVERY)
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        self.assertIsNotNone(staff.retire(row.id))
+
+        self.assertEqual(detached_runs.prune_finished(path.parent), [])
+        self.assertTrue(path.is_file())
+        with patch.object(send, "send", return_value=send.Result("sent", "director received the alert")) as alert:
+            detached_runs.reap_orphan(path)
+            detached_runs.reap_orphan(path)
+        alert.assert_called_once()
+        options = cast(send.Options, alert.call_args.args[0])
+        self.assertEqual(options.to, self.fixture.parent.id)
+        self.assertIn("exit 0", options.text or "")
+        self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
+
     def test_supervisor_alerts_the_director_when_a_busy_worker_retires(self) -> None:
         row = self.fixture.worker(family="codex")
         pane = "w1:p1"
