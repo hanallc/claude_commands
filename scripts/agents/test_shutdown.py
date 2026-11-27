@@ -644,15 +644,21 @@ class ProducerCommandsTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         unit = shutdown.retirement_find_unit("alpha", "alpha")
+        parent = staff.snapshot().parent_of(unit.staff_member)
+        assert parent is not None
         member = replace(unit.staff_member, id=staff.StaffId(fixture_runtime_id("fixed-retiring-holder")))
         self.assertNotEqual(member.id, member.current_session)
         unit = replace(unit, staff_member=member)
+        record = staff.StaffSnapshot((parent, member))
         holds = Path(os.environ["BUILD_HOLD_DIR"])
         fixed_hold = (holds / DIRECTOR).rename(holds / member.id)
-        with patch.object(shutdown, "retirement_remove", return_value=[]) as remove, \
-             patch.object(copies, "remove_trees") as trees, redirect_stdout(io.StringIO()) as output:
-            code = shutdown.retirement_clear_worktree(unit, settings=conf.read("production"),
-                record=staff.StaffSnapshot((member,)), pane_workers=[], pane=herdr.NoPane("alpha"), require_cleanup=True)
+        settings = conf.read("production")
+        checked = shutdown.retirement_check(unit, settings=settings)
+        with (patch.object(staff, "authority_snapshot", return_value=record),
+              patch.object(shutdown, "retirement_remove", return_value=[]) as remove,
+              patch.object(copies, "remove_trees") as trees, redirect_stdout(io.StringIO()) as output):
+            code = shutdown.retirement_clear_worktree(unit, settings=settings, record=record,
+                pane_workers=[], pane=herdr.NoPane("alpha"), origin=checked.origin, require_cleanup=True)
         self.assertEqual(code, 0, output.getvalue())
         self.assertIn(["build_hold.py", "release", "--holder", member.id], case.calls)
         self.assertFalse(fixed_hold.exists())
