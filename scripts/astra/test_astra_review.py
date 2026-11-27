@@ -98,7 +98,8 @@ class AstraReviewTests(StaffTestCase):
         return max((self.root / "runs").glob("*/prompt.md"), key=lambda path: path.stat().st_mtime_ns)
 
     def held_reviewer(self, *, busy: bool = False) -> design_roles.HeldDesign:
-        worker = fixture_worker("demo-proposal-astra-reviewer", unit_membership("demo", "proposal-unit").id,
+        parent = unit_membership("demo", "proposal-unit")
+        worker = fixture_worker("demo-proposal-astra-reviewer", parent.id,
                                 runtime_id=fixture_runtime_id("held-thread"),
                                 backend=staff.CodexBackend(self.root / "codex-home"))
         design_id = "00000000-0000-4000-8000-000000000016"
@@ -109,6 +110,11 @@ class AstraReviewTests(StaffTestCase):
                                    design_roles.RoleInstance("reviewer", "demo-proposal-astra-reviewer", design_roles.RoleOpen(worker.id),
                                                           assignment_claim="active-dispatch" if busy else "")))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        run = design_roles.design_directory(design_id)
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
+            unit_runs.OWNER_FIELD: parent.id,
+            "pass": {worker.name: {"worker_id": worker.id, "confirmed_delivery_ids": ["earlier-review"]}},
+        }))
         return design
 
     def test_document_with_a_held_reviewer_resumes_that_thread_and_saves_each_reply(self) -> None:
