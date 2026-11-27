@@ -27,6 +27,7 @@ import time
 import threading
 from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from datetime import datetime
 from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -1308,15 +1309,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path.startswith(send_hold.HOLD_PATH + "/"):
             self.undo_post(route)
             return
-        if self.headers.get(send_hold.HOLD_HEADER) == "1" and self.held_send_path(route.path):
-            request_ids = self.headers.get_all(send_hold.REQUEST_HEADER, [])
+        undo_requested = self.headers.get(send_hold.HOLD_HEADER) == "1"
+        request_ids = self.headers.get_all(send_hold.REQUEST_HEADER, [])
+        recover_new_item = route.path == review_page.NEW_ITEM_PATH and bool(request_ids) and not undo_requested
+        if recover_new_item or (undo_requested and self.held_send_path(route.path)):
             if request_ids and (len(request_ids) != 1 or not send_hold.valid_hold_id(request_ids[0])):
                 self.json_response(400, {"reason": "The send has no valid request ID."})
                 return
             request_id = request_ids[0] if request_ids else ""
-            seconds = conf.read("review_links").whole("undo_seconds")
+            # Recovery can resume a pending send or file once with the same ID.
+            seconds = 0 if recover_new_item else conf.read("review_links").whole("undo_seconds")
             server = cast(ReviewLinksServer, self.server)
-            if seconds or (request_id and server.send_holds.has_hold(request_id)):
+            if recover_new_item or seconds or (request_id and server.send_holds.has_hold(request_id)):
                 self.hold_post(route, seconds, request_id)
                 return
         if route.path == review_page.NEW_ITEM_PATH:
@@ -1690,6 +1694,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(404, {"error": "The page screenshot is unavailable."})
         return None
 
+    @staticmethod
+    def _new_item_fields(body: bytes) -> dict[str, object]:
+        payload = cast(object, json.loads(body.decode("utf-8")))
+        if not isinstance(payload, dict):
+            raise new_item_dialog.SubmissionError("Invalid New item request.")
+        return cast(dict[str, object], payload)
+
     def new_item_post(self) -> None:
         """File and publish a native record before sending its message."""
         server = cast(ReviewLinksServer, self.server)
@@ -1709,19 +1720,19 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             body = self.rfile.read(size)
             if len(body) != size:
                 raise new_item_dialog.SubmissionError("Incomplete New item request.")
-            payload = cast(object, json.loads(body.decode("utf-8")))
-            if not isinstance(payload, dict):
-                raise new_item_dialog.SubmissionError("Invalid New item request.")
-            fields = cast(dict[str, object], payload)
+            fields = self._new_item_fields(body)
             token = fields.get("token")
-            valid_token = self.valid_request_token(token)
             if fields.get("kind") == new_item_dialog.SCHEDULED_KIND:
-                if not valid_token:
+                replay = server.send_holds.active_replay(self.headers.get(send_hold.REPLAY_TICKET_HEADER, ""))
+                verified_replay = isinstance(replay, send_hold.ActiveReplay) and replay.scheduled_token_verified
+                if not verified_replay and not self.valid_request_token(token):
                     self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
                     return
                 scheduled = new_item_dialog.read_scheduled_request(fields)
-                self.scheduled_item_post(server, scheduled)
+                sent_at = replay.started_at if isinstance(replay, send_hold.ActiveReplay) else the_list.now()
+                self.scheduled_item_post(server, scheduled, sent_at=sent_at)
                 return
+            valid_token = self.valid_request_token(token)
         except new_item_dialog.ScheduledDraftRequired as error:
             self.json_response(409, {"code": "wrong_draft_kind", "error": str(error)})
             return
@@ -1980,10 +1991,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 server.process_committed_capture(new_item_dialog.read_submission_key(saved.key), details.capture_intent,
                                                  attached=review_submissions.PAGE_SCREENSHOT in details.images)
 
-    def scheduled_item_post(self, server: ReviewLinksServer, request: new_item_dialog.ScheduledSubmission) -> None:
+    def scheduled_item_post(self, server: ReviewLinksServer, request: new_item_dialog.ScheduledSubmission, *,
+                            sent_at: datetime) -> None:
         """File or recover a Scheduled item under the shared draft lock."""
-        sent_at = server.send_holds.replay_started_at(self.headers.get(send_hold.REPLAY_TICKET_HEADER, ""),
-                                                      received_at=the_list.now())
         try:
             with server.list_store_access(), server.staff_read_scope():
                 saved = new_item.submit_scheduled(request, sent_at=sent_at)
@@ -2700,13 +2710,29 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if len(body) != size:
             self.json_response(400, {"reason": "The send is incomplete."})
             return
+        admission = self.hold_admission(route.path, body)
         try:
             # A restart waits until the browser has the hold id, so it can read the result from the next server.
             with server.send_holds.answering():
-                held = server.send_holds.hold(route.path, dict(self.headers.items()), body, seconds, request_id=request_id)
+                held = server.send_holds.hold(route.path, dict(self.headers.items()), body, seconds,
+                                              request_id=request_id, admission=admission)
                 self.json_response(202, held, hold=send_hold.HoldHeader.HELD)
+        except send_hold.StaleScheduleToken:
+            self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
         except send_hold.HoldsStopped:
             self.json_response(503, {"reason": "The console is restarting. Send again."})
+
+    def hold_admission(self, path: str, body: bytes) -> send_hold.HoldAdmission:
+        """Check the Scheduled token before the server saves a new hold."""
+        if path == review_page.NEW_ITEM_PATH and self.headers.get_content_type() == "application/json":
+            try:
+                fields = self._new_item_fields(body)
+            except (ValueError, RecursionError):
+                return send_hold.HoldAdmission.CONSOLE_SEND
+            if fields.get("kind") == new_item_dialog.SCHEDULED_KIND:
+                return (send_hold.HoldAdmission.VERIFIED_SCHEDULE if self.valid_request_token(fields.get("token"))
+                        else send_hold.HoldAdmission.STALE_SCHEDULE_TOKEN)
+        return send_hold.HoldAdmission.CONSOLE_SEND
 
     def hold_result(self, hold_id: str) -> None:
         """Answer with the response of a released send, or say that it is still held."""

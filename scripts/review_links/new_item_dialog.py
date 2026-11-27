@@ -1643,10 +1643,10 @@ function bindDraft(dialog, fresh = false) {
   updateSend();
  }
 
- async function post(payload, {keepalive = false, hold = false, receiver, receipt} = {}) {
+ async function post(payload, {keepalive = false, hold, receiver, receipt} = {}) {
   const options = {method: 'POST', headers: {'Content-Type': 'application/json'},
                    body: JSON.stringify(payload), keepalive};
-  const response = await (hold ? heldFetch(endpoint, options, receiver, undefined, receipt) : fetch(endpoint, options));
+  const response = await (hold ? heldFetch(endpoint, options, receiver, undefined, receipt, hold) : fetch(endpoint, options));
   if (!hold && receipt) await showImmediateSendReceipt(response, receipt);
   return responseData(response, 'Could not send this item.');
  }
@@ -2377,7 +2377,7 @@ function bindDraft(dialog, fresh = false) {
    if (submittedDraft?.payload !== item) {
     const recipientName = recipientChips.querySelector('input:checked')?.nextElementSibling.textContent;
     const draft = {payload: item, mode: 'live', recipientName, pageContext, selectedKind: form.elements.kind.value,
-                   includeScreenshot: includePage.checked};
+                   includeScreenshot: includePage.checked, holdId: hadEarlierSend ? '' : randomNonce().slice(0, 24)};
     if (separateFromNativeDraft && nativeListEdit) {
      const files = await Promise.all(nativeListEdit.files.map(pastedData));
      draft.nativeListEdit = {...nativeListEdit, files};
@@ -2390,19 +2390,27 @@ function bindDraft(dialog, fresh = false) {
    const sendItem = hold => {
     posted = true;
     if (usedPreview && captureSession?.image?.key === item.capture_key) captureSession.sent = true;
-    const receiver = !hadEarlierSend && recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
+    const receiver = recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
     return post({...item, token}, {hold, receiver: receiver || undefined,
                                  receipt: item.kind === 'scheduled' ? scheduledReceipt : undefined});
    };
+   const requestId = submittedDraft.holdId;
+   const onRefusal = async () => {
+    if (submittedDraft?.holdId === requestId) {
+     const draft = {...submittedDraft, holdId: ''};
+     submittedDraft = draft;
+     await storeSubmittedDraft(draft).catch(() => {});
+    }
+   };
    let result;
    try {
-    result = await sendItem(!hadEarlierSend);
+    result = await sendItem(requestId ? {requestId, recover: hadEarlierSend, onRefusal} : undefined);
    } catch (failure) {
     if ((onList && item.kind !== 'scheduled') || !failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);
     setOptions(fresh);
     if (!pendingPayload() && selectedRecipient !== item.recipient_id) throw failure;
-    result = await sendItem(false);
+    result = await sendItem();
    }
    const expectedId = item.kind === 'scheduled' ? /^L[1-9][0-9]*$/ : /^[QPI][1-9][0-9]*$/;
    if (typeof result.id !== 'string' || !expectedId.test(result.id)) {
@@ -2412,12 +2420,12 @@ function bindDraft(dialog, fresh = false) {
   } catch (failure) {
    if (!dialog.open) dialog.showModal();
    if (failure instanceof SendUndone) {
-    if (!hadEarlierSend) {
-     clearSubmittedDraft();
-     awaitingEarlierSend = false;
-     if (captureSession) captureSession.sent = false;
-     storeListDraft();
-    }
+    clearSubmittedDraft();
+    awaitingEarlierSend = false;
+    if (captureSession) captureSession.sent = false;
+    showLaterDraft();
+    showSentDetails();
+    storeListDraft();
     setError(failure.message);
     return;
    }

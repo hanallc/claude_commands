@@ -2416,6 +2416,109 @@ window.fetch = (path, options) => {
     def test_scheduled_send_refreshes_a_stale_token_without_another_undo(self) -> None:
         self.assert_scheduled_receipt("list", held=True, stale=True)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_retry_recovers_a_pending_hold_after_both_replies_are_lost(self) -> None:
+        script = r"""
+const failures = [], check = (ok, message) => { if (!ok) failures.push(message); };
+const nativeFetch = window.fetch, host = window.top.document;
+const dialog = document.querySelector('dialog'), launch = document.querySelector('[data-owner-new]');
+const words = dialog.querySelector('textarea'), send = dialog.querySelector('[type="submit"]');
+const error = dialog.querySelector('.new-item-error'), toast = () => host.querySelector('[data-send-undo]');
+const undoFirst = __UNDO__, reload = __RELOAD__;
+const storageKey = 'test.pending-hold', earlier = JSON.parse(sessionStorage.getItem(storageKey) || 'null');
+const responses = earlier?.responses || [], saved = {id:'L1'}, holds = new Map(earlier?.holds || []);
+let original = responses[0]?.id, created, filings = 0;
+document.addEventListener('review-item-created', event => { created = event.detail; });
+window.fetch = async (path, options = {}) => {
+ if (path.startsWith('/send-hold/')) {
+  const [, , id, action] = path.split('/');
+  if (!holds.has(id)) return Response.json({}, {status:404});
+  if (action === 'undo') {
+   holds.delete(id);
+   return Response.json({outcome:'undone'});
+  }
+  if (action === 'send') return Response.json({});
+  holds.delete(id);
+  filings++;
+  return Response.json(saved);
+ }
+ if (!path.startsWith('/console/review/new-item')) return nativeFetch(path, options);
+ if (!options.body) return Response.json({token:'fixture',page_owner:'owner',
+  recipients:[{id:'owner',name:'owner'}]});
+ const item = JSON.parse(options.body);
+ if (item.kind !== 'scheduled') return Response.json({});
+ const headers = new Headers(options.headers);
+ const id = headers.get('X-Undo-Request'), hold = headers.get('X-Undo-Hold');
+ const loseReply = responses.length < 2;
+ responses.push({id, hold, draft: item.request_id});
+ if (hold === '1') holds.set(id, item.request_id);
+ if (loseReply) {
+  original ??= id;
+  throw new TypeError('The hold reply was lost.');
+ }
+ if (holds.has(id)) return Response.json({hold:id,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ filings++;
+ return Response.json(saved);
+};
+function until(test) {
+ if (test()) return Promise.resolve();
+ return new Promise((resolve, reject) => {
+  const observer = new MutationObserver(() => {
+   if (test()) { clearTimeout(deadline); observer.disconnect(); resolve(); }
+  });
+  const deadline = setTimeout(() => {
+   observer.disconnect(); reject(new Error('The Retry did not finish.'));
+  }, 3000);
+  for (const body of [document.body, host.body]) observer.observe(body, {subtree:true,childList:true,attributes:true});
+ });
+}
+(async () => {
+ try {
+  launch.click();
+  await until(() => dialog.querySelector('[name="recipient_id"]:checked'));
+  if (!earlier) {
+   dialog.querySelector('[name="kind"][value="scheduled"]').click();
+   words.value = __WORDS__;
+   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+   send.click();
+  }
+  await until(() => dialog.open && !send.disabled && send.textContent === 'Retry');
+  check(holds.size === 1 && responses.length === 2 && responses.every(response => response.id === original),
+        'Both lost requests use one hold ID.');
+  if (reload && !earlier && !failures.length) {
+   sessionStorage.setItem(storageKey, JSON.stringify({responses, holds:[...holds]}));
+   location.reload();
+   return;
+  }
+  send.click();
+  await until(() => toast()?.querySelector('button') || created);
+  check(responses[2].id === original && responses[2].draft === responses[0].draft &&
+        !filings && holds.size === 1, 'Retry resumes the pending hold for the same draft.');
+  const button = toast()?.querySelector('button');
+  if (!button) throw new Error('Retry offers no Undo for the pending hold.');
+  if (undoFirst) {
+   button.click();
+   await until(() => dialog.open && !send.disabled && !error.hidden);
+   check(!holds.size && !filings && !words.readOnly && send.textContent === 'Send',
+         'Undo cancels the original hold and makes the draft editable.');
+   send.click();
+   await until(() => toast()?.querySelector('button'));
+   check(responses[3].id !== original, 'Send after Undo uses a new hold ID.');
+  }
+  toast().getAnimations()[0].finish();
+  await until(() => created);
+  check(created.id === 'L1' && filings === 1 && !holds.size,
+        'The browser files one item and leaves no pending hold.');
+ } catch (failure) { failures.push(String(failure)); }
+ await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();
+"""
+        for undo, reload in ((True, False), (False, True)):
+            with self.subTest(undo=undo, reload=reload):
+                probe = (script.replace("__UNDO__", json.dumps(undo)).replace("__RELOAD__", json.dumps(reload))
+                         .replace("__WORDS__", json.dumps(SCHEDULED_RECEIPT_WORDS)))
+                self.assertEqual(firefox_probe_results(bug_fixture_page(script=probe)), [[]])
+
     def test_scheduled_receipt_uses_words_the_server_accepts(self) -> None:
         zone = ZoneInfo("America/New_York")
         with (patch.object(the_list, "series_run_limit", return_value=730),

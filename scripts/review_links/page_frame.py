@@ -1038,9 +1038,9 @@ function sendUndoHost(){
 const pause=(ms,view=window)=>new Promise(resolve=>view.setTimeout(resolve,ms));
 const RETRY_LIMIT_MS=120_000,KEEPALIVE_LIMIT=64*1024;
 const heldRequests=new Map();
-function trackHeldRequest(key){
+function trackHeldRequest(key,id=Array.from(crypto.getRandomValues(new Uint8Array(12)),
+                                           byte=>byte.toString(16).padStart(2,'0')).join('')){
  const view=sendUndoHost().defaultView || window;
- const id=Array.from(crypto.getRandomValues(new Uint8Array(12)),byte=>byte.toString(16).padStart(2,'0')).join('');
  const started=Date.now(),elapsed=performance.now();
  const expired=()=>Date.now()-started>=RETRY_LIMIT_MS || performance.now()-elapsed>=RETRY_LIMIT_MS;
  const request={id,hold:id,expired,closed:false,closeToast:null,finish};
@@ -1169,15 +1169,21 @@ function showSendUndo(request,seconds,receiver,receipt){
   });
  });
 }
-async function heldFetch(url,init={},receiver,onHold,receipt){
- const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
+async function heldFetch(url,init={},receiver,onHold,receipt,{requestId,recover=false,onRefusal}={}){
+ const headers=new Headers(init.headers);
+ if(!recover) headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
- const key=JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
- const request=heldRequests.get(key) || trackHeldRequest(key);
+ const key=requestId || JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
+ let request=heldRequests.get(key);
+ if(recover && request?.closed){
+  request.finish();
+  request=undefined;
+ }
+ request ||= trackHeldRequest(key,requestId);
  headers.set(SEND_REQUEST_HEADER,request.id);
  const keepalive=body.length<=KEEPALIVE_LIMIT && new TextEncoder().encode(body).length<=KEEPALIVE_LIMIT;
  const post=async keepalive=>{
-  if(request.expired()) throw new Error('The retry time ended. The send may have left.');
+  if(!recover && request.expired()) throw new Error('The retry time ended. The send may have left.');
   return fetch(url,{...init,headers,keepalive});
  };
  const first=await post(keepalive).catch(error=>{
@@ -1185,7 +1191,10 @@ async function heldFetch(url,init={},receiver,onHold,receipt){
   return post(false);
  });
  if(first.headers.get('X-Send-Hold')!=='held'){
-  if(!(first.status>=500)) request.finish();
+  if(first.status<500){
+   request.finish();
+   if(!first.ok) await onRefusal?.();
+  }
   if(receipt) await showImmediateSendReceipt(first,receipt,()=>request.closed);
   return first;
  }
@@ -1204,6 +1213,7 @@ async function heldFetch(url,init={},receiver,onHold,receipt){
    const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
    if(response.headers.get('X-Send-Hold')!=='pending'){
     if(response.status!==404 || !request.expired()) request.finish();
+    if(!response.ok) await onRefusal?.();
     if(typeof undo==='function') await undo(response);
     else if(receipt) await showImmediateSendReceipt(response,receipt,()=>request.closed);
     return response;

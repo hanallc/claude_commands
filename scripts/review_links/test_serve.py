@@ -1195,15 +1195,23 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(self.held_http("HEAD", f"{send_hold.HOLD_PATH}/{hold_id}")[0], 405)
 
     def test_a_held_schedule_accepts_a_start_that_was_future_at_send(self) -> None:
+        self.check_held_schedule_start(restart=False)
+
+    def test_a_held_schedule_keeps_its_send_time_after_restart(self) -> None:
+        self.check_held_schedule_start(restart=True)
+
+    def check_held_schedule_start(self, *, restart: bool) -> None:
         case = self.review_fixture()
         morty = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
         start = datetime(2099, 11, 30, 9, tzinfo=timezone.utc)
         current = start - timedelta(seconds=5)
-        request = {"token": self.server.new_item_token, "kind": "scheduled", "page": "list",
-                   "page_recipient": "producer", "request_id": "s1-" + uuid4().hex,
-                   "recipient_id": morty.id, "assignee_id": case.fixture.unit.id,
-                   "words": "Check the Scheduled item. Start 2099-11-30T09:00Z."}
+        request: dict[str, object] = {
+            "token": self.server.new_item_token, "kind": "scheduled", "page": "list",
+            "page_recipient": "producer", "request_id": "s1-" + uuid4().hex,
+            "recipient_id": morty.id, "assignee_id": case.fixture.unit.id,
+            "words": "Check the Scheduled item. Start 2099-11-30T09:00Z.",
+        }
         body = json.dumps(request).encode()
         with (patch.object(send_hold, "time", Mock(wraps=time, time=lambda: current.timestamp())),
               patch.object(the_list, "now", side_effect=lambda: current)):
@@ -1212,20 +1220,45 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual((status, hold, fields["seconds"]), (202, "held", 10), fields)
             held_path = f"{send_hold.HOLD_PATH}/{fields['hold']}"
             self.assertEqual(the_list.records(morty.id), [])
-            current += timedelta(seconds=11)
-            self.assertEqual(self.held_http("POST", held_path + "/send")[0], 200)
-            status, _, fields = self.held_http("GET", held_path)
-            self.assertEqual(status, 200, fields)
-            item, = the_list.records(morty.id)
-            self.assertEqual(item.id, fields["id"])
-            self.assertIsInstance(item.schedule, the_list.ScheduledRun)
-            assert isinstance(item.schedule, the_list.ScheduledRun)
-            self.assertEqual(item.schedule.start, start)
-            late = json.dumps({**request, "request_id": "s1-" + uuid4().hex}).encode()
-            headers = {send_hold.REPLAY_HEADER: "1", send_hold.REPLAY_TICKET_HEADER: held_path.rsplit("/", 1)[-1]}
-            status, _, fields = self.held_http("POST", review_page.NEW_ITEM_PATH, late, headers=headers)
-            self.assertEqual((status, fields.get("error")), (400, "The start must be in the future."))
-            self.assertEqual(the_list.records(morty.id), [item])
+            with ExitStack() as recovering:
+                if restart:
+                    old = self.server
+                    self.assertTrue(old.send_holds.stop_if_idle())
+                    old.shutdown()
+                    old.server_close()
+                    current += timedelta(seconds=11)
+                    _ = recovering.enter_context(patch.object(list_page, "recover_pending"))
+                    _ = recovering.enter_context(patch.object(change_page, "recover_pending"))
+                    resumed = recovering.enter_context(started_review_server(("127.0.0.1", self.port), self.root))
+                    self.assertNotEqual(resumed.new_item_token, request["token"])
+                    worker = threading.Thread(target=resumed.serve_forever, daemon=True)
+                    worker.start()
+                    _ = recovering.callback(worker.join, TEST_HANG_GUARD_SECS)
+                    _ = recovering.callback(resumed.shutdown)
+                    fresh_token = resumed.new_item_token
+                else:
+                    current += timedelta(seconds=11)
+                    self.assertEqual(self.held_http("POST", held_path + "/send")[0], 200)
+                    fresh_token = self.server.new_item_token
+                status, _, fields = self.held_http("GET", held_path)
+                self.assertEqual(status, 200, fields)
+                item, = the_list.records(morty.id)
+                self.assertEqual(item.id, fields["id"])
+                assert isinstance(item.schedule, the_list.ScheduledRun)
+                self.assertEqual(item.schedule.start, start)
+                late = {**request, "token": fresh_token, "request_id": "s1-" + uuid4().hex}
+                headers = {send_hold.REPLAY_HEADER: "1", send_hold.REPLAY_TICKET_HEADER: held_path.rsplit("/", 1)[-1]}
+                status, _, fields = self.held_http("POST", review_page.NEW_ITEM_PATH,
+                                                  json.dumps(late).encode(), headers=headers)
+                self.assertEqual((status, fields.get("error")), (400, "The start must be in the future."))
+                invalid = json.dumps({**late, "token": "stale"}).encode()
+                status, _, fields = self.held_http("POST", review_page.NEW_ITEM_PATH, invalid, headers=headers)
+                self.assertEqual((status, fields.get("code")), (403, "stale_token"))
+                status, _, fields = self.held_http("POST", review_page.NEW_ITEM_PATH, invalid,
+                                                  headers={**headers, send_hold.HOLD_HEADER: "1"})
+                self.assertEqual((status, fields.get("code")), (403, "stale_token"))
+                self.assertEqual(self.hold_states(), ["released"])
+                self.assertEqual(the_list.records(morty.id), [item])
 
     def test_a_closed_page_sends_a_held_new_item_at_once(self) -> None:
         case, other, body = self.held_new_item()
@@ -1259,12 +1292,38 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(first, (202, "held", {"hold": request_id, "seconds": 60}))
             repeated = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=headers)
             self.assertEqual((repeated[0], repeated[1], repeated[2]["hold"]), (202, "held", request_id))
+            recovery_headers = {send_hold.REQUEST_HEADER: request_id}
+            resumed = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=recovery_headers)
+            self.assertEqual((resumed[0], resumed[1], resumed[2]["hold"]), (202, "held", request_id))
+            self.assertGreater(cast(float, resumed[2]["seconds"]), 0)
             self.assertEqual(self.hold_states(), ["pending"])
             self.assertEqual(self.held_http("POST", result + "/send")[0], 200)
             self.assertEqual(self.held_http("GET", result)[0], 200)
             _ = write_config_fixture(conf.path("review_links"), "undo_seconds=0\n")
             repeated = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=headers)
             self.assertEqual((repeated[0], repeated[1], repeated[2]["hold"]), (202, "held", request_id))
+            recovered = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=recovery_headers)
+            self.assertEqual(recovered, (202, "held", {"hold": request_id, "seconds": 0}))
+            self.assertEqual(self.hold_states(), ["released"])
+            send.assert_called_once()
+        self.assertEqual(len(investigation.records(other.id)), 1)
+
+    def test_recovery_first_prevents_a_late_post_from_starting_an_undo_hold(self) -> None:
+        case, other, body = self.held_new_item()
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        request_id = send_hold.new_hold_id()
+        recovery_headers = {send_hold.REQUEST_HEADER: request_id}
+        expected = (202, "held", {"hold": request_id, "seconds": 0})
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            self.assertEqual(self.held_http("POST", review_page.NEW_ITEM_PATH, body,
+                                            headers=recovery_headers), expected)
+            self.assertEqual(self.held_http("POST", review_page.NEW_ITEM_PATH, body,
+                                            headers={**recovery_headers, send_hold.HOLD_HEADER: "1"}), expected)
+            status, _, fields = self.held_http("GET", f"{send_hold.HOLD_PATH}/{request_id}")
+            self.assertEqual(status, 200, fields)
             self.assertEqual(self.hold_states(), ["released"])
             send.assert_called_once()
         self.assertEqual(len(investigation.records(other.id)), 1)

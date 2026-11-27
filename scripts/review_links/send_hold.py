@@ -53,6 +53,7 @@ class PendingFile(TypedDict):
     body: str
     due: float
     started_at: NotRequired[float]
+    scheduled_token_verified: NotRequired[bool]
 
 
 class ReleasedFile(TypedDict):
@@ -94,6 +95,26 @@ class HeldFields(TypedDict):
 
 class HoldsStopped(Exception):
     """The server restarts, so it takes no new hold."""
+
+
+class HoldAdmission(Enum):
+    CONSOLE_SEND = "console send"
+    VERIFIED_SCHEDULE = "verified Scheduled token"
+    STALE_SCHEDULE_TOKEN = "stale Scheduled token"
+
+
+class StaleScheduleToken(Exception):
+    """The server cannot admit a new Scheduled hold with this token."""
+
+
+@dataclass(frozen=True)
+class ActiveReplay:
+    started_at: datetime
+    scheduled_token_verified: bool
+
+
+class NoActiveReplay(Enum):
+    ABSENT = "no active replay"
 
 
 @dataclass(frozen=True)
@@ -146,7 +167,7 @@ class Holds:
         self._lock: threading.Condition = threading.Condition()
         self._timers: dict[str, threading.Timer] = {}
         self._releasing: set[str] = set()
-        self._replay_starts: dict[str, datetime] = {}
+        self._active_replays: dict[str, ActiveReplay] = {}
         # Results that the server could not write; the page reads them from memory.
         self._failed: dict[str, HeldResponse] = {}
         self._answering: int = 0
@@ -201,7 +222,7 @@ class Holds:
         return self._saved(path) if path.exists() else BadFile.UNREADABLE
 
     def hold(self, path: str, headers: Mapping[str, str], body: bytes, seconds: float, *,
-             request_id: str = "") -> HeldFields:
+             request_id: str = "", admission: HoldAdmission = HoldAdmission.CONSOLE_SEND) -> HeldFields:
         """Save a send or return its existing hold with the remaining Undo time."""
         hold_id = request_id or new_hold_id()
         if not valid_hold_id(hold_id):
@@ -210,7 +231,8 @@ class Holds:
         saved: PendingFile = {
             "state": "pending", "path": path, "body": base64.b64encode(body).decode("ascii"),
             "headers": {name: value for name, value in headers.items() if name.lower() in REPLAY_HEADERS},
-            "started_at": started_at, "due": started_at + seconds + RELEASE_GRACE_SECONDS}
+            "started_at": started_at, "due": started_at + seconds + (RELEASE_GRACE_SECONDS if seconds else 0),
+            "scheduled_token_verified": admission is HoldAdmission.VERIFIED_SCHEDULE}
         with self._lock:
             if hold_id in self._releasing or hold_id in self._failed:
                 return {"hold": hold_id, "seconds": 0}
@@ -226,6 +248,8 @@ class Holds:
                     return {"hold": hold_id, "seconds": 0}
                 saved["due"] = time.time()
                 seconds = 0
+            if admission is HoldAdmission.STALE_SCHEDULE_TOKEN:
+                raise StaleScheduleToken
             self._write(hold_id, saved)
             self._schedule(hold_id, saved["due"])
         return {"hold": hold_id, "seconds": seconds}
@@ -294,19 +318,19 @@ class Holds:
                 self._releasing.discard(hold_id)
                 self._lock.notify_all()
 
-    def replay_started_at(self, ticket: str, *, received_at: datetime) -> datetime:
-        """Get the server's Send time for an active replay."""
+    def active_replay(self, ticket: str) -> ActiveReplay | NoActiveReplay:
+        """Get the Send time and token check for an active replay."""
         if not ticket:
-            return received_at
+            return NoActiveReplay.ABSENT
         with self._lock:
-            return self._replay_starts.get(ticket, received_at)
+            return self._active_replays.get(ticket, NoActiveReplay.ABSENT)
 
     def _send(self, hold_id: str) -> None:
         try:
             path = self._file(hold_id)
             saved = cast(PendingFile, json.loads(path.read_text(encoding="utf-8")))
             body = base64.b64decode(saved["body"])
-            # Older pending files record the Send time in their file timestamp.
+            # For older files, the modification time can be later than Send.
             started_at = saved["started_at"] if "started_at" in saved else path.stat().st_mtime
             sent_at = datetime.fromtimestamp(started_at, UTC)
             # A server that stops during the replay finds this result, and never sends the request again.
@@ -321,7 +345,7 @@ class Holds:
         # Only the replay request receives this ticket. The browser receives the hold ID.
         ticket = new_hold_id()
         with self._lock:
-            self._replay_starts[ticket] = sent_at
+            self._active_replays[ticket] = ActiveReplay(sent_at, saved.get("scheduled_token_verified") is True)
         try:
             response = self._replay(saved["path"], saved["headers"], body, ticket)
         except TimeoutError:
@@ -331,7 +355,7 @@ class Holds:
             response = failed(f"The held send failed: {error}")
         finally:
             with self._lock:
-                del self._replay_starts[ticket]
+                del self._active_replays[ticket]
         try:
             self._write(hold_id, released_file(response))
         except OSError as error:
