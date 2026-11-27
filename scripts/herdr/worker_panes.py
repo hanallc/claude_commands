@@ -783,6 +783,12 @@ def run_state(run: Path) -> dict[str, object]:
     return worker_lifecycle.read_json_object(run / recorder_state.STATE_FILENAME)
 
 
+@dataclass(frozen=True)
+class ParentRuns:
+    pass_candidates: tuple[Path, ...]
+    default_run: Path
+
+
 def worker_run_directories(record: staff.StaffSnapshot, *, scanned: dict[str, list[str]] | None = None,
                            read: Callable[[Path], dict[str, object]] | None = None) -> unit_runs.LauncherRunDirectories:
     """Resolve each worker through the launcher and retain its candidate directories."""
@@ -793,26 +799,24 @@ def worker_run_directories(record: staff.StaffSnapshot, *, scanned: dict[str, li
     scanned = parent_run_index(record) if scanned is None else scanned
     linked = progress_history.recorded_dispatch_runs()
     read = cache(run_state) if read is None else read
-    parents: dict[StaffId, tuple[list[Path], Path, tuple[Path, ...]]] = {}
+    parents: dict[StaffId, tuple[ParentRuns, tuple[Path, ...]]] = {}
     found: dict[StaffId, tuple[Path, ...]] = {}
     for row in workers:
         parent = record.parent_of(row) or row
         if parent.id not in parents:
             held = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
-            recorded = (parent.run.path,) if isinstance(parent.run, staff.OpenRun) else ()
             fallback = worker_fallback_run(parent, record=record)
-            runs = [Path(run) for run in _parent_runs(parent, held)]
-            parents[parent.id] = (runs, runs[0] if runs else fallback,
-                                  (*runs, *recorded, fallback))
-        runs, first, shared = parents[parent.id]
+            runs = _parent_runs(parent, held, read=read)
+            parents[parent.id] = (runs, (*runs.pass_candidates, fallback))
+        runs, shared = parents[parent.id]
         dispatched = linked[row.id].directory if row.id in linked else None
         try:
-            selected = (_worker_run_in(row, runs, dispatched, first, record=record, read=read) if parent is not row
+            selected = (_worker_run_in(row, runs, dispatched, record=record, read=read) if parent is not row
                         else worker_run(row, record=record, scanned=scanned))
         except recorder_state.OldRecorderState as error:
             print(error, file=sys.stderr)
             # Detached records prove their worker by staff id.
-            selected = first
+            selected = runs.default_run
         found[row.id] = tuple(dict.fromkeys((selected, *shared, *((dispatched,) if dispatched is not None else ()))))
     return unit_runs.LauncherRunDirectories(found, scanned)
 
@@ -831,32 +835,41 @@ def worker_run(member: staff.StaffRow, *,
         return unit_runs.state_dir() / "staff" / "workers" / member.id
     if scanned is None:
         scanned = parent_run_index(record)
-    runs = [Path(run) for run in _parent_runs(parent, unit_runs.held(str(parent.current_session), record=record, scanned=scanned))]
-    first = runs[0] if runs else worker_fallback_run(parent, record=record)
+    read = cache(run_state)
+    held = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
+    runs = _parent_runs(parent, held, read=read)
     if member.kind != "worker":
-        return first
+        return runs.default_run
 
     dispatched = progress_history.recorded_dispatch_run(member.id)
     linked = dispatched.directory if isinstance(dispatched, progress_history.RecordedDispatchRun) else None
-    return _worker_run_in(member, runs, linked, first, record=record, read=run_state)
+    return _worker_run_in(member, runs, linked, record=record, read=read)
 
 
-def _parent_runs(parent: staff.StaffRow, held: list[str]) -> list[str]:
-    """Order the parent's open run, its held runs, then a supplied run that it owns."""
-    runs = list(dict.fromkeys((str(parent.run.path), *held))) if isinstance(parent.run, staff.OpenRun) else held
+def _parent_runs(parent: staff.StaffRow, held: list[str], *, read: Callable[[Path], dict[str, object]]) -> ParentRuns:
+    """Choose a run for startup and keep the pass lookup order."""
+    recorded = (parent.run.path,) if isinstance(parent.run, staff.OpenRun) else ()
+    runs = dict.fromkeys((*recorded, *(Path(run) for run in held)))
     if supplied := unit_runs.environ("RUN_DIR"):
-        fields = worker_lifecycle.read_json_object(Path(supplied) / recorder_state.STATE_FILENAME)
+        directory = Path(supplied)
+        fields = read(directory)
         if fields.get(unit_runs.OWNER_FIELD) == parent.id:
-            runs = list(dict.fromkeys((*runs, supplied)))
-    return runs
+            _ = runs.setdefault(directory)
+            if not unit_runs.terminal_run(fields):
+                return ParentRuns(tuple(runs), directory)
+    first = next((run for run in runs if not unit_runs.terminal_run(read(run))),
+                 unit_runs.state_dir() / "staff" / "workers" / parent.id)
+    return ParentRuns(tuple(runs), first)
 
 
-def _worker_run_in(member: staff.StaffRow, runs: Sequence[Path], linked: Path | None, fallback: Path, *,
+def _worker_run_in(member: staff.StaffRow, runs: ParentRuns, linked: Path | None, *,
                    record: staff.StaffSnapshot, read: Callable[[Path], dict[str, object]]) -> Path:
     """Select the parent run or linked run that holds the worker's newest pass."""
-    candidates = dict.fromkeys((*runs, *(() if linked is None else (linked,)), fallback))
+    candidates = dict.fromkeys((*runs.pass_candidates, *(() if linked is None else (linked,))))
+    if not runs.pass_candidates:
+        candidates[runs.default_run] = None
     passes = [(run, passed) for run in candidates if (passed := _pass_in(member, _run_state(run, read), record))]
-    return max(passes, key=lambda item: _pass_started_at(item[1]))[0] if passes else fallback
+    return max(passes, key=lambda item: _pass_started_at(item[1]))[0] if passes else runs.default_run
 
 
 def _run_state(run: Path, read: Callable[[Path], dict[str, object]] = run_state) -> dict[str, object]:
