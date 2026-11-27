@@ -1016,6 +1016,7 @@ def for_you_details(item: ReviewItem, row: for_you.ForYouRow, inputs: ReviewBody
     """Render the action in the shared Review card."""
     requester = row.requested_by or 'Not recorded'
     rebuild = row.kind == 'rebuild'
+    done = row.status == 'done'
     asker = inputs.names.html(row.requester_reference, requester) if rebuild else inputs.names.html(item.owner, requester)
     if rebuild and not row.requests:
         asker = 'Found by the system check'
@@ -1026,7 +1027,7 @@ def for_you_details(item: ReviewItem, row: for_you.ForYouRow, inputs: ReviewBody
         ('Machine', html.escape(row.machine)),
         ('Working directory', html.escape(row.cwd or 'Not recorded')),
         ('Asked by' if rebuild else 'Requester', asker),
-        *(() if rebuild else (('Waiting work', html.escape(row.waits)),)),
+        *(() if rebuild or done else (('Waiting work', html.escape(row.waits)),)),
         ('Completion', completion),
     )
     metadata = '<dl class="page-state">'+''.join(f'<dt>{label}</dt><dd>{text}</dd>' for label, text in fields)+'</dl>'
@@ -1049,8 +1050,10 @@ def for_you_details(item: ReviewItem, row: for_you.ForYouRow, inputs: ReviewBody
         if not row.running_revision:
             reason += '<p class="rebuild-secondary">The running revision is unknown.</p>'
     form_item = replace(item, actions=('done',)) if row.kind == 'action' and row.status == 'open' else item
+    lead = ('<p><strong>Done.</strong> Nothing is waiting for you.</p>' if done
+            else page_frame.copy_code_block(row.command))
     return ('<div class="list-panel review-panel for-you"><div data-review-body>'
-            +page_frame.copy_code_block(row.command)+reason+evidence+link+'</div><div>'+metadata+'</div>'
+            +lead+reason+evidence+link+'</div><div>'+metadata+'</div>'
             +form(form_item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets),
                   routes=change_browser.send_route_attributes({"done": None}))+'</div>')
 
@@ -1987,6 +1990,11 @@ const firstReviewCard=(()=>{
  }
  const params=recordPlaceParams(reviewPlaceOptions);
  legacyReviewPlace(params);
+ if(history.state?.recordTable && params.get('show')==='Done'){
+  params.set('show','open');
+  for(const field of ['item','jump','linked','reveal']) params.delete(field);
+  history.replaceState(null,'',location.pathname+'#'+params);
+ }
  const key=recordItemLink(params,value=>resolveShownRecordId(index,value));
  if(!index.has(key)) return null;
  const version=document.querySelector('[data-review]').dataset.version;

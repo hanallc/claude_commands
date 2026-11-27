@@ -3435,6 +3435,27 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         saved = store.get(automatic.key)
         self.assertEqual((saved.status, saved.completion, saved.evidence), ('done', 'automatic', 'Marked Done in Review.'))
 
+    def test_completed_for_you_card_shows_evidence_without_work_to_do(self) -> None:
+        opened = ActionStore().add(title='Move old test folders from memory to disk',
+            command='move-test-folders --apply', machine='natedev', cwd='/fixture', requested_by='resources',
+            reason='The test folders still use memory.', waits='Disk space check', concerns='resources',
+            dedupe_key='move-test-folders', completion='manual')
+        action = for_you.action_row(opened, 'resources')
+        completed = replace(action, status='done', evidence='Marked Done in Review.')
+        with patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((action,), ())):
+            open_body = review_page.build_snapshot(self.root).body(action.key)
+        with patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((completed,), ())):
+            done_body = review_page.build_snapshot(self.root).body(action.key)
+        self.assertIn(b'data-copy-code', open_body)
+        self.assertIn(b'<dt>Waiting work</dt><dd>Disk space check</dd>', open_body)
+        self.assertNotIn(b'Nothing is waiting for you.', open_body)
+        notice = b'<strong>Done.</strong> Nothing is waiting for you.'
+        self.assertIn(notice, done_body)
+        self.assertLess(done_body.index(notice), done_body.index(b'<h3>Reason</h3>'))
+        self.assertIn(b'Marked Done in Review.', done_body)
+        for control in (b'data-copy-code', b'move-test-folders --apply', b'Waiting work', b'data-review-form'):
+            self.assertNotIn(control, done_body)
+
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_for_you_notifier_copy_done_and_rebuild_keep_the_review_draft(self) -> None:
         _ = self.question()
@@ -7925,6 +7946,135 @@ window.fetch=(url,options)=>String(url)==='/results' ? sendProbe(url,options) :
         shell = shell.replace('</body>', probe+'</body>', 1)
         review_html, shell_html = (json.dumps(page).replace('</', '<\\/') for page in (review, shell))
         router = f'<script>document.write(location.pathname.endsWith("review.html") ? {review_html} : {shell_html});</script>'
+        self.assertEqual(firefox_probe_results(router.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_console_reload_opens_open_after_a_done_visit(self) -> None:
+        opened = for_you.ForYouRow(f'action/{uuid4()}', 'action', 'Open action', 'fixture-command',
+                                   'natedev', '/fixture', 'resources', '', '',
+                                   '2026-11-27T19:00:00+00:00', 'open', 'manual', '')
+        completed = replace(opened, key=f'action/{uuid4()}', title='Completed action', status='done')
+        with patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((opened, completed), ())):
+            review = browser_markup(self.root)
+        pages = (console.ConsolePage('review', 'Review', 'inbox', 'Review',
+                                     console.AvailablePage('/console/review.html')),)
+        shell = console.render(pages, console.UnavailablePage()).decode()
+        shell = shell.replace('</head>', '''<script>
+const sendProbe=fetch;
+window.fetch=(url,options)=>String(url)==='/results' ? sendProbe(url,options) :
+ Promise.resolve(Response.json({available:true,count:0,entries:[],new:[]}));
+</script></head>''', 1)
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok)failures.push(label);};
+ const frame=document.querySelector('iframe'),stage=sessionStorage.getItem('done-visit');
+ const page=()=>frame.contentDocument;
+ const show=()=>page().querySelector('[data-review]')?.dataset.show;
+ const row=key=>page().querySelector('[data-key="'+key+'"]');
+ const chip=value=>page().querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
+ const until=async(predicate,label)=>{
+  const end=performance.now()+8000;
+  while(!predicate()){
+   if(performance.now()>end)throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ try{
+  if(!stage){
+   sessionStorage.setItem('done-visit','explicit');
+   const path='/console/review.html?show=Done&type=for-you&item='+encodeURIComponent(DONE_KEY);
+   location.search=new URLSearchParams({'page':'review','at.review':path});return;
+  }
+  await until(()=>frame.contentWindow.history.state?.recordTable,'Review did not load.');
+  if(stage==='explicit'){
+   check(show()==='Done' && frame.contentWindow.recordIsOpen(row(DONE_KEY)),
+     'An explicit Done address opens the completed card.');
+   chip('open').click();chip('Done').click();
+   check(show()==='Done' && row(DONE_KEY),'The Done chip shows the completed card.');
+   row(DONE_KEY).querySelector('.list-toggle').click();
+   await until(()=>history.state?.reviewPlace?.table?.opened.includes(DONE_KEY) &&
+     history.state.reviewPlace.place==='/console/review.html'+frame.contentWindow.location.hash,
+     'The console did not save the completed card.');
+   sessionStorage.setItem('done-visit','restored');location.reload();return;
+  }
+  check(show()==='open' && row(OPEN_KEY) && !row(DONE_KEY),
+    'A restored Done view opens on Open and hides the completed card.');
+  chip('Done').click();
+  check(show()==='Done' && row(DONE_KEY) && !row(OPEN_KEY),
+    'The Done chip still shows the completed card after reload.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>""".replace('DONE_KEY', json.dumps(completed.key)).replace('OPEN_KEY', json.dumps(opened.key))
+        shell = shell.replace('</body>', probe+'</body>', 1)
+        review_html, shell_html = (json.dumps(page).replace('</', '<\\/') for page in (review, shell))
+        router = f'<script>document.write(location.pathname.endsWith("review.html") ? {review_html} : {shell_html});</script>'
+        self.assertEqual(firefox_probe_results(router.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_console_link_to_the_saved_done_address_opens_the_card(self) -> None:
+        completed = for_you.ForYouRow(f'action/{uuid4()}', 'action', 'Completed action', 'fixture-command',
+                                      'natedev', '/fixture', 'resources', '', '',
+                                      '2026-11-27T19:00:00+00:00', 'done', 'manual', 'Marked Done in Review.')
+        with patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((completed,), ())):
+            review = browser_markup(self.root)
+        pages = (console.ConsolePage('review', 'Review', 'inbox', 'Review',
+                                     console.AvailablePage('/console/review.html')),
+                 console.ConsolePage('builds', 'Builds', 'hammer', 'Builds',
+                                     console.AvailablePage('/console/builds.html')))
+        shell = console.render(pages, console.UnavailablePage()).decode()
+        shell = shell.replace('</head>', '''<script>
+const sendProbe=fetch;
+window.fetch=(url,options)=>String(url)==='/results' ? sendProbe(url,options) :
+ Promise.resolve(Response.json({available:true,count:0,entries:[],new:[]}));
+</script></head>''', 1)
+        builds = change_page.document('<a target="_top" id="copied-review">Completed action</a>', 'Builds').decode()
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok)failures.push(label);};
+ const frame=page=>document.querySelector('[data-console-page="'+page+'"]');
+ const review=()=>frame('review')?.contentDocument;
+ const row=()=>review()?.querySelector('[data-key="'+DONE_KEY+'"]');
+ const chip=(name,value)=>review().querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
+ const until=async(predicate,label)=>{
+  const end=performance.now()+8000;
+  while(!predicate()){
+   if(performance.now()>end)throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ try{
+  const copied=sessionStorage.getItem('copied-done-address');
+  if(!copied){
+   await until(()=>frame('review')?.contentWindow.history.state?.recordTable,'Review did not load.');
+   chip('type','for-you').click();chip('show','Done').click();
+   row().querySelector('.list-toggle').click();
+   await until(()=>history.state?.reviewPlace?.table?.opened.includes(DONE_KEY),
+     'The console did not record the open card.');
+   sessionStorage.setItem('copied-done-address',location.href);
+   document.querySelector('[data-page="builds"]').click();
+   location.reload();return;
+  }
+  const saved=new URL(copied).searchParams.get('at.review');
+  if(frame('review') || !saved || saved!==history.state?.reviewPlace?.place)
+   throw new Error('The reloaded console must have a saved Done address and no Review frame.');
+  const builds=()=>frame('builds')?.contentDocument;
+  await until(()=>builds()?.readyState==='complete' && builds().querySelector('#copied-review'),
+    'Builds did not load.');
+  const link=builds().querySelector('#copied-review');
+  link.href=copied;link.click();
+  await until(()=>frame('review')?.contentWindow.history.state?.recordTable,'Review did not open from Builds.');
+  check(review().querySelector('[data-review]').dataset.show==='Done','The copied address selects Done.');
+  check(frame('review').contentWindow.recordIsOpen(row()),'The copied address opens its card.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>""".replace('DONE_KEY', json.dumps(completed.key))
+        shell = shell.replace('</body>', probe+'</body>', 1)
+        review_html, builds_html, shell_html = (json.dumps(page).replace('</', '<\\/') for page in (review, builds, shell))
+        router = ('<script>if(location.pathname==="/accounts")history.replaceState(null,"","/console/");'
+                  + 'const page=location.pathname;document.write(page.endsWith("review.html") ? '
+                  + f'{review_html} : page.endsWith("builds.html") ? {builds_html} : {shell_html});</script>')
         self.assertEqual(firefox_probe_results(router.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')

@@ -395,6 +395,10 @@ The console applies the link's recorded place and keeps the source frame open.
 
 The console URL also records the place of each opened page as `at.<id>=<path, query and fragment>`.
 A reload or a shared link opens each page at its recorded place.
+If Review restores a Done view on load, it selects Open and closes the saved card.
+A new address that specifies Done selects Done.
+A console link uses its Review address even if the address matches a saved place.
+The Done chip selects Done during the visit.
 The console takes a recorded place only when its path is the configured path of that page; otherwise it opens the configured URL.
 A place equal to the configured URL removes its `at.<id>` key.
 The console reads a frame's place when the frame loads and at each `hashchange` in the frame.
@@ -608,8 +612,10 @@ The For you Type chip follows All.
 It uses the same action reader as the console notifier.
 It defaults to Open and keeps the Show, Owner, and Search controls.
 All includes withdrawn actions and their reasons.
-The card shows the command, machine, working directory, requester, reason, waiting work, and completion method.
+An open card shows the command, machine, working directory, requester, reason, waiting work, and completion method.
 Copy uses the shared code block. It leaves the action open.
+The top of a Done action card reads “Done. Nothing is waiting for you.”
+The card keeps its evidence and omits the command, Copy control, and waiting work.
 Done uses the signed Review form to complete an open manual action through the action store.
 The saved action leaves Open and appears in Done and All at once.
 The same signed Done request can return the saved result again.

@@ -745,6 +745,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     }
     frameNavigation.set(frame, {
       request(place) {
+        delete frame.reviewPlace;
         pendingPlace = place;
         applyPlace();
       },
@@ -854,7 +855,9 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       const place = placeOf(entry, requested);
       const url = new URL(location.href);
       url.searchParams.set(key, place);
-      history.replaceState(history.state, '', url);
+      const state = history.state;
+      if (identity === 'review') delete state?.reviewPlace;
+      history.replaceState(state, '', url);
       frameNavigation.get(frames.get(identity))?.request(place);
     }
     select(identity, navigate);
