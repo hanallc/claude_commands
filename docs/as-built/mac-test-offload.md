@@ -555,6 +555,10 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   A Linux step skips this removal when `--target-dir` selects another folder.
   A Linux step checks tool versions before this removal.
   A missing target or a failed removal does not stop the build.
+
+  The Mac writes one `sweep_trim` row for the target when the removal frees measured space.
+  The row records the bytes freed, the `abandoned session` cause, and the `partial` extent.
+  The recorder runs in the background. The build continues if the recorder waits for the build-log lock or fails.
 - **Cleanup.** The remote command trims the mirror target after it reports the verdict. A custom `--target-dir` produces `mac_cleanup=skipped`. A request that fetches output keeps the mirror target. The trim uses `mac_budget_gib.<repo>` or the default `mac_budget_gib`. It holds the exclusive mirror lease and uses the shared removal guard. It removes Cargo groups and loose files in `deps`, `build`, `.fingerprint`, and `incremental` by access time. It checks for open files before each removal. It removes the oldest output first and keeps the target directory. The `mac_trim` record gives the status, elapsed seconds, remaining size in KiB, and budget in GiB. The command reports a nonzero cleanup status if the output remains over budget.
 - **Nextest output.** The Mac saves both output streams in a private file under `~/.local/state/mac-test/logs`.
   After success, the runner sends the full output and deletes the file.

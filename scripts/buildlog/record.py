@@ -1504,7 +1504,7 @@ def floor_scan(free_after_scan: int, floor: int, idle_targets: list[IdleFloorTar
 
 
 def sweep_trim(folder: str, bytes_freed: int, extent: Literal["whole", "partial"],
-               cause: Literal["budget take", "floor take"], at: float) -> None:
+               cause: Literal["budget take", "floor take", "abandoned session"], at: float) -> None:
     host = store.host_name()
     store.append_line(store.host_file(host, at), {
         "kind": "sweep_trim", "v": RECORD_VERSION,

@@ -5762,7 +5762,7 @@ def parse_sweep_removals(rows: Iterable[dict[str, object]]) -> list[SweepRemoval
     return events
 
 
-def record_sweep_removal(target: str, cause: Literal["budget take", "floor take"],
+def record_sweep_removal(target: str, cause: Literal["budget take", "floor take", "abandoned session"],
                          bytes_freed: int, extent: Literal["whole", "partial"], at: float) -> bool:
     """One build-log row per target take, including when stdout is discarded."""
     from scripts.buildlog import record
