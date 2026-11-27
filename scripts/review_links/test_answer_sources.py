@@ -517,7 +517,9 @@ class AnswerSourceTests(unittest.TestCase):
                     source: the_list.LockedExchangeSource, exchanges: tuple[list_exchange.Exchange, ...], title: str, *,
                     linked: investigation.ListDestination | the_list.NextNumber, owner: staff.StaffId,
                     members: staff.StaffSnapshot, question_filing: the_list.QuestionFiling,
-                    unresolved_reply_ids: frozenset[str]) -> investigation.ListDestination:
+                    unresolved_reply_ids: frozenset[str],
+                    submission_question: the_list.NativeQuestionItem | the_list.NoQuestionItem
+                    ) -> investigation.ListDestination:
                 if current_thread() is migration_thread:
                     self.assertEqual(the_list.records(KEEPER.id), [])
                     with outstanding.with_suffix(".lock").open("a") as lock, self.assertRaises(BlockingIOError):
@@ -530,7 +532,8 @@ class AnswerSourceTests(unittest.TestCase):
                     current, = update_registration.selected_question_records([path], (), None)
                     self.assertEqual(current.status, "open")
                 return save(source, exchanges, title, linked=linked, owner=owner, members=members,
-                            question_filing=question_filing, unresolved_reply_ids=unresolved_reply_ids)
+                            question_filing=question_filing, unresolved_reply_ids=unresolved_reply_ids,
+                            submission_question=submission_question)
 
             with (patch.object(update_registration, "outstanding_lock", observe_lock),
                   patch.object(the_list, "file_exchanges", side_effect=save_while_withdrawal_starts)):
@@ -573,11 +576,14 @@ class AnswerSourceTests(unittest.TestCase):
                               title: str, *, linked: investigation.ListDestination | the_list.NextNumber,
                               owner: staff.StaffId, members: staff.StaffSnapshot,
                               question_filing: the_list.QuestionFiling,
-                              unresolved_reply_ids: frozenset[str]) -> investigation.ListDestination:
+                              unresolved_reply_ids: frozenset[str],
+                              submission_question: the_list.NativeQuestionItem | the_list.NoQuestionItem
+                              ) -> investigation.ListDestination:
             at_list.set()
             self.assertTrue(proceed.wait(timeout=4))
             return save_exchanges(source, exchanges, title, linked=linked, owner=owner, members=members,
-                                  question_filing=question_filing, unresolved_reply_ids=unresolved_reply_ids)
+                                  question_filing=question_filing, unresolved_reply_ids=unresolved_reply_ids,
+                                  submission_question=submission_question)
 
         @contextmanager
         def pause_before_owner(target: Path) -> Generator[None]:
@@ -1187,6 +1193,42 @@ class AnswerSourceTests(unittest.TestCase):
         saved = the_list.load(KEEPER.id, item.id)
         self.assertEqual({exchange.source_key for exchange in saved.filed_exchanges},
                          {"submission/question/request-original", "submission/question/request-second"})
+
+    def test_conversion_saves_the_original_question_source_before_loading(self) -> None:
+        primary = "submission/question/original-legacy"
+        secondary = "submission/question/linked-later"
+        exchange = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, primary, "followup:1",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which plan?", START, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.QuestionWithoutAnswer.OPEN)
+        with the_list.lock_exchange_source(primary) as source:
+            row = the_list.file_exchanges(source, (exchange,), exchange.question,
+                                          linked=the_list.NextNumber.AVAILABLE, owner=OWNER.id, members=MEMBERS)
+        identity = f"L{row.number}"
+        with the_list.lock_exchange_source(secondary) as source:
+            _ = the_list.file_exchanges(source, (replace(exchange, source_key=secondary),), exchange.question,
+                                        linked=row, owner=OWNER.id, members=MEMBERS)
+        store = list_draft.list_records(row.keeper, the_list.ListError)
+        with store.locked():
+            fields, body = store.read(identity)
+            del fields["question_source_key"]
+            exchanges = list_exchange.decode(fields["filed_exchanges"])
+            fields["filed_exchanges"] = list_exchange.encode(tuple(reversed(exchanges)))
+            store.write(identity, fields, body)
+
+        with patch.object(the_list, "_legacy_question_origin") as infer:
+            with self.assertRaisesRegex(the_list.ListError, "Convert the question item"):
+                _ = the_list.load(row.keeper, identity)
+            infer.assert_not_called()
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        with store.locked():
+            fields, body = store.read(identity)
+            self.assertEqual(fields["question_source_key"], primary)
+            fields["filed_exchanges"] = list_exchange.encode(exchanges)
+            store.write(identity, fields, body)
+        with patch.object(the_list, "_native_question_origins") as infer:
+            saved = the_list.load(row.keeper, identity)
+            self.assertEqual(saved.native_question, the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, primary))
+            infer.assert_not_called()
 
     def test_studio_followup_reply_moves_the_question_to_answers(self) -> None:
         key = "question/staff/asked.md"

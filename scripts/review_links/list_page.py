@@ -212,13 +212,12 @@ def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
               unread_delivery: bool = False, unread_answer: bool = False, open_ask: bool = False,
               report: bool = False, question_item: bool = False) -> ListChip:
     """Find the one status chip for this item."""
+    if question_item and (state is the_list.ItemState.ANSWERED or unread_answer):
+        return ListChip.ANSWERS
     if state is the_list.ItemState.SCHEDULED:
         return ListChip.SCHEDULED
     if state == the_list.ItemState.REPAIRED:
         return ListChip.NEEDS_ME
-    if question_item and (state is the_list.ItemState.ANSWERED
-                          or state is the_list.ItemState.WORKING and unread_answer):
-        return ListChip.ANSWERS
     if question_item and not parked:
         if state is the_list.ItemState.WAITING_FOR_NATE:
             return ListChip.QUESTIONS
@@ -277,8 +276,7 @@ def top_priority_mark(shown: TopPriority, members: staff.StaffSnapshot, item: th
     return TopPriorityMark.TOP_ITEM if producer.top_item == staff.TopItem(item.number) else TopPriorityMark.MAKE_TOP
 
 
-def records(*, include_closed: bool = False, sources: list[Path] | None = None) -> list[ListRecord]:
-    """Read the list folders even when a producer has no current staff row."""
+def list_keepers(sources: list[Path] | None = None) -> list[staff.StaffId]:
     root = record_store.state_root()
     if sources is not None:
         sources.append(root)
@@ -286,9 +284,13 @@ def records(*, include_closed: bool = False, sources: list[Path] | None = None) 
         owners = sorted(root.iterdir())
     except FileNotFoundError:
         return []
-    found = [ListRecord(staff.StaffId(owner.name), item) for owner in owners
-             if owner.is_dir() and not owner.is_symlink()
-             for item in the_list.records(staff.StaffId(owner.name), include_closed=include_closed, sources=sources)]
+    return [staff.StaffId(owner.name) for owner in owners if owner.is_dir() and not owner.is_symlink()]
+
+
+def records(*, include_closed: bool = False, sources: list[Path] | None = None) -> list[ListRecord]:
+    """Read the list folders even when a producer has no current staff row."""
+    found = [ListRecord(keeper, item) for keeper in list_keepers(sources)
+             for item in the_list.records(keeper, include_closed=include_closed, sources=sources)]
     return sorted(found, key=lambda entry: the_list.order(entry.item))
 
 
@@ -1361,9 +1363,11 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     questions = panel_questions(item, today, unread_answers, failed) if isinstance(schedule, the_list.NoSchedule) else ''
     waits_for_answer = (the_list.question_item(item) is the_list.QuestionItemKind.TO_NATE
                         and item.state is the_list.ItemState.WAITING_FOR_NATE)
-    form = '' if waits_for_answer else feedback_form(
-        entry, secret, members=names.members, parking_label=parking_label, schedule=schedule, today=today, mark=mark,
-        unread_answers=unread_answers)
+    if waits_for_answer:
+        form = waiting_feedback_form(entry, secret, "", unread=True, mark=TopPriorityMark.HIDDEN) if unread_answers else ''
+    else:
+        form = feedback_form(entry, secret, members=names.members, parking_label=parking_label, schedule=schedule,
+                             today=today, mark=mark, unread_answers=unread_answers)
     return waiting_note(entry, names, hidden=True) + detail_panel(
         entry, sections + questions + form, today, names, unread_answers, progress, ask_boxes(entry, secret, names),
         schedule=schedule, linked_items=linked_items)
@@ -1384,7 +1388,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
               schedule: DisplayedSchedule, mark: TopPriorityMark, hidden: bool = False, linked_items: str = "") -> str:
     item = entry.item
     producer = owner_name(names.members, item.producer)
-    unread = isinstance(item.unread_since, datetime)
+    unread_at = item.unread_at
+    unread = isinstance(unread_at, datetime)
     waiting = isinstance(visibility, the_list.WaitingForAnswer)
     progress = item_progress(item, names, schedule)
     scheduled = not isinstance(schedule, the_list.NoSchedule)
@@ -1392,7 +1397,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     due = the_list.eta_due(eta)
     eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(eta, today).casefold())
     values = (item.number, owner_sort, producer.casefold(), item.title.casefold(), item.state.value.casefold(),
-              progress.next_step.casefold(), eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
+              progress.next_step.casefold(), eta_sort, unread_at.timestamp() if unread else 0)
     parking = (the_list.ParkUntilDelivered.DELIVERED.value
                if item.parked_until is the_list.ParkUntilDelivered.DELIVERED else str(parked).lower())
     key = entry.key
@@ -1592,7 +1597,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     parked = bool(parked_until)
     schedule = schedule_display(item)
     scheduled = not isinstance(schedule, the_list.NoSchedule)
-    unread = item.unread_since
+    unread = item.unread_at
     unread_answers = the_list.unread_answer_ids(item)
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
     open_question = not scheduled and item.state != the_list.ItemState.CLOSED and the_list.has_open_question(item)
@@ -1651,7 +1656,14 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         saved["next_step_html"] = progress.next_step_html()
         saved["next_step_sort"] = progress.next_step.casefold()
     if read_closed_detail and saved.get("detail_closed"):
-        saved["detail_html"] = detail_panel(ListRecord(owner, item), '', local_today, names, frozenset(), progress)
+        entry = ListRecord(owner, item)
+        can_read = the_list.question_can_mark_read(item, unread_answers)
+        sections = ''
+        if can_read:
+            sections = panel_questions(item, local_today, unread_answers) + waiting_feedback_form(
+                entry, form_secret(reading.root), "", unread=True, mark=TopPriorityMark.HIDDEN)
+        saved["detail_html"] = detail_panel(entry, sections, local_today, names,
+                                            unread_answers if can_read else frozenset(), progress)
     if has_detail:
         reviews: ReviewRecords = {}
         if item.reviews:
@@ -2262,7 +2274,7 @@ class ListQuery:
         item = entry.item
         if self.keys and entry.key not in self.keys:
             return False
-        if self.unread and str(isinstance(item.unread_since, datetime)).lower() != UNREAD_MATCH:
+        if self.unread and str(isinstance(item.unread_at, datetime)).lower() != UNREAD_MATCH:
             return False
         if search:
             search_values = {"number": str(item.number), "ownerName": text.owner, "title": text.title,
@@ -2277,7 +2289,7 @@ class ListQuery:
         if self.item != entry.key:
             return False
         values = {"openQuestion": str(open_question).lower(),
-                  UNREAD_FIELD: str(isinstance(entry.item.unread_since, datetime)).lower()}
+                  UNREAD_FIELD: str(isinstance(entry.item.unread_at, datetime)).lower()}
         active = {UNREAD_FIELD: self.unread}
         return self.reveal or any((not filter_name or active[filter_name]) and values[field] == value
                                   for field, value, filter_name in LINK_REVEAL_FIELDS)
@@ -2332,8 +2344,11 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
     snapshot = records(include_closed=True)
-    items = [entry for entry in snapshot if entry.item.state is not the_list.ItemState.CLOSED]
-    closed = [entry for entry in snapshot if entry.item.state is the_list.ItemState.CLOSED]
+    closed = [entry for entry in snapshot if entry.item.state is the_list.ItemState.CLOSED
+              and not (isinstance(entry.item.native_question, the_list.NativeQuestionItem)
+                       and the_list.unread_answer_ids(entry.item))]
+    hidden_closed_keys = {entry.key for entry in closed}
+    items = [entry for entry in snapshot if entry.key not in hidden_closed_keys]
     targets = {(entry.keeper, number) for entry in snapshot for number in entry.item.related_to}
     linked_records = {(entry.keeper, entry.item.number): entry for entry in snapshot
                       if (entry.keeper, entry.item.number) in targets}
@@ -2778,12 +2793,13 @@ const searchFields=Object.entries(''' + json.dumps(SEARCH_FIELDS) + r''').map(([
 const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + r''';
 const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const questionNeedsRead=data=>data.questionItem!==undefined &&
- (data.state==='Answered' || data.state==='Working' && data.unreadAnswer==='true');
+ (data.state==='Answered' || data.unreadAnswer==='true');
 const chipFor=data=>{
- if(data.state==='Closed' || data.undoPending==='true' || data.sendHeld!==undefined) return;
+ if(data.undoPending==='true' || data.sendHeld!==undefined) return;
+ if(questionNeedsRead(data)) return 'answers';
+ if(data.state==='Closed') return;
  if(data.state==='Repaired') return 'needs-me';
  if(data.state==='Scheduled') return 'scheduled';
- if(questionNeedsRead(data)) return 'answers';
  const parked=isParked(data);
  if(data.questionItem!==undefined && !parked){
   if(data.state==='Waiting for nate') return 'questions';
@@ -3014,28 +3030,29 @@ function syncUnread(item,form,unread,unreadSort){
  const update=item.querySelector('[data-label="Update"]'),dot=update.querySelector('.list-dot');
  const read=form?.querySelector('[value="read"]');
  const answerMark=update.querySelector('[data-new-answer]');
- if(unread && item.dataset.unreadAnswer==='true'){
+ if((unread || item.dataset.questionItem!==undefined) && item.dataset.unreadAnswer==='true'){
   if(!answerMark) update.insertAdjacentHTML('beforeend',newAnswerMarkup);
  }else answerMark?.remove();
  if(unread){
   update.querySelector('[aria-label="No unread update"]')?.remove();
   if(!dot){const mark=document.createElement('span');mark.className='list-dot';mark.setAttribute('role','img');
    mark.setAttribute('aria-label','Unread update');update.prepend(mark);}
-  if(!form) return;
-  const canRead=item.dataset.questionItem!==undefined ? questionNeedsRead(item.dataset)
-   : !form.hasAttribute('data-waiting-actions') || item.dataset.unreadDelivery==='true' || item.dataset.unreadAnswer==='true';
-  if(!canRead) read?.remove();
-  if(canRead && !read){
-   const button=document.createElement('button');button.name='action';button.value='read';
-   button.textContent='Mark read';button.disabled=Boolean(form.dataset.sending);
-   const remove=form.querySelector('[value="remove"]');
-   if(remove) remove.after(button);
-   else form.querySelector('.list-actions,.list-tell')?.prepend(button);
-  }
  }else{
-  dot?.remove();read?.remove();
+  dot?.remove();
   if(!update.querySelector('[aria-label="No unread update"]')){const empty=document.createElement('span');
    empty.setAttribute('aria-label','No unread update');empty.textContent='—';update.prepend(empty);}
+ }
+ if(!form) return;
+ const canRead=item.dataset.questionItem!==undefined ? questionNeedsRead(item.dataset)
+  : unread && (!form.hasAttribute('data-waiting-actions') ||
+   item.dataset.unreadDelivery==='true' || item.dataset.unreadAnswer==='true');
+ if(!canRead) read?.remove();
+ if(canRead && !read){
+  const button=document.createElement('button');button.name='action';button.value='read';
+  button.textContent='Mark read';button.disabled=Boolean(form.dataset.sending);
+  const remove=form.querySelector('[value="remove"]');
+  if(remove) remove.after(button);
+  else form.querySelector('.list-actions,.list-tell')?.prepend(button);
  }
 }
 function installListDetail(item){
@@ -3056,7 +3073,10 @@ async function loadClosedListDetail(item,loading){
   if(!response.ok) throw new Error('The item is unavailable.');
   const result=await response.json();
   if(!result.detail_closed || typeof result.detail_html!=='string') throw new Error('The Closed detail is unavailable.');
-  if(current()) tableView.updateItemDetail(item,detail=>replaceListDetail(detail,result.detail_html));
+  if(current()){
+   tableView.updateItemDetail(item,detail=>replaceListDetail(detail,result.detail_html));
+   installListDetail(item);
+  }
  }catch(_){
   if(current()) loading.textContent='The item could not load. Close and open it to try again.';
  }
@@ -3139,7 +3159,7 @@ const tableView=createRecordTable({content:()=>content,
  },
  filterFacets,
  counts:(items,count,{counts})=>{
-  const open=items.filter(item=>item.dataset.state!=='Closed');
+  const open=items.filter(item=>item.dataset.state!=='Closed' || questionNeedsRead(item.dataset));
   const needYou=['needs-me','questions','answers'].reduce((total,chip)=>total+(counts.show[chip] ?? 0),0);
   return count+' of '+open.length+' items shown · '+needYou+' need you · '+
    open.filter(item=>item.dataset.unread==='true').length+' unread';

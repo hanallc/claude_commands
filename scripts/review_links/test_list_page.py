@@ -2893,6 +2893,72 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_keeps_linked_replies_under_answers_across_question_state_changes(self) -> None:
+        members = staff.snapshot()
+        next_number = the_list.NextNumber.AVAILABLE
+
+        def file(exchange: list_exchange.Exchange, linked: investigation.ListDestination | the_list.NextNumber
+                 ) -> investigation.ListDestination:
+            with the_list.lock_exchange_source(exchange.source_key) as source:
+                return the_list.file_exchanges(source, (exchange,), exchange.question, linked=linked,
+                                               owner=OWNER.id, members=members)
+
+        prompt = list_exchange.Exchange(list_exchange.Source.STAFF_QUESTION, f"question/{OWNER.id}/waiting.md",
+            "initial", list_exchange.Direction.QUESTION_TO_NATE, "Which width?", NOW, OWNER.id, list_exchange.Nate.USER,
+            list_exchange.QuestionWithoutAnswer.OPEN)
+        answer = list_exchange.ExchangeAnswer("Use 800 pixels.", NOW + timedelta(minutes=2),
+                                             list_exchange.AnswerRead.NOT_TRACKED)
+        closed_prompt = replace(prompt, source_key=f"question/{OWNER.id}/closed.md", answer=answer)
+        waiting = file(prompt, next_number)
+        closing = file(closed_prompt, next_number)
+        reply = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, "", "followup:1",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which height?", NOW, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.ExchangeAnswer("Use 600 pixels.", NOW + timedelta(minutes=1), list_exchange.AnswerRead.UNREAD))
+        _ = file(replace(reply, source_key="submission/question/reply-while-waiting"), waiting)
+        parked = the_list.park(waiting.keeper, f"L{waiting.number}", NOW + timedelta(days=1), source="nate")
+        self.assertEqual(len(the_list.unread_answer_ids(parked)), 1)
+        _ = file(replace(reply, source_key="submission/question/reply-before-close"), closing)
+        closed = the_list.close(closing.keeper, f"L{closing.number}", "The width works.", source=OWNER.name,
+                                assigned_to=the_list.ListCloseCaller(OWNER, False))
+        self.assertEqual(len(the_list.unread_answer_ids(closed)), 1)
+        _ = file(replace(reply, source_key="submission/question/reply-after-close"), closing)
+
+        with self.studio_review_server() as origin:
+            self.open_studio_review_fixture(origin)
+            self.studio_review_check(r"""
+ document.querySelector('[data-filter-row="show"] [data-filter-value="answers"]').click();
+ await paint();
+ const item=row(1);
+ check(!item.hidden && item.dataset.state==='Waiting for nate','Answers shows the Waiting item.');
+ item.querySelector('.list-toggle').click();
+ check(recordDetails(item).querySelector('[value="read"]'),'The Waiting item has Mark read.');
+""")
+            _ = file(replace(prompt, answer=answer), waiting)
+            updated = the_list.load(waiting.keeper, f"L{waiting.number}")
+            self.assertIs(updated.state, the_list.ItemState.WORKING)
+            self.assertEqual(len(the_list.unread_answer_ids(updated)), 1)
+            self.open_studio_review_fixture(origin)
+            self.studio_review_check(r"""
+ document.querySelector('[data-list]').dataset.undoSeconds='0';
+ document.querySelector('[data-filter-row="show"] [data-filter-value="answers"]').click();
+ await paint();
+ for(const [number,state] of [[1,'Working'],[2,'Closed']]){
+  const item=row(number);
+  check(!item.hidden && item.dataset.state===state,'Answers shows the '+state+' item.');
+  check(item.querySelector('[data-new-answer]'),'The '+state+' item has an unread reply.');
+  item.querySelector('.list-toggle').click();
+  const read=()=>recordDetails(item).querySelector('[value="read"]');
+  await until(read);
+  read().click();
+  await until(()=>item.hidden && item.dataset.unreadAnswer==='false');
+  check(item.dataset.state===state,'Mark read keeps the '+state+' state.');
+ }
+""")
+        for destination in (waiting, closing):
+            item = the_list.load(destination.keeper, f"L{destination.number}")
+            self.assertFalse(the_list.unread_answer_ids(item))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_evidence_opens_only_reviews_linked_to_the_item(self) -> None:
         review = investigation.file(OWNER.id, "Find the cause", "Read the failed check.", waiting_why="Work continues.")
         key = review_items.investigation_record_key(review)
@@ -4922,15 +4988,16 @@ document.body.append(result);
         markup = list_page.render(root, status=status, include_counts=False).decode()
         controls = markup.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
         # A park at or after the answer reads the answer and puts item 21 in Parked.
-        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["21", "3", "2", "2", "2", "9", "2"])
+        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["21", "3", "0", "0", "2", "2", "2", "9", "2"])
         probe = '''<script>
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const chips=[...document.querySelectorAll('[data-filter-row="show"] button')];
+const chip=name=>chips.find(button=>button.dataset.filterValue===name);
 const unread=document.getElementById('list-unread');
 const total=document.querySelector('[data-list-count]');
 const entries=[
  ['all',[1,2,3,4,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21,22,23],[1,3,4,6,9,11,13,15,18,19,20,21,22]],
- ['needs-me',[4,5,20],[4,20]],['producer-answering',[17,19],[19]],['working',[1,2],[1]],['blocked',[3,7],[3]],
+ ['needs-me',[4,5,20],[4,20]],['questions',[],[]],['answers',[],[]],['producer-answering',[17,19],[19]],['working',[1,2],[1]],['blocked',[3,7],[3]],
  ['parked',[9,10,11,12,13,14,15,18,21],[9,11,13,15,18,21]],
  ['scheduled',[22,23],[22]],
 ];
@@ -4954,7 +5021,7 @@ const row=number=>document.querySelector('[data-number="'+number+'"]');
 const expand=number=>row(number).querySelector('.list-toggle').click();
 const detail=number=>(recordIsOpen(row(number)) ? recordDetails(row(number)) : null);
 unread.click();
-chips[2].click();
+chip('producer-answering').click();
 expand(17);
 check(!row(17).hidden && detail(17)?.querySelector('[data-waiting-note]')?.textContent==='dwight will answer.',
  'Producer answering shows the saved recipient in the waiting note.');
@@ -4964,18 +5031,18 @@ check(!row(19).hidden && detail(19)?.querySelector('[data-question-delivery-fail
 const producerChips=document.querySelector('[data-filter-row="producer"]');
 for(const number of [17,19]){
  producerChips.querySelector('[data-filter-value="staff:'+row(number).dataset.producer+'"]').click();
- check(count(chips[2])===1 && visible().join()===String(number),
+ check(count(chip('producer-answering'))===1 && visible().join()===String(number),
   'Producer answering shows and counts the selected producer’s item.');
 }
 producerChips.querySelector('[data-filter-value="all"]').click();
-chips[5].click();expand(18);
+chip('parked').click();expand(18);
 const waitingPanel=detail(18);
 check(!row(18).hidden && waitingPanel?.querySelector('[data-waiting-note]') &&
  waitingPanel.querySelector('[data-parked-detail]').getClientRects().length &&
  waitingPanel.querySelector('[value="unpark"]').getClientRects().length &&
  !row(18).querySelector('[data-parked-note]').getClientRects().length,
  'The parked item shows one parking note, the waiting note, and Unpark in its panel.');
-chips[1].click();
+chip('needs-me').click();
 expand(20);
 const answer=detail(20)?.querySelector('.list-panel [data-question="Q1"]');
 check(!row(20).hidden && row(20).querySelector('[aria-label="Unread update"]') &&
@@ -5082,7 +5149,7 @@ document.body.append(result);
                 self.assertEqual((state["parked"], state.get("unread_answer")), ("true", "false"))
             parked = without_scripts(list_page.render(root, include_counts=False).decode())
             controls = parked.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
-            self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["2", "0", "0", "0", "0", "2", "0"])
+            self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["2", "0", "0", "0", "0", "0", "0", "2", "0"])
             self.assertNotIn("<small data-new-answer>New answer</small>", parked)
             with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=2)):
                 answer("Q2")
