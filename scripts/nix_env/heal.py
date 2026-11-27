@@ -462,7 +462,7 @@ def alert(directory: Path, limits: HealLimits, session: HealSession, history: He
             escalate = heal_command("escalate", session.session_id)
             if reason == NO_RESTART_REASON:
                 instructions = (
-                    "2. Restart the session after the repair. The next sweep sees its nix shell and clears this alert.\n"
+                    "2. Restart the session after the repair. After that, the healer sends no more alerts for it.\n"
                     f"3. Run this command on {machine} to send Nate a push if you cannot repair the setup or restart the session.\n"
                     f"   {escalate}"
                 )
