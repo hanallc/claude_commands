@@ -584,7 +584,7 @@ class FixedStaffLookup:
 
     def member(self, membership: staff.StaffSnapshot) -> staff.StaffRow | RecipientLookupFailed:
         for row in staff.active(membership, self.kind):
-            if row.id == self.to and not isinstance(row.retirement, staff.RetiredProducer):
+            if row.id == self.to and not row.awaits_legacy_removal:
                 return row
         return RecipientLookupFailed(f"staff ID {self.to} has no current {self.kind} row")
 
@@ -2615,7 +2615,7 @@ def relay_socket(message: Message, timeout: float, *,
         mailbox = ConversationRecipient(machine(), review_session)
     elif isinstance(mailbox, StaffClaudeRecipient):
         member = staff.snapshot().by_id(mailbox.staff_id)
-        if member is None or isinstance(member.retirement, staff.RetiredProducer):
+        if member is None or member.awaits_legacy_removal:
             return message, Result("failed", "the staff recipient is unavailable")
         mailbox = StaffClaudeRecipient(member.id, ConversationRecipient(machine(), str(member.current_session)))
     plan = _claude_delivery_plan(message, mailbox, registry, sessions.running_records(registry))
@@ -3150,12 +3150,12 @@ def staff_named(name: str, membership: staff.StaffSnapshot) -> staff.StaffRow | 
 
 def _conversation_staff_owner(conversation: str, membership: staff.StaffSnapshot) -> staff.StaffRow | None:
     return membership.by_current_session(conversation) or next(
-        (row for row in membership.retired_producers if row.current_session == conversation), None)
+        (row for row in membership.rows if row.awaits_legacy_removal and row.current_session == conversation), None)
 
 
 def _checked_staff_recipient(target: str, member: staff.StaffRow | None
                              ) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
-    if member is not None and isinstance(member.retirement, staff.RetiredProducer):
+    if member is not None and member.awaits_legacy_removal:
         return RecipientLookupFailed(f"{target}: {member.name} is a retired producer")
     return member or NoStaffRecipient()
 
@@ -3240,7 +3240,7 @@ def _staff_recipient_match(
                 matches[candidate.id] = candidate
                 paths[candidate.id] = path
 
-    match_names(membership.rows)
+    match_names(tuple(row for row in membership.rows if not row.awaits_legacy_removal))
     if allow_unit_form and not matches:
         from scripts.copies import copies
 
@@ -3260,7 +3260,7 @@ def _staff_recipient_match(
         if retired_id is not None:
             return _checked_staff_recipient(target, retired_id)
         if include_retired_names:
-            match_names(membership.retired_producers)
+            match_names(tuple(row for row in membership.rows if row.awaits_legacy_removal))
     foreign_workers_only = False
     if "/" not in normalized and matches and all(row.kind == "worker" for row in matches.values()):
         sender = _sender_staff_row(membership)

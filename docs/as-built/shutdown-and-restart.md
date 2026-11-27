@@ -538,10 +538,8 @@ The retirement receipt keeps the profile, session id, and notices.
 The command records notice delivery after the send succeeds.
 A retry refuses if the producer has a different session id.
 The command removes the producer key after a final read confirms that no open List items remain assigned to the producer.
-The staff row keeps the profile in `retired_producer`.
-Active staff lookups omit retired producers.
-The fixed-id lookup supplies their names for closed List items.
-`agents resume NAME --retired` restores the profile, clears the mark and resumes the same conversation.
+The command removes the staff record and keeps the conversation files and document folder.
+A producer clone skips the handoff.
 
 ### First start
 

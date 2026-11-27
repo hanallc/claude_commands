@@ -16,6 +16,8 @@ import tempfile
 import threading
 import time
 import unittest
+
+from scripts.production.staff_test_support import legacy_producer_fixture
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
@@ -1407,7 +1409,7 @@ if(example.filterOn){
         self.assertIn(f':not([data-filter-value="all"],[data-filter-value="staff:{DWIGHT.id}"])) '
                       + '[data-top-band="none"]{display:flex}', bands)
         # A retired producer has no top item.
-        _ = staff.set_producer_retirement(DWIGHT.id, staff.RetiredProducer("claude:sonnet:high"))
+        _ = legacy_producer_fixture(DWIGHT.id, "claude:sonnet:high")
         retired = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
         self.assertNotIn('class="list-top-mark"', retired)
 

@@ -213,17 +213,13 @@ A showrunner rename with a document move preserves staged document bytes separat
 Recovery restores the staged destination entry before removing the source index entry.
 It completes the pending move without staging the working edits.
 
-Run `/agents retire NAME` to remove the unit worktree and branch.
+Run `/agents retire NAME` to remove the unit worktree, branch, staff record, and tab.
 Uncommitted work or an unmerged checkpoint prevents removal.
-Retire records a removed worktree in staff and parks `.unit.toml` under the fixed staff id.
-It releases holds, reservations, and Mac claims.
-It stops worker agents and retains their rows, native conversations, and stopped panes for restore.
-`/agents resume NAME --retired` restores the worktree and resumes the director and its retained workers.
-The showrunner asks the user yes or no before it runs `--retired`.
+Retire releases holds, reservations, and Mac claims.
+It stops the workers and removes their records and panes.
+Conversation files stay on disk for search.
+A unit keeps its reviewer when its plan run ends.
 
-A retired unit keeps its staff row. The status script, the waits and the stall watch
-skip it. A unit's plan run ending retires nothing, because the unit's next plan keeps the same
-reviewer.
 
 ---
 

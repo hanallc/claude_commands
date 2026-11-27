@@ -69,7 +69,7 @@ def select_role(word: str) -> Role:
 def role_rows(record: staff.StaffSnapshot, role: Role) -> list[staff.StaffRow]:
     return sorted(
         (row for row in staff.active(record, role.kind)
-         if isinstance(row.retirement, staff.Active)
+         if not row.awaits_legacy_removal
          and (not role.worker_roles
               or isinstance(row.role, staff.KnownWorkerRole) and row.role.value in role.worker_roles)),
         key=lambda row: (row.name, row.id),
@@ -468,7 +468,7 @@ def on_remote(arguments: list[str]) -> int:
     for staff_id, conversation in zip(identities[::2], identities[1::2], strict=True):
         identity = staff.StaffId(staff_id)
         row = record.by_id(identity)
-        if row is None or not isinstance(row.retirement, staff.Active) or row.current_session != conversation:
+        if row is None or row.awaits_legacy_removal or row.current_session != conversation:
             results[identity] = SessionResult(SessionState.UNKNOWN, "the staff conversation changed or is unavailable")
         else:
             rows.append(row)

@@ -41,7 +41,7 @@ CARGO_STYLE = member("10000000-0000-4000-8000-000000000008", "unit", "style", CA
 SPACETIME_STYLE = member("10000000-0000-4000-8000-000000000009", "unit", "style", SPACETIME)
 MORTY = member("01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a", "producer", "morty")
 ROWS = (DWIGHT, BOB, SPACETIME, MODELS, NATEDEV, POSTMASTER, CARGO, TILE, HIDDEN, CARGO_STYLE, SPACETIME_STYLE)
-MEMBERS = staff.StaffSnapshot(ROWS, retired_producers=(MORTY,))
+MEMBERS = staff.StaffSnapshot(ROWS)
 ADDRESS = for_you.ConsoleAddress("192.0.2.1", 8765)
 EXCHANGE = new_item.exchange
 

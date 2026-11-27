@@ -1395,6 +1395,8 @@ def _read_live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapsh
               for session in read.sessions} if not isinstance(account, AllRestartAccounts) else {}
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
     for row in rows:
+        if row.awaits_legacy_removal:
+            continue
         try:
             machine, _folder = shutdown_record.row_folder(row, record, resolver=resolver)
             if machine != remote.local_machine():
@@ -1842,7 +1844,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 if reference not in saved_ids:
                     row = record.by_current_session(reference)
                     if row is None:
-                        matches = [item for item in record.rows if item.name == reference]
+                        matches = [item for item in record.find() if item.name == reference]
                         row = matches[0] if len(matches) == 1 else None
                     if row is None:
                         if report is not None:

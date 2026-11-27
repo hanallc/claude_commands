@@ -1,4 +1,4 @@
-"""Create, rename, retire and restore a producer."""
+"""Create, rename, and retire a producer."""
 from __future__ import annotations
 
 import json
@@ -246,7 +246,7 @@ def rename(old: str, new: str, repair_displays: Callable[[staff.StaffRow], bool]
                 raise ValueError(f"{old}: retry the rename to {_text(saved, 'name')}")
             if row.kind != "producer" or row.name not in (previous, new):
                 raise ValueError(f"{path}: the saved rename no longer matches its producer")
-        if row.kind != "producer" or isinstance(row.retirement, staff.RetiredProducer):
+        if row.kind != "producer" or row.awaits_legacy_removal:
             raise ValueError(f"{old}: no active producer")
         _protect_morty(row)
         _require_local(row)
@@ -258,7 +258,7 @@ def rename(old: str, new: str, repair_displays: Callable[[staff.StaffRow], bool]
             record = staff.initial_snapshot()
             row = record.by_id(row.id)
             if (row is None or row.kind != "producer" or row.name not in (previous, new)
-                    or isinstance(row.retirement, staff.RetiredProducer)):
+                    or row.awaits_legacy_removal):
                 raise ValueError(f"{old}: the producer changed before the rename")
             _require_local(row)
             folder = _document_folder(row)
@@ -344,7 +344,7 @@ def _machinery_stop(row: staff.StaffRow) -> None:
 
 
 def retire(reference: str, *, to: str | None) -> int:
-    """Record each handoff before removing the profile and marking the producer."""
+    """Record each required handoff before removing the producer."""
     with staff.slot_operation("producer-lifecycle", reference):
         record = staff.initial_snapshot()
         row = lookup(reference, record)
@@ -362,11 +362,25 @@ def retire(reference: str, *, to: str | None) -> int:
             if row is None or row.kind != "producer" or row.name != name:
                 raise ValueError(f"{reference}: the producer changed before retirement")
             _require_local(row)
-            if isinstance(row.retirement, staff.RetiredProducer):
-                _clear_retirement_state(row.id)
-                print(f"{row.name}: retired")
-                return 0
+            if not requires_handoff(row):
+                _machinery_stop(row)
+                profile = _profiles().get(row.name)
+                if profile is not None:
+                    models_registry.remove_producer(row.name, models_registry.parse_producer_profile(profile))
+                return _finish_retirement(row)
             return _retire(row, record, path, to)
+
+
+def requires_handoff(row: staff.StaffRow) -> bool:
+    """Check if retirement must transfer the producer's List items."""
+    return not row.awaits_legacy_removal
+
+
+def _finish_retirement(row: staff.StaffRow) -> int:
+    _ = staff.retire(row.id)
+    _clear_retirement_state(row.id)
+    print(f"{row.name}: retired")
+    return 0
 
 
 def _require_live_destination(row: staff.StaffRow) -> None:
@@ -440,29 +454,4 @@ def _retire(row: staff.StaffRow, record: staff.StaffSnapshot, path: Path, to: st
         _write(path, saved)
     with the_list.require_no_open_producer_items(keeper.id, row.id):
         models_registry.remove_producer(row.name, profile)
-        _ = staff.set_producer_retirement(row.id, staff.RetiredProducer(profile.value()))
-    _clear_retirement_state(row.id)
-    print(f"{row.name}: retired")
-    return 0
-
-
-def restore(reference: str, *, to: str | None, why: str) -> stop_resume.ResumeResult:
-    """Restore the saved profile before the conversation resumes."""
-    with staff.slot_operation("producer-lifecycle", reference):
-        record = staff.initial_snapshot()
-        row = lookup(reference, record)
-        if row is None:
-            raise ValueError(f"{reference}: no producer row")
-        _require_local(row)
-        with staff.slot_operation(row.id, row.name):
-            if isinstance(row.retirement, staff.RetiredProducer):
-                _clear_retirement_state(row.id)
-                profile = models_registry.parse_producer_profile(row.retirement.profile)
-                profiles = _profiles()
-                _check_key(row.name, profiles, own=row.name)
-                if row.name in profiles and profiles[row.name] != profile.value():
-                    raise ValueError(f"{row.name}: its producer key has another profile")
-                _ = models_registry.store_producer(row.name, *profile)
-                _ = staff.set_producer_retirement(row.id, staff.Active())
-            _ = os.environ.pop(models_registry.OPERATION_ENVIRONMENT[0], None)
-            return stop_resume.resume(row.id, why=why, to=to)
+        return _finish_retirement(row)

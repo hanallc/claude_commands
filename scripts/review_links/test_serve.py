@@ -31,6 +31,8 @@ import textwrap
 import threading
 import time
 import unittest
+
+from scripts.production.staff_test_support import legacy_producer_fixture
 import zlib
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -551,7 +553,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         morty = fixture_member("producer", name="morty")
         dwight = fixture_member("producer", name="dwight")
         retired = fixture_member("producer", name="retired")
-        _ = staff.set_producer_retirement(retired.id, staff.RetiredProducer("test-profile"))
+        _ = legacy_producer_fixture(retired.id, "test-profile")
         _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n"
                                  + f"page.builds.owner={unit.id}\npage.list.owner={morty.id}\nowner.default={owner.id}\n")
         _ = conf.path("producer_map").write_text(f"{owner.id} = {dwight.id}\n", encoding="utf-8")
@@ -1722,7 +1724,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             assert isinstance(original.submission, new_item_dialog.ReviewSubmission)
             pending_request_id = original.submission.request_id
             if retire_producer:
-                _ = staff.set_producer_retirement(owner.id, staff.RetiredProducer("claude:sonnet:high"))
+                _ = legacy_producer_fixture(owner.id, "claude:sonnet:high")
 
             restarted = change_page.DeliveryStatus(case.root)
             change_page.recover_pending(restarted)
@@ -1755,7 +1757,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertIn(request.words, notice["words"])
 
             if retire_producer:
-                _ = staff.set_producer_retirement(owner.id, staff.Active())
+                _ = legacy_producer_fixture(owner.id, "")
             retry = self.new_item_http(body, finished=True)
             self.assertEqual(retry.status, 200, retry.body)
         self.assertEqual(the_list.records(morty.id, include_closed=True), rows)
@@ -5101,7 +5103,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         directory = self.root.parent / "former-producer"
         directory.mkdir()
         producer = fixture_member("producer", name="former-list-owner", doc=staff.LiveDoc(local_machine(), directory))
-        _ = staff.set_producer_retirement(producer.id, staff.RetiredProducer("test-profile"))
+        _ = legacy_producer_fixture(producer.id, "test-profile")
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={producer.id}\nowner.default={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         for page in ("", "list", "review"):

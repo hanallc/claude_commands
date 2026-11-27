@@ -182,7 +182,7 @@ def top_priority_mark(shown: TopPriority, members: staff.StaffSnapshot, item: th
     producer = members.by_id(item.producer)
     # Only an active producer has a top item, so the item of any other row shows neither the flag nor the button.
     if (item.state == the_list.ItemState.CLOSED or producer is None or producer.kind != "producer"
-            or isinstance(producer.retirement, staff.RetiredProducer)):
+            or producer.awaits_legacy_removal):
         return TopPriorityMark.HIDDEN
     return TopPriorityMark.TOP_ITEM if producer.top_item == staff.TopItem(item.number) else TopPriorityMark.MAKE_TOP
 
@@ -1764,7 +1764,7 @@ class ListView:
         producers = set(with_items)
         if self.placement is ProducerPlacement.ABOVE_FILTERS:
             producers.update(row.id for row in staff.active(members, "producer")
-                             if not isinstance(row.retirement, staff.RetiredProducer))
+                             if not row.awaits_legacy_removal)
         return producers
 
 

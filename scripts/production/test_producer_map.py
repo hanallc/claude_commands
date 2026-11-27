@@ -5,6 +5,8 @@ import io
 import os
 import tempfile
 import unittest
+
+from scripts.production.staff_test_support import legacy_producer_fixture
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import cast, override
@@ -120,13 +122,13 @@ class ProducerMapTests(StaffTestCase):
         self.rows((self.spacetime, staff.StaffId(missing)))
         self.assertEqual(self.producer(self.models), producer_map.StaleRow(self.spacetime, missing))
         self.rows((self.spacetime, self.dwight.id), (self.models, self.bob.id))
-        bob = staff.set_producer_retirement(self.bob.id, staff.RetiredProducer("claude:sonnet:high"))
+        bob = legacy_producer_fixture(self.bob.id, "claude:sonnet:high")
         self.assertEqual(self.producer(self.models), producer_map.StaleRow(self.models, bob.name))
         self.assertIs(self.producer(bob), producer_map.NO_ROW)
 
     def test_an_answer_replaces_the_stale_row_that_wins(self) -> None:
         self.rows((self.spacetime, self.dwight.id), (self.models, self.bob.id))
-        _ = staff.set_producer_retirement(self.bob.id, staff.RetiredProducer("claude:sonnet:high"))
+        _ = legacy_producer_fixture(self.bob.id, "claude:sonnet:high")
         calls, output = self.set_rows("models", "dwight", "--user-words", "dwight")
         self.assertEqual([call[1] for call in calls], [self.models.id])
         self.assertEqual(output, "Saved: models = dwight.\n")

@@ -96,7 +96,7 @@ ChangeOwner = StaffRoutedChange | ShowrunnerOwnChange | UnroutedChange
 def producer_row(record: staff.StaffSnapshot, identity: staff.StaffId) -> staff.StaffRow | UnroutedChange:
     """Find the unit or showrunner that a Producer cell names.
 
-    The staff record keeps retired producers, so a retired unit still gives its row.
+    An old row with a removed worktree still gives its parent.
     """
     producer = record.by_id(identity)
     if producer is None:

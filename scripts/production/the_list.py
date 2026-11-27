@@ -1899,7 +1899,7 @@ def _require_active_open_producers(items: Sequence[ListItem]) -> None:
         return
     for identity in producers:
         producer = record.by_id(identity)
-        if producer is not None and isinstance(producer.retirement, staff.RetiredProducer):
+        if producer is not None and producer.awaits_legacy_removal:
             raise RetiredListProducer(f"{producer.name}: retired producer. Choose an active producer.")
 
 
@@ -3044,7 +3044,7 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
         _check_producer_update_fields(changes)
         if assigned_to.kind != "producer":
             raise ListError("the assigned producer has no producer staff row")
-        if isinstance(assigned_to.retirement, staff.RetiredProducer):
+        if assigned_to.awaits_legacy_removal:
             raise ListError(f"{assigned_to.name}: retired producer. Choose an active producer.")
         source = assigned_to.name
         scope = assigned_to.id

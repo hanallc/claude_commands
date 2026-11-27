@@ -1,7 +1,7 @@
 """Exercise the staff contract with isolated state and an actual fake SSH process."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_unit_saved_name, fixture_worker, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_unit_saved_name, fixture_worker, fixture_runtime_id, legacy_producer_fixture
 
 import fcntl
 import io
@@ -865,19 +865,16 @@ class StaffTests(StaffCommandTestCase):
         self.assertNotIn("keep_workers", encoded)
         self.assertFalse(staff.Paused.from_json(encoded).keep_workers)
 
-    def test_retired_producer_keeps_its_id_through_unrelated_writes_and_snapshot_round_trips(self) -> None:
+    def test_old_producer_mark_reads_and_stays_out_of_active_lookups(self) -> None:
         producer = fixture_member("producer", name="planner")
-        mark = staff.RetiredProducer("claude:sonnet:high")
-        stopped = staff.set_producer_retirement(producer.id, mark)
+        stopped = legacy_producer_fixture(producer.id, "claude:sonnet:high")
         _ = fixture_member("showrunner", name="another-production")
         record = staff.StaffSnapshot.decode(staff.snapshot().encode())
         self.assertEqual(record.by_id(producer.id), stopped)
         self.assertIsNone(record.by_path(producer.name))
         self.assertIsNone(record.by_current_session(producer.current_session))
         self.assertNotIn(producer, staff.active(record, "producer"))
-        restored = staff.set_producer_retirement(producer.id, staff.Active())
-        self.assertEqual(restored, producer)
-        self.assertEqual(staff.snapshot().by_path(producer.name), restored)
+        self.assertTrue(stopped.awaits_legacy_removal)
 
     def test_producer_top_item_round_trips_and_the_setter_replaces_it(self) -> None:
         producer = fixture_member("producer", name="planner")
@@ -896,7 +893,7 @@ class StaffTests(StaffCommandTestCase):
         for number in ("L1", ""):
             with self.subTest(number=number):
                 _ = self.cli("set-producer-top-item", producer.id, f"--number={number}", code=2)
-        _ = staff.set_producer_retirement(producer.id, staff.RetiredProducer("claude:sonnet:high"))
+        _ = legacy_producer_fixture(producer.id, "claude:sonnet:high")
         self.assert_refused(lambda: staff.set_producer_top_item(producer.id, staff.TopItem(1)))
 
     def test_remote_top_item_setter_uses_one_owner_write(self) -> None:
@@ -1323,103 +1320,10 @@ class StaffTests(StaffCommandTestCase):
                     self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteLockHeld(path))
             self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteAvailable())
 
-    def test_restored_unit_survives_its_previous_pending_retirement(self) -> None:
-        parent = fixture_member("showrunner", name="sdlc")
-        location = staff.PresentWorktree("natedev", self.root / "models")
-        unit = fixture_member("unit", name="models", parent=parent.id, worktree=location)
-        staff.defer_retire((unit.id,))
-        self.assertEqual(staff.retire_pending(), ())
-        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(location.machine, location.path)))
-        staff.defer_retire((unit.id,))
-        self.assertEqual(staff.snapshot().pending_retire, (unit.id,))
 
-        restored = staff.restore_unit(unit.id, location)
-        self.assertEqual(staff.snapshot().pending_retire, ())
-        self.assertEqual(staff.retire_pending(), ())
-        self.assertEqual(staff.by_id(unit.id), restored)
-        self.assertEqual((restored.id, restored.kind, restored.name, restored.parent),
-                         (unit.id, "unit", unit.name, staff.ReportsTo(parent.id)))
-        self.assertEqual(restored.worktree, location)
 
-    def test_restore_unit_keeps_the_retained_id_and_parent_and_rerun_writes_nothing(self) -> None:
-        parent = fixture_member("showrunner", name="sdlc")
-        location = staff.PresentWorktree("natedev", self.root / "models")
-        removed = fixture_member("unit", name="models", parent=parent.id,
-                               worktree=staff.RemovedWorktree(location.machine, location.path))
-        unit = staff.restore_unit(removed.id, location)
-        self.assertEqual((unit.id, unit.kind, unit.name, unit.parent), (removed.id, "unit", "models", staff.ReportsTo(parent.id)))
-        self.assertEqual(unit.worktree, location)
-        self.assertEqual(staff.by_id(removed.id), unit)
-        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        self.assertEqual(staff.restore_unit(removed.id, location), unit)
-        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
-        document = staff.LiveDoc("natedev", self.root / "child-production.md")
-        for machine in ("natedev", "mac"):
-            with self.subTest(machine=machine), self.machine(machine):
-                promoted = staff.promote_unit(unit.id, name=unit.name, parent=parent.id, doc=document)
-                self.assertEqual(promoted, replace(unit, kind="showrunner", unit_type=staff.NotUnit(),
-                                                   worktree=staff.WORKTREE_UNFILLED, doc=document))
-                child = fixture_member("unit", name="child-" + machine, parent=promoted.id)
-                retained = fixture_member("worker", name="worker-" + machine, parent=promoted.id)
-                destination = staff.UnitRole(unit.name, parent.id, location)
-                demoted = staff.change_director(unit.id, destination)
-                self.assertEqual(demoted, unit)
-                self.assertEqual(staff.by_id(child.id), replace(child, parent=staff.ReportsTo(parent.id)))
-                self.assertEqual(staff.by_id(retained.id), retained)
-                unchanged = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-                self.assertEqual(staff.change_director(unit.id, destination), unit)
-                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
-                self.assert_refused(lambda: staff.change_director(retained.id, destination))
-                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
 
-    def test_restore_unit_refuses_missing_identity_or_another_member_without_writing(self) -> None:
-        parent, unit, worker = self.tree()
-        location = staff.PresentWorktree("natedev", self.root / "models")
-        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        for held_id in (parent.id, worker.id, unit.id):
-            with self.subTest(held_id=held_id):
-                self.assert_refused(lambda: staff.restore_unit(held_id, location))
-        with self.assertRaises(staff.StaffNotFound):
-            _ = staff.restore_unit(MISSING_ID, location)
-        self.assertEqual(staff.by_id(unit.id), unit)
-        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
-    def test_restore_unit_refuses_a_different_retained_location_without_writing(self) -> None:
-        parent = fixture_member("showrunner", name="sdlc")
-        removed = fixture_member("unit", name="models", parent=parent.id,
-                               worktree=staff.RemovedWorktree("natedev", self.root / "models"))
-        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        for proposed in (staff.PresentWorktree("mac", self.root / "models"),
-                         staff.PresentWorktree("natedev", self.root / "elsewhere")):
-            with self.subTest(proposed=proposed):
-                self.assert_refused(lambda: staff.restore_unit(removed.id, proposed))
-        self.assertEqual(staff.by_id(removed.id), removed)
-        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
-
-    def test_restore_unit_from_mac_uses_the_owner_and_is_idempotent_through_the_cli(self) -> None:
-        parent = fixture_member("showrunner", name="sdlc")
-        location = staff.PresentWorktree("mac", self.root / "models")
-        removed = fixture_member("unit", name="models", parent=parent.id,
-                               worktree=staff.RemovedWorktree(location.machine, location.path))
-        with self.machine("mac"):
-            restored = staff.restore_unit(removed.id, location)
-            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-            self.assertEqual(staff.restore_unit(removed.id, location), restored)
-        self.assertEqual((restored.id, restored.kind, restored.name, restored.parent),
-                         (removed.id, "unit", "models", staff.ReportsTo(parent.id)))
-        self.assertEqual(restored.worktree, location)
-        self.assertEqual(staff.by_id(removed.id), restored)
-        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
-        self.assertEqual(self.ssh_commands(), [
-            ["restore-unit", removed.id,
-             "--machine", location.machine, "--path", str(location.path), "--json"],
-            ["restore-unit", removed.id,
-             "--machine", location.machine, "--path", str(location.path), "--json"],
-        ])
-        self.assertFalse(self.mac_file.exists())
-        _ = self.assert_rerun("restore-unit", removed.id,
-                              "--machine", location.machine, "--path", str(location.path))
-        self.assertEqual(staff.by_id(removed.id), restored)
 
     def test_admission_publishes_identity_and_location_once_without_a_setter_window(self) -> None:
         runner = fixture_member("showrunner", name="sdlc")
@@ -1588,7 +1492,7 @@ class StaffTests(StaffCommandTestCase):
     def test_owner_location_changes_keep_unknown_fields(self) -> None:
         runner, unit = self.tree()[:2]
         kept = {"future_location": {"items": [False, None, 3]}}
-        for action in ("set_worktree", "set_doc", "restore", "retire_unit", "retire_showrunner"):
+        for action in ("set_worktree", "set_doc", "retire_unit", "retire_showrunner"):
             with self.subTest(action=action):
                 worktree = (staff.RemovedWorktree("natedev", self.root / "unit")
                             if action in ("restore", "retire_showrunner") else
@@ -1606,8 +1510,6 @@ class StaffTests(StaffCommandTestCase):
                 elif action == "set_doc":
                     target, key, path, state = runner, "doc", self.root / "new-doc.md", "live"
                     _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", path))
-                elif action == "restore":
-                    _ = staff.restore_unit(unit.id, staff.PresentWorktree("natedev", path))
                 else:
                     if action == "retire_showrunner":
                         target, key, path, state = runner, "doc", doc.path, "wrapped"

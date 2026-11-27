@@ -79,7 +79,7 @@ class EnrolledProductionShutdownTests(StaffTestCase):
         return subprocess.run(["git", "-C", str(self.repository), *arguments], env=self.environment, check=True,
                               text=True, capture_output=True).stdout
 
-    def test_retirement_preserves_integration_and_waits_for_worktree_removal(self) -> None:
+    def test_retirement_removes_unit_worktrees_and_preserves_protected_branches(self) -> None:
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", str(origin)], env=self.environment, check=True)
         _ = self.git("remote", "add", "origin", str(origin))
@@ -114,13 +114,6 @@ class EnrolledProductionShutdownTests(StaffTestCase):
                     self.assertEqual(notices.getvalue(), "")
                 else:
                     self.assertEqual(result, [])
-                    self.assertIn(f"kept for a manual removal list: {target}", notices.getvalue())
-                self.assertTrue(target.is_dir())
-                self.assertTrue(self.git("branch", "--list", branch))
-                self.assertTrue(self.git("ls-remote", "--heads", "origin", branch))
-                if not kept:
-                    _ = self.git("worktree", "remove", str(target))
-                    self.assertEqual(shutdown.retirement_remove(retiring, settings=settings), [])
                 self.assertEqual(target.exists(), kept)
                 self.assertEqual(bool(self.git("branch", "--list", branch)), kept)
                 self.assertEqual(bool(self.git("ls-remote", "--heads", "origin", branch)), keep_origin)

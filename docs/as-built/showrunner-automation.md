@@ -34,15 +34,6 @@ A plan has no production-name header; its unit's staff parent selects the produc
 `unit_lookup.doc_owner` resolves a document owner, and `StaffSnapshot.parent_of` resolves a parent.
 Callers share one staff snapshot within an operation.
 
-- **Retired units**: `agents retire NAME` records a completed retirement as a `RemovedWorktree`.
-  The row stays in `staff.json` with its fixed identity and parent.
-  Status, the board, status reports, waits, and the stall watch exclude retired units.
-  `unit_lookup.doc_units(doc, record)` returns every recorded unit in staff order.
-  `merge_checkpoint.py`, `ci_points.py`, and `production_lifecycle.py` retain access to retired rows.
-  `agents resume NAME` refuses a retired unit and names `--retired`.
-  `agents resume NAME --retired` restores the worktree, director, and retained workers.
-  The showrunner asks the user yes or no before it runs `--retired`.
-
 `agents retire NAME` finds the unit and its workers in one staff snapshot.
 It stops each row's `current_session` through `stop_resume.stop`.
 Uncommitted work and commits outside the merge branch prevent removal.
@@ -50,10 +41,9 @@ The recorder's only added `Project started` line does not count as uncommitted w
 Retire releases build holds, berth reservations, and Mac claims.
 It reports other cleanup failures as anomalies.
 It removes the worktree and branch.
-The staff row stays with a `RemovedWorktree` location.
-Unit settings remain parked under the staff id.
-Retire writes no retired note or saved branch ref.
-Resume restores the folder from the merge branch and resumes `current_session`.
+Retire closes the tabs and removes the unit and worker records after cleanup.
+Conversation files stay on disk for search.
+An old row for a removed worktree still supports retirement.
 
 - **Merged work.** Git ancestry proves whether a checkpoint reached the merge branch. Git merge bases supply the last shared unit commit. Unit checkpoint records supply CI counts. Unit `phase_started` records supply phase starts. Commit subjects supply no state.
 

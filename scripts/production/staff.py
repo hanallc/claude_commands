@@ -448,13 +448,6 @@ class NoRun:
 
 
 @dataclass(frozen=True)
-class RetiredProducer:
-    """Retain the model profile of a retired producer."""
-
-    profile: str
-
-
-@dataclass(frozen=True)
 class TopItem:
     """The List item number that a producer names as its top priority."""
 
@@ -464,6 +457,9 @@ class TopItem:
 @dataclass(frozen=True)
 class NoTopItem:
     """The producer names no top priority item."""
+
+
+LEGACY_PRODUCER_MARK = "retired_producer"
 
 
 @dataclass(frozen=True)
@@ -484,10 +480,14 @@ class StaffRow:
     launch_folder: SessionLaunchFolder | NoSessionLaunchFolder = field(default_factory=NoSessionLaunchFolder, kw_only=True)
     run: OpenRun | NoRun = field(default_factory=NoRun, kw_only=True)
     unit_type: UnitDetails | NotUnit = field(default_factory=NotUnit, kw_only=True)
-    retirement: RetiredProducer | Active = field(default_factory=Active, kw_only=True)
     top_item: TopItem | NoTopItem = field(default_factory=NoTopItem, kw_only=True)
     resume_pending: ResumePending | NoPendingResume = field(default_factory=NoPendingResume, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
+
+    @property
+    def awaits_legacy_removal(self) -> bool:
+        """Keep an old producer record available for removal."""
+        return self.kind == "producer" and LEGACY_PRODUCER_MARK in self.unknown_fields
 
     def reports_to(self, identity: StaffId) -> bool:
         return self.parent == ReportsTo(identity)
@@ -522,8 +522,6 @@ class StaffRow:
             value["exited"] = self.exited.to_json()
         if isinstance(self.resume_pending, ResumePending):
             value["resume_pending"] = self.resume_pending.to_json()
-        if isinstance(self.retirement, RetiredProducer):
-            value["retired_producer"] = self.retirement.profile
         if isinstance(self.top_item, TopItem):
             value["top_item"] = self.top_item.number
         return value
@@ -561,13 +559,7 @@ class StaffRow:
                        if isinstance(role, str) and role in WORKER_ROLES else WorkerRoleUnknown())
         parsed_home = SessionHome(Path(home)) if isinstance(home, str) and Path(home).is_absolute() else HomeUnknown()
         known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited", "run", "unit_type"}
-        known_fields.update(("retired_producer", "top_item", "resume_pending"))
-        retirement: RetiredProducer | Active = Active()
-        if "retired_producer" in fields:
-            profile = fields["retired_producer"]
-            if kind != "producer" or not isinstance(profile, str) or not profile:
-                raise StaffUnreadable("invalid retired producer profile")
-            retirement = RetiredProducer(profile)
+        known_fields.update(("top_item", "resume_pending"))
         top_item: TopItem | NoTopItem = NoTopItem()
         if "top_item" in fields:
             number = fields["top_item"]
@@ -591,7 +583,7 @@ class StaffRow:
         return cls(StaffId(staff_id), kind, name,
                    ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current),
                    role=parsed_role, home=parsed_home, launch_folder=launch_folder, unit_type=unit_type,
-                   run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(), retirement=retirement, top_item=top_item,
+                   run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(), top_item=top_item,
                    paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
                    resume_pending=ResumePending.from_json(fields["resume_pending"])
@@ -702,18 +694,8 @@ class StaffSnapshot:
     # The session ids a caller already read. None reads the session registry at use.
     running_sessions: frozenset[str] | None = field(default=None, compare=False)
 
-    retired_producers: tuple[StaffRow, ...] = field(default=(), kw_only=True)
-
-    def __post_init__(self) -> None:
-        retired = tuple(row for row in self.rows if isinstance(row.retirement, RetiredProducer))
-        if retired:
-            object.__setattr__(self, "rows", tuple(row for row in self.rows if not isinstance(row.retirement, RetiredProducer)))
-            object.__setattr__(self, "retired_producers", (*self.retired_producers, *retired))
-
     @property
     def all_rows(self) -> tuple[StaffRow, ...]:
-        if self.retired_producers:
-            return tuple(sorted((*self.rows, *self.retired_producers), key=lambda row: row.id))
         return self.rows
 
     def encode(self) -> str:
@@ -729,15 +711,14 @@ class StaffSnapshot:
 
     @cached_property
     def backends(self) -> Mapping[StaffId, ClaudeBackend | CodexBackend]:
-        return _found_backends(self.rows, self.running_sessions)
+        return _found_backends(tuple(row for row in self.rows if not row.awaits_legacy_removal), self.running_sessions)
 
     @cached_property
     def rows_by_id(self) -> dict[StaffId, StaffRow]:
-        return {row.id: row for row in self.rows}
+        return {row.id: row for row in self.rows if not row.awaits_legacy_removal}
 
     def by_id(self, staff_id: StaffId) -> StaffRow | None:
-        return self.rows_by_id.get(staff_id) or next(
-            (row for row in self.retired_producers if row.id == staff_id), None)
+        return self.rows_by_id.get(staff_id) or next((row for row in self.rows if row.id == staff_id), None)
 
     def parent_of(self, row: StaffRow) -> StaffRow | None:
         return self.by_id(row.parent.id) if isinstance(row.parent, ReportsTo) else None
@@ -759,7 +740,8 @@ class StaffSnapshot:
         """The first row for each session, as a scan in row order finds it."""
         found: dict[str, StaffRow] = {}
         for row in self.rows:
-            _ = found.setdefault(row.current_session, row)
+            if not row.awaits_legacy_removal:
+                _ = found.setdefault(row.current_session, row)
         return found
 
     def by_current_session(self, session_id: str) -> StaffRow | None:
@@ -767,10 +749,11 @@ class StaffSnapshot:
 
     def by_member_reference(self, reference: str) -> StaffRow | None:
         """Resolve a persisted fixed member id or its current conversation."""
-        return self.rows_by_id.get(StaffId(reference)) or self.by_current_session(reference)
+        row = self.rows_by_id.get(StaffId(reference)) or self.by_current_session(reference)
+        return None if row is not None and row.awaits_legacy_removal else row
 
     def by_path(self, names: str) -> StaffRow | None:
-        return _row_by_path(self.rows, names)
+        return _row_by_path(self.find(), names)
 
     def by_worktree(self, machine: str, path: Path) -> StaffRow | None:
         """A producer's worktree is its launch folder and owns no path."""
@@ -791,7 +774,7 @@ class StaffSnapshot:
 
     def by_doc(self, machine: str, path: Path) -> StaffRow | None:
         document = path.absolute()
-        candidates = [row for row in self.rows if isinstance(row.doc, (LiveDoc, WrappedDoc))
+        candidates = [row for row in self.rows if not row.awaits_legacy_removal and isinstance(row.doc, (LiveDoc, WrappedDoc))
                       and row.doc.machine == machine]
         exact = next((row for row in candidates if isinstance(row.doc, (LiveDoc, WrappedDoc))
                       and row.doc.path == document), None)
@@ -825,13 +808,14 @@ class StaffSnapshot:
 
     def find(self, *, kind: Kind | None = None, parent: StaffId | None = None) -> list[StaffRow]:
         """An omitted kind or parent leaves that field unrestricted."""
-        return [row for row in self.rows if (kind is None or row.kind == kind)
+        return [row for row in self.rows if not row.awaits_legacy_removal and (kind is None or row.kind == kind)
                 and (parent is None or row.parent == ReportsTo(parent))]
 
 
 def active(record: StaffSnapshot, kind: Kind) -> tuple[StaffRow, ...]:
     """Current members; raw identity and history readers keep using the snapshot."""
     return tuple(row for row in record.rows if row.kind == kind
+                 and not row.awaits_legacy_removal
                  and not isinstance(row.worktree, RemovedWorktree)
                  and not isinstance(row.doc, WrappedDoc))
 
@@ -1156,17 +1140,8 @@ def wait_for_upkeep_row(row: StaffRow, deadline: float) -> None:
 
 
 @contextmanager
-def session_operation(session: str, *, native_key: str, join_recovery: bool = False) -> Generator[StaffSnapshot]:
+def session_operation(session: str, *, native_key: str) -> Generator[StaffSnapshot]:
     """Lock the native session before its staff row, if it has one."""
-    if join_recovery:
-        if not _joined_operation(*_row_lock(native_key)):
-            raise StaffRefused("recovery did not pass the native session lock")
-        record = initial_snapshot()
-        row = record.by_current_session(session)
-        if row is None or not _joined_operation(*_row_lock(row.id)):
-            raise StaffRefused("recovery did not pass the staff row lock")
-        yield record
-        return
     with slot_operation(native_key, session, join=False), ExitStack() as locks:
         record = initial_snapshot()
         row = record.by_current_session(session)
@@ -1544,13 +1519,13 @@ def local_by_current_session(session_id: str) -> StaffRow | None:
             fields = cast(dict[str, object], value)
             if fields.get("current_session", fields.get("id")) == session_id:
                 row = StaffRow.from_json(fields)
-                return None if isinstance(row.retirement, RetiredProducer) else row
+                return None if row.awaits_legacy_removal else row
     return None
 
 
 def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
     """Find the backend for this row's current session."""
-    return (BACKEND_UNAVAILABLE if isinstance(row.retirement, RetiredProducer)
+    return (BACKEND_UNAVAILABLE if row.awaits_legacy_removal
             else _found_backends((row,)).get(row.id, BACKEND_UNAVAILABLE))
 
 
@@ -2076,8 +2051,8 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
         elif runtime_id:
             doc = _document_for_owner(rows, native_id(runtime_id), doc)
     if existing is not None:
-        if isinstance(existing.retirement, RetiredProducer):
-            raise StaffRefused(f"{name}: retired; use agents resume {name} --retired")
+        if existing.awaits_legacy_removal:
+            raise StaffRefused(f"{name}: old retirement record; use agents retire {name}")
         if unit_type is not None and existing.unit_type != UnitDetails(unit_type):
             raise StaffRefused(f"{existing.id}: existing unit_type conflicts with admission")
         if not isinstance(worktree, WorktreeUnfilled) and not isinstance(existing.worktree, WorktreeUnfilled) and existing.worktree != worktree:
@@ -2245,7 +2220,7 @@ def transfer_producer(identity: StaffId, session: StaffId, home: SessionHome, fo
                             "--machine", folder.machine, "--path", str(folder.path)])
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, identity)
-        if row.kind != "producer" or isinstance(row.retirement, RetiredProducer):
+        if row.kind != "producer" or row.awaits_legacy_removal:
             raise StaffRefused("transfer-producer requires an active producer")
         if any(session in (other.id, other.current_session) for other in rows if other.id != row.id):
             raise StaffRefused(f"{session}: runtime identity already belongs to another member")
@@ -2347,27 +2322,6 @@ def publish_native_ids(expected: StaffSnapshot, identities: Mapping[StaffId, Sta
     return _record_transaction(edit)
 
 
-def restore_unit(staff_id: StaffId, worktree: PresentWorktree) -> StaffRow:
-    """Reactivate the retained unit in place, preserving its identity and parent."""
-    if not is_owner():
-        return _remote_row(["restore-unit", staff_id, "--machine", worktree.machine, "--path", str(worktree.path)])
-
-    def edit(rows: list[StaffRow], pending: set[StaffId]) -> StaffRow:
-        existing = _required(rows, staff_id)
-        if existing.kind != "unit":
-            raise StaffRefused("restore-unit requires a unit")
-        if isinstance(existing.worktree, WorktreeUnfilled):
-            raise StaffRefused(f"{existing.name}: staff worktree is unfilled")
-        if (existing.worktree.machine, existing.worktree.path) != (worktree.machine, worktree.path):
-            raise StaffRefused(f"{existing.name}: restore worktree conflicts with retained location")
-        pending.discard(staff_id)
-        restored = replace(existing, worktree=_keep_location_fields(worktree, existing.worktree))
-        rows[rows.index(existing)] = restored
-        return restored
-
-    return _record_transaction(edit)
-
-
 def rename(staff_id: StaffId, new_name: str) -> StaffRow:
     if not is_owner():
         renamed = _remote_row(["rename", staff_id, f"--name={new_name}"])
@@ -2378,7 +2332,7 @@ def rename(staff_id: StaffId, new_name: str) -> StaffRow:
                 validate_unit_name_for_write(new_name)
             if row.kind == "producer":
                 validate_name(row.kind, new_name)
-                if row.name.casefold() == "morty" or isinstance(row.retirement, RetiredProducer):
+                if row.name.casefold() == "morty" or row.awaits_legacy_removal:
                     raise StaffRefused(f"{row.name}: this producer cannot be renamed")
                 if any(other.id != row.id and other.name.casefold() == new_name.casefold() for other in rows):
                     raise StaffRefused(f"{new_name}: another staff row has this name")
@@ -2624,23 +2578,6 @@ def require_stopped(identity: StaffId) -> None:
     check(record, identity)
 
 
-def set_producer_retirement(identity: StaffId, state: RetiredProducer | Active) -> StaffRow:
-    """Change a producer's retirement mark and preserve its identity and locations."""
-    if not is_owner():
-        profile = state.profile if isinstance(state, RetiredProducer) else ""
-        return _remote_row(["set-producer-retirement", identity, f"--profile={profile}"])
-
-    def edit(rows: list[StaffRow]) -> StaffRow:
-        row = _required(rows, identity)
-        if row.kind != "producer" or row.name.casefold() == "morty":
-            raise StaffRefused(f"{row.name}: retirement requires a producer other than morty")
-        changed = replace(row, retirement=state)
-        rows[rows.index(row)] = changed
-        return changed
-
-    return _transaction(edit)
-
-
 def set_producer_top_item(identity: StaffId, top_item: TopItem) -> StaffRow:
     """Name a producer's top priority List item. The caller checks the item."""
     if top_item.number < 1:
@@ -2650,7 +2587,7 @@ def set_producer_top_item(identity: StaffId, top_item: TopItem) -> StaffRow:
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, identity)
-        if row.kind != "producer" or isinstance(row.retirement, RetiredProducer):
+        if row.kind != "producer" or row.awaits_legacy_removal:
             raise StaffRefused(f"{row.name}: a top item requires an active producer")
         changed = replace(row, top_item=top_item)
         rows[rows.index(row)] = changed
@@ -2669,6 +2606,32 @@ def retire(staff_id: StaffId) -> StaffRow | None:
     if removed is not None:
         _forget_restart([staff_id])
     return removed
+
+
+def retire_unit(expected: StaffRow) -> None:
+    """Remove a unit and its stopped workers after checkout and pane cleanup."""
+    if not is_owner():
+        _ = _remote(["remove-unit-record", expected.id, "--expected-row", json.dumps(expected.to_json())])
+        return
+    record = snapshot()
+    row = record.by_id(expected.id)
+    if row is None:
+        return
+    if row.kind != "unit" or row.current_session != expected.current_session or row.worktree != expected.worktree:
+        raise StaffRefused(f"{expected.name}: the unit changed before retirement")
+    members = {member.id: member for member in (row, *record.find(kind="worker", parent=row.id))}
+    for identity in members:
+        require_stopped(identity)
+
+    def edit(rows: list[StaffRow], pending: set[StaffId]) -> None:
+        if (any(_row_by_id(rows, identity) != member for identity, member in members.items())
+                or any(member.parent == ReportsTo(row.id) and member.id not in members for member in rows)):
+            raise StaffRefused(f"{row.name}: the unit or its workers changed before retirement")
+        rows[:] = [member for member in rows if member.id not in members]
+        pending.difference_update(members)
+
+    _record_transaction(edit)
+    _forget_restart(list(members))
 
 
 def _forget_restart(staff_ids: list[StaffId]) -> None:
@@ -2735,8 +2698,6 @@ def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
     row = _row_by_id(rows, staff_id)
     if row is None:
         return None
-    if isinstance(row.retirement, RetiredProducer):
-        raise StaffRefused(f"{row.name}: keep the retired producer's identity")
     if row.kind not in ("worker", "producer"):
         raise StaffRefused("retire requires a worker or producer; retain units and showrunners with their location state")
     rows.remove(row)
@@ -2904,6 +2865,7 @@ class _MoveCommand(Protocol):
 
 
 class _Arguments:
+    expected_row: str = ""
     creation_action: str = ""
     marker: str = ""
     profile: str = ""
@@ -3015,10 +2977,6 @@ def _parser() -> argparse.ArgumentParser:
     _ = transfer_parser.add_argument("--machine", required=True)
     _ = transfer_parser.add_argument("--path", required=True)
     _ = transfer_parser.add_argument("--json", action="store_true")
-    producer_retirement = verbs.add_parser("set-producer-retirement", help=argparse.SUPPRESS)
-    _ = producer_retirement.add_argument("target")
-    _ = producer_retirement.add_argument("--profile", required=True)
-    _ = producer_retirement.add_argument("--json", action="store_true")
     producer_top_item = verbs.add_parser("set-producer-top-item", help=argparse.SUPPRESS)
     _ = producer_top_item.add_argument("target")
     _ = producer_top_item.add_argument("--number", required=True, help="a List item number")
@@ -3039,10 +2997,6 @@ def _parser() -> argparse.ArgumentParser:
         _ = director.add_argument("--json", action="store_true")
         if command == "demote-showrunner":
             _ = director.add_argument("--unit-type", choices=UNIT_TYPES, default="direct")
-    restore_parser = verbs.add_parser("restore-unit", help=argparse.SUPPRESS)
-    _ = restore_parser.add_argument("target")
-    _ = restore_parser.add_argument("--machine", required=True)
-    _ = restore_parser.add_argument("--path", required=True)
     rename_parser = verbs.add_parser("rename", help=argparse.SUPPRESS)
     _ = rename_parser.add_argument("target")
     _ = rename_parser.add_argument("--name", required=True)
@@ -3054,6 +3008,10 @@ def _parser() -> argparse.ArgumentParser:
     _ = retire_parser.add_argument("target")
     _ = retire_parser.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
     _ = retire_parser.add_argument("--worker-row", action="store_true", help=argparse.SUPPRESS)
+    remove_unit = verbs.add_parser("remove-unit-record", help=argparse.SUPPRESS)
+    _ = remove_unit.add_argument("target")
+    _ = remove_unit.add_argument("--expected-row", required=True)
+    _ = remove_unit.add_argument("--json", action="store_true")
     apply_parser = verbs.add_parser("apply-seed", help=argparse.SUPPRESS)
     defer_parser = verbs.add_parser("defer-retire", help=argparse.SUPPRESS)
     _ = defer_parser.add_argument("ids", nargs="*")
@@ -3079,7 +3037,7 @@ def _parser() -> argparse.ArgumentParser:
             if command == "verify-doc-change":
                 _ = location_parser.add_argument("--conditional", action="store_true")
         location_parsers.append(location_parser)
-    for verb in (*location_parsers, show, get, add, restore_parser, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
+    for verb in (*location_parsers, show, get, add, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
         _ = verb.add_argument("--json", action="store_true")
     return parser
 
@@ -3132,9 +3090,6 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))
     if arguments.verb == "update-current-session":
         return update_current_session(StaffId(arguments.target), native_id(arguments.new_id))
-    if arguments.verb == "set-producer-retirement":
-        state = RetiredProducer(arguments.profile) if arguments.profile else Active()
-        return set_producer_retirement(StaffId(arguments.target), state)
     if arguments.verb == "set-producer-top-item":
         if not (arguments.number.isascii() and arguments.number.isdecimal()):
             raise StaffRefused("--number takes a List item number")
@@ -3180,12 +3135,16 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         assert arguments.parent is not None
         return change_director(StaffId(arguments.target), UnitRole(arguments.name, StaffId(arguments.parent),
                                PresentWorktree(arguments.machine, Path(arguments.path)), arguments.unit_type or "direct"))
-    if arguments.verb == "restore-unit":
-        return restore_unit(StaffId(arguments.target), PresentWorktree(arguments.machine, Path(arguments.path)))
     if arguments.verb == "rename":
         return rename(StaffId(arguments.target), arguments.name)
     if arguments.verb == "move":
         return move(StaffId(arguments.target), _parent(arguments.parent))
+    if arguments.verb == "remove-unit-record":
+        expected = StaffRow.from_json(_decode(arguments.expected_row))
+        if expected.id != arguments.target:
+            raise StaffRefused("the expected unit does not match the target")
+        retire_unit(expected)
+        return None
     if arguments.verb == "apply-seed":
         return apply_seed(SeedInput.from_json(_decode(seed_text)))
     if arguments.row_write and is_owner():
