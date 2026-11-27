@@ -213,8 +213,8 @@ It saves no pass because a saved pass describes this machine.
 - The hold and routing messages repeat only when their text or decline reason changes. `verify.sh: running on natedev` marks local execution.
 - After routing, every command checks the hold before taking the cargo token. A test gives this wait the same Mac retry hook, so a hold that starts just after routing still permits a Mac run. Per step, `scripts/lint/invoke.sh` checks it again after memory admission. A new hold returns the memory reservation, waits, then repeats memory admission. Mac runs answer to Mac claims, not natedev holds.
 - `verify.sh` and `invoke.sh` create a missing, nonempty `$TMPDIR` before they make temp files. The lint CLI sources `invoke.sh` before it runs a command, so it uses the same setup.
-- `buildlog-sample.timer` checks once per minute on natedev. `/build:page` and `/build:status` show the saved Mac idle alert. Three minutes without a natedev build or test on the Mac gives `MAC IDLE` when eligible steps wait. A block and an idle claim count as idle. A parked app does not count as build or test work. A future reach backoff shows `MAC UNREACHABLE`. Unreadable or stale state shows `MAC IDLE WATCH`.
-- Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. Before a view shows a Mac condition line, it checks the live local block, claim and backoff files. A saved line that the live state does not agree with shows no Mac condition until the next sample. The watch message uses the reading that the watch just wrote, so it does not read the live state again. At the default three minutes the watch sends one message to the builds showrunner, resolved by `scripts/production/showrunners.py address builds`. The machine watch below sends the phone push. The idle interval and its send keys reset after an active job. No waiting steps means no idle line.
+- `buildlog-sample.timer` checks once per minute on natedev. `/build:page` and `/build:status` show the saved Mac idle alert. Three minutes without a natedev build or test on the Mac gives `MAC IDLE` when eligible steps wait. A block and an idle claim count as idle. A parked app does not count as build or test work. An active backoff or a failed probe mark shows `MAC UNREACHABLE` while eligible steps wait. Unreadable or stale state shows `MAC IDLE WATCH`.
+- Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. Before a view shows a Mac condition line, it checks the local block, claim, backoff and failed probe files. The line shows only when the saved condition agrees with the live state. The watch message uses the reading from the current pass. After three minutes by default, the watch sends one message to the builds showrunner. It uses `scripts/production/showrunners.py address builds` to find the recipient. The machine watch sends the phone push. The idle interval and its send keys reset after an active job. The idle line requires waiting steps.
 - The machine watch, `scripts/buildlog/machine_watch.py`, is the one watch for every registered and pinned target: natedev, mac, mac-linux, hana-aws and hana-gpu. `buildlog sample` runs it each pass on natedev. It runs the Mac idle watch first, then one rule for each machine. A machine that is not off on purpose sends one notice when, for longer than its notice time, it is unusable or steps wait for it and it runs none.
 - The notice time is `excluded_notice_seconds.<machine>` in `config/build_targets.conf`, else `excluded_notice_seconds`. The Mac uses 600 seconds; every other machine uses 3600 seconds.
 - `mac_test.machine_off_on_purpose` decides off on purpose for every target. Each target reads `enabled.<target>=off`. The local target also reads the `/build:hold` holds in force through `build_hold.natedev_holds`; an unreadable hold state counts as in use. An SSH target also reads the block in its own state folder (the Mac in `MAC_TEST_STATE_DIR`, another target under `BUILD_TARGETS_STATE_DIR/<target>`), except when the block holder asks. A macOS target reads `offload=off` in its settings file; another SSH target reads `enabled=off` there (`hana_aws.conf`, and `cloud_gate.conf` for hana-gpu). A Hana GPU target also reads `hana_gpu_route_enabled=off` in its settings file. An unreadable record or a bad value counts as in use.
@@ -270,11 +270,13 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
   The report still decodes legacy `battery` and `mac_busy` decline reasons.
 
 - `offload.py run --settings <path>` reads that target's settings; `--last-decline busy|blocked` silences a decline line (and the claim's holder output) that repeats the last reason. A failed probe prints `mac_test: could not reach the Mac: <reason>`.
+- Each SSH target admits one claim per repository. Mac and mac-linux share one claim.
+- Linux cleanup checks the saved mirror for each old numbered claim before release.
 - A lost run keeps the Mac busy until its leftovers are gone. The runner claims with `--remote <host>`; the claim (`RemoteJobClaim`) outlives its process until the printed `mac_exit=<n>` line with a confirmed cleanup marker, or a leftover check that counted no process (`check_leftovers` → `LeftoversEnded | LeftoversRemain(count) | LeftoverCheckFailed(reason)`). A later `claim --remote` for the same repository takes a kept claim over (exit 13). Leftovers decline `busy`; a failed check declines `unreachable`.
 - Every claim, remote or process-bound, starts a claim watcher (`mac_test.py watch-claim`, one at a time under `claim_watch.lock`). Every `claim_poll_seconds` (60) it checks the claim's host over ssh for the user's mirror work, `cargo`, `rustc`, `cargo-nextest` or binaries under a `/target/` path, sending no signal. After `claim_idle_minutes` (15) with none it deletes the unchanged claim and messages the holder's session (`holder_session`) how to claim again. A failed check changes nothing. Details are in [mac-test-offload.md](mac-test-offload.md) ("The idle claim").
 - A `busy` decline names its holder: `BusyMacDecline(holder: MacHolder)`, `MacHolder = KnownMacJob(what) | LostRunLeftovers | UnreadableMacHolder`, written as `holder=` in the result file.
 - `remote_test_command` sets `MACOSX_DEPLOYMENT_TARGET=14.0` (module constant `MACOSX_DEPLOYMENT_TARGET`), so a test binary that reaches a Swift bridge loads on the Mac. It also sends `BUILDLOG_SENT_TREE_KEY` when `copy_tree_with_key` read the same known tree key before and after the copy, and `LINT_SKIP_SWEEP=1` so the Mac's steps start no detached sweep. After the tests it removes the mirror's `target` folder only when the Mac's free space is below `free_floor_gib` (100 GiB), and keeps it otherwise (`mac_cleanup=kept`); a run that names `--target-dir` skips the cleanup with one line.
-- `scripts/production/mac_run.sh` (the showrunner's Mac build) claims without `--remote`, so its claim lapses with its process. It builds hana and each example with `MACOSX_DEPLOYMENT_TARGET=14.0 ~/.cargo/bin/cargo build`, so a build typed in the Mac's clone reuses them. When `git merge-base --is-ancestor <sha> <clone head>` holds, it checks the commit out in one ssh call with no bundle.
+- `scripts/production/mac_run.sh` requests placement from the Mac queue. It runs Hana and the examples in a numbered copy with `MACOSX_DEPLOYMENT_TARGET=14.0`. It sends a bundle only when the Mac source lacks the requested commit.
 
 ### The commands: `commands/build/`
 
@@ -282,8 +284,8 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | --- | --- | --- |
 | `/build:hold` | `build_hold.py` | Clear, drain, or release natedev; check quiet and show holds. Use `/build:mac block` for the Mac. |
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
-| `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with each kept claim and the holder's showrunner and unit when its session is known. |
-| `/build:bump <selector>`, `/build:bump clear [unit]` | `build_queue.py` | Changes unit priority. A bare command prints usage and the Builds page link. Use `/build:page` for the queue view. |
+| `/build:status` | `build_targets.py status [--probe]` | Reads each target's state and kept claims. Shows the holder's showrunner and unit when its session is known. |
+| `/build:bump <selector>`, `/build:bump clear [unit]` | `build_queue.py` | Saves a unit priority change with the user's words. A bare command prints usage and the Builds page link. |
 | `/build:page` | `memory_feed.py link` | Prints the shared build page link. Use the `buildlog` CLI for detailed records. |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
 
@@ -453,10 +455,11 @@ rustdoc index limit keep their existing rules.
 
 The timed tmp sweep keeps top-level `/tmp/claude` entries and direct
 `unit`/`delegate` run folders without recorded end evidence until they are
-unchanged for 7 days; top-level files and links also wait 7 days. All process,
-ownership and saved-work checks still apply. Its log names removals based on end
-evidence separately from the 7-day fallback and lists paths kept for lack of end
-evidence. Tempfile-named entries, invoke/verify logs and other roots keep their
+unchanged for 7 days. Top-level files and links also wait 7 days.
+The sweep checks processes, ownership and saved work.
+It lists eligible entries for vetted manual removal and gives the reason.
+It reports a count for each reason it keeps entries.
+Tempfile-named entries, invoke/verify logs and other roots keep their
 existing rules; hand cleanup still requires end evidence. Folder audit also uses
 the shared tree change-time check (mtime and ctime) and waits 7 days without a
 change, so a recent copy with preserved mtimes stays.
@@ -470,11 +473,13 @@ different build-log root.
 A cold step has `crates_compiled >= 50`. Its cause is the latest matching
 removal between the same workspace's previous step end and the cold step start.
 The workspace is `worktree` when set, otherwise `cwd`; it also sets the clone
-kind. A tmp sweep can match the workspace or working folder and their ancestors.
+kind.
+A historical tmp sweep removal can match the workspace, the working folder or an ancestor.
 The journal's `the floor took` lines name floor removals. A `lint sweep: removed`
 line for build units uses the budget header from the same journal stream;
-orphan cleanup does not count. `tmp sweep: deleted`
-lines name removed folders. The report groups gate and merge copies, phase
+orphan cleanup does not count.
+Historical `tmp sweep: deleted` lines name removed folders.
+The report groups gate and merge copies, phase
 clones, mktemp folders, scratchpad clones, scratch.py folders, other `/tmp`,
 `~/rust` worktrees, and other folders. Compile-hours use `finished_s`, with
 `duration_s` when that field is absent. The table also gives totals per day.
@@ -532,24 +537,31 @@ the run; the floor sweep discovers the configured gates root and may reclaim
 idle marked caches. See `gate-checkouts.md` for configuration and removal.
 The sweep still reads Cargo's general `build.build-dir` templates.
 
-The copies root (`build_folders.conf` `roots.copies`: `/tmp/claude/copies` on natedev and on the Mac) is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
+The copies root is `/tmp/claude/copies` on natedev and the Mac (`roots.copies` in `build_folders.conf`).
+The root holds copies at `<pair>/<copy>`.
+The tmp sweep lists each eligible copy for vetted manual removal.
+The folder audit and scratch guard keep the root.
+`scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
 
 Record lookup returns `Registered`, `NotRegistered` or `UnreadableRecord(reason)`. A copy's lifetime is `Live(why)`, `Ended(evidence)` or `Unknown(reason)`; cleanup removes only `Ended` copies and names the repair reason for unknown state. An open phase keeps its copy at any age; the recorder's completed, stopped and error states end it. A `landed:<unit>/<branch>` copy ends only when `origin/<branch>` is an ancestor of its recorded land target (default `origin/main`) in the recorded source checkout, whose sessions keep its refs fresh, and all copy work is saved; cleanup never fetches. The tmp sweep then requires seven days without a change. A parent stays while an existing child record borrows its Git objects.
 
 Holders create `.claude-busy` and use a shared flock for the whole run. Judges and dry runs do not create the mark. 
-`targeted_test.py --checkout <copy>` and `merge_gate.py --checkout <copy>` take the shared lock before tests start.
-Scratch end, the tmp sweep and the floor sweep claim an exclusive lock without waiting.
-They create the mark when absent and retain it through deletion.
+The affected gate takes the shared lock after it accepts the prepared copy.
+The merge gate takes the shared lock before tests start.
+The tmp sweep takes an exclusive lock on existing busy marks without waiting before it lists a copy.
+The floor sweep also checks existing busy marks before it lists build output.
+Scratch end records task completion and keeps the folders.
 A folder with a maker lock beside it (`<name>.lock`) is a managed folder.
-`scratch.removal_lock` and `scratch.judgment_lock` first take its lease lock without waiting and hold it through judgment and deletion.
+Both `scratch.removal_lock` and `scratch.judgment_lock` check its lease before the busy mark.
+`scratch.removal_lock` creates a missing busy mark and holds it through removal.
 A held lease is busy, even when no busy mark is held. The collector then creates no busy mark.
 A collector judges a lock file, a lease record or an unfinished lease record by its folder's lease, so it never removes a live owner's records.
 `scratch.removal_lock` also walks the folder without following links and holds every lease lock below it through deletion.
 A held lease below the folder, or an unreadable folder, is busy. `judgment_lock` does not walk, so status reads stay fast; removal makes the final call.
-Every collector that uses these locks (scratch end, the folder audit, the tmp sweep, the floor sweep and copy removal) gets this guard.
+The folder audit, the tmp sweep, the floor sweep and copy removal use these locks.
  A holder checks the present mark and removal evidence before it starts work. Shared holders can run together; a process exit releases its lock. Hana can set the same mark in a target with `flock`, without importing these scripts. `scratch.py hand-over <path> --to <unit> --task <new-task>` replaces owner and the complete task atomically and keeps the path, so child alternates and recovery records retain valid paths. One task-field function clears the old end evidence, run directory, phase id and land target; a phase hand-over supplies `--run-dir` and derives its phase id from the new task, and a landed task can supply `--land-target`.
 
-Scratch end rechecks the task under the removal lock. A hold on a copy's ancestor judges each copy separately and removes only empty containers. Before deleting a copy, cleanup records removal evidence in its pair folder, outside the tree being removed; a rerun finishes a partial deletion even after its scratch record is gone, and that copy no longer keeps a borrowed parent. The certificate records the copy identity and its directory's device and inode; a new copy at the same path discards a stale certificate instead of inheriting its end evidence.
+Explicit task copy removal rechecks the task under the removal lock. A hold on a copy's ancestor judges each copy separately and removes only empty containers. Before deleting a copy, cleanup records removal evidence in its pair folder, outside the tree being removed; a rerun finishes a partial deletion even after its scratch record is gone, and that copy no longer keeps a borrowed parent. The certificate records the copy identity and its directory's device and inode; a new copy at the same path discards a stale certificate instead of inheriting its end evidence.
 
 ## Calibration / gotchas
 
@@ -637,9 +649,22 @@ Each step checks its package when it runs.
 The first failure ends either list with its status.
 A step list reports the command and exit status for each step it runs, including the package of a failed test step.
 On Linux, the parent initializes `BUILDLOG_RUN` once. Each step inherits it and uses its own call record.
-Both list forms keep the queue place during checkout for steps that share the slot.
-A `doc` step with its own slot uses `NO_RUN` in its placement request.
-A standalone step with its own checkout slot also uses `NO_RUN`.
+Both list forms keep the queue place during checkout, including for `doc`.
+The `doc` step acquires its own checkout and uses ordinary memory admission.
+It releases its grant without a memory handoff.
+The repository's Verify run limit exempts the `doc` step.
+A busy Mac leaves a mend step at its existing queue rank for the next placement.
+The Cargo token report uses the existing `wait_s` field to locate the end of the token wait.
+The `admission_wait_s` field totals the waits for memory, routing, holds, and the Cargo token.
+The `step_wait_s` field gives the wait for each step, including separate waits for mend and clippy.
+Verify counts the placement samples after it receives a grant, a refusal, or a confirmed cancellation.
+A confirmed cancellation includes the cancellation that Verify requests before lint formatting.
+The mend wait ends at the last queue reply before Verify cancels and starts formatting.
+The cancellation call takes about one second and adds no time to that wait.
+If Verify stops before it reads a final reply or a sample is missing, it records null for the step and admission totals.
+A skipped hold check records zero in `hold_wait_s`.
+A hold check without a valid sample records null.
+A standalone step with its own numbered copy uses `NO_RUN`.
 Steps with `NO_RUN` can leave their grants without a memory handoff.
 
 `parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.
@@ -653,19 +678,25 @@ Call records use the package name or `workspace`.
 
 After help and saved-pass query exits, verify reads the Git top level.
 If the root has no `Cargo.toml`, Verify prints `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only` on stderr and exits 2.
-If the root has `scripts/copies/copies.py`, Verify also prints `claude_commands: run tests with copies.py --affected or --module` on stderr.
+If the root has `scripts/copies/copies.py`, Verify also prints the command below on stderr.
 This refusal precedes environment setup and Cargo calls.
 
-From a `claude_commands` checkout, run the affected tests through the queue with:
+Run affected tests from a `claude_commands` checkout through `copies.py run`.
+A direct `gate.py --affected` call prints the command with the Git worktree root and its current `HEAD` commit.
+The gate exits with status 1 before it requests placement.
+
+Run this command from the worktree root.
 
 ```sh
-./scripts/lib/py scripts/copies/copies.py run --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
+  --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected
 ```
 
 Add `--module <module>` after `--affected` to select a module.
+Merge-line gates use `--tests-only`.
 
 The final run contract chooses the repository's unit gate when the root has no Cargo manifest.
-For `~/.claude`, that gate is `scripts/lib/py scripts/production/targeted_test.py --checkout <tree>`.
+For `~/.claude`, run the affected gate with the prepared checkout from `copies.py run`.
 No configuration maps repositories to unit gates.
 [Checkpoint documentation and final targets](rustdoc-once-and-final-targets.md) defines the Cargo doc and final behavior.
 
@@ -769,7 +800,7 @@ Remote launch signals use `find_mac_runner_pid` and the rules in [Mac step offlo
 
 ## Cargo token ownership and wait holders
 
-`config/direct.conf` supplies `VERIFY_TOKEN_HOLD_SECONDS` and `VERIFY_TOKEN_RENEW_SECONDS`.
+`config/direct.conf` supplies `verify_token_hold_seconds` and `verify_token_renew_seconds`.
 The shipped values are 3600 and 60 seconds.
 The renewal interval cannot exceed one third of the lease.
 `start_token_renewer` and `stop_token_renewer` maintain one renewer while a step command runs.

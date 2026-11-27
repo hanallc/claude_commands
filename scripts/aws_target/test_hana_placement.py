@@ -5,7 +5,7 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import StringIO
 import json
@@ -53,7 +53,7 @@ class HanaPlacementTests(CostFixture):
         self.provider = FakeProvider(Path(), TestClock())
         self.controller = box.HanaController(Path(), Path(), Path(), self.provider)
         self.assignment = placement.PlacementAssignment('', '', placement.PlacementDestination(
-            'ssh', 'fixture', 'fixture-hana', claim_state.RepositoryScope('hana', KEY, 1), 1),
+            'ssh', 'fixture', 'fixture-hana', claim_state.RepositoryScope('hana', KEY), 1),
             execution_identity.SourceKeyKnown('source'), placement.SubmittingOwner('', 0, ''), OwningSession('fixture-session'), 0)
 
     @override
@@ -234,6 +234,24 @@ class HanaPlacementTests(CostFixture):
             self.assertIsInstance(worker.submit(self.claim).result(timeout=5), hana.HanaClaimPending)
         self.assertEqual(self.provider.calls, [])
 
+    def test_resource_hold_preserves_the_session_block(self) -> None:
+        paths = claim_state.state_paths(self.assignment.destination.target)
+        paths.block.parent.mkdir(parents=True, exist_ok=True)
+        since = datetime.fromtimestamp(self.clock.now, UTC)
+        mac_test.write_block(paths.block, mac_test.ActiveMacBlock(
+            'fixture', 'private hold', since, since + timedelta(hours=1),
+            mac_test.RecordedSession('another-session', 'fixture'), mac_test.NO_SHOWRUNNER,
+            'off_before', mac_test.FREE_MESSAGE_NOT_NEEDED))
+        lifecycle = self.controller.inspect_for_settlement()
+        assert isinstance(lifecycle, box.HanaLifecycleEvidence)
+        for settlement in (lifecycle, box.HanaUnprovisioned()):
+            with (self.subTest(settlement=type(settlement).__name__),
+                  hana_command_lock(self.state) as access,
+                  mock.patch.object(self.controller, 'inspect_for_settlement', return_value=settlement)):
+                self.assertIs(access, HanaCommandAccess.ACQUIRED)
+                self.assertEqual(self.eligibility(), placement.TemporaryExclusion('blocked'))
+        self.assertEqual(self.provider.calls, [])
+
     def test_provider_reply_settles_during_a_resource_hold(self) -> None:
         with ExitStack() as hold:
             def take_hold() -> None:
@@ -280,7 +298,7 @@ with hana_command_lock(directory) as access:
         self.assertEqual(hana.claim_assigned(second, self.holder, self.controller), hana.HanaClaimRefused('Hana is busy'))
         self.assertEqual(self.provider.calls, [])
 
-    def test_claim_rejects_wrong_slot_source_session_and_holder(self) -> None:
+    def test_claim_rejects_wrong_destination_source_session_and_holder(self) -> None:
         variants = [replace(self.assignment, destination=replace(self.assignment.destination, slot=2)),
             replace(self.assignment, source_key=execution_identity.SourceKeyUnavailable('missing')),
             replace(self.assignment, destination=replace(self.assignment.destination, host='other'))]
@@ -405,6 +423,18 @@ with hana_command_lock(directory) as access:
         self.assertEqual(repeated.generation, adopted.generation)
         self.assertEqual(repeated.reserved.claim.generation, hana.generation_text(adopted.generation))
         self.assertNotEqual(hana.generation_text(replace(adopted.generation, boot_id='another')), repeated.reserved.claim.generation)
+
+    def test_assigned_adoption_reads_only_the_repository_claim_paths(self) -> None:
+        adopted = self.ready()
+        paths = claim_state.state_paths(self.assignment.destination.target)
+        scope = self.assignment.destination.scope
+        claim = mac_test.claim_path(paths, scope)
+        _ = (paths.claims / 'unrelated.json').write_text('{')
+        transport = hana.HanaControlTransport(self.workload, self.assignment.destination.host)
+        self.assertEqual(adapter.read_assigned_adoption(self.assignment, self.holder, transport), adopted.reserved.claim)
+
+        _ = claim.rename(claim.with_name(f'{claim.stem}.slot-1.json'))
+        self.assertEqual(adapter.read_assigned_adoption(self.assignment, self.holder, transport), adopted.reserved.claim)
 
     def test_evidence_never_calls_provider_or_ssh(self) -> None:
         adopted = self.ready()
@@ -658,7 +688,7 @@ class HanaGpuPlacementTests(CostFixture):
         process = process_start.process_start(pid)
         assert isinstance(process, process_start.Started)
         self.assignment = placement.PlacementAssignment('episode', 'attempt',
-            placement.PlacementDestination('ssh', 'hana-gpu', 'hana-gpu', claim_state.RepositoryScope('hana', KEY, 1), 1),
+            placement.PlacementDestination('ssh', 'hana-gpu', 'hana-gpu', claim_state.RepositoryScope('hana', KEY), 1),
             execution_identity.SourceKeyKnown('source'), placement.SubmittingOwner(store.host_name(), pid, process.start),
             OwningSession('fixture-session'), 0)
 

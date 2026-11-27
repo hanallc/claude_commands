@@ -1,4 +1,4 @@
-"""Hold first-step admission while a caller prepares its repository slot."""
+"""Hold first-step admission while a caller prepares its numbered copy."""
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
@@ -18,9 +18,10 @@ from scripts.build_targets import target_config
 from scripts.buildlog import store, treekey
 from scripts.direct.step_selection import Pinned
 from scripts.lib import build_folders, conf
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_queue.admission_wire import KnownPlacementStatus, read_assignment
+from scripts.build_queue.placement import MAC_LINUX_START_UNCONFIRMED
 from scripts.lib.build_steps import (
     CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS,
     OtherCommand, VerifyCommand, command_job, command_program, gate_job_from_process, parse_command_program,
@@ -30,7 +31,7 @@ from scripts.mac_test import claim_state
 
 
 class FirstStepRefused(RuntimeError):
-    """The command did not receive permission to take a slot."""
+    """The command did not receive permission to take a copy."""
 
     def __init__(self, reason: str, exit_code: int = 2) -> None:
         super().__init__(reason)
@@ -80,7 +81,7 @@ def close_gate_preserving_status(cleanup: Callable[[], None]) -> None:
 class FirstStepAdmission:
     """Keep the preparation grant until the command can start."""
 
-    queue_position: SlotQueuePosition
+    queue_position: CopyQueuePosition
     grant: wire.Admitted | wire.LocalPlacementGranted | wire.Assignment | GatePlacement | HandedOff
     assignment_file: Path
     preserve_exit_status: bool = field(default=False, init=False)
@@ -138,10 +139,10 @@ class FirstStepAdmission:
         if isinstance(grant, wire.Admitted):
             _ = queue_place.release_place(grant.reservation, 1, grant.cleanup_timing)
         elif isinstance(grant, wire.LocalPlacementGranted):
-            _ = client.finish_step(self.assignment_file, 1, 'slot preparation failed')
+            _ = client.finish_step(self.assignment_file, 1, 'copy preparation failed')
         elif isinstance(grant, (wire.Assignment, OwnedGatePlacement)):
             assignment = grant.grant.assignment if isinstance(grant, OwnedGatePlacement) else grant.assignment
-            reason = 'the gate caller ended' if isinstance(grant, OwnedGatePlacement) else 'slot preparation failed'
+            reason = 'the gate caller ended' if isinstance(grant, OwnedGatePlacement) else 'copy preparation failed'
             try:
                 _ = client.cancel_placement(wire.CancelPlacement(uuid4().hex, assignment.episode,
                     assignment.owner, reason))
@@ -152,7 +153,7 @@ class FirstStepAdmission:
 
 
 def _verify_request(command: VerifyCommand, source: Path, folder: Path, owner: wire.Owner,
-                    position: SlotQueuePosition) -> wire.PlacementRequest:
+                    position: CopyQueuePosition) -> wire.PlacementRequest:
     request_file = folder / 'request.json'
     environment = {**os.environ, 'UNIT_DETACHED_RUN': '1',
         'BUILDLOG_FIRST_STEP_REQUEST': str(request_file), 'BUILDLOG_FIRST_STEP_PID': str(owner.pid),
@@ -184,7 +185,7 @@ def _placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGrant
 
 
 def _program_request(command: Sequence[str], source: Path, owner: wire.Owner,
-                     position: SlotQueuePosition, run: wire.RunIdentity) -> queue_place.RefreshedRequest:
+                     position: CopyQueuePosition, run: wire.RunIdentity) -> queue_place.RefreshedRequest:
     program = parse_command_program(command)
     script, script_arguments = ('', ()) if isinstance(program, OtherCommand) else program
     affected = script == 'targeted_test.py' or '--affected' in script_arguments
@@ -217,7 +218,7 @@ def _program_request(command: Sequence[str], source: Path, owner: wire.Owner,
 
 
 def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
-                   position: SlotQueuePosition, run: wire.RunIdentity) -> wire.Admitted:
+                   position: CopyQueuePosition, run: wire.RunIdentity) -> wire.Admitted:
     program = _program_request(command, source, owner, position, run)
     unit = ''
     def refresh() -> wire.AdmitRequest:
@@ -259,27 +260,28 @@ def run_gate_with_placement(
             if result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
                 refusal = read_gate_claim_failure(assignment_file, request)
                 settled = client.claim_failure(refusal)
+                unconfirmed_start = refusal.reason == MAC_LINUX_START_UNCONFIRMED
                 waiting_for_settlement = isinstance(settled.state, placement.CurrentAssignment) and (
                     destination.provider == 'scaler' or
                     (mac_linux and isinstance(settled.permission, placement.PermissionConsumed)))
                 if (settled.assignment != refusal.assignment
                         or not isinstance(settled.permission, (placement.PermissionAvailable, placement.PermissionConsumed))
                         or not isinstance(settled.retry, placement.RetryAt)
+                        or unconfirmed_start and (not mac_linux or settled.reason
+                            or not isinstance(settled.permission, placement.PermissionConsumed))
                         or (settled.state != placement.ClosedAssignment(refusal.reason) and not waiting_for_settlement)):
                     raise wire.AdmissionUnavailable('the queue did not permit a retry for the gate attempt')
+                if unconfirmed_start:
+                    waiting_for_settlement = False
                 reason = 'did not answer' if refusal.reason == placement.MAC_LINUX_NO_ANSWER else refusal.reason
+                if unconfirmed_start:
+                    reason = 'did not confirm a start'
                 retry_notice = (f'placement: retry — {destination.host} ({destination.target}) {reason}. '
                                 + 'Received a replacement assignment.')
             else:
                 client.request_settlement(wire.SettlementRequest(previous))
                 if mac_linux:
-                    # A retry also requires a report that the guest took no run.
-                    try:
-                        refusal = read_gate_claim_failure(assignment_file, request)
-                    except FileNotFoundError:
-                        return result
-                    if refusal.reason != placement.MAC_LINUX_NO_ANSWER:
-                        return result
+                    return result
                 waiting_for_settlement = True
             if mac_linux and waiting_for_settlement:
                 print(f'waiting for Mac Linux to confirm the end of attempt {previous.attempt}', flush=True)
@@ -335,6 +337,13 @@ def canonical_gate_command(command: Sequence[str], source: Path) -> bool:
     return path == canonical and path.resolve() == canonical
 
 
+def gate_module_mode_error(*, has_modules: bool, tests_only: bool, affected: bool) -> str:
+    """Return the error for named modules in an incompatible gate mode."""
+    if has_modules and not (tests_only or affected):
+        return "--module needs --tests-only or --affected"
+    return ""
+
+
 def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> tuple[str, ...]:
     """Read the caller's gate targets or the source repository's default."""
     if command_program(command) not in GATE_SCRIPTS:
@@ -355,7 +364,7 @@ def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> t
 
 
 def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...],
-                  owner: wire.Owner, position: SlotQueuePosition, run: wire.RunIdentity,
+                  owner: wire.Owner, position: CopyQueuePosition, run: wire.RunIdentity,
                   sidecar: Path) -> wire.PlacementRequest:
     from scripts.build_targets.gate_targets import natedev_only_flag, scaler_candidate
 
@@ -365,7 +374,8 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
         if "natedev" not in targets:
             raise FirstStepRefused(f"gate.py {flag} runs only on natedev")
         targets = ("natedev",)
-    local = replace(_program_request(command, source, owner, position, run).refresh(), sidecar=str(sidecar))
+    local = replace(_program_request(command, source, owner, position, run).refresh(), sidecar=str(sidecar),
+                    trace_sampling=wire.ProcessTreeTraceSampling())
     tree_key = treekey.tree_key(str(source))
     source_key = (execution_identity.SourceKeyKnown(tree_key) if tree_key
                   else execution_identity.SourceKeyUnavailable('source key is unavailable'))
@@ -433,7 +443,7 @@ def checked_gate_assignment(command: Sequence[str], source: Path, file: Path, ta
 @contextmanager
 def admitted_run(command: Sequence[str], source: Path, *,
                  targets: tuple[str, ...] = (), place_unnamed_gate: bool = True) -> Generator[FirstStepAdmission]:
-    """Admit the first step before any caller takes or prepares a slot."""
+    """Admit the first step before any caller takes or prepares a copy."""
     gate = command_program(command) in GATE_SCRIPTS
     if targets and not gate:
         raise FirstStepRefused('named gate targets require a gate command')
@@ -445,7 +455,7 @@ def admitted_run(command: Sequence[str], source: Path, *,
         except (OSError, ValueError, wire.AdmissionUnavailable) as error:
             raise FirstStepRefused(str(error)) from error
         assignment = grant.assignment
-        yield FirstStepAdmission(SlotQueuePosition(assignment.episode, assignment.since), InheritedGatePlacement(grant), file)
+        yield FirstStepAdmission(CopyQueuePosition(assignment.episode, assignment.since), InheritedGatePlacement(grant), file)
         return
     gate_selection = targets
     if gate and place_unnamed_gate and not gate_selection:
@@ -459,7 +469,7 @@ def admitted_run(command: Sequence[str], source: Path, *,
         raise FirstStepRefused('the command has no live process identity')
     owner = wire.Owner(os.getpid(), start)
     run = wire.RunIdentity(owner.pid, owner.start_time)
-    position = SlotQueuePosition(uuid4().hex, time.time())
+    position = CopyQueuePosition(uuid4().hex, time.time())
     keys = ('BUILDLOG_RUN', 'BUILDLOG_FIRST_STEP_ASSIGNMENT', 'BUILDLOG_FIRST_STEP_ROUTE',
             'BUILDLOG_FIRST_STEP_SINCE', 'BUILDLOG_PLACEMENT_FILE', 'BUILDLOG_PLACEMENT_EPISODE',
             'BUILDLOG_PLACEMENT_SIDECAR',

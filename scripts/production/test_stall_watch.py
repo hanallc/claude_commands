@@ -269,11 +269,11 @@ class StallWatchTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(stall_watch, "WATCH_DEFAULTS", defaults))
         configuration = {
             "build_targets": "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n",
-            "production": "# range: 0..\nPROMPT_ALERT_SECONDS=60\n",
+            "production": "# range: 0..\nprompt_alert_seconds=60\n",
             "rca": "# range: 0.001..\nsend_seconds=300\n",
-            "staff": ("# range: 0.001..\nOPERATION_LOCK_SECONDS=30\n# range: 0.001..\nREMOTE_SECONDS=20\n"
-                      + f"PRODUCER_WORKSPACE=producers\nPRODUCER_FOLDER_ROOT={self.root / 'producers'}\n"),
-            "shutdown": "# range: 5e-324..\nSTART_SECONDS=20\n# range: 5e-324..\nSTAY_SECONDS=10\n",
+            "staff": ("# range: 0.001..\noperation_lock_seconds=30\n# range: 0.001..\nremote_seconds=20\n"
+                      + f"producer_workspace=producers\nproducer_folder_root={self.root / 'producers'}\n"),
+            "shutdown": "# range: 5e-324..\nstart_seconds=20\n# range: 5e-324..\nstay_seconds=10\n",
         }
         for name, contents in configuration.items():
             _ = (self.root / f"{name}.conf").write_text(contents)
@@ -368,11 +368,11 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         path = self.root / "production.conf"
         self.environment["CONF_DIR"] = str(self.root)
         self.panes["unit-one"].update(pane=EDIT_PROMPT, agent_status="blocked")
-        _ = path.write_text("# range: 0..\nPROMPT_ALERT_SECONDS=120\n")
+        _ = path.write_text("# range: 0..\nprompt_alert_seconds=120\n")
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 60).returncode, 0)
         self.assertEqual(self.sent(), [])
-        _ = path.write_text("# range: 0..\nPROMPT_ALERT_SECONDS=30\n")
+        _ = path.write_text("# range: 0..\nprompt_alert_seconds=30\n")
         self.assertEqual(self.tick(START + 61).returncode, 0)
         self.assertTrue(any(item.get("to") == "user" for item in self.sent()))
 
@@ -1708,8 +1708,11 @@ runpy.run_path(str(script), run_name='__main__')
         # also when the screen shows a description or the outside warning.
         for pane in ("", BASH_PROMPT, OUTSIDE_PROMPT):
             self.assertEqual(stall_watch.prompt_request(pane, call), "run rm -f b1e4yc8b9.txt")
-        edit = stall_watch.PendingTool("toolu_1", "Edit", {"file_path": "/home/natepiano/rust/x/src/panes.py"}, START)
-        self.assertEqual(stall_watch.prompt_request("", edit), "edit panes.py")
+        for path, request in (("/home/natepiano/rust/x/src/panes.py", "edit panes.py"),
+                              ("/home/natepiano/rust/x/src/line\nbreak.py", "edit line break.py")):
+            with self.subTest(path=path):
+                edit = stall_watch.PendingTool("toolu_1", "Edit", {"file_path": path}, START)
+                self.assertEqual(stall_watch.prompt_request("", edit), request)
         # A tool the transcript cannot word falls back to the prompt on screen.
         other = stall_watch.PendingTool("toolu_1", "WebFetch", {"url": "https://example.com"}, START)
         self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT, other), "edit panes.py")
@@ -1975,10 +1978,18 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertEqual(stall_watch.prompt_request(BASH_PROMPT, pending), "run cargo build -p cargo-handler")
         long = stall_watch.PendingTool("x", "Bash", {"command": "echo " + "y" * 120}, START)
         self.assertEqual(stall_watch.prompt_request("", long), "run echo " + "y" * 84 + "…")
-        rendered = push_texts.render(stall_watch.PROMPT_TEXT_ID, unit="handler", machine="natedev",
-                                     since="09:01 AST", request="run cargo build -p cargo-handler")
-        self.assertEqual(rendered.body, "handler asks to run cargo build -p cargo-handler. It has waited since 09:01 AST."
-                         + "\n\nYes: it does that and goes on.\n\nNo: it does not, and asks you what to do instead.")
+        for unit, title in (("handler", "handler is stuck at a permission prompt"),
+                            ("cargo-handler", "cargo-handler stuck at a permission prompt"),
+                            ("cargo-handler-worker", "cargo-handler-… stuck at a permission prompt")):
+            with self.subTest(unit=unit):
+                rendered = push_texts.render(stall_watch.PROMPT_TEXT_ID, unit=unit, machine="natedev",
+                                             since="09:01 AST", request="run cargo build -p cargo-handler")
+                self.assertEqual(rendered.title, title)
+                self.assertLessEqual(len(rendered.title), 44)
+                self.assertEqual(rendered.body, "It asks to run cargo build -p cargo-handler.")
+                self.assertEqual(rendered.message, f"Session: {unit}\n"
+                                 + f"Action: On natedev, open the {unit} herdr tab and answer its prompt\n"
+                                 + "It asks to run cargo build -p cargo-handler.")
 
     def test_blocked_turn_end_waits_for_a_new_unblocked_status(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)

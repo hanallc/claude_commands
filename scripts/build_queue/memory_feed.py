@@ -8,21 +8,25 @@ except FileNotFoundError:
 
 import argparse
 import hashlib
+import html
 import importlib
 import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, tzinfo
 from enum import Enum, auto
+from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, cast, overload
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, cast, final, overload
 
 
 class CodeRootArguments(argparse.Namespace):
@@ -44,36 +48,39 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import aws_costs, charts, cost_actions, mac_idle, mac_idle_alert, machine_facts, parse
+from scripts.buildlog import aws_costs, charts, cost_actions, index, mac_idle, mac_idle_alert, machine_facts, parse
 from scripts.buildlog.store import host_name, root
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
-from scripts.build_queue import cloud_progress, limits_view, person_actions, placement, queue_snapshot
+from scripts.build_queue import cloud_progress, limits_view, person_actions, placement, program_memory_feed, queue_snapshot
 from scripts.build_targets import targets
 from scripts.build_targets.mac_linux import TRANSFER_ALLOWANCE_SECONDS
-from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
-from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
+from scripts.build_queue.queue_evidence import service_activity_text, step_labels
+from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, kill_action, queue_view
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.queue_lines import age, blocking_step_name, plain, step_owner_name, step_text
 from scripts.build_queue.snapshot_codec import owner_name, row_what
 from scripts.build_queue.queue_view import reason_phrase
-from scripts.build_queue.admission_jobs import StepJob
+from scripts.build_queue.admission_jobs import HAND_MADE, StepJob
 from scripts.lib.build_steps import (GATE_PROGRAMS, RECORDED_STEP_NAMES,
                                      CopiesRunCommand, OtherCommand, StepNames, build_call_arguments, command_script,
                                      copies_run_command, live_process_arguments,
                                      gate_job_from_process, process_arguments, read_step_names)
 from scripts.lib.build_steps import CommandUnreadable as CommandUnreadable
-from scripts.build_queue.slot_wait import QueueRowName as QueueRowName
-from scripts.build_queue.slot_wait import (NoNamedStep, QueueKind, command_programs,
+from scripts.build_queue.queue_wait import QueueRowName as QueueRowName
+from scripts.build_queue.queue_wait import (SHELLS, NoNamedStep, QueueKind, command_programs,
                                            public_queue_text, recorded_step, verify_value_options)
-from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
+from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
 from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, configured_output_folder
 from scripts.build_targets import target_config
+from scripts.herdr import herdr
+from scripts.herdr.herdr import is_claude_process, is_codex_process
+from scripts.herdr.herdr_types import HerdrFailure
 from scripts.lint import memory_admit as gate
-from scripts.message import unit_labels
-from scripts.production import staff
-from scripts.lib import conf
+from scripts.message import sessions, unit_labels
+from scripts.production import staff, staff_sources
+from scripts.lib import conf, process_start
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.user_zone import user_zone
@@ -147,10 +154,9 @@ LOADED_FEED_CODE_VERSION = loaded_feed_code_version(installed.code_root)
 
 
 GIB = 1024 ** 3
-CI_CGROUP = Path("/sys/fs/cgroup/hana.slice/hana-ci.slice")
 PROC = Path("/proc")
 SYS_BLOCK = Path("/sys/block")
-CGROUP = CI_CGROUP.parents[1]
+CGROUP = Path("/sys/fs/cgroup")
 SWAP_NAMES = {
     "agents": "agent sessions ({count})", "apps": "other apps: {app}",
     "desktop": "desktop session", "system": "system services", "ci": "hana CI",
@@ -267,16 +273,83 @@ def build_limit_icons() -> dict[str, str]:
     return {kind: page_frame.icon_svg(icon) for kind, icon in BUILD_LIMIT_ICONS.items()}
 
 
-def page_html(interval_seconds: float) -> str:
+@dataclass(frozen=True)
+class _PageSection:
+    """One Builds page section that a heading button opens in a dialog."""
+    action: str
+    icon: str
+    label: str
+    body: str
+    title_markup: str = ""
+
+    @property
+    def title(self) -> str:
+        # The dialog title is the button label unless the section gives its own title markup.
+        return self.title_markup or self.label
+
+    @property
+    def dialog_id(self) -> str:
+        return f"{self.action}-dialog"
+
+    @property
+    def title_id(self) -> str:
+        return f"{self.action}-title"
+
+
+_PAGE_SECTIONS = (
+    _PageSection("builds-swap", "memory-stick", "Swap and memory pressure", """
+<p class="pressure-reason" id="pressure-reason"></p>
+<div class="gauges" id="gauges">
+  <div class="gauge" data-tip="g-some"><span>Some tasks stall</span><div class="gt"><div class="gf" id="gf-some"></div><div class="gl" id="gl-some"></div><div class="amounts"><span class="bar-amount" id="gv-some" data-start="0"></span><span class="bar-amount limit-label" id="limit-some"></span></div></div></div>
+  <div class="gauge" data-tip="g-full"><span>All tasks stall</span><div class="gt"><div class="gf" id="gf-full"></div><div class="gl" id="gl-full"></div><div class="amounts"><span class="bar-amount" id="gv-full" data-start="0"></span><span class="bar-amount limit-label" id="limit-full"></span></div></div></div>
+  <div class="gauge" data-tip="g-swap"><span>Swap used <span class="num" id="swap-sum"></span></span><div class="gt"><div class="gf" id="gf-swap"></div><div class="amounts"><span class="bar-amount" id="gv-swap" data-start="0"></span></div></div></div>
+</div>
+<p class="swap-reserve" id="swap-reserve" data-tip="swap"></p>
+<h3>Swap by group</h3>
+<div class="swaprows" id="swaprows"></div>
+""", title_markup='<span data-tip="swaphead">Swap and memory pressure</span>'),
+    _PageSection("builds-costs", "chart-bar-decreasing", "Top 3 costs", """
+<div id="report-top">
+  <p class="report-window" id="cost-window"></p>
+  <div id="top-costs">Reading…</div>
+  <p class="report-window">Hours are summed over steps that run at the same time, so a day can pass 24 h.</p>
+</div>
+"""),
+    _PageSection("builds-leftovers", "ghost", "Leftover processes", '<div id="leftover-rows">Reading…</div>'),
+)
+
+
+def _page_action_button(action: str, icon: str, label: str, dialog_id: str) -> str:
+    # Stand-in until newalways (admin-console) is on main: replace with page_frame.page_action_button
+    # and the owner control's actions argument.
+    escaped_label = html.escape(label, quote=True)
+    return (f'<button type="button" class="page-action" data-page-action="{action}" aria-label="{escaped_label}" '
+            + f'title="{escaped_label}" aria-haspopup="dialog" aria-controls="{dialog_id}">'
+            + page_frame.icon_svg(icon) + '</button>')
+
+
+def page_document(interval_seconds: float) -> str:
+    """Fill the Builds page template: the frame, the section buttons and dialogs, and the refresh interval."""
     source = console_theme.with_theme(PAGE_SOURCE.read_text(encoding="utf-8"))
-    page = page_frame.template(source, "Builds", "builds").replace(
-        "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(interval_seconds))
-    page = page.replace("__BUILD_LIMIT_ICONS__", json.dumps(build_limit_icons()))
+    actions = "".join(_page_action_button(section.action, section.icon, section.label, section.dialog_id)
+                      for section in _PAGE_SECTIONS)
+    # console_dialog adds the shared dialog style and script to each dialog; the page needs them once.
+    dialogs = page_frame.CONSOLE_DIALOG_ASSETS + "".join(
+        page_frame.console_dialog(section.dialog_id, section.title_id, section.title, section.body)
+        .removeprefix(page_frame.CONSOLE_DIALOG_ASSETS) for section in _PAGE_SECTIONS)
+    page = (page_frame.template(source, "Builds", "builds")
+            .replace("__BUILDS_PAGE_ACTIONS__", actions).replace("__BUILDS_PAGE_DIALOGS__", dialogs)
+            .replace("__BUILD_LIMIT_ICONS__", json.dumps(build_limit_icons()))
+            .replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(interval_seconds)))
     return page.replace('</head>', staff_names.script({}) + '</head>', 1)
 
 
+page_html = page_document
+
+
 def publish_page(configuration: FeedConfiguration) -> None:
-    page = page_html(configuration.interval_seconds)
+    """Publish the repository page with the configured refresh interval."""
+    page = page_document(configuration.interval_seconds)
     write_text_atomic(configuration.output_folder / PAGE_NAME, page, new_file_mode=0o644)
 
 
@@ -305,40 +378,9 @@ class LeftoverScope(TypedDict):
     members: list[LeftoverProcess]
 
 
-class CIRunnerMemory(TypedDict):
-    unit: str
+class CIRunnerServiceRam(TypedDict):
     name: str
-    used: float
-    pid: int | admission_records.PidNotRecorded
-
-
-class BusyCIRunner(CIRunnerMemory):
-    state: Literal["busy"]
-    started_at: float
-    job: str
-
-
-class IdleCIRunner(CIRunnerMemory):
-    state: Literal["idle"]
-
-
-class UnreadableCIRunner(TypedDict):
-    unit: str
-    name: str
-    state: Literal["unreadable"]
-    diagnostic: str
-
-
-CIRunner = BusyCIRunner | IdleCIRunner | UnreadableCIRunner
-
-
-@dataclass(frozen=True)
-class RunnerProcess:
-    pid: int
-    parent: int
-    started_at: float
-    program: str
-    command: tuple[str, ...]
+    bytes: RamReading
 
 
 class NoProgress(TypedDict):
@@ -350,6 +392,7 @@ class TokenWaitProgress(TypedDict):
     kind: Literal["TokenWaitProgress"]
     stage: str
     tokens: int
+    memory_paused: NotRequired[Literal[True]]
 
 
 class RowProgress(TypedDict):
@@ -491,6 +534,7 @@ class ConfirmedGuestRun(TypedDict):
 class LastMove(TypedDict):
     kind: Literal["bump"]
     who: str
+    who_id: NotRequired[staff.StaffId]
     from_place: int
     to_place: int
     at: str
@@ -507,14 +551,15 @@ class RowQueueNotes(CallNotes, MoveFields):
     detail_parts: NotRequired[list[staff_names.NamePart]]
     because_parts: NotRequired[list[staff_names.NamePart]]
     key: NotRequired[str]
-    # The configured description and the changes of a known gate job.
     about: NotRequired[str]
     changes: NotRequired[str]
     # True on the step the queue admits next; only that step shows its room.
     first_in_line: NotRequired[bool]
     head_room: NotRequired[HeadRoom]
-    priority_text: NotRequired[str]
+    # The run of the step, when the step has a live run; a run entry marks only the rows of its run.
     priority_entries: NotRequired[list[admission_records.PriorityEntry]]
+    # Each line names the unit or the one run, the actor that asked, and the user's words.
+    priority_lines: NotRequired[list[str]]
     ci_label: NotRequired[str]
     runs_on: NotRequired[str]
     because: NotRequired[str]
@@ -592,6 +637,11 @@ class TargetNotes(TypedDict):
     because_parts: NotRequired[list[staff_names.NamePart]]
 
 
+def unit_name(unit: str) -> str:
+    """Return an empty name when the unit is absent."""
+    return "" if unit in ("", "—", unit_labels.OWNER_NOT_RECORDED) else unit
+
+
 def target_notes(route: target_config.StepRoute, routes: target_availability.MacRoutes, step: str, folder: str,
                  package: str | admission_records.PackageNotRecorded) -> TargetNotes:
     """State the route reason once and name any Mac hold."""
@@ -609,7 +659,7 @@ def target_notes(route: target_config.StepRoute, routes: target_availability.Mac
         mac = routes.mac
         if isinstance(mac, targets.TargetSnapshot) and isinstance(state := mac.states[0], targets.Held):
             identity = target_availability.holder_labels(state, routes.labels)
-            owner = identity.unit if identity.unit != "—" else identity.session
+            owner = unit_name(identity.unit) or identity.session
             parts = staff_names.text_parts("build hold by ", staff_names.StaffReference(owner))
             if identity.showrunner != "—":
                 parts.extend(staff_names.text_parts(" (", staff_names.StaffReference(identity.showrunner), ")"))
@@ -676,7 +726,7 @@ def head_room(check: admission_records.RoomCheck,
     earlier = max(0, ram["room_bytes"] - free)
     rows: list[RoomRow] = [
         {"label": "Queue cap", "gib": gib(ram["cap_bytes"])},
-        {"label": "− Builds", "gib": gib(ram["queued_builds_bytes"] + ram["build_tools_bytes"] + ram["ci_bytes"])},
+        {"label": "− Builds", "gib": gib(ram["queued_builds_bytes"] + ram["build_tools_bytes"])},
         {"label": "− Build reserved", "gib": gib(ram["build_covered_bytes"])}]
     if earlier:
         rows.append({"label": "− Earlier waiters", "gib": gib(earlier)})
@@ -723,10 +773,31 @@ def ci_step_label(runner: str, job: str) -> str:
     return codec.ci_label(template, runner, job)
 
 
-class SlotPlace(TypedDict):
-    # The slot folder's name and machine; the Disks page finds the step that holds a slot by them.
-    slot_folder: NotRequired[str]
-    slot_machine: NotRequired[str]
+@dataclass(frozen=True)
+class RecordedRunFolder:
+    """The full execution path and its matching home, if known."""
+
+    path: str
+    home: str = ""
+
+
+@dataclass(frozen=True)
+class RunFolderNotReported:
+    """The run has an execution folder that the feed cannot name."""
+
+
+class RunFolderField(TypedDict, total=False):
+    """A row omits this field when it has no execution folder."""
+
+    run_folder: RecordedRunFolder | RunFolderNotReported
+
+
+def run_folder(folder: str, home: str) -> RecordedRunFolder | RunFolderNotReported:
+    path = Path(folder)
+    if not path.is_absolute():
+        return RunFolderNotReported()
+    matching_home = home if home and path.is_relative_to(Path(home)) else ""
+    return RecordedRunFolder(folder, matching_home)
 
 
 class ProcessName(str):
@@ -793,17 +864,17 @@ def build_row_step(step: str, package: str | admission_records.PackageNotRecorde
     return program_name if isinstance(program_name, QueueRowName) else QueueRowName.recorded_step_text(step)
 
 
-def ended_step_name(facts: admission_records.EndedStepFacts, names: StepNames) -> QueueRowName | NoNamedStep:
+def ended_step_name(facts: admission_records.EndedStepFacts, names: StepNames, caller: str) -> QueueRowName | NoNamedStep:
     step = facts.step if isinstance(facts.step, str) else ""
     if step in GATE_STEPS:
-        return QueueRowName.owner_only(facts.caller_name if isinstance(facts.caller_name, str) else "")
+        return QueueRowName.owner_only(caller)
     return build_row_step(step, facts.package,
         facts.project if isinstance(facts.project, str) else "", facts.folder if isinstance(facts.folder, str) else "", names)
 
 
-class RunRow(RowQueueNotes, SlotPlace, NamedQueueRow):
+class RunRow(RowQueueNotes, NamedQueueRow, RunFolderField):
+    kill_ref: NotRequired[str]
     read_at: NotRequired[float]
-    admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
     tokens: NotRequired[int]
@@ -822,12 +893,10 @@ class RunRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     queued: bool
     keep_text: str
     group: str
-    ci: bool
     parts: list[GroupPart]
-    ci_runners: NotRequired[list[CIRunner]]
-    ci_cgroup: NotRequired[str]
     need: NotRequired[float]
     need_part: NotRequired[bool]
+    program_memory: NotRequired[program_memory_feed.ProgramMemoryView]
 
 
 GATE_STEPS = frozenset(GATE_PROGRAMS)
@@ -892,9 +961,8 @@ def job_notes(job: StepJobReading, names: StepNames, *, step: str = "",
 
 def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | CloudWorkRow) -> str:
     """Keep a process identity across changes to memory, labels, and queue order."""
-    # An idle or unreadable CI row has no pid or start time; its cgroup tells two CI rows apart.
     identity = [row.get("machine") or "natedev", row.get("kind", "local"), row["pid"],
-                row.get("started_at", row.get("since", 0)), row.get("group", ""), row.get("ci_cgroup", "")]
+                row.get("started_at", row.get("since", 0)), row.get("group", ""), ""]
     if row.get("guest_run") or row.get("guest_unconfirmed"):
         # The consume time names the guest run. The pid and attempt come with the confirmation,
         # so they stay out of the key, and an open hover stays when the queue confirms the run.
@@ -963,23 +1031,17 @@ class FeedStaff:
     def __init__(self, members: staff.StaffSnapshot):
         self.members: staff.StaffSnapshot = members
         self.worktrees: dict[tuple[str, Path], staff.StaffRow | None] = {}
-        self.labels: Mapping[str, unit_labels.UnitLabels] = unit_labels.recorded_owner_labels(
-            {member.current_session for member in members.rows}, members)
+        self.labels_by_id: Mapping[staff.StaffId, unit_labels.UnitLabels] = {
+            member.id: unit_labels.recorded_member_labels(members, member) for member in members.rows}
 
     def labels_for(self, reference: str, machine: str, folder: Path) -> unit_labels.UnitLabels | None:
         member = self.members.by_member_reference(reference) if reference else None
         if member is None and folder.is_absolute():
             member = self.worktree_owner(machine, folder)
-        return self.labels.get(member.current_session) if member is not None else None
-
-    def member_name(self, reference: str) -> str:
-        """The staff name of a fixed member id or its current conversation, or "" for an unknown session."""
-        member = self.members.by_member_reference(reference) if reference else None
-        return member.name if member is not None else ""
+        return self.labels_by_id.get(member.id) if member is not None else None
 
     def fixed_owner_labels(self, staff_id: staff.StaffId) -> unit_labels.UnitLabels | None:
-        member = self.members.by_id(staff_id) if staff_id else None
-        return self.labels.get(member.current_session) if member is not None else None
+        return self.labels_by_id.get(staff_id)
 
     def ended_step_labels(self, identity: admission_records.EndedStepFacts) -> unit_labels.UnitLabels:
         """Find the current staff labels by the ended step's fixed ID."""
@@ -1009,7 +1071,7 @@ def leftover_program(pid: int | admission_records.PidNotRecorded, recorded: str)
     return ProcessName(Path(recorded).name)
 
 
-class WaitRow(RowQueueNotes, SlotPlace, NamedQueueRow):
+class WaitRow(RowQueueNotes, NamedQueueRow):
     showrunner: str
     unit: str
     pid: int
@@ -1030,13 +1092,6 @@ class MemoryWaitRow(WaitRow):
     move: NotRequired[admission_records.QueueMoveMember]
     order_note: NotRequired[str]
     job_start: NotRequired[str]
-
-
-class MacStarter(TypedDict):
-    """Who started a Mac build with no unit, and its step. The page shows them as a unit row shows its unit."""
-
-    name: str
-    step: str
 
 
 class HeldPlaceRow(TypedDict):
@@ -1068,8 +1123,10 @@ def held_place_row(place: admission_records.HeldPlace, zone: tzinfo) -> HeldPlac
             "kept_until": targets.clock(datetime.fromtimestamp(place.ends_at, UTC), zone)}
 
 
-class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
+class MacBuildRow(RowQueueNotes, NamedQueueRow, RunFolderField):
     kind: Literal["mac-build"]
+    row_owner: QueueRowName
+    row_step: str
     repository: str
     gate_label: str
     showrunner: str
@@ -1082,9 +1139,6 @@ class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     stage: queue_view.MacBuildStage
     progress: RowProgress | NoProgress
     vcpus: int | queue_view.MacJobsUnavailable
-    slot_folder: NotRequired[str]
-    slot_machine: NotRequired[str]
-    started_by: NotRequired[MacStarter]
 
 
 class MacReadingUnavailableRow(RowQueueNotes, NamedQueueRow):
@@ -1102,6 +1156,8 @@ class MacReadingUnavailableRow(RowQueueNotes, NamedQueueRow):
 
 class CloudWorkRow(RowQueueNotes, NamedQueueRow):
     activity: str
+    stage: str
+    location: str
     failed_modules: int
     kind: Literal["cloud"]
     showrunner: str
@@ -1112,12 +1168,13 @@ class CloudWorkRow(RowQueueNotes, NamedQueueRow):
     vcpus: int | queue_view.UnknownCpuCount
     state: str
     status: str
+    chart_status: str
     progress: RowProgress | NoProgress
     stale: bool
     late_age: str
 
 
-class CloudRunRow(CloudWorkRow):
+class CloudRunRow(CloudWorkRow, RunFolderField):
     started_at: float
 
 
@@ -1189,6 +1246,26 @@ class SwapTotals(TypedDict):
     builds_ci_bytes: int
     outside_bytes: int
     reserve_share_percent: int
+    # Swap-in within the window, at most the swap outside builds and CI.
+    swap_in_window_bytes: int
+    window_seconds: int
+
+
+class BuildReserveBasis(TypedDict):
+    """Build reserved is the share of room to grow, plus memory held between steps and needs with no use reading."""
+    growth_bytes: int
+    growth_kept_bytes: NotRequired[int]
+    share_percent: int
+    between_steps_bytes: int
+    unread_bytes: int
+
+
+def build_reserve_basis(room: admission_records.MemoryRoom, share_percent: int) -> BuildReserveBasis:
+    parts = [admission_records.keep_aside_parts(hold.memory, share_percent) for hold in room.runs]
+    return {"growth_bytes": sum(part.growth for part in parts),
+            "growth_kept_bytes": sum(part.growth_kept for part in parts), "share_percent": share_percent,
+            "between_steps_bytes": sum(part.between_steps for part in parts),
+            "unread_bytes": sum(part.unread for part in parts)}
 
 
 class BumpNotice(TypedDict):
@@ -1196,10 +1273,23 @@ class BumpNotice(TypedDict):
     detail: str
 
 
+class OutsideQueueProcess(TypedDict):
+    kill_ref: NotRequired[str]
+    pid: int
+    start_time: str
+    unit: str
+    owner: str
+    command: str
+    age_seconds: float
+    current_cpu: float | None
+    cpu_seconds: float
+
+
 class MemoryPage(TypedDict):
     colors: PageColors
     staff_names: NotRequired[dict[str, str]]
     unit_open: NotRequired[str]
+    role_labels: NotRequired[dict[str, staff_names.RoleLabel]]
     ok: bool
     read_at: float
     fresh_until: float
@@ -1218,12 +1308,11 @@ class MemoryPage(TypedDict):
     limit: str
     ram: RamBlocks
     memory_status: MemoryStatus
-    ci_name: str
-    ci_ram: float
     waiting: int
     smallest_need: float
     pressure: str
     swap: SwapTotals
+    build_reserve: BuildReserveBasis
     walk: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow]
     waiters: list[WaitRow | CloudWaitRow]
     # Held places show among the waiters in arrival order; the page places them by since.
@@ -1236,6 +1325,7 @@ class MemoryPage(TypedDict):
     bump_notices: list[BumpNotice]
     unmatched_priority_text: str
     unmatched_priority_entries: list[admission_records.PriorityEntry]
+    unmatched_priority_lines: list[str]
     mac_idle_alert: str
     targets: list[target_availability.TargetRow]
     cloud_slots_used: int
@@ -1248,6 +1338,7 @@ class MemoryPage(TypedDict):
     report_version: str
     swap_rows: int
     leftovers: list[LeftoverScope]
+    outside_queue: list[OutsideQueueProcess]
     build_limits: NotRequired[limits_view.BuildLimits]
 
 
@@ -1267,73 +1358,164 @@ class PageUnavailable(TypedDict):
     read_at: float
 
 
-def cargo_job(command: tuple[str, ...]) -> str:
-    """Return the job word from a Cargo command or from the CI cargo front's command."""
-    for index, argument in enumerate(command):
-        if Path(argument).name == parse.CI_CARGO_FRONT:
-            return cargo_job(("cargo", *parse.cargo_front_call(command[index + 1:]).arguments))
-        if Path(argument).name not in ("cargo", "cargo-tile-real", "cargo-nextest"):
+def ci_runner_units(readings: Sequence[admission_records.UnownedSliceMemory]) -> tuple[Path, ...]:
+    """Find runner services below the recorded CI slices."""
+    return tuple(sorted({unit for memory in readings if memory.cgroup
+                         for unit in Path(memory.cgroup).glob("github-runner-*.service") if unit.is_dir()}))
+
+
+def ci_runner_name(unit: Path) -> str:
+    return unit.name.removeprefix("github-runner-").removesuffix(".service")
+
+
+class CIRunnerHistory:
+    """Keep the last good reading for up to two incomplete process samples."""
+
+    def __init__(self) -> None:
+        self.last_good: dict[Path, tuple[int, int]] = {}
+
+    def current(self, unit: Path, sample: RamReading | process_start.Unreadable | None) -> RamReading:
+        if isinstance(sample, int):
+            self.last_good[unit] = (sample, 0)
+            return sample
+        if ((sample is None or isinstance(sample, process_start.Unreadable))
+                and (previous := self.last_good.get(unit)) is not None and previous[1] < 2):
+            amount, misses = previous
+            self.last_good[unit] = (amount, misses + 1)
+            return amount
+        _ = self.last_good.pop(unit, None)
+        if isinstance(sample, process_start.Unreadable):
+            return admission_records.ReadingUnavailable(sample.reason)
+        return sample if sample is not None else admission_records.ReadingUnavailable("no live runner processes in the sample")
+
+
+def read_ci_runner(
+    members: set[int], processes: Mapping[int, gate.ProcessIdentity], cargo: set[int],
+) -> RamReading | process_start.Unreadable | None:
+    """Read service memory only when each live member is in the process table."""
+    candidates = members - cargo
+    if not candidates:
+        return 0
+    pids = candidates.intersection(processes)
+    # The table omits ended processes and processes whose stat it could not read.
+    for pid in candidates - pids:
+        identity = process_start.proc_table_start(pid, PROC)
+        if isinstance(identity, process_start.Unreadable):
+            return identity
+        if isinstance(identity, process_start.Started):
+            return process_start.Unreadable(f"runner process {pid} is missing from the process table")
+    use = gate.process_memory(pids, PROC).anonymous
+    if isinstance(use, admission_records.RunUseUnavailable):
+        # A status read can fail or lack valid RssAnon or RssShmem for more than two reads.
+        return admission_records.ReadingUnavailable(use.reason)
+    if use.bytes:
+        return use.bytes
+    # A process can exit during the memory read. Check if a zero sample has a live member.
+    live = False
+    for pid in pids:
+        identity = process_start.proc_table_start(pid, PROC)
+        if isinstance(identity, process_start.Unreadable):
+            return identity
+        live |= identity == process_start.Started(processes[pid].start)
+    return 0 if live else None
+
+
+def ci_runner_service_ram(
+    units: Sequence[Path],
+    steps: Iterable[tuple[admission_records.Reservation, admission_records.ExplainedRunningStep]],
+    history: CIRunnerHistory | None = None,
+) -> list[CIRunnerServiceRam]:
+    """Read cgroup membership before the process table to exclude new Cargo children."""
+    if history is not None:
+        for unit in history.last_good.keys() - set(units):
+            del history.last_good[unit]
+    if not units:
+        return []
+    scopes: set[Path] = set()
+    process_roots: dict[int, str] = {}
+    for reservation, entry in steps:
+        memory = entry.step.measured
+        source = memory.anonymous_source if isinstance(memory, admission_records.MeasuredMemory) else None
+        if isinstance(source, admission_records.ScopeSource):
+            scopes.add(source.directory)
+        else:
+            process_roots[reservation["pid"]] = reservation["start_time"]
+    membership = gate.ScopeMembershipPass()
+    samples: dict[Path, set[int] | admission_records.ReadingUnavailable] = {}
+    for unit in units:
+        try:
+            members = membership.read(unit)
+            if members:
+                scoped = {pid for scope in gate.owned_scope_roots(scopes, unit) for pid in membership.read(scope)}
+                samples[unit] = set(members) - scoped
+            elif history is not None:
+                # A missing or empty service cgroup has no running service.
+                _ = history.last_good.pop(unit, None)
+        except (OSError, ValueError) as error:
+            # A cgroup.procs read, a directory listing, or PID parsing can fail across reads.
+            samples[unit] = admission_records.ReadingUnavailable(str(error))
+    table_error: admission_records.ReadingUnavailable | None = None
+    processes: dict[int, gate.ProcessIdentity] = {}
+    if any(isinstance(sample, set) and sample for sample in samples.values()):
+        try:
+            processes = gate.process_table(PROC)
+        except OSError as error:
+            # An inaccessible proc directory can stay inaccessible.
+            table_error = admission_records.ReadingUnavailable(str(error))
+    cargo = gate.process_tree(process_roots, processes)
+    history = history if history is not None else CIRunnerHistory()
+    services: list[CIRunnerServiceRam] = []
+    for unit, sample in samples.items():
+        if isinstance(sample, admission_records.ReadingUnavailable):
+            amount = sample
+        elif table_error is not None and sample:
+            amount = table_error
+        else:
+            amount = read_ci_runner(sample, processes, cargo)
+        services.append({"name": ci_runner_name(unit), "bytes": history.current(unit, amount)})
+    return services
+
+
+def ci_service_shares(services: Sequence[CIRunnerServiceRam], charge: int) -> tuple[list[CIRunnerServiceRam], int]:
+    """Divide the saved charge. Return the part that has no service reading."""
+    measured = sum(known_bytes(service["bytes"]) for service in services)
+    complete = all(isinstance(service["bytes"], int) for service in services)
+    assigned = charge if measured and complete else min(charge, measured)
+    if not measured or assigned == measured:
+        return list(services), charge - assigned
+    shares: list[CIRunnerServiceRam] = []
+    cumulative = previous = 0
+    for service in services:
+        amount = service["bytes"]
+        if isinstance(amount, int):
+            cumulative += amount
+            boundary = assigned * cumulative // measured
+            service = CIRunnerServiceRam(name=service["name"], bytes=boundary - previous)
+            previous = boundary
+        shares.append(service)
+    return shares, charge - assigned
+
+
+def external_ci_owners(readings: Sequence[admission_records.UnownedSliceMemory],
+                       steps: Mapping[str, tuple[admission_records.RunningStep, admission_records.Reservation]],
+                       builds: Path) -> set[str]:
+    """Find queued runs that the builds slice does not contain."""
+    external = [memory for memory in readings if memory.cgroup
+                and not Path(memory.cgroup).is_relative_to(builds)]
+    scopes = tuple(Path(memory.cgroup) for memory in external)
+    pids = {member.pid for memory in external if isinstance(memory.activity, ScopeProcesses)
+            for member in memory.activity.members}
+    owners: set[str] = set()
+    for owner, (step, _) in steps.items():
+        if not isinstance(step.measured, admission_records.MeasuredMemory):
             continue
-        subcommand = parse.cargo_subcommand(command[index + 1:])
-        if subcommand in ("test", "nextest"):
-            return "tests"
-        if subcommand == "build" and any(flag in command for flag in ("--release", "-r")):
-            return "release build"
-        if subcommand:
-            return subcommand
-    return ""
-
-
-def read_ci_runner(unit: Path, proc: Path) -> CIRunner:
-    name = unit.name.removeprefix("github-runner-").removesuffix(".service")
-    try:
-        used = gib(gate.slice_working_set(unit).bytes)
-        boot = float(next(line.split()[1] for line in read_proc_text(proc / "stat").splitlines()
-                          if line.startswith("btime ")))
-        ticks = int(os.sysconf("SC_CLK_TCK"))
-        members: set[int] = set()
-        pending = [unit]
-        while pending:
-            scope = pending.pop()
-            members.update(int(value) for value in (scope / "cgroup.procs").read_text().split())
-            pending.extend(child for child in scope.iterdir() if child.is_dir())
-        processes: dict[int, RunnerProcess] = {}
-        for pid in sorted(members):
-            try:
-                stat = read_proc_text(proc / str(pid) / "stat")
-                fields = stat.rsplit(") ", 1)[1].split()
-                if fields[0] in ("Z", "X"):
-                    continue
-                command = tuple(part for part in read_proc_text(proc / str(pid) / "cmdline").split("\0") if part)
-                processes[pid] = RunnerProcess(pid, int(fields[1]), boot + int(fields[19]) / ticks,
-                                               stat.split("(", 1)[1].rsplit(") ", 1)[0], command)
-            except FileNotFoundError:
-                continue
-        workers = sorted((p for p in processes.values() if p.program == "Runner.Worker"),
-                         key=lambda p: (p.started_at, p.pid))
-        if workers:
-            worker = workers[0]
-            jobs: list[tuple[float, str]] = []
-            for process in processes.values():
-                job = cargo_job(process.command)
-                if not job:
-                    continue
-                ancestor = process.pid
-                seen: set[int] = set()
-                while ancestor in processes and ancestor not in seen:
-                    if ancestor == worker.pid:
-                        jobs.append((process.started_at, job))
-                        break
-                    seen.add(ancestor)
-                    ancestor = processes[ancestor].parent
-            return {"unit": unit.name, "name": name, "state": "busy", "used": used,
-                    "pid": worker.pid, "started_at": worker.started_at,
-                    "job": min(jobs)[1] if jobs else "CI job"}
-        listeners = sorted(p.pid for p in processes.values() if p.program == "Runner.Listener")
-        return {"unit": unit.name, "name": name, "state": "idle", "used": used,
-                "pid": listeners[0] if listeners else admission_records.PidNotRecorded()}
-    except (OSError, ValueError, IndexError, StopIteration) as error:
-        return {"unit": unit.name, "name": name, "state": "unreadable", "diagnostic": str(error)}
+        source = step.measured.anonymous_source
+        if isinstance(source, admission_records.ScopeSource):
+            if any(source.directory.is_relative_to(scope) for scope in scopes):
+                owners.add(owner)
+        elif isinstance(source, admission_records.ProcessSource) and step.pid in pids:
+            owners.add(owner)
+    return owners
 
 
 def job_age(started_at: float, now: float) -> str:
@@ -1352,54 +1534,8 @@ def job_start_text(job_start: admission_records.JobStart, now: float, zone: tzin
     return f"{started} · {job_age(job_start.started_at, now)} ago"
 
 
-def ci_amount(value: float) -> str:
-    """Show the shared CI text for an amount in GiB."""
-    return ci_bytes_text(round(value * admission_records.GIB))
-
-
-def build_ci_row(used: float, now: float,
-                 cgroup: Path = CI_CGROUP, proc: Path = PROC, *, admitted: bool = False,
-                 names: StepNames = RECORDED_STEP_NAMES) -> RunRow:
-    runners: list[CIRunner]
-    try:
-        units = sorted(child for child in cgroup.iterdir()
-                       if child.name.startswith("github-runner-") and child.name.endswith(".service"))
-        runners = [read_ci_runner(unit, proc) for unit in units]
-    except OSError as error:
-        runners = [{"unit": cgroup.name, "name": "hana CI",
-                                    "state": "unreadable", "diagnostic": str(error)}]
-    busy = [runner for runner in runners if runner["state"] == "busy"]
-    busy.sort(key=lambda runner: runner["started_at"])
-    detail = (f"{len(busy)} of {len(runners)} runners busy · {job_age(busy[0]['started_at'], now)}"
-              if busy else "idle")
-    if any(runner["state"] == "unreadable" for runner in runners):
-        detail = detail + " · runner not readable" if busy else "runner not readable"
-    lines: list[str] = []
-    for runner in runners:
-        if runner["state"] == "unreadable":
-            lines.append(f"{runner['name']} · not readable")
-        elif runner["state"] == "busy":
-            lines.append(f"{runner['name']} · {runner['job']} · {job_age(runner['started_at'], now)} · {ci_amount(runner['used'])}")
-        else:
-            lines.append(f"{runner['name']} · idle · {ci_amount(runner['used'])}")
-    lines.append(f"hana CI uses {ci_amount(used)} now. This use is part of the work inside the cap.")
-    idle = [runner for runner in runners if runner["state"] == "idle" and isinstance(runner["pid"], int)]
-    pid = busy[0]["pid"] if busy else idle[0]["pid"] if idle else admission_records.PidNotRecorded()
-    job = busy[0]["job"] if busy else ""
-    label = ci_step_label(busy[0]["name"] if busy else "", job)
-    name = QueueRowName.fixed(QueueKind.CI)
-    return {**queue_row_labels(name, name, ci_label=label),
-            **job_notes(NotGateStep(), names, ci=True),
-            "showrunner": "", "unit": "", "ci_label": label, "owner_text": label.split(" · ", 1)[0],
-            "state": detail if not busy else "",
-            "pid": pid, "detail": detail, "used": used,
-            "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
-            "queued": False, "keep_text": "\n".join(lines), "group": "", "ci": True, "parts": [],
-            "ci_runners": runners, "ci_cgroup": str(cgroup), "admitted": admitted,
-            "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
-
-
-def row_progress(steps: Sequence[admission_records.RunningStep], token_stage: str) -> RowProgress | TokenWaitProgress | NoProgress:
+def row_progress(steps: Sequence[admission_records.RunningStep], token_stage: str, *,
+                 memory_paused: bool = False) -> RowProgress | TokenWaitProgress | NoProgress:
     """Use the newest step counter or token wait from the admission reading."""
     reason = "no admission counter"
     phase: Literal["building", "testing"]
@@ -1408,8 +1544,11 @@ def row_progress(steps: Sequence[admission_records.RunningStep], token_stage: st
         counter = queue_view.step_counter(step)
         if isinstance(counter, progress.NoCounter):
             if isinstance(counter.token_wait, progress.TokenWait):
-                return {"kind": "TokenWaitProgress", "stage": token_stage,
-                        "tokens": counter.token_wait.tokens}
+                wait: TokenWaitProgress = {"kind": "TokenWaitProgress", "stage": token_stage,
+                                           "tokens": counter.token_wait.tokens}
+                if memory_paused:
+                    wait["memory_paused"] = True
+                return wait
             reason = counter.reason
             continue
         if counter.phase == "modules" or counter.phase.startswith("suites"):
@@ -1504,15 +1643,13 @@ def step_page_owner(step: admission_records.RunningStep | admission_records.Wait
 
 def mac_build_units(builds: Sequence[queue_view.MacBuild],
                     mac_claims: Sequence[claim_state.HeldClaim]) -> Mapping[int, unit_labels.UnitLabels]:
-    """Use a Mac claim's session, from the page's one target reading, to resolve its staff unit."""
+    """Use claims that match the build's checkout or submitting session."""
     from scripts.copies import copies
-    from scripts.mac_test import claim_state
 
     if not builds:
         return {}
-    held_claims = [claim for claim in mac_claims
-                   if claim.record.get("remote_host", "mac").rsplit("@", 1)[-1] == "mac"]
-    claims = [claim.record for claim in held_claims]
+    claims = [claim.record for claim in mac_claims
+              if claim.record.get("remote_host", "mac").rsplit("@", 1)[-1] == "mac"]
     leases = [lease for lease in copies.held_remote_mirrors()
               if lease.identity.host.rsplit("@", 1)[-1] == "mac"]
     labels = unit_labels.unit_labels_for([claim["submitting_session"] for claim in claims], os.environ)
@@ -1540,77 +1677,48 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild],
                     claim.get("repo_name", "") == build.repository)}
         if len(matches) == 1:
             result[build.pid] = next(iter(matches))
-        elif (not matches and not sessions and build.origin is queue_view.MacBuildOrigin.NON_CI and
-              not any(contains(claim["worktree"], build.folder) for claim in claims)):
-            repository_claims = [claim for claim in held_claims
-                                 if (claim.scope.name if isinstance(claim.scope, claim_state.RepositoryScope)
-                                     else claim.record.get("repo_name")) == build.repository]
-            if len(repository_claims) == 1:
-                session = repository_claims[0].record["submitting_session"]
-                if session in labels:
-                    result[build.pid] = labels[session]
     return result
 
 
-def build_slot_number(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> int | Literal["—"]:
-    """Read the number of a test copy under the machine's build root."""
-    root = roots.get(f"roots.build.{machine}", roots.get("roots.build", ""))
-    if not root or not folder:
-        return "—"
-    uses_home = root == "~" or root.startswith("~/") or re.search(r"\$(?:HOME\b|\{HOME\})", root)
-    if uses_home and not home:
-        return "—"
-    root = re.sub(r"\$(?:HOME\b|\{HOME\})", lambda _: home, root)
-    if root == "~" or root.startswith("~/"):
-        root = home + root[1:]
-    # Compare the Mac root unresolved; the page cannot resolve Mac paths locally.
-    configured = Path(os.path.realpath(root) if machine == host_name() else os.path.normpath(root))
-    run_folder = Path(os.path.normpath(folder))
-    if not run_folder.is_relative_to(configured):
-        return "—"
-    parts = run_folder.relative_to(configured).parts
-    if len(parts) != 3 or parts[1] in ("main", "ci") or not re.fullmatch(r"[1-9][0-9]*", parts[2]):
-        return "—"
-    try:
-        return int(parts[2])
-    except ValueError:
-        return "—"
+@dataclass(frozen=True)
+class MacBuildSource:
+    """The checkout, submitting session, and host of an offloaded build."""
+
+    folder: str
+    session: str
+    host: str
 
 
-def slot_place(number: int | Literal["—"], folder: str, machine: str) -> SlotPlace:
-    """The slot folder and machine of a step in slot number; empty for a step in no slot."""
-    if number == "—":
+def mac_verify_call_id(build: queue_view.MacBuild) -> str:
+    if build.verify_call_id:
+        return build.verify_call_id
+    # Older readings may only record the Verify step's placement.
+    episode = build.gate_placement.partition("/")[0]
+    call_id, _, step = episode.rpartition("-step-")
+    return call_id if step.isdecimal() else ""
+
+
+def mac_verify_sources(call_ids: set[str]) -> dict[str, MacBuildSource]:
+    """Read the indexed source calls after their placements leave the queue."""
+    if not call_ids:
         return {}
-    key = "/".join(Path(os.path.normpath(folder)).parts[-3:])
-    return {"slot_folder": key, "slot_machine": machine}
-
-
-def build_slot(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> SlotPlace:
-    """The slot folder and machine when the run is in a slot; the Disks page finds the run by them."""
-    return slot_place(build_slot_number(folder, machine, roots, home=home), folder, machine)
-
-
-def mac_launcher_name(build: queue_view.MacBuild, members: FeedStaff) -> str:
-    """Name who started a Mac build: hana CI, a Claude session's staff name, or the launcher; "" for an old reading."""
-    if build.origin is queue_view.MacBuildOrigin.CI:
-        return QueueKind.CI.value
-    match build.launcher:
-        case queue_view.MacLauncher.CLAUDE:
-            return members.member_name(build.launcher_session) or "Claude session"
-        case queue_view.MacLauncher.CI:
-            return QueueKind.CI.value
-        case queue_view.MacLauncher.RUST_ANALYZER | queue_view.MacLauncher.TERMINAL:
-            return build.launcher.value
-        case queue_view.MacLauncher.UNKNOWN:
-            return ""
-        case _:
-            assert_never(build.launcher)
+    try:
+        with closing(index.read_only()) as database:
+            rows = cast(list[tuple[str, str, str, str]], database.execute(
+                """SELECT id, COALESCE(NULLIF(worktree, ''), cwd, ''), COALESCE(session, ''), COALESCE(host, '')
+                FROM calls WHERE id IN (SELECT value FROM json_each(?)) AND tool = 'verify.sh'""",
+                (json.dumps(sorted(call_ids)),)).fetchall())
+    except sqlite3.Error:
+        # The report index can be absent or replaced during a refresh.
+        return {}
+    return {call_id: MacBuildSource(folder, session, host)
+            for call_id, folder, session, host in rows if folder or session}
 
 
 def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading,
                  identity: unit_labels.UnitLabels, *, names: StepNames,
-                 slot_roots: Mapping[str, str], slot_machine: str,
-                 placed_step: admission_records.RunningStep | None = None, launcher: str = "") -> MacBuildRow:
+                 placed_step: admission_records.RunningStep | None = None, source_folder: str = "",
+                 verify_source_missing: bool = False) -> MacBuildRow:
     """Keep Mac memory and its stage separate from natedev admission values."""
     label = ci_step_label(build.ci_runner, build.ci_job) if build.origin is queue_view.MacBuildOrigin.CI else ""
     gate = queue_view.gate_label_text(build)
@@ -1625,12 +1733,18 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
     unit = staff_unit(identity, missing="—")
     caller = "" if label or public_queue_text(identity.owner_text) else codec.select_queue_name(
         public_owner_name(identity.session, build.session))
-    # A placed run keeps the owner that its queue request stored.
-    stored_unit, stored_name = (placed_step.unit, placed_step.session_name) if placed_step is not None else ("", "")
-    who = QueueKind.CI.value if ci else owner_name(identity, stored_unit, stored_name, caller, launcher,
-                                                   package or build.repository)
+    if ci:
+        who = QueueKind.CI.value
+    elif verify_source_missing:
+        who = ""
+    else:
+        checkout = source_folder or (placed_step.folder if placed_step is not None else build.folder)
+        who = owner_name(identity, "", caller, Path(checkout).name, build.repository)
     name = QueueRowName.owned(who, shown_step) if isinstance(shown_step, QueueRowName) else title_step
     display_name = name.with_mac_status(shown_gate)
+    row_step = ""
+    if isinstance(shown_step, QueueRowName):
+        row_step = title_step if isinstance(unit, StaffUnitName) and not ci else shown_step
     parts = (staff_names.row_parts(who, shown_step, identity.unit) if isinstance(shown_step, QueueRowName)
              else staff_names.text_parts(name))
     parts.extend(staff_names.text_parts(" · " + shown_gate if shown_gate else ""))
@@ -1642,7 +1756,8 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
             call = build_command_call(shlex.split(build.command))
         except ValueError:
             pass
-    row: MacBuildRow = {"kind": "mac-build", **queue_row_labels(title_step, display_name, unit=unit, ci_label=label, caller=caller),
+    row: MacBuildRow = {"kind": "mac-build", "row_owner": QueueRowName.owner_only(who), "row_step": row_step,
+            **queue_row_labels(title_step, display_name, unit=unit, ci_label=label, caller=caller),
             **call_notes(verify, placed_step.step if placed_step is not None else verb, call),
             **job_notes(NotGateStep(), names, step=verb, verify=verify, ci=ci),
             "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
@@ -1650,15 +1765,12 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
             "pid": build.pid, "machine": "mac", "started_at": build.started_at, "read_at": reading.read_at,
             "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,
             "stage": build.stage, "vcpus": queue_view.mac_command_jobs(build.command),
-            **build_slot(build.folder, slot_machine, slot_roots, home=reading.home),
+            "run_folder": run_folder(build.folder, reading.home),
             "progress": ({"kind": "RowProgress", "phase": "testing" if build.counter.phase.startswith("test:") else "building",
                           "done": build.counter.done, "total": build.counter.total, "percent": build.counter.percent,
                           "unit": "tests" if build.counter.phase.startswith("test:") else "units"}
                          if isinstance(build.counter, progress.ProgressCounter) else
                          {"kind": "NoProgress", "reason": build.counter.reason})}
-    # A row with no unit starts with who started it, as a unit row starts with its unit.
-    if launcher and not isinstance(unit, StaffUnitName) and not stored_unit:
-        row["started_by"] = {"name": who, "step": shown_step if isinstance(shown_step, QueueRowName) else ""}
     if placement_notes is not None:
         row["runs_on"] = placement_notes["runs_on"]
         row["targets"] = placement_notes["targets"]
@@ -1670,6 +1782,13 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
         if "because_parts" in placement_notes:
             row["because_parts"] = placement_notes["because_parts"]
     return row
+
+
+def cloud_stage(row: wire.CloudRow) -> str:
+    """Use the reported stage, or the state when the stage is absent."""
+    if isinstance(row.progress, cloud_progress.CloudProgress):
+        return row.progress.stage or ("testing" if row.progress.state == "running" else row.progress.state)
+    return "testing" if isinstance(row.counter, progress.ProgressCounter) else ""
 
 
 def cloud_row_progress(counter: progress.ProgressCounter | progress.NoCounter) -> RowProgress | NoProgress:
@@ -1726,8 +1845,8 @@ def route_reason(reason: str) -> str:
     """Use a phrase for the route restriction."""
     phrases = {"step writes the tree": "edits the tree", "the run asks for it": "requested by the caller",
                "a direct cargo command runs where it starts": "direct cargo command"}
-    phrase = phrases.get(reason, reason.removeprefix("it "))
-    return phrase.rstrip(".")
+    phrase = phrases.get(reason, reason.strip().removeprefix("it "))
+    return phrase.rstrip(".!?")
 
 
 def read_stalls() -> PressureValues:
@@ -1809,13 +1928,13 @@ class TokenHoldersUnknown:
     reason: str
 
 
-NO_TOKEN_DUMP_YET = TokenHoldersUnknown("The feed has not read a steve token dump yet.")
+NO_TOKEN_DUMP_YET = TokenHoldersUnknown("waiting for a steve token dump")
 STEVE_UNIT = "steve.service"
 # systemctl must never ask for a password: the polkit rule allows this reload alone.
 STEVE_DUMP_COMMAND = ("systemctl", "--no-ask-password", "reload", STEVE_UNIT)
 STEVE_DUMP_TIMEOUT_SECONDS = 5
 STEVE_DUMP_DENIED = "Access denied"
-STEVE_DUMP_DENIED_REASON = "natedev does not yet let the feed ask steve which build holds each token."
+STEVE_DUMP_DENIED_REASON = "no permission to request a steve token dump"
 STEVE_DUMP_HEADER = re.compile(r"steve: currently (\d+) tokens available out of (\d+)")
 STEVE_DUMP_HOLDER = re.compile(r"\s+PID (\d+)(?: \(.*\))? holds (\d+) tokens:")
 STEVE_DUMP_DETAIL = re.compile(r"\s+(job 0x[0-9a-f]+ running for .*|\d+ processes waiting for a job token.*|PID \d+ is .*)")
@@ -1855,7 +1974,7 @@ def token_holders(journal: str) -> TokenHolders | TokenHoldersUnknown:
     messages = [line.split(": ", 1)[1] for line in journal.splitlines() if ": " in line]
     starts = [index for index, message in enumerate(messages) if STEVE_DUMP_HEADER.fullmatch(message)]
     if not starts:
-        return TokenHoldersUnknown("steve wrote no token dump in the journal window.")
+        return TokenHoldersUnknown("no recent steve token dump")
     for start in reversed(starts):
         header = STEVE_DUMP_HEADER.fullmatch(messages[start])
         assert header is not None
@@ -1868,7 +1987,7 @@ def token_holders(journal: str) -> TokenHolders | TokenHoldersUnknown:
                 break
         if sum(held.values()) == int(header[2]) - int(header[1]):
             return TokenHolders(held)
-    return TokenHoldersUnknown("Each steve token dump in the journal window was incomplete.")
+    return TokenHoldersUnknown("incomplete steve token dumps")
 
 
 def newest_token_holders(dump_seconds: int) -> TokenHolders | TokenHoldersUnknown:
@@ -1876,7 +1995,7 @@ def newest_token_holders(dump_seconds: int) -> TokenHolders | TokenHoldersUnknow
     try:
         return token_holders(steve_journal(2 * dump_seconds))
     except (OSError, subprocess.TimeoutExpired) as error:
-        return TokenHoldersUnknown(f"The steve journal is unreadable: {error}")
+        return TokenHoldersUnknown(f"unreadable steve journal · {error}")
 
 
 def parent_pid(pid: int) -> int:
@@ -1906,19 +2025,12 @@ def tokens_by_run(holders: TokenHolders, run_pids: set[int]) -> dict[int, int]:
     return counts
 
 
-def token_wait_stage(pool: TokenPool | TokenPoolUnavailable) -> str:
-    """Name the memory pause as the cause of a natedev token wait."""
-    if pool["kind"] == "TokenPool" and pool["paused"]:
-        return f"{progress.TOKEN_WAIT_REASON} (memory under {pool['memory_floor_bytes'] / GIB:g} GiB)"
-    return progress.TOKEN_WAIT_REASON
-
-
 def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
     """Read the top costs from one provider result."""
     try:
-        recent_days = conf.read("buildlog").whole("TOP_COST_RECENT_DAYS")
+        recent_days = conf.read("buildlog").whole("top_cost_recent_days")
         if days < recent_days:
-            raise conf.Unusable(f"history_days={days} must be at least TOP_COST_RECENT_DAYS={recent_days}")
+            raise conf.Unusable(f"history_days={days} must be at least top_cost_recent_days={recent_days}")
         report = charts.page_data(days, n=3)
         if isinstance(report, charts.IndexUnavailable):
             return report
@@ -2196,8 +2308,8 @@ class RamBlocks(TypedDict):
     python_tests_bytes: int
     waiting_runs_bytes: int
     other_build_tools_bytes: int
-    # The CI use that the queue cap counts: swap-backed use.
-    ci_bytes: int
+    # Live swap-backed use for each CI runner service.
+    ci_services: list[CIRunnerServiceRam]
     # What builds may use: build tools, queued builds, CI, build reserved and free.
     cap_bytes: int
     agents_bytes: RamReading
@@ -2551,6 +2663,502 @@ def tool_group_children(path: Path) -> list[Path]:
         return []
 
 
+def direct_test_time_limit_seconds() -> float | None:
+    """Check the live configuration stamp before reading the CPU limit."""
+    path = conf.path("test_times")
+    try:
+        stamp = conf.ConfigurationStamp.from_stat(path.stat())
+    except OSError:
+        stamp = None
+    return configured_cpu_limit(path, stamp)
+
+
+@lru_cache(maxsize=1)
+def configured_cpu_limit(path: Path, _stamp: conf.ConfigurationStamp | None) -> float | None:
+    """Read the live CPU limit when its file changes."""
+    key = "direct_test.time_limit_seconds"
+    config = conf.read(path)
+    if isinstance(config.settings, dict) and config.effective_key(key) in config.settings:
+        try:
+            return config.value(key, conf.positive_whole_seconds, recover_invalid=False)
+        except conf.Unusable as error:
+            print(f"memory feed: outside queue marks disabled: {error}", file=sys.stderr)
+    else:
+        print(f"memory feed: outside queue marks disabled: {key} missing in {path}", file=sys.stderr)
+    return None
+
+
+@dataclass(frozen=True)
+class OutsideProcess:
+    parent: int
+    start: str
+    ticks: int
+    reaped_ticks: int
+    zombie: bool
+
+
+def read_outside_process(pid: int) -> OutsideProcess | None:
+    try:
+        fields = (PROC / str(pid) / "stat").read_bytes().rsplit(b") ", 1)[1].split()
+        if fields[0] not in (b"X", b"x") and fields[19].isdigit():
+            return OutsideProcess(int(fields[1]), fields[19].decode("ascii"),
+                                  int(fields[11]) + int(fields[12]), int(fields[13]) + int(fields[14]),
+                                  fields[0] == b"Z")
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def outside_process_table() -> dict[int, OutsideProcess]:
+    """Read CPU counters for live processes and zombies."""
+    return {int(name): process for name in os.listdir(PROC) if name.isdecimal()
+            and (process := read_outside_process(int(name))) is not None}
+
+
+def outside_command_line(pid: int) -> tuple[str, ...]:
+    try:
+        line = read_proc_text(PROC / str(pid) / "cmdline").removesuffix("\0")
+    except OSError:
+        return ()
+    return tuple(line.split("\0")) if line else ()
+
+
+def outside_process_group(pid: int) -> Path | None:
+    try:
+        for line in read_proc_text(PROC / str(pid) / "cgroup").splitlines():
+            if line.startswith("0::/"):
+                return CGROUP / line[4:]
+    except OSError:
+        pass
+    return None
+
+
+@dataclass(frozen=True)
+class OutsideCommand:
+    row: OutsideQueueProcess
+    sample_seconds: float
+    over_limit: bool
+    caller: staff.StaffRow | None = None
+
+
+class OutsideCpuReadings:
+    """Keep one CPU sample per live command."""
+
+    def __init__(self) -> None:
+        self.sampled_at: float | None = None
+        self.samples: dict[tuple[int, str], float] = {}
+
+    def update(self, commands: Sequence[OutsideCommand], now: float) -> None:
+        elapsed = now - self.sampled_at if self.sampled_at is not None else 0
+        samples: dict[tuple[int, str], float] = {}
+        for command in commands:
+            row = command.row
+            key = (row["pid"], row["start_time"])
+            samples[key] = command.sample_seconds
+            previous = self.samples.get(key)
+            if previous is not None and elapsed > 0:
+                row["current_cpu"] = max(0.0, (command.sample_seconds - previous) * 100 / elapsed)
+        self.samples = samples
+        self.sampled_at = now
+
+
+def is_codex_agent(command: Sequence[str]) -> bool:
+    return bool(command) and (is_codex_process(command) or Path(command[0]).name == "codex-real")
+
+
+def is_agent_command(command: Sequence[str]) -> bool:
+    return is_claude_process(command) or is_codex_agent(command)
+
+
+@dataclass(frozen=True)
+class OutsideThreadHost:
+    """The process hosts threads and has no session of its own."""
+
+
+@dataclass(frozen=True)
+class OutsideIdentityUnreadable:
+    """The scan could not verify the agent's session."""
+
+
+@dataclass(frozen=True)
+class OutsideEnvironmentUnreadable:
+    """The scan could not read the process environment."""
+
+
+@final
+class OutsideQueueScan:
+    """Read current placement for one feed refresh."""
+
+    def __init__(self, inputs: admission_records.QueueInputs, processes: dict[int, OutsideProcess],
+                 staff_members: FeedStaff, builds: Path, *, for_table: bool) -> None:
+        self.processes = processes
+        self.staff_members = staff_members
+        self.builds = builds
+        self.ticks_per_second = os.sysconf("SC_CLK_TCK")
+        self.boot_now = time.clock_gettime(time.CLOCK_BOOTTIME)
+        self.groups: dict[int, Path | None] = {}
+        self.for_table = for_table
+        self.commands: dict[int, tuple[str, ...]] = {}
+        self.native_sessions: dict[int, str | OutsideThreadHost | OutsideIdentityUnreadable] = {}
+        self.herdr_pids: set[int] = set()
+        self.codex_environments: dict[int, dict[str, str] | OutsideEnvironmentUnreadable] = {}
+        self.children: dict[int, list[int]] = {}
+        for pid, process in processes.items():
+            self.children.setdefault(process.parent, []).append(pid)
+        sources = [source for step in inputs.running if gate.running_has_reservation(step)
+                                and isinstance(step.measured, admission_records.MeasuredMemory)
+                                and isinstance(source := step.measured.anonymous_source, admission_records.ScopeSource)]
+        self.admitted_scopes = {source.directory for source in sources}
+        self.queued: set[int] = set()
+        waiters = (row for _, row in inputs.ordered) if for_table else ()
+        pending = [row["pid"] for row in (*inputs.reservations, *waiters)
+                   if (owner := processes.get(row["pid"])) is not None and owner.start == row["start_time"]]
+        pending.extend(run.pid for step in inputs.running if isinstance(run := step.run, LiveBuildRun)
+                       and (process := processes.get(run.pid)) is not None and not process.zombie
+                       and process.start == run.start_time)
+        self.queue_ancestors: set[int] = set()
+        if for_table:
+            scope_pids = {pid for source in sources for pid in source.members if pid in processes
+                          and (group := self.group(pid)) is not None and group.is_relative_to(source.directory)}
+            self.queue_ancestors = {ancestor for pid in (*pending, *scope_pids) for ancestor in self.ancestors(pid)}
+        while pending:
+            pid = pending.pop()
+            if pid not in self.queued:
+                self.queued.add(pid)
+                pending.extend(self.children.get(pid, ()))
+
+    def scope_commands(self, scope: Path, pids: Iterable[int]) -> dict[int, tuple[str, ...]]:
+        """Read arguments for live candidates in this scope."""
+        commands: dict[int, tuple[str, ...]] = {}
+        for pid in pids:
+            group = self.group(pid)
+            if group is not None and group.is_relative_to(scope) and not self.processes[pid].zombie:
+                commands[pid] = self.command(pid)
+        return commands
+
+    def command(self, pid: int) -> tuple[str, ...]:
+        if pid not in self.commands:
+            self.commands[pid] = outside_command_line(pid)
+        return self.commands[pid]
+
+    @cached_property
+    def claude_sessions(self) -> dict[tuple[int, str], str]:
+        return {(record["pid"], start): record["sessionId"] for entry in sessions.read_registry().entries
+                if (start := (record := entry.record).get("procStart"))}
+
+    @cached_property
+    def herdr_places(self) -> herdr.HerdrProcessPlacements:
+        return herdr.herdr_places({pid for pid in self.herdr_pids
+                                  if isinstance(environment := self.codex_environment(pid), dict)
+                                  and environment.get("HERDR_PANE_ID") and not environment.get("TMUX_PANE")})
+
+    def codex_environment(self, pid: int) -> dict[str, str] | OutsideEnvironmentUnreadable:
+        if pid not in self.codex_environments:
+            try:
+                self.codex_environments[pid] = herdr.process_environment(pid)
+            except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError):
+                self.codex_environments[pid] = OutsideEnvironmentUnreadable()
+        return self.codex_environments[pid]
+
+    def codex_session(self, pid: int) -> str | OutsideIdentityUnreadable:
+        try:
+            environment = self.codex_environment(pid)
+            if isinstance(environment, OutsideEnvironmentUnreadable):
+                return OutsideIdentityUnreadable()
+            if environment.get("HERDR_PANE_ID") and not environment.get("TMUX_PANE"):
+                place = self.herdr_places.get(pid)
+            else:
+                place = herdr.process_placement(pid, environment=environment)
+            if isinstance(place, herdr.NotInHerdr):
+                return herdr.codex_resume_thread(pid)
+            if not isinstance(place, herdr.HerdrPlace):
+                return OutsideIdentityUnreadable()
+            client = herdr.Herdr(place.session)
+            info = herdr.json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
+                                     "Codex pane process info")
+            owner = herdr.pane_foreground(place, info)
+            if not isinstance(owner, herdr.ProvedCodexForeground) or owner.pid != pid:
+                return OutsideIdentityUnreadable()
+            pane = herdr.json_object(client.result("pane", "get", place.pane).get("pane"), "Codex pane")
+            native = herdr.read_foreground_pane_owner(owner, {**pane, "pane_id": place.pane})
+            return native.current_identity if native.started == self.processes[pid].start else OutsideIdentityUnreadable()
+        except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError):
+            return OutsideIdentityUnreadable()
+
+    def read_native_session(self, pid: int, command: tuple[str, ...]) -> str | OutsideThreadHost | OutsideIdentityUnreadable:
+        if is_claude_process(command):
+            native = self.claude_sessions.get((pid, self.processes[pid].start), "")
+        elif staff_sources.codex_thread_host(list(command)):
+            process = self.current_process(pid)
+            return OutsideThreadHost() if process is not None and not process.zombie else OutsideIdentityUnreadable()
+        else:
+            native = self.codex_session(pid)
+        if isinstance(native, OutsideIdentityUnreadable) or not native:
+            return OutsideIdentityUnreadable()
+        process = self.current_process(pid)
+        return native if process is not None and not process.zombie else OutsideIdentityUnreadable()
+
+    def parent_first(self, pids: set[int]) -> Iterable[int]:
+        """Visit each candidate after its candidate ancestors."""
+        visited: set[int] = set()
+        for member in sorted(pids, reverse=True):
+            branch: list[int] = []
+            for pid in self.ancestors(member):
+                if pid in visited:
+                    break
+                visited.add(pid)
+                if pid in pids:
+                    branch.append(pid)
+            yield from reversed(branch)
+
+    def ancestors(self, pid: int) -> Iterable[int]:
+        visited: set[int] = set()
+        while (process := self.processes.get(pid)) is not None and pid not in visited:
+            visited.add(pid)
+            yield pid
+            parent = self.processes.get(process.parent)
+            if parent is None or int(parent.start) > int(process.start):
+                break
+            pid = process.parent
+
+    def agent_owner(self, pid: int) -> staff.StaffRow | None:
+        for ancestor in self.ancestors(pid):
+            if ancestor == pid or not is_agent_command(command := self.command(ancestor)):
+                continue
+            if ancestor not in self.native_sessions:
+                self.native_sessions[ancestor] = self.read_native_session(ancestor, command)
+            native = self.native_sessions[ancestor]
+            if isinstance(native, OutsideThreadHost):
+                continue
+            if isinstance(native, OutsideIdentityUnreadable):
+                return None
+            if (owner := self.staff_members.members.by_current_session(native)) is not None:
+                return owner
+        return None
+
+    def group(self, pid: int) -> Path | None:
+        if pid not in self.groups:
+            self.groups[pid] = outside_process_group(pid)
+        return self.groups[pid]
+
+    def command_tree(self, pid: int, launchers: set[int], seen: set[int]) -> list[int]:
+        """Keep descendants outside the builds slice. Stop at an agent or launcher."""
+        tree: list[int] = []
+        pending = [pid]
+        while pending:
+            child = pending.pop()
+            if child in seen or child in launchers:
+                continue
+            if child != pid:
+                group = self.group(child)
+                if group is not None and group.is_relative_to(self.builds):
+                    continue
+                command = self.command(child)
+                if is_agent_command(command) or is_session_launcher(command):
+                    continue
+            seen.add(child)
+            tree.append(child)
+            pending.extend(pid for pid in self.children.get(child, ())
+                           if int(self.processes[child].start) <= int(self.processes[pid].start))
+        return tree
+
+    def current_process(self, pid: int) -> OutsideProcess | None:
+        process = read_outside_process(pid)
+        return process if process is not None and process.start == self.processes[pid].start else None
+
+    def command_row(self, pid: int, command: tuple[str, ...], seconds: float,
+                    sample: float, *, over_limit: bool) -> OutsideCommand:
+        process = self.processes[pid]
+        script = command_script(command)
+        label = (public_queue_text(Path(script or command[0]).name) or "Unknown command")[:80]
+        row: OutsideQueueProcess = {"pid": pid, "start_time": process.start, "unit": "",
+            "owner": "", "command": label, "cpu_seconds": seconds,
+            "age_seconds": max(0.0, self.boot_now - int(process.start) / self.ticks_per_second), "current_cpu": None}
+        return OutsideCommand(row, sample, over_limit)
+
+    def find_owners(self, rows: list[OutsideCommand]) -> None:
+        """Collect the Codex candidates before reading their shared Herdr placement."""
+        over_limit = [command.row["pid"] for command in rows if command.over_limit]
+        ancestors = {ancestor for pid in over_limit for ancestor in self.ancestors(pid) if ancestor != pid}
+        self.herdr_pids.update(pid for pid in ancestors if is_codex_agent(argv := self.command(pid))
+                               and not staff_sources.codex_thread_host(list(argv)))
+        for index, command in enumerate(rows):
+            row = command.row
+            pid = row["pid"]
+            if not command.over_limit or (caller := self.agent_owner(pid)) is None:
+                continue
+            if (owner := self.staff_members.fixed_owner_labels(caller.id)) is not None:
+                row["unit"] = staff_unit(owner)
+                row["owner"] = public_queue_text(owner.session)
+            if self.for_table and pid > 1:
+                row["kill_ref"] = kill_action.OutsideKillCandidate(pid, row["start_time"], row["command"]).reference
+            rows[index] = replace(command, caller=caller)
+
+    def has_queue_work(self, pids: Iterable[int], scopes: set[Path]) -> bool:
+        return any(pid in self.queued or pid in self.queue_ancestors or (
+            bool(scopes) and (group := self.group(pid)) is not None
+            and any(group.is_relative_to(scope) for scope in scopes)) for pid in pids)
+
+
+def outside_scope_pids(scope: Path, processes: Mapping[int, OutsideProcess]) -> set[int]:
+    try:
+        return gate.scope_members(scope).intersection(processes)
+    except (OSError, ValueError):
+        return set()
+
+
+def is_session_launcher(command: tuple[str, ...]) -> bool:
+    return bool(command) and Path(command_script(command) or command[0]).name == "relaunch.py"
+
+
+def is_outside_tree_wrapper(command: tuple[str, ...]) -> bool:
+    return not command or (
+        Path(command[0]).name.lstrip("-") in SHELLS and not command_script(("sh", *command[1:])))
+
+
+def outside_agent_rows(scopes: Iterable[Path], scan: OutsideQueueScan, limit: float) -> list[OutsideCommand]:
+    """Measure command trees below agents and session launchers."""
+    rows: list[OutsideCommand] = []
+    commands = {pid: command for scope in scopes
+                for pid, command in scan.scope_commands(scope, outside_scope_pids(scope, scan.processes)).items()}
+    agents = {pid for pid, command in commands.items() if is_agent_command(command)}
+    launchers = {ancestor for pid in agents for ancestor in scan.ancestors(pid)}
+    launchers.update(pid for pid, command in commands.items() if is_session_launcher(command))
+    allowed = {pid for pid, command in commands.items() if command and pid not in launchers}
+    seen: set[int] = set()
+    for pid in scan.parent_first(allowed):
+        if pid in seen or is_outside_tree_wrapper(commands[pid]):
+            continue
+        tree = scan.command_tree(pid, launchers, seen)
+        if scan.has_queue_work(tree, scan.admitted_scopes):
+            continue
+        root_process = scan.current_process(pid)
+        if root_process is None or root_process.zombie:
+            continue
+        # Read the root first so a child it reaps during the scan cannot count twice.
+        members = {pid}
+        live = root_process.ticks
+        limit_ticks = live + root_process.reaped_ticks
+        for child in tree[1:]:
+            member = scan.current_process(child)
+            if (member is not None and member.parent in members
+                    and int(scan.processes[member.parent].start) <= int(member.start)):
+                members.add(child)
+                limit_ticks += member.ticks + member.reaped_ticks
+                if not member.zombie:
+                    live += member.ticks
+        seconds = (live + root_process.reaped_ticks) / scan.ticks_per_second
+        over_limit = limit_ticks / scan.ticks_per_second > limit
+        rows.append(scan.command_row(pid, commands[pid], seconds, live / scan.ticks_per_second,
+                                     over_limit=over_limit))
+    return rows
+
+
+def detached_cpu_seconds(scope: Path) -> float:
+    """Read the CPU time charged to the detached scope."""
+    stat = scope / "cpu.stat"
+    gate.check_memory_reading(stat)
+    try:
+        for line in stat.read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key == "usage_usec":
+                return int(value) / 1_000_000
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
+def outside_detached_row(scope: Path, scan: OutsideQueueScan, limit: float) -> OutsideCommand | None:
+    # Only CPU charged to the detached scope counts, even when a child has its own build scope.
+    seconds = detached_cpu_seconds(scope)
+    pids = outside_scope_pids(scope, scan.processes)
+    if any(scope.is_relative_to(admitted) for admitted in scan.admitted_scopes):
+        return None
+    nested = {admitted for admitted in scan.admitted_scopes if admitted.is_relative_to(scope)}
+    if scan.has_queue_work(pids, nested):
+        return None
+    commands = scan.scope_commands(scope, pids)
+    if any(is_agent_command(command) or is_session_launcher(command) for command in commands.values()):
+        return None
+    for pid in sorted(commands, key=lambda item: (scan.processes[item].parent in pids, int(scan.processes[item].start))):
+        if (not is_outside_tree_wrapper(commands[pid])
+                and (process := scan.current_process(pid)) is not None and not process.zombie):
+            return scan.command_row(pid, commands[pid], seconds, seconds, over_limit=seconds > limit)
+    return None
+
+
+def detached_command_scope(scope: Path) -> bool:
+    """Match the launcher's command scope to its run slice."""
+    match = re.fullmatch(r"detached-(?:detect|python-tests|other)-([0-9]{8}T[0-9]{6}-[0-9]+-[0-9a-f]{4})\.scope",
+                         scope.name)
+    return match is not None and scope.parent.name == f"builds-detached-{match[1].replace('-', '')}.slice"
+
+
+def outside_commands(inputs: admission_records.QueueInputs, staff_members: FeedStaff, limit: float, *,
+                     for_table: bool) -> list[OutsideCommand]:
+    """Measure command trees in agent scopes and CPU use in detached scopes."""
+    agents = gate.user_manager_cgroup() / "app.slice" / "app-agents.slice"
+    builds = gate.builds_slice_cgroup()
+    detached = builds / "builds-detached.slice"
+    agent_scopes = sorted(path for path in tool_group_children(agents) if path.suffix == ".scope")
+    detached_groups = tool_group_children(detached)
+    detached_scopes = [path for path in detached_groups if path.suffix == ".scope"]
+    detached_scopes.extend(scope for run in detached_groups if run.suffix == ".slice"
+                           for scope in tool_group_children(run) if detached_command_scope(scope))
+    if not agent_scopes and not detached_scopes:
+        return []
+    try:
+        processes = outside_process_table()
+    except OSError:
+        return []
+    scan = OutsideQueueScan(inputs, processes, staff_members, builds, for_table=for_table)
+    rows = outside_agent_rows(agent_scopes, scan, limit)
+    rows.extend(row for scope in sorted(detached_scopes) if (row := outside_detached_row(scope, scan, limit)) is not None)
+    scan.find_owners(rows)
+    return rows
+
+
+def outside_queue_processes(inputs: admission_records.QueueInputs, staff_members: FeedStaff,
+                            cpu: OutsideCpuReadings | None = None, *, sampled_at: float | None = None,
+                            for_table: bool = False) -> list[OutsideQueueProcess]:
+    limit = direct_test_time_limit_seconds()
+    commands = outside_commands(inputs, staff_members, limit, for_table=for_table) if limit is not None else []
+    if cpu is not None:
+        cpu.update(commands, time.monotonic() if sampled_at is None else sampled_at)
+    rows = [command.row for command in commands if command.over_limit]
+    return sorted(rows, key=lambda row: (-row["cpu_seconds"], row["pid"]))
+
+
+def live_outside_kill_targets() -> dict[str, kill_action.OutsideKillTarget]:
+    """Read the current outside rows and their registered owners."""
+    limit = direct_test_time_limit_seconds()
+    if limit is None or host_name() != "natedev":
+        return {}
+    reading = admission_client.view()
+    members = staff.snapshot()
+    commands = outside_commands(outside_queue_inputs(reading), FeedStaff(members), limit, for_table=True)
+    targets: dict[str, kill_action.OutsideKillTarget] = {}
+    for command in commands:
+        row, caller = command.row, command.caller
+        if "kill_ref" not in row or caller is None:
+            continue
+        candidate = kill_action.OutsideKillCandidate(row["pid"], row["start_time"], row["command"])
+        route = kill_action.outside_stop_route(candidate, caller.id)
+        if not isinstance(route, kill_action.NoStopRoute):
+            targets[candidate.reference] = kill_action.OutsideKillTarget(
+                candidate, route, *kill_action.notice_recipient(members, caller))
+    return targets
+
+
+def outside_queue_inputs(reading: admission_records.QueueRead) -> admission_records.QueueInputs:
+    """Include the published waiters and reservations granted after the admission pass."""
+    explanation = reading.explanation
+    inputs = explanation.decided_from
+    occupancy = explanation.local_occupancy
+    return replace(inputs, ordered=(*inputs.ordered, *reading.ordered),
+                   reservations=occupancy.reservations if occupancy is not None else inputs.reservations)
+
+
 class ToolGroupKind(Enum):
     PYTHON_TESTS = auto()
     OTHER = auto()
@@ -2725,6 +3333,11 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
         elif (isinstance(memory, admission_records.UnownedSliceMemory) and memory.cgroup
               and not memory.diagnostic and not gate.detached_tool_memory(memory, builds)):
             path = Path(memory.cgroup)
+            if not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice):
+                excluded.add(path)
+                if path.is_relative_to(builds):
+                    named_inside += gate.ci_cap_use((memory,))
+                continue
         else:
             continue
         try:
@@ -2738,9 +3351,8 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
             jobs = sum(job.use.bytes for job in memory.jobs if isinstance(job.use, admission_records.AnonymousRunUse))
             amount = max(0, amount - jobs)
             sccache += amount
-        elif (not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)
-              or entry.step.step == SWAP_NAMES["between"]):
-            # A CI service counts in hana CI, and a run between steps counts in its queued hold.
+        elif entry.step.step == SWAP_NAMES["between"]:
+            # The queued hold counts the run between steps.
             excluded.add(path)
         elif isinstance(memory.activity, ScopeProcesses) and memory.activity.program == RUST_ANALYZER:
             rust_analyzer += amount
@@ -2778,10 +3390,10 @@ def known_bytes(value: RamReading) -> int:
 
 
 def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_time: float,
-               program_rows: int) -> RamBlocks:
+               program_rows: int, ci_services: Sequence[CIRunnerServiceRam] = ()) -> RamBlocks:
     """Give each bar block one amount: covered reserves, program RAM, the kernel, the cache and the rest.
 
-    Build tools, queued builds, CI, reserved memory and free memory add to the queue cap.
+    Build tools, queued builds, reserved memory and free memory add to the queue cap.
     """
     available, safety, swap, build = room.available, room.safety, room.agent_swap_demand, room.kept
     safety_covered = min(safety, available)
@@ -2795,10 +3407,12 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
                     key=lambda item: item[1], reverse=True)
     smaller = ranked[program_rows:]
     other_programs_bytes = sum(amount for _, amount in ranked)
-    build_tools = tools.rust_analyzer + tools.sccache + tools.python_tests + tools.waiting_runs + tools.other
+    service_shares, unassigned_ci = ci_service_shares(ci_services, room.ci_use)
+    other_tools = tools.other + unassigned_ci
+    build_tools = tools.rust_analyzer + tools.sccache + tools.python_tests + tools.waiting_runs + tools.other + room.ci_use
     total: RamReading = (room.total if isinstance(room.total, int)
                          else admission_records.ReadingUnavailable("total RAM is not recorded"))
-    named = (room.used + build_tools + room.ci_use + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
+    named = (room.used + build_tools + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
              + known_bytes(kernel.total) + known_bytes(cache))
     unattributed = total - available - named if isinstance(total, int) else 0
     readings = ((RAM_NAMES["agents"], agents), (RAM_NAMES["desktop"], desktop),
@@ -2815,8 +3429,8 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
         "build_missing_bytes": build - build_covered,
         "queued_builds_bytes": room.used, "build_tools_bytes": build_tools, "rust_analyzer_bytes": tools.rust_analyzer,
         "sccache_bytes": tools.sccache, "python_tests_bytes": tools.python_tests, "waiting_runs_bytes": tools.waiting_runs,
-        "other_build_tools_bytes": tools.other, "ci_bytes": room.ci_use,
-        "cap_bytes": room.used + build_tools + room.ci_use + build_covered + room.room,
+        "other_build_tools_bytes": other_tools, "ci_services": service_shares,
+        "cap_bytes": room.used + build_tools + build_covered + room.room,
         "agents_bytes": agents, "desktop_bytes": desktop, "desktop_protection_bytes": gate.desktop_guarantee(),
         "programs": [{"id": name.lower(), "name": name, "bytes": amount} for name, amount in ranked[:program_rows]],
         "other_programs_bytes": other_programs_bytes,
@@ -2883,14 +3497,22 @@ def move_progress(directory: Path) -> person_actions.BumpProgress:
 def move_fields(move: person_actions.AppliedBump | None, members: FeedStaff, zone: tzinfo) -> MoveFields:
     if move is None:
         return {}
-    who = members.member_name(move.who) or ("user" if move.who == "user" else "name not recorded")
-    return {"last_move": {"kind": "bump", "who": who, "from_place": move.from_place,
-            "to_place": move.to_place, "at": datetime.fromtimestamp(move.at, zone).strftime("%H:%M %Z")}}
+    actor = members.members.by_member_reference(move.who) if move.who else None
+    who = actor.name if actor is not None else ("user" if move.who == "user" else "name not recorded")
+    last_move: LastMove = {"kind": "bump", "who": who, "from_place": move.from_place,
+                           "to_place": move.to_place, "at": datetime.fromtimestamp(move.at, zone).strftime("%H:%M %Z")}
+    if actor is not None:
+        last_move["who_id"] = actor.id
+    return {"last_move": last_move}
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET,
-            *, limit_source: Callable[[admission_records.QueueRead], limits_view.Background] | None = None,
+            *, program_memory: program_memory_feed.ProgramMemoryFeed | None = None,
+            ci_history: CIRunnerHistory | None = None,
+            outside_cpu: OutsideCpuReadings | None = None,
+            outside_sampled_at: float | None = None,
+            limit_source: Callable[[admission_records.QueueRead], limits_view.Background] | None = None,
             mac_source: Callable[[target_availability.Snapshots], limits_view.MacReading | None] | None = None) -> MemoryPage:
     started = time.perf_counter()
     if isinstance(configuration, conf.UseConfiguredValue):
@@ -2910,11 +3532,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     snapshots = target_availability.read_snapshots()
     mac = mac_source(snapshots) if mac_source is not None else None
     mac_sessions = [claim.working_session for claim in mac.claims if claim.working_session] if mac else []
-    slot_roots = conf.read_or_repository("build_folders").values()
     mac_reading = queue_view.read_mac_builds()
     mac_machine = conf.read_or_repository("machines").words("mac.hosts")[0]
     machine = host_name()
-    slot_homes = {mac_machine: mac_reading.home, machine: str(Path.home())}
+    run_homes = {mac_machine: mac_reading.home, machine: str(Path.home())}
     with staff.supplied_snapshot(staff_display.members):
         labels = unit_labels.unit_labels_for(
             [*(step.session_id for step in (*parsed.view.running, *parsed.view.waiting)),
@@ -2927,14 +3548,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     moves_by_key = {move.step_key: move for move in moves.values()}
     moves_by_waiter = {(move.owner.pid, move.owner.start_time, move.since): move for move in moves.values()}
     routes = target_availability.MacRoutes(snapshots, labels, zone)
-    ci_rows: dict[str, RunRow] = {}
-    for entry in explanation.running:
-        memory = entry.step.measured
-        if isinstance(memory, admission_records.UnownedSliceMemory) and not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice):
-            ci_rows[memory.cgroup] = build_ci_row(gib(memory.bytes), explanation.now,
-                Path(memory.cgroup) if memory.cgroup else CI_CGROUP,
-                admitted=isinstance(admission_records.recorded_service_state(memory), RunningServiceJob), names=names)
-    ci_runners = frozenset(runner["name"] for row in ci_rows.values() for runner in row.get("ci_runners", []))
+    ci_readings = gate.ci_readings(entry.step.measured for entry in explanation.running)
+    ci_units = ci_runner_units(ci_readings)
+    ci_runners = frozenset(ci_runner_name(unit) for unit in ci_units)
     process_starts = {row["pid"]: row["start_time"] for row in explanation.decided_from.reservations}
     process_starts.update((row["pid"], row["start_time"]) for _, row in parsed.ordered)
 
@@ -2979,22 +3595,30 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         leftovers.append({"owner": owner, "age": queue_view.leftover_age(age(activity.started_at, explanation.now))
                           if activity.started_at else "not recorded", "used": gib(memory.bytes), "members": scope_members})
     tokens = token_pool(captured.available, configuration.stevie_program)
-    token_stage = token_wait_stage(tokens)
-    ram = ram_blocks(captured, build_tool_ram(explanation.running, captured.used, explanation.ordered),
-                     explanation.now, configuration.other_rows)
+    memory_paused = tokens["kind"] == "TokenPool" and tokens["paused"]
+    by_owner: dict[str, tuple[admission_records.RunningStep, admission_records.Reservation]] = {}
+    steps_by_owner: dict[str, list[admission_records.RunningStep]] = {}
+    trace_reservations: program_memory_feed.ReservationsByOwner = {}
+    reserved_steps = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
+    reservations = tuple(zip(explanation.decided_from.reservations, reserved_steps, strict=True))
+    for reservation, entry in reservations:
+        owner = gate.reservation_owner(reservation, entry.step)
+        by_owner[owner] = entry.step, reservation
+        steps_by_owner.setdefault(owner, []).append(entry.step)
+        if program_memory is not None:
+            trace_reservations.setdefault(owner, []).append((reservation, entry))
+    ci_owners = external_ci_owners(ci_readings, by_owner, gate.builds_slice_cgroup())
+    queued_ci = sum(hold.memory.use.bytes for hold in captured.runs if hold.memory.owner in ci_owners
+                    and isinstance(hold.memory.use, admission_records.AnonymousRunUse))
+    ci_services = ci_runner_service_ram(ci_units, reservations, ci_history)
+    tools = build_tool_ram(explanation.running, captured.used - queued_ci, explanation.ordered)
+    ram = ram_blocks(captured, tools, explanation.now, configuration.other_rows, ci_services)
     cap = gib(ram["cap_bytes"]) if isinstance(captured.cap, int) else captured.cap
     safety = gib(captured.safety)
     used = gib(captured.used)
     total = gib(host.total) if isinstance(host.total, int) else used + gib(captured.available)
     reserved = gib(sum(run.bytes for run in captured.runs))
-    ci_ram, ci_name = gib(captured.ci_use), "hana CI"
-    by_owner: dict[str, tuple[admission_records.RunningStep, admission_records.Reservation]] = {}
-    steps_by_owner: dict[str, list[admission_records.RunningStep]] = {}
-    reserved_steps = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
-    for reservation, entry in zip(explanation.decided_from.reservations, reserved_steps, strict=True):
-        owner = gate.reservation_owner(reservation, entry.step)
-        by_owner[owner] = entry.step, reservation
-        steps_by_owner.setdefault(owner, []).append(entry.step)
+    trace_rows: list[tuple[str, float]] = []
     held_slots = {admission_records.run_owner(slot.run.pid, slot.run.start_time): slot
                   for slot in sorted((gate.between_steps(state) for state in explanation.decided_from.slots
                                       if gate.slot_in_force(state, explanation.now)),
@@ -3013,15 +3637,16 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             if isinstance(slot.identity.job, StepJob):
                 job = slot.identity.job
             labels_for_slot = members.ended_step_labels(slot.identity)
-            title_step = ended_step_name(slot.identity, names)
-            if isinstance(title_step, NoNamedStep):
-                continue
             caller = codec.resolve_queue_caller(stored_caller=slot.identity.caller_name,
                                                 staff_caller=labels_for_slot.session)
+            title_step = ended_step_name(slot.identity, names, caller)
+            if isinstance(title_step, NoNamedStep):
+                continue
             owner = StepPageOwner(labels_for_slot, caller,
                                   unit=staff_unit(labels_for_slot))
             display_name = title_step
-            parts: list[staff_names.NamePart] = []
+            parts = (staff_names.text_parts(staff_names.StaffReference(owner.unit))
+                     if isinstance(owner.unit, StaffUnitName) and owner.unit == display_name else [])
             move = None
         else:
             step, reservation = running
@@ -3044,24 +3669,33 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         pid = (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid) if step is not None else (
             run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
         row_labels = queue_row_labels(title_step, display_name, unit=owner.unit, ci_label=ci_label, caller=owner.caller)
+        step_host = admission_records.execution_host(step, machine) if step is not None else machine
+        step_home = run_homes.get(step_host, "")
         walk.append({**row_labels, **move_fields(move, members, zone),
                      "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                      **owner.fields(ci_label=ci_label), "between_steps": step is None,
                      "state": "", "pid": pid, "detail": detail, "used": use,
-                     **(build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
-                        home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))
-                        if step is not None else SlotPlace()),
+                     "run_folder": run_folder(step.folder, step_home) if step is not None else RunFolderNotReported(),
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": step.started_at if step is not None else 0,
-                     "progress": row_progress(steps_by_owner.get(hold.memory.owner, ()), token_stage),
-                     "queued": True, "keep_text": "", "group": "", "ci": False, "parts": [],
+                     "progress": row_progress(steps_by_owner.get(hold.memory.owner, ()),
+                                              progress.TOKEN_WAIT_REASON, memory_paused=memory_paused),
+                     "queued": True, "keep_text": "", "group": "", "parts": [],
                      "need": gib(hold.memory.need), "need_part": need_in_next_part(steps_by_owner.get(hold.memory.owner, ())),
                      **(step_target_notes(step, routes)
                         if step is not None and not ci_label else NO_TARGET_NOTES),
                      **(local_call_notes(step) if step is not None else CallNotes()),
-                     **(job_notes(job, names, step=step.step, verify=step.verify,
-                                  ci=bool(ci_label))
+                     **(job_notes(job, names, step=step.step, verify=step.verify, ci=bool(ci_label))
                         if step is not None else job_notes(job, names, kind="between-steps"))})
+        if running is not None:
+            stop_candidate = kill_action.candidate(*running, machine, ci=bool(ci_label))
+            if isinstance(stop_candidate, kill_action.KillCandidate):
+                walk[-1]["kill_ref"] = stop_candidate.reference
+        if program_memory is not None:
+            trace_rows.append((hold.memory.owner, walk[-1]["started_at"]))
+    if program_memory is not None:
+        for index, view in program_memory.views(trace_rows, trace_reservations, explanation.now, host_name()):
+            walk[index]["program_memory"] = view
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
     guest_placements: set[str] = set()
@@ -3095,6 +3729,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             if isinstance(named, NoNamedStep):
                 continue
             remote_groups.add(key)
+            evidence = step.execution
+            folder = RunFolderNotReported()
+            if (guest and isinstance(evidence, execution_identity.ObservedExecution)
+                    and isinstance(execution := evidence.identity, execution_identity.GuestExecution)
+                    and execution.attempt == guest.attempt):
+                folder = run_folder(execution.folder, execution.home)
             remote_row: RunRow = {**queue_row_labels(named.title, named.name, unit=owner.unit, caller=owner.caller),
                 "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                 **owner.fields(),
@@ -3103,14 +3743,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                 "progress": (cloud_row_progress(step.counter) if guest_gate
                              else row_progress((step,), progress.TOKEN_WAIT_REASON)),
-                "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
+                "queued": False, "keep_text": memory.reason, "group": "", "parts": [],
                 "machine": MAC_LINUX_TARGET if guest_gate else admission_records.execution_host(step, machine),
                 "vcpus": step.guest_vcpus if guest and step.guest_vcpus is not None else queue_view.UnknownCpuCount(),
                 **call_notes(step.verify, step.step),
                 **job_notes(job, names, step=step.step, verify=step.verify,
-                            ci=step.unit in ci_runners),
-                **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
-                    home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
+                            ci=step.unit in ci_runners)}
+            if step.step != HAND_MADE.step or step.assignment_target != MAC_LINUX_TARGET:
+                remote_row["run_folder"] = folder
             if placed := gate_placement_notes(step):
                 remote_row["runs_on"] = placed["runs_on"]
                 remote_row["targets"] = placed["targets"]
@@ -3134,21 +3774,16 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 remote_row["guest_unconfirmed"] = "starting" if published.written_at < deadline else "not confirmed"
             walk.append(remote_row)
             continue
-        service = (isinstance(memory, admission_records.CompilerServiceMemory)
-                   or not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice) or bool(memory.diagnostic))
-        if service:
-            name = memory.owner if isinstance(memory, admission_records.UnownedSliceMemory) else "compiler cache"
-            activity = service_activity_text(memory, explanation.now)
-            state = activity
-            detail = activity if isinstance(memory, admission_records.UnownedSliceMemory) else "sccache.service · " + activity
-            if isinstance(memory, admission_records.UnownedSliceMemory):
-                description = memory.diagnostic
-            else:
-                description = "Memory the compiler cache holds. The queue does not start it."
-        else:
+        if isinstance(memory, admission_records.UnownedSliceMemory):
+            if not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice) or memory.diagnostic:
+                continue
             description = "Memory these processes hold. The queue did not start them."
-            if isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses):
+            if isinstance(memory.activity, ScopeProcesses):
                 name = leftover_program(step.pid, memory.activity.program)
+        else:
+            state = service_activity_text(memory, explanation.now)
+            detail = f"sccache.service · {state}"
+            description = "Memory the compiler cache holds. The queue does not start it."
         if isinstance(memory, admission_records.CompilerServiceMemory):
             cache_name = QueueRowName.fixed(QueueKind.COMPILER_CACHE)
             row_labels = queue_row_labels(cache_name, cache_name)
@@ -3160,15 +3795,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                        "showrunner": "", "unit": "", "state": state, "pid": (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid), "detail": detail, "used": gib(memory.bytes),
                        "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                        "age": queue_view.leftover_age(age(step.started_at, explanation.now)) if step.started_at else "not recorded",
-                       "progress": row_progress((step,), token_stage),
-                       "queued": False, "keep_text": description, "group": "", "ci": False, "parts": []}
-        if service and isinstance(memory, admission_records.UnownedSliceMemory):
-            row = ci_rows[memory.cgroup] if memory.cgroup in ci_rows else build_ci_row(gib(memory.bytes), explanation.now,
-                               Path(memory.cgroup) if memory.cgroup else CI_CGROUP,
-                               admitted=isinstance(admission_records.recorded_service_state(memory), RunningServiceJob), names=names)
-            if memory.diagnostic:
-                row["keep_text"] += "\n" + memory.diagnostic
-        if not service and isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
+                       "progress": row_progress((step,), progress.TOKEN_WAIT_REASON, memory_paused=memory_paused),
+                       "queued": False, "keep_text": description, "group": "", "parts": []}
+        if (isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses)
+                and memory.bytes < GIB // 2):
             program = row["name"]
             group = "Codex servers" if program in ("codex", "codex-real") else "unowned processes"
             row["detail"] = " · ".join(part for part in (detail, program) if part)
@@ -3187,7 +3817,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "used": amount, "counted": 0.0, "reserved": 0.0, "started_at": 0,
                      "queued": False, "keep_text": "Memory these processes hold. The queue did not start them.",
                      "progress": {"kind": "NoProgress", "reason": "group has no admission counter"},
-                     "group": name, "ci": False, "parts": [{"who": row["detail"].removeprefix("owner not recorded · "),
+                     "group": name, "parts": [{"who": row["detail"],
                          "who_parts": row.get("detail_parts", staff_names.text_parts(row["detail"])), "pid": row["pid"],
                          "gib": row["used"], "age": row.get("age", ""), "started_at": row["started_at"]}
                          for row in sorted(group_members, key=lambda row: gib(row["used"]), reverse=True)
@@ -3198,7 +3828,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         _ = row.setdefault("vcpus", vcpus if vcpus is not None else queue_view.UnknownCpuCount())
     # steve serves natedev builds; CI uses its own pool, and remote rows use no natedev tokens.
     token_rows = {row["pid"]: row for row in walk
-                  if row.get("machine") == machine and not row["ci"] and isinstance(row["pid"], int)}
+                  if row.get("machine") == machine and isinstance(row["pid"], int)}
     if isinstance(holders, TokenHolders):
         counts = tokens_by_run(holders, set(token_rows))
         # steve lists each connected process, including holders of zero tokens.
@@ -3282,11 +3912,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                                 else wait_why(waiter.reason),
                         **local_call_notes(waiter),
                         **notes,
-                        # A waiting step names its slot, so the Disks page names the slot's work as this row does.
-                        **slot_place(build_slot_number(waiter.folder, host_name(), slot_roots, home=slot_homes[host_name()]),
-                                     waiter.folder, host_name()),
-                        **job_notes(job, names, step=waiter.step, verify=waiter.verify,
-                                    ci=bool(ci_label))}
+                        **job_notes(job, names, step=waiter.step, verify=waiter.verify, ci=bool(ci_label))}
         if waiter.speculative_copy:
             waiters[place]["order_note"] = "Newest eligible copy starts first"
         elif waiter.took_place:
@@ -3308,17 +3934,28 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         with staff.supplied_snapshot(staff_display.members):
             mac_units = mac_build_units(mac_reading.builds, target_availability.mac_claims(snapshots))
         mac_steps = {step.mac_placement: step for step in parsed.view.running if step.mac_placement}
+        call_ids = {build.pid: call_id for build in mac_reading.builds
+                    if build.origin is not queue_view.MacBuildOrigin.CI and build.gate_placement not in mac_steps
+                    and (call_id := mac_verify_call_id(build))}
+        verify_sources = mac_verify_sources(set(call_ids.values()))
         for build in mac_reading.builds:
             if build.gate_label is queue_view.MacGateLabel.PLACEMENT and build.gate_placement in guest_placements:
                 continue
-            current = members.labels_for(build.session, mac_machine, Path(build.folder))
-            claim = mac_units.get(build.pid)
-            identity = current if current is not None and public_owner_name(current.owner_text, build.session) else (
-                claim or current or unit_labels.UnitLabels(""))
             placed = mac_steps.get(build.gate_placement) if build.gate_label is queue_view.MacGateLabel.PLACEMENT else None
-            mac_row: MacBuildRow = mac_work_row(build, mac_reading, identity, names=names, slot_roots=slot_roots,
-                                   slot_machine=mac_machine, placed_step=placed,
-                                   launcher=mac_launcher_name(build, members))
+            source = MacBuildSource(placed.folder, placed.session_id, machine) if placed is not None else (
+                verify_sources.get(call_ids.get(build.pid, "")))
+            verify_source_missing = source is None and build.pid in call_ids
+            if source is not None:
+                identity = members.labels_for(source.session, source.host or machine, Path(source.folder)) or unit_labels.UnitLabels("")
+            elif verify_source_missing:
+                identity = unit_labels.UnitLabels("")
+            else:
+                current = members.labels_for(build.session, mac_machine, Path(build.folder))
+                identity = current if current is not None and public_owner_name(current.owner_text, build.session) else (
+                    mac_units.get(build.pid) or current or unit_labels.UnitLabels(""))
+            mac_row: MacBuildRow = mac_work_row(build, mac_reading, identity, names=names, placed_step=placed,
+                                   source_folder=source.folder if source is not None else "",
+                                   verify_source_missing=verify_source_missing)
             if placed is not None:
                 mac_row = {**mac_row, **move_fields(moves.get(placed.mac_placement.partition("/")[0]), members, zone)}
             work_rows.append(mac_row)
@@ -3340,9 +3977,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             information = queue_view.cloud_work(cloud, explanation.now, parsed.cloud_gate_stale_pushes, interval)
             recorded = cloud.identity
             member = members.labels_for(recorded.session_id, machine, Path(recorded.folder))
-            current = next((label for label in (
-                member, cloud_labels.get(recorded.session_id)
-            ) if label is not None and public_owner_name(label.owner_text, recorded.session_id)), None)
+            current = member
+            if current is None or not (staff_unit(current) or public_queue_text(current.owner_text)):
+                resolved = cloud_labels.get(recorded.session_id)
+                current = (resolved if resolved is not None
+                           and public_owner_name(resolved.owner_text, recorded.session_id) else None)
             unit = staff_unit(current, missing="—") if current is not None else ""
             identity = current if current is not None else unit_labels.UnitLabels(
                 recorded_caller_name(recorded.session_id, recorded.name))
@@ -3362,6 +4001,13 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             else:
                 display_name = QueueRowName.owned(who, title_step)
             parts = staff_names.row_parts(who, title_step, unit)
+            stage = cloud_stage(cloud)
+            chart_status = plain([queue_view.cloud_page_status(cloud, information)])
+            status = chart_status if isinstance(cloud.wait, wire.CloudSlotWait) else " · ".join(filter(None, (
+                information.state if information.state != "running" else "", queue_view.cloud_detail(cloud),
+                information.modules if isinstance(cloud.counter, progress.ProgressCounter) else "", chart_status)))
+            reported_stage = cloud.progress.stage if isinstance(cloud.progress, cloud_progress.CloudProgress) else ""
+            activity = reported_stage or ("testing" if isinstance(cloud.counter, progress.ProgressCounter) else information.state)
             values: CloudWorkRow = {"kind": "cloud", **queue_row_labels(title_step, display_name, unit=unit, caller=caller),
                 "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                 **page_owner_labels(identity, unit=unit, caller=caller), "pid": cloud.owner.pid,
@@ -3370,10 +4016,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                              else recorded_process_call(cloud.owner.pid, cloud.owner.start_time)),
                 "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
                 "vcpus": information.vcpus,
-                "state": information.state, "status": plain([queue_view.cloud_page_status(cloud, information)]),
-                "activity": (cloud.progress.stage if isinstance(cloud.progress, cloud_progress.CloudProgress) and cloud.progress.stage
-                             else "testing" if isinstance(cloud.counter, progress.ProgressCounter)
-                             else information.state), "failed_modules": information.failed_modules,
+                "state": information.state, "status": status, "chart_status": chart_status,
+                "activity": activity, "stage": stage,
+                "location": queue_view.cloud_location(cloud.progress)
+                    if isinstance(cloud.progress, cloud_progress.CloudProgress) else "",
+                "failed_modules": information.failed_modules,
                 "progress": cloud_row_progress(cloud.counter),
                 "stale": isinstance(information.update, queue_view.CloudUpdateLate)
                          and not isinstance(cloud.wait, wire.CloudSlotWait),
@@ -3386,30 +4033,34 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": cloud.wait.text,
                     "runs_on": CLOUD_RUNS_ON, "because": "natedev when AWS cannot start", "targets": ["aws"]}
             else:
-                work_rows.append({**values, "started_at": cloud.started_at or cloud.since})
+                work_rows.append({**values, "started_at": cloud.started_at or cloud.since,
+                                  "run_folder": RunFolderNotReported()})
         work_rows.sort(key=lambda row: row["started_at"])
     visible_waits = limits_view.visible_waits(model, {place: row["name"] for place, row in waiters.items()},
                                               {owner: row["name"] for owner, row in cloud_waiters.items()})
     waiting_rows: list[WaitRow | CloudWaitRow] = [
         named_wait for visible in visible_waits
         if (named_wait := (cloud_waiters.get(entry.owner) if isinstance(entry := visible.source, wire.CloudRow) else
-                           waiters.get(entry.position) if isinstance(entry, queue_view.WaitingBuild) else None)) is not None]
-    unmatched_priority_text = ""
+                           waiters.get(entry.position))) is not None]
     unmatched_priority_entries: list[admission_records.PriorityEntry] = []
+    unmatched_priority_lines: list[str] = []
+    unmatched_priority_text = ""
     queued_priority_units: list[str] = []
     if isinstance(explanation.priority, admission_records.QueuePriority):
-        priorities = {entry["unit"]: f"queue priority: {entry['unit']} ({entry['why']})"
-                      for entry in explanation.priority.entries}
-        queued_priority_units = list(dict.fromkeys(row["unit"] for row in waiting_rows if row["unit"] in priorities))
-        matched_units: set[str] = set()
+        entries = explanation.priority.entries
+        matched: set[int] = set()
         for work_row in (*work_rows, *waiting_rows):
-            if work_row["unit"] in priorities:
-                work_row["priority_text"] = priorities[work_row["unit"]]
-                work_row["priority_entries"] = [entry for entry in explanation.priority.entries
-                                                if entry["unit"] == work_row["unit"]]
-                matched_units.add(work_row["unit"])
-        unmatched_priority_text = "\n".join(text for unit, text in priorities.items() if unit not in matched_units)
-        unmatched_priority_entries = [entry for entry in explanation.priority.entries if entry["unit"] not in matched_units]
+            covering = [index for index, entry in enumerate(entries)
+                        if not admission_records.is_run_entry(entry) and entry["unit"] == work_row["unit"]]
+            if covering:
+                work_row["priority_lines"] = [head_facts.priority_entry_text(entries[index]) for index in covering]
+                work_row["priority_entries"] = [entries[index] for index in covering]
+                matched.update(covering)
+        queued_priority_units = list(dict.fromkeys(row["unit"] for row in waiting_rows if "priority_entries" in row))
+        unmatched_priority_entries = [entry for index, entry in enumerate(entries) if index not in matched]
+        unmatched_priority_lines = [head_facts.priority_entry_text(entry) for entry in unmatched_priority_entries]
+        unmatched_priority_text = head_facts.priority_text(
+            admission_records.QueuePriority(tuple(unmatched_priority_entries)))
     if waiting_rows:
         head_pid = waiting_rows[0]["pid"]
         if isinstance(explanation.head, admission_records.HeadExplanation):
@@ -3442,20 +4093,24 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     page: MemoryPage = {
         "colors": configuration.colors,
         "staff_names": staff_display.registry(), "unit_open": staff_display.unit_open(),
+        "role_labels": staff_display.role_labels(),
         "ok": True, "read_at": published.written_at, "fresh_until": published.fresh_until,
         "render_seconds": 0.0, "total": total, "available": gib(captured.available),
-        "cap": cap, "floor": safety, "cap_text": room_text(captured),
+        "cap": cap, "floor": safety,
+        "cap_text": f"Cap unavailable because {cap_unavailable_reason(cap)}"
+                    if isinstance(cap, admission_records.CapUnavailable) else "",
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(ram["cap_bytes"] - captured.room), "room": gib(captured.room), "room_source": "free",
         "limit": "room and head protection", "ram": ram,
         "memory_status": memory_status(explanation, captured, len(by_owner)),
-        "ci_name": ci_name, "ci_ram": ci_ram,
         "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting
             if not step.placement_targets), default=0.0),
         "pressure": pressure_label,
         "swap": {"used_bytes": swap.used, "capacity_bytes": swap.total, "builds_ci_bytes": swap.builds_ci,
                  "outside_bytes": swap.used - swap.builds_ci,
-                 "reserve_share_percent": explanation.policy.agent_swap_share_percent},
+                 "reserve_share_percent": explanation.policy.agent_swap_share_percent,
+                 "swap_in_window_bytes": captured.returning_swap, "window_seconds": host.swap_in_window_seconds},
+        "build_reserve": build_reserve_basis(captured, explanation.policy.build_reserve_share_percent),
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "held_places": [held_place_row(place, zone) for place in held_places],
         "priority_text": head_facts.priority_text(explanation.priority),
@@ -3463,6 +4118,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "bump_notices": bump_notices(admission, zone, bump_progress),
         "unmatched_priority_text": unmatched_priority_text,
         "unmatched_priority_entries": unmatched_priority_entries,
+        "unmatched_priority_lines": unmatched_priority_lines,
         "mac_idle_alert": "\n".join(text for text in (
             mac_idle.view_alert_line(time.time(), zone,
                 block=mac_idle_alert.BlockText.OMITTED if routes.blocked() else mac_idle_alert.BlockText.SHOWN) or "",
@@ -3474,6 +4130,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit},
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
+        "outside_queue": outside_queue_processes(
+            outside_queue_inputs(parsed), members, outside_cpu, sampled_at=outside_sampled_at, for_table=True),
     }
     if limit_source is not None:
         page["build_limits"] = limits_view.build_limits(parsed, snapshots, visible_waits, limit_cloud_names,
@@ -3518,6 +4176,9 @@ def main(argv: Sequence[str]) -> int:
     if args.command == "link":
         return page_link()
     configuration = read_configuration()
+    program_memory = program_memory_feed.configured_feed()
+    ci_history = CIRunnerHistory()
+    outside_cpu = OutsideCpuReadings()
     publish_page(configuration)
     target = configuration.output_folder / DATA_NAME
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
@@ -3568,6 +4229,7 @@ def main(argv: Sequence[str]) -> int:
                 # Count from after the request, so slow reads before it never shorten the interval.
                 next_tokens_at = time.monotonic() + configuration.token_dump_seconds
             payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders,
+                program_memory=program_memory, ci_history=ci_history, outside_cpu=outside_cpu, outside_sampled_at=now,
                 limit_source=limit_source, mac_source=mac_source)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:

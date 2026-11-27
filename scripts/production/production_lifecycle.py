@@ -7,9 +7,13 @@ except FileNotFoundError:
     pass
 
 import argparse
+import fcntl
 import json
-from dataclasses import replace
-from datetime import datetime
+import os
+from collections.abc import Generator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import Enum
 import re
 import subprocess
@@ -18,10 +22,10 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 
-from scripts.production import investigation, session_staff, staff, unit_config
-from scripts.agents import stop_resume
-from scripts.lib import land_main, main_publish, main_push_lock
-from scripts.herdr import worker_panes
+from scripts.production import ci_points, investigation, session_staff, staff, unit_config
+from scripts.agents import pane_record, stop_resume
+from scripts.lib import git_files, land_main, main_publish, main_push_lock, main_sync, origin_deletion
+from scripts.herdr import herdr, worker_panes
 from scripts.agents.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
@@ -30,21 +34,36 @@ from scripts.production import showrunners
 from scripts.production import showrunner_tree
 from scripts.production import tidy_wrapped
 from scripts.production import unit_lookup
-from scripts.production.production_doc import Production, Refusal, production_field, read_production
+from scripts.production.production_doc import Production, Refusal, production_field, read_production, staged_notes_directory
+from scripts.production.production_admission import (
+    canonical_document_path, capture_rollout_inventory, complete_document_rebind, prepare_document_rebind,
+    record_verified_move, require_admission, require_document_receipt,
+    require_guard_ready as require_guard_ready,
+    require_new_document as require_new_document,
+)
 from scripts.production.checkpoint_gate import Stop, report
 from scripts.production.merge_checkpoint import (
-    PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
+    PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed, VerifiedIntegrationTip,
     branch_is_landed, git, good, merged_checkpoints, promote_local_checkout, pull_mac_checkout,
 )
-from scripts.production import production_doc
-from scripts.production.update_registration import QuestionStaff, RegistrationFailure, judgment_state
+from scripts.production import production_doc, promotion as publication
+from scripts.production.production_names import (
+    CARGO_LINER_PRODUCTION, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD, MOVE_RECORD,
+    MOVE_VERSION, NOTES_DIRECTORY,
+)
+from scripts.production.update_registration import (
+    QuestionStaff, RegistrationFailure, judgment_state, status_line,
+)
 
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import berth_board
-from scripts.worktree.worktrees import release_worktree_pair
+from scripts.worktree import worktrees
+from scripts.worktree.worktrees import main_checkout, release_worktree_pair
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
+OFFSET_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+                         + r"(?:\.[0-9]+)?[+-](?:[01][0-9]|2[0-3]):[0-5][0-9]")
 
 
 class PlanLanded(NamedTuple):
@@ -69,6 +88,9 @@ class ProductionWrapped(NamedTuple):
 
 class VerdictMissing(NamedTuple):
     pass
+
+
+VERDICT_MISSING = VerdictMissing()
 
 
 class CommitVerdict(NamedTuple):
@@ -105,9 +127,371 @@ def doc_lines(production: Production) -> list[str]:
     return production.doc.read_text(encoding="utf-8").splitlines()
 
 
+@dataclass(frozen=True)
+class MoveDestinations:
+    live_doc: Path
+    log: Path
+
+
+@dataclass(frozen=True)
+class MovePlan:
+    main: Path
+    integration: Path
+    merge_branch: str
+    destinations: MoveDestinations
+
+
+@dataclass(frozen=True)
+class MoveOpen:
+    """The approved window can still grant a move."""
+
+
+@dataclass(frozen=True)
+class MoveClosed:
+    closed_at: datetime
+
+
+@dataclass(frozen=True)
+class MoveApproval:
+    production: str
+    target_staff_id: staff.StaffId
+    executor_staff_id: staff.StaffId
+    approved_at: datetime
+    window_start: datetime
+    window_end: datetime
+    destinations: MoveDestinations
+    status: MoveOpen | MoveClosed
+
+    def encode(self) -> str:
+        status = ({"kind": "open"} if isinstance(self.status, MoveOpen)
+                  else {"kind": "closed", "closed_at": self.status.closed_at.isoformat()})
+        return json.dumps({
+            "version": MOVE_VERSION, "production": self.production,
+            "target_staff_id": self.target_staff_id, "executor_staff_id": self.executor_staff_id,
+            "approved_at": self.approved_at.isoformat(),
+            "window_start": self.window_start.isoformat(), "window_end": self.window_end.isoformat(),
+            "destinations": {"live_doc": str(self.destinations.live_doc), "log": str(self.destinations.log)},
+            "status": status,
+        }, indent=2) + "\n"
+
+
+@dataclass(frozen=True)
+class NoMoveApproval:
+    """The record has never been written."""
+
+
+def offset_time(text: str) -> datetime:
+    if not OFFSET_TIME.fullmatch(text):
+        raise ValueError("use an RFC 3339 time with a numeric offset")
+    return datetime.fromisoformat(text).astimezone(UTC)
+
+
+def saved_move_time(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("the saved time must be UTC")
+    normalized = value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value
+    if not normalized.endswith("+00:00"):
+        raise ValueError("the saved time must be UTC")
+    return offset_time(normalized)
+
+
+def move_fields(value: object, keys: set[str]) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("the move record must contain an object")
+    fields = cast(dict[str, object], value)
+    if set(fields) != keys:
+        raise ValueError("the move record has incorrect fields")
+    return fields
+
+
+def move_text(value: object) -> str:
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise ValueError("the move record has invalid text")
+    return value
+
+
+def move_destination(value: object) -> Path:
+    text = move_text(value)
+    destination = Path(text)
+    if not destination.is_absolute() or str(destination.resolve()) != text:
+        raise ValueError(f"{text}: the move destination must be canonical and absolute")
+    return destination
+
+
+def read_move_approval(path: Path) -> MoveApproval | NoMoveApproval:
+    try:
+        original = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return NoMoveApproval()
+    try:
+        fields = move_fields(cast(object, json.loads(original)),
+                             {"version", "production", "target_staff_id", "executor_staff_id",
+                              "approved_at", "window_start", "window_end", "destinations", "status"})
+        if type(fields["version"]) is not int or fields["version"] != MOVE_VERSION:
+            raise ValueError("the move record version is unsupported")
+        start = saved_move_time(fields["window_start"])
+        end = saved_move_time(fields["window_end"])
+        approved = saved_move_time(fields["approved_at"])
+        if start >= end or approved >= end:
+            raise ValueError("the move record has an invalid window")
+        targets = move_fields(fields["destinations"], {"live_doc", "log"})
+        destinations = MoveDestinations(move_destination(targets["live_doc"]), move_destination(targets["log"]))
+        if destinations.live_doc == destinations.log:
+            raise ValueError("the move destinations must be different")
+        status: MoveOpen | MoveClosed
+        if fields["status"] == {"kind": "open"}:
+            status = MoveOpen()
+        else:
+            closed = move_fields(fields["status"], {"kind", "closed_at"})
+            if closed["kind"] != "closed":
+                raise ValueError("the move record has an invalid status")
+            closed_at = saved_move_time(closed["closed_at"])
+            if not max(start, approved) <= closed_at < end:
+                raise ValueError("the move record has an invalid close time")
+            status = MoveClosed(closed_at)
+        return MoveApproval(move_text(fields["production"]), staff.native_id(move_text(fields["target_staff_id"])),
+                            staff.native_id(move_text(fields["executor_staff_id"])), approved, start, end,
+                            destinations, status)
+    except (OSError, ValueError, OverflowError, staff.StaffRefused) as error:
+        raise Refusal(f"{path}: {error}") from error
+
+
+@contextmanager
+def locked_move(owner: staff.StaffRow) -> Generator[Path]:
+    path = showrunners.SHOWRUNNER_STATE_DIR / staff.native_id(owner.id) / MOVE_RECORD
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield path
+
+
+def require_approval_terminal(action: str = "approve-move") -> None:
+    if (staff.caller_identity() or os.environ.get("CLAUDECODE")
+            or not all(stream.isatty() for stream in (sys.stdin, sys.stdout, sys.stderr))):
+        raise Refusal(f"{action} requires a regular interactive terminal outside an agent session")
+    pid = os.getpid()
+    try:
+        while pid > 1:
+            arguments = pane_record.process_arguments(pid)
+            if herdr.is_claude_process(arguments) or herdr.is_codex_process(arguments):
+                raise Refusal(f"{action} cannot run from an agent process")
+            parent = pane_record.process_parent(pid)
+            if parent < 0 or parent == pid:
+                raise ValueError("invalid process parent")
+            pid = parent
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as error:
+        raise Refusal(f"{action} cannot verify process ancestry: {error}") from error
+
+
+def move_member(reference: str, record: staff.StaffSnapshot) -> staff.StaffRow:
+    matches = [row for row in record.rows if reference in (row.id, row.name, record.qualified_name(row))]
+    if len(matches) != 1:
+        raise Refusal(f"{reference}: expected one staff row")
+    return matches[0]
+
+
+def move_caller(record: staff.StaffSnapshot) -> staff.StaffRow:
+    identity = staff.caller_identity() or staff.runtime_id()
+    row = record.by_current_session(identity)
+    if row is None:
+        raise Refusal("the caller has no current staff session")
+    return row
+
+
+def move_plan(production: Production, lines: list[str]) -> MovePlan:
+    owner = production.owner
+    if not isinstance(owner.doc, staff.LiveDoc) or owner.doc.machine != local_machine():
+        raise Refusal(f"{production.name}: the live staff document must be on this machine")
+    if staff.declares_merge_checkout(lines):
+        raise Refusal(f"{production.name}: the live staff document is already enrolled")
+    main = Path(production_field(lines, "Repository")).expanduser().resolve(strict=True)
+    main_git = git_files.at(main)
+    if main_git.git_dir != main_git.common_dir or git_files.head(main_git) != git_files.OnBranch("main"):
+        raise Refusal(f"{main}: expected the main checkout on main")
+    source = git_files.locate(production.doc.parent)
+    if source.common_dir != main_git.common_dir:
+        raise Refusal(f"{production.doc}: document belongs to a different repository")
+    integration, branch = production.checkout, production.merge_branch
+    if production.name == CARGO_LINER_PRODUCTION:
+        merge_unit = staff.serving_merge_unit(owner.id)
+        if (merge_unit is None or merge_unit.name != f"{production.name}-merges"
+                or not isinstance(merge_unit.worktree, staff.PresentWorktree)
+                or merge_unit.worktree.machine != local_machine()):
+            raise Refusal(f"{production.name}: record its local merge unit staging worktree first")
+        integration = (merge_unit.worktree.path.parent / "integration").resolve(strict=True)
+        branch = f"{merge_unit.name}-integration"
+    merge_git = git_files.at(integration)
+    if (merge_git == main_git or merge_git.common_dir != main_git.common_dir
+            or git_files.head(merge_git) != git_files.OnBranch(branch)):
+        raise Refusal(f"{integration}: expected a separate worktree of {main} on {branch}")
+    relative_doc = production.doc.relative_to(source.toplevel)
+    relative_live = relative_doc.with_name(relative_doc.stem + LIVE_DOCUMENT_SUFFIX)
+    relative_log = Path(production_field(lines, "Log"))
+    live_doc, log = main / relative_live, main / relative_log
+    for path in (live_doc, log):
+        if path != path.resolve() or not path.is_relative_to(main) or path == main:
+            raise Refusal(f"{path}: destination must be a canonical path under {main}")
+    if live_doc == log:
+        raise Refusal("the move destinations must be different")
+    return MovePlan(main, integration, branch, MoveDestinations(live_doc, log))
+
+
+def approve_move(production: Production, executor: staff.StaffRow, start: datetime, end: datetime,
+                 lines: list[str]) -> None:
+    if start >= end:
+        raise Refusal("the move window start must be before its end")
+    plan = move_plan(production, lines)
+    with locked_move(production.owner) as path:
+        at = datetime.now(UTC)
+        if end <= at:
+            raise Refusal("the move window has already ended")
+        previous = read_move_approval(path)
+        if isinstance(previous, MoveApproval) and isinstance(previous.status, MoveOpen) and at < previous.window_end:
+            raise Refusal(f"{path}: an unexpired move approval is already open")
+        approval = MoveApproval(production.name, staff.native_id(production.owner.id), staff.native_id(executor.id),
+                                at, start, end, plan.destinations, MoveOpen())
+        write_text_atomic(path, approval.encode(), new_file_mode=0o600)
+        print(path.read_text(encoding="utf-8"), end="")
+
+
+def require_move_window(approval: MoveApproval) -> datetime:
+    at = datetime.now(UTC)
+    if not isinstance(approval.status, MoveOpen) or not approval.window_start <= at < approval.window_end:
+        raise Refusal("move-files requires an open approval within its window")
+    return at
+
+
+def migrated_document(production: Production, lines: list[str], plan: MovePlan) -> bytes:
+    fields = {
+        "Repository": f"- **Repository:** `{plan.main}`",
+        "Merge branch": f"- **Merge branch:** `{plan.merge_branch}`",
+        "Showrunner checkout": (f"- **Showrunner checkout:** `{plan.integration}`\n"
+                                + f"- **{MERGE_CHECKOUT_FIELD}:** `{plan.main}`"),
+    }
+    result: list[str] = []
+    merge_tests = False
+    for line in lines:
+        if line.startswith(("- **", "## ")):
+            merge_tests = line.startswith("- **Merge tests:**")
+        if merge_tests:
+            line = line.replace(str(production.checkout), str(plan.integration))
+            line = re.sub(r"showrunner checkout", "integration checkout", line, flags=re.IGNORECASE)
+        result.append(next((value for field, value in fields.items() if line.startswith(f"- **{field}:**")), line))
+    return ("\n".join(result) + "\n").encode("utf-8")
+
+
+def copy_already_present(path: Path, data: bytes) -> bool:
+    if path != path.resolve():
+        raise Refusal(f"{path}: cannot copy through a symlink")
+    try:
+        existing = path.read_bytes()
+    except FileNotFoundError:
+        return False
+    if existing != data:
+        raise Refusal(f"{path}: the destination already has different bytes")
+    return True
+
+
+def write_move_copy(path: Path, data: bytes, mode: int) -> None:
+    if copy_already_present(path, data):
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with prepared_replacement(path, data, mode=mode) as temporary:
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if not copy_already_present(path, data):
+                raise
+        else:
+            sync_folder(path.parent)
+
+
+def move_files(production: Production, lines: list[str], record: staff.StaffSnapshot, *,
+               reverse: bool = False) -> None:
+    caller = move_caller(record)
+    plan = move_plan(production, lines)
+    targets = plan.destinations
+    with locked_move(production.owner) as path:
+        approval = read_move_approval(path)
+        if isinstance(approval, NoMoveApproval):
+            raise Refusal(f"{path}: move approval is missing")
+        if (approval.production != production.name or approval.target_staff_id != production.owner.id
+                or approval.executor_staff_id != caller.id or approval.destinations != targets):
+            raise Refusal(f"{path}: approval must name this production, executor, and both destinations")
+        receipt = path.with_name(f"worktrees-{approval.approved_at:%Y%m%dT%H%M%S%fZ}.json")
+        if reverse:
+            if production.name != CARGO_LINER_PRODUCTION:
+                raise Refusal("only cargo-liner has worktree records to reverse")
+            count = worktrees.retarget_cargo_liner_records(plan.main, plan.merge_branch, receipt, reverse=True)
+            print(f"Restored {count} cargo-liner worktree records.")
+            return
+        _ = require_move_window(approval)
+        require_admission(production)
+        for destination in (targets.live_doc, targets.log):
+            require_untracked_ignored(plan.main, destination.relative_to(plan.main).as_posix())
+        document = migrated_document(production, lines, plan)
+        log = production.log.read_bytes()
+        same_log = targets.log.exists() and production.log.samefile(targets.log)
+        _ = copy_already_present(targets.live_doc, document)
+        if not same_log:
+            _ = copy_already_present(targets.log, log)
+        _ = require_move_window(approval)
+        write_move_copy(targets.live_doc, document, production.doc.stat().st_mode & 0o777)
+        if not same_log:
+            _ = require_move_window(approval)
+            write_move_copy(targets.log, log, production.log.stat().st_mode & 0o777)
+        if (targets.live_doc.read_bytes() != document or doc_lines(production) != lines
+                or targets.log.read_bytes() != production.log.read_bytes()):
+            raise Refusal("the live document or LOG differs after the move")
+        verified = production_doc.resolve_production_paths(targets.live_doc)
+        if (not isinstance(verified, production_doc.EnrolledPaths) or verified.live_doc != targets.live_doc
+                or verified.log != targets.log or verified.integration != plan.integration):
+            raise Refusal("the moved document does not resolve to the approved destinations")
+        if production.name == CARGO_LINER_PRODUCTION:
+            _ = require_move_window(approval)
+            _ = worktrees.retarget_cargo_liner_records(plan.main, plan.merge_branch, receipt)
+        _ = require_move_window(approval)
+        record_verified_move(production, targets.live_doc)
+        closed = replace(approval, status=MoveClosed(require_move_window(approval)))
+        write_text_atomic(path, closed.encode())
+        print(f"Moved {targets.live_doc} and {targets.log}.")
+
+
+def stage_notes(production: Production, lines: list[str], record: staff.StaffSnapshot) -> None:
+    if move_caller(record).id != production.owner.id:
+        raise Refusal("only the owning showrunner can stage its notes")
+    plan = move_plan(production, lines)
+    relative = Path(NOTES_DIRECTORY) / staff.native_id(production.owner.id)
+    source = production.checkout / relative
+    destination = plan.main / relative
+    if source != source.resolve() or destination != destination.resolve():
+        raise Refusal("notes must use canonical paths")
+    ensure_excluded(plan.main, "/" + relative.as_posix())
+    if not source.exists():
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    staged = staged_notes_directory(production.doc)
+    if staged is None or staged != destination:
+        raise Refusal(f"{destination}: the production notes folder does not match")
+    if source.samefile(staged):
+        return
+    copies: list[tuple[Path, bytes, int]] = []
+    for entry in sorted(source.rglob("*")):
+        if entry.is_symlink() or not (entry.is_file() or entry.is_dir()):
+            raise Refusal(f"{entry}: the notes folder must contain regular files and directories")
+        if entry.is_file():
+            target = staged / entry.relative_to(source)
+            require_untracked_ignored(plan.main, target.relative_to(plan.main).as_posix())
+            data = entry.read_bytes()
+            _ = copy_already_present(target, data)
+            copies.append((target, data, entry.stat().st_mode & 0o777))
+    for target, data, mode in copies:
+        write_move_copy(target, data, mode)
+    print(f"Staged {len(copies)} notes in {staged}.")
+
+
 def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | ProductionWrapped:
-    match = next((re.search(r"^> \*\*Status: PRODUCTION — (planned|running|wrapped)\.\*\*", line)
-                  for line in lines if line.startswith("> **Status:")), None)
+    match = status_line(lines)
     if match is None:
         raise LifecycleStop("input", "failed", "production doc lacks a valid status")
     status = match.group(1)
@@ -204,11 +588,13 @@ def move_session_state(production_name: str, scratch: Path) -> None:
 
 
 def load(production: Production, lines: list[str], resume: bool, scratch: Path | None) -> None:
+    require_admission(production)
+    status = ProductionRunning() if resume else doc_status(lines)
     state = checkout_ready(production)
     report("load", "ok", "production doc read")
     if scratch is not None:
         move_session_state(production.name, scratch)
-    if not resume and not isinstance(doc_status(lines), ProductionRunning):
+    if not isinstance(status, ProductionRunning):
         return
     owed: tuple[str, ...] = ()
     try:
@@ -252,7 +638,16 @@ def open_production(production: Production, lines: list[str]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionWrapped):
         raise LifecycleStop("open", "held", "production is already wrapped")
+    require_admission(production)
+    original = production.doc.read_bytes()
+    if original.decode("utf-8").splitlines() != lines:
+        raise LifecycleStop("doc", "held", f"{production.doc}: document changed before open")
     record = staff.snapshot()
+    enrolled = production_doc.resolve_production_paths(production.doc)
+    main = enrolled.main if isinstance(enrolled, production_doc.EnrolledPaths) else production.checkout
+    if isinstance(enrolled, production_doc.EnrolledPaths):
+        for path in (enrolled.live_doc, enrolled.log):
+            require_untracked_ignored(main, path.relative_to(main).as_posix())
     rows = tuple(record.find(kind="unit", parent=production.owner.id))
     resolver = session_staff.RowResolver(record)
     state = checkout_ready(production)
@@ -266,9 +661,14 @@ def open_production(production: Production, lines: list[str]) -> None:
         updated = [line.replace("**Status: PRODUCTION — planned.**", "**Status: PRODUCTION — running.**")
                    for line in updated]
     if updated != lines:
-        write_text_atomic(production.doc, "\n".join(updated) + "\n")
+        mode = production.doc.stat().st_mode & 0o777
+        with prepared_replacement(production.doc, "\n".join(updated) + "\n", mode=mode) as temporary:
+            if production.doc.read_bytes() != original or production.doc.stat().st_mode & 0o777 != mode:
+                raise LifecycleStop("doc", "held", f"{production.doc}: document changed during open")
+            _ = temporary.replace(production.doc)
+            sync_folder(production.doc.parent)
     report("doc", "ok", "running")
-    paths = [doc_path_in_checkout(production, production.doc)]
+    paths = [doc_path_in_checkout(production, production.doc)] if isinstance(enrolled, production_doc.LegacyProduction) else []
     for row in rows:
         name = row.name
         match resolver.unit_config(row):
@@ -284,15 +684,17 @@ def open_production(production: Production, lines: list[str]) -> None:
                 report("plan", "ok", f"{name}: no .unit.toml yet; no plan committed")
     subject = f"production({production.name}): plans for {len(rows)} units"
     subjects = checked(production.checkout, "commit", "log", "--format=%s", production.merge_branch)
-    committed_paths = checked(production.checkout, "commit", "ls-tree", "-r", "--name-only", "HEAD", "--", *paths)
-    if subject in subjects.splitlines() and set(paths).issubset(committed_paths.splitlines()):
+    committed_paths = checked(production.checkout, "commit", "ls-tree", "-r", "--name-only", "HEAD", "--", *paths) if paths else ""
+    if not paths or subject in subjects.splitlines() and set(paths).issubset(committed_paths.splitlines()):
         report("commit", "ok", "plans already committed")
     else:
         _ = checked(production.checkout, "commit", "add", "--", *paths)
-        pending = git(production.checkout, "diff", "--cached", "--quiet")
+        enrolled_paths = ["--", *paths] if isinstance(enrolled, production_doc.EnrolledPaths) else []
+        pending = git(production.checkout, "diff", "--cached", "--quiet", *enrolled_paths)
         if pending.returncode == 1:
-            _ = checked(production.checkout, "commit", "commit", "-m", subject)
-            report("commit", "ok", "production doc and unit plans committed")
+            options = ["--only"] if enrolled_paths else []
+            _ = checked(production.checkout, "commit", "commit", *options, "-m", subject, *enrolled_paths)
+            report("commit", "ok", "unit plans committed" if enrolled_paths else "production doc and unit plans committed")
         elif pending.returncode == 0:
             report("commit", "ok", "plans already committed")
         else:
@@ -302,13 +704,19 @@ def open_production(production: Production, lines: list[str]) -> None:
     if remote.returncode:
         raise LifecycleStop("push", "failed", remote.stderr.strip())
     if not remote.stdout.startswith(tip):
-        _ = checked(production.checkout, "push", "push", "-u", "origin", production.merge_branch)
+        if publication.is_main_branch(production.merge_branch) and isinstance(enrolled, production_doc.LegacyProduction):
+            _ = checked(production.checkout, "push", "push", "-u", "origin", "main")
+        else:
+            push_integration_tip(production, tip, "push")
+            branch = production.merge_branch.removeprefix("refs/heads/")
+            _ = checked(production.checkout, "push", "branch", "--set-upstream-to", f"origin/{branch}", branch)
         report("push", "ok", f"{production.merge_branch} at {tip}")
     else:
         report("push", "ok", f"already at {tip}")
-    log_name = production.log.relative_to(production.checkout).as_posix()
+    log_name = production.log.relative_to(main).as_posix()
     try:
-        ensure_excluded(production.checkout, log_name)
+        if isinstance(enrolled, production_doc.LegacyProduction):
+            ensure_excluded(main, log_name)
     except ExcludeRefused as error:
         raise LifecycleStop("log", "failed", str(error)) from error
     if not production.log.exists():
@@ -320,6 +728,18 @@ def open_production(production: Production, lines: list[str]) -> None:
 def ci_steps(production: Production, tip: str, no_ci: bool,
              ci_green: CommitVerdict | VerdictMissing,
              smoke_passed: CommitVerdict | VerdictMissing) -> None:
+    if production.name == CARGO_LINER_PRODUCTION and staff.declares_merge_checkout(doc_lines(production)):
+        if no_ci:
+            raise LifecycleStop("ci", "held", "this production requires CI on the integration tip")
+        state_dir = showrunners.session_state_dir(production.owner.id) / "waiting_state"
+        try:
+            ci_points.ci_collect(production, state_dir, no_ci)
+            verdict = ci_points.ci_record(state_dir)
+        except ci_points.PointFailure as error:
+            raise LifecycleStop(error.step, "held", error.detail) from error
+        if not isinstance(verdict, ci_points.CiRecord) or verdict.tip != tip:
+            raise LifecycleStop("ci", "held", f"no collected CI result for integration tip {tip}")
+        return
     if no_ci:
         for step in ("ci", "smoke-launch", "mac-run"):
             report(step, "ok", "skipped: no CI")
@@ -341,52 +761,95 @@ def ci_steps(production: Production, tip: str, no_ci: bool,
     report("mac-run", "ok", "Mac run is recorded with the CI point")
 
 
+def push_integration_tip(production: Production, tip: str, step: str) -> None:
+    try:
+        publication.push_integration(production.checkout, tip, production.merge_branch)
+    except Stop as error:
+        raise LifecycleStop(step, error.state, error.detail) from error
+
+
 def promote_main(production: Production, lines: list[str], no_ci: bool,
                  ci_green: CommitVerdict | VerdictMissing,
                  smoke_passed: CommitVerdict | VerdictMissing,
-                 verdict_checked: bool = False) -> str:
+                 checked_tip: CommitVerdict | VerdictMissing = VERDICT_MISSING) -> str:
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         raise LifecycleStop("promote", "held", "merge branch does not exist")
-    tip = checked(production.checkout, "promote", "rev-parse", "HEAD")
-    if not verdict_checked:
+    tip = state.tip
+    if isinstance(checked_tip, VerdictMissing):
         ci_steps(production, tip, no_ci, ci_green, smoke_passed)
+    elif checked_tip.sha != tip:
+        raise LifecycleStop("promote", "held", f"checked tip {checked_tip.sha} differs from integration tip {tip}")
     with main_push_lock.main_push_lock(production.checkout):
+        current = checked(production.checkout, "promote", "rev-parse", "HEAD")
+        if current != tip:
+            raise LifecycleStop("promote", "held", f"integration tip changed from {tip} to {current}")
+        try:
+            conflicts = main_sync.live_file_conflicts(main_checkout(production.checkout), tip)
+        except production_doc.ProductionPathsError as error:
+            raise LifecycleStop("push", "held", str(error)) from error
+        if conflicts:
+            for conflict in conflicts:
+                report("push", "held", str(conflict))
+            raise LifecycleStop("push", "held", "incoming tree conflicts with live production files")
         _ = checked(production.checkout, "main", "fetch", "origin", "main")
         if git(production.checkout, "merge-base", "--is-ancestor", "origin/main", tip).returncode:
             raise LifecycleStop("main", "held", f"origin/main has commits absent from {tip}")
         report("main", "ok", f"origin/main is behind {tip}")
         promotion = production_doc.promotion_from_doc(lines)
-        if isinstance(promotion, production_doc.NoPromotion) or not promotion.checkouts:
-            try:
-                landed = land_main.land(production.checkout, tip)
-            except land_main.LandError as error:
-                raise LifecycleStop("push", "failed", str(error)) from error
-            if isinstance(landed.push, land_main.Pushed):
-                report("promote", "ok", f"main pushed to {tip}")
-            else:
-                report("promote", "ok", f"already at {tip}")
-            report("post-push", "ok", land_main.hook_report(landed.hook))
+        approval: publication.PromotionApproval
+        if no_ci:
+            approval = publication.LifecycleNoCi(production.doc)
+        elif isinstance(ci_green, CommitVerdict):
+            approval = publication.LifecycleCi(production.doc, ci_green.sha)
         else:
+            approval = publication.CollectedCi(production.doc)
+
+        def publish_destinations(approved: publication.ApprovedPromotion) -> None:
+            if isinstance(promotion, production_doc.NoPromotion) or not promotion.checkouts:
+                landed = approved.land(production.checkout)
+                detail = f"main pushed to {approved.sha}" if isinstance(landed.push, land_main.Pushed) else f"already at {approved.sha}"
+                report("promote", "ok", detail)
+                report("post-push", "ok", land_main.hook_report(landed.hook))
+                return
+            verified = VerifiedIntegrationTip(production.checkout, approved.sha)
+            remote_ref = f"refs/remotes/origin/{production.merge_branch}"
+            _ = checked(production.checkout, "promote", "fetch", "origin",
+                        f"+refs/heads/{production.merge_branch}:{remote_ref}")
             for destination in promotion.checkouts:
-                result = promote_local_checkout(destination, production.merge_branch, tip)
+                verified.require_current(production.merge_branch, production.checkout)
+                if destination.resolve() == production.merge_checkout:
+                    result = promote_local_checkout(destination, production.merge_branch, approved,
+                                                    integration=production.checkout)
+                else:
+                    result = promote_local_checkout(destination, production.merge_branch, approved)
                 if isinstance(result, PromotionNotPushed):
                     raise LifecycleStop("promote", "held", f"{destination} has main commits outside the merge branch")
                 if isinstance(result, PromotionAlreadyAtTip):
-                    detail = f"{destination}: already at {tip}"
+                    detail = f"{destination}: already at {result.tip}"
                 elif isinstance(result, PromotionOriginPushed):
-                    detail = f"{destination}: pushed {tip}"
+                    detail = f"{destination}: pushed {result.tip}"
                 else:
-                    detail = f"{destination}: advanced to {tip}"
+                    detail = f"{destination}: advanced to {result.tip}"
                 report("promote", "ok", detail)
+        try:
+            if (publication.is_main_branch(production.merge_branch)
+                    and isinstance(production.merge_checkout, production_doc.LegacyProduction)):
+                published = publication.publish_legacy_main(production.checkout, tip, publish_destinations)
+            else:
+                published = publication.publish(approval, production.checkout, production.merge_branch, tip, publish_destinations)
+        except land_main.LandError as error:
+            raise LifecycleStop("push", "failed", str(error)) from error
+        except Stop as error:
+            raise LifecycleStop(error.step, error.state, error.detail) from error
     if isinstance(promotion, production_doc.PromoteTo) and isinstance(promotion.mac, production_doc.MacCheckout):
         source = promotion.checkouts[0] if promotion.checkouts else production.checkout
-        outcome = pull_mac_checkout(promotion.mac.path, source)
+        outcome = pull_mac_checkout(promotion.mac.path, source, published)
         if isinstance(outcome, main_publish.MacPullPending):
             report("promote", "ok", f"mac unreachable, pull pending: {promotion.mac.path}")
         else:
             report("promote", "ok", f"mac {promotion.mac.path} main pulled")
-    return tip
+    return published.sha
 
 
 def close_out_items(lines: list[str]) -> tuple[str, ...]:
@@ -410,17 +873,49 @@ def wrap_production(name: str) -> Production:
     record = staff.snapshot()
     owner = showrunners.owner_for(name, record)
     if isinstance(owner.doc, staff.LiveDoc) and not owner.doc.path.exists():
-        source = owner.doc.path
+        source = canonical_document_path(owner.doc.path)
         checkout = Path(checked(source.parent, "wrap", "rev-parse", "--show-toplevel"))
         renames = checked(checkout, "wrap", "diff", "--cached", "--name-status",
                           "--diff-filter=R", "--find-renames", "-z").split("\0")
         for before, after in zip(renames[1::3], renames[2::3]):
             if checkout / before == source:
-                document = production_doc.read_new_production(checkout / after, owner.name)
+                document = production_doc.read_new_production(checkout / after, owner.name, infer_legacy_branch=True)
                 production = document.for_owner(owner)
                 if archived_doc(replace(production, doc=source)) == production.doc:
                     return production
+    if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        return production_doc.read_new_production(owner.doc.path, owner.name, infer_legacy_branch=True).for_owner(owner)
     return read_production(owner)
+
+
+def record_wrap_merge_branch(production: Production) -> None:
+    """Keep the resolved branch in the production record before removing worktrees."""
+    before = production.doc.read_bytes()
+    document = before.decode("utf-8")
+    lines = document.splitlines()
+    field = production_doc.optional_field(lines, "Merge branch")
+    if isinstance(field, production_doc.FieldPresent) and (saved := production_doc.cell_value(field.text)):
+        if saved != production.merge_branch:
+            raise LifecycleStop("retire", "held", f"{production.doc}: Merge branch changed to {saved}")
+        return
+    head = git_files.head(git_files.at(production.checkout))
+    if head != git_files.OnBranch(production.merge_branch):
+        raise LifecycleStop("retire", "held", f"{production.checkout}: expected {production.merge_branch}")
+    line = f"- **Merge branch:** `{production.merge_branch}`"
+    if isinstance(field, production_doc.FieldPresent):
+        updated = re.sub(r"(?m)^- \*\*Merge branch:\*\*[^\r\n]*", lambda _match: line, document, count=1)
+    else:
+        separator = "\r\n" if "\r\n" in document else "\n"
+        checkout_field = re.search(r"(?m)^- \*\*Showrunner checkout:\*\*", document)
+        if checkout_field is None:
+            raise LifecycleStop("retire", "held", f"{production.doc}: Showrunner checkout is missing")
+        position = checkout_field.start()
+        updated = document[:position] + line + separator + document[position:]
+    if production.doc.read_bytes() != before:
+        raise LifecycleStop("retire", "held", f"{production.doc}: changed while recording Merge branch")
+    write_text_atomic(production.doc, updated)
+    report("retire", "ok", f"recorded Merge branch {production.merge_branch}")
+
 
 
 def retire_reservations(worktree: Path) -> None:
@@ -524,6 +1019,14 @@ class PreparedWrapUnit(NamedTuple):
     retirement: unit_config.RetiredSession
 
 
+def require_retirable_worktrees(production: Production, rows: tuple[UnitRow, ...]) -> None:
+    for unit in rows:
+        try:
+            production_doc.require_removable_checkout(unit.worktree, production.checkout, unit.branch)
+        except production_doc.ProductionPathsError as error:
+            raise LifecycleStop("retire", "held", f"{unit.name}: {error}") from error
+
+
 def prepare_wrap_units(production: Production, rows: tuple[UnitRow, ...]) -> tuple[PreparedWrapUnit, ...]:
     """Validate all retirement evidence before the first worktree is removed."""
     prepared: list[PreparedWrapUnit] = []
@@ -593,8 +1096,13 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
          smoke_passed: CommitVerdict | VerdictMissing, done: tuple[str, ...]) -> int:
     held = False
     status = doc_status(lines)
+    enrolled = staff.declares_merge_checkout(lines)
     if isinstance(status, ProductionPlanned):
         raise LifecycleStop("wrap", "held", "production must be running")
+    if enrolled:
+        main = session_staff.production_session_directory(production.doc, production.checkout)
+        for path in (production.doc, production.log):
+            require_untracked_ignored(main, path.relative_to(main).as_posix())
     record = staff.snapshot()
     if isinstance(status, ProductionRunning):
         refuse_running_children(production.name, record)
@@ -603,12 +1111,14 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         raise LifecycleStop("wrap", "held", "merge branch does not exist")
     runner = production.owner
     rows = units(runner, record)
+    require_retirable_worktrees(production, rows)
     checkpoints = merged_checkpoints(production, record=record)
     if isinstance(status, ProductionRunning):
         for item in close_out_items(lines):
             if item not in done:
                 raise LifecycleStop("close-out", "held", f'{item} is not recorded done; finish it or get the owner\'s OK, then pass --close-out-done "{item}"')
             report("close-out", "ok", f"{item} (recorded done)")
+    require_document_receipt(runner.id)
     prepared = prepare_wrap_units(production, rows)
     tip = checked(production.checkout, "wrap", "rev-parse", "HEAD")
     commit_count = "0"
@@ -626,15 +1136,24 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             if merged is BranchMergeState.UNMERGED:
                 raise LifecycleStop("worktree", "held", f"{unit.name} branch {unit.branch} is not merged")
             report("worktree", "ok", f"{unit.name} clean and merged")
-        _ = checked(production.checkout, "push", "push", "origin", production.merge_branch)
+        current = checked(production.checkout, "wrap", "rev-parse", "HEAD")
+        if current != tip:
+            raise LifecycleStop("wrap", "held", f"integration tip changed from {tip} to {current}")
+        if (publication.is_main_branch(production.merge_branch)
+                and isinstance(production.merge_checkout, production_doc.LegacyProduction)):
+            _ = checked(production.checkout, "push", "push", "origin", "main")
+        else:
+            push_integration_tip(production, tip, "push")
         report("push", "ok", f"{production.merge_branch} pushed")
         _ = checked(production.checkout, "main", "fetch", "origin", "main")
-        commit_count = checked(production.checkout, "main", "rev-list", "--count", "origin/main..HEAD")
-        tip = promote_main(production, lines, no_ci, ci_green, smoke_passed, verdict_checked=True)
+        commit_count = checked(production.checkout, "main", "rev-list", "--count", f"origin/main..{tip}")
+        tip = promote_main(production, lines, no_ci, ci_green, smoke_passed, checked_tip=CommitVerdict(tip))
     if isinstance(status, ProductionRunning):
         _ = capture_release(production.name, record=record)
+    record_wrap_merge_branch(production)
     for item in prepared:
         unit = item.unit
+        require_retirable_worktrees(production, (unit,))
         _ = stop_resume.stop_unit_workers(unit.member.id, record)
         remaining = worker_panes.observe(unit.member.id, staff.snapshot()) if record.find(kind="worker", parent=unit.member.id) else []
         if any(isinstance(state, (worker_panes.OpenWorker, worker_panes.UncertainWorker)) for state in remaining):
@@ -654,10 +1173,14 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             # The preparation check also accepts equal patches after a cherry-pick.
             _ = checked(production.checkout, "retire", "branch", "-D", unit.branch)
             report("retire", "ok", f"deleted local {unit.branch}")
-        remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", unit.branch)
+        ref = f"refs/heads/{unit.branch}"
+        remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", ref)
         if remote.returncode == 0:
-            _ = checked(production.checkout, "retire", "push", "origin", "--delete", unit.branch)
-            report("retire", "ok", f"deleted origin/{unit.branch}")
+            result = origin_deletion.delete(production.checkout, "origin", ref, remote.stdout.split()[0])
+            if isinstance(result, origin_deletion.Kept):
+                report("retire", "kept", f"{ref} on origin: {' '.join(result.reason.splitlines())}")
+            elif isinstance(result, origin_deletion.Deleted):
+                report("retire", "ok", f"deleted origin/{unit.branch}")
         elif remote.returncode != 2:
             raise LifecycleStop("retire", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
     held = retire_wrap_rows(rows, record, runner) or held
@@ -683,42 +1206,59 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         notifier = Path.home() / ".claude/scripts/message/notifier.sh"
         _ = command("notifier", production.checkout, str(notifier), "remove", showrunners.timer_name(production.name))
         report("notifier", "ok", "update timer removed")
-        updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
-                   for line in lines]
         with investigation.recipient_locks(runner.id):
-            write_text_atomic(production.doc, "\n".join(updated) + "\n")
-    doc_paths = [doc_path_in_checkout(production, production.doc)]
-    archive = archived_doc(production)
+            original = production.doc.read_bytes()
+            document = original.decode("utf-8")
+            current_status = doc_status(document.splitlines())
+            if isinstance(current_status, ProductionPlanned):
+                raise LifecycleStop("wrap", "held", "production status changed to planned")
+            if isinstance(current_status, ProductionRunning):
+                updated = re.sub(r"(?m)^> \*\*Status: PRODUCTION — running\.\*\*",
+                                 "> **Status: PRODUCTION — wrapped.**", document, count=1)
+                mode = production.doc.stat().st_mode & 0o777
+                with prepared_replacement(production.doc, updated.encode("utf-8"), mode=mode) as temporary:
+                    if production.doc.stat().st_mode & 0o777 != mode or production.doc.read_bytes() != original:
+                        raise LifecycleStop("wrap", "held", f"{production.doc}: document changed during wrap")
+                    os.replace(temporary, production.doc)
+                    sync_folder(production.doc.parent)
+    doc_paths = [] if enrolled else [doc_path_in_checkout(production, production.doc)]
+    archive = None if enrolled else archived_doc(production)
+    final_doc = archive if archive is not None else production.doc
+    binding = staff.WrappedDoc(local_machine(), final_doc)
+    prepare_document_rebind(runner, binding)
     if archive is not None:
         archive.parent.mkdir(parents=True, exist_ok=True)
         doc_paths.append(doc_path_in_checkout(production, archive))
         _ = checked(production.checkout, "wrap", "mv", "--", *doc_paths)
         report("wrap", "ok", f"moved the doc out of productions/ to {doc_paths[1]}")
-    else:
+    elif doc_paths:
         renames = checked(production.checkout, "wrap", "diff", "--cached", "--name-status",
                           "--diff-filter=R", "--find-renames", "-z").split("\0")
         doc_paths[:0] = [source for source, destination in zip(renames[1::3], renames[2::3])
                         if destination == doc_paths[-1]]
-    final_doc = archive if archive is not None else production.doc
     if not final_doc.is_file():
         raise LifecycleStop("staff", "held", f"wrapped production doc is missing: {final_doc}")
-    wrapped_runner = staff.set_doc(runner.id, staff.WrappedDoc(local_machine(), final_doc))
+    wrapped_runner = complete_document_rebind(runner, binding)
     record = replace(record, rows=tuple(wrapped_runner if row.id == wrapped_runner.id else row for row in record.rows))
     if record.pending_retire:
         _ = staff.retire_pending()
-    if git(production.checkout, "diff", "--quiet", "HEAD", "--", *doc_paths).returncode == 1:
+    if doc_paths and git(production.checkout, "diff", "--quiet", "HEAD", "--", *doc_paths).returncode == 1:
         _ = checked(production.checkout, "wrap", "add", "--", doc_paths[-1])
         _ = checked(production.checkout, "wrap", "commit", "--only", "-m",
                     f"production({production.name}): wrapped", "--", *doc_paths)
         report("wrap", "ok", "production doc committed")
-    else:
+    elif doc_paths:
         report("wrap", "ok", "production doc already committed")
     current_tip = checked(production.checkout, "wrap", "rev-parse", "HEAD")
     remote_tip = git(production.checkout, "ls-remote", "origin", f"refs/heads/{production.merge_branch}")
     if remote_tip.returncode:
         raise LifecycleStop("wrap", "failed", remote_tip.stderr.strip())
     if not remote_tip.stdout.startswith(current_tip):
-        _ = checked(production.checkout, "wrap", "push", "origin", production.merge_branch)
+        if (publication.is_main_branch(production.merge_branch)
+                and isinstance(production.merge_checkout, production_doc.LegacyProduction)):
+            _ = checked(production.checkout, "wrap", "push", "origin", "main")
+        else:
+            push_integration_tip(production, current_tip, "wrap")
         report("wrap", "ok", "production doc pushed")
     else:
         report("wrap", "ok", "production doc already pushed")
@@ -746,8 +1286,16 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("action", choices=("load", "open", "promote-main", "wrap"))
-    _ = parser.add_argument("--production", required=True, type=str)
+    _ = parser.add_argument("action", choices=("load", "open", "promote-main", "wrap", "approve-move", "move-files",
+                                               "stage-notes", "capture-admission-inventory"))
+    _ = parser.add_argument("--production")
+    _ = parser.add_argument("--staff-id", action="append", default=[],
+                            help="capture-admission-inventory: repeat for each existing legacy production")
+    _ = parser.add_argument("--reverse", action="store_true",
+                            help="move-files: restore cargo-liner worktree records after restoring its legacy document")
+    _ = parser.add_argument("--executor")
+    _ = parser.add_argument("--window-start")
+    _ = parser.add_argument("--window-end")
     _ = parser.add_argument("--no-ci", action="store_true")
     _ = parser.add_argument("--resume", action="store_true")
     _ = parser.add_argument("--scratch", type=Path, help="load: the scratchpad whose state moves to the state directory")
@@ -759,6 +1307,47 @@ def main() -> int:
     args = parser.parse_args()
     try:
         action = cast(str, args.action)
+        name = cast(str | None, args.production)
+        identities = cast(list[str], args.staff_id)
+        executor = cast(str | None, args.executor)
+        start = cast(str | None, args.window_start)
+        end = cast(str | None, args.window_end)
+        reverse = cast(bool, args.reverse)
+        if action == "capture-admission-inventory":
+            if name is not None or executor is not None or start is not None or end is not None or reverse:
+                raise Refusal("capture-admission-inventory accepts only --staff-id")
+            require_approval_terminal(action)
+            print(capture_rollout_inventory(identities))
+            return 0
+        if identities:
+            raise Refusal("only capture-admission-inventory accepts --staff-id")
+        if name is None:
+            parser.error("--production is required")
+        if reverse and action != "move-files":
+            raise Refusal("only move-files accepts --reverse")
+        if action == "approve-move":
+            require_approval_terminal()
+            if executor is None or start is None or end is None:
+                raise Refusal("approve-move requires --executor, --window-start and --window-end")
+            record = staff.snapshot()
+            owner = move_member(name, record)
+            if owner.kind != "showrunner":
+                raise Refusal(f"{name}: the target must be a showrunner")
+            production = read_production(owner, record)
+            approve_move(production, move_member(executor, record), offset_time(start), offset_time(end),
+                         doc_lines(production))
+            return 0
+        if executor is not None or start is not None or end is not None:
+            raise Refusal("only approve-move accepts the executor and window options")
+        if action in ("move-files", "stage-notes"):
+            record = staff.snapshot()
+            production = read_production(name, record)
+            lines = doc_lines(production)
+            if action == "move-files":
+                move_files(production, lines, record, reverse=reverse)
+            else:
+                stage_notes(production, lines, record)
+            return 0
         no_ci = cast(bool, args.no_ci)
         ci_sha = cast(str | None, args.ci_green)
         smoke_sha = cast(str | None, args.smoke_passed)
@@ -766,7 +1355,6 @@ def main() -> int:
             raise LifecycleStop("input", "failed", "--no-ci excludes the verdict flags")
         ci_green = CommitVerdict(ci_sha) if ci_sha is not None else VerdictMissing()
         smoke_passed = CommitVerdict(smoke_sha) if smoke_sha is not None else VerdictMissing()
-        name = cast(str, args.production)
         production = wrap_production(name) if action == "wrap" else read_production(name)
         lines = doc_lines(production)
         if action == "load":
@@ -784,7 +1372,8 @@ def main() -> int:
         report(error.step, error.state, error.detail.replace("\n", "; "))
     except Stop as error:
         report(error.step, error.state, error.detail.replace("\n", "; "))
-    except (staff.StaffRefused, staff.StaffNotFound, Refusal, OSError, ValueError) as error:
+    except (staff.StaffRefused, staff.StaffNotFound, Refusal, worktrees.Refused,
+            OSError, ValueError, OverflowError) as error:
         report("input", "failed", str(error).replace("\n", "; "))
     return 2
 

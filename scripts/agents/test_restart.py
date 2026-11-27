@@ -79,7 +79,7 @@ def short_resume_check_config(file: str | Path) -> conf.ConfigRead:
     settings = READ_CONFIG(file)
     if file == "shutdown" and isinstance(settings.settings, dict):
         values = dict(settings.settings)
-        for key in ("RESUME_CHECK_SECONDS", "RESUME_CHECK_INTERVAL_SECONDS"):
+        for key in ("resume_check_seconds", "resume_check_interval_seconds"):
             values[key] = conf.Setting("0.001", "# range: 0..3600", 0)
         return replace(settings, settings=values)
     return settings
@@ -1301,7 +1301,7 @@ class RestartTests(RestartTestCase):
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             _ = write_config_fixture(configuration / source.name)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
-        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
+        _ = write_config_fixture(configuration / "staff.conf", "producer_workspace=producers\n")
         _ = write_registry(configuration / "models.conf", {"producers": {
             "unit-0": "claude:opus:max", "probe-codex": "codex:gpt-test:high",
             "morty": "claude:opus:max", "TEST-agent": "claude:opus:max",
@@ -1690,7 +1690,7 @@ class RestartTests(RestartTestCase):
         for release in (True, False):
             with self.subTest(release=release):
                 config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-                text = config.read_text().replace("UPKEEP_ROW_WAIT_SECONDS=5", "UPKEEP_ROW_WAIT_SECONDS=0.04")
+                text = config.read_text().replace("upkeep_row_wait_seconds=5", "upkeep_row_wait_seconds=0.04")
                 write_text_atomic(config, text)
                 shutdown_record.save([str(row.id)])
                 with path.open("w+") as lock:
@@ -2296,7 +2296,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         record_lock = shutdown_record.record_path().with_suffix(".lock")
         if step == "busy lock":
             config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-            _ = write_config_fixture(config, "RESTART_RECORD_LOCK_SECONDS=0.05\n")
+            _ = write_config_fixture(config, "restart_record_lock_seconds=0.05\n")
         read_fd, ready_fd = os.pipe()
         lock_context = record_lock.open("a") if step == "busy lock" else nullcontext()
         with lock_context as lock, os.fdopen(read_fd, "rb"), os.fdopen(ready_fd, "wb"), path.open("ab") as log:
@@ -2486,9 +2486,12 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id, "pass": {}}))
         state = worker_panes.OpenWorker(child, "w1:p1", "terminal", herdr.AgentStatus.IDLE)
         shutdown_record.save([str(child.id)])
+        before = worker.PaneWorkerStates([worker_panes.ClosedWorker(child)], [run])
+        after = worker.PaneWorkerStates([state], [run])
         with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(staff, "local_snapshot", return_value=record),
-              patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [run])),
+              patch.object(worker, "_read_workers", side_effect=[before, after]),
               patch.object(worker_panes, "worker_run", return_value=run),
               patch.object(worker_panes, "_transcript_messages", return_value=["user:\nOne moment."]) as messages,
               patch.object(worker_panes, "close") as close, redirect_stdout(io.StringIO()) as output):
@@ -2524,6 +2527,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             return ["user:\nOne moment."]
 
         with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(staff, "local_snapshot", return_value=record),
               patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates(states, [run])),
               patch.object(worker_panes, "worker_run", return_value=run),
@@ -2553,16 +2557,27 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         director = herdr.TabSession("w1:p0", owner.name, "", owner.current_session)
         shutdown_record.save([str(child.id)])
         with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(staff, "local_snapshot", return_value=record),
               patch.object(worker, "resume_receipt", return_value=worker.DispatchNotSubmitted()) as receipt,
               patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [current, previous])),
               patch.object(worker_panes, "worker_run", return_value=current),
               patch.object(herdr.Herdr, "tab_sessions", return_value=[director]),
-              patch.object(herdr.Herdr, "prompt") as send, redirect_stdout(io.StringIO()) as output):
+              patch.object(herdr.Herdr, "prompt") as send,
+              patch.object(worker, "_dispatch_transcript", return_value=worker.TranscriptReceipt(
+                  worker.DispatchNotSubmitted(), frozenset())) as transcript,
+              redirect_stdout(io.StringIO()) as output):
             dispatch = progress_history.begin_dispatch(previous, slot=child.name, phase="46", role="impl",
                 worker_name=child.name, worker_id=child.id, launcher_command=["assign.sh"], prompt=prompt, kind="impl", lens="")
+            delivery = pass_record.DispatchDelivery(f"End your final reply with DONE {dispatch}.", dispatch, "")
+            progress_history.save_dispatch_delivery(previous, dispatch, delivery)
+
+            def accept_assignment(*_args: object, **_kwargs: object) -> None:
+                transcript.return_value = worker.TranscriptReceipt(worker.DispatchSubmitted(), frozenset())
+
+            send.side_effect = accept_assignment
             self.assertEqual(shutdown.main(["restart"]), 0)
-        receipt.assert_called_once_with(child, progress_history.ActiveDispatch(dispatch, ("assign.sh",)))
+        receipt.assert_called_once_with(child, progress_history.ActiveDispatch(dispatch, ("assign.sh",)), run=previous)
         send.assert_called_once_with(director.pane_id, resume_message.launcher_prompt(child.id, dispatch, ("assign.sh",)),
                                      target=str(owner.current_session))
         self.assertIn("1 of 1 sessions back", output.getvalue())
@@ -2584,6 +2599,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         saved = [str(child.id)]
         shutdown_record.save(saved)
         with (live_detached_run(previous, former), patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               staff.supplied_snapshot(record), patch.object(staff, "local_snapshot", return_value=record),
               patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [current, previous])),
               patch.object(worker_panes, "worker_run", return_value=current),
@@ -2628,6 +2644,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 
         recover = turn_end.recover_completion
         with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(staff, "local_snapshot", return_value=record),
               patch.object(staff, "backend", return_value=staff.ClaudeBackend()),
               patch.object(worker_admission, "transcript_source", return_value=source),
@@ -2682,6 +2699,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             return json.dumps({"type": role, "message": {"role": role, "content": text}}) + "\n"
 
         with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(staff, "local_snapshot", return_value=record),
               patch.object(staff, "backend", return_value=staff.ClaudeBackend()),
               patch.object(worker_admission, "transcript_source", return_value=source),
@@ -2979,7 +2997,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                 if incomplete:
                     fixture = set_up_fixture(scope.callback, WorkerPaneTests("runTest"))
                     config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-                    _ = write_config_fixture(config, "UPKEEP_ROW_WAIT_SECONDS=0\n")
+                    _ = write_config_fixture(config, "upkeep_row_wait_seconds=0\n")
                     owner = staff.rename(fixture.parent.id, "TEST-selected-owner")
                     other = fixture_member("unit", name="TEST-other-owner", parent=owner.parent)
                     selected = fixture.worker("TEST-selected")
@@ -3346,6 +3364,35 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                                             environment, herdr.NO_ENVIRONMENT_REMOVALS)
             self.assertEqual(pane, "w1:p0")
 
+    def test_restart_standalone_claude_preserves_its_implicit_home_after_loading_the_environment(self) -> None:
+        self.running.clear()
+        home = self.root / "source-home"
+        identity = self.rows[0].current_session
+        row = staff.StaffRow(identity, "session", "clone", staff.StaffRoot(), current_session=identity,
+                             launch_folder=staff.SessionLaunchFolder(remote.local_machine(), self.root),
+                             home=staff.SessionHome(home / ".claude"))
+        record = staff.StaffSnapshot((row,))
+        with patch.object(staff, "initial_snapshot", return_value=record):
+            entry = pane_record.launch("w1:p0", str(identity), str(self.root), {"HOME": str(home)}, ["claude", "-n", "clone"])
+            with (patch.object(pane_record, "publication_for_session",
+                      return_value=pane_launch.LaunchPublication(pane_record.record_path("agents"), entry)),
+                  patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                  patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
+                      self.root, {"HOME": "/inherited/home", "CLAUDE_CONFIG_DIR": "/inherited/account"})) as prepare,
+                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                      "w1:p0", herdr.PromptSubmissionNotRequired())) as launch):
+                self.assertEqual(restart.start_row(row, record, herdr.Herdr("agents"),
+                    worker_scope=restart.WorkerRestartScope.SELECTED_ROWS), "w1:p0")
+        supplied = cast(dict[str, str], prepare.call_args.args[2])
+        self.assertEqual(supplied["HOME"], str(home))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", supplied)
+        self.assertNotIn("CLAUDE_CODE_REMOTE_MEMORY_DIR", supplied)
+        self.assertEqual(prepare.call_args.args[3], frozenset({"CLAUDE_CONFIG_DIR"}))
+        prepared = cast(herdr.PreparedAgentEnvironment, launch.call_args.args[2])
+        self.assertEqual(prepared.env, {"HOME": str(home)})
+        self.assertEqual(prepared.unset_environment, frozenset({"CLAUDE_CONFIG_DIR"}))
+        self.assertEqual(prepared.claude_home, pane_launch.ImplicitClaudeHome(home))
+
     def test_start_row_uses_the_configured_opening_prompt_budget_only_for_claude_prompts(self) -> None:
         for start_seconds, opening_seconds in ((7, 43), (51, 17)):
             for kind, opening in (
@@ -3358,8 +3405,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                         self.running.clear()
                         config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
                         write_text_atomic(config,
-                            f"# range: 1..\nSTART_SECONDS={start_seconds}\n"
-                            + f"# range: 1..\nOPENING_PROMPT_SECONDS={opening_seconds}\n")
+                            f"# range: 1..\nstart_seconds={start_seconds}\n"
+                            + f"# range: 1..\nopening_prompt_seconds={opening_seconds}\n")
                         row = self.rows[0]
                         arguments = (["--resume", str(row.current_session)] if kind == "claude" else
                                      ["resume", str(row.current_session)])
@@ -3792,7 +3839,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 
     def test_saved_tab_waits_for_its_own_shell_and_never_splits(self) -> None:
         settings = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-        _ = write_config_fixture(settings, "OWN_PANE_SHELL_SECONDS=0.2\n")
+        _ = write_config_fixture(settings, "own_pane_shell_seconds=0.2\n")
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"staff_id": "row-0", "seen": 1}]}]}
         self.rows = (self.rows[0], replace(self.rows[1], kind="worker", parent=staff.ReportsTo(self.rows[0].id)), self.rows[2])
@@ -5330,7 +5377,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             with self.subTest(source=source, shared_checks=shared_checks):
                 self.running.clear()
                 now = [100.0]
-                start_seconds = READ_CONFIG("shutdown").number("START_SECONDS")
+                start_seconds = READ_CONFIG("shutdown").number("start_seconds")
                 exit_at = (100.3 if source == "exits within start" else
                            100.0 + start_seconds + 1 if source in ("exits during check", "missing publication") else math.inf)
                 locations = {"w1:p0": pane.copy()}

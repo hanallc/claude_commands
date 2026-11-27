@@ -3,8 +3,7 @@
 #
 # Usage: end_session.sh
 #
-# Clears the run pointer that prepare_session.sh stores in staff.
-# Ends each run that this session directs.
+# End and clean each run that this session directs.
 
 # Keeps workers and app-servers while their unit director is live. Otherwise,
 # pauses Codex workers and stops this run's servers after preserving queues.
@@ -20,6 +19,7 @@
 
 set -euo pipefail
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
+# shellcheck source=../lib/unit_env.sh
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
@@ -78,18 +78,38 @@ while IFS= read -r run; do
 done <<< "${HELD}"
 
 if (( ${#RUNS[@]} > 0 )); then
-  REMOVE_ARGS=()
+  PREPARED_RUN=""
+  if [[ -n "${SESSION_DIR}" && ! -e "${SESSION_DIR}/progress_history_state.json" && ! -L "${SESSION_DIR}/progress_history_state.json" ]]; then
+    PREPARED_RUN="${SESSION_DIR}"
+  fi
+  ENDED_RUNS=()
   for run in "${RUNS[@]}"; do
-    REMOVE_ARGS+=(--session-dir "${run}")
+    [[ "${run}" != "${PREPARED_RUN}" ]] || continue
+    if ! "$PY" -c 'from scripts.direct import progress_history; progress_history.main()' \
+      finish-run --session-dir "${run}" --status stopped; then
+      echo "end_session: run end failed for ${run}. If work still runs, run end_session.sh again after it stops." >&2
+      exit 1
+    fi
+    ENDED_RUNS+=("${run}")
   done
-  for run in "${RUNS[@]}"; do
-    cleanup "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}"
-  done
-  cleanup "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}"
-  cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked --owned-workspaces "${RUNS[@]}"
-  for run in "${RUNS[@]}"; do
-    cleanup "$PY" "${SCRIPT_DIR}/../production/staff.py" clear-run "${DIRECTOR_SESSION_ID}" "${run}"
-  done
+  if [[ -n "${PREPARED_RUN}" ]]; then
+    if ! "$PY" -c 'import sys; from pathlib import Path; from scripts.direct import remove_run_scratch, workers
+sys.exit(workers.finish_prepared_session(Path(sys.argv[3]), tuple(map(Path, sys.argv[4:])), remove_run_scratch.main))' \
+      --tracked --owned-workspaces "${PREPARED_RUN}" "${ENDED_RUNS[@]}"; then
+      echo "end_session: failed to end and clean ${PREPARED_RUN}. If work still runs, run end_session.sh again after it stops." >&2
+      exit 1
+    fi
+  else
+    REMOVE_ARGS=()
+    for run in "${RUNS[@]}"; do
+      REMOVE_ARGS+=(--session-dir "${run}")
+    done
+    for run in "${RUNS[@]}"; do
+      cleanup "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}"
+    done
+    cleanup "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}"
+    cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked --owned-workspaces "${RUNS[@]}"
+  fi
 else
   cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --owned-workspaces
 fi

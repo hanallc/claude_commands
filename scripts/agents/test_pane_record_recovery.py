@@ -141,8 +141,10 @@ class FakeClient(herdr.Herdr):
 
     @override
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
-                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
-        _ = (kind, opening, timeout_ms)
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *,
+                    publication: herdr.LaunchPublicationTiming = herdr.LaunchPublicationTiming.ON_START,
+                    ) -> herdr.PromptSubmissionNotRequired:
+        _ = (kind, opening, timeout_ms, publication)
         if not any(row["pane_id"] == pane for row in self.rows):
             self.rows.append({"pane_id": pane, "label": name, "workspace_id": "w1",
                               "terminal_id": pane + "-terminal"})
@@ -234,7 +236,7 @@ class PaneRecordRecoveryTests(unittest.TestCase):
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             _ = write_config_fixture(configuration / source.name)
         write_machine_config(configuration)
-        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
+        _ = write_config_fixture(configuration / "staff.conf", "producer_workspace=producers\n")
         registry = write_registry(configuration / "models.conf", {"producers": {"alpha": "claude:opus:max"}})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
         for pid in (123, 4242):

@@ -197,9 +197,9 @@ class FindingsLedgerTests(FindingsLedgerFixture):
     def test_changed_config_is_read_on_the_next_command_with_comments(self) -> None:
         _ = self.open_finding("blocker", "needs a repair")
         self.close_round(["F001"])
-        self.write_config("MIN_REPAIR_BUDGET=4 # current floor\n")
+        self.write_config("min_repair_budget=4 # current floor\n")
         first = self.gate()
-        self.write_config("MIN_REPAIR_BUDGET=8 # revised floor\n")
+        self.write_config("min_repair_budget=8 # revised floor\n")
         second = self.gate()
         self.assertEqual(first["repair_budget"], 4)
         self.assertEqual(second["repair_budget"], 8)
@@ -490,7 +490,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(payload["consecutive_same_kind"], {"kind": "fix", "count": 1})
 
     def test_refunded_launch_starts_spend_no_round_or_attempt(self) -> None:
-        self.write_config("MAX_CONSECUTIVE_SAME_KIND_PASSES=2\n")
+        self.write_config("max_consecutive_same_kind_passes=2\n")
         self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         self.write_progress_state("instance-a")
         _ = self.open_finding("blocker", "retry fails")
@@ -599,7 +599,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(payload["advisory"], "3 consecutive fix passes ran without the phase advancing")
 
     def test_refunded_dispatches_do_not_reach_the_runaway_advisory(self) -> None:
-        self.write_config("RUNAWAY_ROUNDS=2\n")
+        self.write_config("runaway_rounds=2\n")
         _ = self.open_finding("blocker", "retry fails")
         for _ in range(2):
             _ = self.run_command("dispatch", "--covers", "F001")
@@ -712,7 +712,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
 
     def test_the_repair_budget_floor_is_configurable(self) -> None:
         """direct.conf raises the floor, and the extra round is authorized."""
-        self.write_config("MIN_REPAIR_BUDGET=4\n")
+        self.write_config("min_repair_budget=4\n")
         for index in range(3):
             batch: list[str] = []
             for _ in range(2 if index % 2 == 0 else 1):
@@ -1000,7 +1000,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertIn("F002", partial.stderr)
 
     def test_no_history_does_not_count_a_ledger_dispatch_for_routing(self) -> None:
-        self.write_config("ROUTING_FROM_ROUND=2\n")
+        self.write_config("routing_from_round=2\n")
         _ = self.open_finding("blocker", "first")
         self.close_round(["F001"])
         (self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl").unlink()
@@ -1068,7 +1068,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertFalse(any(row["event_type"] == "finding_astra_review" for row in self.events()))
 
     def test_the_failed_fix_trigger_uses_the_configured_limit(self) -> None:
-        self.write_config("ASTRA_AFTER_FAILED_FIXES=1\n")
+        self.write_config("astra_after_failed_fixes=1\n")
         _ = self.open_finding("blocker", "retry")
         self.close_round(["F001"], verdict="still_open")
         self.assertEqual(self.gate()["astra_review_due"], ["F001"])

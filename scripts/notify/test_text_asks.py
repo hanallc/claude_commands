@@ -35,7 +35,7 @@ class TextAskTests(unittest.TestCase):
         self.approvals = root / "text-approvals"
         config = root / "config"
         config.mkdir()
-        _ = (config / "notify.conf").write_text("# range: 1..60\nTEXT_ASK_MINUTES=7\n", encoding="utf-8")
+        _ = (config / "notify.conf").write_text("# range: 1..60\ntext_ask_minutes=7\n", encoding="utf-8")
         _ = (config / "script_prompts.conf").write_text("# whole: 1..\nmax_records=4096\n", encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "NOTIFY_STATE_DIR": str(root),

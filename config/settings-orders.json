@@ -1,13 +1,12 @@
 {
+  "accounts": {
+    "login_sitting_interval_days": 25
+  },
   "aws_target": {
     "accounting_zone": 8
   },
   "build_admission": {
     "head_stall_alert_minutes": 9
-  },
-  "build_folders": {
-    "slots.Nates-MacBook-Pro-2023.cargo-liner.max": 14,
-    "slots.Nates-MacBook-Pro-2023.hana.max": 13
   },
   "build_targets": {
     "enabled.mac-linux": 22
@@ -27,10 +26,12 @@
     "sweep_build_floor_gib.natedev": 6
   },
   "mac_test": {
-    "offload": 21
+    "free_floor_gib": 27,
+    "offload": 21,
+    "probe_timeout_s": 26
   },
-  "merge_gate": {
-    "GATE_TIME_LIMIT_FACTOR": 5
+  "gate": {
+    "gate_time_limit_factor": 5
   },
   "send": {
     "review_hold": 16,
@@ -38,6 +39,7 @@
   },
   "statusline": {
     "account.claude2": 15,
+    "account.claude6": 24,
     "role.worker": 12
   },
   "user_zone": {

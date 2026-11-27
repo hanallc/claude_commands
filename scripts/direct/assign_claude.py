@@ -170,7 +170,7 @@ def claim_phase(run: Path, phase: str, cwd: Path, log: Path, status: Path | Uncl
     if phase:
         with log.open("a") as output:
             reserved = subprocess.run([PYTHON, str(SCRIPTS / "phase_reservation.py"), "claim",
-                "--session-dir", str(run), "--phase", phase, "--repo", str(cwd)],
+                "--session-dir", str(run), "--phase", phase, "--launch-cwd", str(cwd)],
                 env=env, stdout=output, stderr=subprocess.STDOUT)
         if reserved.returncode:
             print(f"ERROR: phase {phase} could not claim its files before its worker opens; see {log}.", file=sys.stderr)

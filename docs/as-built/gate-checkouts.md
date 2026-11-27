@@ -135,7 +135,7 @@ Run targeted tests with the source worktree's uncommitted changes and a merge, i
   --commit HEAD \
   --apply-uncommitted ~/worktrees/claude-build-followups-verify \
   --merge origin/builds -- \
-  ~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout '{tree}'
+  ./scripts/lib/py scripts/production/gate.py --affected
 ```
 
 `run --repo R --commit C [--apply-uncommitted W] [--merge REF] [--publish PATH ...]
@@ -153,8 +153,9 @@ Stdout prints `published: <absolute path> <full commit>` for each file.
 A path that does not exist prints `copies: publish: <path> not built` on stderr.
 A copy failure ends the scratch folder and prints `copies: publish: <error>` on stderr.
 Publication never changes the exit status of `run`.
-The scratch deadline removes the folder; the hourly sweep does the removal.
-The scratch default task has a random suffix, so `scratch.end()` removes only this folder.
+After the scratch deadline, the hourly sweep lists the eligible folder for vetted manual removal.
+The default scratch task has a random suffix.
+`scratch.end()` records task completion and keeps the folder for vetted manual removal.
 The folder is outside the cache root, so a unit reads it with no permission prompt.
 `/hana_shot` launches a gate build with the `published:` path as `--binary`.
 A unit never copies from a gate checkout's `target`.
@@ -248,7 +249,7 @@ Callers must finish all checkout access before the context ends.
 
 `hold --repo R --tree T --scratch` holds a checkout of staged tree `T` until its standard input closes.
 It prints the checkout path.
-`hold --repo R --tree T` without `--scratch` runs one slot step in that tree.
+`hold --repo R --tree T` without `--scratch` runs one step in a numbered copy of that tree.
 `hold` without `--tree` exits with status 2 and prints `copies: hold requires --tree. Run verify.sh again.` before it opens a checkout.
 That message reaches a `verify.sh` run that started before the `--tree` change.
 It reads the source owner, including the owner in a standing checkout's `.gate.json`.
@@ -309,16 +310,15 @@ An unset source or Git path inside interpreter text can also pass when its top-l
 | `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` | Clones external upstream at a version, not a copy of our work. |
 | `scripts/worktree/make_worktree.sh` | Makes an original work worktree, not a build copy. |
 
-Cargo gates use the first available cache slot.
-More than two Cargo gates for one owner and repository wait.
+Cargo gates use the lowest available copy number.
+If all existing copies are busy, the next gate takes the lowest unused number.
 TMPDIR cleanup at reboot removes checkouts left by killed gate processes.
 
 ## Remote mirrors
 
 `copies.py` creates and refreshes mirrors for Mac, Linux, and AWS targets.
 `offload.py` requests a mirror through this API.
-`mac_run.sh` creates and registers its test clone through the same implementation.
-Neither caller has a copy-creation exception.
+`mac_run.sh` requests a numbered copy on the Mac through `copies.py run`.
 
 `remote_lease_path(mirror)` names the lease beside the mirror's registry record.
 The claim service reads `/proc/locks` once and reports held mirrors by host, path, and session.
@@ -363,18 +363,17 @@ The lsof scanner accepts output only with exit status 0 or 1.
 Every other status makes the scan unavailable.
 The Linux scanner reports unreadable working directories during its single process scan.
 
-`target_config.slot_capacity` reads the slot capacity for claims and offload admission.
-Both callers raise `ConfigError` for a bad configured value, including an empty value.
-The required `missing` policy applies only when both capacity keys are absent.
-Mac claims still use one slot.
+Each SSH target permits one claim per repository.
+The claim reader keeps the saved file for each old numbered claim until release.
 Offload records use `owning_session.owning_session()` before the shell session fallback.
 Busy refusals can therefore name the unit director's session.
 
-After confirmed clone cleanup, `mac_run.sh` calls `copies.py unregister-remote` for both registry records.
-It removes the Mac's `localhost` record before the natedev record.
+`mac_run.sh` clears the numbered copy's keep file only after `stop-checkout` confirms the copy is clear.
+The queue retries scratch cleanup for an old smoke run with `argv.json.state`.
+It keeps the run record and receipt if cleanup fails.
+If the record names a task without a checkout path, the callback lists the record for manual cleanup.
 `unregister-remote` accepts only `--host` and `--path`.
 `mirror-remove` accepts `--host`; receive and use accept the command arguments.
-A failed clone cleanup keeps both records.
 A marked mirror probe starts no remote Python and skips `mirror_local_path`.
 An unmarked probe keeps the existing path check and metadata creation.
 

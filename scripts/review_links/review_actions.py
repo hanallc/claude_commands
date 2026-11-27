@@ -8,14 +8,15 @@ import sys
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from urllib.parse import urlencode
 
+from scripts.for_you.action import REVIEW_PATH
 from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
-from scripts.production import change_review, change_routing, investigation, proposal_issue, staff, update_registration
+from scripts.production import change_review, change_routing, investigation, proposal_issue, staff, the_list, update_registration
 from scripts.production.production_doc import Production
 from scripts.review_links import change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
 from scripts.review_links import question_path, question_record, reply_tokens
@@ -207,22 +208,35 @@ def resume_efficiency(item: review_items.ReviewItem) -> None:
             atomic_file.write_text_atomic(source.path, '\n'.join(lines)+'\n')
 
 
-def later(item: review_items.ReviewItem, value: str, words: str, *,
-          verify_revision: Callable[[], object] | None = None, root: Path | None = None) -> str:
-    if isinstance(item.source, review_items.ChangeSource) and isinstance(
-            item.source.assignment.production, change_routing.UnavailableProduction):
-        raise question_record.AnswerRefused("the production document is not available")
-    zone = user_zone()
-    selected = question_path.read_later(value, lambda time: time.replace(tzinfo=zone))
-    if isinstance(selected, question_path.UntilDelivered):
+def save_timed_park[Result](value: str, zone: tzinfo,
+                           save: Callable[[datetime, Callable[[datetime], None]], Result], *,
+                           require_offset: bool = False) -> Result:
+    """Pass the selected deadline and its check to the item's writer."""
+    def local_time(time: datetime) -> datetime:
+        if require_offset:
+            raise ValueError('a time must have a time zone')
+        return time.replace(tzinfo=zone)
+
+    until = question_path.read_later(value, local_time)
+    if isinstance(until, question_path.UntilDelivered):
         raise question_record.AnswerRefused('Review Later requires a time.')
-    until = selected.astimezone(zone)
+
+    def check_deadline(moment: datetime) -> None:
+        the_list.require_active_parking(until, moment)
+
+    return save(until, check_deadline)
+
+
+def _save_review_park(item: review_items.ReviewItem, until: datetime, words: str, *,
+                      check_deadline: Callable[[datetime], None],
+                      verify_revision: Callable[[], object] | None, root: Path | None) -> str:
     event = 'Later until '+question_path.write_later(until)+(': '+words if words else '')
 
     def record_later(publish_deadline: Callable[[], None]) -> None:
         def check_and_publish() -> None:
             if verify_revision is not None:
                 _ = verify_revision()
+            check_deadline(datetime.now(UTC))
             publish_deadline()
 
         record_action(item, event, root=root, check=check_and_publish)
@@ -232,6 +246,16 @@ def later(item: review_items.ReviewItem, value: str, words: str, *,
           else nullcontext()):
         review_later.save(item.key, until, record_log=record_later)
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
+
+
+def later(item: review_items.ReviewItem, value: str, words: str, *,
+          verify_revision: Callable[[], object] | None = None, root: Path | None = None) -> str:
+    if isinstance(item.source, review_items.ChangeSource) and isinstance(
+            item.source.assignment.production, change_routing.UnavailableProduction):
+        raise question_record.AnswerRefused("the production document is not available")
+    zone = user_zone()
+    return save_timed_park(value, zone, lambda until, check: _save_review_park(
+        item, until.astimezone(zone), words, check_deadline=check, verify_revision=verify_revision, root=root))
 
 
 def send(item: review_items.ReviewItem, path: Path, row: str, message: str, save: Callable[[], object],
@@ -259,16 +283,52 @@ class SubmissionDeliveryPending(OSError):
     """Another request is sending this item."""
 
 
+_READ_STAFF_AUTHORITY = staff.ReadStaffAuthority()
+
+
 def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words: str,
-                                status: change_page.DeliveryStatus, *, evidence_page: str = ""
+                                status: change_page.DeliveryStatus, *, evidence_page: str = "",
+                                members: staff.StaffSnapshot | staff.ReadStaffAuthority = _READ_STAFF_AUTHORITY
                                 ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     """Claim the first message for a published native request."""
-    return _claim_submission_delivery(saved.address, status, words=words, evidence_page=evidence_page)
+    with staff.supplied_snapshot(members) if isinstance(members, staff.StaffSnapshot) else nullcontext():
+        return _claim_submission_delivery(saved.address, status, words=words, evidence_page=evidence_page)
+
+
+def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
+    """Finish a staged List row before claiming its notice."""
+    route = review_submissions.list_filing_route(saved)
+    if isinstance(route, review_submissions.NoListFiling):
+        return
+    if isinstance(route, review_submissions.ListFilingUnavailable):
+        review_submissions.skip_list_filing(saved, route.reason)
+        return
+    key = review_items.submission_review_key(saved)
+    evidence = REVIEW_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
+    words = saved.words
+    try:
+        _ = the_list.add_review_item(route["keeper"], review_submissions.submission_title(words), owner=route["owner"],
+                                     producer=route["producer"], unit=route["unit"], words=words, evidence=evidence,
+                                     review_key=key, source=route["source"],
+                                     reservation=review_submissions.list_filing_reservation(saved))
+    except the_list.RetiredListProducer as error:
+        review_submissions.skip_list_filing(saved, str(error))
 
 
 def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus, *,
                                words: str = "", evidence_page: str = ""
                                ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    # Finish the List row under the recipient locks before taking the delivery lock.
+    with review_submissions.submission_for_delivery(address) as filing:
+        if isinstance(filing, review_submissions.NoNativeSubmission):
+            return change_page.NoMessageDelivery()
+        _ensure_list_filing(filing.saved())
+        assignment = filing.details.assignment
+    assignee = ""
+    if isinstance(assignment, new_item_dialog.ChosenAssignee):
+        name = review_items.name(assignment.id, staff.snapshot())
+        assignee = f"\n{name} is the assignee."
+
     with status.locked(), review_submissions.submission_for_delivery(address) as located:
         if isinstance(located, review_submissions.NoNativeSubmission):
             return change_page.NoMessageDelivery()
@@ -301,9 +361,17 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
         else:
             evidence = ""
             if evidence_page:
-                key = review_items.submission_item(saved, staff.snapshot()).key
+                key = review_items.submission_review_key(saved)
                 evidence = "\n\nEvidence in Review\n" + evidence_page + '#' + urlencode({'item': key})
-            message = (f'New {saved.kind} {saved.id} from Review.\n\n{words or saved.words}{evidence}\n\n'
+            notice = saved.details.notice
+            label = saved.kind.value
+            source = " from Review"
+            if isinstance(notice, new_item_dialog.SubmissionNotice):
+                if not isinstance(notice.kind, new_item_dialog.SubmissionKind):
+                    label = notice.kind.capitalize()
+                if notice.from_command:
+                    source = ""
+            message = (f'New {label} {saved.id}{source}.{assignee}\n\n{words or saved.words}{evidence}\n\n'
                        + change_page.reply_command(saved.key))
             record: change_page.StoredReviewMessage = {
                 'source': str(path), 'row': row, 'saved': True, 'owner': saved.owner,
@@ -337,7 +405,7 @@ def recover_submission_deliveries(status: change_page.DeliveryStatus, review_pat
             finally:
                 if isinstance(delivery, change_page.MessageDelivery):
                     status.release_recovery_claims((delivery.attempt,))
-        except (OSError, ValueError, RuntimeError) as error:
+        except (OSError, ValueError, RuntimeError, staff.StaffRefused) as error:
             print(f"Review first message {pending.address.request_id}: {error}", file=sys.stderr)
 
 

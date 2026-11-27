@@ -83,6 +83,9 @@ from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, fixture_session
 
 
+RELAY = send.relay
+
+
 def setUpModule() -> None:
     install_signal_pid_guard()
     install_guard_test_budget()
@@ -1164,12 +1167,6 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     self.assertEqual(len(error.getvalue().splitlines()), 1)
                     read.assert_not_called()
 
-    def test_review_watch_gets_a_reference_without_a_new_caller_argument(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "review_watch.acknowledge")
-        options = send.parse(["--to", "user", "--text-id", entry.id,
-                              *(item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}"))])
-        self.assertEqual(options.reference, {"kind": "review_watch"})
-
     def test_outcome_parser_preserves_first_header_payload_and_acknowledgement(self) -> None:
         acknowledged = send.acknowledged_skip_reason("shutdown-fixture", "2026-10-30T12:00:00+00:00")
         self.assertEqual(acknowledged, "key 'shutdown-fixture' acknowledged at 2026-10-30T12:00:00+00:00; `send.py reopen` to resume")
@@ -1243,9 +1240,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.relayed: list[send.Message] = []
         self.outcome: send.Result = send.Result("sent", "ok")
         self.cases: list[rca.Report] = []
-        # What the fake push review gives; None approves the draft. Each review's draft and time limit.
+        # The fake review approves the draft when the test supplies no verdict.
         self.verdict: review.ReviewOutcome | None = None
-        self.reviews: list[tuple[review.Draft, float]] = []
+        self.reviews: list[tuple[review.Draft, float, str]] = []
 
     @override
     def setUp(self) -> None:
@@ -1263,7 +1260,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.root = Path(directory.name)
         # No test opens a real rca.py case: it would write the machine's cases and message its owner.
         _ = self.enterContext(mock.patch.object(rca, "open_case", self.open_case))
-        # No test runs the real push review (claude -p): an auto_mode.refused send reviews its waits sentence.
+        # Use a fake review for the waits clause.
         _ = self.enterContext(mock.patch.object(review, "review", side_effect=self.review))
         for name, value in (("STATE", self.root), ("SESSIONS", self.root / "sessions"), ("relay", self.relay)):
             patcher = mock.patch.object(send, name, value)
@@ -2137,9 +2134,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.relayed.append(message)
         return self.outcome
 
-    def review(self, draft: review.Draft, revision: bool, *, limit: float = 0) -> review.ReviewOutcome:
+    def review(self, draft: review.Draft, revision: bool, *, limit: float = 0, text_id: str = "") -> review.ReviewOutcome:
         del revision
-        self.reviews.append((draft, limit))
+        self.reviews.append((draft, limit, text_id))
         return self.verdict or review.Approved(draft)
 
     def send(self, *args: str) -> send.Result:
@@ -2204,6 +2201,153 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(held, [held_notice(1, "recipient")])
         self.assertEqual(self.held_text().count("Same update."), 1)
         self.assertEqual(self.relayed, [])
+
+    def test_interrupted_review_release_keeps_one_continuation(self) -> None:
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
+        self.session("recipient", "Recipient")
+        at = send.now().timestamp()
+        key = "agents-resume:recipient:2026-11-24T08:31:00-08:00"
+        options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                 "--text", "Continue where you stopped."])
+        review_hold.set_count("recipient", 2, at, self.fail, record_keys=send.record_released_acceptances)
+        self.assertEqual(send.send(options).outcome, "kept")
+
+        # Leave the reservation that a stopped review process would leave before it files the messages.
+        path = review_hold.held_file("recipient").with_name("recipient.json")
+        reservation = cast(dict[str, object], json.loads(path.read_text()))
+        reservation["reserved"] = reservation["messages"]
+        reservation["messages"] = []
+        _ = path.write_text(json.dumps(reservation))
+        with send.key_states() as states:
+            del states[key]
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+
+        def interrupted(_notice: str) -> None:
+            self.assertTrue(send.once_accepted(key))
+            self.assertEqual(self.held_text().count("Continue where you stopped."), 1)
+            raise OSError("fixture notice interruption")
+
+        with self.assertRaisesRegex(OSError, "fixture notice interruption"):
+            review_hold.set_count("recipient", 0, at, interrupted, record_keys=send.record_released_acceptances)
+        released: list[str] = []
+        review_hold.set_count("recipient", 0, at + 30, released.append, record_keys=send.record_released_acceptances)
+        review_hold.set_count("recipient", 0, at + 60, released.append, record_keys=send.record_released_acceptances)
+        self.assertEqual(released, [held_notice(1, "recipient")])
+        self.assertEqual(self.held_text().count("Continue where you stopped."), 1)
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+        self.assertEqual(self.relayed, [])
+
+    def test_normal_mail_queues_when_an_offline_review_holds_a_continuation(self) -> None:
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
+        self.session("recipient", "Recipient")
+        at = send.now()
+        review_hold.set_count("recipient", 2, at.timestamp(), self.fail, record_keys=send.record_released_acceptances)
+        args = ["--to", "session:recipient"]
+        key = "agents-resume:recipient:2026-11-24T08:31:00-08:00"
+        continuation = local_options([*args, "--key", key, "--once-per-key",
+                                      "--text", "Continue where you stopped."])
+        self.assertEqual(send.send(continuation).outcome, "kept")
+        (self.root / "sessions/recipient.json").unlink()
+        with mock.patch.object(send, "now", return_value=at + timedelta(minutes=2)):
+            normal = send.send(local_options([*args, "--text", "An ordinary update."]))
+        self.assertEqual(normal.outcome, "queued")
+        self.session("recipient", "Recipient")
+        queued = send.pending("session:recipient")
+        self.assertIn("An ordinary update.", queued)
+        self.assertIn(held_notice(1, "recipient"), queued)
+        self.assertEqual(self.held_text().count("Continue where you stopped."), 1)
+
+    def test_once_queue_drain_records_acceptance_without_staff_calls_under_the_lock(self) -> None:
+        key = "agents-resume:recipient:2026-11-24T08:31:00-08:00"
+        options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                 "--text", "Continue where you stopped."])
+        self.assertEqual(send.send(options).outcome, "queued")
+        with send.key_states() as states:
+            del states[key]
+        self.session("recipient", "Recipient")
+        membership = staff.snapshot()
+
+        def read_staff() -> staff.StaffSnapshot:
+            with (self.root / ".lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return membership
+
+        with (mock.patch.object(staff, "snapshot", side_effect=read_staff) as read,
+              mock.patch.object(staff, "initial_snapshot", side_effect=AssertionError("unexpected staff read")),
+              mock.patch.object(staff, "set_hold", side_effect=AssertionError("unexpected staff write"))):
+            self.assertEqual(send.pending("session:recipient").count("Continue where you stopped."), 1)
+        read.assert_called_once_with()
+        self.assertEqual(send.pending("session:recipient"), "")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+
+    def test_once_send_retries_definite_failure_and_stops_after_acceptance(self) -> None:
+        self.session("recipient", "Recipient")
+        key = "test-continuation"
+        options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                 "--text", "Continue where you stopped."])
+        self.outcome = send.Result("failed", "fixture delivery failure")
+        self.assertEqual(send.send(options), send.Result("failed", send.BEFORE_ACCEPTANCE + "fixture delivery failure"))
+        self.assertFalse(send.once_accepted(key))
+        self.outcome = send.Result("sent", "fixture delivery confirmed")
+        self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+
+    def test_once_send_reclaims_a_dead_owner_before_the_relay(self) -> None:
+        self.session("recipient", "Recipient")
+        key = "interrupted-before-relay"
+        options = local_options(["--to", "recipient", "--recipient-kind", "unit", "--key", key,
+                                 "--once-per-key", "--text", "Continue where you stopped."])
+        stop_in_child(lambda: send.send(options), send, "relay", when="before")
+
+        session_record = self.root / "sessions/recipient.json"
+        recorded = session_record.read_text(encoding="utf-8")
+        session_record.unlink()
+        self.assertEqual(send.send(options).outcome, "pending")
+        self.assertEqual(self.relayed, [])
+
+        _ = session_record.write_text(recorded, encoding="utf-8")
+        self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+        self.assertEqual([message.key for message in self.relayed], [key])
+
+    def test_once_send_recovers_a_relay_receipt_after_the_sender_dies(self) -> None:
+        self.session("recipient", "Recipient")
+        for confirmed in (False, True):
+            with self.subTest(confirmed=confirmed):
+                key = f"interrupted-after-relay-{confirmed}"
+                delivered = self.root / key
+                options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                         "--text", "Continue where you stopped."])
+
+                def forward(message: send.Message, *_args: object) -> send.RelayTransportResponse:
+                    claim = message.direct_relay_claim
+                    assert isinstance(claim, send.DirectRelayClaim)
+                    send.mark_direct_relay_write(claim)
+                    with delivered.open("a", encoding="utf-8") as log:
+                        _ = log.write(message.text + "\n")
+                    return send.RelayTransportResponse(0, "", "", message.to,
+                        send.RelayRequestForwarded("fixture-tool", send.agent_text(message, via_relay=True)))
+
+                with (mock.patch.object(send, "relay", RELAY),
+                      mock.patch.object(send, "claude_binary", return_value="fixture-claude"),
+                      mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
+                      mock.patch.object(models_registry, "claude_model", return_value="fixture"),
+                      mock.patch("scripts.whoami.mac_fallback_token.prepare_child", return_value=False),
+                      mock.patch.object(send, "_bound_relay", side_effect=forward),
+                      mock.patch.object(send, "read_relay", return_value=send.CheckedRelayAcceptance("fixture-tool", "fixture"))):
+                    stop_in_child(lambda: send.send(options), send, "relay" if confirmed else "read_relay",
+                                  when="after" if confirmed else "before")
+                    result = send.send(options)
+                self.assertEqual(result.outcome, "skipped" if confirmed else "pending")
+                self.assertEqual(delivered.read_text(encoding="utf-8").splitlines(), ["Continue where you stopped."])
+
+    def test_once_send_allows_matching_message_and_recipient_keys(self) -> None:
+        self.session("recipient", "Recipient")
+        options = local_options(["--to", "session:recipient", "--key", "once", "--recipient-key", "once",
+                                 "--once-per-key", "--text", "Continue where you stopped."])
+        self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+        self.assertEqual(len(self.relayed), 1)
 
     def test_urgent_send_goes_through_an_open_review(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
@@ -2909,6 +3053,64 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 self.assertEqual(peer.recv(1), b"")
         self.assertEqual(self.claims("race"), {})
         self.assertFalse((self.root / "queue").exists())
+
+    def test_once_relay_refuses_a_staff_move_during_lock_acquisition(self) -> None:
+        _, row = self.canonical_recipient()
+        path = Path(row["messagingSocketPath"])
+        path.unlink()
+        producer = staff.StaffRow(staff.StaffId("fixed-producer"), "producer", "planner", staff.StaffRoot(),
+                                  current_session=staff.StaffId(row["sessionId"]))
+        self.staff_rows[producer.id] = producer
+        replacement = replace(producer, current_session=staff.StaffId("replacement"))
+        key = "race"
+        locked = send.locked
+        move_on_lock = False
+
+        @contextmanager
+        def move_on_relay_lock() -> Generator[None]:
+            nonlocal move_on_lock
+            if move_on_lock:
+                move_on_lock = False
+                self.staff_rows[producer.id] = replacement
+            with locked():
+                yield
+
+        def launch(command: list[str], prompt: str, _timeout: float, _environment: dict[str, str],
+                   _cwd: Path) -> tuple[int, str, str]:
+            nonlocal move_on_lock
+            destination = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
+                                                   if line.startswith("- to: "))))
+            payload = guarded_payload(command, destination, "Private")
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(3)
+                client.connect(destination[4:])
+                move_on_lock = True
+                client.sendall(relay_wire(payload))
+                client.shutdown(socket.SHUT_WR)
+            return 0, stream(INIT, call(STAND_IN, target=destination), answer(OK)), ""
+
+        options = local_options(["--to", producer.id, "--recipient-kind", "producer", "--from", "test",
+                                 "--key", key, "--once-per-key", "--summary", "Private", "--text", "Private body."])
+        with (socket.socket(socket.AF_UNIX) as listener,
+              mock.patch.object(send, "relay", REAL_RELAY),
+              mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
+              mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
+              mock.patch.object(models_registry, "claude_model", return_value="fixture"),
+              mock.patch.object(unit_lookup, "current_claude_record", REAL_CURRENT_CLAUDE_RECORD),
+              mock.patch.object(send, "locked", move_on_relay_lock),
+              mock.patch.object(send, "run", side_effect=launch)):
+            listener.bind(str(path))
+            listener.listen()
+            listener.settimeout(3)
+            result = send.send(options)
+            with listener.accept()[0] as old_peer:
+                old_peer.settimeout(3)
+                self.assertEqual(old_peer.recv(1), b"")
+        self.assertEqual(self.staff_rows[producer.id], replacement)
+        self.assertEqual(result, send.Result("failed", send.BEFORE_ACCEPTANCE
+                                             + "the session changed for staff ID fixed-producer"))
+        self.assertEqual(send.pending_deliveries(send.read_key_states().get(key, {"last": {}})), {})
+        self.assertEqual(self.claims(key), {})
 
     def test_raw_socket_queue_keeps_the_recipient_selected_before_replacement(self) -> None:
         canonical, row = self.canonical_recipient()
@@ -7125,30 +7327,31 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 *(item for key, value in values.items() for item in ("--value", f"{key}={value}")),
                 *(item for command in commands for item in ("--value", f"command={command}")), *extra]
 
-    def test_auto_mode_template_takes_its_sender_from_this_session_and_shows_each_refused_command(self) -> None:
+    def test_auto_mode_template_uses_its_sender_and_hides_refused_commands(self) -> None:
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "cargo-liner-style"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
-        options = local_options(self.auto_mode_arguments())
-        self.assertEqual(options.summary, "cargo-liner-style: modules commands refused")
+        options = local_options(self.auto_mode_arguments(waits="its build waits"))
+        self.assertEqual(options.summary, "modules: 2 commands refused; its build waits")
         self.assertEqual(options.sender, "cargo-liner-style")
         self.assertEqual(options.need, "decision")
         self.assertIn("sender=cargo-liner-style", options.values)
-        self.assertIn("rule_line=", options.values)
-        self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n"
-                      + "assign.sh --role implement --to modules-impl\nreview.sh --to modules-test\n\n"
-                      + "Go: the session runs these commands now, and auto mode can refuse these commands again.", options.text or "")
-        self.assertTrue((options.text or "").endswith("Allow rule: auto mode lets these commands run from then on."))
+        self.assertEqual(options.text, "Session: modules\n")
+        self.assertEqual(options.action, ActionRequired("On natedev, in the modules pane, type: Go: run the refused commands"))
+        self.assertNotIn("rule", send.template_values(options))
+        self.assertNotIn("rule_line", send.template_values(options))
         one = local_options(self.auto_mode_arguments(commands=("git push origin build-followups-messaging",),
-                                                     waits="The merge waits for it.", rule="Bash(git push:*)"))
-        self.assertIn("Auto mode refused a shell command in the modules session. The merge waits for it.\n"
-                      + "git push origin build-followups-messaging\n\n"
-                      + "Go: the session runs this command now, and auto mode can refuse this command again.", one.text or "")
-        self.assertTrue((one.text or "").endswith("lets this command run from then on. The rule: Bash(git push:*)"))
+                                                     waits="its merge waits", rule="Bash(git push:*)"))
+        self.assertEqual(one.summary, "modules: 1 command refused; its merge waits")
+        self.assertEqual(one.text, "Session: modules\n")
+        self.assertEqual(one.action, ActionRequired("On natedev, in the modules pane, type: Go: run the refused command"))
+        self.assertEqual(send.template_values(one)["rule"], "Bash(git push:*)")
+        self.assertEqual(send.refusal_report(one).commands, ("git push origin build-followups-messaging",))
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
         self.assertEqual(command[command.index("--text-id") + 1], "auto_mode.refused")
         self.assertIn("sender=cargo-liner-style", command)
+        self.assertEqual(self.cases[0].commands, ("assign.sh --role implement --to modules-impl", "review.sh --to modules-test"))
         for arguments in (self.auto_mode_arguments("--value", "sender=someone"), self.auto_mode_arguments("--from", "someone"),
                           self.auto_mode_arguments("--machine", "mac"), self.auto_mode_arguments(commands=()),
                           self.auto_mode_arguments(commands=("assign.sh", " ")), self.auto_mode_arguments(count="2"),
@@ -7194,60 +7397,70 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(len(cases), 1)
             self.assertFalse(cases[0].get("owner_told", True))
 
-    def test_the_rca_pushes_are_not_held_as_a_free_text_auto_mode_refusal(self) -> None:
-        values = {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
-                  "stop": "auto mode refused a shell command", "cause": "a helper ran a build command that needs your permission",
-                  "fix": "helpers use the build command that is always allowed"}
-        rendered = push_texts.render(rca.FIXED_TEXT, **values)
-        self.assertTrue(send.reports_auto_mode_refusal(rendered.title + "\n" + rendered.body))
-        for text_id in (rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT):
-            with self.subTest(text_id=text_id):
-                options = local_options(["--to", "user", "--summary", rendered.title, "--no-action", "--text", rendered.body])
-                self.assertEqual(send.wrong_template(options._replace(text_id=text_id), rendered.body), None)
-                self.assertEqual(send.wrong_template(options, rendered.body), send.AUTO_MODE_HELD)
-
-    def test_auto_mode_cuts_a_long_refused_command_to_90_characters(self) -> None:
+    def test_auto_mode_hides_long_commands_and_gives_rca_the_full_text(self) -> None:
         self.writer_session()
         exact, long = "a" * 90, "cargo test --workspace --all-features " + "b" * 60
         options = local_options(self.auto_mode_arguments(commands=(exact, long)))
-        self.assertIn(f"The P542 build waits for them.\n{exact}\n{long[:89]}…\n\nGo:", options.text or "")
+        self.assertEqual(options.summary, "modules: 2 commands refused")
+        self.assertEqual(options.text, "Session: modules\n")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(self.cases[0].commands, (exact, long))
 
     def test_auto_mode_waits_says_what_waits_and_gives_no_instruction(self) -> None:
         self.writer_session()
-        # The tile push that reached the phone: its waits gave a second action in a second session.
+        # The tile push gave a second action in a second session.
         tile = "Type ! kill -TERM -3137969 -3138422 in the cargo-liner session."
         for waits in (tile, "The build waits; type: /resume", "The merge waits in the cargo-liner pane"):
             with self.subTest(waits=waits), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
                 _ = send.parse(self.auto_mode_arguments(session="tile", commands=("cargo test -p tile",), waits=waits))
             self.assertIn("waits says only what waits", errors.getvalue())
-        options = local_options(self.auto_mode_arguments(waits="The merge waits for them.."))
-        self.assertIn(" in the modules session. The merge waits for them.\nassign.sh", options.text or "")
+        for waits, normalized in (
+            ("The merge waits for them..", "The merge waits for them"),
+            ("Type\nchecking for the modules build waits for the refused commands.",
+             "Type checking for the modules build waits for the refused commands"),
+        ):
+            with self.subTest(waits=waits):
+                options = local_options(self.auto_mode_arguments(waits=waits))
+                self.assertEqual(send.template_values(options)["waits"], normalized)
+                self.assertEqual(options.summary, "modules: 2 commands refused")
+                self.assertEqual(options.text, "Session: modules\n")
 
-    def test_auto_mode_keeps_its_waits_sentence_only_when_the_review_approves_it_within_30_seconds(self) -> None:
+    def test_auto_mode_reviews_its_waits_clause_within_30_seconds(self) -> None:
         self.writer_session()
-        options = local_options(self.auto_mode_arguments())
-        withheld = review.Withheld(review.Draft("s", "1", "t", NoActionRequired(), "b", False), "asks for nothing")
+        options = local_options(self.auto_mode_arguments(waits="its build waits"))
+        example = review.Draft("s", "1", "t", NoActionRequired(), "b", False)
+        withheld = review.Withheld(example, "asks for nothing")
+        title_issue = review.RuleFailure("title-names-the-stake", "modules: 2 commands refused")
+        action_issue = review.RuleFailure("every-choice-says-what-it-does", "Go: run the refused commands")
+        waits_issue = review.RuleFailure("plain-words", "its build waits")
         for verdict, kept in ((None, True), (review.Unreviewed("timeout"), False), (review.Unreviewed("review unavailable"), False),
-                              (review.Failed(review.Draft("s", "1", "t", NoActionRequired(), "b", False), ["plain-words"]), False),
-                              (review.Rewritten(review.Draft("s", "1", "t", NoActionRequired(), "b", False), ["plain-words"]), False),
+                              (review.Failed(example, ["plain-words"]), False),
+                              (review.Rewritten(example, ["plain-words"]), False),
+                              (review.Failed(example, [title_issue.rule, action_issue.rule], failures=(title_issue, action_issue)), True),
+                              (review.Failed(example, [action_issue.rule, waits_issue.rule], failures=(action_issue, waits_issue)), False),
                               (withheld, False)):
             self.verdict, self.reviews, self.cases = verdict, [], []
             with (self.subTest(verdict=verdict), mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run,
+                  mock.patch.object(send, "user", wraps=send.user) as deliver,
                   redirect_stderr(io.StringIO()) as errors):
                 self.assertEqual(send.send(options).outcome, "sent")
-            # The review reads the whole alert with its waits sentence, and holds it back at most 30 s.
-            [(draft, limit)] = self.reviews
+            [(draft, limit, text_id)] = self.reviews
             self.assertEqual(limit, send.waits_review_seconds())
             self.assertEqual(send.waits_review_seconds(), 30)
-            self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n", draft.body)
+            self.assertEqual(text_id, "auto_mode.refused")
+            self.assertEqual(draft.title, "modules: 2 commands refused")
+            self.assertEqual(draft.body, "its build waits.")
             pushed = cast(list[str], run.call_args.args[0])
-            self.assertIn("waits_line= The P542 build waits for them." if kept else "waits_line=", pushed)
-            text = cast(str, self.log()[-1]["text"])
-            self.assertIn("in the modules session. The P542 build waits for them.\nassign.sh" if kept else
-                          "Auto mode refused 2 shell commands in the modules session.\nassign.sh", text)
-            self.assertEqual(self.cases[0].waits, "The P542 build waits for them" if kept else "")
-            self.assertEqual("goes without its waits sentence" in errors.getvalue(), not kept)
-        # With the review off, or no waits sentence, nothing is reviewed.
+            self.assertIn("waits=its build waits" if kept else "waits=", pushed)
+            self.assertFalse(any(value.startswith("waits_line=") for value in pushed))
+            message = cast(send.Message, deliver.call_args.args[0])
+            title = "modules: 2 commands refused; its build waits" if kept else "modules: 2 commands refused"
+            self.assertEqual(message.summary, title)
+            self.assertEqual(self.log()[-1]["text"], "Session: modules")
+            self.assertEqual(self.cases[0].waits, "Its build waits" if kept else "")
+            self.assertEqual("goes without its waits clause" in errors.getvalue(), not kept)
+        # The switch disables the waits review.
         self.verdict, self.reviews = None, []
         (self.root / "notify").mkdir(exist_ok=True)
         _ = (self.root / "notify/review_off").write_text("")
@@ -7286,11 +7499,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
         options = local_options(self.auto_mode_arguments(session="types", commands=("save_counts.py --per-unit",),
                                                          waits="The trunk plan waits for it"))
-        self.assertEqual(options.summary, "cargo-liner: types command refused")
+        self.assertEqual(options.summary, "types: 1 command refused")
         self.assertEqual(options.sender, "cargo-liner")
         self.assertEqual(options.action, ActionRequired("On natedev, in the types pane, type: Go: run the refused command"))
-        self.assertIn("Auto mode refused a shell command in the types session. The trunk plan waits for it.\n"
-                      + "save_counts.py --per-unit", options.text or "")
+        self.assertEqual(options.text, "Session: types\n")
+        self.assertEqual(send.refusal_report(options).commands, ("save_counts.py --per-unit",))
 
     def test_a_free_text_auto_mode_refusal_is_held_with_the_template_call(self) -> None:
         self.writer_session()
@@ -7312,6 +7525,15 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
             self.assertEqual(send.send(local_options(self.user_arguments("--key", "plain"))).outcome, "sent")
 
+    def test_free_text_auto_mode_refusal_is_held_without_an_action(self) -> None:
+        for title, body in (("Build status", "Auto mode refused a command."),
+                            ("Auto mode", "The session refused a command.")):
+            with self.subTest(title=title):
+                options = send.parse(["--here", "--to", "user", "--no-action", "--summary", title, "--text", body])
+                self.assertEqual(options.text_id, "")
+                self.assertIsInstance(options.action, NoActionRequired)
+                self.assertEqual(send.wrong_template(options, f"{title}\n{body}"), send.AUTO_MODE_HELD)
+
     def test_help_lists_the_auto_mode_template_and_when_to_use_it(self) -> None:
         with redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
             _ = send.parse(["--help"])
@@ -7322,10 +7544,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("quota.paid_credits: an account now spends paid credits; a script with no Claude session names itself with --from.", output.getvalue())
         self.assertIn("quota.paid_credits_queued: an account now spends paid credits and the user queued a workers move;", output.getvalue())
         self.assertIn("session.needs_go: a session is stopped until the user types a go in its pane.", output.getvalue())
-        self.assertIn("permission.rca_started: a unit starts to fix the cause of a permission stop or refusal. Sent by"
-                      + f" rca.py start; sessions run rca.py, not this: {rca.CALL} start <id> --owner <unit>", output.getvalue())
-        self.assertIn("permission.rca_fixed: the fix merged; that permission does not stop or refuse the session again."
-                      + f" Sent by rca.py fixed; sessions run rca.py, not this: {rca.CALL} fixed <id>", output.getvalue())
 
     def needs_go_arguments(self, *extra: str, **changed: str) -> list[str]:
         values = {"session": "trunk", "machine": "natedev", "go": "Go: remove arrange_jacks/ from phases/130/files; 140 owns it",
@@ -7398,14 +7616,16 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_paid_credits_template_takes_its_sender_from_this_session_else_the_script_name(self) -> None:
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         # The session record wins over a name the caller gives.
         options = local_options(self.paid_credits_arguments("--value", "sender=quota_alert"))
-        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.summary, "codex2 now spends paid credits: 25,345 left")
         self.assertEqual(options.need, "decision")
         self.assertIn("sender=natedev", options.values)
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
-        self.assertTrue((options.text or "").startswith("codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT."))
+            "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none"))
+        self.assertEqual(options.text, "")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
@@ -7413,9 +7633,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("sender=natedev", command)
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
             script = local_options(self.paid_credits_arguments("--from", "quota_alert"))
-            self.assertEqual(script.summary, "quota_alert: codex2 now uses paid credits")
+            self.assertEqual(script.summary, "codex2 now spends paid credits: 25,345 left")
             self.assertEqual(local_options(self.paid_credits_arguments("--value", "sender=quota_alert")).summary,
-                             "quota_alert: codex2 now uses paid credits")
+                             "codex2 now spends paid credits: 25,345 left")
             with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
                 _ = local_options(self.paid_credits_arguments())
             self.assertIn("needs a sender", errors.getvalue())
@@ -7426,12 +7646,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                      *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         options = local_options([*arguments, "--value", "sender=quota_alert"])
-        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.summary, "codex2 uses credits until move: 25,345 left")
         self.assertEqual(options.need, "decision")
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
-        self.assertTrue((options.text or "").endswith("Turn off: workers stop and wait for your queued move."))
+            "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none"))
+        self.assertEqual(options.text, "")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
@@ -7439,13 +7661,15 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("sender=natedev", command)
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
             self.assertEqual(local_options([*arguments, "--from", "quota_alert"]).summary,
-                             "quota_alert: codex2 now uses paid credits")
+                             "codex2 uses credits until move: 25,345 left")
             with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
                 _ = local_options(arguments)
             self.assertIn("quota.paid_credits_queued needs a sender", errors.getvalue())
 
     def test_a_free_text_paid_credit_push_is_held_with_the_template_call(self) -> None:
         self.writer_session()
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         for title, text, action in (("codex2 now spends paid credits", "It refills Tue.", "Choose in natedev terminal."),
                                     ("Codex workers", "They spend credits now.", "Remove codex2 from codex_credit_accounts"),
                                     ("Codex workers", "They now use Paid-Credit time.", "Choose in natedev terminal.")):
@@ -8746,7 +8970,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.row_id = self.fixture.worker("impl").id
         self.fixture.world.add(self.row, "w1:p1")
         self.state = self.fixture.root / "messages"
-        _ = (self.fixture.root / "conf/direct.conf").write_text("WORKER_SPLIT_RATIO=0.667\n")
+        _ = (self.fixture.root / "conf/direct.conf").write_text("worker_split_ratio=0.667\n")
         _ = self.enterContext(mock.patch.object(send, "STATE", self.state))
         _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster([], [])))
         _ = self.enterContext(mock.patch.object(unit_lookup, "checked_conversation",
@@ -9291,6 +9515,14 @@ class PaneWorkerMessageTests(unittest.TestCase):
                 self.assertEqual(self.fixture.world.commands, before)
                 if state == "blocked":
                     self.assertIn("Worker blocked: worker is blocked", retained)
+                    marker = "Detached run: fixture"
+                    result = send.deliver_worker_text(row, staff.snapshot(), marker,
+                        sender="detached-runs", timeout=send.delivery_timeout(),
+                        receipt=send.WorkerResultReceipt(marker))
+                    self.assertEqual(result.outcome, "retry", result.detail)
+                    self.assertEqual(result.detail, "worker is blocked")
+                    self.assertEqual(self.fixture.world.commands, before)
+                    self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
                 elif state == "unknown":
                     notes = [line for line in errors.getvalue().splitlines() if "process read unavailable" in line]
                     self.assertEqual(len(notes), 1, errors.getvalue())

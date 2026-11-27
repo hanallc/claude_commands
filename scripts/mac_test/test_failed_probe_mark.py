@@ -44,7 +44,7 @@ class FailedProbeTests(OffloadCommandFixture):
         super().setUp()
         self.linux_settings = self.root / "box.conf"
         _ = write_config_fixture(self.linux_settings,
-            "offload=on\nhost=fake-box\nkinds=test,check,lint,doc,build\nslots=1\nslots.hana=1\n"
+            "offload=on\nhost=fake-box\nkinds=test,check,lint,doc,build\n"
             + "shell_timeout_s=2\nparity.rustc=fixture\nparity.nextest=fixture\n"
             + "parity.mend=fixture\nparity.scripts_commit=fixture\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
@@ -692,7 +692,7 @@ class StepRecoveryTests(VerifyLintScopeFixture):
     def test_local_work_finishes_while_a_new_step_recovers_linux(self) -> None:
         _ = write_config_fixture(self.root / "mac_test.conf", f"offload=on\nlinux_only.{self.root.name}=\n")
         _ = write_config_fixture(self.root / "linux.conf",
-            "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc,lint\nslots=1\n"
+            "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc,lint\n"
             + "devshell=default\nshell_cache=.local/state/build-target/shells\nshell_timeout_s=2\n"
             + "parity.rustc=fixture\nparity.nextest=fixture\nparity.mend=fixture\n"
             + "parity.scripts_commit=fixture\n", template="mac_test")

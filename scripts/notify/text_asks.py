@@ -147,7 +147,7 @@ def _answer(path: Path, session_id: str, pane: str, prompt: str, now: datetime) 
     if ask.session != session_id:
         return Refused("The ask belongs to another session.")
     try:
-        limit = conf.read("notify").number("TEXT_ASK_MINUTES") * 60
+        limit = conf.read("notify").number("text_ask_minutes") * 60
     except conf.Unusable as error:
         return Refused(f"Cannot read the ask time limit. {error}")
     if not 0 <= age < limit:
