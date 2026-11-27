@@ -1567,8 +1567,15 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
         self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
 
+    def assert_retirement_origin_report(self, output: str, expected: str, observed: str, *,
+                                        retained: str = "The branch stays.") -> None:
+        self.assertEqual([line for line in output.splitlines() if line.startswith("Origin mismatch")], [
+            f"Origin mismatch between {expected!r} and {observed!r}. {retained} "
+            + "The merge check does not prove a production merge."
+        ], output)
+
     def test_retirement_keeps_local_and_origin_tips_that_change_after_the_check(self) -> None:
-        for where in ("local", "origin", "push URL", "changed push URL", "push URL at deletion"):
+        for where in ("local", "origin", "push URL", "changed push URL", "push URL at deletion", "push only merge"):
             with self.subTest(where=where):
                 case = RetireUnitTests()
                 case.setUp()
@@ -1580,10 +1587,22 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     new = git(case.checkout, "commit-tree", "-p", old, "-m", "New work", f"{old}^{{tree}}")
                     origin = case.root / "origin.git"
                     other = case.root / "other.git"
-                    if where in ("push URL", "changed push URL", "push URL at deletion"):
+                    if where in ("push URL", "changed push URL", "push URL at deletion", "push only merge"):
                         _ = git(case.root, "clone", "-q", "--bare", str(origin), str(other))
-                    if where == "push URL":
+                    if where in ("push URL", "push only merge"):
                         _ = git(case.checkout, "remote", "set-url", "--push", "origin", str(other))
+                    if where == "push only merge":
+                        write_text_atomic(case.worktree / "work.txt", "only in the push repository\n")
+                        _ = git(case.worktree, "commit", "-qam", "Merge only on the push destination")
+                        tip = git(case.worktree, "rev-parse", "HEAD")
+                        _ = git(case.worktree, "push", "-q", "origin", "HEAD:refs/heads/main")
+                        code, output = case.retire()
+                        case.assertEqual(code, 1, output)
+                        case.assertIn(f"unmerged commits on alpha-branch: {tip}", output)
+                        case.assertEqual(staff.by_id(row.id), row)
+                        case.assertTrue(case.worktree.is_dir())
+                        case.assertEqual(case.stops(), [])
+                        continue
 
                     def advance(_identity: str) -> None:
                         if where == "local":
@@ -1605,23 +1624,16 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     with (mock.patch.object(copies, "remove_trees", side_effect=advance),
                           mock.patch.object(origin_deletion, "delete", side_effect=change_before_push)):
                         code, output = case.retire()
-                    self.assertEqual(code, 1, output)
-                    self.assertEqual(staff.by_id(row.id), row if where == "push URL" else None)
-                    if where == "push URL at deletion":
-                        self.assertIn("the configured push destination changed", output)
-                        self.assertEqual(git(case.checkout, "branch", "--list", "alpha-branch"), "")
-                        self.assertEqual(git(other, "rev-parse", branch), old)
-                    else:
-                        self.assertEqual(git(case.checkout, "rev-parse", branch), new if where == "local" else old)
+                    mismatch = where in ("push URL", "changed push URL", "push URL at deletion")
+                    self.assertEqual(code, 0 if mismatch else 1, output)
+                    self.assertIsNone(staff.by_id(row.id))
+                    self.assertEqual(git(case.checkout, "rev-parse", branch), new if where == "local" else old)
                     self.assertEqual(git(origin, "rev-parse", branch), new if where == "origin" else old)
-                    if where in ("local", "origin"):
-                        self.assertTrue(case.worktree.is_dir())
-                    if where in ("push URL", "changed push URL"):
-                        self.assertIn("origin fetch and push destinations differ", output)
-                        self.assertTrue(case.worktree.is_dir())
+                    self.assertEqual(case.worktree.is_dir(), not mismatch)
+                    if mismatch:
+                        case.assert_retirement_origin_report(output, str(origin), str(other))
                         self.assertEqual(git(other, "rev-parse", branch), old)
-                    if where == "push URL":
-                        self.assertEqual(case.stops(), [])
+                        self.assertFalse(shutdown.retirement_journal(row).exists())
                 finally:
                     case.doCleanups()
 
@@ -1640,73 +1652,143 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(self.stops(), [])
 
     def test_remote_legacy_retirement_uses_the_production_checkout(self) -> None:
-        self.park_without_worktree()
-        caller_checkout = self.root / "caller-checkout"
-        _ = git(self.root, "clone", "-q", str(self.root / "origin.git"), str(caller_checkout))
-        production = read_production("alpha")
+        for urls in ("same basename", "different suffix", "absolute SSH", "explicit SSH port", "equivalent"):
+            with self.subTest(urls=urls):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    case.park_without_worktree()
+                    origin = case.root / "origin.git"
+                    checkout = case.root / "caller-checkout"
+                    _ = git(case.root, "clone", "-q", str(origin), str(checkout))
+                    production = read_production("alpha")
+                    row = case.move_to_other_machine()
+                    row = staff.set_worktree(row.id, staff.RemovedWorktree("mac", case.worktree,
+                        staff.ParkedBranch("alpha-branch")), expected=row.worktree)
+                    self.assertFalse((case.worktree.parent / ".git").exists())
+                    _ = git(checkout, "branch", "alpha-branch", "origin/alpha-branch")
+                    tip = git(checkout, "rev-parse", "alpha-branch")
+                    selected = case.checkout
+                    host_origin = origin
+                    caller_url, host_url = str(origin), str(origin)
+                    match urls:
+                        case "same basename" | "different suffix":
+                            host_origin = case.root / "origin"
+                            if urls == "same basename":
+                                host_origin = case.root / "unrelated" / "origin.git"
+                                host_origin.parent.mkdir()
+                            _ = git(case.root, "clone", "-q", "--bare", str(origin), str(host_origin))
+                            selected = case.root / "other-checkout"
+                            _ = git(case.root, "clone", "-q", str(host_origin), str(selected))
+                            _ = git(selected, "branch", "alpha-branch", "origin/alpha-branch")
+                            _ = git(selected, "merge", "--ff-only", "alpha-branch")
+                            host_url = str(host_origin)
+                        case "absolute SSH":
+                            caller_url = "git@github.example:group/origin.git"
+                            host_url = "ssh://git@github.example/group/origin.git"
+                            self.assertEqual(shutdown.retirement_origin_identity(selected, host_url),
+                                shutdown.retirement_origin_identity(selected, "git@github.example:/group/origin.git"))
+                        case "explicit SSH port":
+                            caller_url = "ssh://git@github.example:22/group/origin.git"
+                            host_url = "ssh://git@github.example/group/origin.git"
+                        case "equivalent":
+                            caller_url = "https://github.example/group/origin"
+                            host_url = "git@github.example:group/origin.git"
+
+                    def peer_checkout(word: str) -> Path:
+                        self.assertEqual(remote.local_machine(), "mac")
+                        self.assertEqual(word, "origin")
+                        return selected
+
+                    def network_identity(context: Production, *, settings: conf.ConfigRead) -> shutdown.RetirementProduction:
+                        del settings
+                        url = host_url if context.checkout == selected and remote.local_machine() == "mac" else caller_url
+                        if urls == "equivalent":
+                            url = shutdown.retirement_origin_identity(context.checkout, url)
+                        return shutdown.RetirementProduction(context.merge_branch, url)
+
+                    with (mock.patch.object(shutdown, "retirement_production_of", return_value=replace(production, checkout=checkout)),
+                          mock.patch.object(worktree_records, "main_checkout_path", side_effect=peer_checkout),
+                          mock.patch.object(shutdown, "retirement_production_identity", side_effect=network_identity)):
+                        code, output = case.retire()
+                    self.assertEqual(code, 0, output)
+                    self.assertIsNone(staff.by_id(row.id))
+                    self.assertFalse(case.worktree.exists())
+                    self.assertFalse(shutdown.retirement_journal(row).exists())
+                    self.assertEqual(git(checkout, "rev-parse", "alpha-branch"), tip)
+                    if urls == "equivalent":
+                        self.assertNotIn("Origin mismatch", output)
+                        self.assertEqual(git(selected, "branch", "--list", "alpha-branch"), "")
+                        self.assertEqual(git(host_origin, "branch", "--list", "alpha-branch"), "")
+                    else:
+                        case.assert_retirement_origin_report(output, caller_url, host_url)
+                        self.assertEqual(git(selected, "rev-parse", "alpha-branch"), tip)
+                        self.assertEqual(git(host_origin, "rev-parse", "alpha-branch"), tip)
+                        self.assertEqual(git(origin, "rev-parse", "alpha-branch"), tip)
+                finally:
+                    case.doCleanups()
+
+    def test_retirement_keeps_the_mismatched_branch_on_a_pane_retry(self) -> None:
+        self.retire_with_mismatched_origin(detached=False)
+
+    def test_retirement_saves_unmerged_production_history_from_a_detached_checkout(self) -> None:
+        self.retire_with_mismatched_origin(detached=True)
+
+    def retire_with_mismatched_origin(self, *, detached: bool) -> None:
         row = self.move_to_other_machine()
-        row = staff.set_worktree(row.id, staff.RemovedWorktree("mac", self.worktree,
-            staff.ParkedBranch("alpha-branch")), expected=row.worktree)
-        self.assertFalse((self.worktree.parent / ".git").exists())
-        _ = git(caller_checkout, "branch", "alpha-branch", "origin/alpha-branch")
-        caller_tip = git(caller_checkout, "rev-parse", "alpha-branch")
-        other_origin = self.root / "unrelated" / "origin.git"
-        other_origin.parent.mkdir()
-        _ = git(self.root, "clone", "-q", "--bare", str(self.root / "origin.git"), str(other_origin))
-        other_checkout = self.root / "unrelated-checkout"
-        _ = git(self.root, "clone", "-q", str(other_origin), str(other_checkout))
-        _ = git(other_checkout, "branch", "alpha-branch", "origin/alpha-branch")
-        local_origin_without_suffix = self.root / "origin"
-        _ = git(self.root, "clone", "-q", "--bare", str(self.root / "origin.git"), str(local_origin_without_suffix))
-        selected = other_checkout
+        origin = self.root / "origin.git"
+        other = self.root / "other.git"
+        authority = self.root / "authority-checkout"
+        _ = git(self.root, "clone", "-q", str(origin), str(authority))
+        _ = git(self.root, "clone", "-q", "--bare", str(origin), str(other))
+        _ = git(self.checkout, "remote", "set-url", "origin", str(other))
+        branch = "refs/heads/alpha-branch"
+        tip = git(self.checkout, "rev-parse", branch)
+        if detached:
+            _ = git(self.worktree, "switch", "--detach")
+            write_text_atomic(self.worktree / "work.txt", "only on the other origin\n")
+            _ = git(self.worktree, "commit", "-qam", "Work on the other origin")
+            tip = git(self.worktree, "rev-parse", "HEAD")
+            _ = git(self.worktree, "push", "-q", "origin", "HEAD:refs/heads/main")
+        read_identity = shutdown.retirement_production_identity
 
-        def peer_checkout(word: str) -> Path:
-            self.assertEqual(remote.local_machine(), "mac")
-            self.assertEqual(word, "origin")
-            return selected
+        def production_origin(context: Production, *, settings: conf.ConfigRead) -> shutdown.RetirementProduction:
+            if remote.local_machine() != "mac":
+                context = replace(context, checkout=authority)
+            return read_identity(context, settings=settings)
 
-        with (mock.patch.object(shutdown, "retirement_production_of", return_value=replace(production, checkout=caller_checkout)),
-              mock.patch.object(worktree_records, "main_checkout_path", side_effect=peer_checkout)):
-            code, output = self.retire()
-            self.assertEqual(code, 1, output)
-            self.assertIn("origin does not match the production repository", output)
-            self.assertIsNotNone(staff.by_id(row.id))
-            self.assertEqual(git(other_checkout, "rev-parse", "alpha-branch"), caller_tip)
-            self.assertEqual(git(other_origin, "rev-parse", "alpha-branch"), caller_tip)
-            self.assertEqual(self.stops(), [])
-            _ = git(other_checkout, "remote", "set-url", "origin", str(local_origin_without_suffix))
-            code, output = self.retire()
-            self.assertEqual(code, 1, output)
-            self.assertIn("origin does not match the production repository", output)
-            self.assertEqual(git(local_origin_without_suffix, "rev-parse", "alpha-branch"), caller_tip)
-            self.assertEqual(git(other_checkout, "rev-parse", "alpha-branch"), caller_tip)
-            selected = self.checkout
-
-            host_url = "ssh://git@github.example/group/origin.git"
-            caller_url = "git@github.example:group/origin.git"
-
-            def network_identity(context: Production, *, settings: conf.ConfigRead) -> shutdown.RetirementProduction:
-                del settings
-                url = host_url if context.checkout == self.checkout and remote.local_machine() == "mac" else caller_url
-                return shutdown.RetirementProduction(context.merge_branch, shutdown.retirement_origin_identity(context.checkout, url))
-
-            with mock.patch.object(shutdown, "retirement_production_identity", side_effect=network_identity):
+        with mock.patch.object(shutdown, "retirement_production_identity", side_effect=production_origin):
+            if detached:
                 code, output = self.retire()
+            else:
+                with mock.patch.object(shutdown, "retirement_close_idle_shell", return_value=False) as close:
+                    code, output = self.retire()
                 self.assertEqual(code, 1, output)
-                self.assertIn("origin does not match the production repository", output)
-                self.assertEqual(staff.by_id(row.id), row)
-                self.assertEqual(git(self.checkout, "rev-parse", "alpha-branch"), caller_tip)
-                self.assertEqual(self.stops(), [])
-                self.assertEqual(shutdown.retirement_origin_identity(self.checkout, host_url),
-                                 shutdown.retirement_origin_identity(self.checkout, "git@github.example:/group/origin.git"))
-                caller_url = "https://github.example/group/origin"
-                host_url = "git@github.example:group/origin.git"
-                code, output = self.retire()
-        self.assertEqual(code, 0, output)
+                close.assert_called_once()
+        journal = self.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
         self.assertIsNone(staff.by_id(row.id))
-        self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
-        self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
-        self.assertEqual(git(caller_checkout, "rev-parse", "alpha-branch"), caller_tip)
+        self.assertFalse(self.worktree.exists())
+        if detached:
+            self.assertEqual(code, 0, output)
+            recovery = f"refs/retirement/{row.id}/{tip}"
+            self.assert_retirement_origin_report(output, str(origin), str(other), retained=f"Recovery ref {recovery} stays.")
+            self.assertEqual(git(self.checkout, "rev-parse", recovery), tip)
+            self.assertEqual(git(self.checkout, "show", f"{recovery}:work.txt"), "only on the other origin")
+            self.assertNotEqual(git(origin, "rev-parse", "main"), tip)
+            self.assertEqual(git(other, "rev-parse", "main"), tip)
+        else:
+            self.assert_retirement_origin_report(output, str(origin), str(other))
+            self.assertTrue(journal.exists())
+            self.assertEqual(git(self.checkout, "rev-parse", branch), tip)
+            self.assertEqual(git(other, "rev-parse", branch), tip)
+            _ = git(self.checkout, "remote", "set-url", "origin", str(origin))
+            code, output = self.retire()
+            self.assertEqual(code, 0, output)
+            self.assert_retirement_origin_report(output, str(origin), str(other))
+            self.assertEqual(git(self.checkout, "rev-parse", branch), tip)
+            self.assertEqual(git(other, "rev-parse", branch), tip)
+            self.assertEqual(git(origin, "rev-parse", branch), tip)
+        self.assertFalse(journal.exists())
 
     def test_retirement_retry_keeps_the_new_terminal_after_the_old_shell_exits(self) -> None:
         row = staff.by_id(self.unit_staff_id)
@@ -1964,8 +2046,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         case.assertIsNone(staff.authority_snapshot().by_id(case.unit_staff_id))
                         return close(identity, terminal=terminal)
                     remove = shutdown.retirement_remove
-                    def remove_worktree(unit: shutdown.RetiringUnit, checked: shutdown.RetirementCheck, *, settings: conf.ConfigRead) -> list[str]:
-                        return ["TEST-removal failed"] if removal_fails else remove(unit, checked, settings=settings)
+                    def remove_worktree(unit: shutdown.RetiringUnit, checked: shutdown.RetirementCheck, *,
+                                         settings: conf.ConfigRead, saved: dict[str, object]) -> list[str]:
+                        return ["TEST-removal failed"] if removal_fails else remove(unit, checked, settings=settings, saved=saved)
                     with (mock.patch.object(unit_move, "processes_inside", side_effect=inside),
                           mock.patch.object(shutdown, "retirement_process_session", return_value=""),
                           mock.patch.object(shutdown, "retirement_proc_start", return_value="TEST-start"),
@@ -2015,8 +2098,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                                                  {"CLAUDE_CONFIG_DIR": str(case.config)}, ["claude", "-n", other.name])
                     replacement = pane_launch.retained_launch(observed, staff.snapshot())
                     remove = shutdown.retirement_remove
-                    def replace_after_cleanup(unit: shutdown.RetiringUnit, checked: shutdown.RetirementCheck, *, settings: conf.ConfigRead) -> list[str]:
-                        result = remove(unit, checked, settings=settings)
+                    def replace_after_cleanup(unit: shutdown.RetiringUnit, checked: shutdown.RetirementCheck, *,
+                                         settings: conf.ConfigRead, saved: dict[str, object]) -> list[str]:
+                        result = remove(unit, checked, settings=settings, saved=saved)
                         case.assertEqual(result, [])
                         case.pane_world.locations["w1:p1"]["terminal_id"] = "TEST-new-terminal"
                         case.pane_world.locations["w1:p1"]["label"] = other.name
@@ -2402,7 +2486,8 @@ fi
                         raise staff.StaffUnreadable(f"fixture {failure} failed")
 
                     remove = shutdown.retirement_remove
-                    def blocked_remove(unit: shutdown.RetiringUnit, checked: shutdown.RetirementCheck, *, settings: conf.ConfigRead) -> list[str]:
+                    def blocked_remove(unit: shutdown.RetiringUnit, checked: shutdown.RetirementCheck, *,
+                                         settings: conf.ConfigRead, saved: dict[str, object]) -> list[str]:
                         case.assertEqual(remote.local_machine(), "mac")
                         if failure == "remove":
                             return ["fixture removal failed"]
@@ -2410,7 +2495,7 @@ fi
                             _ = git(case.checkout, "worktree", "remove", "--force", str(case.worktree))
                             _ = git(case.checkout, "branch", "-D", "alpha-branch")
                             return ["fixture branch deletion failed"]
-                        result = remove(unit, checked, settings=settings)
+                        result = remove(unit, checked, settings=settings, saved=saved)
                         return ["fixture completion failed"] if failure == "branch" else result
                     def stop(identity: str, *, deadline: float = math.inf) -> StopResult:
                         case.assertEqual(remote.local_machine(), "mac")

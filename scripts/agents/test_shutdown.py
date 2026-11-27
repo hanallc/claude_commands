@@ -109,7 +109,7 @@ class EnrolledProductionShutdownTests(StaffTestCase):
                 retiring = shutdown.RetiringUnit(production, unit.name, target, branch, unit)
                 with redirect_stderr(io.StringIO()) as notices:
                     checked = shutdown.retirement_check(retiring, settings=settings)
-                    result = shutdown.retirement_remove(retiring, checked, settings=settings)
+                    result = shutdown.retirement_remove(retiring, checked, settings=settings, saved={})
                 if kept:
                     self.assertIn("protected production", result[0])
                     self.assertEqual(notices.getvalue(), "")
@@ -663,7 +663,7 @@ class ProducerCommandsTests(unittest.TestCase):
               patch.object(shutdown, "retirement_remove", return_value=[]) as remove,
               patch.object(copies, "remove_trees") as trees, redirect_stdout(io.StringIO()) as output):
             code = shutdown.retirement_clear_worktree(unit, settings=settings, record=record,
-                pane_workers=[], pane=herdr.NoPane("alpha"), origin=checked.origin, cleanup_token=token)
+                pane_workers=[], pane=herdr.NoPane("alpha"), origin=checked.origin, cleanup_token=token, saved={})
         self.assertEqual(code, 0, output.getvalue())
         self.assertIn(["build_hold.py", "release", "--holder", member.id], case.calls)
         self.assertFalse(fixed_hold.exists())
