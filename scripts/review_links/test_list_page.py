@@ -4119,7 +4119,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         self.assertEqual(body.count('<tbody data-list-item'), 5)
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
-        controls = body.split('data-record-filters>', 1)[1].split('<p data-missing-item', 1)[0]
+        controls = body.split('data-record-filters>', 1)[1].split('<p data-hidden-action-status', 1)[0]
         self.assertNotIn('<select', controls)
         self.assertEqual(body.count('type="search"'), 1)
         self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
