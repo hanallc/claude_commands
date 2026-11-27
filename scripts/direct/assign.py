@@ -1025,7 +1025,8 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
             return recorded.returncode
     parent = worker_admission.parent(staff.snapshot(), run=run)
     private_helper = unit_runs.read_run_fields(run).get(unit_runs.PRIVATE_HELPER_SLOT) == args.new_worker
-    target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer")
+    target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer",
+                                      worker_panes.DispatchRun(run))
     policy = pane_policy(args.policy or "astra-reviewer", model=args.model, effort=args.effort)
     before = staff_worker.rows_before_launch()
     with ExitStack() as notices, worker_panes.worker_lock(target.parent, target.name) as hold, ExitStack() as cleanup:
