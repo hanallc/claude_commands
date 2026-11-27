@@ -9,6 +9,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -182,6 +183,19 @@ def producer_defaults() -> ProducerProfile:
     return profile
 
 
+def _claude_producer_configuration(configuration: LaunchModelConfiguration, model: str) -> LaunchModelConfiguration:
+    """Use the family effort list to validate an unlisted, versioned Claude ID."""
+    versioned = re.fullmatch(r"claude-([a-z]+)-[0-9]+(?:-[0-9]+)*", model)
+    if versioned is None:
+        return configuration
+    agents = parse_registry(configuration.text).get("claude.agents", {})
+    if model in agents or versioned[1] not in agents:
+        return configuration
+    row = registry_rows.RowChange("claude.agents", model, f"{model}={agents[versioned[1]]}")
+    text = registry_rows.replay(configuration.text, [row], False)
+    return LaunchModelConfiguration(configuration.path, text, tuple(registry_rows.records(text)))
+
+
 def launch_settings(section: str, key: str, family: Literal["claude", "codex", "assigned"] = "assigned", *,
                     configuration: LaunchModelConfiguration | None = None) -> LaunchSettings:
     """Read launch settings through the existing shell resolver.
@@ -199,6 +213,8 @@ def launch_settings(section: str, key: str, family: Literal["claude", "codex", "
             profile = parse_producer_profile(value)
         except ValueError as error:
             raise ValueError(f"invalid launch settings for {section}.{key}: {error}") from error
+        if section == "producers" and profile.family == "claude":
+            configuration = _claude_producer_configuration(configuration, profile.model)
         resolver_arguments = [profile.family, f"{profile.model}:{profile.effort}"]
         resolver = ('AGENT_FAMILY="$4"; _agents_validate_pair "$2.$3" "$4" "$5" && '
                     '_agents_resolve_service_tier "$2.$3" "$4"')

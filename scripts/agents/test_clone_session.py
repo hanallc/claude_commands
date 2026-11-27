@@ -132,9 +132,10 @@ class CloneCommandTests(StaffTestCase):
         assert call is not None
         return cast(herdr.PreparedAgentEnvironment, call.args[2])
 
-    def clone_producer(self) -> tuple[staff.StaffRow, staff.StaffRow]:
+    def clone_producer(self, *, opus_alias: str = "opus") -> tuple[staff.StaffRow, staff.StaffRow]:
         registry = self.root / "models.conf"
-        _ = write_registry(registry, {"producers": {"morty": "claude:sonnet:medium"}})
+        _ = write_registry(registry, {"producers": {"morty": "claude:sonnet:medium"},
+                                      "claude.families": {"opus": opus_alias}})
         _ = self.enterContext(cast(AbstractContextManager[object], patch.dict(os.environ, {
             "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0", "MODELS_CONFIG_TIER_ONLY": "1",
         })))
@@ -185,16 +186,27 @@ class CloneCommandTests(StaffTestCase):
         producer, clone = self.clone_producer()
         profiles = models_registry.parse_registry(models_registry.registry_text())["producers"]
         self.assertEqual(profiles[producer.name], "claude:sonnet:medium")
-        self.assertEqual(profiles[clone.name], "claude:opus:high")
+        self.assertEqual(profiles[clone.name], "claude:claude-opus-4-8:high")
+        self.assert_producer_resume(clone.name, "claude-opus-4-8")
+
+    def test_producer_clone_resumes_the_exact_model_outside_the_catalog(self) -> None:
+        _, clone = self.clone_producer(opus_alias="claude-opus-4-7")
+        registry = models_registry.parse_registry(models_registry.registry_text())
+        self.assertNotIn("claude-opus-4-8", registry["claude.agents"])
+        self.assert_producer_resume(clone.name, "claude-opus-4-8")
+        self.assertEqual(registry["producers"][clone.name], "claude:claude-opus-4-8:high")
+
+    def assert_producer_resume(self, name: str, model: str) -> None:
         home = self.clone_scratch / ".claude4"
 
         def start(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, label: str, _message: str) -> sessions.LiveSessionProcess:
             self.assertEqual((tab.pane_id, tab.session_id, label), (FORK_PANE, FORK, "claude4"))
             self.assertEqual(entry["cwd"], str(self.folder))
             self.assertEqual(entry["environment"]["CLAUDE_CONFIG_DIR"], str(home))
-            arguments = stop_resume.resume_arguments(entry)
+            environment = {**os.environ, **entry["environment"]}
+            arguments = models_registry.claude_arguments(stop_resume.resume_arguments(entry), environment)
             self.assertEqual(arguments[:2], ["--resume", FORK])
-            self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
+            self.assertEqual(arguments[arguments.index("--model") + 1], model)
             self.assertEqual(arguments[arguments.index("--effort") + 1], "high")
             return sessions.LiveSessionProcess(456)
 
@@ -208,7 +220,7 @@ class CloneCommandTests(StaffTestCase):
               patch.object(stop_resume, "_watch_resume")):
             diagnostic = io.StringIO()
             with redirect_stderr(diagnostic):
-                result = shutdown.main(["resume", clone.name])
+                result = shutdown.main(["resume", name])
             self.assertEqual(result, 0, diagnostic.getvalue())
         launch.assert_called_once()
 
@@ -222,7 +234,7 @@ class CloneCommandTests(StaffTestCase):
         profiles = models_registry.parse_registry(models_registry.registry_text())["producers"]
         self.assertEqual(profiles[producer.name], "claude:sonnet:medium")
         self.assertNotIn(clone.name, profiles)
-        self.assertEqual(profiles["morty-new"], "claude:opus:high")
+        self.assertEqual(profiles["morty-new"], "claude:claude-opus-4-8:high")
         renamed = staff.initial_snapshot().by_id(clone.id)
         assert renamed is not None
         self.assertEqual((renamed.name, renamed.current_session, renamed.clone_of),

@@ -2190,10 +2190,10 @@ def create_producer_clone(name: str, identity: str, clone_of: ProducerClone,
             raise StaffUnreadable(f"{name}: cannot read the shared launch profile: {error}") from error
         return row
 
-    profile_saved = False
+    profile_write_started = False
 
     def edit(rows: list[StaffRow]) -> StaffRow:
-        nonlocal profile_saved
+        nonlocal profile_write_started
         source = _row_by_id(rows, clone_of.source)
         if source is None or source.kind != "producer":
             raise StaffRefused(f"{clone_of.source}: producer clone source is unavailable")
@@ -2202,8 +2202,8 @@ def create_producer_clone(name: str, identity: str, clone_of: ProducerClone,
         row = _ensure_row(rows, "producer", name, STAFF_ROOT, worktree=folder, runtime_id=identity)
         clone = replace(row, home=home, clone_of=clone_of)
         rows[rows.index(row)] = clone
+        profile_write_started = True
         _ = models_registry.store_producer(name, *profile)
-        profile_saved = True
         return clone
 
     with slot_operation("producer-marker-" + name.casefold(), name):
@@ -2212,17 +2212,23 @@ def create_producer_clone(name: str, identity: str, clone_of: ProducerClone,
             registry = models_registry.parse_registry(models_registry.registry_text())
             if any(key.casefold() == name.casefold() for key in registry.get("producers", {})):
                 raise StaffRefused(f"{name}: the registry already has a producer key")
-            if (profile.family == "claude" and profile.model.startswith("claude-")
-                    and profile.model not in registry.get("claude.agents", {})):
-                # The registry can use a model alias when it has no key for the exact model ID.
-                alias = profile.model.removeprefix("claude-").partition("-")[0]
-                profile = models_registry.ProducerProfile(profile.family, alias, profile.effort)
             return _transaction(edit)
-        except StaffRefused:
-            if profile_saved:
+        except (OSError, StaffRefused, ValueError) as error:
+            if not profile_write_started:
+                if isinstance(error, ValueError):
+                    raise StaffRefused(str(error)) from error
+                raise
+            # A write can fail after it makes the row or profile visible.
+            try:
+                admitted = _load(initial=True).by_id(native_id(identity))
+            except StaffUnreadable as read_error:
+                raise StaffUnreadable(f"{name}: cannot confirm clone admission after {error}: {read_error}") from read_error
+            if admitted is not None:
+                raise StaffUnreadable(str(error)) from error
+            try:
                 models_registry.remove_producer(name, profile)
-            raise
-        except ValueError as error:
+            except (OSError, ValueError) as cleanup_error:
+                raise StaffRefused(f"{error}; cannot remove the clone profile: {cleanup_error}") from cleanup_error
             raise StaffRefused(str(error)) from error
 
 
