@@ -655,7 +655,9 @@ class ProducerCommandsTests(unittest.TestCase):
         settings = conf.read("production")
         checked = shutdown.retirement_check(unit, settings=settings)
         token = "a" * 32
-        authority = staff.StaffSnapshot((parent,), retirement_cleanup={member.id: token})
+        assert isinstance(member.worktree, staff.PresentWorktree)
+        claim = staff.RetirementCheckoutClaim(token, member.worktree.machine, unit.worktree.resolve(), unit.worktree)
+        authority = staff.StaffSnapshot((parent,), retirement_cleanup={member.id: claim})
         with (patch.object(staff, "authority_snapshot", return_value=authority),
               patch.object(staff, "require_stopped"),
               patch.object(shutdown, "retirement_remove", return_value=[]) as remove,

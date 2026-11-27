@@ -1364,14 +1364,17 @@ def retirement_origin_identity(checkout: Path, url: str) -> str:
     location = retirement_origin_location(checkout, url)
     if location.startswith("/"):
         return location
-    if url.startswith(("https://", "ssh://")):
+    if url.startswith("https://"):
         network = urlsplit(url)
         if (not network.hostname or network.query or network.fragment
-                or network.port not in (None, 443 if network.scheme == "https" else 22)
-                or network.scheme == "ssh" and network.username not in (None, "git")):
+                or network.port not in (None, 443)):
             return url
         return build_repository.remote_identity(url, str(checkout))
     if "://" not in url and url.startswith("git@") and not any(character in url for character in "?#\r\n\t"):
+        host, _, path = url.partition(":")
+        # Git sends absolute SCP paths as absolute SSH paths.
+        if path.startswith("/"):
+            return f"ssh://{host}{path}" if not path.startswith("/~") and "%" not in path else url
         return build_repository.remote_identity(url, str(checkout))
     return url
 
@@ -1772,9 +1775,7 @@ def retire_remote_unit(row: staff.StaffRow, record: staff.StaffSnapshot, fields:
     parent = record.parent_of(row)
     assert parent is not None
     identity = remote_retirement_production(parent, fields.get("retirement"), settings=settings)
-    saved = saved_retirement(row)
-    if "cleanup_token" in saved:
-        saved = {}
+    saved = active_retirement(row, record)
     if saved:
         checkout, branch = Path(str(saved["checkout"])), str(saved["branch"])
     elif isinstance(location, staff.RemovedWorktree):
@@ -2076,11 +2077,22 @@ def saved_retirement(row: staff.StaffRow) -> dict[str, object]:
     return saved
 
 
+def active_retirement(row: staff.StaffRow, record: staff.StaffSnapshot) -> dict[str, object]:
+    saved = saved_retirement(row)
+    if "cleanup_token" not in saved:
+        return saved
+    parent = record.parent_of(row)
+    workers = record.find(kind="worker", parent=row.id)
+    if (saved.get("completed_row") == row.to_json() and parent is not None
+            and saved.get("parent") == parent.to_json()
+            and saved.get("workers") == [worker.to_json() for worker in workers]):
+        return saved
+    return {}
+
+
 def retire_local_unit(unit: RetiringUnit, *, settings: conf.ConfigRead,
                       record: staff.StaffSnapshot, saved: dict[str, object]) -> int:
     row = unit.staff_member
-    if "cleanup_token" in saved:
-        saved = {}
     if saved:
         branch = str(saved["branch"])
         checkout = Path(str(saved["checkout"]))
@@ -2099,7 +2111,8 @@ def retire_local_unit(unit: RetiringUnit, *, settings: conf.ConfigRead,
                 return 1
     parent = record.parent_of(row)
     assert parent is not None
-    token = uuid4().hex
+    previous_token = saved.get("cleanup_token")
+    token = previous_token if isinstance(previous_token, str) else uuid4().hex
     if not saved:
         pane = retirement_pane(row, record)
         saved = {
@@ -2121,12 +2134,14 @@ def retire_local_unit(unit: RetiringUnit, *, settings: conf.ConfigRead,
 
 def require_retirement_receipt(row: staff.StaffRow, token: str) -> None:
     current = staff.authority_snapshot()
-    if current.by_id(row.id) is not None or current.retirement_cleanup.get(row.id) != token:
-        raise staff.StaffRefused(f"{row.name}: the staff record does not confirm retirement")
+    claim = current.retirement_cleanup.get(row.id)
     location = row.worktree
-    if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree)) and any(
-            isinstance(member.worktree, staff.PresentWorktree) and unit_machine_is_local(member.worktree.machine)
-            and member.worktree.path.resolve() == location.path.resolve() for member in current.rows):
+    if (current.by_id(row.id) is not None or not isinstance(claim, staff.RetirementCheckoutClaim)
+            or claim.token != token or isinstance(location, staff.WorktreeUnfilled)
+            or location.path.resolve() != claim.path):
+        raise staff.StaffRefused(f"{row.name}: the staff record does not confirm retirement")
+    if any(isinstance(member.worktree, staff.PresentWorktree) and unit_machine_is_local(member.worktree.machine)
+           and member.worktree.path.resolve() == claim.path for member in current.rows):
         raise staff.StaffRefused(f"{location.path}: another member holds the worktree")
 
 
@@ -2189,7 +2204,7 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
             production = retirement_production_of(unit.production.name, record=current)
             if production != unit.production or current.parent_of(row) != production.owner:
                 raise staff.StaffRefused(f"{row.name}: the production changed before retirement")
-            code = retire_local_unit(unit, settings=settings, record=current, saved=saved_retirement(row))
+            code = retire_local_unit(unit, settings=settings, record=current, saved=active_retirement(row, current))
             if code:
                 return code
     else:
@@ -2253,13 +2268,15 @@ def finish_retirement_on_worktree_host(row: staff.StaffRow) -> int:
             raise ValueError("the retirement journal changed before cleanup")
         if saved.get("cleanup_complete") is not True:
             try:
+                current = staff.authority_snapshot()
+                if current.retirement_cleanup.get(row.id) == token:
+                    staff.remove_unit_for_retirement(row, parent, workers, token)
                 require_retirement_receipt(row, token)
                 checkout = Path(str(saved["checkout"]))
                 merge_branch = saved.get("merge_branch")
                 if not checkout.is_absolute() or not isinstance(merge_branch, str) or not merge_branch:
                     raise ValueError("the retirement journal has no production checkout or merge branch")
                 known = {member.id for member in members.rows}
-                current = staff.authority_snapshot()
                 record = staff.StaffSnapshot((*members.rows, *(member for member in current.rows if member.id not in known)))
                 production = Production(Path(), parent.name, merge_branch, checkout, Path(), ZoneInfo("UTC"), parent)
                 unit = RetiringUnit(production, row.name, location.path, str(saved["branch"]), row)
