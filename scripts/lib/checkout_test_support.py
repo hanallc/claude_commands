@@ -137,7 +137,7 @@ def direct_test_fixture_environment(root: Path, *, seconds: int | None = None) -
                                  f"# whole: 1..\ndirect_test.time_limit_seconds={seconds}\n")
     environment = {**os.environ, "TMPDIR": str(root), "CONF_DIR": str(config),
                    "XDG_CACHE_HOME": str(root / "cache"), "CLAUDE_PYTHON": sys.executable}
-    for name in ("GATE_PARENT_PID", "DEVTOOLS_GATE_PARENT_SOURCE_FD",
+    for name in ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID", "DEVTOOLS_GATE_PARENT_SOURCE_FD",
                  "TEST_TIMES_OUT", RUN_FOLDER_ENV):
         _ = environment.pop(name, None)
     return environment

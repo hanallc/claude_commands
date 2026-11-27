@@ -61,7 +61,7 @@ An empty override value also selects those helpers.
 Other callers use `$HOME/.claude/scripts`.
 This rule covers admission, hold, target, release wait, detached run, recipient registration, and unit retirement helpers.
 Test fixtures create no helper links in the real home.
-`gate.py` already runs from the installed copy; its hold reader remains unchanged.
+`merge_gate.py` already runs from the installed copy; its hold reader remains unchanged.
 
 Service waiters retain `repository_name` separately from `step`.
 Reservations retain `repo` separately from `step`.
@@ -1782,7 +1782,7 @@ They also register the nearest command agent when its recipient key differs from
 It checks the command first, then each ancestor in order.
 At each process, `CODEX_THREAD_ID` gives the key `codex:<thread>` before `CLAUDE_CODE_SESSION_ID` gives a Claude session key.
 The cycle keeps both recipients without adding a field.
-The enforcer does not signal `verify.sh` or `gate.py` without a call id.
+The enforcer does not signal `verify.sh`, `targeted_test.py`, or `merge_gate.py` without a call id.
 Each waits at its own hold gate.
 With a call id, the record decides.
 Verify routes eligible steps to the Mac and waits for other steps.
@@ -1816,10 +1816,10 @@ Runs shorter than one pass can finish first, so call guards refuse those starts.
 **Build call guard.** `settings.json` installs `scripts/hooks/pre-tool-use-build-hold-guard.sh` for Bash PreToolUse. 
 The Bash front reads stdin once.
 It starts no Python when the hold directory has no entry.
-It also starts no Python when the input contains neither `cargo` nor `gate.py`.
+It also starts no Python when the input has none of `cargo`, `merge_gate`, or `targeted_test`.
  An unreadable hold path also starts the decision reader. Otherwise it passes the same input to `pre-tool-use-build-hold-guard.py` and relays its output and status. The guard refuses raw building `cargo` verbs (including short forms and `+toolchain`) while a non-holder natedev hold applies; removal ends that holder’s hold. All `verify.sh` calls pass, with or without a step record: verify routes eligible steps to the Mac during the hold and waits for other steps. Non-building calls pass. The Python guard checks the command through `tool_call_text.py`, checks for a hold entry, then imports `scripts/build_hold/hold_applies.py` in the same process. The helper uses `target_state(local_target())`, `natedev_holds` and `caller_holds_only_own()`. The sole in-force holder may build. Other sessions see `natedev builds are held by <holder>. Keep working, writes included. Use verify.sh: eligible steps go to the Mac; other steps wait. Raw cargo and gate jobs must wait for the hold to end.` Only in-force holders are named, with `holder_text`. The helper exits 0 with that refusal on stdout, 1 silently when builds may run, or 2 with a read error on stderr. The guard denies hold read errors and any other exception in its decision path with a one-line reason that names the failed read. Only an explicit allow decision permits a build; no wait is registered.
 The cargo verbs include `mend` and `miri`; the guard does not match `verify.sh` step names or options.
-The guard also refuses `gate.py` in every mode under the same hold decision.
+The guard also refuses `merge_gate.py` and `targeted_test.py` in every mode under the same hold decision.
 This applies to direct calls and calls through Python or `lib/py`.
 The refusal tells the caller to run after the hold ends.
 Quoted mentions and written examples pass.

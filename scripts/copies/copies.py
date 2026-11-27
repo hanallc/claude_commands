@@ -51,7 +51,7 @@ from scripts.buildlog import treekey
 from scripts.lib.build_copies import CopyGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    GATE_SCRIPTS,
+    GATE_SCRIPTS, MERGE_GATE_PROGRAMS,
     OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, command_program,
     parse_command_program, read_step_names, verify_command,
 )
@@ -1580,9 +1580,9 @@ def gate_command_source_check(command: Sequence[str], *,
         return None
     script, arguments = program
     launcher = Path(script)
-    if launcher.name not in GATE_SCRIPTS:
+    if launcher.name not in MERGE_GATE_PROGRAMS:
         return None
-    relative = Path(GATE_SCRIPT)
+    relative = Path(GATE_SCRIPT).with_name(launcher.name)
     launcher_checkout = None
     if launcher.is_absolute():
         from scripts.lib.python_startup.sitecustomize import checkout_root
@@ -1599,7 +1599,7 @@ def gate_command_source_check(command: Sequence[str], *,
         path = parser_root / GATE_SCRIPT
         if path.resolve() != path:
             raise CopyError(f"Use the regular {GATE_SCRIPT} file in {parser_root}.")
-        if launcher_checkout is None:
+        if launcher_checkout is None and launcher.name == "gate.py":
             expanded = [part.replace("{tree}", str(source)) for part in command] if numbered_copy else command
             if not first_step.canonical_gate_command(expanded, source):
                 return
@@ -2852,7 +2852,7 @@ def run_prepared_gate(command: Sequence[str], *, cwd: Path, descriptors: tuple[i
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
     program = parse_command_program(command)
-    if not isinstance(program, OtherCommand) and program[0] in GATE_SCRIPTS:
+    if not isinstance(program, OtherCommand) and program[0] in MERGE_GATE_PROGRAMS:
         arguments = program[1]
         if "-h" not in arguments and "--help" not in arguments:
             error = first_step.gate_module_mode_error(

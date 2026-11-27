@@ -623,7 +623,6 @@ class MergeGateFixture(unittest.TestCase):
         _ = self.git(self.checkout, "config", "user.email", "gate@example.invalid")
         _ = self.git(self.checkout, "remote", "add", "origin", str(self.origin))
         self.write(self.checkout / "settings.json", '{"fixture": true}\n')
-        self.write(self.checkout / "config/gate.conf", GATE_TEST_SETTINGS)
         self.write(self.checkout / "subject.txt", "base\n")
         self.write(self.checkout / "Cargo.toml", "[workspace]\n")
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")

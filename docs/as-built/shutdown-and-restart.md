@@ -1083,7 +1083,7 @@ A bare call from a Claude director stays attached.
 `assign.sh` does not detach the commands that its worker starts later.
 
 Survival of a gate run in a Claude background shell is unproved.
-`copies.py run` starts the gate attached, and `gate.py` stops its module groups on TERM or HUP.
+`copies.py run` starts the gate attached, and `merge_gate.py` stops its module groups on TERM or HUP.
 Before another run, check for a complete saved gate result.
 Put a gate that must survive a restart in a detached run.
 

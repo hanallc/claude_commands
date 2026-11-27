@@ -43,6 +43,7 @@ def load_tests(loader, tests, pattern):
     return tests
 '''
 COPY_TARGETED_RUN = COPY_IMPORT_AUDIT + '''
+import runpy
 from unittest import mock
 from scripts.copies import copies
 from scripts.production import gate
@@ -55,11 +56,11 @@ def selected_suite(repo, *args, **kwargs):
     return gate.run_suites(repo, machine=gate.WholeMachine(),
         selected=gate.SelectedModules(('scripts/build_targets/test_copy_imports.py',)),
         mode=kwargs['mode'])
-sys.argv = [str(root / 'scripts/production/gate.py'), '--affected', '--repo', str(root)]
+sys.argv = [str(root / 'scripts/production/targeted_test.py'), '--repo', str(root)]
 with (mock.patch.object(copies, 'take_prepared_gate_handoff', return_value=True),
       mock.patch.object(gate, 'run_gate_suites', side_effect=selected_suite)):
     try:
-        raise SystemExit(gate.main())
+        runpy.run_path(sys.argv[0], run_name='__main__')
     finally:
         audit()
 '''

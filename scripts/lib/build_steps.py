@@ -95,8 +95,15 @@ RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "t
     "targeted-test", "merge-gate", "gate", "integrate", "test-all", "test-modules",
     "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote", HAND_MADE.step}
 QUEUE_STEP_DISPLAY = {"run": "cargo run", "test-modules": "test named", HAND_MADE.step: "hand made"}
-GATE_SCRIPTS = frozenset({"gate.py"})
-GATE_STEPS = frozenset({"gate", "test-affected", "merge-gate", "targeted-test"})
+MERGE_GATE_PROGRAMS = ("gate.py", "merge_gate.py")
+GATE_PROGRAMS = {
+    "gate": MERGE_GATE_PROGRAMS,
+    "test-affected": (*MERGE_GATE_PROGRAMS, "targeted_test.py"),
+    "merge-gate": MERGE_GATE_PROGRAMS,
+    "targeted-test": ("targeted_test.py",),
+}
+GATE_STEPS = frozenset(GATE_PROGRAMS)
+GATE_SCRIPTS = frozenset(script for programs in GATE_PROGRAMS.values() for script in programs)
 # The assigned target started no tests. A claim failure can allow the queue to place the gate again.
 GATE_PRELAUNCH_REFUSED_STATUS = 79
 # The assigned target could have started tests and supplied no verdict.
@@ -255,7 +262,8 @@ def live_process_arguments(process: Path, start_time: str) -> list[str] | Comman
 
 def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> StepJob | OtherCommand | CommandUnreadable:
     """Read the gate job from the gate process or its copies.py supervisor."""
-    if step not in GATE_STEPS:
+    expected = GATE_PROGRAMS.get(step, ())
+    if not expected:
         return OTHER_COMMAND
     try:
         argv = live_process_arguments(process, start_time) if start_time else process_arguments(process)
@@ -265,7 +273,7 @@ def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> 
         return argv
     copied = copies_run_command(argv)
     command = copied.arguments if isinstance(copied, CopiesRunCommand) else argv
-    return command_job(command) if command_program(command) in GATE_SCRIPTS else OTHER_COMMAND
+    return command_job(command) if command_program(command) in expected else OTHER_COMMAND
 
 
 def _test_job(arguments: Sequence[str], *, affected: bool) -> StepJob:
@@ -282,12 +290,12 @@ def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
     if isinstance(program, OtherCommand):
         return program
     name, arguments = program
+    if name == "targeted_test.py" or (name in MERGE_GATE_PROGRAMS and "--affected" in arguments):
+        return _test_job(arguments, affected=True)
     if name == "verify.sh":
         return _verify_step(arguments)
-    if name not in GATE_SCRIPTS:
+    if name not in MERGE_GATE_PROGRAMS:
         return OTHER_COMMAND
-    if "--affected" in arguments:
-        return _test_job(arguments, affected=True)
     branch = _option(arguments, "--merge-branch")
     if "--nightly" in arguments:
         return StepJob("test-nightly", branch=branch)

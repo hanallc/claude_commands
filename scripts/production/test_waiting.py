@@ -105,7 +105,7 @@ def setUpModule() -> None:
 class LiteralScratchCommandTests(unittest.TestCase):
     def test_only_literal_command_words_can_use_admission_before_the_slot(self) -> None:
         literal = ('bash verify.sh check sample', 'bash "verify.sh" check "sample package"',
-                   "python3 gate.py --affected --repo scripts/production")
+                   "python3 targeted_test.py --repo scripts/production")
         shell = ('bash verify.sh check "$PKG"', 'bash verify.sh check ${PKG}',
                  'bash verify.sh check $(printf sample)', 'bash verify.sh check `printf sample`',
                  'bash verify.sh check sample*', 'bash verify.sh check sample?',

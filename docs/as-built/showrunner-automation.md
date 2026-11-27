@@ -292,7 +292,7 @@ Sync refuses incoming paths that overlap the live document, LOG, or notes.
   Publication records survive promotion failure.
   A style notice becomes complete only after successful delivery.
   A completed child handoff retry changes nothing and sends no second notice.
-  Local and Mac promotion use the [shared edited-path check](merge-gate-and-test-speed.md#the-gate-scriptsproductiongatepy).
+  Local and Mac promotion use the [shared edited-path check](merge-gate-and-test-speed.md#the-gate-scriptsproductionmerge_gatepy).
 - **Review numbers.** The unit obtains `--review-trial` from `progress_history.py review-trial`.
   The checkpoint command passes `--phase-id <phase id>` for the phase it checkpoints.
   [Review regime records](review-regime-trial.md) define the counts, times, types, and checkpoint parser.
@@ -532,7 +532,7 @@ Sync refuses incoming paths that overlap the live document, LOG, or notes.
 - **Unit targeted tests.** A `claude_commands` unit runs `gate.py --affected` through `copies.py run`.
   Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
   The gate uses the shared runner with affected-module selection.
-- **The `~/.claude` repo's own gate.** `scripts/production/gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
+- **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
   The gate runs all test modules under a memory governor.
   Basedpyright runs only with `--nightly`.
   Recursive discovery sorts module paths and uses the first folder under `scripts/` as the suite.

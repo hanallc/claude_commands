@@ -2422,15 +2422,16 @@ def live_state_refusal(repo: Path, target: str) -> str:
         except (OSError, subprocess.SubprocessError) as error:
             return f"promotion refused: live state check could not export {target}: {error}"
         settings = tree / "config" / "gate.conf"
-        if not settings.is_file():
-            old_settings = "config/merge_gate.conf"
-            if (tree / old_settings).is_file():
-                return f"promotion refused: {target} has only {old_settings}. Move the live state checks to config/gate.conf."
+        # Chunk 6 removes the old config path.
+        if not settings.exists():
+            settings = tree / "config" / "merge_gate.conf"
+        if not settings.exists():
             return ""
+        # A target tree from before these checks names none.
         config = conf.read(settings)
+        if "live_state_checks" not in config.values():
+            return ""
         try:
-            if not config.values("live_state_checks"):
-                return ""
             checks = config.words("live_state_checks")
             seconds = config.whole("live_state_check_seconds")
         except conf.Unusable as error:

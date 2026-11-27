@@ -64,8 +64,8 @@ import sys
 original_exit = argparse.ArgumentParser.exit
 
 def checked_exit(parser, status=0, message=None):
-    from scripts.production import gate
-    print("gate module identity:", gate is sys.modules["__main__"])
+    from scripts.production import gate, merge_gate
+    print("gate module identity:", gate is merge_gate is sys.modules["__main__"])
     original_exit(parser, status, message)
 
 argparse.ArgumentParser.exit = checked_exit
@@ -80,7 +80,7 @@ argparse.ArgumentParser.exit = checked_exit
             self.assertIn("--affected", result.stdout)
 
     def test_a_targeted_run_with_no_session_names_the_worktree_owner(self) -> None:
-        # An affected gate with no session names the owner of its queue requests.
+        # targeted_test under systemd, or with no session, still names who started its queue requests.
         observed: list[dict[str, str]] = []
 
         def suites(_repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:

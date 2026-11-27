@@ -45,8 +45,11 @@ class GateResultUnknown(GatePlacementIncomplete):
 
 class SuiteMode(Enum):
     """Choose the step and whether the runner selects affected modules."""
+    # Callers outside scripts/production use the old names; chunk 6 removes these aliases.
     GATE = "gate"
+    MERGE_GATE = "gate"
     TARGETED = "test-affected"
+    TARGETED_TEST = "test-affected"
 
     @classmethod
     @override
