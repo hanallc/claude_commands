@@ -1639,6 +1639,8 @@ if(example.filterOn){
  check(longTitle.offsetHeight>shortTitle.offsetHeight,'The long title wraps.');
  const titleStyle=getComputedStyle(longTitle);
  const topStyle=getComputedStyle(document.querySelector('[data-top-band] .list-top-link'));
+ check(longTitle!==document.activeElement && titleStyle.color===getComputedStyle(links().querySelector('.list-state')).color &&
+  titleStyle.textDecorationLine==='underline','The unfocused link uses the accent color and an underline.');
  check(['color','fontSize','fontWeight','textDecorationLine'].every(field=>titleStyle[field]===topStyle[field]),
   'The linked item uses the same style as the Top priority link.');
  refreshMarkup=FRESH_PAGE;
@@ -1736,6 +1738,9 @@ if(example.filterOn){
   !middleDetail.querySelector('form'),'Opening the middle item reads only its read-only detail.');
  check(link?.textContent==='#1 Check the last result' &&
   link.nextElementSibling?.textContent==='Closed','The middle item shows the Closed target and its title.');
+ const linkStyle=getComputedStyle(link),sourceLinkStyle=getComputedStyle(recordDetails(row).querySelector('[data-list-linked-card]'));
+ check(link!==document.activeElement && linkStyle.color===sourceLinkStyle.color && linkStyle.textDecorationLine==='underline',
+  'The unfocused overlay link keeps the link color and underline.');
  link.click();await flush();
  check(opened().dataset.number==='1' && recordDetails(opened()).textContent.includes('The leaf log is complete.') &&
   !recordDetails(opened()).querySelector('form') && closedReads.join()==='L2,L1','The target replaces the overlay item.');
@@ -3052,16 +3057,38 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_answers_the_team_question_in_its_open_row(self) -> None:
         item = self.studio_team_question()
+        exchange = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, "submission/question/answered", "followup:1",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which width?", NOW, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.ExchangeAnswer("Use 800 pixels.", NOW, list_exchange.AnswerRead.UNREAD))
+        members = staff.snapshot()
+        with the_list.lock_exchange_source(exchange.source_key) as source:
+            _ = the_list.file_exchanges(source, (exchange,), exchange.question, linked=the_list.NextNumber.AVAILABLE,
+                                        owner=OWNER.id, members=members)
         with (patch.object(serve.ReviewLinksHandler, "deliver_review", return_value=change_page.DeliveryConfirmed()),
               self.studio_review_server() as origin):
-            self.open_studio_review_fixture(origin, "#show=questions")
+            self.open_studio_review_fixture(origin, "#show=answers")
             self.studio_review_check(r"""
+ const show=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
+ const answered=row(2);
+ answered.querySelector('.list-toggle').click();
+ await paint();
+ const answeredLabel=recordDetails(answered).querySelector('[data-question-read]').elements.words.labels[0];
+ const labelStyle=label=>{
+  const style=getComputedStyle(label);
+  return [style.color,style.fontSize,style.fontWeight,style.display,style.marginBottom].join('|');
+ };
+ const answeredStyle=labelStyle(answeredLabel);
+ show('questions').click();
+ await paint();
  const item=row(1);
  check(!item.hidden && !recordIsOpen(item),'The Questions chip shows the closed row.');
  item.querySelector('.list-toggle').click();
  await until(()=>recordDetails(item).querySelector('[data-studio-question-card] [data-review-form]'));
  const card=recordDetails(item).querySelector('[data-studio-question-card]');
  const form=card.querySelector('[data-review-form]');
+ const openLabel=form.elements.feedback.labels[0];
+ check(answeredLabel.textContent==='Your words' && openLabel.textContent==='Your words' && labelStyle(openLabel)===answeredStyle,
+  'The answered row and the open question use the same label style.');
  check(!dialog.open && !card.querySelector('iframe'),'The question opens in the row.');
  check(card.textContent.includes('Both layouts fit the list.') &&
        card.textContent.includes('so readers can see the controls.'),'The card shows the reason and recommendation.');

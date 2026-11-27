@@ -1108,7 +1108,8 @@ def words_field(identity: str, name: str, rows: int, *, placeholder: str = 'Type
                 maxlength: int = 0) -> str:
     field = html.escape(identity, quote=True)
     limit = f' maxlength="{maxlength}"' if maxlength else ''
-    return (f'<label for="{field}">Your words</label><textarea id="{field}" name="{name}" rows="{rows}"{limit} '
+    return (f'<label class="review-words-label" for="{field}">Your words</label>'
+            + f'<textarea id="{field}" name="{name}" rows="{rows}"{limit} '
             + f'placeholder="{html.escape(placeholder, quote=True)}"></textarea>')
 
 
@@ -1787,7 +1788,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
 
 QUESTION_COLOR_RULE = '.question{--type-color:#b99aff}'
 REVIEW_FORM_STYLE = '''
-[data-review-form] label{display:block;font-weight:600;margin-bottom:6px}
+[data-review-form] label,label.review-words-label{display:block;font-weight:600;margin-bottom:6px}
+label.review-words-label{font-size:inherit;color:var(--ink)}
 [data-review-form] textarea{display:block;box-sizing:border-box;width:100%;font:inherit;padding:9px 12px;background:var(--bg);
 color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
 .review-actions{margin-top:12px}

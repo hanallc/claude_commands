@@ -2693,10 +2693,9 @@ scrollbar-width:thin;scrollbar-color:var(--ink-3) transparent}
 .item-links li:first-child{padding-top:0;border-top:0}
 [data-linked-items]>ul{display:grid;grid-template-columns:minmax(0,1fr) max-content;column-gap:12px}
 [data-linked-items]>ul>li{display:grid;grid-column:1/-1;grid-template-columns:subgrid;align-items:start;justify-items:start;padding-inline-end:8px}
-.item-links .item-link-label{color:var(--accent);font-weight:600}
-a.list-top-link{color:var(--ink);overflow-wrap:anywhere}
-:is(.item-links .item-link-label,.list-top-link){text-decoration:none}
-:is(.item-links .item-link-label,.list-top-link):is(:hover,:focus-visible){text-decoration:underline}
+.item-links .item-link-label{color:var(--accent);font-weight:600;text-decoration:none}
+.item-links .item-link-label:is(:hover,:focus-visible){text-decoration:underline}
+a.list-top-link{color:var(--accent);overflow-wrap:anywhere;text-decoration:underline}
 .item-link-field{color:var(--ink-2);margin-inline-start:8px}
 .item-link-address{display:block;color:var(--ink-3);font-size:12px;margin-top:2px}
 .list-actions{position:relative}
