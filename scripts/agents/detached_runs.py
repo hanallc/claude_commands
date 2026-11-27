@@ -1038,7 +1038,7 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
                 return CompletionReplay.HANDLED
             if not _unconfirmed_pass_result(record):
                 return CompletionReplay.RETRY
-        if _cancels_pass(record) and delivery in ("", ORPHAN_RESULT_PENDING):
+        if _cancels_pass(record) and (delivery in ("", ORPHAN_RESULT_PENDING) or _stop_canceled_before_receipt(record)):
             delivery = _complete_stopped_run(path, record)
             if delivery is CompletionReplay.RETRY or _worker_result_pending(delivery):
                 return CompletionReplay.RETRY
@@ -1129,6 +1129,8 @@ def _complete_stopped_run(path: Path, record: RunRecord) -> str | Literal[Comple
         return _save_delivery(path, f"finished: the pane pass {result.outcome}")
     if isinstance(result, worker_panes.Kept):
         print(f"detached_runs: {record['run_id']}: kept the pane pass: {result.blocker}", file=sys.stderr)
+    if _stop_canceled_before_receipt(record):
+        return CompletionReplay.RETRY
     if record.get("orphan_result_superseded"):
         return _save_delivery(path, SUPERSEDED_ORPHAN_DELIVERY)
     return deliver(record, command_result(record))
@@ -1433,6 +1435,7 @@ class WorkerResultDeferred(Enum):
 
 class WorkerResultDeliverySuppressed(Enum):
     SUCCESS_ONLY = "the worker requested pane delivery only on success"
+    STOP_CANCELED = "a stop canceled the run before the worker received its result"
 
 
 class RunFinishTimeUnknown(Enum):
@@ -1495,6 +1498,27 @@ UNCONFIRMED_WORKER_RESULT = "unconfirmed: "
 WORKER_INPUT_CHECKPOINT = UNCONFIRMED_WORKER_RESULT + "the prompt may have sent input"
 FAILED_RESULT_PUSH = "result push failed: "
 UNCONFIRMED_RESULT_PUSH = UNCONFIRMED_WORKER_RESULT + "result push: "
+
+
+def _stop_canceled_before_receipt(record: RunRecord) -> bool:
+    if (record["status"] != "finished" or record.get("self_stop") or record.get("scope_error")
+            or "worker_result_receipt" in record or "delivered_at" in record):
+        return False
+    stopped = (_cancels_pass(record) or (record.get("ended") == "supervisor gone"
+                                       and record.get("stop_reason") == SUPERVISOR_GONE_REASON))
+    return stopped and record.get("delivery") in (
+        PARKED_WORKER_RESULT, UNCONFIRMED_WORKER_RESULT + "the worker transcript has no result receipt")
+
+
+def recover_stop_canceled_worker_pass(run: Path, worker: staff.StaffRow, instance: str) -> None:
+    """Retry the saved stop before admitting another assignment to the worker."""
+    runs = run / DETACHED_RUNS_DIR
+    for record in _registered_runs(runs, worker.id):
+        if (record["staff_id"] == worker.id and record.get("pane_dispatch_id") == instance
+                and Path(record["session_dir"]).resolve() == run.resolve() and _cancels_pass(record)
+                and _stop_canceled_before_receipt(record)):
+            _ = _finish_record(runs / f"{record['run_id']}.json", record)
+            return
 
 
 def _worker_result_pending(delivery: str) -> bool:
@@ -1796,6 +1820,8 @@ def worker_results(runs: Path, worker: staff.StaffRow, *, since: float, pane_dis
         stop_fallback = _stop_fallback_delivered(record, delivery)
         if delivery == COVERED_BY_DONE:
             results[record["run_id"]] = WorkerRunReceipt(record, finished, WorkerResultCovered.BY_DONE)
+        elif _stop_canceled_before_receipt(record):
+            results[record["run_id"]] = WorkerRunReceipt(record, finished, WorkerResultDeliverySuppressed.STOP_CANCELED)
         elif not delivery or _worker_result_pending(delivery):
             results[record["run_id"]] = WorkerRunReceipt(record, finished, WorkerResultDeferred.PENDING)
         elif record["done_message_file"] and delivery == _success_only_delivery(command_result(record)):

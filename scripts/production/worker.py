@@ -814,6 +814,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
         return reply
     covered_by_reply = {run_id for run_id, result in deliveries.items()
                         if isinstance(verified, VerifiedPassDone)
+                        and result.delivered_at is not detached_runs.WorkerResultDeliverySuppressed.STOP_CANCELED
                         and verified.covers_run(result.run, result.finished_at) == detached_runs.ResultDoneCoverage.COVERED}
     covered = {run_id for run_id, result in deliveries.items()
                if result.delivered_at is detached_runs.WorkerResultCovered.BY_DONE} | covered_by_reply
@@ -828,7 +829,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
     reap_required = {run_id for run_id, result in deliveries.items()
                      if result.delivered_at is detached_runs.WorkerResultDeferred.REAP_REQUIRED}
     unseen = {run_id for run_id in deliveries.keys() - received - covered - reap_required
-              if deliveries[run_id].delivered_at is not detached_runs.WorkerResultDeliverySuppressed.SUCCESS_ONLY}
+              if not isinstance(deliveries[run_id].delivered_at, detached_runs.WorkerResultDeliverySuppressed)}
     live_ids = {record["run_id"] for record in live}
     pending = unseen | live_ids | reap_required
     pending.update(run_id for run_id, result in deliveries.items()
@@ -1658,6 +1659,15 @@ def _admit_completion(row: staff.StaffRow, recovery: CompletionRecovery) -> Exit
     return ExitCode.OK
 
 
+def _recover_stop_before_assignment(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
+    recorded = progress_history.recorded_dispatch_run(row.id)
+    if isinstance(recorded, progress_history.RecordedDispatchRun):
+        passed = worker_panes.worker_pass(row, recorded.directory, record=record)
+        instance = passed.get("instance_id")
+        if passed.get("status") in ("active", "refused") and isinstance(instance, str) and instance:
+            detached_runs.recover_stop_canceled_worker_pass(recorded.directory, row, instance)
+
+
 def admit_dispatch(parent: StaffId, name: WorkerName | progress_history.DispatchTargetAtUse, role: WorkerRole, prompt: Path, *,
                    session_dir: Path, slot: str, phase: str, launcher_command: list[str],
                    work: progress_history.DispatchWork, prompt_source: Path | bytes, record: staff.StaffSnapshot,
@@ -1750,6 +1760,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         notice_delivery = notices if isinstance(notices, ExitStack) else after_dispatch
         expected = (worker_admission.find_worker(staff.snapshot(), parent, name.value)
                     if isinstance(lock, worker_panes.WorkerLockAtUse) else None)
+        if expected is not None:
+            _recover_stop_before_assignment(expected, record)
         hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
             return _busy_dispatch(hold.blocker)
@@ -2536,6 +2548,8 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                 return ExitCode.BUSY
             return startup_result(WorkerName.parse(role), chosen)
         selected_row = worker_admission.find_worker(record, parent, chosen.value)
+        if selected_row is not None:
+            _recover_stop_before_assignment(selected_row, record)
         hold = operations.enter_context(worker_panes.worker_lock(parent, chosen))
         if isinstance(hold, worker_panes.Kept):
             source = prompt.resolve()

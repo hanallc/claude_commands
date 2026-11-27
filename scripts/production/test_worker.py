@@ -4504,6 +4504,69 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("Detached run: late-result\n", notice)
         self.assertEqual(self.command(*assign_next), (0, "submitted\n", ""))
 
+    def save_stop_canceled_worker_runs(self) -> tuple[staff.StaffRow, str, str]:
+        self.agent.without_done = True
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane, _ = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        instance = str(worker_panes.worker_pass(row, self.run_dir)["instance_id"])
+        for run_id, delivery in (("parked-stop", "deferred: the worker is parked"),
+                                 ("unreceived-stop", "unconfirmed: the worker transcript has no result receipt")):
+            path, record = self.detached_record(row, run_id)
+            record.update(pane_dispatch_id=instance, ended="supervisor gone", stop_pass_requested=True,
+                          stop_reason=detached_runs.SUPERVISOR_GONE_REASON, exit_code=143, delivery=delivery,
+                          completion_pending=True)
+            atomic_file.write_text_atomic(path, json.dumps(record))
+        self.agent.append(pane, "assistant", "The lint runs are still pending.")
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
+        self.agent.without_done = False
+        return row, pane, instance
+
+    def test_assignment_recovers_stop_canceled_runs_without_a_worker_receipt(self) -> None:
+        row, _, instance = self.save_stop_canceled_worker_runs()
+        following = self.run_dir / "next-prompt.md"
+        atomic_file.write_text_atomic(following, "Start the next assignment.\n")
+        with patch.object(detached_runs, "_stopped_group_has_ended", return_value=True):
+            result = self.command("assign", "impl", str(following), "--name", row.name, "--slot", "impl", "--phase", "8",
+                                  "--kind", "assign", "--session-dir", str(self.run_dir), "--launcher-command", '["assign.sh"]')
+        self.assertEqual(result[:2], (0, "submitted\n"), result[2])
+        self.assertNotEqual(worker_panes.worker_pass(row, self.run_dir)["instance_id"], instance)
+        stopped, = progress_history.stopped_pass_receipts(self.run_dir, row.id)
+        self.assertEqual(stopped.instance_id, instance)
+
+    def test_delivered_stop_canceled_result_still_requires_done(self) -> None:
+        row, pane, instance = self.save_stop_canceled_worker_runs()
+        path, record = self.detached_record(row, "delivered-stop")
+        record.update(pane_dispatch_id=instance, stop_pass_requested=True, exit_code=143,
+                      stop_reason=detached_runs.SUPERVISOR_GONE_REASON, delivery=f"sent: worker {row.name} at {pane}")
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        for run_id in ("delivered-stop", "unreceived-stop"):
+            self.agent.append(pane, "user", f"Detached run: {run_id}\nRun finished: private verification")
+        receipt = self.receipt()
+        assert isinstance(receipt, worker.DispatchWaitingForRuns)
+        self.assertEqual(receipt.runs, ("delivered-stop", "unreceived-stop"))
+        self.assertIs(worker.waiting_recovery(receipt), worker.CompletionRecovery.WAITING_ON_REPLY)
+        self.agent.complete(pane)
+        self.assertIsInstance(self.receipt(), worker.DispatchComplete)
+
+    def test_running_and_pending_stop_results_still_hold_the_pass(self) -> None:
+        row, _, instance = self.save_stop_canceled_worker_runs()
+        running, record = self.detached_record(row, "running-stop")
+        record.update(status="running", pane_dispatch_id=instance, stop_pass_requested=True, pid=34718)
+        atomic_file.write_text_atomic(running, json.dumps(record))
+        pending, record = self.detached_record(row, "pending-stop")
+        record.update(pane_dispatch_id=instance, stop_pass_requested=True, exit_code=143,
+                      stop_reason=detached_runs.SUPERVISOR_GONE_REASON, delivery=detached_runs.ORPHAN_RESULT_PENDING)
+        atomic_file.write_text_atomic(pending, json.dumps(record))
+        def supervises(pid: int, path: Path) -> bool:
+            return pid == 34718 and path == running
+
+        with patch.object(detached_run_process, "supervises", side_effect=supervises):
+            receipt = self.receipt()
+        assert isinstance(receipt, worker.DispatchWaitingForRuns)
+        self.assertEqual(receipt.runs, ("pending-stop", "running-stop"))
+        self.assertIs(worker.waiting_recovery(receipt), worker.CompletionRecovery.WAITING_ON_RUNS)
+
     def test_answer_recovers_an_interrupted_result_turn_before_assignment(self) -> None:
         row, pane, path, assign_next = self.ended_pass_with_result("interrupted", "already delivered: late-result")
         self.agent.append(pane, "user", "Detached run: late-result\nRun finished: private verification")
