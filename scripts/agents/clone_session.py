@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -116,12 +117,6 @@ _CODEX_MODEL = r"gpt-[a-z0-9][a-z0-9.-]*"
 _CODEX_MODEL_AND_EFFORT = re.compile(rf"(.+?) (none|minimal|{set_model.DISPLAY_EFFORT})(?: (?:fast|standard|flex))?")
 
 
-@dataclass(frozen=True)
-class LiveForkSettings:
-    model: str
-    effort: str
-
-
 def _codex_models(home: Path) -> dict[str, set[str]]:
     try:
         cache = codex_models_cache.read_models_cache(home / "models_cache.json", retry_delays=())
@@ -148,7 +143,7 @@ def _codex_model(name: str, catalog: dict[str, set[str]]) -> str:
     return name if re.fullmatch(_CODEX_MODEL, name) else ""
 
 
-def _live_settings(source: CloneSource, client: herdr.Herdr, home: Path) -> LiveForkSettings:
+def _live_settings(source: CloneSource, client: herdr.Herdr, home: Path) -> models_registry.LaunchSettings:
     terminal = client.command_terminal(source.pane)
     footer = client.command_footer(source.pane, terminal, target=source.identity, codex=source.kind == "codex")
     if source.kind == "claude":
@@ -166,10 +161,10 @@ def _live_settings(source: CloneSource, client: herdr.Herdr, home: Path) -> Live
     if not model or not effort:
         missing = "model and effort" if not (model or effort) else "effort" if model else "model"
         raise ValueError(f"{source.name}: cannot prove the current {missing} from the live pane")
-    return LiveForkSettings(model, effort)
+    return models_registry.LaunchSettings(source.kind, model, effort, "")
 
 
-def _arguments(source: CloneSource, settings: LiveForkSettings, name: str) -> list[str]:
+def _arguments(source: CloneSource, settings: models_registry.LaunchSettings, name: str) -> list[str]:
     if isinstance(source.producer_clone, staff.ProducerClone):
         prompt = (f"You are {name}, a clone of {source.name}. "
                   f"Do not continue the ongoing work of {source.name}. "
@@ -190,7 +185,7 @@ def _arguments(source: CloneSource, settings: LiveForkSettings, name: str) -> li
 
 def _admit_clone(name: str, source: CloneSource, client: herdr.Herdr, launched: herdr.ForkLaunched,
                  prepared: herdr.PreparedAgentEnvironment, environment: dict[str, str], home: Path,
-                 settings: LiveForkSettings) -> str:
+                 profile: models_registry.ProducerProfile | staff.NotAClone) -> str:
     pane, terminal = launched.pane, launched.terminal
     try:
         native = stop_resume.wait_for_native_session(client, pane,
@@ -217,9 +212,10 @@ def _admit_clone(name: str, source: CloneSource, client: herdr.Herdr, launched: 
             try:
                 machine = remote.local_machine()
                 if isinstance(source.producer_clone, staff.ProducerClone):
+                    assert isinstance(profile, models_registry.ProducerProfile)
                     row = staff.create_producer_clone(
                         name, native, source.producer_clone, staff.PresentWorktree(machine, prepared.directory),
-                        staff.SessionHome(home), profile=models_registry.ProducerProfile(source.kind, settings.model, settings.effort))
+                        staff.SessionHome(home), profile=profile)
                 else:
                     row = staff.create_session(name, native, staff.SessionLaunchFolder(machine, prepared.directory),
                                                staff.SessionHome(home))
@@ -264,7 +260,17 @@ def run(reference: str, name: str) -> int:
         prepared = replace(prepared, env={**{key: value for key, value in prepared.env.items() if key not in unset},
                                           **environment},
                            unset_environment=(prepared.unset_environment | unset).difference(environment))
-        settings = _live_settings(source, client, home)
+        profile: models_registry.ProducerProfile | staff.NotAClone = staff.NotAClone()
+        if isinstance(source.producer_clone, staff.ProducerClone):
+            configuration = models_registry.launch_configuration(os.environ)
+            settings = models_registry.launch_settings("producers", source.name, configuration=configuration)
+            if settings.kind != source.kind:
+                raise ValueError(f"{source.name}: the registered family differs from the live conversation")
+            profiles = models_registry.parse_registry(configuration.text)["producers"]
+            profile = models_registry.parse_producer_profile(profiles[source.name])
+            prepared = replace(prepared, env=configuration.environment(prepared.env))
+        else:
+            settings = _live_settings(source, client, home)
         if client.foreground_launch(source.pane, source.kind) != source.launch:
             raise ValueError(f"{reference}: source changed before the fork")
         arguments = _arguments(source, settings, name)
@@ -275,7 +281,7 @@ def run(reference: str, name: str) -> int:
         if not isinstance(launched, herdr.ForkLaunched):
             raise ValueError(f"{name}: cannot prove the fork terminal")
         try:
-            native = _admit_clone(name, source, client, launched, prepared, environment, home, settings)
+            native = _admit_clone(name, source, client, launched, prepared, environment, home, profile)
         except _AdmissionUnconfirmed as error:
             raise ValueError(str(error)) from error
     print(f"{name}: cloned {source.name} as {native} in pane {launched.pane}")

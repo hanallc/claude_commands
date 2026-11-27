@@ -2199,6 +2199,11 @@ def create_producer_clone(name: str, identity: str, clone_of: ProducerClone,
             raise StaffRefused(f"{clone_of.source}: producer clone source is unavailable")
         if any(row.name.casefold() == name.casefold() for row in rows):
             raise StaffRefused(f"{name}: another staff row has this name")
+        profiles = models_registry.parse_registry(models_registry.registry_text()).get("producers", {})
+        if any(key.casefold() == name.casefold() for key in profiles):
+            raise StaffRefused(f"{name}: the registry already has a producer key")
+        if profiles.get(source.name) != profile.value():
+            raise StaffRefused(f"{source.name}: the registered profile changed before clone admission")
         row = _ensure_row(rows, "producer", name, STAFF_ROOT, worktree=folder, runtime_id=identity)
         clone = replace(row, home=home, clone_of=clone_of)
         rows[rows.index(row)] = clone
@@ -2209,9 +2214,6 @@ def create_producer_clone(name: str, identity: str, clone_of: ProducerClone,
     with slot_operation("producer-marker-" + name.casefold(), name):
         try:
             _ = producer_creation.require_record(name, {})
-            registry = models_registry.parse_registry(models_registry.registry_text())
-            if any(key.casefold() == name.casefold() for key in registry.get("producers", {})):
-                raise StaffRefused(f"{name}: the registry already has a producer key")
             return _transaction(edit)
         except (OSError, StaffRefused, ValueError) as error:
             if not profile_write_started:
@@ -2226,9 +2228,9 @@ def create_producer_clone(name: str, identity: str, clone_of: ProducerClone,
             if admitted is not None:
                 raise StaffUnreadable(str(error)) from error
             try:
-                models_registry.remove_producer(name, profile)
+                models_registry.remove_failed_clone_profile(name, profile)
             except (OSError, ValueError) as cleanup_error:
-                raise StaffRefused(f"{error}; cannot remove the clone profile: {cleanup_error}") from cleanup_error
+                raise StaffUnreadable(f"{error}. Cannot confirm removal of the clone profile: {cleanup_error}") from cleanup_error
             raise StaffRefused(str(error)) from error
 
 

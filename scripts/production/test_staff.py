@@ -1768,7 +1768,7 @@ class StaffTests(StaffCommandTestCase):
         clone_of = staff.ProducerClone(source.id)
         registry = self.root / "models.conf"
         _ = write_registry(registry, {"producers": {"morty": "claude:sonnet:medium"}})
-        profile = models_registry.ProducerProfile("claude", "opus", "high")
+        profile = models_registry.ProducerProfile("claude", "sonnet", "medium")
         with (self.machine("mac"),
               mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
                                           "MODELS_CONFIG_TIER_ONLY": "1"})):
@@ -1798,7 +1798,7 @@ class StaffTests(StaffCommandTestCase):
                                           "MODELS_CONFIG_TIER_ONLY": "1"}),
               self.assertRaisesRegex(staff.StaffRefused, "another staff row has this name")):
             _ = staff.create_producer_clone("morty-copy", fixture_runtime_id("fork"), staff.ProducerClone(source.id),
-                                           folder, home, profile=models_registry.ProducerProfile("claude", "opus", "high"))
+                                           folder, home, profile=models_registry.ProducerProfile("claude", "sonnet", "medium"))
         self.assertEqual(self.staff_state(), before)
         self.assertEqual(registry.read_bytes(), profiles_before)
 
@@ -1814,7 +1814,7 @@ class StaffTests(StaffCommandTestCase):
                                           "MODELS_CONFIG_TIER_ONLY": "1"}),
               self.assertRaisesRegex(staff.StaffRefused, "registry already has a producer key")):
             _ = staff.create_producer_clone("morty-copy", fixture_runtime_id("fork"), staff.ProducerClone(source.id),
-                                           folder, home, profile=models_registry.ProducerProfile("claude", "opus", "high"))
+                                           folder, home, profile=models_registry.ProducerProfile("claude", "sonnet", "medium"))
         self.assertEqual(registry.read_bytes(), profiles_before)
         self.assertEqual(self.staff_state(), staff_before)
 
@@ -1829,7 +1829,7 @@ class StaffTests(StaffCommandTestCase):
         def admit() -> staff.StaffRow:
             return staff.create_producer_clone("morty-copy", identity, staff.ProducerClone(source.id),
                 staff.PresentWorktree("natedev", self.root / "launch"), staff.SessionHome(self.root / ".claude4"),
-                profile=models_registry.ProducerProfile("claude", "opus", "high"))
+                profile=models_registry.ProducerProfile("claude", "sonnet", "medium"))
 
         return admit, registry, identity
 
@@ -1838,7 +1838,7 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"], {"morty": "claude:sonnet:medium"})
         clone = admit()
         self.assertEqual(staff.by_id(identity), clone)
-        self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"]["morty-copy"], "claude:opus:high")
+        self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"]["morty-copy"], "claude:sonnet:medium")
 
     def test_producer_clone_retries_after_a_staff_write_failure(self) -> None:
         admit, registry, identity = self.producer_clone_admission()
@@ -1864,6 +1864,15 @@ class StaffTests(StaffCommandTestCase):
               self.assertRaisesRegex((staff.StaffUnreadable, staff.StaffRefused), "registry publish failed")):
             _ = admit()
         self.assert_producer_clone_retry(admit, registry, identity)
+
+    def test_producer_clone_reports_unconfirmed_profile_removal(self) -> None:
+        admit, registry, identity = self.producer_clone_admission()
+        with (mock.patch("scripts.production.staff._store", side_effect=OSError("staff write failed")),
+              mock.patch.object(models_registry, "remove_failed_clone_profile", side_effect=OSError("remote unavailable")),
+              self.assertRaisesRegex(staff.StaffUnreadable, "Cannot confirm removal of the clone profile: remote unavailable")):
+            _ = admit()
+        self.assertIsNone(staff.by_id(identity))
+        self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"]["morty-copy"], "claude:sonnet:medium")
 
     def test_a_remote_producer_transfer_uses_one_owner_write(self) -> None:
         morty = fixture_member("producer", name="morty")
