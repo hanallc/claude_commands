@@ -77,7 +77,13 @@ A failed scan leaves the live index unchanged. The scan adds no candidate object
 
 The installed jobs continue their daily commits and pushes of their own generated notes.
 The first-save review does not cover the installed jobs' ongoing output.
-A Gitleaks hit stops the first save. The director tells sdlc the redacted finding.
+A Gitleaks finding stops the first save.
+The scan runs Gitleaks with `--redact=100` and reads the template output from stdout into memory.
+The template emits one JSON object per finding with the file, line, and rule ID.
+The refusal uses only the file, line, and rule ID from each finding.
+The refusal uses the file and rule ID as Gitleaks reports them.
+The scan discards Gitleaks stderr and uses a fixed refusal message for an unreadable report.
+The director tells sdlc the redacted finding.
 The director reports a hit in a job-owned path at once.
 
 Commit takes the lock and checks the source hashes, modes, and filtered blob hashes against the manifest.
