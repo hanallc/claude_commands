@@ -9,7 +9,9 @@ from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, tzinfo
+from importlib import import_module
 from pathlib import Path
+from typing import cast
 from urllib.parse import urlencode
 
 from scripts.for_you.action import REVIEW_PATH
@@ -482,12 +484,19 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
     evidence = REVIEW_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
     words = saved.words
     try:
-        _ = the_list.add_review_item(route["keeper"], review_submissions.submission_title(words), owner=route["owner"],
-                                     producer=route["producer"], unit=route["unit"], words=words, evidence=evidence,
-                                     review_key=key, source=route["source"],
-                                     reservation=review_submissions.list_filing_reservation(saved))
+        number = the_list.add_review_item(route["keeper"], review_submissions.submission_title(words), owner=route["owner"],
+                                          producer=route["producer"], unit=route["unit"], words=words, evidence=evidence,
+                                          review_key=key, source=route["source"],
+                                          reservation=review_submissions.list_filing_reservation(saved))
     except the_list.RetiredListProducer as error:
         review_submissions.skip_list_filing(saved, str(error))
+        return
+    if isinstance(record, update_registration.QuestionRecord):
+        destination = investigation.ListDestination(route["keeper"], number)
+        file_question = cast(Callable[[review_submissions.SavedSubmission, investigation.ListDestination,
+                                       staff.StaffSnapshot], None],
+                             import_module("scripts.review_links.answer_sources").file_list_submission_question)
+        file_question(saved, destination, staff.snapshot())
 
 
 def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus,

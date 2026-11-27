@@ -2027,9 +2027,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         def send_submission() -> change_page.DeliveryOutcome:
             outcome = self.deliver_review(server, delivery, report_outcome=True)
             if on_list and saved.kind == new_item_dialog.SubmissionKind.QUESTION:
-                from scripts.review_links import answer_sources
-
-                answer_sources.file_saved_submission(new_item_dialog.read_submission_key(saved.key), created.members)
                 self.publish_review_delivery(server, created.key)
             return outcome
 

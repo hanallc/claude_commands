@@ -216,7 +216,8 @@ def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
         return ListChip.SCHEDULED
     if state == the_list.ItemState.REPAIRED:
         return ListChip.NEEDS_ME
-    if question_item and state is the_list.ItemState.ANSWERED:
+    if question_item and (state is the_list.ItemState.ANSWERED
+                          or state is the_list.ItemState.WORKING and unread_answer):
         return ListChip.ANSWERS
     if question_item and not parked:
         if state is the_list.ItemState.WAITING_FOR_NATE:
@@ -767,9 +768,10 @@ def repair_buttons(entry: ListRecord, members: staff.StaffSnapshot, *, repaired:
 
 def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapshot, parking_label: str,
                   schedule: DisplayedSchedule, today: datetime, routing: the_list.ListQuestionRouting,
+                  unread_answers: frozenset[the_list.UnreadAnswerId],
                   mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
-    if (the_list.question_item(entry.item) is not the_list.NoQuestionItem.ORDINARY
-            and entry.item.state is the_list.ItemState.ANSWERED):
+    question = the_list.question_item(entry.item) is not the_list.NoQuestionItem.ORDINARY
+    if question and entry.item.state is the_list.ItemState.ANSWERED:
         receiver = html.escape(owner_name(members, entry.item.owner), quote=True)
         label = f"Your words for {receiver}"
         return ('<form method="post" data-feedback-form data-question-read>'
@@ -778,8 +780,8 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
                 + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
                 + '<button name="action" value="read">Mark read</button></div></form>')
     read = ('<button name="action" value="read">Mark read</button>'
-            if isinstance(entry.item.unread_since, datetime)
-            and the_list.question_item(entry.item) is the_list.NoQuestionItem.ORDINARY else '')
+            if (not question and isinstance(entry.item.unread_since, datetime)
+                or the_list.question_can_mark_read(entry.item, unread_answers)) else '')
     top = top_button(mark)
     key = html.escape(entry.key.replace('/', '-'), quote=True)
     scheduled = not isinstance(schedule, the_list.NoSchedule)
@@ -790,7 +792,8 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
     start_now = ('<button name="action" value="start-now">Start now</button>'
                  if isinstance(schedule, (the_list.ScheduledRun, UpcomingSeriesRun)) else '')
     zone = user_zone()
-    schedule_editor = schedule_fields(entry, schedule, members, key, zone)
+    schedule_editor = ('' if question else '<template data-schedule-template>'
+                       + schedule_fields(entry, schedule, members, key, zone) + '</template>')
     recipient_name = owner_name(members, feedback_recipient(entry.item))
     words_label = html.escape(f"Your words for {recipient_name} about this item", quote=True)
     remove = ('<button name="action" value="remove">Remove</button>'
@@ -819,14 +822,13 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
             + f'<p data-parked-detail{parked}>{note}</p>'
             + '<div class="list-actions">' + remove + read + top
             + f'<div class="list-parking-actions">{start_now}<button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
-            + '<div class="list-park">' + record_table.park_control(
+            + f'<div class="list-park"{" data-park-only" if question else ""}>' + record_table.park_control(
                 picker_label, field="until", action="action", value="park", identity="park-" + key, allow_delivery=True)
             + '</div></div></div>'
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + f'placeholder="{words_label}" aria-label="{words_label}"></textarea>'
             + repair + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
-            + ask + tell + '</div>'
-            + '<template data-schedule-template>' + schedule_editor + '</template></form>')
+            + ask + tell + '</div>' + schedule_editor + '</form>')
 
 
 def review_card_link(key: str, label: str, *, studio_question: bool = False) -> str:
@@ -1351,7 +1353,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
                         and item.state is the_list.ItemState.WAITING_FOR_NATE)
     form = '' if waits_for_answer else feedback_form(
         entry, secret, members=names.members, parking_label=parking_label, schedule=schedule, today=today,
-        mark=mark, routing=routing)
+        mark=mark, routing=routing, unread_answers=unread_answers)
     return waiting_note(entry, names, hidden=True) + detail_panel(
         entry, sections + questions + form, today, names, unread_answers, progress, ask_boxes(entry, secret, names),
         schedule=schedule, linked_items=linked_items)
@@ -2653,6 +2655,7 @@ font-weight:600;cursor:pointer}
  transform:translate(var(--list-picker-x,0px),var(--list-picker-y,0px))}
 .list-park [data-later-menu] [data-later-preset]{display:block;width:calc(50% - 12px);margin:6px 6px 4px}
 .list-park [data-later-custom]:not([hidden]){display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px 12px;align-items:start}
+.list-park[data-park-only] [data-later-custom]:not([hidden]){grid-template-columns:minmax(0,1fr)}
 .list-park .later-save{grid-column:1 / -1}
 .list-schedule-fields{display:grid;gap:6px;min-width:0}
 .list-schedule-fields small{color:var(--ink-2)}
@@ -2765,11 +2768,13 @@ const searchFields=Object.entries(''' + json.dumps(SEARCH_FIELDS) + r''').map(([
  [field,pattern && new RegExp(pattern)]);
 const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + r''';
 const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
+const questionNeedsRead=data=>data.questionItem!==undefined &&
+ (data.state==='Answered' || data.state==='Working' && data.unreadAnswer==='true');
 const chipFor=data=>{
  if(data.state==='Closed' || data.undoPending==='true' || data.sendHeld!==undefined) return;
  if(data.state==='Repaired') return 'needs-me';
  if(data.state==='Scheduled') return 'scheduled';
- if(data.questionItem!==undefined && data.state==='Answered') return 'answers';
+ if(questionNeedsRead(data)) return 'answers';
  const parked=isParked(data);
  if(data.questionItem!==undefined && !parked){
   if(data.state==='Waiting for nate') return 'questions';
@@ -3003,7 +3008,7 @@ function syncUnread(item,form,unread,unreadSort){
   if(!dot){const mark=document.createElement('span');mark.className='list-dot';mark.setAttribute('role','img');
    mark.setAttribute('aria-label','Unread update');update.prepend(mark);}
   if(!form) return;
-  const canRead=item.dataset.questionItem!==undefined ? item.dataset.state==='Answered'
+  const canRead=item.dataset.questionItem!==undefined ? questionNeedsRead(item.dataset)
    : !form.hasAttribute('data-waiting-actions') || item.dataset.unreadDelivery==='true' || item.dataset.unreadAnswer==='true';
   if(!canRead) read?.remove();
   if(canRead && !read){
@@ -3333,15 +3338,8 @@ function chooseScheduleScope(parent,{number,canEditFollowing,removing,parking,ch
   dialog.showModal();
  });
 }
-function bindScheduleFields(form,until,zone,draft,edit){
- const panel=form.querySelector('[data-schedule-template]').content.firstElementChild.cloneNode(true);
- const words=panel.querySelector('[data-schedule-words]'),select=panel.querySelector('[data-repeat]');
- const menu=form.querySelector('[data-later-menu]'),status=panel.querySelector('[data-schedule-status]');
- const picker=menu.querySelector('[data-later-custom]'),save=picker.querySelector('.later-save');
- const calendar=document.createElement('div');
- calendar.append(...[...picker.children].filter(child=>child!==save));
- picker.prepend(calendar);
- const anchor=menu.closest('.list-actions');
+function trackParkMenu(menu,onClose=()=>{}){
+ const anchor=menu.closest('.later-menu');
  const fitPicker=()=>{
   if(!menu.offsetWidth){pickerSize.disconnect();return;}
   const width=document.documentElement.clientWidth;
@@ -3354,7 +3352,7 @@ function bindScheduleFields(form,until,zone,draft,edit){
  };
  const pickerSize=new ResizeObserver(fitPicker);
  const observer=new MutationObserver(()=>{
-  if(menu.hidden){panel.remove();pickerSize.disconnect();}
+  if(menu.hidden){onClose();pickerSize.disconnect();}
   else{
    fitPicker();
    pickerSize.observe(anchor);
@@ -3362,6 +3360,16 @@ function bindScheduleFields(form,until,zone,draft,edit){
   }
  });
  observer.observe(menu,{attributes:true,attributeFilter:['hidden']});
+}
+function bindScheduleFields(form,until,zone,draft,edit){
+ const panel=form.querySelector('[data-schedule-template]').content.firstElementChild.cloneNode(true);
+ const words=panel.querySelector('[data-schedule-words]'),select=panel.querySelector('[data-repeat]');
+ const menu=form.querySelector('[data-later-menu]'),status=panel.querySelector('[data-schedule-status]');
+ const picker=menu.querySelector('[data-later-custom]'),save=picker.querySelector('.later-save');
+ const calendar=document.createElement('div');
+ calendar.append(...[...picker.children].filter(child=>child!==save));
+ picker.prepend(calendar);
+ trackParkMenu(menu,()=>panel.remove());
  const custom=panel.querySelector('[data-edit-custom]');
  const label=panel.querySelector('[data-repeat-field]');
  const {start='',rule='',repeatStart,repeatText,repeatZone,repeatOffset,revision}=panel.dataset;
@@ -3497,7 +3505,6 @@ function bindFeedbackForm(form){
   const unpark=form.querySelector('[value="unpark"]'),parkedDetail=form.querySelector('[data-parked-detail]');
   showActionFailure(notice,tableView.actionNotice(item));
   const waitingForm=form.hasAttribute('data-waiting-actions');
-  const questionRead=form.hasAttribute('data-question-read');
   const zone=content.dataset.zone;
   const confirmation=()=>({state:item.dataset.state,parked:item.dataset.parked,
    unread:item.dataset.unread==='true',unreadDelivery:item.dataset.unreadDelivery,unreadAnswer:item.dataset.unreadAnswer,
@@ -3651,7 +3658,7 @@ function bindFeedbackForm(form){
   const unconfirmed=draft?.unconfirmed ?? new Set();
   const parkSettings=()=>JSON.parse(content.dataset.parking);
   const edit=()=>{draftStamp++;retain();persistDraft();};
-  const scheduleEditor=waitingForm || questionRead ? null : bindScheduleFields(form,until,zone,draft?.schedule,edit);
+  const scheduleEditor=form.querySelector('[data-schedule-template]') ? bindScheduleFields(form,until,zone,draft?.schedule,edit) : null;
   const matching=(action,scheduleKey)=>[...unconfirmed].findLast(attempt=>attempt.words===words.value &&
    (attempt.action==='park-until-delivered' || attempt.until===until.value) &&
    (scheduleKey===undefined || attempt.scheduleKey===scheduleKey) &&
@@ -3682,6 +3689,11 @@ function bindFeedbackForm(form){
    retryTime:()=>Date.parse((scheduleEditor.words() ?
     [...unconfirmed].findLast(attempt=>attempt.action==='schedule' && attempt.until===until.value &&
       JSON.parse(attempt.scheduleKey).words===scheduleEditor.words()) : matching('park'))?.parkingTime ?? '')});
+  else if(parkToggle){
+   trackParkMenu(form.querySelector('[data-later-menu]'));
+   bindDateTimePicker(form,{zone,settings:parkSettings,summaryPrefix:'Parks until ',
+    formatSummary:formatParkingTime,retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
+  }
   form.addEventListener('submit',async event=>{
    event.preventDefault();
    const formKey=form.elements.keeper.value+'/'+form.elements.id.value;
@@ -3694,6 +3706,7 @@ function bindFeedbackForm(form){
    const parks=buttonAction==='park' || parkForDelivery || preset;
    const action=buttonAction==='park' && scheduleEditor?.words() ? 'schedule'
     : buttonAction==='unpark' && scheduleEditor?.scheduled ? 'unschedule' : preset ? 'park' : buttonAction;
+   const questionRead=action==='read' && current.dataset.questionItem!==undefined;
    const scheduleWrite=['schedule','unschedule','start-now'].includes(action);
    const parkingReceipt=parks || scheduleWrite;
    const changesParking=parks || action==='unpark' || scheduleWrite;
