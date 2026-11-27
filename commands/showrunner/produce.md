@@ -597,7 +597,9 @@ notice to the unit director before any merge command runs:
    rule and the fix, and do not merge. Never ask the user whether a visible
    defect matters. User rule 2026-10-01 (nightly review): the unit judges its
    own shots before it moves on, so holds are not found after it has.
-4. **Run the checkpoint.** Name the production whose repo holds the checkpoint as the destination.
+4. **Producer code review.** A change that carries a top item waits for
+   <ProducerCodeReview/>. Merge it only after its producer answers `reviewed, go`.
+5. **Run the checkpoint.** Name the production whose repo holds the checkpoint as the destination.
    Give the order to a merge unit that serves the destination under `commands/unit/merge.md`.
    Use a merge unit under the destination's showrunner or one of its ancestors.
    Without a merge unit, start a detached run:
@@ -673,14 +675,14 @@ until every row has a valid proposal or that reason is logged. Report no entry
 message.
 </ChangeReviewFeatureLog>
 
-5. **Report where it landed.** Include every `into:` line from the script in
+6. **Report where it landed.** Include every `into:` line from the script in
    the user update. Each names the checkout, why it received the merge and
    what work it enables. If the showrunner then merges the merge branch into
    a unit worktree, add an `into:` line for that worktree with the same why
    and unblocks fields. A failed promote still reports each place already
    reached. A rerun of the same hash resumes promotion.
 
-6. **After the push.** Run <CrossUnitChange/> if the merge renamed or removed
+7. **After the push.** Run <CrossUnitChange/> if the merge renamed or removed
    public items or changed the file structure. After each code merge, run
    `~/.claude/scripts/lib/py ~/.claude/scripts/production/ci_points.py due
    --production <showrunner name> --state-dir WAITING_STATE_DIR`.
@@ -688,6 +690,27 @@ message.
    the production rules say CI does not apply. A shrink adds no review ledger
    row or CI count.
 </MergeCheckpoint>
+
+---
+
+<ProducerCodeReview>
+nate, Nov 27 (List 541): producers review the code of their top items when the
+showrunner says they are ready to merge.
+
+A top item is a producer's top priority item (`the_list.py top-priority`) and
+each item in its `related_to` and `blocked_by`.
+
+1. **Send.** When a change that carries a top item goes into the merge line,
+   send its producer one message in the same turn. Give the item number, the
+   branch, the base hash, the tip hash, and one line on what changed.
+2. **Wait in the line.** The review runs while the change waits in the merge
+   line. Do not hold its test run for the review.
+3. **Merge on the answer.** Merge the change only after the producer answers
+   `reviewed, go`. Only the producer answers; a peer word for it is not the answer.
+4. **Findings.** Findings come to you. Decide the repair and send it to the unit.
+   Send the repaired change to the producer again, with the new tip hash and
+   the changed files only.
+</ProducerCodeReview>
 
 ---
 

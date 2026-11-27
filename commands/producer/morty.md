@@ -62,6 +62,8 @@ nate's verdicts and question answers go to the owner, not to morty.
 Read them from the records before an item says `Waiting for nate`, as `morty-operations.md` shows.
 Then correct the item state and ask the owner for nate's answer.
 nate's words on a List page item of another producer go to that producer. Read them from the item log.
+Review the code of your own top items under `/producer:produce` → Code review of top items.
+A top item that waits for its producer's code review has the next step `<producer> reviews the code before the merge.`
 
 ## Low-context status rounds
 
