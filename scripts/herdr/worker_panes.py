@@ -159,7 +159,17 @@ class HolderRun(Enum):
     CURRENT = "holder's run"
 
 
+@dataclass(frozen=True)
+class UnboundRoleLaunchRun:
+    """Set the launch environment before the first dispatch creates the recorder."""
+
+    directory: Path
+
+
 def dispatch_run_fields(parent: StaffId, run: Path, *, record: staff.StaffSnapshot) -> dict[str, object] | AdmissionRefused:
+    owner = record.by_id(parent)
+    if owner is None or owner.kind not in ("unit", "showrunner"):
+        return AdmissionRefused("only a unit or showrunner can admit a worker")
     fields = unit_runs.read_run_fields(run)
     try:
         _ = pass_recorder.resolve_run_owner(run, fields, record)
@@ -1683,7 +1693,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
                     policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT, runs: dict[str, list[str]] | None = None,
-                    dispatch_run: DispatchRun | HolderRun = HolderRun.CURRENT,
+                    dispatch_run: DispatchRun | HolderRun | UnboundRoleLaunchRun = HolderRun.CURRENT,
                     codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
                     selection: SelectedWorkerRows | Literal["by_name"] = "by_name",
                     phase: str | None = None,
@@ -1809,7 +1819,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead,
                   paths: EnrolledPaths | OrdinaryWorkerOwner, *, keep_model: bool,
-                  selection: SelectedWorkers | SelectedWorkerRows, dispatch_run: DispatchRun | HolderRun,
+                  selection: SelectedWorkers | SelectedWorkerRows,
+                  dispatch_run: DispatchRun | HolderRun | UnboundRoleLaunchRun,
                   recorder_lock: ExitStack, berth_session: str) -> WorkerStart:
     started = time.monotonic()
     try:
@@ -1840,6 +1851,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     backend = staff.backend(row) if row is not None else staff.BACKEND_UNAVAILABLE
     switching = not isinstance(backend, staff.BackendUnavailable) and backend.family != policy.settings.kind
     explicit = isinstance(dispatch_run, DispatchRun)
+    unbound_role_open = isinstance(dispatch_run, UnboundRoleLaunchRun)
+    launch_run = dispatch_run.directory.absolute() if unbound_role_open else allowed.run
     recheck_run_before_restart = False
     if row is not None and not lock.owns(row):
         return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
@@ -1929,7 +1942,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             same_run = True
             same_account = True
             same_berth = True
-            check_run = owner.kind == "unit" and not passed
+            check_run = unbound_role_open or (owner.kind == "unit" and not passed)
             if matches:
                 try:
                     pane_row = next(pane for pane in evidence.panes if pane.get("pane_id") == current.pane)
@@ -1942,7 +1955,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     if explicit:
                         same_run = _uses_dispatch_run(launched, allowed.run)
                     elif check_run:
-                        same_run = launched.environment.get("UNIT_RUN_DIR") == str(allowed.run)
+                        same_run = launched.environment.get("UNIT_RUN_DIR") == str(launch_run)
                     expected = launch_environment(policy, account, True)
                     if isinstance(expected, StartRefused):
                         return expected
@@ -1983,8 +1996,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         environment[phase_reservation.SESSION_ENVIRONMENT] = berth_session
     else:
         unset_environment |= {phase_reservation.SESSION_ENVIRONMENT}
-    if explicit or owner.kind == "unit" or isinstance(paths, EnrolledPaths):
-        environment["UNIT_RUN_DIR"] = str(allowed.run)
+    if explicit or unbound_role_open or owner.kind == "unit" or isinstance(paths, EnrolledPaths):
+        environment["UNIT_RUN_DIR"] = str(launch_run)
     if temporary := os.environ.get("TMPDIR"):
         environment["TMPDIR"] = temporary
     if isinstance(paths, EnrolledPaths):

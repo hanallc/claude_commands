@@ -19,7 +19,7 @@ import subprocess
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast, final, override
@@ -111,6 +111,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
     def test_submitted_held_review_keeps_the_phase_open_until_the_hook_completes(self) -> None:
         design = self.panes.open("reviewer", bound=False)
         directory = design_roles.design_directory(design.placement.design_id)
+        self.assertEqual(self.panes.world.requests[-1][2]["UNIT_RUN_DIR"], str(directory))
         self.panes.command_case.agent.finish_after = 1
         submitted = design_roles.resume(design.placement.design_id + "/reviewer", self.panes.command_case.prompt)
         self.assertIsInstance(submitted, design_roles.SubmittedRoleTurn)
@@ -681,8 +682,8 @@ class DurableRolesTests(HeldRolePaneCase):
     def instance(self, design: design_roles.HeldDesign, role: Role) -> design_roles.RoleInstance:
         return next(instance for instance in design.roles if instance.role == role)
 
-    def assign_command(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
-        result = self.panes.assign(arguments)
+    def assign_command(self, arguments: list[str], *, env: Mapping[str, str] = os.environ) -> subprocess.CompletedProcess[str]:
+        result = self.panes.assign(arguments, env=env)
         if "--new-worker" in arguments and result.returncode == 0:
             for row in staff.snapshot().find(kind="worker", parent=self.panes.command_case.fixture.parent.id):
                 for pane, (pid, family, _) in self.panes.world.foreground.items():

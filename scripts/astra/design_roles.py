@@ -45,6 +45,7 @@ from scripts.production import staff, worker_admission
 ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
 DESIGNER_SANDBOX = 'danger-full-access'
+DURABLE_ROLE_LAUNCH_RUN_ENV = 'UNIT_DURABLE_ROLE_LAUNCH_RUN'
 
 
 class AstraCensusProjection(Protocol):
@@ -786,9 +787,9 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
     return SubmittedRoleTurn(reply, run)
 
 
-def _assign_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+def _assign_command(arguments: list[str], *, env: Mapping[str, str] = os.environ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(['bash', str(ROOT / 'scripts/direct/assign.sh'), *arguments],
-                          capture_output=True, text=True, check=False)
+                          env=env, capture_output=True, text=True, check=False)
 
 
 def _recorder_command(arguments: list[str], *, env: Mapping[str, str] = os.environ) -> None:
@@ -878,9 +879,13 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
     parent = staff.snapshot().by_current_session(staff.runtime_id())
     if parent is None or parent.kind not in ('unit', 'showrunner'):
         raise RoleRefused('staff: caller: not opened: caller is not a unit or showrunner')
+    env = dict(os.environ)
+    _ = env.pop(DURABLE_ROLE_LAUNCH_RUN_ENV, None)
+    if isinstance(design.binding, DesignUnbound):
+        env[DURABLE_ROLE_LAUNCH_RUN_ENV] = str(run)
     result = _assign_command(['--role', 'review' if role == 'reviewer' else 'implement',
         '--target', 'durable-design-role', '--policy', 'astra-' + role, '--new-worker', name,
-        '--session-dir', str(run), '--phase', phase, '--parent', str(parent.id)])
+        '--session-dir', str(run), '--phase', phase, '--parent', str(parent.id)], env=env)
     if result.returncode:
         raise RoleRefused(result.stderr.strip() or 'held worker startup did not complete; creation claim is retained')
     fields = _object(cast(object, json.loads(result.stdout)))
