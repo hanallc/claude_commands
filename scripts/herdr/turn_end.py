@@ -857,10 +857,12 @@ def _handle_event(event: WorkerEvent, owner: staff.StaffId | WorkerByThread, *,
     try:
         decision = _handle_locked(event, owner, result_pass=result_pass, retry_run=retry_run, pane_wait=pane_wait)
         if isinstance(decision, ResultInputWait):
-            if not _wait_for_result_input(decision):
-                return TurnOutcome.RETRY_EVIDENCE
-            decision = _handle_locked(event, decision.pane.row.id, result_pass=result_pass, result_target=decision)
+            target = decision
+            decision = (_handle_locked(event, target.pane.row.id, result_pass=result_pass, result_target=target)
+                        if _wait_for_result_input(target) else TurnOutcome.RETRY_EVIDENCE)
             assert not isinstance(decision, ResultInputWait)
+            if event.kind == EventKind.TURN_END and decision is not TurnOutcome.SUBMITTED:
+                detached_runs.resume_pending_worker_results(target.run, target.pane.row.id)
         if isinstance(decision, TurnDecision):
             return decision.send_notice() or decision.outcome
     except recorder_state.OldRecorderState as error:
@@ -1677,6 +1679,9 @@ def _handle_locked(event: WorkerEvent,
                     state = worker_panes.observe_worker(parent.id, row, record)
                 if isinstance(state, worker_panes.OpenWorker):
                     return ResultInputWait(state, run, instance, stage)
+                if event.kind == EventKind.TURN_END:
+                    hold.defer_until_unlock((run, "resume pending results"),
+                                            lambda: detached_runs.resume_pending_worker_results(run, row.id))
                 return TurnOutcome.RETRY_EVIDENCE
             if replay in (detached_runs.WorkerResultReplay.RETRY, detached_runs.WorkerResultReplay.DUPLICATE):
                 return TurnOutcome.RETRY_EVIDENCE

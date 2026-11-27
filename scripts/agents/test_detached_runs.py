@@ -6663,6 +6663,46 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIs(saved["push_alert_attempted"], True)
         self.assertNotIn("push_alert_delivery", saved)
 
+    def test_alert_retry_reports_each_lookup_failure_once(self) -> None:
+        row = self.fixture.worker()
+        record = self.record(row, "alert-lookup-failures")
+        path = Path(record["log"]).with_suffix(".json")
+        failure = detached_runs.FAILED_RESULT_PUSH + "fixture refusal"
+        record.update(status="finished", exit_code=7, delivery=failure, push_alert_delivery=failure)
+        write_text_atomic(path, json.dumps(record))
+        self.assertIsNotNone(staff.retire(row.id))
+        membership = staff.snapshot()
+        state_path = self.run_dir / unit_runs.STATE_FILE
+        director_state = state_path.read_text()
+        write_text_atomic(state_path, "{")
+        lookups = 0
+        retries = 0
+
+        def read_staff() -> staff.StaffSnapshot:
+            nonlocal lookups
+            lookups += 1
+            if lookups <= 2:
+                raise staff.StaffUnreadable(f"fixture staff read {lookups} failed")
+            return membership
+
+        def restore_lookup(_seconds: float) -> None:
+            nonlocal retries
+            retries += 1
+            self.assertLessEqual(retries, 4)
+            self.assertEqual(worker_lifecycle.read_json_object(path)["push_alert_delivery"], failure)
+            if retries == 4:
+                write_text_atomic(state_path, director_state)
+
+        with (patch.object(staff, "snapshot", new=read_staff), patch.object(time, "sleep", new=restore_lookup),
+              patch.object(send, "send", return_value=send.Result("sent", "director received the alert")) as alert,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            _ = detached_runs._retry_result_delivery(path)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(retries, 4)
+        self.assertEqual(errors.getvalue().count("anomaly:"), 2)
+        self.assertIn("fixture staff read 1 failed", errors.getvalue())
+        self.assertIn(str(state_path), errors.getvalue())
+        alert.assert_called_once()
+
     def test_result_delivery_matrix(self) -> None:
         all_owners = ("worker", "director", "retired", "self-stop")
         relay_owners = ("worker", "director", "retired")
@@ -7436,6 +7476,25 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIs(saved["push_alert_attempted"], True)
         self.assertNotIn("push_alert_delivery", saved)
         self.assertNotIn("push_retries", saved)
+
+    def test_prune_removes_the_run_after_the_director_accepts_a_retirement_alert(self) -> None:
+        row = self.fixture.worker()
+        record = self.record(row, "accepted-retirement-alert")
+        log = Path(record["log"])
+        path = log.with_suffix(".json")
+        failure = detached_runs.FAILED_RESULT_PUSH + f"{row.name}: detached run has no worker or director staff row"
+        record.update(status="finished", exit_code=7, completion_pending=True, pid=DEAD_PID,
+                      delivery=failure, push_alert_delivery=failure)
+        write_text_atomic(path, json.dumps(record))
+        self.assertIsNotNone(staff.retire(row.id))
+        self.assertEqual(detached_runs.prune_finished(path.parent), [])
+        self.assertTrue(log.is_file())
+        with patch.object(send, "send", return_value=send.Result("sent", "director received the alert")) as alert:
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        alert.assert_called_once()
+        self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
+        self.assertFalse(path.exists())
+        self.assertFalse(log.exists())
 
     def test_supervisor_retries_a_self_stop_after_the_workers_pane_closes(self) -> None:
         row = self.fixture.worker(family="codex")
@@ -8344,6 +8403,50 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.inputs), 1)
         self.assertEqual(self.notices, [])
         self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], f"sent: worker {row.name} at {pane}")
+
+    def test_orphaned_pane_result_gets_a_retry_after_timeout_or_retirement(self) -> None:
+        _ = write_config_fixture(self.fixture.root / "conf/send.conf", "delivery_timeout=40\n")
+        for retired in (False, True):
+            with self.subTest(retired=retired):
+                row = self.fixture.worker(f"unowned-result-{retired}", family="codex")
+                pane = "w1:p1"
+                self.fixture.world.add(row, pane, family="codex")
+                self.fixture.world.locations[pane]["agent_status"] = "done"
+                record = self.record(row, row.name)
+                record.update(status="finished", exit_code=7, pane_dispatch_id="", pid=DEAD_PID,
+                              delivery=(detached_runs.WORKER_CLOSED_RESULT if retired
+                                        else detached_runs.WORKER_READINESS_PENDING),
+                              completion_pending=not retired)
+                path = Path(record["log"]).with_suffix(".json")
+                write_text_atomic(path, json.dumps(record))
+
+                with patch.object(subprocess, "Popen") as spawn:
+                    if retired:
+                        self.fixture.world.remove_pane(pane)
+                        self.assertIsNotNone(staff.retire(row.id))
+                        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir), row.name), [])
+                    else:
+                        with (patch.object(self.fixture.world, "readiness", return_value={
+                                  "agent_status": herdr.AgentStatus.DONE, "interactive_ready": False}),
+                              patch.object(self.fixture.world, "wait_for_prompt_input",
+                                           return_value=herdr.PromptInputTimedOut()) as wait):
+                            self.assertIs(turn_end.handle(turn_end.WorkerEvent(str(row.current_session))),
+                                          turn_end.TurnOutcome.RETRY_EVIDENCE)
+                        wait.assert_called_once()
+                spawn.assert_called_once()
+                argv = cast(list[str], spawn.call_args.args[0])
+                self.assertEqual(argv[2:4], ["deliver-deferred", str(path)])
+                with (patch.object(time, "sleep") as delay,
+                      patch.object(send, "send", return_value=send.Result("sent", "director received the alert")) as alert):
+                    self.assertEqual(detached_runs.main(argv[2:]), 0)
+                delay.assert_called_once_with(5)
+                saved = worker_lifecycle.read_json_object(path)
+                if retired:
+                    alert.assert_called_once()
+                    self.assertIs(saved["push_alert_attempted"], True)
+                else:
+                    alert.assert_not_called()
+                    self.assertEqual(saved["delivery"], f"sent: worker {row.name} at {pane}")
 
     def test_supervisor_counts_a_herdr_timeout_with_no_receipt(self) -> None:
         self.check_prompt_without_receipt(subprocess.TimeoutExpired("herdr agent prompt", 10), through_herdr=True)
