@@ -50,8 +50,8 @@ UNREACHABLE_WAIT_FIXTURE_SECONDS = 45
 UNREACHABLE_WAIT_FIXTURE = f"# whole: 1..86400\nunreachable_wait_seconds={UNREACHABLE_WAIT_FIXTURE_SECONDS}\n"
 
 
-# Give real fixture commands short deadlines.
-# A test that exercises a deadline sets its own value.
+# Give fixtures short deadlines and the word values their tests expect.
+# Explicit fixture settings take precedence.
 TEST_CONFIG_DEFAULTS = {
     "accounts.conf": (
         "quota_relay_timeout_seconds=30\n"
@@ -91,6 +91,10 @@ TEST_CONFIG_DEFAULTS = {
         "locks.probe_retry_seconds=0.005\n"
     ),
     "build_targets.conf": (
+        "targets=hana-aws,mac,mac-linux,natedev\n"
+        "pinned_targets=hana-gpu\n"
+        "enabled.mac-linux=on\n"
+        "notices.mac=on\n"
         "hold_sender_timeout_seconds=30\n"
         "sync.connect_timeout_s=10\n"
         "sync.reach_timeout_s=30\n"
@@ -102,6 +106,9 @@ TEST_CONFIG_DEFAULTS = {
     ),
     "buildlog.conf": "index_read_wait_seconds=1\n",
     "cloud_gate.conf": (
+        "enabled=on\n"
+        "execution_transport=hana-gpu\n"
+        "hana_gpu_route_enabled=on\n"
         "gpu_setup_dry_run_retry_timeout_s=30\n"
         "gpu_setup_dry_run_retry_interval_s=5\n"
         "spot_price_live_read_timeout_s=3\n"
@@ -136,6 +143,8 @@ TEST_CONFIG_DEFAULTS = {
         "fetch_lock_wait_seconds=0.5\n"
     ),
     "hana_aws.conf": (
+        "enabled=on\n"
+        "execution_transport=hana-control\n"
         "guard_grace_seconds=30\n"
         "mount_timeout_seconds=15\n"
         "stop_poll_seconds=10\n"
@@ -181,6 +190,8 @@ TEST_CONFIG_DEFAULTS = {
         "terminate_grace_seconds=3\n"
     ),
     "mac_test.conf": (
+        "offload=on\n"
+        "linux_only.hana=hana_video,hana_clerestory\n"
         "connect_timeout_s=6\n"
         "probe_timeout_s=15\n"
         "floor_sweep_timeout_s=30\n"

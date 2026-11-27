@@ -81,10 +81,7 @@ class MachineWatchTests(NotificationGuardedTestCase):
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILD_HOLD_DIR": str(self.root / "holds"),
         }))
-        # Pin the Mac notices on: the repository value is a live setting that nate turns off.
-        _ = write_config_fixture(config / "build_targets.conf", "enabled.mac-linux=on\nnotices.mac=on\n")
-        _ = write_config_fixture(config / "mac_test.conf", "offload=on\n")
-        for stem in ("mac_linux", "hana_aws", "cloud_gate", "lint"):
+        for stem in ("build_targets", "mac_test", "mac_linux", "hana_aws", "cloud_gate", "lint"):
             _ = write_config_fixture(config / f"{stem}.conf")
         (self.root / "mac-state").mkdir()
         self.paths = machine_watch.watch_paths()
