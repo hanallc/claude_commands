@@ -116,6 +116,26 @@ class NativeHookEntryTests(unittest.TestCase):
 
 @final
 class PassNoticeOrderTests(unittest.TestCase):
+    def test_repeated_turn_delivers_the_pending_notice_once(self) -> None:
+        with TemporaryDirectory() as folder:
+            run = Path(folder)
+            route = pass_notices.Route("pass", staff.StaffId("director"), "worker")
+            legacy = pass_notices.LegacyNoticeStamp("", "")
+            notice = pass_notices.Notice("The check is running.", "codex:worker", pass_notices.NoticeKind.STATUS,
+                                         transition="waiting on runs", source_event_id="turn:first")
+            repeated = replace(notice, source_event_id="turn:second")
+
+            with patch.object(pass_notices, "_send", return_value=send.Result("sent", "")) as transport:
+                first = pass_notices.stage_status(run, route, notice, legacy=legacy)
+                second = pass_notices.stage_status(run, route, repeated, legacy=legacy)
+                self.assertEqual(second, first)
+                transport.assert_not_called()
+
+                pass_notices.deliver_status(run, route.instance_id, second)
+                transport.assert_called_once_with(run, route, first, notice)
+
+            self.assertTrue(pass_notices.is_settled(run, route.instance_id, first))
+
     def test_changed_turn_notice_detail_is_delivered_and_replay_is_skipped(self) -> None:
         with TemporaryDirectory() as folder:
             run = Path(folder)
