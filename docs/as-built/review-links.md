@@ -2415,7 +2415,8 @@ Closed staff questions without a saved answer stay outside the migration.
 #### Question items in the Studio
 
 The List saves the question kind and native source key when it files a question item.
-Conversion resolves the original source of a legacy question and saves its key.
+Conversion uses the submitted question's request ID to find its saved List reservation after an owner transfer.
+Migration files the question on the reserved row and saves the native source key.
 The loader reports a question item without a saved source key as a conversion error.
 Replies on Changes, Bugs, and Investigations keep the ordinary List workflow.
 A question to Nate starts in **Waiting for nate** and appears under **Questions**.
@@ -2445,7 +2446,8 @@ The Studio uses the same row and **Working** badge for questions and other work.
 Migration keeps open questions waiting for Nate.
 It moves Nate's questions with an unread reply to **Answered**, including a closed question.
 It closes questions Nate already answered and logs “Closed when questions became items”.
-Migration uses the saved List acknowledgment to keep old answers read.
+Conversion saves the read marks for individual replies that the legacy List acknowledged, including through Park or Close.
+The saved marks keep those replies read when migration runs again.
 
 New questions and answers use the same writer after the source saves.
 The writer keeps the source key, exchange ID, and question and reply origins.

@@ -2958,6 +2958,35 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
             item = the_list.load(destination.keeper, f"L{destination.number}")
             self.assertFalse(the_list.unread_answer_ids(item))
 
+    def test_studio_news_counts_a_closed_question_with_an_unread_linked_reply(self) -> None:
+        members = staff.snapshot()
+        key = f"question/{OWNER.id}/closed.md"
+        prompt = list_exchange.Exchange(list_exchange.Source.STAFF_QUESTION, key, "initial",
+            list_exchange.Direction.QUESTION_TO_NATE, "Which width?", NOW, OWNER.id, list_exchange.Nate.USER,
+            list_exchange.ExchangeAnswer("Use 800 pixels.", NOW, list_exchange.AnswerRead.NOT_TRACKED))
+        with the_list.lock_exchange_source(key) as source:
+            row = the_list.file_exchanges(source, (prompt,), prompt.question, linked=the_list.NextNumber.AVAILABLE,
+                                          owner=OWNER.id, members=members)
+        identity = f"L{row.number}"
+        _ = the_list.close(row.keeper, identity, "The width works.", source=OWNER.name,
+                           assigned_to=the_list.ListCloseCaller(OWNER, False))
+        request = console.NewsRequest(self.root)
+        self.assertFalse(list_page.waiting_updates(request))
+
+        key = "submission/question/closed-item-reply"
+        replied_at = NOW + timedelta(minutes=1)
+        reply = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "followup:1",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which height?", NOW, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.ExchangeAnswer("Use 600 pixels.", replied_at, list_exchange.AnswerRead.UNREAD))
+        with the_list.lock_exchange_source(key) as source:
+            _ = the_list.file_exchanges(source, (reply,), reply.question, linked=row, owner=OWNER.id, members=members)
+        closed = the_list.load(row.keeper, identity)
+        self.assertIs(closed.state, the_list.ItemState.CLOSED)
+        self.assertEqual(list_page.waiting_updates(request),
+                         {f"{list_page.ListRecord(row.keeper, closed).key}/{replied_at.isoformat()}"})
+        _ = the_list.mark_read(row.keeper, identity, source=the_list.PAGE_SOURCE)
+        self.assertFalse(list_page.waiting_updates(request))
+
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_evidence_opens_only_reviews_linked_to_the_item(self) -> None:
         review = investigation.file(OWNER.id, "Find the cause", "Read the failed check.", waiting_why="Work continues.")

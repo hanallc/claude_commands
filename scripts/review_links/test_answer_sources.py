@@ -27,14 +27,14 @@ from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import (
-    change_review, change_routing, delivery_state, investigation, list_exchange, record_store, staff, the_list,
-    unrouted_alert, update_registration,
+    change_review, change_routing, delivery_state, investigation, list_exchange, record_store,
+    staff, the_list, tidy_wrapped, unrouted_alert, update_registration,
 )
 from scripts.production.issues import Issue
 from scripts.review_links import (
     answer_sources, change_browser, change_page, image_store, images, list_draft, list_page, new_item_dialog,
     question_path, question_record,
-    reply_tokens, review_items, review_page, staff_names,
+    reply_tokens, review_items, review_later, review_page, review_submissions, staff_names,
 )
 from scripts.review_links.review_events import ReviewLog, encode, rows
 
@@ -1166,6 +1166,94 @@ class AnswerSourceTests(unittest.TestCase):
             the_list.QuestionItemKind.FROM_NATE, f"submission/question/{request}"))
         self.assertIs(saved.state, the_list.ItemState.CLOSED)
         self.assertFalse(the_list.unread_answer_ids(saved))
+
+    def test_migration_files_a_transferred_question_on_its_reserved_row(self) -> None:
+        request = f"r6-{'2' * 32}-question-{OWNER.id}"
+        submission = origin(request)
+        key = self.native("question-before-transfer", {
+            "since": FILED, "text": "Which plan?", "question": "Which plan?", "review_id": "Q1",
+            "review_submission": new_item_dialog.stored_submission(submission),
+            "followup": {"text": "Which plan?", "sent": FILED},
+        })
+        folder = review_submissions.image_folder(submission).parent
+        folder.mkdir(parents=True)
+        _ = (folder / "list-filing.json").write_text(json.dumps({
+            "keeper": KEEPER.id, "owner": OWNER.id, "producer": OWNER.id, "unit": "", "source": "nate via New item",
+        }), encoding="utf-8")
+        number = the_list.add_review_item(KEEPER.id, "Which plan?", owner=OWNER.id, producer=OWNER.id, unit="",
+            words="Which plan?", evidence="/console/review.html#" + urlencode({"jump": key}), review_key=key,
+            source="nate via New item", reservation=folder / "list-number")
+        source = record_store.default_question_folder(OWNER.id) / key.rsplit("/", 1)[1]
+        destination = record_store.default_question_folder(ASKER.id) / "question-after-transfer.md"
+        destination.parent.mkdir(parents=True)
+        document = self.root / "parent.md"
+        document.touch()
+        move = tidy_wrapped.ReviewRecordMove.plan(source, destination, OWNER.id, ASKER.id, "Q1",
+                                                 new_item_dialog.SubmissionKind.QUESTION, submission)
+        with review_later.locked() as later:
+            tidy_wrapped.apply_review_moves([move], document, update_registration.QuestionStaff.for_record(MEMBERS), later)
+        self.assertFalse(source.exists())
+        current = update_registration.read_review_question(destination, ASKER.id)
+        self.assertEqual(review_submissions.native_origin(current), submission)
+        self.assertNotEqual(review_items.question_record_key(current), key)
+
+        dry_status, preview = self.migrate(apply=False)
+        self.assertEqual(dry_status, 0)
+        self.assertIn("sent-question/scoped-reply: sources=1 exchanges=1 linked=1 new-rows=0", preview)
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        saved, = the_list.records(KEEPER.id, include_closed=True)
+        self.assertEqual(saved.number, number)
+        self.assertEqual(saved.native_question, the_list.NativeQuestionItem(
+            the_list.QuestionItemKind.FROM_NATE, f"submission/question/{request}"))
+        self.assertEqual(saved.reviews, (key,))
+        store = list_draft.list_records(KEEPER.id, the_list.ListError)
+        with store.locked():
+            self.assertEqual(store.next_number(), number + 1)
+            fields, body = store.read(saved.id)
+            del fields["question_source_key"]
+            store.write(saved.id, fields, body)
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        self.assertEqual(the_list.load(KEEPER.id, saved.id), saved)
+
+    def test_question_migration_keeps_replies_read_after_legacy_park_or_close(self) -> None:
+        for action in ("Park", "Close"):
+            key = f"submission/question/read-by-{action.lower()}"
+            reply = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "followup:1",
+                list_exchange.Direction.ANSWER_TO_NATE, "Which plan?", START, list_exchange.Nate.USER, OWNER.id,
+                list_exchange.ExchangeAnswer("Plan A.", FIRST_REPLY, list_exchange.AnswerRead.UNREAD))
+            with the_list.lock_exchange_source(key) as source:
+                row = the_list.file_exchanges(source, (reply,), reply.question, linked=the_list.NextNumber.AVAILABLE,
+                                              owner=OWNER.id, members=MEMBERS)
+            identity = f"L{row.number}"
+            store = list_draft.list_records(row.keeper, the_list.ListError)
+            with store.locked():
+                fields, body = store.read(identity)
+                del fields["question_kind"]
+                del fields["question_source_key"]
+                fields["state"] = the_list.ItemState.WORKING.value
+                body = body.removesuffix("\n").rsplit("\n", 1)[0] + "\n"
+                store.write(identity, fields, body)
+            with patch.object(the_list, "now", return_value=READ):
+                if action == "Park":
+                    read = the_list.park(row.keeper, identity, READ + timedelta(days=1), source="nate")
+                else:
+                    read = the_list.close(row.keeper, identity, "Plan A works.", source="nate")
+            self.assertFalse(the_list.unread_answer_ids(read))
+            if action == "Close":
+                with store.locked():
+                    fields, body = store.read(identity)
+                    fields["question_kind"] = the_list.QuestionItemKind.FROM_NATE.value
+                    store.write(identity, fields, body)
+
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        first = the_list.records(KEEPER.id, include_closed=True)
+        self.assertEqual(len(first), 2)
+        for saved in first:
+            self.assertIs(saved.state, the_list.ItemState.CLOSED)
+            self.assertFalse(the_list.unread_answer_ids(saved))
+            self.assertEqual(len(saved.legacy_read_replies), 1)
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        self.assertEqual(the_list.records(KEEPER.id, include_closed=True), first)
 
     def test_legacy_question_keeps_its_first_link_when_the_second_files_first(self) -> None:
         first, second = (self.native(name, {
