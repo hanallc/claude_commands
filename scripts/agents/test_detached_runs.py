@@ -4389,7 +4389,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         progress_history.save_dispatch_delivery(self.run_dir, dispatch, stage)
         self.assert_holder_result(record, "worker is stopped" if state == "stopped" else "worker pane is closed")
 
-    def test_holder_delivery_sends_after_both_locks_release(self) -> None:
+    def test_holder_delivery_locks_the_state_write_and_sends_after_unlock(self) -> None:
         row, _stage, record, path = self.prepare_holder_pass("closed")
         checks: list[str] = []
 
@@ -4404,14 +4404,16 @@ class PaneRunDeliveryTests(unittest.TestCase):
             return self.holder_notice(options, membership=membership)
 
         def during_save(target: Path, text: str) -> None:
-            if target == path and "sent: holder received the result" in text:
-                check_lock("delivery save")
+            if target == path and detached_runs.UNCONFIRMED_RESULT_PUSH in text:
+                with self.assertRaises(BlockingIOError), worker_panes.worker_id_lock(row.id):
+                    pass
+                checks.append("checkpoint")
             write_text_atomic(target, text)
 
         with (patch.object(send, "_send", new=during_transport),
               patch.object(detached_runs, "write_text_atomic", new=during_save)):
             self.assert_holder_result(record, "worker pane is closed")
-        self.assertEqual(checks, ["transport", "delivery save"])
+        self.assertEqual(checks, ["checkpoint", "transport"])
         with worker_panes.worker_id_lock(row.id):
             pass
 
@@ -4615,17 +4617,18 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertNotIn("worker_result_receipt", worker_lifecycle.read_json_object(path))
             self.assertEqual(len(attempts), 1)
 
-    def test_supervisor_rechecks_stage_before_sending_without_the_worker_lock(self) -> None:
-        for step in ("before check", "before boundary", "during transport", "during confirmation", "during save"):
-            with self.subTest(step=step):
-                case = PaneRunDeliveryTests("runTest")
-                case.setUp()
-                try:
-                    case.check_result_stage_lock(step)
-                finally:
-                    _ = case.doCleanups()
+    def test_supervisor_keeps_the_worker_lock_through_the_receipt_save(self) -> None:
+        for from_hook in (False, True):
+            for step in ("before check", "before boundary", "during transport", "during confirmation", "during save"):
+                with self.subTest(step=step, from_hook=from_hook):
+                    case = PaneRunDeliveryTests("runTest")
+                    case.setUp()
+                    try:
+                        case.check_result_stage_lock(step, from_hook=from_hook)
+                    finally:
+                        _ = case.doCleanups()
 
-    def check_result_stage_lock(self, step: str) -> None:
+    def check_result_stage_lock(self, step: str, *, from_hook: bool) -> None:
         agent = test_worker.DispatchAgent(self.fixture)
         row = self.fixture.worker("stage-lock", family="codex")
         pane = "w1:p1"
@@ -4635,7 +4638,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
         agent.append(pane, "user", stage.line)
         record = self.record(row)
         record.update(status="finished", exit_code=0, pane_dispatch_id=dispatch,
-                      finished_at=datetime.now(timezone.utc).isoformat())
+                      finished_at=datetime.now(timezone.utc).isoformat(), completion_pending=True,
+                      delivery=detached_runs.BUSY_WORKER_RESULT)
         path = Path(record["log"]).with_suffix(".json")
         write_text_atomic(path, json.dumps(record))
         replacement = replace(stage, completion_id=f"{dispatch}-second-stage")
@@ -4655,7 +4659,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
         readiness = self.fixture.world.readiness
 
         def before_check(target: str) -> herdr.WorkerReadiness:
-            advance_stage()
+            if not changed:
+                advance_stage()
             return readiness(target)
 
         reads = 0
@@ -4692,16 +4697,14 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 _ = stack.enter_context(patch.object(self.fixture.world, "run", new=during_transport))
             else:
                 _ = stack.enter_context(patch.object(detached_runs, "write_text_atomic", new=during_save))
-            result = detached_runs.deliver(record, detached_runs.CompletedCommand(0))
+            if from_hook:
+                self.assertIs(turn_end.run_finished(row.id, dispatch), detached_runs.CompletionReplay.RETRY)
+            else:
+                self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(0)),
+                                 f"sent: worker {row.name} at {pane}")
         saved = worker_lifecycle.read_json_object(path)
-        if step in ("before check", "before boundary"):
-            self.assertEqual(result, detached_runs.DEFERRED_WORKER_RESULT + "the worker stage changed")
-            self.assertEqual(changed, [True])
-            self.assertEqual(self.inputs, [])
-            self.assertNotIn("worker_result_receipt", saved)
-            return
-        self.assertEqual(result, f"sent: worker {row.name} at {pane}")
-        self.assertEqual(changed, [True])
+        self.assertEqual(saved["delivery"], f"sent: worker {row.name} at {pane}")
+        self.assertEqual(changed, [False])
         receipt = detached_runs.read_worker_result_receipt(saved)
         assert isinstance(receipt, detached_runs.WorkerResultReceipt)
         self.assertEqual(receipt.assignment, detached_runs.ResultSubmissionPass(dispatch, stage.completion_id))
@@ -7545,7 +7548,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     if attempts == 2:
                         self.assertEqual(location["agent_status"], "working")
                         saved = worker_lifecycle.read_json_object(path)
-                        self.assertEqual(saved.get("delivery"), detached_runs.WORKER_READINESS_PENDING)
+                        expected = (detached_runs.BUSY_WORKER_RESULT if transition == "at lock"
+                                    else detached_runs.WORKER_READINESS_PENDING)
+                        self.assertEqual(saved.get("delivery"), expected)
                         self.assertNotIn("delivered_at", saved)
                     location["agent_status"] = "idle"
 

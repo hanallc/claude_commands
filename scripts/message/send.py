@@ -833,11 +833,17 @@ class WorkerResultUnconfirmed(Result):
 
 
 @dataclass(frozen=True)
-class BlockedWorkerResult:
-    """The worker needs input, and the result must wait for the pane."""
+class WorkerResultHolderRelay:
+    """The holder can receive the result after the worker lock releases."""
 
     detail: str
     send_to_holder: Callable[[str, str], Result]
+
+
+@dataclass(frozen=True)
+class BlockedWorkerResult(WorkerResultHolderRelay):
+    """The worker needs input, and the result must wait for the pane."""
+
     outcome: Literal["retry"] = field(init=False, default="retry")
 
 
@@ -5536,9 +5542,7 @@ class WorkerResultSubmission:
 
     wait_for_idle: bool = False
     before_input: Callable[[], object] = lambda: None
-    recheck_input: Callable[[], object] = lambda: None
     worker_only: bool = False
-    before_holder: Callable[[], object] = lambda: None
 
 
 class NoResultTranscript(Enum):
@@ -5682,7 +5686,8 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         sender: str, timeout: float, reason: str = "",
                         receipt: WorkerResultProbe | WorkerResultSubmission | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
                         selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
-                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False) -> Result | BlockedWorkerResult | WorkerResultSubmitted:
+                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False,
+                        ) -> Result | WorkerResultHolderRelay | WorkerResultSubmitted:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
     from scripts.herdr import herdr
@@ -5733,7 +5738,6 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     except (OSError, ValueError, subprocess.SubprocessError) as error:
                         raise _WorkerResultReadinessFailure(f"worker transcript is unavailable: {error}") from error
                     check_readiness()
-                    _ = receipt.recheck_input()
                 attempting_input = True
 
             def check_message_status() -> None:
@@ -5820,7 +5824,9 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         return Result("retry", reason)
     if not allow_holder_fallback or isinstance(selection, FixedStaffLookup):
         return Result("failed", reason)
-    if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
+    if isinstance(receipt, WorkerResultSubmission):
+        return WorkerResultHolderRelay(reason, send_to_holder)
+    if isinstance(receipt, WorkerResultProbe):
         _ = receipt.before_holder()
     return send_to_holder(reason, text)
 

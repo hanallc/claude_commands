@@ -828,17 +828,9 @@ class ResultDeliveryAfterUnlock:
     run: Path
     instance: str
     stage: str
-    parked: bool
 
     def outcome(self) -> TurnOutcome | ResultInputWait:
-        replay = self.delivery.replay
-        if isinstance(replay, detached_runs.ConfirmedPaneResult):
-            if (replay.ownership is detached_runs.ResultPassOwnership.CURRENT and self.parked
-                    and not worker.clear_result_park(self.worker, worker_panes.ParkWaitingPass(
-                        self.run, self.instance, self.stage))):
-                return TurnOutcome.RETRY_EVIDENCE
-            return TurnOutcome.SUBMITTED
-        if replay is detached_runs.WorkerResultReplay.WAIT_FOR_INPUT:
+        if self.delivery.replay is detached_runs.WorkerResultReplay.WAIT_FOR_INPUT:
             selection = worker_panes.SelectedWorkerRows(frozenset({self.worker.id}))
             membership = staff.snapshot()
             parent = membership.by_id(self.parent)
@@ -1700,7 +1692,7 @@ def _handle_locked(event: WorkerEvent,
             replay = detached_runs.submit_finished_worker_result(
                 run, row, worker_input=worker_input, resume_parked=resume, input_lock=hold, pane_wait=pane_wait)
             if isinstance(replay, detached_runs.WorkerResultAfterUnlock):
-                return ResultDeliveryAfterUnlock(replay, row, parent.id, run, instance, stage, parked)
+                return ResultDeliveryAfterUnlock(replay, row, parent.id, run, instance, stage)
             if isinstance(replay, detached_runs.ConfirmedPaneResult):
                 if replay.ownership is detached_runs.ResultPassOwnership.CURRENT:
                     if parked and not worker.clear_result_park(row, worker_panes.ParkWaitingPass(
