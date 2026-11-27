@@ -280,9 +280,10 @@ def send_user_push(rendered: RenderedPush, *, sender: str, key: str, clears_when
     return False
 
 
-def user_retire_argv(sender: str, key: str) -> list[str]:
+def user_retire_argv(sender: str, key: str, *,
+                     send_script: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
     """The send.py argv that stops the repeats of the emergency push `user_send_argv` sent with `key`."""
-    return session_send.send_argv("retire", "--to", "user", "--from", sender, "--key", key)
+    return session_send.send_argv("retire", "--to", "user", "--from", sender, "--key", key, send_script=send_script)
 
 
 class FilledExampleRecord(TypedDict):

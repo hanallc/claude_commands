@@ -17,6 +17,7 @@ from typing import Protocol, cast
 
 from scripts.lib import conf, operation_deadline
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.user_zone import user_zone
 from scripts.notify import push_reference, silence
 from scripts.notify.push_reference import PushIdentity
 
@@ -140,7 +141,7 @@ def report(line: str) -> None:
     try:
         root.mkdir(parents=True, exist_ok=True)
         with (root / "notifier.log").open("a", encoding="utf-8") as output:
-            _ = output.write(f"{datetime.now().astimezone().isoformat()} | {line}\n")
+            _ = output.write(f"{datetime.now(user_zone()).isoformat()} | {line}\n")
     except OSError as error:
         print(f"{line}. Cannot write the notifier log: {error}", file=sys.stderr)
 
