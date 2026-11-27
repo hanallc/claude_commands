@@ -1,18 +1,29 @@
 """Tests for the Codex worker stop: which workers stop, what ends, and who gets a report."""
 from __future__ import annotations
 
+import io
+import json
+import os
+import subprocess
+import sys
+import time
 import unittest
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
+from threading import Barrier, Event
 from typing import override
 from unittest import mock
 
 from scripts.agents import detached_runs, remote, restart, shutdown_record
 from scripts.direct import progress_history
-from scripts.herdr import herdr, herdr_types, worker_panes
-from scripts.production import broadcast, session_staff, showrunners, staff, worker_capacity
+from scripts.herdr import herdr, herdr_types, turn_end, worker_panes
+from scripts.lib import atomic_file
+from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.production import broadcast, session_staff, showrunners, staff, worker, worker_capacity
+from scripts.production import test_worker as worker_fixture
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker
+from scripts.whoami import quota_state
 
 FAULTS_TO = "fault-reader"
 HEADING = "Codex workers have no capacity. This is the stop report for your Codex workers."
@@ -87,6 +98,7 @@ class WorkerCapacityTests(StaffTestCase):
         _ = self.enterContext(mock.patch.object(broadcast, "send", side_effect=record_send))
         _ = self.enterContext(mock.patch.object(herdr, "shared_session", return_value="fixture-session"))
         _ = self.enterContext(mock.patch.object(herdr, "Herdr"))
+        _ = self.enterContext(mock.patch.object(quota_state, "no_worker_mode", return_value=True))
         _ = self.enterContext(mock.patch.object(showrunners, "load_settings", return_value=showrunners.ShowrunnerSettings(
             threshold_percent=1, stall_minutes=5, faults_to=FAULTS_TO, always=[])))
 
@@ -97,6 +109,82 @@ class WorkerCapacityTests(StaffTestCase):
 
     def open_worker(self, row: staff.StaffRow | None = None, status: herdr.AgentStatus = herdr.AgentStatus.WORKING) -> worker_panes.OpenWorker:
         return worker_panes.OpenWorker(row or self.codex, "p1", "t1", status)
+
+    def second_parent(self) -> tuple[staff.StaffRow, staff.StaffRow]:
+        director = self.parent.parent
+        assert isinstance(director, staff.ReportsTo)
+        parent = fixture_member("unit", name="other-capacity-unit", parent=director.id)
+        row = fixture_worker("reader", parent.id, backend=staff.CodexBackend(self.root / "codex"))
+        _ = self.enterContext(mock.patch.object(session_staff, "pane_parents", return_value=[self.parent, parent]))
+        _ = self.enterContext(mock.patch.object(worker_panes, "observe_parents", return_value={
+            self.parent.id: [self.open_worker()], parent.id: [self.open_worker(row)],
+        }))
+        return parent, row
+
+    def test_all_worker_stops_overlap_across_parents(self) -> None:
+        parent, row = self.second_parent()
+        backend = staff.CodexBackend(self.root / "codex")
+        local_peer = fixture_worker("implementer2", self.parent.id, backend=backend)
+        other_peer = fixture_worker("reader2", parent.id, backend=backend)
+        observed = {
+            self.parent.id: [self.open_worker(), self.open_worker(local_peer)],
+            parent.id: [self.open_worker(row), self.open_worker(other_peer)],
+        }
+        entered = Barrier(sum(map(len, observed.values())))
+        starts: list[float] = []
+        finishes: list[float] = []
+        delay = 0.25
+
+        def stop_worker(_parent: staff.StaffRow, selected: staff.StaffRow, _client: herdr.Herdr, *,
+                        sweep: worker_capacity.StopSweep) -> worker_capacity.WorkerStopped:
+            self.assertTrue(sweep.active())
+            starts.append(time.monotonic())
+            _ = entered.wait(timeout=2)
+            _ = Event().wait(delay)
+            finishes.append(time.monotonic())
+            return worker_capacity.WorkerStopped(selected.name, "stopped", 1)
+
+        start = time.monotonic()
+        with (mock.patch.object(worker_panes, "observe_parents", return_value=observed),
+              mock.patch.object(worker_capacity, "stop_worker", side_effect=stop_worker)):
+            self.assertEqual(worker_capacity.stop(), 0)
+        self.assertLess(max(starts), min(finishes))
+        self.assertLess(time.monotonic() - start, 1.8 * delay)
+        self.assertCountEqual([(recipient, text.splitlines()[1]) for recipient, _, text in self.sent], [
+            (str(self.parent.id), f"Stopped: {self.codex.name}, {local_peer.name}."),
+            (str(parent.id), f"Stopped: {row.name}, {other_peer.name}."),
+        ])
+
+    def test_mode_ends_after_one_stop_while_the_other_waits_for_its_lock(self) -> None:
+        _ = self.second_parent()
+        mode_ended = Event()
+
+        @contextmanager
+        def lock(parent: staff.StaffId, _name: staff.WorkerName, *, deadline: float) -> Generator[object]:
+            self.assertGreater(deadline, 0)
+            if parent != self.parent.id:
+                self.assertTrue(mode_ended.wait(timeout=2))
+            yield self.lock
+
+        def observe(_parent: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+            if mode_ended.is_set():
+                return [worker_panes.ClosedWorker(self.codex)]
+            return [self.open_worker()]
+
+        def stop_row(*_args: object, **_kwargs: object) -> bool:
+            mode_ended.set()
+            return True
+
+        self.stop_row.side_effect = stop_row
+        with (mock.patch.object(quota_state, "no_worker_mode", side_effect=lambda: not mode_ended.is_set()),
+              mock.patch.object(worker_panes, "worker_lock", side_effect=lock),
+              mock.patch.object(worker_panes, "observe", side_effect=observe),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(worker_capacity.stop(), 0)
+        self.assertEqual([call.args[0] for call in self.stop_row.call_args_list], [self.codex])
+        self.cancel.assert_called_once_with(self.run_dir, self.codex.id)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(output.getvalue(), "No-worker mode ended during the stop.\n")
 
     def test_an_open_codex_worker_stops_and_its_pass_ends_and_its_director_gets_one_report(self) -> None:
         stopped = worker_panes.StoppedWorker(self.codex, "p1", "t1")
@@ -183,7 +271,7 @@ class WorkerCapacityTests(StaffTestCase):
 
         with mock.patch.object(worker_panes, "worker_lock", side_effect=lock):
             self.assertEqual(self.stop([opened, self.open_worker(other)], self.open_worker(other), stopped), 1)
-        self.assertEqual(seen, ["implementer", "reader"])
+        self.assertCountEqual(seen, ["implementer", "reader"])
         self.assertEqual([call.args[0] for call in self.stop_row.call_args_list], [other])
         self.assertIn("Stopped: reader.", self.sent[0][2])
         self.assertIn("Not proved stopped: implementer: pane read failed. Send it no work.", self.sent[0][2])
@@ -242,6 +330,56 @@ class WorkerCapacityTests(StaffTestCase):
         self.assertEqual(worker_capacity.main([]), 2)
         self.assertEqual(worker_capacity.main(["start"]), 2)
         self.assertEqual(worker_capacity.main(["stop"]), 0)
+
+
+class CanceledWorkerAssignmentTests(unittest.TestCase):
+    def test_canceled_worker_accepts_a_new_assignment_after_its_detached_run_ends(self) -> None:
+        case = set_up_fixture(self.addCleanup, worker_fixture.WorkerCommandTests("runTest"))
+        case.agent.without_done = True
+        status = case.run_dir / "impl_status"
+        following = case.run_dir / "next-prompt.md"
+        atomic_file.write_text_atomic(following, "Start the next assignment.\n")
+
+        def assign(prompt: Path) -> tuple[int, str, str]:
+            return case.command("assign", "impl", str(prompt), "--name", "impl", "--slot", "impl", "--phase", "8",
+                                "--kind", "assign", "--session-dir", str(case.run_dir), "--launcher-command", '["assign.sh"]')
+
+        with mock.patch.dict(os.environ, {progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}):
+            self.assertEqual(assign(case.prompt), (0, "submitted\n", ""))
+            pane, _ = case.agent.submitted[-1]
+            row = case.agent.row(pane)
+            instance = str(worker_panes.worker_pass(row, case.run_dir)["instance_id"])
+            self.assertEqual(status.read_text(), "running\n")
+            case.agent.append(pane, "user", "Detached run: earlier-result\nRun finished: private verification")
+            path, record = case.detached_record(row, "last-run")
+            record.update(status="running", pane_dispatch_id=instance)
+            with subprocess.Popen(
+                [sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
+                stdin=subprocess.PIPE, text=True,
+            ) as supervisor:
+                record["pid"] = supervisor.pid
+                atomic_file.write_text_atomic(path, json.dumps(record))
+                self.assertTrue(case.fixture.world.stop(row, case.fixture.world))
+                self.assertEqual(progress_history.cancel_worker_passes(case.run_dir, row.id), 1)
+                self.assertEqual(status.read_text(), "error\n")
+                self.assertEqual(turn_end.run_finished(row.id, instance), detached_runs.CompletionReplay.RETRY)
+                self.assertIn(pane, case.fixture.world.locations)
+                answer = ("answer", row.name, "--text", "Report the result.")
+                code, output, errors = assign(following)
+                self.assertEqual((code, output), (worker.ExitCode.BUSY, ""), errors)
+                self.assertEqual(case.command(*answer), (code, output, errors))
+                record.update(status="finished", delivery="sent: holder received the result")
+                atomic_file.write_text_atomic(path, json.dumps(record))
+                assert supervisor.stdin is not None
+                supervisor.stdin.close()
+            self.assertEqual(turn_end.run_finished(row.id, instance), detached_runs.CompletionReplay.HANDLED)
+            self.assertNotIn(pane, case.fixture.world.locations)
+            code, output, errors = case.command(*answer)
+            self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""), errors)
+            self.assertIn("no active pass. Use assign.sh for new work.", errors)
+            atomic_file.write_text_atomic(status, "running\n")
+            self.assertEqual(assign(following), (0, "submitted\n", ""))
+            self.assertNotEqual(worker_panes.worker_pass(row, case.run_dir)["instance_id"], instance)
 
 
 if __name__ == "__main__":

@@ -481,7 +481,7 @@ buildlog_sample_anon "$1" "$2" "$$"
         if stat.exists():
             try:
                 return stat.read_text().rsplit(") ", 1)[1][0] != "Z"
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 return False
         return True
 

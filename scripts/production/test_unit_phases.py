@@ -501,11 +501,14 @@ class UnitPhasesTests(unittest.TestCase):
             return subprocess.CompletedProcess([], 0, "", "")
 
         def capacity_stop() -> subprocess.CompletedProcess[str]:
+            from scripts.whoami import quota_state
+
             output, errors = io.StringIO(), io.StringIO()
             opened = worker_panes.OpenWorker(worker, "pane-1", "terminal-1", herdr.AgentStatus.WORKING)
             closed = worker_panes.ClosedWorker(worker)
             arguments = ["stop"]
-            with (patch.object(session_staff, "pane_parents", return_value=[member]),
+            with (patch.object(quota_state, "no_worker_mode", return_value=True),
+                  patch.object(session_staff, "pane_parents", return_value=[member]),
                   patch.object(worker_panes, "observe_parents", return_value={member.id: [opened]}),
                   patch.object(worker_panes, "observe", side_effect=[[opened], [closed]]) as observed,
                   patch.object(worker_panes, "observe_worker", return_value=closed),

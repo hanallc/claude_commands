@@ -15,6 +15,7 @@ from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, v
 from scripts.direct import verify_lint_scope_test_support as lint_support
 from scripts.direct.test_verify_lint_scope import assert_clippy_calls
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
+from scripts.lib.process_start import Started, Zombie, process_start
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -60,7 +61,22 @@ class LongStepOwnershipTests(VerifyTokenWaitFixture):
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertFalse(lock.exists())
         # There must be no heartbeat left in the call's session after release.
-        self.assertEqual(self.live_group_processes(process.pid), [])
+        survivors = self.live_group_processes(process.pid)
+        details: list[str] = []
+        for pid in survivors:
+            identity = process_start(pid)
+            start = identity.start if isinstance(identity, (Started, Zombie)) else type(identity).__name__
+            try:
+                info = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "ppid=", "-o", "command="],
+                                      env=self.environment, capture_output=True, text=True, check=False,
+                                      timeout=TEST_HANG_GUARD_SECS)
+                parent, _, command = info.stdout.strip().partition(" ")
+            except (OSError, subprocess.SubprocessError) as error:
+                parent, command = "", str(error)
+            details.append(
+                f"PID {pid}, parent PID {parent or 'unknown'}, start {start}, command {command.strip() or 'unavailable'}"
+            )
+        self.assertEqual(survivors, [], "\n".join(details))
 
     def test_expired_matching_live_step_keeps_ownership_but_dead_holder_is_freed(self) -> None:
         board = self.root / "board"

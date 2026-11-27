@@ -2218,6 +2218,26 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(row["unit"], "")
         self.assertIn("test all", row["name"])
 
+    def test_full_affected_test_keeps_changes_without_a_unit(self) -> None:
+        reading = with_wait_reason(captured_reading(), admission_records.ReadyForAdmission())
+        waiter = replace(reading.view.waiting[0], step="test-affected", session_id="missing-session", unit="")
+        reading = replace(reading, view=replace(reading.view, waiting=(waiter,)))
+        proc = self.root / "proc"
+        command = proc / str(waiter.pid) / "cmdline"
+        command.parent.mkdir()
+        _ = command.write_bytes(b"python3\0gate.py\0--affected\0--full\0")
+        _ = write_config_fixture(self.root / "build_steps.conf",
+                                 "names.test-all=test all\nabout.test-all=runs every test\nabout.gate-job=\n"
+                                 + "changes.default=no branch\n")
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
+            page = memory_feed.reading()
+        row, = page["waiters"]
+        # Every row has a description (b1ea3138c0); a run with no unit keeps the default changes text.
+        self.assertEqual(row.get("changes"), "no branch")
+        self.assertEqual(row.get("about"), "runs every test")
+        self.assertEqual(row["unit"], "")
+        self.assertIn("test all", row["name"])
+
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:
         for step in ("test-affected", "gate", "nextest", "test", "t"):

@@ -1711,7 +1711,7 @@ class LocateTests(HanaShotTest):
                 self.assertLess(rect["width"], self.fake.window_physical_size[0])
 
     def test_hover_finds_help_that_spawns_only_on_hover(self) -> None:
-        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", f"settle_seconds={TEST_HANG_GUARD_SECS}\n")
         self.fake.named_entities[-1]["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
         help_mesh = self.box(2001, "Help", (2.5, 2, 0), (0.5, 1, 0))
         help_mesh["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
@@ -1734,7 +1734,7 @@ class LocateTests(HanaShotTest):
         self.assertGreaterEqual(rect["x"] + rect["width"], 960)
 
     def test_hover_reports_a_failed_help_read_as_it_is(self) -> None:
-        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", f"settle_seconds={TEST_HANG_GUARD_SECS}\n")
         self.fake.fit_moves_camera = True
         self.fake.tooltips_error_on_target = True
 

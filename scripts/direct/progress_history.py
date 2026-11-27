@@ -2407,6 +2407,8 @@ def stop_dispatch(run: Path, slot: str, instance_id: str, worker: staff.StaffRow
                 or state.get(unit_runs.OWNER_FIELD) != director
                 or isinstance(hook_completion(passed), HookCompletion)):
             return StopDispatchRefused.CHANGED
+        if status_file := pass_recorder.assignment_status_file(passed):
+            _write_run_artifact(Path(status_file), "error\n")
         notice = _stage_stopped_pass(state, passed, worker, director, run_id=run_id, reason=reason)
         _ = _close_slot_pass(run, state, slot, "canceled", pass_recorder.now_epoch())
         return notice
@@ -2457,6 +2459,8 @@ def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
         for slot, passed in pass_recorder.open_passes(state).items():
             if passed.get("worker_id") != worker_id or isinstance(hook_completion(passed), HookCompletion):
                 continue
+            if status_file := pass_recorder.assignment_status_file(passed):
+                _write_run_artifact(Path(status_file), "error\n")
             _ = _stage_stopped_pass(state, passed, worker, owner.id, run_id="", reason="The worker was canceled.")
             ended += _close_slot_pass(session_dir, state, slot, "canceled", pass_recorder.now_epoch())
         return ended

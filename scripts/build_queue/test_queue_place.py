@@ -905,7 +905,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         with mock.patch.object(subprocess, "Popen", side_effect=start):
                             child = place.popen([sys.executable, "-c", CHILD, str(status)],
                                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                        output, _ = child.communicate(b"queued protocol\x00\xff", timeout=3)
+                        output, _ = child.communicate(b"queued protocol\x00\xff", timeout=TEST_HANG_GUARD_SECS)
                         self.assertEqual(output, b"queued protocol\x00\xff")
                         _, row = fixture.reservation()
                         place.observe(GIB, GIB)
@@ -921,7 +921,11 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 with queue.queue_place("rust-analyzer", fixture.root) as place:
                     places.append(place)
                     child = place.popen([sys.executable, "-c", "pass"])
-                    self.assertEqual(child.wait(timeout=3), 0)
+                    try:
+                        status = child.wait(timeout=TEST_HANG_GUARD_SECS)
+                    except subprocess.TimeoutExpired:
+                        self.fail("The queued program did not exit before the holder raised an error.")
+                    self.assertEqual(status, 0)
                     _, row = fixture.reservation()
                     reservation_id = str(row.get("reservation_id", ""))
                     place.observe(GIB, GIB)
@@ -1062,7 +1066,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
         with QueuePlaceFixture() as fixture:
             with queue.queue_place("rust-analyzer", fixture.root) as place:
                 child = place.popen([sys.executable, "-c", "pass"])
-                _ = child.wait(timeout=3)
+                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
                 with self.assertRaises(queue.QueuePlaceRefused):
                     _ = place.popen([sys.executable, "-c", "raise SystemExit(99)"])
                 self.assertEqual(len(fixture.children), 1)
@@ -1156,7 +1160,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     with queue.queue_place("rust-analyzer", fixture.root) as place:
                         child = place.popen([sys.executable, "-c", CHILD, "0"],
                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                        echoed, _ = child.communicate(b"Content-Length: 4\r\n\r\n{}\x00\xff", timeout=3)
+                        echoed, _ = child.communicate(b"Content-Length: 4\r\n\r\n{}\x00\xff", timeout=TEST_HANG_GUARD_SECS)
                         self.assertEqual(echoed, b"Content-Length: 4\r\n\r\n{}\x00\xff")
             self.assertIn("estimate_refresh_seconds='abc'", diagnostics.getvalue())
             self.assertIn(str(fixture.config), diagnostics.getvalue())
@@ -1739,7 +1743,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                       "print(int(signal.SIGTERM in mask),int(signal.SIGINT in mask),flush=True)")
             with queue.queue_place("rust-analyzer", fixture.root) as place:
                 process = place.popen([sys.executable, "-c", source], stdout=subprocess.PIPE)
-                output, _ = process.communicate(timeout=3)
+                output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 0)
                 self.assertEqual(output, b"0 0\n")
 

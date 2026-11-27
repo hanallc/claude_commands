@@ -48,7 +48,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.message import session_records, session_send
-from scripts.agents import member_account, pane_record, producer_creation, remote, shutdown_record
+from scripts.agents import member_account, pane_record, producer_creation, remote, shutdown_record, worker_lifecycle
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
@@ -1260,7 +1260,6 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
                       keep_running: frozenset[StaffId] = NO_WORKERS_TO_KEEP_RUNNING,
                       failures: dict[StaffId, str] | None = None) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
-    from scripts.agents import worker_lifecycle
     from scripts.herdr import worker_panes
     from scripts.agents import restart
 
@@ -1435,6 +1434,32 @@ def wait_for_native_session(client: herdr.Herdr, pane: str, deadline: float, *, 
             time.sleep(operation_deadline.remaining(min(0.5, remaining)))
 
 
+def _resume_liveness(identity: str, *, deadline: float = math.inf
+                     ) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
+    """Give a concurrent registry write another chance before a resume fails."""
+    live = (sessions.session_liveness(identity) if deadline == math.inf
+            else sessions.session_liveness(identity, deadline=deadline))
+    if isinstance(live, sessions.SessionLivenessUnknown) and live.unreadable_registry:
+        deadline = worker_lifecycle.effective_deadline(deadline)
+        delay = sessions.retry_policy().registry_delay_seconds
+        if monotonic() + delay >= deadline:
+            return live
+        time.sleep(delay)
+        if monotonic() >= deadline:
+            return live
+        try:
+            registry = sessions.read_registry(for_session=identity, deadline=deadline)
+        except session_records.RegistryReadExpired as error:
+            if not error.registry.entries:
+                return live
+            observed = sessions.session_liveness(identity, registry=error.registry)
+            return observed if isinstance(observed, sessions.LiveSessionProcess) else live
+        except TimeoutError:
+            return live
+        return sessions.session_liveness(identity, registry=registry)
+    return live
+
+
 def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, account: str, message: str) -> sessions.LiveSessionProcess:
     """Run the account command in the session's own pane, with one resume message."""
     client = herdr.Herdr(herdr.shared_session())
@@ -1453,14 +1478,16 @@ def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, a
         cursor.since = launched_at
     operation_deadline.check()
     client.run_in_pane(tab.pane_id, command)
-    deadline = monotonic() + operation_deadline.remaining(start_seconds)
-    live = sessions.session_liveness(entry["session_id"])
-    while isinstance(live, sessions.SessionNotLive):
+    deadline = worker_lifecycle.effective_deadline(monotonic() + start_seconds)
+    while monotonic() < deadline:
+        live = _resume_liveness(entry["session_id"], deadline=deadline)
+        if not isinstance(live, sessions.SessionNotLive):
+            break
         remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise herdr_types.HerdrFailure("never started")
-        time.sleep(operation_deadline.remaining(min(0.5, remaining)))
-        live = sessions.session_liveness(entry["session_id"])
+        if remaining > 0:
+            time.sleep(min(0.5, remaining))
+    else:
+        raise herdr_types.HerdrFailure("never started")
     if isinstance(live, sessions.SessionLivenessUnknown):
         raise herdr_types.HerdrFailure(live.reason)
     if not message:
@@ -1549,7 +1576,7 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude", cap
         if not observed.pids:
             return ResumeFailed(identity, "live Codex thread has no process account proof")
         return _codex_running_on_account(identity, pane_id, observed.pids[0], capture_generation)
-    live = sessions.session_liveness(identity)
+    live = sessions.session_liveness(identity) if capture_generation else _resume_liveness(identity)
     if isinstance(live, sessions.SessionNotLive):
         return live
     if isinstance(live, sessions.SessionLivenessUnknown):
@@ -1749,11 +1776,15 @@ def heal_account_trust(
     return trust
 
 
-def _unit_resume_owner(production: str, unit: str, record: StaffSnapshot) -> unit_lookup.UnitOwner:
+def _unit_resume_owner(production: str, unit: StaffRow, record: StaffSnapshot) -> unit_lookup.UnitOwner:
     """Read the unit again while only non-agent holders block its pane."""
     from scripts.production import unit_lookup
 
-    owner = unit_lookup.checked_unit(production, unit, record=record)
+    def observe() -> unit_lookup.UnitOwner:
+        registry = sessions.read_registry(for_session=unit.current_session, deadline=worker_lifecycle.effective_deadline())
+        return unit_lookup.checked_unit(production, unit.name, record=record, registry=registry)
+
+    owner = observe()
     if not isinstance(owner, unit_lookup.NonAgentPaneHolders):
         return owner
     seconds = conf.read("shutdown").number("holder_exit_seconds")
@@ -1766,8 +1797,11 @@ def _unit_resume_owner(production: str, unit: str, record: StaffSnapshot) -> uni
         _ = wait.wait(min(herdr.PANE_POLL_SECONDS, remaining))
         if monotonic() >= deadline:
             break
-        with operation_deadline.within(deadline):
-            observed = unit_lookup.checked_unit(production, unit, record=record)
+        try:
+            with operation_deadline.within(deadline):
+                observed = observe()
+        except TimeoutError:
+            break
         if monotonic() >= deadline:
             break
         owner = observed
@@ -1868,7 +1902,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if row is not None and row.kind == "unit" and (parent := names.tab_record.parent_of(row)) is not None:
             from scripts.production import unit_lookup
 
-            match _unit_resume_owner(parent.name, row.name, names.tab_record):
+            match _unit_resume_owner(parent.name, row, names.tab_record):
                 case unit_lookup.UnknownUnit(reason=reason):
                     return ResumeFailed(identity, reason)
                 case unit_lookup.ProvedLiveUnit():
@@ -2027,7 +2061,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 client.prompt(tab.pane_id, message, target=identity)
             started = launched
         else:
-            live = sessions.session_liveness(identity)
+            live = _resume_liveness(identity)
             if isinstance(live, sessions.SessionLivenessUnknown):
                 raise herdr_types.HerdrFailure(live.reason)
             if isinstance(live, sessions.SessionNotLive):
@@ -2388,7 +2422,7 @@ def _confirm_move_start(result: ClaudeUp, requester: str, why: str) -> ClaudeUp 
         failure = _early_exit(identity, result.pane_id, result.account, 0.0,
                               requester=requester, why=why, failure=reason)
         return ResumeFailed(identity, failure)
-    live = sessions.session_liveness(identity)
+    live = _resume_liveness(identity)
     failure = (_check_stay(identity, result.pane_id, result.account, live.pid,
                            sessions.process_start(live.pid) or "", requester, why)
                if isinstance(live, sessions.LiveSessionProcess) else
