@@ -19,7 +19,7 @@ import subprocess
 import sys
 import threading
 from bisect import bisect_right
-from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
@@ -732,6 +732,7 @@ class ListItem:
     report: ListReport | NoListReport = NoListReport.ABSENT
     filed_exchanges: tuple[list_exchange.FiledExchange, ...] = ()
     native_question: NativeQuestionItem | NoQuestionItem = NoQuestionItem.ORDINARY
+    legacy_read_replies: frozenset[UnreadAnswerId] = frozenset()
 
     @property
     def question_kind(self) -> QuestionItemKind | NoQuestionItem:
@@ -2154,6 +2155,28 @@ def _read_native_question(fields: dict[str, str], exchanges: tuple[list_exchange
     return origin
 
 
+def _read_legacy_reply_marks(text: str) -> frozenset[UnreadAnswerId]:
+    raw = cast(object, json.loads(text))
+    if not isinstance(raw, list):
+        raise ListError("Invalid legacy reply marks.")
+    marks: set[UnreadAnswerId] = set()
+    for value in cast(list[object], raw):
+        match value:
+            case str(question) if question:
+                marks.add(question)
+            case [str(source), str(exchange)] if source and exchange:
+                marks.add(ReturnedAnswerId(source, exchange))
+            case _:
+                raise ListError("Invalid legacy reply mark.")
+    return frozenset(marks)
+
+
+def _write_legacy_reply_marks(marks: frozenset[UnreadAnswerId]) -> str:
+    questions = sorted(mark for mark in marks if isinstance(mark, str))
+    exchanges = sorted((mark.source_key, mark.exchange_id) for mark in marks if isinstance(mark, ReturnedAnswerId))
+    return json.dumps([*questions, *exchanges], ensure_ascii=False)
+
+
 def _decode_item(store: record_store.NumberedRecords, fields: dict[str, str], body: str,
                  exchanges: tuple[list_exchange.FiledExchange, ...],
                  origin: NativeQuestionItem | NoQuestionItem) -> ListItem:
@@ -2189,7 +2212,7 @@ def _decode_item(store: record_store.NumberedRecords, fields: dict[str, str], bo
                     delivery_state.read_list_questions(fields.get("questions", "[]")), schedule,
                     _read_run_deliveries(fields), list_draft.read_list_draft(fields),
                     _read_asks(fields.get("asks", "[]")), _read_report(fields.get("report", "")),
-                    exchanges, origin)
+                    exchanges, origin, _read_legacy_reply_marks(fields.get("legacy_read_replies", "[]")))
 
 
 def _checked_item(identity: str, item: ListItem) -> ListItem:
@@ -2269,6 +2292,8 @@ def _save(store: record_store.NumberedRecords, item: ListItem, *, previous_produ
     if isinstance(origin := item.native_question, NativeQuestionItem):
         fields["question_kind"] = origin.kind.value
         fields["question_source_key"] = origin.source_key
+        if item.legacy_read_replies:
+            fields["legacy_read_replies"] = _write_legacy_reply_marks(item.legacy_read_replies)
     if item.asks:
         fields["asks"] = json.dumps([_stored_ask(ask) for ask in item.asks], ensure_ascii=False)
     if isinstance(item.report, ListReport):
@@ -2643,23 +2668,25 @@ def question_filing_state(exchanges: Sequence[list_exchange.Exchange], filing: Q
     return ItemState.WORKING if pending and not historical else ItemState.CLOSED
 
 
-def _acknowledged_exchanges(item: ListItem) -> frozenset[ReturnedAnswerId]:
-    unread = unread_answer_ids(item)
-    return frozenset(entry.what.identity for entry in item.log
-                     if isinstance(entry.what, ReturnedAnswer) and entry.what.identity not in unread)
+def _acknowledged_replies(item: ListItem) -> frozenset[UnreadAnswerId]:
+    replies = {content.question_id if isinstance(content, QuestionAnswered) else content.identity
+               for entry in item.log if isinstance(content := entry.what, (QuestionAnswered, ReturnedAnswer))}
+    return frozenset(replies - unread_answer_ids(item))
 
 
 def _file_question_kind(item: ListItem, before: ListItem, filing: QuestionFiling,
                         origin: NativeQuestionItem | NoQuestionItem) -> ListItem:
     if not isinstance(origin, NativeQuestionItem):
         return item
-    item = replace(item, native_question=origin)
+    marks = _acknowledged_replies(before)
+    item = replace(item, native_question=origin, legacy_read_replies=marks)
     exchanges = question_item_exchanges(item)
     before_exchanges = question_item_exchanges(replace(before, native_question=origin))
     historical = filing is QuestionFiling.HISTORY or bool(
         before_exchanges and isinstance(_native_prompt(before_exchanges).answer, list_exchange.ExchangeAnswer))
     mode = QuestionFiling.HISTORY if historical else filing
-    state = question_filing_state(exchanges, mode, acknowledged=_acknowledged_exchanges(before))
+    acknowledged = frozenset(mark for mark in marks if isinstance(mark, ReturnedAnswerId))
+    state = question_filing_state(exchanges, mode, acknowledged=acknowledged)
     if item.state is ItemState.CLOSED and state is not ItemState.ANSWERED:
         return item
     words = ("Closed when questions became items" if historical and origin.kind is QuestionItemKind.TO_NATE
@@ -2667,10 +2694,12 @@ def _file_question_kind(item: ListItem, before: ListItem, filing: QuestionFiling
     return _move_question(item, QuestionMove.FILE, state, now(), closing_words=words)
 
 
-def project_question_migration(item: ListItem, exchanges: tuple[list_exchange.FiledExchange, ...] = ()) -> ListItem:
+def project_question_migration(item: ListItem, exchanges: tuple[list_exchange.FiledExchange, ...] = (), *,
+                               submission_question: NativeQuestionItem | NoQuestionItem = NoQuestionItem.ORDINARY
+                               ) -> ListItem:
     """Project the question migration without saving it."""
     if exchanges:
-        item = _with_filed_exchanges(item, exchanges, QuestionFiling.HISTORY)
+        item = _with_filed_exchanges(item, exchanges, QuestionFiling.HISTORY, submission_question)
     origin = item.native_question
     if origin is NoQuestionItem.ORDINARY:
         return _file_question_kind(item, item, QuestionFiling.HISTORY, _legacy_question_origin(item))
@@ -2985,7 +3014,8 @@ def _save_new_exchanges(store: record_store.NumberedRecords, number: int, title:
     return item
 
 
-def convert_legacy_question_sources(keeper: staff.StaffId) -> None:
+def convert_legacy_question_sources(keeper: staff.StaffId, *,
+                                    reservations: Mapping[int, set[NativeQuestionItem]]) -> None:
     """Resolve the original source of each question that lacks a saved key."""
     store = _store(keeper)
     paths = tuple(store.folder().glob("L*.md"))
@@ -2999,10 +3029,14 @@ def convert_legacy_question_sources(keeper: staff.StaffId) -> None:
                 continue
             exchanges = list_exchange.decode(fields.get("filed_exchanges", "[]"))
             item = _decode_item(store, fields, body, exchanges, NoQuestionItem.ORDINARY)
-            origin = _legacy_question_origin(item)
-            if not isinstance(origin, NativeQuestionItem) or origin.kind != QuestionItemKind(fields["question_kind"]):
+            matches = _native_question_origins(exchanges) & reservations.get(item.number, set())
+            origin = next(iter(matches)) if matches else _legacy_question_origin(item)
+            if (len(matches) > 1 or not isinstance(origin, NativeQuestionItem)
+                    or origin.kind != QuestionItemKind(fields["question_kind"])):
                 raise ListError(f"{identity}: cannot resolve the original question source.")
             fields["question_source_key"] = origin.source_key
+            if marks := _acknowledged_replies(item):
+                fields["legacy_read_replies"] = _write_legacy_reply_marks(marks)
             _ = _read_item(store, identity, fields, body)
             with record_store.keep_file_on_error(path):
                 store.write(identity, fields, body)
@@ -4413,8 +4447,11 @@ def _unread_question_replies(item: ListItem) -> Iterator[ItemChange]:
             continue
         if isinstance(change.what, MarkedRead) or change.what == "Marked read":
             return
-        if isinstance(change.what, (QuestionAnswered, ReturnedAnswer)):
-            yield change
+        content = change.what
+        if isinstance(content, (QuestionAnswered, ReturnedAnswer)):
+            identity = content.question_id if isinstance(content, QuestionAnswered) else content.identity
+            if identity not in item.legacy_read_replies:
+                yield change
 
 
 def unread_answer_ids(item: ListItem) -> frozenset[UnreadAnswerId]:

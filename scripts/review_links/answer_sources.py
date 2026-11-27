@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import sys
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
@@ -12,7 +13,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from functools import partial
 from pathlib import Path
-from typing import final
+from typing import cast, final
 from zoneinfo import ZoneInfo
 
 from scripts.lib.user_zone import user_zone
@@ -39,9 +40,15 @@ class LegacyListLink:
 type ListLink = investigation.ListDestination | LegacyListLink
 
 
+class NoQuestionReservation(StrEnum):
+    ABSENT = "no List reservation for the submitted question"
+
+
 @dataclass(frozen=True)
 class Exchange(list_exchange.Exchange):
     list_links: tuple[ListLink, ...]
+    question_reservation: investigation.ListDestination | NoQuestionReservation = field(
+        default=NoQuestionReservation.ABSENT, kw_only=True)
 
 
 type ReloadExchanges = Callable[[], Iterable[Exchange]]
@@ -1391,7 +1398,33 @@ def _native_question_exchanges(record: update_registration.QuestionRecord, key: 
                                zone: ZoneInfo, members: staff.StaffSnapshot,
                                history: tuple[list_exchange.FiledExchange, ...] = (),
                                unresolved: list[tuple[str, int]] | None = None) -> AcceptedExchanges:
-    return ExchangeVerifier(record, zone, members, history).resolve(key, links, unresolved)
+    destination = _question_reservation(record)
+    if isinstance(destination, investigation.ListDestination) and destination not in links:
+        links = (*links, destination)
+    accepted = ExchangeVerifier(record, zone, members, history).resolve(key, links, unresolved)
+    if isinstance(destination, investigation.ListDestination):
+        accepted = replace(accepted, exchanges=tuple(replace(exchange, question_reservation=destination)
+                                                     for exchange in accepted))
+    return accepted
+
+
+def _question_reservation(record: update_registration.QuestionRecord
+                          ) -> investigation.ListDestination | NoQuestionReservation:
+    """Read the List reservation by the native question's request ID."""
+    origin = review_submissions.native_origin(record)
+    if not isinstance(origin, new_item_dialog.ReviewSubmission):
+        return NoQuestionReservation.ABSENT
+    folder = review_submissions.image_folder(origin).parent
+    number = the_list.reserved_review_number(folder / "list-number")
+    if isinstance(number, the_list.NextNumber):
+        return NoQuestionReservation.ABSENT
+    fields = cast(object, json.loads((folder / "list-filing.json").read_text(encoding="utf-8")))
+    match fields:
+        case {"keeper": str(keeper)} if keeper:
+            new_item_dialog.check_recipient_id(staff.StaffId(keeper))
+            return investigation.ListDestination(staff.StaffId(keeper), number)
+        case _:
+            raise the_list.ListError(f"Invalid List route for request {origin.request_id}.")
 
 
 def _list_exchanges(entry: list_page.ListRecord, members: staff.StaffSnapshot, zone: ZoneInfo) -> Iterator[Exchange]:
@@ -1482,6 +1515,13 @@ def _reload_picture(root: Path, identity: str, keepers: dict[int, list[staff.Sta
 def read_exchanges(root: Path, *, members: staff.StaffSnapshot) -> ExchangeInventory:
     """Read one inventory without changing the records or reserving List numbers."""
     zone = user_zone()
+    reviews = review_items.read(root, members=members, kinds=_REVIEW_SOURCE_KINDS, zone=zone,
+                                sources=[], include_filed=True)
+    return _read_exchanges(root, members, zone, reviews)
+
+
+def _read_exchanges(root: Path, members: staff.StaffSnapshot, zone: ZoneInfo,
+                    reviews: Iterable[review_items.ReviewItem]) -> ExchangeInventory:
     entries = list_page.records(include_closed=True)
     list_items: set[investigation.ListDestination] = set()
     keepers: dict[int, list[staff.StaffId]] = defaultdict(list)
@@ -1504,8 +1544,7 @@ def read_exchanges(root: Path, *, members: staff.StaffSnapshot) -> ExchangeInven
     exchanges: list[Exchange] = []
     unresolved: list[tuple[str, int]] = []
     reload: dict[str, ReloadExchanges] = {}
-    for item in review_items.read(root, members=members, kinds=_REVIEW_SOURCE_KINDS, zone=zone,
-                                 sources=[], include_filed=True):
+    for item in reviews:
         linked = tuple(links.get(item.key, ()))
         key = _review_source_key(item)
         history = the_list.combine_exchange_history(tuple(previous.get(key, ())), the_list.pending_exchanges(key))
@@ -1556,6 +1595,16 @@ class FilingPlan:
     exchanges: tuple[Exchange, ...]
     destinations: tuple[ListLink, ...]
     previously_filed: bool
+
+    @property
+    def reserved_question(self) -> the_list.NativeQuestionItem | the_list.NoQuestionItem:
+        return _reserved_question(self.exchanges[0])
+
+
+def _reserved_question(exchange: Exchange) -> the_list.NativeQuestionItem | the_list.NoQuestionItem:
+    if isinstance(exchange.question_reservation, investigation.ListDestination):
+        return the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, exchange.source_key)
+    return the_list.NoQuestionItem.ORDINARY
 
 
 def _plans(exchanges: Iterable[Exchange], filed: Iterable[tuple[investigation.ListDestination, list_exchange.FiledExchange]]
@@ -1618,6 +1667,8 @@ def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadEx
         if not first.question.strip():
             raise the_list.ListError("The source question has no text.")
         title = review_submissions.submission_title(first.question)
+        if submission_question is the_list.NoQuestionItem.ORDINARY:
+            submission_question = _reserved_question(first)
         try:
             conflicts: frozenset[str] = current.conflicting_ids if isinstance(current, AcceptedExchanges) else frozenset()
             return the_list.file_exchanges(source, exchanges, title, linked=link, owner=owner, members=members,
@@ -1822,14 +1873,25 @@ def main() -> int:
     if args.apply and args.command != "migrate":
         parser.error("--apply requires migrate")
     members = staff.snapshot()
+    root = change_routing.review_root()
+    zone = user_zone()
+    reviews = review_items.read(root, members=members, kinds=_REVIEW_SOURCE_KINDS, zone=zone,
+                                sources=[], include_filed=True)
     if args.apply:
+        reserved: dict[staff.StaffId, dict[int, set[the_list.NativeQuestionItem]]] = defaultdict(lambda: defaultdict(set))
+        for item in reviews:
+            if isinstance(item.source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
+                destination = _question_reservation(item.source.record)
+                if isinstance(destination, investigation.ListDestination):
+                    reserved[destination.keeper][destination.number].add(the_list.NativeQuestionItem(
+                        the_list.QuestionItemKind.FROM_NATE, _review_source_key(item)))
         for keeper in list_page.list_keepers():
             try:
-                the_list.convert_legacy_question_sources(keeper)
+                the_list.convert_legacy_question_sources(keeper, reservations=reserved[keeper])
             except (OSError, ValueError) as error:
                 print(f"List question conversion for {keeper}: {error}", file=sys.stderr)
                 return 1
-    inventory = read_exchanges(change_routing.review_root(), members=members)
+    inventory = _read_exchanges(root, members, zone, reviews)
     if args.command == "migrate":
         return migrate(inventory, members, apply=args.apply)
     for line in _count(inventory):

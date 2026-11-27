@@ -301,10 +301,17 @@ def parked_for_delivery(item: the_list.ListItem) -> bool:
 
 def waiting_updates(_request: console.NewsRequest) -> frozenset[str]:
     """Identify each unread update by its record and time."""
-    return frozenset(f"{entry.key}/{entry.item.unread_since.isoformat()}" for entry in records()
-                     if entry.item.state is not the_list.ItemState.SCHEDULED
-                     and isinstance(entry.item.unread_since, datetime)
-                     and (not parked_for_delivery(entry.item) or the_list.unread_answer_ids(entry.item)))
+    updates: set[str] = set()
+    for entry in records(include_closed=True):
+        item = entry.item
+        replies = the_list.unread_answer_ids(item)
+        if isinstance(item.native_question, the_list.NativeQuestionItem) and replies:
+            if isinstance(moment := item.unread_at, datetime):
+                updates.add(f"{entry.key}/{moment.isoformat()}")
+        elif (item.state not in (the_list.ItemState.CLOSED, the_list.ItemState.SCHEDULED)
+              and isinstance(item.unread_since, datetime) and (not parked_for_delivery(item) or replies)):
+            updates.add(f"{entry.key}/{item.unread_since.isoformat()}")
+    return frozenset(updates)
 
 
 def owner_name(members: staff.StaffSnapshot, owner: the_list.ItemOwner) -> str:
