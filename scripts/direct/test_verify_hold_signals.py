@@ -19,6 +19,7 @@ from unittest import mock
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.process_group import send_process_group
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.wait_for_test_state import wait_for_file, wait_for_pid
 from scripts.direct.verify_hold_wait_test_support import (
@@ -63,7 +64,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         send_process_group(process.pid, signum)
         # Drain the log pipes while the coordinator records the interrupted call.
         code, output = self.finish(process)
-        survivors = self.wait_for_owned_exit(max(0, started + SIGNAL_EXIT_SECONDS - time.monotonic()))
+        survivors = self.wait_for_owned_exit(TEST_HANG_GUARD_SECS)
         elapsed = time.monotonic() - started
         remaining = self.memory_queue_pids()
         diagnostic = (f"{signum.name}: exit={code}, elapsed={elapsed:.3f}s, "
@@ -213,9 +214,12 @@ finish_verify_run() { :; }
     def test_normal_exit_keeps_result_messages_on_stdout(self) -> None:
         token = self.fixture.root / "held-token"
         token.touch()
-        result = subprocess.run(self.verify_exit_command(token, "start_run_log\nverify_exit 0 exit"),
-                                env=verify_test_environment(), capture_output=True, text=True,
-                                check=False, timeout=SIGNAL_EXIT_SECONDS)
+        try:
+            result = subprocess.run(self.verify_exit_command(token, "start_run_log\nverify_exit 0 exit"),
+                                    env=verify_test_environment(), capture_output=True, text=True,
+                                    check=False, timeout=TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            self.fail("The normal Verify exit did not return the result messages.")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "completed\n")
         self.assertEqual(result.stderr, "cleanup diagnostic\n")
@@ -225,9 +229,12 @@ finish_verify_run() { :; }
         token = self.fixture.root / "held-token"
         token.touch()
         with full_output_pipe() as write_fd:
-            result = subprocess.run(self.verify_exit_command(token, "verify_exit 0 exit"),
-                                    env=verify_test_environment(), stdout=write_fd, stderr=subprocess.PIPE,
-                                    text=True, check=False, timeout=SIGNAL_EXIT_SECONDS)
+            try:
+                result = subprocess.run(self.verify_exit_command(token, "verify_exit 0 exit"),
+                                        env=verify_test_environment(), stdout=write_fd, stderr=subprocess.PIPE,
+                                        text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+            except subprocess.TimeoutExpired:
+                self.fail("Verify did not exit and release the token with stdout full.")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "cleanup diagnostic\n")
         self.assertFalse(token.exists())
@@ -290,7 +297,10 @@ exec "${0%/*}/cargo-original" "$@"
         release_fd = os.open(release, os.O_RDWR)
         try:
             pid = wait_for_pid(started, processes=(process,))
-            output, errors = process.communicate(timeout=SIGNAL_EXIT_SECONDS)
+            try:
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            except subprocess.TimeoutExpired:
+                self.fail("Verify did not close its output while the step child was still running.")
             self.assertEqual(process.returncode, 0, output + errors)
             os.kill(pid, 0)
         finally:
@@ -385,14 +395,21 @@ read -r command
                     self.assertEqual(len(readers), 2)
                     wait_for_file(log)
                     send_process_group(process.pid, signal.SIGHUP)
-                    self.assertEqual(process.wait(timeout=5), 129)
+                    try:
+                        status = process.wait(timeout=TEST_HANG_GUARD_SECS)
+                    except subprocess.TimeoutExpired:
+                        self.fail("The log harness did not exit after SIGHUP.")
+                    self.assertEqual(status, 129)
                     self.assertTrue(all(not Path(f"/proc/{pid}").exists() for pid in readers))
                 finally:
                     try:
                         send_process_group(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                    _ = process.communicate(timeout=5)
+                    try:
+                        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    except subprocess.TimeoutExpired:
+                        self.fail("The log harness did not close stderr after cleanup.")
 
     def test_interrupted_verification_removes_its_registered_call(self) -> None:
         self.hold()

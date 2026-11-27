@@ -818,9 +818,22 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
             _save_pass_done(done_path, verify.instance, evidence)
     reap_required = {run_id for run_id, result in deliveries.items()
                      if result.delivered_at is detached_runs.WorkerResultDeferred.REAP_REQUIRED}
+    live_ids = {record["run_id"] for record in live}
+    if isinstance(pane_pass, progress_history.StoppedPassReceipt) and isinstance(
+            pane_pass.results, progress_history.LegacyResultsForStoppedPass):
+        pending = live_ids | reap_required | {run_id for run_id in deliveries.keys() - covered
+                                             if deliveries[run_id].delivered_at is detached_runs.WorkerResultDeferred.PENDING}
+        if pending:
+            return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply, reap_required=frozenset(reap_required))
+        if isinstance(row.parent, staff.ReportsTo):
+            state = worker_panes.observe_worker(row.parent.id, row, staff.local_snapshot())
+            if isinstance(state, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
+                # A stopped worker cannot reply after result delivery.
+                if isinstance(reply, DispatchAwaitingReply):
+                    return DispatchSubmitted(reply.last_reply)
+                return reply
     unseen = {run_id for run_id in deliveries.keys() - received - covered - reap_required
               if not isinstance(deliveries[run_id].delivered_at, detached_runs.WorkerResultDeliverySuppressed)}
-    live_ids = {record["run_id"] for record in live}
     pending = unseen | live_ids | reap_required
     pending.update(run_id for run_id, result in deliveries.items()
                    if result.requires_done_after_finish and run_id not in covered)
@@ -1839,7 +1852,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 return DispatchSubmission.SUBMITTED
         if isinstance(started, StartAtDispatch):
             before = rows_before_launch()
-            current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
+            current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy, phase=phase)
             arm_launch_cleanup(cleanup, before, current_start)
         else:
             if not started.row.reports_to(parent) or not hold.owns(started.row):
@@ -2334,7 +2347,8 @@ def _waiting_on_done(row: staff.StaffRow, detached: session_state.RunningDetache
     if not pending:
         return False
     passed = worker_panes.worker_pass(row, run, record=record)
-    return (pending.get("instance") == passed.get("instance_id")
+    return (passed.get("status") != "canceled"
+            and pending.get("instance") == passed.get("instance_id")
             and pending.get("stage") == pass_recorder.dispatch_delivery(passed).completion_id)
 
 
@@ -2405,9 +2419,12 @@ def _assignment_hold(row: staff.StaffRow, record: staff.StaffSnapshot, detached:
     state = _worker_dispatch_state(row, record, detached, lock, read=reply_checks)
     if isinstance(state, worker_panes.DispatchHoldsWorker):
         return state
-    statuses = {status_file} if status_file and not isinstance(retry, RetryingAssignment) else set[str]()
+    statuses = {Path(status_file)} if status_file and not isinstance(retry, RetryingAssignment) else set[Path]()
+    latest_status_pass: dict[Path, tuple[float, bool]] = {}
     for directory in detached.launcher_runs.by_worker[row.id]:
-        for passed in _pass_records(read(directory)):
+        fields = read(directory)
+        current_passes = _pass_records(fields)
+        for passed in current_passes:
             if passed.get("worker_id") != row.id:
                 continue
             if passed.get("status") in ("active", "refused"):
@@ -2415,12 +2432,19 @@ def _assignment_hold(row: staff.StaffRow, record: staff.StaffSnapshot, detached:
                         and passed.get("instance_id") == state.dispatch_id):
                     continue
                 return worker_panes.DispatchHoldsWorker("a pass is open")
-            saved = passed.get("assign_status_file") or pass_recorder.dispatch_delivery(passed).actions.status_file
-            if isinstance(saved, str) and saved:
-                statuses.add(saved)
+            if saved := pass_recorder.assignment_status_file(passed):
+                statuses.add(Path(saved))
+        for passed in (*current_passes, *pass_recorder.retained_passes(fields).values()):
+            if passed.get("worker_id") == row.id and (saved := pass_recorder.assignment_status_file(passed)):
+                path = Path(saved)
+                started = pass_recorder.number(passed.get("started_at"), float("-inf"))
+                blocks_assignment = passed.get("status") != "canceled"
+                latest_status_pass[path] = max(latest_status_pass.get(path, (float("-inf"), False)),
+                                               (started, blocks_assignment))
     for status in statuses:
+        _, blocks_assignment = latest_status_pass.get(status, (0, True))
         try:
-            if Path(status).read_text(encoding="utf-8").strip() == "running":
+            if status.read_text(encoding="utf-8").strip() == "running" and blocks_assignment:
                 return worker_panes.DispatchHoldsWorker("the assignment status is running")
         except FileNotFoundError:
             continue
@@ -2467,10 +2491,11 @@ def _free_name(parent: StaffId, role: WorkerRole, record: staff.StaffSnapshot) -
 def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
            policy: worker_panes.LaunchPolicy, *,
            lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+           phase: str | None = None,
            ) -> worker_panes.WorkerStart:
     """Start an explicit staff target with the supplied policy."""
     with staff.row_operation(target.parent):
-        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock)
+        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock, phase=phase)
 
 
 def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.WorkerStart:
@@ -2742,9 +2767,13 @@ def _answer_ended_pass(row: staff.StaffRow, run: Path, passed: dict[str, object]
     director = record.parent_of(row)
     completion = progress_history.hook_completion(passed)
     if (passed.get("status") not in ENDED_PASS_STATUSES or not instance or not delivery.line
-            or isinstance(completion, progress_history.HookCompletion) and completion.outcome == "stopped"
             or not isinstance(started, (int, float)) or director is None):
         return _refuse_answer(name, "no active pass")
+    if isinstance(completion, progress_history.HookCompletion) and completion.outcome == "stopped":
+        recovery = _completion_notices().recover_completion(row, director, run, hold, record=record,
+                                                            pane=ReuseCompletedPane(delivery.actions.held_role))
+        admission = _admit_completion(row, recovery)
+        return _refuse_answer(name, "no active pass") if admission is ExitCode.OK else admission
     completion_id = delivery.completion_id or instance
     receipt = dispatch_receipt(row, delivery.line, completion_id, run=run, require_current_transcript=True)
     if isinstance(receipt, DispatchEvidenceUnknown):

@@ -201,17 +201,42 @@ Provisional: S2 designs the API from the uses and can change these phases. The S
 | S7 | 11 | Timing, memory, Mac proof against the S1 targets | both | S6 |
 | S8 | 12 | Shadow comparison, switch with nate's go, removal of Python selection | `~/.claude` | S7 |
 
-S3 and S4 run one after the other: a unit holds one Rust build-queue item at a time (nate, 2026-11-18). Each speed phase reports its result against its target: **milestone 7**.
+S4 starts beside S3 groups B and C (cargo-liner showrunner, 2026-11-22). The build queue holds the unit's second run by itself. Group C owns the shared files until it merges; S4 adds new lines only. Each step starts when its plan dependencies are on main or in a tree it builds on. Each speed phase reports its result against its target: **milestone 7**.
 
-S3 runs as five phases in series, from the S3 inventory (2026-11-18). Each phase is one cargo-liner checkpoint:
+S3 has nine phases, re-cut from the declaration scope read (style-unit, 2026-11-19: the declaration outcome calls the rename proofs). Each phase is one cargo-liner checkpoint and adds one answer to the `finding` reply. The first two ran in series. The rest run in three groups (cargo-liner showrunner ruling): each group runs the full suite and Python parity once, on its final tree, and merges as one. Group C runs last, after group A merges.
 
-1. `s3-cache`: typed facts apart from their wire format; the blob fact cache in `selection.sqlite` by blob id and reader version; misses parse on all cores.
-2. `s3-ledger`: read-only ledger access and the `finding` subcommand with its first answer, the source anchor, and the `observed` ledger revision.
-3. `s3-declarations`: `finding` adds declaration outcomes and site evidence.
-4. `s3-rename`: `finding` adds rename permission and the applied check.
-5. `s3-footprint`: `finding` adds footprints; the S3 measure (needed blobs, cold time, the stop point).
+1. `s3-cache` (done; on main 2026-11-22): typed facts apart from their wire format; the blob fact cache in `selection.sqlite` by blob id and reader version; misses parse on all cores.
+2. `s3-ledger` (done; on main 2026-11-22): read-only ledger access and the `finding` subcommand with its first answer, the source anchor, and the `observed` ledger revision.
+
+Group A (branch `style-s3`, checkpoints done 2026-11-20; on main 2026-11-22, merge run 6, main a9dea4906):
+
+3. `s3-site`: `original_site`, whether the original judgment still covers a site at the synced tip (`_site_proof`).
+4. `s3-relocation`: `same_declaration`, the declaration in place, a gained same-name destination, or the exact blocker.
+5. `s3-outside`: `outside_rename`, the source-based outside rename proof or its candidates and reasons.
+
+Group B (branches `style-s3-rename`, `style-s3-applied` and `style-s3-footprint`, checkpoints done 2026-11-20; group merge checkpoint 8637efe on `style-s3-group-b`, 2026-11-23, waits for the merge line):
+
+6. `s3-rename`: `rename_admission`, the anchored rename permission or its refusal.
+7. `s3-rename-applied`: `rename_applied`, the ticket-aware applied check. It builds on `s3-rename`.
+8. `s3-footprint`: `footprint`; then the S3 measure (needed blobs, cold time, the stop point).
+
+Group C (branch `style-s3-declarations`, checkpoint f991c6968, 2026-11-24; on cargo-liner main in 2317a6ae8 as 520ceaf89, 2026-11-24):
+
+9. `s3-declarations`: `declaration`, `site_evidence` and `approvals`, the complete declaration reading. The request carries an approval snapshot (decision paths and answers); Python keeps the decision-file parse. The phase also moved the S3 readers to the one oracle pin 1210fd999a: the ledger read accepts schemas 47 and 51 from one list, and the file rename plan follows the Python grammar.
 
 Code with no consumer cannot land, so each S3 phase extends `finding`, its consumer. The `next` request and reply types (`NextOutcome`, `SelectedTicket`) move to S5, which builds `next` (style-unit, 2026-11-18).
+
+S4 has seven phases, from the S4 scope read (style-unit, 2026-11-22). Phase 1 runs first. Phases 2, 3 and 4 run in series after it: phase 2 builds the shared source mask that phases 3 and 4 read, and the unit has one writer and one tester (style-unit, 2026-11-24). Phase 5 follows them. Phase 6 builds its ledger projection beside them. Phase 7 adds the B and D cells after phase 5 (style-unit, 2026-11-23). The full suite and Python parity run once, on the final S4 tree. The Python membership adapter moves to S5, with the publication adapter.
+
+1. `s4-sites-regex` (checkpoint 88a4d1f58 on `style-s4-sites-regex`, 2026-11-23; on cargo-liner main as 4902fb25e, 2026-11-24): `sites` with the shared envelope, catalog input, schema 47 and 51 reads, typed `Unavailable`, and regex sites. One difference from Python is intended: `sites` lists only the requested rule. Python `_refresh_candidate_sites` lists every tier B and D rule, so one bad rule fails the request for all rules. In Rust, an invalid rule fails only its own request (style-unit, 2026-11-23, review finding F003).
+2. `s4-sites-types` (checkpoint 1333da8ec on `style-s4-sites-types`, 2026-11-25): the shared source mask (`mask_source`), field affixes, variant stutter, field type stutter, struct fields and single-impl traits.
+3. `s4-sites-source` (checkpoint 0707f206a on `style-s4-sites-source`, 2026-11-26): allows, test allows, observer guards, literals and test literals. `MaskedSource` keeps each literal's contents, kind, line and code-point column, as Python `mask_source` returns them (s4-sites-types review F001). `tests/sites/parity.rs` is the one parity runner for the type and source sites tests; it compares refusals and the WAL file.
+A fix phase runs before phase 4 (cargo-liner showrunner, 2026-11-26): `style-split-destinations`, in `~/.claude` on `natedev-style`. A restructure finding names a move destination from its crate source root (`scan/language_stats/collect.rs`). `approved_renames.stated_split_destinations` now resolves that name to its repository path, so the refill no longer stops on ticket 1524 with `unknown crate`.
+
+4. `s4-sites-structure` (checkpoint abe1c8a60 on `style-s4-sites-structure`, 2026-11-26): module roots, submodule names, workspace dependencies and Bevy Kana; candidate D membership. Python reads the ledger tree under the input root `/export`, so a root-level file's parent name is `export` and an absolute workspace member resolves only under `/export` (review pass 2, F003 and F011).
+5. `s4-sites-prefilter` (checkpoint ddeced43b on `style-s4-sites-prefilter`, 2026-11-27): B prefilter rules over the full generator path union. A pre_filter request needs the full universe, so it takes the Python refusal of the first failing generator in Python rule order (root-local before member-local) and of any invalid sibling pattern. A direct generator request still fails only for its own rule. Every request refuses on a malformed committed root `Cargo.toml`, as the Python synced tip read does.
+6. `s4-coverage` (checkpoint ce2d467e7 on `style-s4-coverage`, 2026-11-23; on cargo-liner main as 77c877600, 2026-11-24): `coverage` with observed counts and the cell projection for tier A, C and E rules. A rule that needs B or D sites gives a typed `Unavailable` answer.
+7. `s4-coverage-sites`: tier B and D cells from the native `sites` membership. It starts after `s4-sites-prefilter`.
 
 ### `syn` and reuse
 
