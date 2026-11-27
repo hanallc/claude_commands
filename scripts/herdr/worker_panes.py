@@ -1631,8 +1631,8 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     return herdr.SplitPane(ordered[-1], "down", ratio, label)
 
 
-def _worker_phase(state: dict[str, object], owner: staff.StaffRow, row: staff.StaffRow | None,
-                  record: staff.StaffSnapshot) -> str:
+def worker_phase(state: dict[str, object], owner: staff.StaffRow, row: staff.StaffRow | None,
+                 record: staff.StaffSnapshot) -> str:
     """Read the worker's phase from the pass, the only open phase, or the saved launch."""
     phases = recorder_state.open_phase_ids(state)
     if len(phases) == 1:
@@ -1651,6 +1651,12 @@ def _worker_phase(state: dict[str, object], owner: staff.StaffRow, row: staff.St
     return ""
 
 
+def phase_berth_session(owner: staff.StaffRow, phase: str) -> str:
+    if not phase or phase in ("ad hoc", "adhoc", pass_recorder.AS_BUILT_PHASE):
+        return ""
+    return phase_reservation.phase_session_id(owner.current_session, phase)
+
+
 @herdr.pane_evidence_run()
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
@@ -1658,7 +1664,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT, runs: dict[str, list[str]] | None = None,
                     codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
                     selection: SelectedWorkerRows | Literal["by_name"] = "by_name",
-                    phase: str | None = None,
+                    phase: str | None = None, continuation: OpenWorker | None = None,
                     ) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
@@ -1691,7 +1697,13 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "worker lock does not own this worker")
             if isinstance(policy, UseRolePolicy):
                 saved = _checked_resume_policies.get({}).get(existing.current_session) if existing is not None else None
-                checked = saved if saved is not None and saved.role == role else checked_role_policy(role)
+                if continuation is None:
+                    checked = saved if saved is not None and saved.role == role else checked_role_policy(role)
+                else:
+                    backend = staff.backend(continuation.row)
+                    if isinstance(backend, staff.BackendUnavailable):
+                        return AdmissionRefused("the continuation target has no known backend")
+                    checked = checked_role_policy(role, "codex" if isinstance(backend, staff.CodexBackend) else "claude")
                 if isinstance(checked, StartRefused):
                     return checked
                 policy = checked.launch
@@ -1707,15 +1719,15 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             run_fields = unit_runs.read_run_fields(run)
             if unit_runs.terminal_run(run_fields):
                 return AdmissionRefused(f"{run}: the run has ended dispatch admission")
-            phase = _worker_phase(run_fields, owner, existing, record) if phase is None else phase
-            berth_session = (phase_reservation.phase_session_id(owner.current_session, phase)
-                             if phase and phase not in ("ad hoc", "adhoc", pass_recorder.AS_BUILT_PHASE) else "")
+            phase = worker_phase(run_fields, owner, existing, record) if phase is None else phase
+            berth_session = phase_berth_session(owner, phase)
             allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
                 worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
             target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
             with worker_admission.worker_operation(allowed):
                 result = _start_locked(owner, name, role, policy, account, allowed, held, codex, paths,
-                                       keep_model=keep_model, selection=target, berth_session=berth_session)
+                                       keep_model=keep_model, selection=target, berth_session=berth_session,
+                                       continuation=continuation)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1765,7 +1777,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead,
                   paths: EnrolledPaths | OrdinaryWorkerOwner, *, keep_model: bool,
-                  selection: SelectedWorkers | SelectedWorkerRows, berth_session: str) -> WorkerStart:
+                  selection: SelectedWorkers | SelectedWorkerRows, berth_session: str,
+                  continuation: OpenWorker | None) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1798,6 +1811,9 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
         return current
+    if continuation is not None and (
+            not isinstance(current, OpenWorker) or current != continuation or not current.status.idle or switching):
+        return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the continuation target changed before startup")
     if isinstance(paths, EnrolledPaths):
         try:
             if isinstance(current, OpenWorker):
@@ -1859,7 +1875,20 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     return state
                 else:
                     return _uncertain(row, "retained launch proof is incomplete")
-    if isinstance(current, OpenWorker):
+    if isinstance(current, OpenWorker) and continuation is not None:
+        launched = client.native_pane_process(current.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+        if launched.current_identity != current.row.current_session or not berth_session:
+            return _uncertain(current.row, "continuation launch identity is unproved")
+        if launched.environment.get(phase_reservation.SESSION_ENVIRONMENT) == berth_session:
+            return current
+        if isinstance(account, ConfiguredWorkerAccount):
+            from scripts.accounts import accounts
+
+            if policy.settings.kind == "codex" and (home := launched.environment.get("CODEX_HOME")):
+                account = accounts.CodexWorkersAccount("current", Path(home))
+            elif policy.settings.kind == "claude" and (home := launched.environment.get("CLAUDE_CONFIG_DIR")):
+                account = accounts.NamedAccount("current", Path(home))
+    elif isinstance(current, OpenWorker):
         passed = worker_pass(current.row, allowed.run)
         dispatch = worker_dispatch_state(current.row, worker_run(current.row, record=record), lock)
         if passed.get("kind") != role and isinstance(dispatch, DispatchHoldsWorker):
@@ -1920,6 +1949,10 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         environment["TMPDIR"] = temporary
     if isinstance(paths, EnrolledPaths):
         directory = paths.main
+    elif continuation is not None:
+        from scripts.worktree import worktrees
+
+        directory = worktrees.moved_launch_folder(shutdown_record.row_folder(continuation.row, record)[1])
     elif claimed := os.environ.get(CLAIMED_WORKING_DIR_ENV):
         directory = Path(claimed).resolve()
     else:
@@ -1929,6 +1962,10 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if isinstance(prepared, nix_env.Refused):
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(prepared))
     if isinstance(current, OpenWorker) and not switching:
+        if continuation is not None:
+            latest = read_evidence(staff.snapshot())
+            if not any(item == current for item in latest.states):
+                return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the continuation target changed before stop")
         herdr.forget_pane_evidence(client.session, current.pane)
         if not _stop_row(current.row, client, deadline=deadline):
             return _uncertain(current.row, "agent stop is incomplete; pane retained")

@@ -2922,6 +2922,7 @@ NO_LAUNCH_CLEANUP = NoLaunchCleanup()
 class WorkerResume:
     step: BusyPass | UnsubmittedAssignment | NoOwnPass
     detached: str = ""
+    phase_run: Path | None = None
 
 
 def _resume_launcher(opened: worker_panes.OpenWorker, resume: WorkerResume, *,
@@ -2954,6 +2955,16 @@ def _resume_launcher(opened: worker_panes.OpenWorker, resume: WorkerResume, *,
     return ExitCode.OK
 
 
+def _worker_berth_matches(opened: worker_panes.OpenWorker, expected: str) -> bool:
+    backend = staff.backend(opened.row)
+    if isinstance(backend, staff.BackendUnavailable):
+        raise ValueError("The continuation target has no known backend")
+    process = _client().native_pane_process(opened.pane, backend.family, herdr.PROGRAM_TIMEOUT_SECONDS)
+    if process.current_identity != opened.row.current_session:
+        raise ValueError("The continuation target changed during the process read")
+    return process.environment.get(pane_launch.BERTH_SESSION_ENV) == expected
+
+
 def _detached_resume_context(row: staff.StaffRow, directories: Iterable[Path]) -> str:
     lines: list[str] = []
     for directory in dict.fromkeys(directories):
@@ -2983,18 +2994,21 @@ def _resume_needed(state: worker_panes.OpenWorker | worker_panes.StoppedWorker |
                 _ = active.setdefault(dispatch.instance_id, (directory, dispatch))
     if len(active) > 1:
         return DispatchEvidenceUnknown("The worker has multiple active dispatches")
+    phase_run = None
     if active:
         run, dispatch = next(iter(active.values()))
         step = resume_step(state.row, dispatch, run=run)
+        if isinstance(step, BusyPass):
+            phase_run = run
     else:
         step = NO_OWN_PASS
     if isinstance(step, DispatchEvidenceUnknown):
         return step
     if detached or isinstance(step, UnsubmittedAssignment):
-        return WorkerResume(step, detached)
+        return WorkerResume(step, detached, phase_run)
     already_working = (isinstance(state, worker_panes.OpenWorker)
                        and state.status in (herdr.AgentStatus.WORKING, herdr.AgentStatus.RUNNING))
-    return WorkerResume(step) if isinstance(step, BusyPass) and not already_working else None
+    return WorkerResume(step, phase_run=phase_run) if isinstance(step, BusyPass) and not already_working else None
 
 
 def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot, *,
@@ -3483,13 +3497,29 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                                    notice=f"{name}: not resumed: no-worker mode")
                         elif report is None:
                             print(f"{name}: not resumed: no-worker mode")
-                        else:
+                        elif isinstance(report, RestoreReport):
                             report.skipped[state.row.id] = "No-worker mode keeps this worker stopped"
                         continue
                     resume = _resume_launcher
-                    if not isinstance(state, worker_panes.OpenWorker):
+                    start = worker_panes.start_or_resume
+                    rebind = False
+                    berth_session = ""
+                    if isinstance(state, worker_panes.OpenWorker) and not isinstance(plan.step, UnsubmittedAssignment):
+                        phase_fields = unit_runs.read_run_fields(plan.phase_run or run)
+                        phase = worker_panes.worker_phase(phase_fields, current_holder, state.row, current_record)
+                        berth_session = worker_panes.phase_berth_session(current_holder, phase)
+                        rebind = bool(berth_session and not _worker_berth_matches(state, berth_session))
+                        if rebind:
+                            if not state.status.idle:
+                                failed(state.row, "The worker must be idle to correct the berth key")
+                                continue
+                            if workers_held and isinstance(staff.backend(state.row), staff.CodexBackend):
+                                failed(state.row, "No-worker mode prevents a restart to correct the berth key")
+                                continue
+                            start = partial(start, phase=phase, continuation=state)
+                    if not isinstance(state, worker_panes.OpenWorker) or rebind:
                         before = rows_before_launch()
-                        result = worker_panes.start_or_resume(parent, worker_name, worker_panes.dispatch_role(state.row),
+                        result = start(parent, worker_name, worker_panes.dispatch_role(state.row),
                             account=launch_account, lock=hold, runs=runs, codex=codex, selection=selection)
                         arm_launch_cleanup(cleanup, before, result)
                         if not isinstance(result, worker_panes.OpenWorker):
@@ -3504,6 +3534,9 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                             resume = partial(resume, on_submission=cleanup.pop_all)
                         changed = True
                         state = result
+                        if rebind and not _worker_berth_matches(state, berth_session):
+                            failed(state.row, "The restored worker has the wrong berth key")
+                            continue
                     row = state.row
                     resumed_record = staff.authority_snapshot() if row != current else current_record
                     with staff.supplied_snapshot(resumed_record):
