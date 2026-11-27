@@ -12,7 +12,7 @@ import json
 import re
 import sys
 from textwrap import indent
-from typing import ClassVar, cast
+from typing import cast
 from unicodedata import category
 
 from scripts.astra import astra_review, astra_roles, astra_work
@@ -64,23 +64,11 @@ class NateSpecified(BehaviorEvidence):
 
 
 @dataclass(frozen=True)
-class UnverifiedNateRequest(BehaviorEvidence):
-    """The cited source did not verify the request."""
-
-    verdict: ClassVar[BehaviorVerdict] = BehaviorVerdict.FOLLOWS
-
-    @property
-    def reason(self) -> str:
-        source = str(self.source)
-        return f"quote did not verify in {source if source.splitlines() == [source] else repr(source)}"
-
-
-@dataclass(frozen=True)
 class NoNateDecision:
     test: str
 
 
-type BehaviorFinding = NoNateDecision | NateRequest | NateSpecified | UnverifiedNateRequest
+type BehaviorFinding = NoNateDecision | NateRequest | NateSpecified
 type ReviewFinding = NoNateDecision | ClaimedNateRequest | NateSpecified
 
 
@@ -160,7 +148,8 @@ def verify_requests(findings: Iterable[ReviewFinding]) -> list[BehaviorFinding]:
         elif (day := verified[finding.source].get(finding.quote)) is not None:
             results.append(NateRequest(finding.test, finding.quote, finding.source, day, finding.change))
         else:
-            results.append(UnverifiedNateRequest(finding.test, finding.quote, finding.source, finding.day, finding.change))
+            results.append(NateSpecified(finding.test, finding.quote, finding.source, finding.day, finding.change,
+                                         BehaviorVerdict.UNCLEAR, "The cited source did not verify the quote."))
     return results
 
 
@@ -212,7 +201,7 @@ If you cannot complete the review, report the blocker instead of a finding.
 Return one JSON array. Give one object for each test ID in tests.json.
 Use {{"test":"ID","finding":"none"}} when you find no such words.
 Use "requested" only when Nate's newest words on the behavior ask for this change.
-For "requested", cite a typed Claude turn, a sent List Tell from Nate, or Nate's saved answer.
+For "requested", cite Nate's typed Claude turn, sent List Tell, or saved question answer or feedback.
 Quote one or more complete sentences or lines in order. Use the source date.
 Use {{"test":"ID","finding":"requested","quote":"exact words","source":"/absolute/path",
 "date":"YYYY-MM-DD","change":"how the behavior changes"}}
@@ -636,14 +625,10 @@ def read_clear_findings(key: str, record: behavior_check.Clear) -> dict[str, Rev
     return findings
 
 
-def verify_clear_findings(saved: Iterable[ReviewFinding], record: behavior_check.Clear) -> tuple[BehaviorFinding, ...]:
+def verify_clear_findings(saved: Iterable[ReviewFinding]) -> tuple[BehaviorFinding, ...]:
     findings = tuple(verify_requests(saved))
-    for finding in findings:
-        if isinstance(finding, NateSpecified) and finding.verdict.asks_nate:
-            raise behavior_check.BehaviorCheckError("The saved approval has no valid proof.")
-        # A previously verified request must still have proof.
-        if isinstance(finding, UnverifiedNateRequest) and finding.test not in record.unverified_requests:
-            raise behavior_check.BehaviorCheckError("The saved approval has no valid proof.")
+    if any(isinstance(finding, NateSpecified) and finding.verdict.asks_nate for finding in findings):
+        raise behavior_check.BehaviorCheckError("The saved approval has no valid proof.")
     return findings
 
 
@@ -651,7 +636,7 @@ def clear_proof(tests: behavior_check.ChangedTests, record: behavior_check.Clear
     try:
         saved = read_clear_findings(tests.key, record)
         require_findings(saved, tests.tests)
-        return verify_clear_findings(saved.values(), record)
+        return verify_clear_findings(saved.values())
     except (behavior_check.BehaviorCheckError, OSError, ValueError):
         return InvalidClearProof()
 
@@ -685,7 +670,7 @@ def report(key: str, record: behavior_check.LandingRecord | behavior_check.NoRev
     return 1
 
 
-def verdict_line(finding: NateSpecified | UnverifiedNateRequest) -> str:
+def verdict_line(finding: NateSpecified) -> str:
     return f"{finding.test} {finding.verdict} {finding.reason}"
 
 
@@ -693,7 +678,7 @@ def print_clear_findings(findings: Iterable[BehaviorFinding], *, include_request
     for finding in findings:
         if isinstance(finding, NateRequest) and include_requests:
             print(finding.test, f"Nate's request ({finding.day}, {finding.source}): {finding.quote}", sep="\n")
-        elif isinstance(finding, (NateSpecified, UnverifiedNateRequest)) and not finding.verdict.asks_nate:
+        elif isinstance(finding, NateSpecified) and not finding.verdict.asks_nate:
             print(verdict_line(finding))
 
 
@@ -758,8 +743,7 @@ def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key
             print_clear_findings(findings, include_requests=False)
         if not evidence:
             reply = parts[0].reply if isinstance(plan, ReviewPart) else save_split_proof(path, parts)
-            unverified = frozenset(finding.test for finding in findings if isinstance(finding, UnverifiedNateRequest))
-            record = behavior_check.Clear(reply, unverified)
+            record = behavior_check.Clear(reply)
         elif question is behavior_check.NoQuestionDraft.OMITTED:
             print_findings(change, tests, evidence)
             print("Nate was not asked. Write the question for nate in the question template as JSON, "
@@ -796,7 +780,7 @@ def status(key: str) -> int:
             record = refresh_answer(key, record)
         elif isinstance(record, behavior_check.Clear):
             try:
-                findings = verify_clear_findings(read_clear_findings(key, record).values(), record)
+                findings = verify_clear_findings(read_clear_findings(key, record).values())
             except (behavior_check.BehaviorCheckError, OSError, ValueError):
                 findings = ()
             if not findings:
