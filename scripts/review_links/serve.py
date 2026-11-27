@@ -2259,20 +2259,21 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             state = review_items.ReviewState.DONE if review_items.on_list(saved.item) else saved.item.state
             result.update(state=state, type=saved.item.type,
                           later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
+        studio_delivery = (isinstance(action_delivery, review_actions.StudioNoticeDelivery) or
+                           (isinstance(action_delivery, change_page.MessageDelivery)
+                            and change_page.studio_review_delivery(action_delivery.page)))
+
         def deliver_saved(*, report_outcome: bool = False) -> change_page.DeliveryOutcome:
             if isinstance(action_delivery, review_actions.ListFeedbackDelivery):
-                try:
-                    return list_page.deliver_with_outcome(action_delivery)
-                except OSError as error:
-                    print(f"review-links delivery result {action_delivery.identity}: {error}", file=sys.stderr)
-                    return change_page.DeliveryUnconfirmed()
+                return server.deliver_list_notice(action_delivery)
             delivery = change_page.finish_verdict_cleanup(action_delivery, server.delivery_status)
             return self.deliver_review(server, delivery, report_outcome=report_outcome)
 
         if (self.headers.get(send_hold.REPLAY_HEADER) == "1"
                 or self.headers.get(review_page.DELIVERY_RESULT_HEADER) == "1"):
             outcome = deliver_saved(report_outcome=True)
-            result.update(held_delivery_result(outcome, not pending))
+            if not studio_delivery:
+                result.update(held_delivery_result(outcome, not pending))
             result['delivery_pending'] = False
             if pending:
                 self.publish_review_delivery(server, key)
@@ -2558,13 +2559,20 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             reply["words_saved"] = True
         if current is not None and isinstance(submission, list_page.ListUnparkSubmission):
             reply["unpark_outcome"] = submission.response_outcome(current).value
+
+        def deliver_saved() -> change_page.DeliveryOutcome:
+            if isinstance(submission, review_actions.StudioNoticeDelivery):
+                return server.deliver_list_notice(submission)
+            return list_page.deliver_with_outcome(submission)
+
         if self.headers.get(send_hold.REPLAY_HEADER) == "1" or repair_feedback:
             try:
-                outcome = list_page.deliver_with_outcome(submission)
+                outcome = deliver_saved()
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
                 outcome = change_page.DeliveryUnconfirmed()
-            reply.update(held_delivery_result(outcome, not pending))
+            if action not in ("read", "question"):
+                reply.update(held_delivery_result(outcome, not pending))
             reply["delivery_pending"] = False
             if repair_feedback and isinstance(delivery, list_page.ListFeedbackDelivery):
                 receipt_state = (list_page.NotFixedReceiptState.DELIVERED
@@ -2580,7 +2588,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 self.json_response(200, reply)
             finally:
                 try:
-                    list_page.deliver(submission)
+                    if isinstance(submission, review_actions.StudioNoticeDelivery):
+                        _ = server.deliver_list_notice(submission)
+                    else:
+                        list_page.deliver(submission)
                 except OSError as error:
                     print(f"review-links delivery status: {error}", file=sys.stderr)
 
@@ -2926,6 +2937,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         self._item_deliveries: set[str] = set()
         self._item_delivery_lock: threading.Lock = threading.Lock()
+        self._studio_notice_retries: set[review_actions.StudioNoticeDelivery] = set()
+        self.studio_notice_recovery: threading.Thread | None = None
         self.branch_deletions: set[Path] = set()
         self.branch_deletions_lock: threading.Lock = threading.Lock()
         self._staff_snapshot_lock: threading.Lock = threading.Lock()
@@ -2982,7 +2995,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
                     self.delivery_status.startup_recovery_pending.clear()
                 # Recover Go first because its message includes the producer's next-step notice.
                 recover("List Go", partial(recover_goes, self.store_folder))
-                recover("List feedback", partial(recover_list, self.store_folder))
+                recover("List feedback", partial(recover_list, self.store_folder, send_notice=self.deliver_list_notice))
                 recover("Scheduled notice", partial(new_item.recover_scheduled_notices, self.root))
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
@@ -3076,6 +3089,33 @@ class ReviewLinksServer(ThreadingHTTPServer):
     def item_delivery_pending(self, check: str) -> bool:
         with self._item_delivery_lock:
             return check in self._item_deliveries
+
+    def deliver_list_notice(self, delivery: review_actions.ListFeedbackDelivery) -> change_page.DeliveryOutcome:
+        try:
+            result = list_page.deliver_with_outcome(delivery)
+        except FileNotFoundError:
+            return change_page.DeliveryUnconfirmed()
+        except OSError as error:
+            print(f"review-links List delivery {delivery.identity}: {error}", file=sys.stderr)
+            result = change_page.DeliveryUnconfirmed()
+        if isinstance(delivery, review_actions.StudioNoticeDelivery):
+            with self._item_delivery_lock:
+                if isinstance(result, change_page.DeliveryConfirmed):
+                    self._studio_notice_retries.discard(delivery)
+                else:
+                    self._studio_notice_retries.add(delivery)
+        return result
+
+    def retry_studio_notices(self) -> None:
+        with self._item_delivery_lock:
+            retries, self._studio_notice_retries = self._studio_notice_retries, set()
+        for delivery in retries:
+            try:
+                _ = self.deliver_list_notice(delivery)
+            except (OSError, ValueError, RuntimeError) as error:
+                print(f"review-links Studio notice {delivery.identity}: {error}", file=sys.stderr)
+                with self._item_delivery_lock:
+                    self._studio_notice_retries.add(delivery)
 
     def list_review_records(self) -> list_page.ImmediateReviewRecords:
         cache = self.review_cache
@@ -3374,6 +3414,12 @@ class ReviewLinksServer(ThreadingHTTPServer):
                 self.alert_recovery = threading.Thread(
                     target=self.delivery_status.recover_deferred_alerts, daemon=True)
                 self.alert_recovery.start()
+            with self._item_delivery_lock:
+                studio_notices_pending = bool(self._studio_notice_retries)
+            if (studio_notices_pending
+                    and (self.studio_notice_recovery is None or not self.studio_notice_recovery.is_alive())):
+                self.studio_notice_recovery = threading.Thread(target=self.retry_studio_notices, daemon=True)
+                self.studio_notice_recovery.start()
 
 
 def main(arguments: list[str]) -> int:

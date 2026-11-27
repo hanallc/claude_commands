@@ -3156,10 +3156,18 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         self.assertEqual(exchange.answer.text, "Use the wide layout.")
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
-    def test_browser_studio_question_shows_delivery_failure_with_undo_disabled(self) -> None:
+    def test_browser_studio_answer_alerts_the_team_without_a_delivery_line(self) -> None:
         item = self.studio_team_question()
-        failure = change_page.FailedDelivery("attempt", self.root / "question.md", item.id, "The owner is offline.")
-        with (patch.object(serve.ReviewLinksHandler, "deliver_review", return_value=failure) as deliver,
+        alerted = threading.Event()
+
+        def send(recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> None:
+            self.assertTrue(key.startswith("review:"))
+            if recipient == DWIGHT.id:
+                raise RuntimeError("The owner is offline.")
+            alerted.set()
+
+        with (patch.object(change_page, "send_to_staff", side_effect=send),
+              patch.object(change_page, "review_alert_showrunners", return_value=(OWNER.id,)),
               self.studio_review_server() as origin):
             self.open_studio_review_fixture(origin, "#show=questions")
             self.studio_review_check(r"""
@@ -3171,18 +3179,28 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  form().querySelector('[value="answer"]').click();
  await until(()=>!recordIsOpen(item));
  const status=document.querySelector('[data-hidden-action-status]');
- check(!status.hidden && status.textContent.includes('Saved. Delivery failed: The owner is offline.'),
-  'The closed row reports that the answer saved and delivery failed.');
+ check(status.hidden,'The closed row shows no delivery failure.');
 """)
-        deliver.assert_called_once()
-        self.assertIs(cast(object, deliver.call_args.kwargs["report_outcome"]), True)
+            self.assertTrue(alerted.wait(TEST_HANG_GUARD_SECS))
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(saved.state, the_list.ItemState.WORKING)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_answer_keeps_pending_delivery_for_recovery(self) -> None:
         item = self.studio_team_question()
-        with (patch.object(change_page, "send_to_staff", return_value="pending") as send,
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        pending = threading.Event()
+        tries = conf.read("review_links").whole("delivery_tries")
+        keys: list[str] = []
+
+        def send_pending(_recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> str:
+            keys.append(key)
+            if len(keys) == tries:
+                pending.set()
+            return "pending"
+
+        with (patch.object(change_page, "send_to_staff", side_effect=send_pending),
+              patch.object(change_page, "review_alert_showrunners", return_value=()),
               self.studio_review_server() as origin):
             self.open_studio_review_fixture(origin, "#show=questions")
             self.studio_review_check(r"""
@@ -3193,23 +3211,37 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  const answer=readForm();
  answer.elements.feedback.value='Use the wide layout.';
  answer.querySelector('[value="answer"]').click();
+ const undo=()=>document.querySelector('[data-send-undo] button');
+ await until(undo);
+ check(undo().textContent==='Undo' && undo().previousElementSibling.textContent==='Saved.',
+  'Answer shows the usual saved message and Undo.');
  await until(()=>!recordIsOpen(item));
  const status=document.querySelector('[data-hidden-action-status]');
- check(!status.hidden && status.textContent.includes('Saved. The sender has not confirmed delivery.'),
-  'The row reports that the answer saved and delivery is unconfirmed.');
+ check(status.hidden,'The closed row shows no pending delivery line.');
 """)
+            self.assertTrue(pending.wait(TEST_HANG_GUARD_SECS))
         saved = the_list.load(MORTY.id, item.id)
         exchange, = saved.filed_exchanges
         assert isinstance(exchange.answer, list_exchange.ExchangeAnswer)
         self.assertEqual(exchange.answer.text, "Use the wide layout.")
-        keys = {cast(str, call.kwargs["key"]) for call in send.call_args_list}
-        self.assertEqual(len(keys), 1)
+        self.assertEqual(len(set(keys)), 1)
         status = change_page.DeliveryStatus(self.root / "reviews")
         with patch.object(change_page, "send_to_staff", return_value="skipped") as recover:
             change_page.recover_question_answers(status)
             change_page.recover_question_answers(status)
         recover.assert_called_once()
-        self.assertEqual({cast(str, recover.call_args.kwargs["key"])}, keys)
+        self.assertEqual(cast(str, recover.call_args.kwargs["key"]), keys[0])
+
+    def test_studio_question_and_answer_use_the_short_time_form(self) -> None:
+        item = self.studio_team_question()
+        exchange, = item.filed_exchanges
+        answer_time = NOW + timedelta(days=11, hours=4, minutes=19)
+        answered = replace(exchange, answer=list_exchange.ExchangeAnswer(
+            "Use the wide layout.", answer_time, list_exchange.AnswerRead.READ))
+        shown = list_page.filed_exchange_sections(replace(item, filed_exchanges=(answered,)),
+            NOW.astimezone(user_zone()), staff_names.StaffNames(staff.snapshot()), frozenset())
+        self.assertEqual(re.findall(r"<time[^>]*>([^<]+)</time>", shown),
+                         ["Nov 16 18:00 EST", "Nov 27 17:19 EST"])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_later_reuses_short_preset_after_lost_responses(self) -> None:
@@ -3250,12 +3282,20 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         self.assertEqual((notice.state, notice.form_words), ("sent", "Wait for the desktop check."))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
-    def test_browser_overlay_keeps_question_delivery_failure_after_form_reload(self) -> None:
+    def test_browser_overlay_hides_delivery_failure_after_form_reload(self) -> None:
         item = self.studio_team_question()
         source = self.add("Read the linked question", number=2)
         _ = the_list.update(MORTY.id, source.id, {"related_to": (item.number,)}, source="morty")
-        failure = change_page.FailedDelivery("attempt", self.root / "question.md", item.id, "The owner is offline.")
-        with (patch.object(serve.ReviewLinksHandler, "deliver_review", return_value=failure),
+        alerted = threading.Event()
+
+        def send(recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> None:
+            self.assertTrue(key.startswith("review:"))
+            if recipient == DWIGHT.id:
+                raise RuntimeError("The owner is offline.")
+            alerted.set()
+
+        with (patch.object(change_page, "send_to_staff", side_effect=send),
+              patch.object(change_page, "review_alert_showrunners", return_value=(OWNER.id,)),
               self.studio_review_server() as origin):
             self.open_studio_review_fixture(origin)
             self.studio_review_check(r"""
@@ -3269,11 +3309,11 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  original.querySelector('[value="question"]').click();
  await until(()=>form() && form()!==original);
  const status=form().querySelector('[data-send-status]');
- check(dialog.open && !status.hidden && status.textContent.includes('Saved. Delivery failed: The owner is offline.'),
-  'The new form keeps the delivery failure.');
+ check(dialog.open && status.hidden,'The new form shows no delivery failure.');
  close();
  check(!dialog.open,'Close dismisses the overlay.');
 """)
+            self.assertTrue(alerted.wait(TEST_HANG_GUARD_SECS))
 
     def studio_team_question(self) -> the_list.ListItem:
         members = staff.snapshot()
@@ -4242,7 +4282,7 @@ frame.addEventListener('load',async()=>{
         self.assertNotIn('<dt>Next step</dt>', second)
         self.assertIn(f'<dt>Next step</dt><dd><p>{initial_step}</p></dd>', third)
         self.assertNotIn('<dt>Latest status</dt>', third)
-        self.assertIn(f'<time datetime="{NOW.isoformat()}">13:00 EST</time>', second)
+        self.assertIn(f'<time datetime="{NOW.isoformat()}">Nov 16 13:00 EST</time>', second)
         self.assertIn('morty</small>', without_role_colors(second))
 
     def test_updated_log_keeps_the_time_and_source_when_no_fields_change(self) -> None:
@@ -4250,7 +4290,7 @@ frame.addEventListener('load',async()=>{
             '- 2026-11-16 18:00:00+00:00 Added; state: "Working" — nate',
             '- 2026-11-16 18:10:00+00:00 Updated state: "Working" — morty')
         update = log.split('<li data-log-index="1">', 1)[1].split('</li>', 1)[0]
-        self.assertIn('<time datetime="2026-11-16T18:10:00+00:00">13:10 EST</time>', update)
+        self.assertIn('<time datetime="2026-11-16T18:10:00+00:00">Nov 16 13:10 EST</time>', update)
         self.assertIn('<strong>Updated <small>— morty</small></strong>', without_role_colors(update))
         self.assertNotIn('<dl>', update)
 
@@ -4312,7 +4352,8 @@ frame.addEventListener('load',async()=>{
         updated = NOW + timedelta(minutes=20)
         with patch.object(the_list, "now", return_value=updated):
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "The report is ready."}, source="morty")
-        for read_at, expected in ((updated, "13:20 EST"), (updated + timedelta(days=1), "2026-11-16 13:20 EST")):
+        expected = "Nov 16 13:20 EST"
+        for read_at in (updated, updated + timedelta(days=1)):
             with self.subTest(read_at=read_at), patch.object(time, "time", return_value=read_at.timestamp()):
                 body = list_page.render(self.root / "reviews", include_counts=False).decode()
                 self.assertIn(f'<h3>Latest status · <time datetime="{updated.isoformat()}">{expected}</time></h3>', body)
@@ -4323,7 +4364,7 @@ frame.addEventListener('load',async()=>{
             read = the_list.mark_read(MORTY.id, item.id, source="nate")
             self.assertEqual(read.updated, read_at)
             body = list_page.render(self.root / "reviews", include_counts=False).decode()
-            self.assertIn(f'<h3>Latest status · <time datetime="{updated.isoformat()}">2026-11-16 13:20 EST</time></h3>', body)
+            self.assertIn(f'<h3>Latest status · <time datetime="{updated.isoformat()}">{expected}</time></h3>', body)
 
     def test_report_hides_latest_status_only_when_it_repeats_the_report_words(self) -> None:
         item = self.file_repaired_report("Fix the menu")
@@ -4381,7 +4422,7 @@ frame.addEventListener('load',async()=>{
 
     def test_log_shows_the_recorded_clock_time_once(self) -> None:
         log = self.legacy_log('- 2026-11-16 18:20:00+00:00 Updated state: "Working" — morty, 09:00 CST')
-        self.assertIn('<time datetime="2026-11-16T18:20:00+00:00">13:20 EST</time>', log)
+        self.assertIn('<time datetime="2026-11-16T18:20:00+00:00">Nov 16 13:20 EST</time>', log)
         self.assertIn("morty</small>", without_role_colors(log))
         self.assertEqual(log.count("13:20 EST"), 1)
         self.assertNotIn("09:00 CST", log)
@@ -5428,7 +5469,7 @@ document.body.append(result);
             else:
                 place.assert_not_called()
             with (patch.object(unrouted_alert, "message_outcome", return_value=outcome) as send,
-                  patch.object(change_page, "alert_delivery_failures")):
+                  patch.object(change_page, "send_to_staff", return_value=None)):
                 list_page.deliver(delivery)
             if number == 17:
                 send.assert_called_once()
@@ -5496,8 +5537,9 @@ expand(17);
 check(!row(17).hidden && detail(17)?.querySelector('[data-waiting-note]')?.textContent==='dwight will answer.',
  'Producer answering shows the saved recipient in the waiting note.');
 expand(19);
-check(!row(19).hidden && detail(19)?.querySelector('[data-question-delivery-failed]'),
- 'The failed question stays in Producer answering with a failure notice.');
+check(!row(19).hidden && detail(19)?.textContent.includes('Which check passed?') &&
+ !detail(19).querySelector('[data-question-delivery-failed]'),
+ 'Producer answering keeps the question with no delivery warning.');
 const producerChips=document.querySelector('[data-filter-row="producer"]');
 for(const number of [17,19]){
  producerChips.querySelector('[data-filter-value="staff:'+row(number).dataset.producer+'"]').click();
@@ -6193,7 +6235,7 @@ window.fetch=(url,options)=>{
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].state, "sent")
         body = list_page.render(root, include_counts=False).decode()
-        self.assertIn("Feedback sent to dwight", without_role_colors(body))
+        self.assertIn("Words for dwight", without_role_colors(body))
 
     def waiting_dwight_item(self) -> tuple[the_list.ListItem, dict[str, str]]:
         item = self.add("Read the waiting result", the_list.ItemState.WAITING_FOR_NATE, number=107)
@@ -6207,7 +6249,7 @@ window.fetch=(url,options)=>{
         moved = the_list.move_open_producer(MORTY.id, item.id, DWIGHT.id, MORTY.id, source="morty")
         self.assertEqual(moved.producer, MORTY.id)
         log = list_page.render(root, include_counts=False).decode().split('<ol class="list-log">', 1)[1]
-        self.assertIn("Feedback for dwight", without_role_colors(log.split("</ol>", 1)[0]))
+        self.assertIn("Words for dwight", without_role_colors(log.split("</ol>", 1)[0]))
         with patch.object(change_page, "send_to_staff") as send:
             list_page.recover_pending(self.root / "reviews")
         self.assertEqual(send.call_count, 1)
@@ -6224,6 +6266,16 @@ window.fetch=(url,options)=>{
         self.assertEqual(cast(tuple[str, ...], alert.call_args.kwargs["recipients"]), (MORTY.id,))
         feedback = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]]
         self.assertEqual((feedback.state, feedback.alerted_to), ("alerted", "morty"))
+        markup = without_role_colors(list_page.render(self.root / "reviews", include_counts=False).decode())
+        self.assertIn("Words for dwight", markup)
+        self.assertNotIn("Feedback could not reach", markup)
+        with patch.object(change_page, "send_to_staff", return_value=None) as send:
+            list_page.recover_pending(self.root / "reviews")
+            list_page.recover_pending(self.root / "reviews")
+        send.assert_called_once_with(DWIGHT.id, change_page.SENDER, feedback.words, key=change_page.review_delivery_key(
+            the_list.folder(MORTY.id) / (item.id + ".md"), item.id, fields["request"]))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].state, "sent")
 
     def test_mark_read_on_a_waiting_item_with_an_open_question_sends_no_message(self) -> None:
         root = self.root / "reviews"
@@ -8888,8 +8940,8 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         asked_at = NOW - timedelta(days=1)
         answered_at = NOW - timedelta(minutes=25)
         answer_logged_at = answered_at + timedelta(minutes=1)
-        asked_time = f'<time datetime="{asked_at.isoformat()}">2026-11-15 13:00 EST</time>'
-        answer_time = f'<time datetime="{answered_at.isoformat()}">12:35 EST</time>'
+        asked_time = f'<time datetime="{asked_at.isoformat()}">Nov 15 13:00 EST</time>'
+        answer_time = f'<time datetime="{answered_at.isoformat()}">Nov 16 12:35 EST</time>'
         question_clock = Mock(wraps=datetime)
         question_clock.configure_mock(**{"now.side_effect": (asked_at, answered_at)})
         with patch.object(page_question, "datetime", question_clock):
@@ -8935,7 +8987,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         log = re.sub(r'<span class="staff-name"[^>]*>(.*?)</span>', r'\1', log)
         question_row = ('<li class="question" data-log-index="Q1-asked">' + asked_time
                         + '<div><strong>Question</strong> Q1 <small>— nate</small>')
-        logged_time = f'<time datetime="{answer_logged_at.isoformat()}">12:36 EST</time>'
+        logged_time = f'<time datetime="{answer_logged_at.isoformat()}">Nov 16 12:36 EST</time>'
         answer_row = ('<li class="question" data-log-index="Q1-answered">' + logged_time
                       + '<div><strong>Answer</strong> <small>— morty</small>')
         self.assertIn(question_row + '<p>What changed in &lt;List&gt;?</p></div></li>', log)
@@ -9029,7 +9081,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                     self.assertEqual((read.get("unread_answer"), read["parked"]), ("false", "true"))
                     self.assertEqual(the_list.load(MORTY.id, item.id).parked_until, until)
 
-    def test_another_question_keeps_the_first_failure_visible(self) -> None:
+    def test_another_question_does_not_show_the_first_delivery_failure(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         item = self.add("Keep the first question available")
@@ -9042,7 +9094,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
 
         first = ask("Which check passed?")
         with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "Producer offline")),
-              patch.object(change_page, "alert_delivery_failures")):
+              patch.object(change_page, "send_to_staff", return_value=None)):
             list_page.deliver(first)
         second = ask("Which check is next?")
         with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
@@ -9059,9 +9111,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                         for match in re.finditer(r'<section class="page-question" data-question="(Q[12])">(.*?)</section>',
                                                  markup, re.DOTALL)}
                     self.assertEqual(set(sections), {"Q1", "Q2"})
-                    self.assertIn("Question not delivered.", sections["Q1"])
-                    self.assertNotIn("Question not delivered.", sections["Q2"])
-                    self.assertEqual(markup.count("Question not delivered."), 1)
+                    self.assertNotIn("Question not delivered.", markup)
                     self.assertNotIn('value="resend-', markup)
 
     def test_a_malformed_job_id_keeps_sender_exclusion_until_the_lock_releases(self) -> None:
@@ -9235,7 +9285,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         self.assertIs(saved.state, delivery_state.QuestionSendState.SENT)
         self.assertEqual(saved.attempt_id, claimed.attempt_id)
 
-    def test_a_new_ask_of_the_same_words_starts_an_attempt_after_a_confirmed_failure(self) -> None:
+    def test_a_failed_ask_retries_the_same_attempt(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         item = self.add("Ask again after a failure")
@@ -9245,25 +9295,23 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         assert isinstance(first, list_page.ListQuestionDelivery)
         path = status.path(first.delivery.page, first.delivery.row)
         with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "Producer offline")),
-              patch.object(change_page, "alert_delivery_failures")):
+              patch.object(change_page, "send_to_staff", return_value=None)):
             list_page.deliver(first)
         failed = change_page.read_question_attempt(path)
-        self.assertIs(failed.state, delivery_state.QuestionSendState.FAILED)
+        self.assertIs(failed.state, delivery_state.QuestionSendState.UNKNOWN)
         current = the_list.load(MORTY.id, item.id)
         with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
             list_page.deliver(list_page.submit(root, urlencode(fields), change_page.DeliveryStatus(root)))
         send.assert_not_called()
         self.assertEqual(change_page.read_question_attempt(path), failed)
         self.assertEqual(the_list.load(MORTY.id, item.id), current)
-        next_fields = self.fields(current, "question", words=words)
-        self.assertNotEqual(next_fields["request"], fields["request"])
         with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
-            list_page.deliver(list_page.submit(root, urlencode(next_fields), status))
-            list_page.deliver(list_page.submit(root, urlencode(next_fields), status))
+            change_page.recover_deferred_questions(status)
+            change_page.recover_deferred_questions(status)
         send.assert_called_once_with(MORTY.id, failed.message, failed.message_id)
         accepted = change_page.read_question_attempt(path)
         self.assertIs(accepted.state, delivery_state.QuestionSendState.SENT)
-        self.assertNotEqual(accepted.attempt_id, failed.attempt_id)
+        self.assertEqual(accepted.attempt_id, failed.attempt_id)
         self.assertEqual(the_list.load(MORTY.id, item.id).questions, current.questions)
 
     def test_recorded_question_failure_takes_priority_when_the_intent_clear_fails(self) -> None:
@@ -9290,7 +9338,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         self.assertEqual(reopened.failed_delivery(page, delivery.row), failure)
         markup = without_scripts(list_page.render(root, include_counts=False).decode())
         self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
-        self.assertIn("Question not delivered.", markup)
+        self.assertNotIn("Question not delivered.", markup)
         self.assertNotIn('value="resend-', markup)
 
     def test_startup_reuses_the_list_question_key_after_a_result_write_failure(self) -> None:
@@ -9384,7 +9432,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
             first = list_page.submit(root, urlencode(offline), status)
         assert isinstance(first, list_page.ListQuestionDelivery)
         with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "Keeper offline")),
-              patch.object(change_page, "alert_delivery_failures")):
+              patch.object(change_page, "send_to_staff", return_value=None)):
             list_page.deliver(first)
         old_question, = the_list.load(MORTY.id, retry_item.id).questions
         with patch.object(session_pane, "session_place"):
@@ -9686,7 +9734,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
             current = the_list.load(MORTY.id, item.id)
             delivery = list_page.submit(root, urlencode(self.fields(current, "question", words=words)), status)
             with (patch.object(change_page, "send_question", return_value=outcome),
-                  patch.object(change_page, "alert_delivery_failures")):
+                  patch.object(change_page, "send_to_staff", return_value=None)):
                 list_page.deliver(delivery)
         with (patch.object(staff, "caller_identity", return_value=MORTY.current_session),
               redirect_stdout(io.StringIO())):
@@ -9695,7 +9743,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         body = without_scripts(list_page.render(root, include_counts=False, status=reopened).decode())
         self.assertIn('data-waiting-for-answer="false"', body)
         self.assertIn('aria-label="Unread update"', body)
-        self.assertEqual(body.count("Question not delivered."), 1)
+        self.assertNotIn("Question not delivered.", body)
         self.assertNotIn('value="resend-', body)
         self.assertIn('data-unread-answer="true"', body)
         self.assertRegex(body, r'data-filter-value="needs-me"[^>]*data-filter-count="1"')
@@ -11151,13 +11199,11 @@ window.fetch=async(_url,options)=>{
   }
  };
  words.value=text;words.dispatchEvent(new Event('input'));
- const ask=form.querySelector('[value="question"]');
- const recipient=ask.getAttribute('aria-label')?.slice(ask.textContent.length+2);
  submit('question');
  const toast=()=>document.querySelector('[data-send-undo]:has(button)');
  await changed(toast,'The Undo toast did not show.');
  const message=toast().querySelector('span').textContent;
- check(message==='Sent to '+recipient+'.','The Ask button and toast name the same receiver.');
+ check(message==='Saved.','The toast shows the usual saved message.');
  check(shown().length===1 && !row.getClientRects().length && all.dataset.filterCount==='1',
   'The held question removes its item from the List and the chip count.');
  toast().getAnimations()[0].finish();
@@ -11173,7 +11219,7 @@ window.fetch=async(_url,options)=>{
                     self.browser_action_sequence(steps, add_item=False, window_size=(500, 900))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_ask_button_toast_and_delivery_name_the_producer(self) -> None:
+    def test_browser_ask_shows_saved_and_keeps_the_named_recipient(self) -> None:
         item = self.add("Check the assigned item", number=1)
         _ = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
         root = self.root / "reviews"
@@ -11225,7 +11271,7 @@ window.fetch=async(_url,options)=>{
                                                                "returnByValue": True}, browser.session)
                 self.assertNotIn("exceptionDetails", result)
                 self.assertEqual(cast(dict[str, object], result["result"])["value"],
-                                 [f"Ask question, {DWIGHT.name}", f"Sent to {DWIGHT.name}.", True])
+                                 [f"Ask question, {DWIGHT.name}", "Saved.", True])
             finally:
                 browser.navigate("about:blank")
                 server.shutdown()
@@ -11507,7 +11553,7 @@ window.fetch=async(_url,options)=>{
         item = self.add("Keep the row with a failed question", number=1)
         delivery = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check failed?")))
         with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "Producer offline")),
-              patch.object(change_page, "alert_delivery_failures")):
+              patch.object(change_page, "send_to_staff", return_value=None)):
             list_page.deliver(delivery)
         return the_list.load(MORTY.id, item.id)
 
@@ -11516,7 +11562,7 @@ window.fetch=async(_url,options)=>{
         _ = self.add_item_with_failed_question()
         self.browser_action_sequence(r"""
  const ask=form.querySelector('[value="question"]'),input=form.elements.words;
- check(Boolean(recordDetails(row).querySelector('[data-question-delivery-failed]')),'The older question has a delivery failure');
+ check(!recordDetails(row).querySelector('[data-question-delivery-failed]'),'The older question shows no delivery failure.');
  refreshMarkup=listSnapshot();
  input.value='Which check is next?';input.dispatchEvent(new Event('input'));
  ask.focus();
@@ -11536,8 +11582,9 @@ window.fetch=async(_url,options)=>{
         _ = self.add("The next unread item", number=2)
         self.browser_action_sequence(r"""
  onlyUnread();
- check(!row.hidden && recordDetails(row).querySelector('[data-question-delivery-failed]'),
-  'Unread shows the item with a failed question');
+ check(!row.hidden && recordDetails(row).textContent.includes('Which check failed?') &&
+  !recordDetails(row).querySelector('[data-question-delivery-failed]'),
+  'Unread shows the question with no delivery warning.');
  const snapshot=document.documentElement.cloneNode(true);
  snapshot.querySelector('[data-number="1"]').dataset.unread='false';
  refreshMarkup=snapshot.outerHTML;

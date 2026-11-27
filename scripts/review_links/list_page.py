@@ -456,7 +456,7 @@ def log_source_html(source: str, names: staff_names.StaffNames) -> str:
 
 
 def time_html(moment: datetime, today: datetime) -> str:
-    return f'<time datetime="{moment.isoformat()}">{html.escape(list_time(moment, today))}</time>'
+    return f'<time datetime="{moment.isoformat()}">{html.escape(short_list_time(moment, today.tzinfo))}</time>'
 
 
 def log_row(index: str, moment: datetime, body: str, today: datetime, *,
@@ -500,7 +500,8 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
                 f'<dt>{names.role_label(field, FIELD_LABELS[field])}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
                 for field, value in visible_fields) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
-        label = {"pending": "Feedback for", "sent": "Feedback sent to", "alerted": "Feedback could not reach"}[content.state]
+        label = ("Words for" if content.studio_save_notice else
+                 {"pending": "Feedback for", "sent": "Feedback sent to", "alerted": "Feedback could not reach"}[content.state])
         recipients = " and ".join(names.html(identity, owner_name(names.members, identity))
                                   for identity in content.recipient_ids(keeper))
         body = label + " " + recipients + by
@@ -934,9 +935,7 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
         waiting = " — waiting for an answer" if pending else ""
         body = (f'<section class="page-question" data-question="{identity}"><h3>Question {identity}{waiting}</h3>'
                 + question_time_html(question.asked_at, today) + f'<p>{item_text_html(question.words)}</p>')
-        if answer is None:
-            body += change_page.question_failure_html(question.question_id in failed)
-        else:
+        if answer is not None:
             marker = ' <span class="question-unread">Unread</span>' if unread else ''
             body += (f'<h3>Answer{marker}</h3>'
                      + question_time_html(answer.answered_at, today) + f'<p>{item_text_html(answer.text)}</p>')
@@ -1490,7 +1489,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     sent = the_list.feedback_notice_time(item)
     if isinstance(sent, datetime):
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
-        if feedback.state == "alerted":
+        if feedback.state == "alerted" and not feedback.studio_save_notice:
             recipient_id = feedback.recipient_id(entry.keeper)
             recipient = names.html(recipient_id, owner_name(names.members, recipient_id))
             alert = names.html(feedback.alerted_to) + " told" if feedback.alerted_to else "no showrunner for alert"
@@ -1963,8 +1962,11 @@ def _notice_delivery(keeper: staff.StaffId, item: the_list.ListItem,
                      request: str) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
     """Send the notice that an item action saved, if it is still pending."""
     notice = the_list.feedback_requests(item).get(request)
-    return (ListFeedbackDelivery(keeper, item.id, request)
-            if notice is not None and notice.state == "pending" else change_page.NoMessageDelivery())
+    if notice is None or notice.state == "sent":
+        return change_page.NoMessageDelivery()
+    if notice.studio_save_notice:
+        return review_actions.StudioNoticeDelivery(keeper, item.id, request)
+    return ListFeedbackDelivery(keeper, item.id, request) if notice.state == "pending" else change_page.NoMessageDelivery()
 
 
 def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
@@ -1999,19 +2001,22 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
         key = change_page.review_delivery_key(source, item.id, feedback.request)
         recipients = feedback.recipient_ids(delivery.keeper)
         repair = feedback.action is the_list.ReportVerdict.NOT_FIXED
-        confirm = repair or (feedback.action in ("read", "park") and feedback.origin is the_list.PageNoticeOrigin.STUDIO)
+        confirm = repair or feedback.studio_save_notice
         failures = change_page.send_with_retries(change_page.SENDER, recipients, message,
                                                  tries, settings.number("delivery_pause_seconds"), key=key,
                                                  confirm=confirm)
-        if confirm and any(isinstance(failure, change_page.UnconfirmedDelivery) for failure in failures):
+        if repair and any(isinstance(failure, change_page.UnconfirmedDelivery) for failure in failures):
             return feedback
         if not failures:
             outcome = change_page.DeliveryConfirmed()
             return replace(feedback, state="sent", alerted_to="")
         outcome = change_page.FailedDelivery(feedback.request, source, item.id, failures[-1].error)
+        if feedback.studio_save_notice and feedback.state == "alerted":
+            return feedback
         owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id not in recipients)
         reached = change_page.alert_delivery_failures(failures, tries, source=source, row=item.id, message=message,
-            recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
+            recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention",
+            confirm=feedback.studio_save_notice)
         return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
     the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
     if not attempted:
@@ -2019,14 +2024,13 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
         feedback = the_list.feedback_requests(item).get(delivery.request)
         if feedback is not None:
             repair = feedback.action is the_list.ReportVerdict.NOT_FIXED
-            studio_later = feedback.action == "park" and feedback.origin is the_list.PageNoticeOrigin.STUDIO
-            if repair or studio_later:
+            if repair or feedback.studio_save_notice:
                 if feedback.state == "sent":
                     return change_page.DeliveryConfirmed()
                 if feedback.state == "alerted":
                     source = the_list.folder(delivery.keeper) / f"{item.id}.md"
                     reason = ("The owner or producer did not receive Not fixed." if repair
-                              else "The owner did not receive the Later notice.")
+                              else "The owner did not receive the Studio notice.")
                     return change_page.FailedDelivery(feedback.request, source, item.id, reason)
     return outcome
 
@@ -2186,13 +2190,16 @@ def _go_sends_notice(ledger: Path, keeper: staff.StaffId, feedback: the_list.Pag
     return entry["sent"].get(feedback.recipient_id(keeper)) is False
 
 
-def recover_pending(ledger: Path) -> None:
+def recover_pending(ledger: Path, *, send_notice: Callable[[ListFeedbackDelivery], object] = deliver) -> None:
     """Retry each pending request once at server start; leave a Go's next-step notice to the Go path."""
     for entry in records(include_closed=True):
         for feedback in the_list.feedback_requests(entry.item).values():
-            if feedback.state == "pending" and not _go_sends_notice(ledger, entry.keeper, feedback):
+            if (feedback.state == "pending" or (feedback.state == "alerted" and feedback.studio_save_notice)
+                    ) and not _go_sends_notice(ledger, entry.keeper, feedback):
                 try:
-                    deliver(ListFeedbackDelivery(entry.keeper, entry.item.id, feedback.request))
+                    delivery = _notice_delivery(entry.keeper, entry.item, feedback.request)
+                    if isinstance(delivery, ListFeedbackDelivery):
+                        _ = send_notice(delivery)
                 except (OSError, ValueError) as error:
                     print(f"List feedback recovery {entry.key}: {error}", file=sys.stderr)
 
@@ -3172,28 +3179,20 @@ function bindStudioQuestion(item,card,form,view){
   const submittedDraft=rememberReviewDraft(form);
   const hold=holdCard(item,hidden=>{if(hidden) view.applyAction();});
   const resultItem=view===tableView ? item : rowIn(content,key);
-  const submission=resultItem && tableView.startAction(resultItem);
-  const overlaySubmission=view!==tableView ? view.startAction(item) : undefined;
-  let saved=false,deliveryResult;
+  if(resultItem) tableView.startAction(resultItem);
+  if(view!==tableView) view.startAction(item);
+  let saved=false;
   startListSave();
   showNotice('');
   await saveReviewAction(data,{
-   url:reviewPagePath,hold,button,reportDelivery:true,
+   url:reviewPagePath,hold,button,saveOnly:true,
    sending:()=>setCardSubmitting(form,true),
    confirmedSave:()=>{
     saved=true;
     if(action==='later' || action==='answer') clearLaterRequest();
     if(reviewDrafts.get(draftKey)===submittedDraft) reviewDrafts.delete(draftKey);
    },
-   saved:result=>{
-    if(result.send_failure){
-     deliveryResult={kind:'failure',message:'Saved. '+result.send_failure};
-    }else if(!result.no_message && result.delivery_pending===false){
-     const receiver=data.get('receiver');
-     const message=receiver ? 'Sent to '+receiver+'.' : 'Sent.';
-     deliveryResult={kind:'success',message,hiddenMessage:'Item #'+item.dataset.number+': '+message};
-    }
-   },
+   saved:()=>{},
    failed:reason=>showNotice('Not saved: '+reason),
    undone:message=>{
     if(action==='later') clearLaterRequest();
@@ -3210,10 +3209,6 @@ function bindStudioQuestion(item,card,form,view){
     view.preserveRecordRowTop(()=>{
      if(saved && (action==='answer' || action==='later')) view.closeCard(key,{focusShow:true});
      else if(form.isConnected){setCardSubmitting(form,false);syncControls();}
-     if(deliveryResult){
-      if(resultItem) tableView.showActionResult(resultItem,submission,'Item #'+item.dataset.number,deliveryResult);
-      if(view!==tableView) view.showActionResult(item,overlaySubmission,'Item #'+item.dataset.number,deliveryResult);
-     }
      view.applyAction();
     });
     if(saved && action==='question') void loadStudioQuestion(item,card,view);
@@ -4023,7 +4018,7 @@ function bindFeedbackForm(form,view=tableView){
     }
     const options={method:'POST',body:data,signal:parkingReceipt ? listRequestSignal() : undefined};
     const response=await (action==='works' || usesWords || heldSave
-     ? hold.post(actionPath,options,saveAction ? readReceiver ?? null : receiver)
+     ? hold.post(actionPath,options,saveAction || asksQuestion ? null : receiver)
      : fetch(actionPath,options));
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parkingReceipt && action!=='remove'));
     if(!parkingReceipt) saved=response.ok && !questionRead;

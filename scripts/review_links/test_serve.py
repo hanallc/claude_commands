@@ -5363,7 +5363,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                         with (patch.object(list_page, "recover_pending",
                                            side_effect=OSError("The List feedback store failed.")) as recover_list,
                               started_review_server(("127.0.0.1", 0), review_link.review_root()) as restarted):
-                            recover_list.assert_called_once_with(restarted.store_folder)
+                            recover_list.assert_called_once_with(restarted.store_folder, send_notice=restarted.deliver_list_notice)
                     retry.assert_called_once_with(*first.call_args.args)
                     self.assertEqual(retry.call_args.args[0], producer)
                 self.assertEqual(cast(dict[str, object], json.loads(receipt.read_text()))["confirmed"],
@@ -7021,7 +7021,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         notice, = the_list.feedback_requests(saved).values()
         self.assertEqual((notice.form_words, notice.state), (words, "sent"))
 
-    def test_studio_later_keeps_a_pending_send_unconfirmed(self) -> None:
+    def test_studio_later_retries_pending_delivery_without_a_delivery_line(self) -> None:
         case, key, row = self.filed_studio_team_question()
         data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
         shown = re.search(rb'name="revision" value="([^"]+)"', data)
@@ -7029,15 +7029,22 @@ class ReviewLinksServerTests(unittest.TestCase):
         until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
         body = case.body(key, "later", "Wait for the desktop check.") + "&" + urlencode({
             "revision": shown[1].decode(), "later": until.isoformat()})
-        with patch.object(change_page, "send_to_staff", return_value="pending"):
+        tries = conf.read("review_links").whole("delivery_tries")
+        with (patch.object(change_page, "send_to_staff", side_effect=[*(["pending"] * tries), "skipped"]) as send,
+              patch.object(change_page, "alert_delivery_failures", return_value=False) as alert):
             status, reply = self.post(review_page.PAGE_PATH, body, headers={review_page.DELIVERY_RESULT_HEADER: "1"})
-        self.assertEqual(status, 200, reply)
-        result = cast(dict[str, object], json.loads(reply))
-        self.assertEqual(result.get("send_failure"), "The sender has not confirmed delivery.")
-        saved = the_list.load(row.keeper, row.item.id)
-        self.assertEqual(saved.parked_until, until)
-        notice, = the_list.feedback_requests(saved).values()
-        self.assertEqual(notice.state, "pending")
+            self.assertEqual(status, 200, reply)
+            self.assertNotIn(b"send_failure", reply)
+            saved = the_list.load(row.keeper, row.item.id)
+            self.assertEqual(saved.parked_until, until)
+            notice, = the_list.feedback_requests(saved).values()
+            self.assertEqual(notice.state, "pending")
+            self.server.retry_studio_notices()
+            self.server.retry_studio_notices()
+        self.assertEqual(send.call_count, tries + 1)
+        self.assertEqual(len({cast(str, call.kwargs["key"]) for call in send.call_args_list}), 1)
+        alert.assert_called_once()
+        self.assertEqual(the_list.feedback_requests(the_list.load(row.keeper, row.item.id))[notice.request].state, "sent")
 
     def test_submit_snapshot_returns_the_studio_later_delivery(self) -> None:
         case, key, row = self.filed_studio_team_question()
@@ -7077,22 +7084,19 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(change_page, "send_to_staff", side_effect=[None, "skipped"]) as send):
             status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
             self.assertEqual(status, 200, reply)
-            result = cast(dict[str, object], json.loads(reply))
-            self.assertEqual(result.get("send_failure"), "The sender has not confirmed delivery.")
+            self.assertNotIn(b"send_failure", reply)
             parked = the_list.load(row.keeper, row.item.id)
             self.assertEqual(parked.parked_until, until)
             self.assertEqual(the_list.feedback_requests(parked)[request].state, "pending")
             fail_result = False
-            status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
-            self.assertEqual(status, 200, reply)
-            self.assertNotIn(b"send_failure", reply)
+            self.server.retry_studio_notices()
         first, second = send.call_args_list
         self.assertEqual(cast(object, first.kwargs["key"]), cast(object, second.kwargs["key"]))
         saved = the_list.load(row.keeper, row.item.id)
         self.assertEqual(list(the_list.feedback_requests(saved)), [request])
         self.assertEqual(the_list.feedback_requests(saved)[request].state, "sent")
 
-    def test_studio_later_retry_reports_saved_delivery_failure(self) -> None:
+    def test_studio_later_retries_after_alert_without_a_delivery_line(self) -> None:
         case, key, row = self.filed_studio_team_question()
         data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
         shown = re.search(rb'name="revision" value="([^"]+)"', data)
@@ -7103,18 +7107,22 @@ class ReviewLinksServerTests(unittest.TestCase):
             "revision": shown[1].decode(), "later": until.isoformat(), "request": request})
         headers = {review_page.DELIVERY_RESULT_HEADER: "1"}
         _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
-        with (patch.object(change_page, "send_to_staff", side_effect=RuntimeError("The owner is offline.")) as send,
+        failure = RuntimeError("The owner is offline.")
+        with (patch.object(change_page, "send_to_staff", side_effect=[failure, failure, "skipped"]) as send,
               patch.object(change_page, "alert_delivery_failures", return_value=True) as alert):
             status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
             self.assertEqual(status, 200, reply)
-            self.assertIn(b"Delivery failed: The owner is offline.", reply)
+            self.assertNotIn(b"send_failure", reply)
             saved = the_list.load(row.keeper, row.item.id)
             self.assertEqual(the_list.feedback_requests(saved)[request].state, "alerted")
             status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
             self.assertEqual(status, 200, reply)
-            self.assertIn(b"Delivery failed: The owner did not receive the Later notice.", reply)
-        send.assert_called_once()
+            self.assertNotIn(b"send_failure", reply)
+            self.server.retry_studio_notices()
+        self.assertEqual(send.call_count, 3)
+        self.assertEqual(len({cast(str, call.kwargs["key"]) for call in send.call_args_list}), 1)
         alert.assert_called_once()
+        self.assertEqual(the_list.feedback_requests(the_list.load(row.keeper, row.item.id))[request].state, "sent")
 
     def test_studio_later_returns_the_same_delivery_from_submit_and_cache(self) -> None:
         case, key, row = self.filed_studio_team_question()
@@ -7128,7 +7136,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         body = case.body(key, "later", "Wait for the desktop check.") + "&" + urlencode({
             "revision": shown[1].decode(), "later": until.isoformat(), "request": request})
         result = review_page.submit(case.root, body, case.status, snapshot=snapshot)
-        self.assertEqual(result.delivery, review_actions.ListFeedbackDelivery(row.keeper, row.item.id, request))
+        self.assertEqual(result.delivery, review_actions.StudioNoticeDelivery(row.keeper, row.item.id, request))
         saved = cache.save(body, case.status)
         self.assertEqual(saved.delivery, result.delivery)
         self.assertEqual(saved.answer, result.answer)
@@ -9491,9 +9499,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             sent.clear()
             recovered = threading.Event()
             recover = list_page.recover_pending
-            def recover_and_finish(ledger: Path) -> None:
+            def recover_and_finish(ledger: Path, *, send_notice: Callable[[review_actions.ListFeedbackDelivery], object]) -> None:
                 try:
-                    recover(ledger)
+                    recover(ledger, send_notice=send_notice)
                 finally:
                     recovered.set()
             with patch.object(list_page, "recover_pending", side_effect=recover_and_finish):
@@ -9635,9 +9643,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         """Start a second server that runs the Go and List Tell recoveries; return each send and its message."""
         recovered = threading.Event()
         recover = list_page.recover_pending
-        def recover_and_finish(ledger: Path) -> None:
+        def recover_and_finish(ledger: Path, *, send_notice: Callable[[review_actions.ListFeedbackDelivery], object]) -> None:
             try:
-                recover(ledger)
+                recover(ledger, send_notice=send_notice)
             finally:
                 recovered.set()
         with (patch.object(change_page, "send_to_staff", side_effect=send) as delivery,
@@ -10489,7 +10497,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 writer = change_page.publish_question_attempt
 
                 def write_attempt(path: Path, record: delivery_state.QuestionAttempt) -> None:
-                    if record.state is delivery_state.QuestionSendState.FAILED:
+                    if record.state is delivery_state.QuestionSendState.UNKNOWN:
                         raise failure
                     writer(path, record)
 
@@ -10560,7 +10568,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual([(question.question_id, question.words) for question in the_list.load(morty.id, item.id).questions],
                          [("Q1", words)])
 
-    def test_exhausted_list_question_reports_failure_after_automatic_retries(self) -> None:
+    def test_exhausted_list_question_saves_failure_for_the_team(self) -> None:
         morty, item = self.list_keeper_item("The question item")
         request, words = uuid4().hex, "Which check passed?"
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
@@ -10582,7 +10590,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(list_page, "counts_strip", return_value=""),
               patch.object(list_page, "deliver", side_effect=deliver),
-              patch.object(change_page, "alert_delivery_failures"),
+              patch.object(change_page, "send_to_staff", return_value=None),
               patch.object(change_page, "send_question", side_effect=[
                   *([question_outcome("refused", "Producer offline")] * tries)]) as send):
             code, response = self.post(list_page.PAGE_PATH, urlencode(fields))
@@ -10597,7 +10605,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             markup = re.sub(r'<script\b[^>]*>.*?</script>', '', opened.body.decode(), flags=re.DOTALL)
             self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
             self.assertIn('data-open-question="true"', markup)
-            self.assertIn("Question not delivered.", markup)
+            self.assertNotIn("Question not delivered.", markup)
             self.assertNotIn('value="resend-', markup)
             self.assertNotIn("ready to send", markup)
             code, _ = self.post(list_page.PAGE_PATH, urlencode({**fields, "action": "resend-Q1"}))
@@ -10607,6 +10615,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(len(messages), 1)
             self.assertIn(f"\n{words}\n", messages[0])
             self.assertIn(f"answer L1 --keeper {morty.id} --question Q1", messages[0])
+            self.assertTrue(self.server.delivery_status.has_deferred_questions())
 
     def test_an_image_question_delivers_when_the_browser_response_fails(self) -> None:
         _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))

@@ -1413,7 +1413,8 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs, *,
         item, inputs.browser, inputs.words_rows, revision, owner=owner, validator=validator,
         receivers=receivers, names=names, view=inputs.view,
         assignment=assign_menu(item, names) if 'approve' in item.actions else '')
-    body += inputs.assets.get('question-delivery:'+item.key, '')
+    if not studio_card:
+        body += inputs.assets.get('question-delivery:'+item.key, '')
     body += inputs.assets.get('submission:'+item.key, '')
     if inline:
         if not studio_question:
@@ -2110,16 +2111,15 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
   refreshError(error);
  }
 }
-async function saveReviewAction(data,{url=location.pathname,hold,button,reportDelivery=false,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
+async function saveReviewAction(data,{url=location.pathname,hold,button,saveOnly=false,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
  let conflict=false,confirmed=false;
  try{
   const outcome=data.get('outcome'),later=outcome==='later';
   const receiver=later ? button.form.dataset.studioLaterReceiver : sendReceiver(button);
   if(!later || receiver!==undefined) data.set('receiver',receiver ?? '');
   sending?.();
-  const headers=reportDelivery ? {'X-Review-Delivery-Result':'1'} : undefined;
-  const response=await hold.post(url,{method:'POST',body:data,headers},
-   outcome==='validate' || (later && (!receiver || !data.get('feedback').trim())) ? null : receiver);
+  const response=await hold.post(url,{method:'POST',body:data},
+   saveOnly || outcome==='validate' || (later && (!receiver || !data.get('feedback').trim())) ? null : receiver);
   conflict=response.status===409;
   confirmed=response.ok;
   if(confirmed) confirmedSave?.();
@@ -2273,7 +2273,7 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
   let saved=false;
   await saveReviewAction(data,{
    hold:holdCard(row),
-   button,
+   button,saveOnly:new URLSearchParams(location.search).get('view')==='studio-question',
    sending:()=>boxFrame?.dispatchEvent(new Event('review-card-sending')),
    saved:()=>{
     saved=true;

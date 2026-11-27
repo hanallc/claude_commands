@@ -312,9 +312,8 @@ def studio_question_action(item: review_items.ReviewItem, record: update_registr
         'question': item.title, 'answer': words if action == 'answer' else '', 'message': message, 'kind': action,
     }
     opened: change_page.NoQuestion | change_page.OpenQuestion = change_page.NoQuestion()
-    if action == 'answer':
-        saved['studio_answer'] = True
-    else:
+    saved['studio_delivery'] = True
+    if action == 'question':
         identity = secrets.token_hex(4)
         saved['question_id'] = identity
         saved['question_text'] = words.strip()
@@ -337,6 +336,11 @@ class ListFeedbackDelivery:
     keeper: staff.StaffId
     identity: str
     request: str
+
+
+@dataclass(frozen=True)
+class StudioNoticeDelivery(ListFeedbackDelivery):
+    """Deliver words from a Studio Later or Mark read save."""
 
 
 def sent_question_action(item: review_items.ReviewItem, record: update_registration.QuestionRecord,
@@ -459,7 +463,7 @@ def studio_later(target: StudioQuestionTarget, value: str, words: str, request: 
 
         _ = the_list.park(target.keeper, identity, until, source=the_list.PAGE_SOURCE, notice=notice,
                           note='Later: '+words if words.strip() else '', check_deadline=check_current)
-        delivery = (ListFeedbackDelivery(target.keeper, identity, request)
+        delivery = (StudioNoticeDelivery(target.keeper, identity, request)
                     if isinstance(notice, the_list.PageItemNotice) else change_page.NoMessageDelivery())
         return delivery, label
 

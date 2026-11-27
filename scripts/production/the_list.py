@@ -301,6 +301,11 @@ class PageFeedback:
     additional_recipient: staff.StaffId | NoAdditionalRecipient = NoAdditionalRecipient.ABSENT
     origin: PageNoticeOrigin = PageNoticeOrigin.LIST_PAGE
 
+    @property
+    def studio_save_notice(self) -> bool:
+        return ((self.action == "park" and self.origin is PageNoticeOrigin.STUDIO)
+                or (self.action == "read" and next_step_go_id(self.request) is None))
+
     def key(self) -> PageRequest:
         return PageRequest(self.request, self.action, self.words, self.form_words, self.parked_until)
 
@@ -5601,8 +5606,9 @@ def deliver_feedback(keeper: staff.StaffId, identity: str, request: str,
         with store.locked():
             item = load(keeper, identity)
             feedback = feedback_requests(item).get(request)
-        if feedback is None or not (feedback.state == "pending"
-                                    or (feedback.state == "alerted" and feedback.action is ReportVerdict.NOT_FIXED)):
+        if feedback is None or not (feedback.state == "pending" or (
+                feedback.state == "alerted" and (
+                    feedback.action is ReportVerdict.NOT_FIXED or feedback.studio_save_notice))):
             return
         result = send(item, feedback)
         if result == feedback or result.state == "pending":
@@ -5613,7 +5619,7 @@ def deliver_feedback(keeper: staff.StaffId, identity: str, request: str,
             if latest is None or latest != feedback:
                 return
             moment = now()
-            if latest.action is ReportVerdict.NOT_FIXED:
+            if latest.action is ReportVerdict.NOT_FIXED or latest.studio_save_notice:
                 log = tuple(replace(entry, what=result) if entry.what == latest else entry for entry in current.log)
             else:
                 log = (*current.log, ItemChange(moment, result, PAGE_SOURCE))
