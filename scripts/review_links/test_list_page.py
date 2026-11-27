@@ -2836,7 +2836,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         with patch.object(change_page, "send_question", return_value=question_outcome()):
             for request, words in (("ask-one", "Which width fits?"), ("ask-two", "Which height fits?")):
                 delivery = the_list.ask_question(row.keeper, identity, the_list.PageRequest(request, "question", words),
-                                                 status, recipient=MORTY.id)
+                                                 status)
                 change_page.deliver(delivery, status)
         waiting = list_page.saved_action_state(row.keeper, identity, status=status)
         self.assertEqual(waiting["waiting_for_answer"], "true")

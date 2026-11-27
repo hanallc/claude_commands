@@ -1939,7 +1939,7 @@ class AnswerSourceTests(unittest.TestCase):
         with patch.object(change_page, "send_question") as send:
             delivery = the_list.ask_question(KEEPER.id, item.id,
                 the_list.PageRequest("followup", "question", "What did the check show?"),
-                change_page.DeliveryStatus(self.review), recipient=KEEPER.id)
+                change_page.DeliveryStatus(self.review))
             send.assert_not_called()
         assert isinstance(delivery, change_page.PageQuestionSend)
         if isinstance(delivery.job, change_page.QuestionJob):
