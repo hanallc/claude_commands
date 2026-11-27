@@ -33,6 +33,16 @@ class TranscriptTests(unittest.TestCase):
                     with self.subTest(path=path.name):
                         self.assertEqual(list(transcripts.transcript_lines(path)), content.splitlines(keepends=True))
 
+    def test_transcript_lines_names_a_corrupt_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.jsonl"
+            archive = path.with_suffix(".jsonl.zst")
+            _ = archive.write_bytes(b"invalid compressed data")
+            with self.assertRaises(OSError) as failure:
+                _ = list(transcripts.transcript_lines(path))
+            self.assertIn(str(archive), str(failure.exception))
+            self.assertIsInstance(failure.exception.__cause__, subprocess.CalledProcessError)
+
     def test_compressed_lines_stream_in_order_and_report_a_decoder_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session.jsonl"

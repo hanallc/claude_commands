@@ -153,7 +153,8 @@ Use these sources:
    Follow the store paths in the showrunner documents and the showrunner state root.
 3. User turns in Claude session transcripts. Do not count assistant, tool, or peer messages.
    Use scripts/lib/transcripts.py to find distinct paths.
-   Use `transcript_lines(Path(path))` from `scripts.lib.transcripts` to read plain and compressed transcripts.
+   Import `transcript_lines` from `scripts.lib.transcripts`.
+   Read plain and compressed transcripts with `with contextlib.closing(transcript_lines(Path(path))) as lines:`.
    Use `rg --search-zip --files-with-matches --hidden --no-ignore` on groups of transcript paths.
    Select files by terms for the affected behaviors. Parse only those files for matching user turns.
 4. Commit messages in {change.repo}.

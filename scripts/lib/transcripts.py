@@ -116,7 +116,10 @@ def transcript_lines(path: Path) -> Generator[bytes]:
     """Yield plain or compressed transcript lines without writing a file."""
     source = transcript_source(path)
     if source.suffix == ".zst":
-        yield from compressed_transcript_lines(source)
+        try:
+            yield from compressed_transcript_lines(source)
+        except subprocess.CalledProcessError as error:
+            raise OSError(f"Cannot decompress transcript {source}: {error}") from error
         return
     with source.open("rb") as stream:
         yield from stream

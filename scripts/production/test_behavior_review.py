@@ -143,7 +143,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
 
         self.assertEqual(code, 0, output)
         prompt = cast(str, runner.call_args.args[1])
-        self.assertIn("`transcript_lines(Path(path))` from `scripts.lib.transcripts`", prompt)
+        self.assertIn("`with contextlib.closing(transcript_lines(Path(path))) as lines:`", prompt)
+        self.assertIn("Import `transcript_lines` from `scripts.lib.transcripts`.", prompt)
 
     def test_clear_requires_a_saved_reply_for_this_patch_and_each_test(self) -> None:
         args, key = self.changed_range()
