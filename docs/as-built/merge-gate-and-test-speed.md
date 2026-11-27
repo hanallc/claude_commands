@@ -659,7 +659,8 @@ A changed config file selects each module that reads it in its source or in its 
 The targeted gate keeps the caller's build log, and it writes its own gate record there. Each test module has its own private build log.
 Only a direct test run (`start_test_run`) moves an unset `BUILDLOG_DIR` into its run folder.
 
-Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files`.
+Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files, selected in S s`.
+S is the wall time of the selection, to one decimal place.
 It prints module names when ten or fewer modules are selected.
 A full run prints `full suite: <reason>` and repeats the reason in the final `Gate tests:` summary.
 An untouched suite prints `skipped (not affected)`.

@@ -1634,13 +1634,13 @@ def full_required() -> FullSuite | NoFullRunRequired:
         return FullSuite(f"last nightly run was red (unreadable marker: {error})")
 
 
-def report_selection(selection: AffectedSelection | FullSuite, total: int) -> None:
+def report_selection(selection: AffectedSelection | FullSuite, total: int, selection_s: float) -> None:
     if isinstance(selection, FullSuite):
         print(f"full suite: {selection.reason}", flush=True)
         return
     when = datetime.fromisoformat(selection.base.at).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
     print(f"affected: {len(selection.modules)} of {total} modules (base {selection.base.commit[:12]}, {when}), "
-          + f"{len(selection.changed_files)} changed files", flush=True)
+          + f"{len(selection.changed_files)} changed files, selected in {selection_s:.1f} s", flush=True)
     if len(selection.modules) <= 10:
         print(", ".join(f"{path.parent.name}/{path.name}" for path in selection.modules) or "(none)", flush=True)
 
@@ -1654,9 +1654,13 @@ def select_targeted_modules(repo: Path, tested_tree: CleanTestTree | Unrecordabl
         raise GateRefused("the test list is empty")
     ledger = PassedTreeLedger(repo, source, tested_tree, sorted({suite for suite, _ in modules}))
     dirty = set(tested_tree.dirty_paths) if isinstance(tested_tree, UnrecordableTestTree) else set[str]()
-    selection = select_affected(repo, ledger.certified_base(), [path for _, path in modules], dirty,
-                                state_dir=gate_state_dir())
-    report_selection(selection, len(modules))
+    base = ledger.certified_base()
+    paths = [path for _, path in modules]
+    state_dir = gate_state_dir()
+    started = time.monotonic()
+    selection = select_affected(repo, base, paths, dirty, state_dir=state_dir)
+    selection_s = time.monotonic() - started
+    report_selection(selection, len(modules), selection_s)
     return selection, ledger
 
 
@@ -1953,8 +1957,8 @@ def _run_suites(repo: Path, type_dirs: Sequence[str], module_time_limit_s: float
                     selection = FullSuite(f"{read_step_names().prose(mode.value)} runs all modules")
                 else:
                     selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-                if mode is SuiteMode.GATE or full:
-                    report_selection(selection, len(modules))
+                if isinstance(selection, FullSuite) and (mode is SuiteMode.GATE or full):
+                    print(f"full suite: {selection.reason}", flush=True)
                 if isinstance(selection, AffectedSelection):
                     selected_paths = set(selection.modules)
                     modules = [(suite, path) for suite, path in modules if path in selected_paths]
