@@ -60,6 +60,7 @@ from scripts.message import send_result, session_send
 from scripts.review_links.test_page_question import question_outcome
 from scripts.review_links.server_test_support import started_review_server
 from scripts.production import (
+    list_exchange,
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
     record_store, staff, the_list, tidy_wrapped, unrouted_alert, update_registration,
 )
@@ -5847,6 +5848,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertTrue(change_page.answer_item(key, 'The layout changed.', asked.question_id, recovered))
 
     def test_response_followup_uses_the_same_owner_and_got_it_closes_the_question(self) -> None:
+        _ = self.enterContext(patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")))
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -5910,6 +5912,101 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(update_registration.read_review_question(path, owner.id).status, 'closed')
             self.assertEqual(self.request(card_url).status, 404)
             send.assert_called_once()
+
+    def test_answers_a_filed_open_staff_question_from_studio(self) -> None:
+        from scripts.review_links import answer_sources
+
+        case = self.review_fixture()
+        key = case.question()
+        members = staff.snapshot()
+        source = review_page.build_snapshot(case.root).records[key].source
+        assert isinstance(source, review_items.QuestionSource)
+        answer_sources.file_saved_question(source.record, members)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            snapshot = cache.get()
+            self.assertNotIn(key, {entry["key"] for entry in snapshot.entries})
+            self.assertEqual(self.request(review_page.card_url(key)).status, 303)
+            card = self.request(review_page.card_url(key, studio_question=True))
+            self.assertEqual(card.status, 200, card.body)
+            self.assertIn(b'value="answer"', card.body)
+            revision = re.search(rb'name="revision" value="([^"]+)"', card.body)
+            self.assertIsNotNone(revision)
+            assert revision is not None
+            body = case.body(key, "answer", "Use the wide layout.") + "&" + urlencode({"revision": revision[1].decode()})
+            status, answer = self.post(review_page.PAGE_PATH, body)
+            self.assertEqual(status, 200, answer)
+        keeper = record_store.list_keeper(conf.read("console"), members)
+        assert keeper is not None
+        item, = the_list.records(keeper.id)
+        exchange, = item.filed_exchanges
+        self.assertEqual(exchange.source_key, key)
+        self.assertIsInstance(exchange.answer, answer_sources.ExchangeAnswer)
+        assert isinstance(exchange.answer, answer_sources.ExchangeAnswer)
+        self.assertIn("Use the wide layout.", exchange.answer.text)
+
+    def test_legacy_change_reply_retry_files_the_saved_answer(self) -> None:
+        case = self.review_fixture(changes=1)
+        page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, ("C1",), "")
+        question = case.status.ask(page, "C1", "Which layout?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        arguments = ["answer-question", "--production", "page-owner", "--list", str(page.review_list),
+                     "--row", "C1", "--question", question.question_id, "--text", "Use the wide layout."]
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        with patch.object(the_list, "_save", side_effect=OSError("The List write failed.")):
+            self.assertEqual(change_page.main(arguments), 0)
+        self.assertEqual(the_list.records(keeper.id), [])
+        self.assertEqual(change_page.main(arguments), 0)
+        item, = the_list.records(keeper.id)
+        exchange, = item.filed_exchanges
+        self.assertEqual(exchange.exchange_id, "question:" + question.question_id)
+        self.assertEqual(exchange.question, "Which layout?")
+        self.assertEqual(exchange.answerer, item.owner)
+
+    def test_change_reply_retry_files_from_an_explicit_review_root(self) -> None:
+        case = self.review_fixture(changes=1)
+        status = change_page.DeliveryStatus(case.root / "explicit")
+        page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, ("C1",), "")
+        question = status.ask(page, "C1", "Which layout?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        members = staff.snapshot()
+        keeper = record_store.list_keeper(conf.read("console"), members)
+        assert keeper is not None
+        words = "Use the wide layout."
+        saved = status.save_question_answer(page, "C1", question.question_id, words, author=keeper.id)
+        self.assertIsInstance(saved, datetime)
+        self.assertEqual(the_list.records(keeper.id), [])
+        self.assertFalse(change_page.answer_item("page-owner/C1", words, question.question_id, status))
+        item, = the_list.records(keeper.id)
+        exchange, = item.filed_exchanges
+        self.assertEqual((exchange.exchange_id, exchange.question), ("question:" + question.question_id, "Which layout?"))
+
+    def test_filed_review_answer_redirects_to_the_saved_studio_item(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="item-producer")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = case.submission_request(kind, owner.id)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+            sent = cast(dict[str, str], json.loads(created.body))
+            key = sent["key"]
+            origin = review_items.submission_origin(cache.get().records[key])
+            assert isinstance(origin, new_item_dialog.ReviewSubmission)
+            reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], request.request_id)
+            self.assertTrue(change_page.answer_item(reply, "Use the wide layout.", origin.reply_token, case.status))
+            updated, _ = cache.publish_record(cache.get(), key)
+            self.assertNotIn(key, {entry["key"] for entry in updated.entries})
+            target = updated.filed_item_url(case.root, key)
+            self.assertTrue(target.startswith(studio_page.PAGE_PATH + "#item="), target)
+            result = self.request(review_page.card_url(key))
+            self.assertEqual((result.status, result.headers.get("location")), (303, target))
 
     def test_review_waits_for_directory_sync_and_list_commit_before_feature_closeout(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)
@@ -6707,7 +6804,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_review_shows_only_current_question_failures(self) -> None:
         case = self.review_fixture(changes=1)
-        report = case.investigation()
+        with patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")):
+            report = case.investigation()
         investigation_key = f'investigation/{report.owner}/{report.id}'
         proposal, efficiency = case.decisions()
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -6725,10 +6823,20 @@ class ReviewLinksServerTests(unittest.TestCase):
                 if key == investigation_key:
                     question = case.status.slots(saved.delivery.page, saved.delivery.row).question
                     assert isinstance(question, change_page.OpenQuestion)
+                    self.assertIn(investigation_key, {entry["key"] for entry in current.entries})
                     _ = investigation.answer(report.owner, report.id, 'The smoke checks passed.',
                                              question_id=question.question_id)
                     cache.publish_delivery_result(investigation_key)
-                    self.assertNotIn('question-delivery:'+investigation_key, cache.get().assets)
+                    final = cache.get()
+                    self.assertNotIn('question-delivery:'+investigation_key, final.assets)
+                    self.assertNotIn(investigation_key, {entry["key"] for entry in final.entries})
+                    keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+                    assert keeper is not None
+                    row, = the_list.records(keeper.id)
+                    pairs = [(exchange.question, exchange.answer.text) for exchange in row.filed_exchanges
+                             if isinstance(exchange.answer, list_exchange.ExchangeAnswer)]
+                    self.assertCountEqual(pairs, [(report.question, report.answer),
+                                                  ("Which checks passed?", "The smoke checks passed.")])
                 elif key in (proposal, efficiency):
                     self.assertNotIn('question-delivery:'+investigation_key, current.assets)
 
@@ -7522,11 +7630,14 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertIn(change.key, snapshot.records)
                 self.assertEqual(the_list.load(keeper, item.id), parked)
                 with change_review.review_delivery_lock(case.root, wait=False) as lock:
-                    self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+                    self.assertIs(lock, file_lock.LockResult.BUSY)
                 self.assertFalse(asked.done(), "Ask must still be paused.")
             finally:
                 finish_ask.set()
-            change_page.deliver(asked.result(timeout=TEST_HANG_GUARD_SECS), status)
+            delivery = asked.result(timeout=TEST_HANG_GUARD_SECS)
+            with change_review.review_delivery_lock(case.root, wait=False) as lock:
+                self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+            change_page.deliver(delivery, status)
             pending = the_list.load(keeper, item.id)
             self.assertEqual([saved.words for saved in pending.questions], [question.words])
             self.assertIs(pending.parked_until, the_list.ParkUntilDelivered.DELIVERED)

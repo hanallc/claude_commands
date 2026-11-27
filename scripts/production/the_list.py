@@ -42,6 +42,7 @@ from scripts.lib.file_lock import LockResult, exclusive
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
 from scripts.notify import push_texts
+from scripts.production import list_exchange
 from scripts.production import delivery_state, goal, investigation, producer_map, record_store, repeat_rule, session_pane, staff
 from scripts.review_links import change_page, list_draft, page_frame, page_question, question_path, question_record
 from scripts.review_links.review_items import LegacyValidationLog, ValidationLogStart
@@ -57,6 +58,10 @@ class ListError(ValueError):
 
 class ScheduleSelectionChanged(ListError):
     """The saved schedule or selected run changed before the write."""
+
+
+class ConflictingExchangeReplies(ListError):
+    """The source has no exchange without a reply conflict."""
 
 
 class SavedReadFailed(OSError):
@@ -708,6 +713,7 @@ class ListItem:
     new_item_draft_id: list_draft.ListDraftOrigin = list_draft.NoNewItemDraft.ABSENT
     asks: tuple[Ask, ...] = ()
     report: ListReport | NoListReport = NoListReport.ABSENT
+    filed_exchanges: tuple[list_exchange.FiledExchange, ...] = ()
 
     def __post_init__(self) -> None:
         if self.state != ItemState.CLOSED or not isinstance(self.unread_since, datetime):
@@ -2011,7 +2017,8 @@ def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[
                         _review_keys(cast(object, json.loads(fields.get("reviews", "[]")))),
                         delivery_state.read_list_questions(fields.get("questions", "[]")), schedule,
                         _read_run_deliveries(fields), list_draft.read_list_draft(fields),
-                        _read_asks(fields.get("asks", "[]")), _read_report(fields.get("report", "")))
+                        _read_asks(fields.get("asks", "[]")), _read_report(fields.get("report", "")),
+                        list_exchange.decode(fields.get("filed_exchanges", "[]")))
         if item.id != identity or not changes:
             raise ListError("the item number must match its path and the log must not be empty")
         _validate(item)
@@ -2076,6 +2083,8 @@ def _save(store: record_store.NumberedRecords, item: ListItem, *, previous_produ
                                              ensure_ascii=False)
     if item.questions:
         fields["questions"] = json.dumps([question_record.stored(question) for question in item.questions], ensure_ascii=False)
+    if item.filed_exchanges:
+        fields["filed_exchanges"] = list_exchange.encode(item.filed_exchanges)
     if item.asks:
         fields["asks"] = json.dumps([_stored_ask(ask) for ask in item.asks], ensure_ascii=False)
     if isinstance(item.report, ListReport):
@@ -2175,7 +2184,7 @@ def _check_links(number: int, changes: ItemChanges, *, require_related: Callable
 def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
     """Create complete typed records after checking the whole batch under one lock."""
     store = _store(keeper)
-    with store.list_allocation():
+    with _list_allocation(store):
         next_number = store.next_number()
         for item in items:
             if item.number < next_number:
@@ -2258,7 +2267,7 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
     def require_related(number: int) -> None:
         _ = read_reference(number, scope=AllItems.INCLUDED)
 
-    with store.list_allocation():
+    with _list_allocation(store):
         next_number = store.next_number()
         chosen = next_number if isinstance(number, NextNumber) else number
         identity = f"L{chosen}"
@@ -2338,7 +2347,7 @@ def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, 
     if isinstance(number, int) and store.path(f"L{number}").is_file():
         sync_folder(store.folder())
         return number
-    with store.list_allocation():
+    with _list_allocation(store):
         number = reserved_review_number(reservation)
         if isinstance(number, int) and store.path(f"L{number}").is_file():
             sync_folder(store.folder())
@@ -2353,6 +2362,254 @@ def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, 
             write_text_atomic(reservation, f"{chosen}\n", new_file_mode=0o600)
         _save(store, item)
         return chosen
+
+
+def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.FiledExchange, ...]) -> ListItem:
+    saved = {(exchange.source_key, exchange.exchange_id): exchange for exchange in item.filed_exchanges}
+    for exchange in exchanges:
+        key = (exchange.source_key, exchange.exchange_id)
+        previous = saved.get(key)
+        saved[key] = previous.updated(exchange) if previous is not None else exchange
+    return replace(item, filed_exchanges=tuple(saved.values()))
+
+
+@dataclass(frozen=True)
+class ExchangeDestination:
+    destination: investigation.ListDestination
+    reserved_new_item: bool
+
+
+def _exchange_reservation(path: Path) -> ExchangeDestination | NextNumber:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return NextNumber.AVAILABLE
+    mode, separator, location = value.partition(" ")
+    keeper, list_prefix, number = location.partition("/L")
+    if not separator or mode not in ("new", "linked") or not list_prefix or not re.fullmatch(r"[1-9][0-9]*", number):
+        raise ListError(f"{path}: invalid exchange reservation")
+    return ExchangeDestination(investigation.ListDestination(staff_id(keeper, "List keeper"), int(number)), mode == "new")
+
+
+def _save_exchange_reservation(path: Path, destination: investigation.ListDestination, mode: Literal["new", "linked"]) -> None:
+    write_text_atomic(path, f"{mode} {destination.keeper}/L{destination.number}\n", new_file_mode=0o600)
+
+
+def _exchange_path(key: str) -> Path:
+    return record_store.state_root() / ".list-exchanges" / hashlib.sha256(key.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class LockedExchangeSource:
+    key: str
+    reservation: Path
+
+
+@contextmanager
+def lock_exchange_source(key: str) -> Generator[LockedExchangeSource]:
+    reservation = _exchange_path(key)
+    reservation.parent.mkdir(parents=True, exist_ok=True)
+    with exclusive(reservation.with_suffix(".lock")):
+        yield LockedExchangeSource(key, reservation)
+
+
+def _read_pending_exchanges(reservation: Path) -> tuple[list_exchange.FiledExchange, ...]:
+    try:
+        return list_exchange.decode(reservation.with_suffix(".pending").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ()
+
+
+def pending_exchanges(key: str) -> tuple[list_exchange.FiledExchange, ...]:
+    return _read_pending_exchanges(_exchange_path(key))
+
+
+def exchange_history(key: str) -> tuple[list_exchange.FiledExchange, ...]:
+    """Read the destination row and any changes that still need a receipt."""
+    reservation = _exchange_path(key)
+    destination = _exchange_reservation(reservation)
+    saved: tuple[list_exchange.FiledExchange, ...] = ()
+    if isinstance(destination, ExchangeDestination):
+        keeper, identity = destination.destination.keeper, f"L{destination.destination.number}"
+        path = _store(keeper).path(identity)
+        try:
+            row = load(keeper, identity)
+        except ListError:
+            if path.exists():
+                raise
+        else:
+            saved = tuple(exchange for exchange in row.filed_exchanges if exchange.source_key == key)
+    return combine_exchange_history(saved, _read_pending_exchanges(reservation))
+
+
+def combine_exchange_history(saved: tuple[list_exchange.FiledExchange, ...],
+                             pending: tuple[list_exchange.FiledExchange, ...]) -> tuple[list_exchange.FiledExchange, ...]:
+    history = {exchange.exchange_id: exchange for exchange in saved}
+    for exchange in pending:
+        previous = history.get(exchange.exchange_id)
+        history[exchange.exchange_id] = previous.updated(exchange) if previous is not None else exchange
+    return tuple(history.values())
+
+
+def _exchange_receipt_line(destination: investigation.ListDestination, exchange: list_exchange.FiledExchange) -> str:
+    digest = hashlib.sha256(list_exchange.encode((exchange,)).encode()).hexdigest()
+    return f"{destination.keeper}/L{destination.number} {digest}"
+
+
+def confirmed_exchanges(key: str, destination: investigation.ListDestination,
+                        exchanges: Iterable[list_exchange.FiledExchange],
+                        *, sources: list[Path] | None = None) -> frozenset[list_exchange.FiledExchange]:
+    path = _exchange_path(key).with_suffix(".saved")
+    if sources is not None:
+        sources.append(path)
+    try:
+        receipt = set(path.read_text(encoding="utf-8").splitlines())
+    except FileNotFoundError:
+        return frozenset()
+    return frozenset(exchange for exchange in exchanges if _exchange_receipt_line(destination, exchange) in receipt)
+
+
+def _recover_exchange_allocation(store: record_store.NumberedRecords, journal: Path) -> None:
+    try:
+        value = journal.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    saved = re.fullmatch(r"([a-f0-9]{64}) ([^ /\n]+)/L([1-9][0-9]*)\n", value)
+    if saved is None:
+        raise ListError(f"{journal}: invalid exchange allocation")
+    digest, keeper, number_text = saved.groups()
+    destination = investigation.ListDestination(staff_id(keeper, "List keeper"), int(number_text))
+    reservation = journal.parent / ".list-exchanges" / digest
+    previous = _exchange_reservation(reservation)
+    if isinstance(previous, ExchangeDestination) and previous != ExchangeDestination(destination, True):
+        raise ListError(f"{journal}: the exchange already has a different reservation")
+    sync_folder(journal.parent)
+    if store.next_number() <= destination.number:
+        store.reserve_number(destination.number)
+    else:
+        sync_folder(store.folder())
+    _save_exchange_reservation(reservation, destination, "new")
+    journal.unlink()
+    sync_folder(journal.parent)
+
+
+@contextmanager
+def _list_allocation(store: record_store.NumberedRecords) -> Generator[Path]:
+    """Complete an interrupted exchange reservation before allocating another number."""
+    with store.list_allocation():
+        journal = record_store.state_root() / ".list-exchange-allocation"
+        _recover_exchange_allocation(store, journal)
+        yield journal
+
+
+def _reserve_exchange_number(store: record_store.NumberedRecords, reservation: Path) -> ExchangeDestination:
+    with _list_allocation(store) as journal:
+        current = _exchange_reservation(reservation)
+        if isinstance(current, ExchangeDestination):
+            return current
+        destination = investigation.ListDestination(store.owner, store.next_number())
+        write_text_atomic(journal, f"{reservation.name} {destination.keeper}/L{destination.number}\n",
+                          new_file_mode=0o600)
+        _recover_exchange_allocation(store, journal)
+        return ExchangeDestination(destination, True)
+
+
+_NO_UNRESOLVED_REPLIES: frozenset[str] = frozenset()
+
+
+def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.Exchange, ...], title: str, *,
+                   linked: investigation.ListDestination | NextNumber,
+                   owner: staff.StaffId, members: staff.StaffSnapshot,
+                   unresolved_reply_ids: frozenset[str] = _NO_UNRESOLVED_REPLIES) -> investigation.ListDestination:
+    """Save one source and publish its receipt after the List row is durable."""
+    key, reservation = source.key, source.reservation
+    if not exchanges or any(exchange.source_key != key for exchange in exchanges):
+        raise ListError("File one exchange source at a time.")
+    filed = tuple(list_exchange.FiledExchange.from_exchange(exchange) for exchange in exchanges)
+    reserved = _exchange_reservation(reservation)
+    if isinstance(linked, investigation.ListDestination) and isinstance(reserved, NextNumber):
+        if (record_store.state_root() / ".list-exchange-allocation").exists():
+            keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+            if keeper is None:
+                raise ListError("The List keeper is unavailable.")
+            with _list_allocation(_store(keeper.id)):
+                reserved = _exchange_reservation(reservation)
+    if isinstance(linked, investigation.ListDestination):
+        if isinstance(reserved, ExchangeDestination):
+            if reserved.destination != linked:
+                raise ListError("The exchange source has two List destinations.")
+        else:
+            _save_exchange_reservation(reservation, linked, "linked")
+            reserved = ExchangeDestination(linked, False)
+    if isinstance(reserved, NextNumber):
+        proposed = combine_exchange_history(_read_pending_exchanges(reservation), filed)
+        conflicts = list_exchange.conflicting_reply_ids(proposed, members) | unresolved_reply_ids
+        if all(exchange.exchange_id in conflicts for exchange in proposed):
+            raise ConflictingExchangeReplies("The exchanges claim the same reply.")
+        route = report_route(owner, members)
+        reserved = _reserve_exchange_number(_store(route.keeper), reservation)
+    destination = reserved.destination
+    store = _store(destination.keeper)
+    with store.locked():
+        identity = f"L{destination.number}"
+        new_row = reserved.reserved_new_item and not store.path(identity).exists()
+        item = None if new_row else load(destination.keeper, identity)
+        if item is None:
+            history: tuple[list_exchange.FiledExchange, ...] = ()
+        else:
+            history = tuple(exchange for exchange in item.filed_exchanges if exchange.source_key == key)
+            if reserved.reserved_new_item and not history:
+                raise ListError(f"{identity} holds a different source.")
+        pending_path = reservation.with_suffix(".pending")
+        pending = _read_pending_exchanges(reservation)
+        candidate = combine_exchange_history(combine_exchange_history(history, pending), filed)
+        conflicts = list_exchange.conflicting_reply_ids(candidate, members) | unresolved_reply_ids
+        candidate = tuple(exchange for exchange in candidate if exchange.exchange_id not in conflicts)
+        if not candidate:
+            raise ConflictingExchangeReplies("The exchanges claim the same reply.")
+        disputed_pending = tuple(exchange for exchange in pending if exchange.exchange_id in conflicts)
+        staged = (*candidate, *disputed_pending)
+        safe_history = tuple(exchange for exchange in history if exchange.exchange_id not in conflicts)
+        if candidate != safe_history and staged != pending:
+            write_text_atomic(pending_path, list_exchange.encode(staged), new_file_mode=0o600)
+            pending = staged
+        if item is None:
+            item = _save_new_exchanges(store, destination.number, title, owner, report_route(owner, members), candidate)
+        else:
+            item = _save_linked_exchanges(store, item, candidate)
+        saved = tuple(exchange for exchange in item.filed_exchanges if exchange.source_key == key)
+        confirmed = confirmed_exchanges(key, destination, saved)
+        receipted = tuple(exchange for exchange in saved if exchange.exchange_id not in conflicts or exchange in confirmed)
+        if frozenset(receipted) != confirmed:
+            receipt = "".join(_exchange_receipt_line(destination, exchange) + "\n" for exchange in receipted)
+            write_text_atomic(reservation.with_suffix(".saved"), receipt, new_file_mode=0o600)
+        if disputed_pending:
+            if disputed_pending != pending:
+                write_text_atomic(pending_path, list_exchange.encode(disputed_pending), new_file_mode=0o600)
+        else:
+            pending_path.unlink(missing_ok=True)
+    return destination
+
+
+def _save_linked_exchanges(store: record_store.NumberedRecords, item: ListItem,
+                           exchanges: tuple[list_exchange.FiledExchange, ...]) -> ListItem:
+    changed = _with_filed_exchanges(item, exchanges)
+    if changed != item:
+        with record_store.keep_file_on_error(store.path(item.id)):
+            _save(store, changed)
+    else:
+        sync_folder(store.folder())
+    return changed
+
+
+def _save_new_exchanges(store: record_store.NumberedRecords, number: int, title: str, owner: staff.StaffId,
+                        route: ReportRoute, exchanges: tuple[list_exchange.FiledExchange, ...]) -> ListItem:
+    item = _new_item(number, title, owner, store.owner, PAGE_SOURCE, {"producer": route.producer, "unit": route.unit})
+    _require_active_open_producers((item,))
+    item = _with_filed_exchanges(replace(item, unread_since=NoTimestamp.UNSET), exchanges)
+    with record_store.keep_file_on_error(store.path(item.id)):
+        _save(store, item)
+    return item
 
 
 def investigation_report_kind(record: investigation.Investigation) -> ReportKind | NoListReport:
@@ -2480,7 +2737,7 @@ class ReservedReportNumber:
 def reserve_moved_report(keeper: staff.StaffId, evidence_key: str) -> ReservedReportNumber:
     """Select the number for a source marker before the source writer runs."""
     store = _store(keeper)
-    with store.list_allocation():
+    with _list_allocation(store):
         items = records(keeper, include_closed=True)
         for item in items:
             if isinstance(item.report, ListReport) and item.report.evidence_key == evidence_key:
@@ -2501,7 +2758,7 @@ def file_report(keeper: staff.StaffId, report: ListReport, title: str, *, owner:
                 retry: ReportRetry = ReportRetry.KEEP) -> int:
     """File a report once, or add its evidence to an existing linked List item."""
     store = _store(keeper)
-    with store.list_allocation():
+    with _list_allocation(store):
         reserved = reserved_review_number(reservation) if isinstance(reservation, Path) else reservation
         if isinstance(reserved, ReservedReportNumber):
             reserved = reserved.number
@@ -4116,6 +4373,9 @@ class _ListQuestionStore:
             except AtomicDurabilityUnconfirmed:
                 if load(self.keeper, item) != changed:
                     raise
+        file_exchange = cast(Callable[[staff.StaffId, ListItem], None],
+                             import_module("scripts.review_links.answer_sources").file_saved_list)
+        file_exchange(self.keeper, changed)
 
 
 def _new_question_recipient(keeper: staff.StaffId, producer: staff.StaffId
@@ -4160,7 +4420,7 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
     request = replace(request, words=request.words.strip())
     store = _store(keeper)
     questions = _ListQuestionStore(keeper, request)
-    with store.locked():
+    with status.locked(), store.locked():
         item = load(keeper, identity)
         previous = _previous_page_request(item, request)
         if item.state == ItemState.CLOSED:

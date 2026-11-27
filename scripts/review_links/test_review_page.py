@@ -323,7 +323,8 @@ class ReviewPageTests(unittest.TestCase):
             with self.subTest(key=created.key):
                 self.assertEqual(snapshot.records[created.key], cache.get().records[created.key])
                 self.assertNotIn(created.key, {item.key for item in review_items.read_open(self.root)})
-                self.assertTrue(change_page.answer_item(created.saved.key, 'The check passed.', created.saved.reply_token, self.status))
+                with patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")):
+                    self.assertTrue(change_page.answer_item(created.saved.key, 'The check passed.', created.saved.reply_token, self.status))
         open_keys = {item.key for item in review_items.read_open(self.root)}
         new_keys = {item.key for item in published}
         self.assertEqual(open_keys & new_keys, {item.key for item in published[:2]})
@@ -340,7 +341,8 @@ class ReviewPageTests(unittest.TestCase):
         cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
         created = cache.create_submission(request)
         before = cache.get().render(show='all').decode()
-        self.assertTrue(review_submissions.answer(created.saved.key, 'Use the wide layout.', created.saved.reply_token))
+        with patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")):
+            self.assertTrue(review_submissions.answer(created.saved.key, 'Use the wide layout.', created.saved.reply_token))
         fresh = review_page.build_snapshot(self.root)
         self.assertEqual(fresh.records[created.key].type, review_items.ReviewType.RESPONSE)
 
@@ -3717,6 +3719,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
                              review_page.waiting_items(console.NewsRequest(self.root))))
 
     def test_validating_question_keeps_the_handoff_and_returns_the_answer(self) -> None:
+        _ = self.enterContext(patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")))
         key = 'page-owner/C1'
         check, _ = review_page.submit(self.root, self.body(key, 'validate', 'Check the queued step.'), self.status)
         assert isinstance(check, change_page.MessageDelivery)
@@ -5865,7 +5868,8 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 until = now + timedelta(days=1)
                 if item.type == review_items.ReviewType.CHANGE:
                     review_later.save(key, until)
-                self.assertEqual(change_page.main(args),0)
+                with patch.object(the_list, "_save", side_effect=OSError("The List save failed.")):
+                    self.assertEqual(change_page.main(args),0)
                 returned = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(returned.state, review_items.ReviewState.OPEN)
                 self.assertEqual(sum('The second case passes.' in entry.words for entry in returned.log),1)
@@ -6354,6 +6358,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertEqual(review_later.times(), times_before)
 
     def test_review_projects_legacy_and_positioned_answers(self) -> None:
+        _ = self.enterContext(patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")))
         now = datetime.now(user_zone())
         before = now - timedelta(hours=2)
         read_at = now - timedelta(hours=1)
@@ -6658,6 +6663,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             self.assertEqual(reads.read_text().splitlines().count('user_zone'), 1)
 
     def test_an_answer_returns_a_later_investigation_until_mark_read(self) -> None:
+        _ = self.enterContext(patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")))
         for legacy_answer in (False, True):
             with self.subTest(legacy_answer=legacy_answer):
                 self.check_later_investigation_answer(legacy_answer)

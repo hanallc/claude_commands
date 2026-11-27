@@ -1048,17 +1048,30 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 fields = parse_qs(route.query)
                 delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
                 snapshot = server.review_cache.get()
+                if 'filed' in fields:
+                    url = snapshot.filed_item_url(root, fields['filed'][0], include_done=True)
+                    self.json_response(200, {"url": url})
+                    return None
+                if 'version' not in fields and 'index' not in fields:
+                    key = next((fields[name][0] for name in ('jump', 'item', 'body') if name in fields), '')
+                    include_done_link = 'body' not in fields or fields.get('view') == ['card']
+                    if key and fields.get('from') != ['studio-question']:
+                        if url := snapshot.filed_item_url(root, key, include_done=include_done_link):
+                            self.redirect(url)
+                            return None
                 if 'body' in fields:
                     view = (review_page.ReviewBodyView.CARD if fields.get('view') == ['card']
                             else review_page.ReviewBodyView.TABLE)
+                    if view is review_page.ReviewBodyView.CARD and fields.get('from') == ['studio-question']:
+                        view = review_page.ReviewBodyView.STUDIO_QUESTION
                     try:
                         key = fields['body'][0]
-                        include_done = view is review_page.ReviewBodyView.CARD or fields.get('saved') == ['1']
+                        include_done = view is not review_page.ReviewBodyView.TABLE or fields.get('saved') == ['1']
                         content = (snapshot.linked_card(root, key, view=view) if include_done else snapshot.body(key))
                     except LookupError as error:
                         message = str(error)
                         content = (change_page.document(page_frame.action_failure("review-card-failure", message), 'Review card')
-                                   if view is review_page.ReviewBodyView.CARD else html.escape(message).encode())
+                                   if view is not review_page.ReviewBodyView.TABLE else html.escape(message).encode())
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version, status=404)
                     else:
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)

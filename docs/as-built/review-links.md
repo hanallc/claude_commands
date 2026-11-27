@@ -2374,6 +2374,81 @@ The Studio header and New item dialog use `page.studio.owner`.
 The List records stay in the store selected by `page.list.owner`.
 The Studio uses the List status age limit and has no `status.studio` key.
 
+#### Question and answer inventory
+
+Run `./scripts/lib/py -m scripts.review_links.answer_sources count` to count saved questions and answers.
+The command reads staff Questions, sent Question and scoped replies, inline List answers, and picture answers.
+For each source, it prints the number of records, exchanges, read and unread answers to Nate, and records with and without List links.
+It checks each List link against the saved List items and prints each broken link.
+Go, Approval, verdict replies, and chat transcripts are outside this inventory.
+
+`answer_sources.read_exchanges` keeps the source key and exchange ID with the direction, participants, words, times, read state, and List links.
+Follow-ups share the source key of their original Question.
+The reader preserves missing times and reports answers whose read state is unknown.
+The command reads the existing stores and reserves no List numbers.
+
+Run `./scripts/lib/py -m scripts.review_links.answer_sources migrate` to preview List filing by source.
+Add `--apply` to file the exchanges and print their List numbers.
+Each source question has one List item.
+Follow-ups use that item and keep their own read state.
+An existing List item keeps its state and links.
+Closed staff questions without a saved answer stay outside the migration.
+
+New questions and answers use the same writer after the source saves.
+The writer keeps the source key, exchange ID, and question and reply origins.
+A reply uses a tag, a verified log event, a slot answer, or a native record answer.
+An unanswered exchange records that it has no answer.
+A slot question uses its source key and question ID.
+An anonymous log question needs independent evidence to share that ID.
+A native Question keeps its saved pairs even when a reply cannot claim a log event.
+A unique request interval can supply reply metadata when saved tags and other stronger evidence permit the match.
+A submitted Question can use its original question for the first owner reply.
+A closed staff Question can recover one log pair from its saved reason.
+A legacy Bug can use its original question when one owner reply matches the saved answer before a later request.
+A different earlier Investigation reply requires a later verified question and reply that match the saved answer.
+One verifier selects the log replies and the current slot answer for filing and Review.
+One verifier reads the source owner, terminal events, slot state, saved pairs, tags, and reply digests.
+It reports verified ownership, conflicting evidence, or missing evidence.
+Approval, decline, or supersession ends the request for every type of reply proof.
+Feedback or a replacement question also ends the initial submitted Question request.
+Each submitted Question and Investigation reply must match its owner.
+An open slot cannot supply proof of an answer.
+A reply identity uses its resolved author ID, time, and words.
+The writer checks the complete source, including saved and pending rows, before it saves an exchange.
+When multiple exchanges claim one reply identity, the writer leaves those exchanges unresolved.
+A Change slot answer can file without a known author.
+An unknown author matches any author when two replies have the same time and words.
+The slot answer and its competing replies stay unresolved when they match.
+If an Investigation restores its original answer to the log, Review uses the verified log position and keeps the saved binding.
+A conflicting or unverified log reply stays in Review.
+The native question and answer can still file when the log association remains unresolved.
+A verified exchange keeps its filed ID.
+New anonymous log exchanges use a digest of the prompt, its time, and the reply event.
+Verified Feedback replies remain in Review outside the unresolved question count.
+The preview reports each unresolved source key and its reply count.
+Review keeps an Investigation or native Question visible while an outgoing question waits or a reply remains unresolved.
+Review hides a card only after a confirmed List receipt covers every reply and the current answer.
+An Open Change with only one confirmed slot answer can move to the List when the answerer is unknown.
+A later slot change leaves the filed reply binding and answer text intact.
+A filed question can receive an answer or close after withdrawal.
+The writer also updates read state and verified question metadata.
+The writer rereads the source under its filing lock.
+The List allocator records the destination before it advances the counter.
+The writer saves pending exchanges before it writes the List item.
+A retry uses the recorded destination and pending exchanges.
+Old bindings keep their encoded form for receipt checks.
+Migration rewrites verified bindings in place and issues receipts after the new List data is durable.
+An unverified Investigation binding remains visible in Review and requires a separate repair.
+Review checks a save receipt before it hands off each exchange.
+A failed pending exchange read leaves that card in Review.
+A unique reply digest can verify a moved log event without a change to the receipt.
+Review locates a moved log question in the verified reply's request interval.
+A new reply uses its digest as its ID when a saved reply owns the position ID.
+The handoff hides only the recorded reply event.
+Review keeps separate decisions and unread replies that remain in Review.
+Old links to a filed Review answer open its Studio item.
+Use **Answer question** on a Studio item to answer an open staff question.
+
 ### Images page
 
 `/console/images.html` shows registered images with their instructions, oldest first.

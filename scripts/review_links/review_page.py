@@ -16,6 +16,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from collections.abc import Callable, Mapping
+from importlib import import_module
 from typing import NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode
 from zoneinfo import ZoneInfo
@@ -64,10 +65,14 @@ CARD_ERROR = b'<p role="status" data-review-card-unavailable>This card is not av
 class ReviewBodyView(Enum):
     TABLE = 'table'
     CARD = 'card'
+    STUDIO_QUESTION = 'studio-question'
 
 
-def card_url(key: str) -> str:
-    return PAGE_PATH + '?' + urlencode({'body': key, 'view': ReviewBodyView.CARD.value})
+def card_url(key: str, *, studio_question: bool = False) -> str:
+    values = {'body': key, 'view': ReviewBodyView.CARD.value}
+    if studio_question:
+        values['from'] = 'studio-question'
+    return PAGE_PATH + '?' + urlencode(values)
 
 
 class ReviewIndexEntry(TypedDict):
@@ -165,6 +170,7 @@ class ReviewBodyInputs:
     assets: Mapping[str, str]
     zone: ZoneInfo
     names: staff_names.StaffNames
+    view: ReviewBodyView = ReviewBodyView.TABLE
 
 
 @dataclass(frozen=True)
@@ -225,7 +231,7 @@ class ReviewSnapshot:
         item = self.records.get(key)
         if item is None:
             raise LookupError('This item is not in the current snapshot.')
-        body = self.render_body(item, self.assets)
+        body = self.render_body(item, self.assets, view=view)
         if view is ReviewBodyView.TABLE:
             if body == CARD_ERROR:
                 return body
@@ -235,6 +241,23 @@ class ReviewSnapshot:
         if entry is None:
             entry = card_entry(item, self.members, self.names, self.zone)
         return render_card(self, entry, body.decode(), waiting_why=item.waiting_why)
+
+    def filed_item_url(self, root: Path, key: str, *, include_done: bool = False) -> str:
+        """Find the Studio item that replaced a standalone Review card."""
+        item = self.records.get(key)
+        if item is None:
+            def matches(record: ReviewItem) -> bool:
+                return key == record.key or key.casefold() == record.id.casefold()
+            found = [record for record in self.records.values() if matches(record)]
+            if not found and include_done:
+                found = [record for record in review_items.read(root, members=self.members, kinds=TYPES,
+                                                                show=ReviewState.DONE) if matches(record)]
+            if len(found) == 1:
+                item = found[0]
+        if item is not None and isinstance(handoff := item.exchange_handoff, review_items.FiledReviewExchange):
+            if handoff.hides_card:
+                return report_url(handoff.destination)
+        return ""
 
     def linked_card(self, root: Path, key: str, *, view: ReviewBodyView = ReviewBodyView.CARD) -> bytes:
         """Serve an active or completed card."""
@@ -248,18 +271,19 @@ class ReviewSnapshot:
         item = review_items.normalize_times(item, self.zone)
         assets: dict[str, str] = {}
         retain_asset(item, assets)
-        body = self.render_body(item, assets)
+        body = self.render_body(item, assets, view=view)
         if view is ReviewBodyView.TABLE:
             return body
         entry = card_entry(item, self.members, self.names, self.zone)
         return render_card(self, entry, body.decode(), waiting_why=item.waiting_why)
 
-    def render_body(self, item: ReviewItem, assets: Mapping[str, str]) -> bytes:
+    def render_body(self, item: ReviewItem, assets: Mapping[str, str], *,
+                    view: ReviewBodyView = ReviewBodyView.TABLE) -> bytes:
         body = CARD_ERROR
         if item.key not in self.unavailable_cards:
             try:
                 body = details(item, ReviewBodyInputs(self.browser, self.members, self.words_rows,
-                    assets, self.zone, self.names)).encode()
+                    assets, self.zone, self.names, view)).encode()
             except Exception as error:
                 logging.getLogger(__name__).warning('Review card %s: %s', item.key, error)
         return body
@@ -1029,8 +1053,11 @@ def assign_menu(item: ReviewItem, names: staff_names.StaffNames) -> str:
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
          owner: str = '', validator: str = '', assignment: str = '', routes: str = '',
-         names: staff_names.StaffNames | None = None) -> str:
-    if (review_items.on_list(item) or item.state == ReviewState.DONE
+         names: staff_names.StaffNames | None = None, view: ReviewBodyView = ReviewBodyView.TABLE) -> str:
+    studio_answer = (view is ReviewBodyView.STUDIO_QUESTION and review_items.on_list(item)
+                     and isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
+                     and item.exchange_handoff.open_staff_question and 'answer' in item.actions)
+    if ((review_items.on_list(item) and not studio_answer) or item.state == ReviewState.DONE
             or (item.type == ReviewType.FOR_YOU and not item.actions)):
         return ''
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
@@ -1048,7 +1075,10 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         labels.update(read='Got it', question='Ask a follow-up')
     elif validator:
         labels['question'] = 'Ask a question'
-    for index, action in enumerate(item.actions):
+    for index, action in enumerate(("answer",) if studio_answer else item.actions):
+        if (action == 'read' and isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
+                and not item.unread_answer):
+            continue
         primary = index == 0 and not validator
         if action in (page_frame.VerdictAction.WORKS, page_frame.VerdictAction.NOT_FIXED):
             button = page_frame.verdict_button(page_frame.VerdictItemType.CHANGE, page_frame.VerdictAction(action),
@@ -1061,7 +1091,7 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         if action == 'approve':
             closes.append(assignment)
     later = ''
-    if (item.state not in (ReviewState.DONE, ReviewState.VALIDATING)
+    if (not studio_answer and item.state not in (ReviewState.DONE, ReviewState.VALIDATING)
             and item.type not in (ReviewType.RESPONSE, ReviewType.FOR_YOU) and not waiting_change(item)):
         later = record_table.park_control('Later', field='later', action='outcome', value='later')
     words = ''
@@ -1102,7 +1132,10 @@ def log_html(item: ReviewItem, inputs: ReviewBodyInputs, owner: str) -> str:
     for index, entry in enumerate(item.log):
         time = entry.time.isoformat()
         words = entry.words
-        if index in item.body_answer_events and words != 'Answered the question':
+        handoff = item.exchange_handoff
+        if isinstance(handoff, review_items.FiledReviewExchange) and index in handoff.answer_events:
+            words = 'Answer filed on the List'
+        elif index in item.body_answer_events and words != 'Answered the question':
             words = 'Answered'
         actor = inputs.names.html(entry.who, owner if response is not None and entry.who == item.owner else entry.who)
         rows.append(f'<li data-log-index="{index}"><time datetime="{time}">'
@@ -1221,13 +1254,16 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
         if proof.strip() or (validator and inputs.assets.get('image:'+item.key)):
             body += section('Proof', proof)
         question = source.slots.question
+        filed_answer = (isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
+                        and isinstance(question, change_page.AnsweredQuestion)
+                        and item.exchange_handoff.filed_slot_id == question.question_id)
         if validator:
             duration = (' · Validating for <time data-validating-age datetime="'
                         +source.handed_at.isoformat()+'"></time>') if source.handed_at is not None else ''
             shown_validator = names.html(item.owner, validator)
             handoff = '<p class="review-handoff">With '+shown_validator+duration+'</p>'
-            if isinstance(question, (change_page.OpenQuestion, change_page.AnsweredQuestion)) and not isinstance(
-                    question, (change_page.OpenFeedback, change_page.CompletedFeedback)):
+            if (isinstance(question, (change_page.OpenQuestion, change_page.AnsweredQuestion)) and not filed_answer
+                    and not isinstance(question, (change_page.OpenFeedback, change_page.CompletedFeedback))):
                 exchange = section('Question for '+shown_validator, question.text)
                 if isinstance(question, change_page.AnsweredQuestion):
                     exchange += ('<section><h3>Answer from '+shown_validator+'</h3>'
@@ -1235,7 +1271,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
         else:
             if isinstance(question, change_page.OpenQuestion) and not isinstance(question, change_page.OpenFeedback):
                 body += section('Question', question.text)
-            elif isinstance(question, change_page.AnsweredQuestion):
+            elif isinstance(question, change_page.AnsweredQuestion) and not filed_answer:
                 body += answer_section(question.answer)
         if path := inputs.assets.get('image:'+item.key):
             alt = html.escape('Screenshot: '+item.title,quote=True)
@@ -1246,7 +1282,8 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
         body = section('You asked', source.record.question)
         if isinstance(destination, investigation.ListDestination):
             body = f'<p><a href="{report_url(destination)}">Open List item {destination.number}</a></p>' + body
-        if source.record.answer:
+        if source.record.answer and not (isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
+                                         and item.exchange_handoff.filed_investigation_answer):
             body += answer_section(source.record.answer)
     elif isinstance(source, review_items.ProposalSource):
         body = ('<section><h3>Proposal</h3><div data-proposal-body>'
@@ -1261,10 +1298,13 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     body += inputs.assets.get('question-delivery:'+item.key, '')
     body += inputs.assets.get('submission:'+item.key, '')
     log_id = html.escape('review-log-'+item.key.replace('/', '-'), quote=True)
+    if isinstance(filed := item.exchange_handoff, review_items.FiledReviewExchange):
+        body += f'<p><a href="{report_url(filed.destination)}">Open answer on List item {filed.destination.number}</a></p>'
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div>'
             +'<div class="review-log-column">'+record_table.log_panel(log_id, log_html(item, inputs, owner))+exchange+'</div>'
             +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets),
                   owner=owner, validator=validator, routes=review_toast_routes(item, inputs.members), names=names,
+                  view=inputs.view,
                   assignment=assign_menu(item, names) if 'approve' in item.actions else '')+footer+'</div>')
 
 
@@ -1386,7 +1426,10 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         return review_items.read_current(root, retained, staff.snapshot())
 
     def validate_revision(current: ReviewItem) -> ReviewItem:
-        if review_items.on_list(current):
+        handoff = current.exchange_handoff
+        if review_items.on_list(current) and (
+                not isinstance(handoff, review_items.FiledReviewExchange) or not handoff.open_staff_question
+                or outcome != "answer"):
             raise review_items.ReviewRecordChanged('Open the report on the List.')
         if current.state == ReviewState.DONE:
             raise review_items.ReviewRecordChanged('This item is already Done.')
@@ -1471,6 +1514,12 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     else:
         delivery, answer = review_actions.decision_action(
             item, outcome, words, status, assignee=fields.get('assignee', [''])[0], verify_revision=validate)
+    if isinstance(item.source, review_items.QuestionSource) and outcome == 'answer':
+        with review_items.after_store_write(key):
+            members = staff.snapshot()
+            file_exchange = cast(Callable[[ReviewItem, staff.StaffSnapshot, Path], None],
+                                 import_module("scripts.review_links.answer_sources").file_saved_review)
+            file_exchange(review_items.read_current(root, item, members), members, root)
     if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery) and item.type == ReviewType.QUESTION:
         with review_items.after_store_write(item.key):
             delivery = review_actions.track_question(delivery, key, words, status)
@@ -2763,6 +2812,18 @@ document.addEventListener('review-item-created',event=>{
  });
 });
 function followItemLink(options){
+ const linked = recordPlaceParams(reviewPlaceOptions);
+ legacyReviewPlace(linked);
+ const linkedItem = linked.get('jump') || linked.get('item');
+ if(linkedItem && !index.has(resolveShownRecordId(index,linkedItem))){
+  const current=location.href;
+  const query=new URLSearchParams({filed:linkedItem});
+  void fetch(location.pathname+'?'+query,{cache:'no-store',signal:reviewRequestSignal()})
+    .then(response=>response.ok ? response.json() : null)
+    .then(filed=>{
+      if(filed?.url && location.href===current) location.replace(filed.url);
+    }).catch(()=>{});
+ }
  const applyLink=unappliedOnly=>view.followItemLink({...options,unappliedOnly,beforeJump:key=>{
   if(pendingSaves.has(key)) return false;
   const marker=saved.get(key);
