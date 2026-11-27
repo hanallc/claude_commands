@@ -237,11 +237,18 @@ it was registered (showrunner ruling, 2026-10-28): the five-minute sweep and the
 PATH wrappers cover a session that starts outside its shell. Revisit only if a
 failed build from such a session is seen.
 
-The local five-minute sweep is a notifier timer, registered on main on natedev:
+The local five-minute sweep is a notifier timer named `nix-heal`. It does not run now:
+
+- natedev: the timer was registered on 2026-10-28. Its stored `RUN` keeps a literal `$HOME`, which `notifier.sh` does not expand. Each run exits 127 (`no such file or directory: $HOME/.claude/scripts/lib/py`), so the healer has never run.
+- Mac: no `nix-heal` timer exists.
+
+A working registration names absolute paths, because `notifier.sh` splits `RUN` into words and does no parameter expansion:
 
 ```sh
-~/.claude/scripts/message/notifier.sh new nix-heal --every 5 --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/nix_env/heal.py sweep"
+~/.claude/scripts/message/notifier.sh new nix-heal --every 5 --run "/home/natepiano/.claude/scripts/lib/py /home/natepiano/.claude/scripts/nix_env/heal.py sweep"
 ```
+
+On the Mac the paths start with `/Users/natemccoy`. A timer with restart power needs nate's go before it is registered (List 329).
 
 The showrunner still owns the bare `claude` and `codex` PATH wrappers in
 `/etc/nixos`; each must call this helper with the real absolute executable.
