@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import nullcontext, redirect_stdout
 from functools import cached_property
+from io import StringIO
 import os
 from pathlib import Path
 import re
@@ -15,7 +17,7 @@ import unittest
 from unittest import mock
 
 from scripts.copies import copies
-from scripts.lib import conf
+from scripts.lib import build_folders, conf
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.mac_test.mirror_root import MacMirrorRoot
 
@@ -51,11 +53,23 @@ class MirrorScriptTests(unittest.TestCase):
         self.assertTrue(self.repositories)
         self.addCleanup(offload.offload_mirror_root.reset, offload.offload_mirror_root.set(self.root))
 
+    def host_probe_script(self) -> str:
+        controller = offload.ProcessController()
+        reply = offload.CommandOutput(0, "free_gib=120\nhost=fixture-mac\nrc=0\n", "")
+        with (mock.patch.object(offload, "record_reachable"),
+              mock.patch.object(controller, "capture", return_value=reply) as capture):
+            _ = offload.probe_mac_host(
+                controller, eligibility.probe_settings(self.settings), "mac",
+                tuple(repository.name for repository in self.repositories),
+                setup_mirrors=tuple(repository.legacy_mirror_name for repository in self.repositories),
+            )
+        arguments = cast(Sequence[str], capture.call_args.args[0])
+        return arguments[-1]
+
     def test_mac_control_scripts_do_not_match_mirror_selectors(self) -> None:
         config = eligibility.read_config(self.settings.source)
         paths = [offload.remote_mirror(repository) for repository in self.repositories]
         patterns = [command_pattern(scope) for scope in (*self.repositories, offload.ALL_MIRRORS)]
-        legacy_names = tuple(repository.legacy_mirror_name for repository in self.repositories)
         identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
         fence = offload.start_fence_relative(identity, "mac").with_suffix(".lock")
         machine = "d764b59a-1a37-4c78-8a1a-9c0aa3e5962b"
@@ -66,14 +80,6 @@ class MirrorScriptTests(unittest.TestCase):
             captured.append(arguments[-1])
             return offload.CommandOutput(0, "free_gib=120\nhost=fixture-mac\nrc=0\n", "")
 
-        with (mock.patch.object(offload, "record_reachable"),
-              mock.patch.object(controller, "capture", side_effect=capture)):
-            _ = offload.probe_mac_host(
-                controller, eligibility.probe_settings(self.settings), "mac",
-                tuple(repository.name for repository in self.repositories), setup_mirrors=legacy_names,
-            )
-        host_probe, = captured
-        captured.clear()
         with (tempfile.TemporaryDirectory() as state,
               mock.patch.object(eligibility, "state_directory", return_value=Path(state)),
               mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(config.free_floor_gib, "mac")),
@@ -83,7 +89,7 @@ class MirrorScriptTests(unittest.TestCase):
             ), offload.MacDiskReady(config.free_floor_gib))
         floor_sweep, = captured
         scripts: dict[str, str] = {
-            "host probe setup and scan": host_probe,
+            "host probe setup and scan": self.host_probe_script(),
             "floor sweep": floor_sweep,
             "activity": mac_test.mac_activity_script(),
             "fence setup": offload.prepare_start_fence_command(identity, "mac", machine_id_timeout=1),
@@ -99,6 +105,13 @@ class MirrorScriptTests(unittest.TestCase):
             mirror = offload.request_mirror(config, request, repository)
             cleanup = offload.remote_cleanup_command(config, request, repository)
             observe = offload.leftover_check_script(repository, fence=fence, observe=True, mirror_root=self.root)
+            fetch_size = offload.fetch_size_command(repository, "mac", 1, offload.FetchFolder("target/shots"))
+            receiver = copies.remote_rsync(CONFIG, mirror, CONFIG / "exclude", offload.ssh_options(config.connection))
+            sender = ["rsync", f"{mirror.host}:{mirror.path}/target/shots/", str(CONFIG)]
+            receive_path = next(word for word in offload.mac_floor_rsync(mirror.path, receiver)
+                                if word.startswith("--rsync-path="))
+            send_path = next(word for word in offload.mac_floor_rsync(mirror.path, sender)
+                             if word.startswith("--rsync-path="))
             repository_scripts = {
                 "probe": offload.probe_script(repository),
                 "observation": observe,
@@ -106,8 +119,12 @@ class MirrorScriptTests(unittest.TestCase):
                     identity, "mac", settle=True, report_holders=True, leftover_observation=(observe, 1.0, machine),
                 ),
                 "end cleanup": cleanup,
-                "cleanup-only wrapper": copies.remote_use_command(mirror, cleanup),
-                "fetch size": offload.fetch_size_command(repository, "mac", 1, offload.FetchFolder("target/shots")),
+                "cleanup-only wrapper": offload.after_mac_floor_group(
+                    mirror.path, copies.remote_use_command(mirror, cleanup),
+                ),
+                "fetch size": offload.after_mac_floor_group(mirror.path, shlex.join(["/bin/sh", "-c", fetch_size])),
+                "rsync receiver": receive_path,
+                "rsync sender": send_path,
                 "floor removal": copies.remote_copies_command("mirror-remove", mirror, "--host", mirror.host),
             }
             scripts.update((f"{name} for {repository.name}", script) for name, script in repository_scripts.items())
@@ -121,13 +138,19 @@ class MirrorScriptTests(unittest.TestCase):
                     self.assertNotRegex(script, pattern)
 
     def test_mac_probe_child_decodes_the_original_path(self) -> None:
-        for repository in self.repositories:
-            path = offload.remote_mirror(repository)
-            with self.subTest(repository=repository.name):
-                setup = offload.probe_script(repository).split(" || exit 1", 1)[0]
-                program, encoded = shlex.split(setup.split(" -c ", 1)[1])
-                self.assertNotIn(path, encoded)
-                with (mock.patch.object(copies, "probe_remote_folder") as probe,
-                      mock.patch.object(sys, "argv", ["-c", encoded])):
-                    exec(program, {})
-                probe.assert_called_once_with(path)
+        lines = self.host_probe_script().splitlines()
+        setup = next(line for line in lines if "prepare_mac_probe_mirrors" in line)
+        program, encoded, seconds, *_ = shlex.split(setup.partition(" -c ")[2])
+        requests = [shlex.split(line)[-1] for line in lines if line.startswith("test -f ")]
+        paths = [offload.remote_mirror(repository) for repository in self.repositories]
+        self.assertNotIn(self.root.relative, encoded)
+        for path in paths:
+            self.assertNotIn(path, encoded)
+        with (tempfile.TemporaryDirectory() as home,
+              mock.patch.object(Path, "home", return_value=Path(home)),
+              mock.patch.object(build_folders, "mac_mirror_hold", return_value=nullcontext()),
+              mock.patch.object(copies, "probe_remote_folder") as probe,
+              mock.patch.object(sys, "argv", ["-c", encoded, seconds, *requests]),
+              redirect_stdout(StringIO())):
+            exec(program, {})
+        self.assertEqual(probe.call_args_list, [mock.call(str(Path(home) / path)) for path in paths])

@@ -2774,6 +2774,15 @@ def mirror_metadata_locks(tree: Path) -> Generator[floor_claims.ClaimSnapshot]:
 
 def mirror_remove(args: CopyArguments) -> int:
     tree = floor_claims.mirror_local_path(args.path)
+    with ExitStack() as hold:
+        try:
+            _ = hold.enter_context(build_folders.mac_mirror_hold(tree, build_folders.MacMirrorHold.EXCLUSIVE))
+        except BlockingIOError as error:
+            raise CopyError(f"{tree}: busy; a Mac run or the floor sweep holds the mirror") from error
+        return remove_leased_mirror(tree, args)
+
+
+def remove_leased_mirror(tree: Path, args: CopyArguments) -> int:
     authority = floor_claims.removal_authority_path(tree)
     with local_mirror_lease(tree, args.session, create=False):
         with mirror_metadata_locks(tree) as claims:
@@ -3251,10 +3260,17 @@ def run_mirror_receiver(command: list[str], descriptors: tuple[int, ...], enviro
 
 def mirror_run(args: CopyArguments) -> int:
     tree = floor_claims.mirror_local_path(args.path)
-    with local_mirror_lease(tree, args.session, create_tree=args.action != "mirror-receive"):
+    receiving = args.action == "mirror-receive"
+    with ExitStack() as leases:
+        floor = leases.enter_context(build_folders.mac_mirror_hold(tree, build_folders.MacMirrorHold.SHARED))
+        _ = leases.enter_context(local_mirror_lease(tree, args.session, create_tree=not receiving))
         with mirror_metadata_locks(tree):
-            if args.action == "mirror-receive":
-                receive_metadata(tree, args)
+            if receiving:
+                if isinstance(floor, int) and floor_claims.removal_authority_path(tree).exists():
+                    with build_folders.mac_mirror_hold(tree, build_folders.MacMirrorHold.UPGRADE, shared=floor):
+                        receive_metadata(tree, args)
+                else:
+                    receive_metadata(tree, args)
             else:
                 mark_mirror(tree, args.owner, args.repository, args.session,
                             last_use=time.time(), process_group=os.getpgrp())
@@ -3262,8 +3278,10 @@ def mirror_run(args: CopyArguments) -> int:
         if not command:
             raise CopyError("remote mirror requires a command")
         descriptors = COMMAND_LOCKS.get()
-        if args.action == "mirror-use":
+        if not receiving:
             descriptors = tuple(dict.fromkeys((*descriptors, *floor_claims.inherited_mirror_descriptors())))
+        if isinstance(floor, int) and floor not in descriptors:
+            descriptors = (*descriptors, floor)
         environment = {**os.environ, floor_claims.MIRROR_LEASE_FDS: ",".join(map(str, descriptors))}
         if args.action == "mirror-receive":
             return run_mirror_receiver(command, descriptors, environment)
