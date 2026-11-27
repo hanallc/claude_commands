@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from datetime import datetime, timezone
 import os
 import errno
@@ -23,7 +23,7 @@ import time
 import unittest
 from typing import Never, cast, final, override
 from unittest import mock
-from contextlib import AbstractContextManager, chdir, nullcontext, redirect_stdout
+from contextlib import AbstractContextManager, ExitStack, chdir, contextmanager, nullcontext, redirect_stdout
 
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
 from scripts.lib.boot_identity import boot_identity
@@ -36,6 +36,22 @@ from scripts.lib.git_test_support import commit_repository, fixture_git_environm
 def _release_folder(path: Path) -> None:
     release = cast(Callable[[Path], None], getattr(folders, "_release_build_folder"))
     release(path)
+
+
+@contextmanager
+def _reuse_lock_descriptor() -> Generator[None]:
+    open_lock = build_folder_lock.open_lock
+
+    def open_reusable_lock(path: Path, directory: int, *, create: bool) -> int:
+        descriptor = open_lock(path, directory, create=create)
+        try:
+            # Use a descriptor above those used during removal.
+            return fcntl.fcntl(descriptor, fcntl.F_DUPFD_CLOEXEC, 64)
+        finally:
+            os.close(descriptor)
+
+    with mock.patch.object(build_folder_lock, "open_lock", side_effect=open_reusable_lock):
+        yield
 
 
 class FolderFormTests(unittest.TestCase):
@@ -1267,7 +1283,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
     def test_cli_call_releases_the_locks_it_took_and_keeps_the_callers(self) -> None:
         kept = folders.create_build_folder(folders.UniqueBuildFolder("kept-cli-"))
         self.addCleanup(_release_folder, kept)
-        locks = cast(dict[int, Path], getattr(folders, "_locks"))
+        locks = cast(dict[int, object], getattr(folders, "_locks"))
         before = dict(locks)
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(folders.main(["unique", "--prefix", "main-cli-"]), 0)
@@ -1278,6 +1294,72 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.assertEqual(folders.build_folder_state(kept), "held")
         self.assertEqual(folders.main(["remove", str(created)]), 0)
         self.assertFalse(created.exists())
+
+    def test_cli_remove_keeps_another_threads_replacement_lock(self) -> None:
+        request = folders.StableOwnerFolder("replace-cli", folders.ExplicitBuildParent(self.root))
+
+        def allocate() -> Path:
+            with _reuse_lock_descriptor():
+                return folders.create_build_folder(request)
+
+        path = allocate()
+        self.addCleanup(_release_folder, path)
+        descriptor = folders.build_folder_lock_fd(path)
+        removed = threading.Event()
+        remove_folder = cast(Callable[[Path], object], getattr(folders, "_remove_build_folder"))
+
+        def replace() -> int:
+            self.assertTrue(removed.wait(TEST_HANG_GUARD_SECS))
+            self.assertEqual(allocate(), path)
+            return folders.build_folder_lock_fd(path)
+
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            worker = workers.submit(replace)
+
+            def remove_then_replace(candidate: Path) -> object:
+                result = remove_folder(candidate)
+                self.assertFalse(candidate.exists())
+                removed.set()
+                self.assertEqual(worker.result(timeout=TEST_HANG_GUARD_SECS), descriptor)
+                return result
+
+            try:
+                with mock.patch.object(folders, "_remove_build_folder", side_effect=remove_then_replace):
+                    self.assertEqual(folders.main(["remove", str(path)]), 0)
+            finally:
+                removed.set()
+
+        _ = os.fstat(descriptor)
+        self.assertEqual(folders.build_folder_lock_fd(path), descriptor)
+        self.assertEqual(folders.build_folder_state(path), "held")
+
+    def test_cli_cleanup_keeps_a_lock_replaced_after_selection(self) -> None:
+        path = self.root / "replace-during-cleanup"
+        request = folders.StableOwnerFolder(path.name, folders.ExplicitBuildParent(self.root))
+        release = cast(Callable[..., None], getattr(folders, "_release_build_folder"))
+        self.addCleanup(_release_folder, path)
+
+        def replace(descriptor: int) -> int:
+            release(path, descriptor=descriptor)
+            self.assertEqual(folders.create_build_folder(request), path)
+            return folders.build_folder_lock_fd(path)
+
+        with ThreadPoolExecutor(max_workers=1) as workers, _reuse_lock_descriptor():
+            def replace_then_release(candidate: Path, *, descriptor: int, **kwargs: object) -> None:
+                self.assertEqual(candidate, path)
+                replacement = workers.submit(replace, descriptor)
+                self.assertEqual(replacement.result(timeout=TEST_HANG_GUARD_SECS), descriptor)
+                release(candidate, descriptor=descriptor, **kwargs)
+
+            with mock.patch.object(folders, "_release_build_folder", side_effect=replace_then_release) as cleanup:
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(folders.main(["stable", "--path", str(path)]), 0)
+            cleanup.assert_called_once()
+            descriptor = cast(int, cleanup.call_args.kwargs["descriptor"])
+
+        _ = os.fstat(descriptor)
+        self.assertEqual(folders.build_folder_lock_fd(path), descriptor)
+        self.assertEqual(folders.build_folder_state(path), "held")
 
     def test_mkdir_collision_preserves_the_other_creators_folder(self) -> None:
         spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=1,
@@ -1408,7 +1490,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
             self.assertFalse(path.with_name(path.name + ".lease.json").exists())
 
     def test_cancelled_collision_keeps_another_requests_reused_descriptor(self) -> None:
-        registry: dict[int, Path] = {}
+        registry: dict[int, object] = {}
         collision = self.root / "collision"
         collision.mkdir()
         closed: list[int] = []
@@ -1423,6 +1505,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
             other = folders.create_build_folder(folders.StableOwnerFolder(
                 "other", folders.ExplicitBuildParent(self.root)))
             original = folders.build_folder_lock_fd(other)
+            held = registry[original]
 
             def cancel_after_reuse(spec: folders.BuildFolderSpec) -> Path:
                 del spec
@@ -1430,7 +1513,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                     return collision
                 reused = os.dup2(original, closed[0])
                 self.assertEqual(reused, closed[0])
-                registry[reused] = other
+                registry[reused] = held
                 _ = registry.pop(original)
                 os.close(original)
                 raise KeyboardInterrupt()
@@ -1440,7 +1523,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                         mock.patch.object(folders, "build_folder_path", side_effect=cancel_after_reuse):
                     with self.assertRaises(KeyboardInterrupt):
                         _ = folders.create_build_folder(folders.UniqueBuildFolder("collision-"))
-                self.assertEqual(registry.get(closed[0]), other)
+                self.assertIs(registry.get(closed[0]), held)
                 self.assertEqual(folders.build_folder_lock_fd(other), closed[0])
                 _ = os.fstat(closed[0])
                 self.assertEqual(folders.build_folder_state(other), "held")
@@ -1449,7 +1532,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                 _release_folder(other)
 
     def test_interrupted_collision_close_keeps_another_requests_reused_descriptor(self) -> None:
-        registry: dict[int, Path] = {}
+        registry: dict[int, object] = {}
         collision = self.root / "close-collision"
         collision.mkdir()
         collided: list[int] = []
@@ -1466,6 +1549,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
             other = folders.create_build_folder(folders.StableOwnerFolder(
                 "close-other", folders.ExplicitBuildParent(self.root)))
             original = folders.build_folder_lock_fd(other)
+            held = registry[original]
 
             def cancel_close(descriptor: int) -> None:
                 close(descriptor)
@@ -1473,7 +1557,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                     replacement = os.dup2(original, descriptor)
                     self.assertEqual(replacement, descriptor)
                     reused.append(replacement)
-                    registry[replacement] = other
+                    registry[replacement] = held
                     _ = registry.pop(original)
                     close(original)
                     raise KeyboardInterrupt()
@@ -1485,7 +1569,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                     with self.assertRaises(KeyboardInterrupt):
                         _ = folders.create_build_folder(folders.UniqueBuildFolder("close-collision-"))
                 self.assertEqual(reused, collided)
-                self.assertEqual(registry.get(reused[0]), other)
+                self.assertIs(registry.get(reused[0]), held)
                 self.assertEqual(folders.build_folder_lock_fd(other), reused[0])
                 _ = os.fstat(reused[0])
                 self.assertEqual(folders.build_folder_state(other), "held")
@@ -1494,7 +1578,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                 _release_folder(other)
 
     def test_release_closes_the_descriptor_when_registry_removal_stops(self) -> None:
-        class InterruptedRegistry(dict[int, Path]):
+        class InterruptedRegistry(dict[int, object]):
             @override
             def pop(self, key: int, default: object = None) -> Never:
                 _ = super().pop(key, default)
@@ -1728,6 +1812,37 @@ print('free')
                 result = subprocess.run([sys.executable, "-c", probe, stage], capture_output=True, text=True, timeout=4)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "free\n")
+
+    def test_interrupt_after_registration_removes_the_temporary_folder(self) -> None:
+        request = folders.BuildFolderSpec(
+            kind="temporary", parent=self.root, repository="repo", owner="unit",
+            purpose="after-registration", suffix="fixed", suffix_length=5)
+        path = folders.build_folder_path(request)
+        self.addCleanup(_release_folder, path)
+        guard = cast(threading.Lock, getattr(folders, "_locks_guard"))
+        descriptors: list[int] = []
+
+        class InterruptAfterRegistration:
+            def __enter__(self) -> None:
+                _ = guard.acquire()
+
+            def __exit__(self, *_exit_args: object) -> None:
+                guard.release()
+                if not descriptors:
+                    descriptors.append(folders.build_folder_lock_fd(path))
+                    assert path.is_dir()
+                    raise KeyboardInterrupt()
+
+        with mock.patch.object(folders, "_locks_guard", InterruptAfterRegistration()):
+            with self.assertRaises(KeyboardInterrupt):
+                with folders.temporary_build_folder(request):
+                    self.fail("allocation returned after the interrupt")
+
+        self.assertEqual(len(descriptors), 1)
+        with self.assertRaises(OSError) as error:
+            _ = os.fstat(descriptors[0])
+        self.assertEqual(error.exception.errno, errno.EBADF)
+        self.assertEqual(folders.temporary_allocation_entries(path), ())
 
     def test_interrupt_before_stable_mkdir_keeps_existing_output(self) -> None:
         path = folders.create_build_folder(folders.StableOwnerFolder("existing", folders.ExplicitBuildParent(self.root)))
@@ -2167,6 +2282,62 @@ print('shared')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "shared\n")
         self.assertTrue(path.is_dir())
+
+    def test_child_starts_after_another_thread_releases_its_folder_lock(self) -> None:
+        parent = folders.ExplicitBuildParent(self.root)
+        ready, release = threading.Event(), threading.Event()
+
+        def hold_other_folder() -> int:
+            with folders.leased_build_folder(folders.UniqueBuildFolder("worker-", parent)) as path:
+                descriptor = folders.build_folder_lock_fd(path)
+                ready.set()
+                self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
+                return descriptor
+
+        with (folders.leased_build_folder(folders.UniqueBuildFolder("caller-", parent)) as caller,
+              open(os.devnull, "rb") as inherited,
+              folders.inherit_build_lock(inherited.fileno()),
+              ThreadPoolExecutor(max_workers=1) as workers):
+            with ExitStack() as reserved:
+                # Free lower numbers for the subprocess error pipe after the worker closes its lock.
+                for _ in range(4):
+                    _ = reserved.enter_context(open(os.devnull, "rb"))
+                worker = workers.submit(hold_other_folder)
+                try:
+                    self.assertTrue(ready.wait(TEST_HANG_GUARD_SECS))
+                    descriptors = folders.held_build_folder_descriptors()
+                finally:
+                    release.set()
+                closed = worker.result(timeout=TEST_HANG_GUARD_SECS)
+            with self.assertRaises(OSError) as error:
+                _ = os.fstat(closed)
+            self.assertEqual(error.exception.errno, errno.EBADF)
+
+            caller_fd = folders.build_folder_lock_fd(caller)
+            _ = subprocess.run([sys.executable, "-c", "import os, sys; [os.fstat(int(fd)) for fd in sys.argv[1:]]",
+                                str(caller_fd), str(inherited.fileno())],
+                               pass_fds=descriptors, check=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertNotIn(closed, descriptors)
+
+    def test_caller_can_release_a_folder_lock_after_its_thread_exits(self) -> None:
+        request = folders.UniqueBuildFolder("worker-", folders.ExplicitBuildParent(self.root))
+
+        def acquire() -> tuple[Path, int]:
+            path = folders.create_build_folder(request)
+            return path, folders.build_folder_lock_fd(path)
+
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            path, descriptor = workers.submit(acquire).result(timeout=TEST_HANG_GUARD_SECS)
+
+        try:
+            self.assertEqual(folders.build_folder_lock_fd(path), descriptor)
+            self.assertNotIn(descriptor, folders.held_build_folder_descriptors())
+        finally:
+            _release_folder(path)
+        with self.assertRaises(OSError) as error:
+            _ = os.fstat(descriptor)
+        self.assertEqual(error.exception.errno, errno.EBADF)
+        self.assertEqual(folders.build_folder_state(path), "free")
 
     def test_inherited_descriptor_holds_after_the_parent_releases_it(self) -> None:
         request = folders.UniqueBuildFolder("inherit-", folders.ExplicitBuildParent(self.root))

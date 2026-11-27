@@ -26,7 +26,7 @@ from importlib import import_module
 from pathlib import Path
 import sys
 import tempfile
-from threading import Lock
+from threading import Lock, Thread, current_thread
 import time
 from typing import TYPE_CHECKING, Literal, Protocol, cast, final, overload, override
 
@@ -867,8 +867,21 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
     return path
 
 
-_locks: dict[int, Path] = {}
+@dataclass(frozen=True)
+class _HeldBuildFolderLock:
+    path: Path
+    acquiring_thread: Thread
+
+
+_locks: dict[int, _HeldBuildFolderLock] = {}
+_locks_guard = Lock()
 _inherited_build_locks: ContextVar[tuple[int, ...]] = ContextVar('inherited_build_locks', default=())
+
+
+def _matches_registered_folder_lock(descriptor: int, path: Path) -> bool:
+    lock = _locks.get(descriptor)
+    return lock is not None and lock.path == path
+
 
 def _probe_timing(*, wait: bool = True, settings: ConfigRead | None = None) -> build_folder_lock.ProbeTiming:
     settings = _settings() if settings is None else settings
@@ -917,12 +930,14 @@ def build_folder_state(path: Path) -> BuildFolderState:
 
 def build_folder_lock_fd(path: Path) -> int:
     """Return the held descriptor for subprocess pass_fds."""
-    return next(descriptor for descriptor, candidate in reversed(_locks.items()) if candidate == path)
+    return next(descriptor for descriptor, lock in reversed(_locks.copy().items()) if lock.path == path)
 
 
 def held_build_folder_descriptors() -> tuple[int, ...]:
-    """Retain all build locks in source and command subprocesses."""
-    return (*_inherited_build_locks.get(), *_locks)
+    """Retain inherited locks and locks that the calling thread acquired."""
+    caller = current_thread()
+    owned = (descriptor for descriptor, lock in _locks.copy().items() if lock.acquiring_thread is caller)
+    return (*_inherited_build_locks.get(), *owned)
 
 
 @contextmanager
@@ -935,19 +950,27 @@ def inherit_build_lock(descriptor: int) -> Generator[None]:
         _inherited_build_locks.reset(token)
 
 
-def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
-    if descriptor is None:
-        try:
-            descriptor = build_folder_lock_fd(path)
-        except StopIteration:
-            return
-    if _locks.get(descriptor) != path:
-        return
+def _close_registered_folder_lock(descriptor: int) -> None:
+    """Remove and close the descriptor while the caller holds the table guard."""
     try:
         _ = _locks.pop(descriptor, None)
     finally:
         # Closing preserves a child's inherited hold on the same lock.
         os.close(descriptor)
+
+
+def _release_build_folder(path: Path, *, descriptor: int | None = None,
+                          expected: _HeldBuildFolderLock | None = None) -> None:
+    with _locks_guard:
+        if descriptor is None:
+            try:
+                descriptor = build_folder_lock_fd(path)
+            except StopIteration:
+                return
+        lock = _locks.get(descriptor)
+        if lock is None or lock.path != path or (expected is not None and lock is not expected):
+            return
+        _close_registered_folder_lock(descriptor)
 
 
 class MacFloorLeaseFile(Enum):
@@ -1706,7 +1729,7 @@ def numbered_copy_use_lease(path: Path) -> Generator[NumberedCopyUseLease | Numb
             floor = stack.enter_context(mac_numbered_copy_lease(form.repo))
             claims = stack.enter_context(build_folder_use(path))
             directory = stack.enter_context(build_folder_lock.folder_parent(path, build_root(), create=False))
-            inherited = next((str(fd) for fd, held in _locks.items() if held == path),
+            inherited = next((str(fd) for fd, lock in _locks.copy().items() if lock.path == path),
                              os.environ.get(NUMBERED_COPY_LOCK_ENV, ""))
             descriptor = build_folder_lock.open_lock(path, directory, create=False)
             _ = stack.callback(os.close, descriptor)
@@ -2320,13 +2343,16 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     if made_inode is not None and callable(on_create):
                         on_create(path, made_inode)
                     os.set_inheritable(descriptor, True)
-                    _locks[descriptor] = path
+                    lock = _HeldBuildFolderLock(path, current_thread())
+                    with _locks_guard:
+                        _locks[descriptor] = lock
                     if isinstance(request, _TemporaryFolderRequest):
                         _ = request.cleanup.callback(_finish_temporary, path, directory, allocated,
                                                      descriptor=descriptor, temporary=not stable)
                     return path
                 except BaseException:
-                    _ = _locks.pop(descriptor, None)
+                    with _locks_guard:
+                        _ = _locks.pop(descriptor, None)
                     if isinstance(original, LinkedEditableRepository) or spec.kind == "copy":
                         if allocated is not None:
                             print(f"kept for a manual removal list: {path} (build_folders, checkout setup failed)",
@@ -2342,7 +2368,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                         os.close(closing)
     except BaseException:
         if descriptor >= 0:
-            _release_build_folder(_locks[descriptor], descriptor=descriptor)
+            _release_build_folder(_locks[descriptor].path, descriptor=descriptor)
         raise
 
 
@@ -2613,7 +2639,7 @@ class FreeFolderRemovalLease:
                     before_stage: RemovalTreeAction | None = None) -> bool:
         """Remove the same tree while retaining the child locks."""
         if isinstance(self, HeldFolderRemovalLease):
-            if (self.folder != path or _locks.get(self.descriptor) != path
+            if (self.folder != path or not _matches_registered_folder_lock(self.descriptor, path)
                     or not build_folder_lock.lock_current(path, self.directory, self.descriptor)
                     or not build_folder_lock.parent_current(path, self.directory)):
                 return False
@@ -2730,8 +2756,8 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
         if _kept_build_copy(path, directory):
             return KeptCopyRemovalLease()
         return UnreservedRemovalFolder()
-    with ExitStack() as opened:
-        _ = opened.callback(os.close, descriptor)
+    registered = False
+    try:
         acquired = _take_lock(descriptor, fcntl.LOCK_EX, wait=wait)
         if acquired and (mark or created):
             build_folder_lock.mark_lock(descriptor)
@@ -2748,10 +2774,26 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
             if created:
                 _unlink_transient_lock(lease)
             return KeptCopyRemovalLease()
-        _ = opened.callback(_locks.pop, descriptor, None)
-        _locks[descriptor] = path
-        _ = stack.enter_context(opened.pop_all())
-    return lease
+        lock = _HeldBuildFolderLock(path, current_thread())
+
+        def release() -> None:
+            with _locks_guard:
+                if _locks.get(descriptor) is lock:
+                    _close_registered_folder_lock(descriptor)
+
+        _ = stack.callback(release)
+        with _locks_guard:
+            try:
+                _locks[descriptor] = lock
+                registered = True
+            except BaseException:
+                _ = _locks.pop(descriptor, None)
+                registered = False
+                raise
+        return lease
+    finally:
+        if not registered:
+            os.close(descriptor)
 
 
 EXTERNAL_LINK_REASON = "the folder contains a symbolic link that can point outside the folder"
@@ -3208,7 +3250,7 @@ class _ScratchBorrowerCheck(Protocol):
 
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
                       descriptor: int, temporary: bool) -> None:
-    if _locks.get(descriptor) != path:
+    if not _matches_registered_folder_lock(descriptor, path):
         return
     _release_build_folder(path, descriptor=descriptor)
     with ExitStack() as claim:
@@ -3471,16 +3513,16 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
 
 
 def main(argv: Sequence[str]) -> int:
-    # verify_helper.py runs main in its long-lived process. A lock kept past the call loses its
-    # owner when the helper reloads this module, and a later remove cannot take that lock.
-    # Thus each call releases the locks it took, as a process that exits does.
-    held = set(_locks.items())
+    # verify_helper.py runs main in a long-lived process.
+    # A lock that survives the call can prevent removal after a module reload.
+    caller = current_thread()
+    held = _locks.copy()
     try:
         return _command(argv)
     finally:
-        for descriptor, path in list(_locks.items()):
-            if (descriptor, path) not in held:
-                _release_build_folder(path, descriptor=descriptor)
+        for descriptor, lock in _locks.copy().items():
+            if lock.acquiring_thread is caller and held.get(descriptor) is not lock:
+                _release_build_folder(lock.path, descriptor=descriptor, expected=lock)
 
 
 def _command(argv: Sequence[str]) -> int:
