@@ -626,7 +626,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                                      assignment=assignment)
         output = self.output.getvalue()
         self.assertEqual(output.count("affected: "), 1, output)
-        self.assertIn("affected: 1 of 2 modules (base ", output)
+        self.assertRegex(output, r"affected: 1 of 2 modules \(base [^\n]+\(cache \d+ hits, \d+ misses;")
         self.cloud_route.assert_not_called()
         local.assert_not_called()
 
@@ -1384,7 +1384,7 @@ class MacGateSuitesTests(GateSuitesFixture):
             run = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED,
                                        target=self.aws_assignment())
         self.assertTrue(run.passed, self.output.getvalue())
-        self.assertIn("affected: 2 of 3 modules", self.output.getvalue())
+        self.assertRegex(self.output.getvalue(), r"affected: 2 of 3 modules[^\n]+\(cache \d+ hits, \d+ misses;")
         self.assert_targeted_cloud_selection(HOOKS, MESSAGE)
         self.assertEqual(self.module_events(), [])
         self.assertEqual(run.jobs[:2], jobs)

@@ -136,7 +136,12 @@ class CargoLifetimeTests(unittest.TestCase):
                 prefix = f"build-admission-ci-{os.getuid()}-"
                 if use_shared:
                     with subprocess.Popen([sys.executable, "-c", "pass"]) as finished:
-                        self.assertEqual(finished.wait(timeout=3), 0)
+                        try:
+                            status = finished.wait(timeout=TEST_HANG_GUARD_SECS)
+                        except subprocess.TimeoutExpired:
+                            finished.kill()
+                            self.fail("The stale Cargo fixture process did not exit.")
+                        self.assertEqual(status, 0)
                     live_start = records.process_start_time(os.getpid())
                     self.assertIsNotNone(live_start)
                     live_folder = shared / f"{prefix}{os.getpid()}-{live_start}-live"
@@ -179,7 +184,10 @@ class CargoLifetimeTests(unittest.TestCase):
                         self.assertTrue(Path(record.sidecar).parent.name.startswith(
                             f"{prefix}{child.pid}-{record.owner.start_time}-"))
                 os.kill(int(str(data["pid"])), signal.SIGUSR1)
-                output, errors = child.communicate(timeout=8)
+                try:
+                    output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+                except subprocess.TimeoutExpired:
+                    self.fail("The Cargo wrapper did not exit after SIGUSR1.")
                 self.assertEqual(child.returncode, 0, output + errors)
                 paths, temporary, module_path = calls.read_text().splitlines()
                 self.assertNotIn(str(front_dir), paths.split(os.pathsep))
@@ -267,7 +275,7 @@ class CargoLifetimeTests(unittest.TestCase):
                     self.assertEqual(data["progress"], "always")
                     self.assertEqual(data["width"], "80")
                     os.kill(int(str(data["pid"])), signal.SIGUSR1)
-                    output, errors = child.communicate(timeout=8)
+                    output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(child.returncode, 0, output + errors)
                 with fixture.loop_turn():
                     self.assertFalse(fixture.server.reservations)
@@ -279,7 +287,7 @@ class CargoLifetimeTests(unittest.TestCase):
             with self.subTest(arguments=arguments), AdmissionFixture() as fixture:
                 fixture.kill_socket_server()
                 child = self.start_front(fixture, *arguments)
-                output, errors = child.communicate(timeout=8)
+                output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(child.returncode, 0, errors)
                 data = cast(dict[str, object], json.loads(output))
                 self.assertEqual(data["argv"], arguments)
@@ -296,18 +304,19 @@ class CargoLifetimeTests(unittest.TestCase):
                 fixture.allow_next_start()
                 second = self.start_front(fixture, "build")
                 errors = cast(TextIO, second.stderr)
-                self.assertTrue(select.select([errors], [], [], 8)[0])
+                self.assertTrue(select.select([errors], [], [], TEST_HANG_GUARD_SECS)[0],
+                                "the second Cargo wrapper did not report its memory wait")
                 self.assertIn("memory", errors.readline())
                 with fixture.loop_turn():
                     self.assertEqual(len(fixture.server.reservations), 1)
                     self.assertEqual(len(fixture.server.waiters), 1)
                 os.kill(int(str(first_data["pid"])), signal.SIGUSR1)
-                first_output, first_errors = first.communicate(timeout=8)
+                first_output, first_errors = first.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(first.returncode, 0, first_output + first_errors)
                 fixture.allow_next_start()
                 second_data = self.started(second)
                 os.kill(int(str(second_data["pid"])), signal.SIGUSR1)
-                second_output, second_errors = second.communicate(timeout=8)
+                second_output, second_errors = second.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(second.returncode, 0, second_output + second_errors)
                 with fixture.loop_turn():
                     self.assertFalse(fixture.server.reservations)
@@ -319,7 +328,7 @@ class CargoLifetimeTests(unittest.TestCase):
             _ = self.started(child)
             self.supply_front_memory(fixture, child)
             child.terminate()
-            output, errors = child.communicate(timeout=8)
+            output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(child.returncode, 143, output + errors)
             with fixture.loop_turn():
                 self.assertFalse(fixture.server.reservations)
@@ -341,11 +350,11 @@ class CargoLifetimeTests(unittest.TestCase):
                         self.assertEqual(len(fixture.server.reservations), 1)
                     os.kill(int(str(data["pid"])), signal.SIGUSR1)
                     try:
-                        output, errors = child.communicate(timeout=8)
+                        output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
                     except subprocess.TimeoutExpired:
                         os.kill(child.pid, signal.SIGUSR2)
                         os.kill(descendant, signal.SIGKILL)
-                        output, errors = child.communicate(timeout=8)
+                        output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
                         self.fail("the cargo front did not finish descendant cleanup: " + output + errors)
                     self.assertEqual(child.returncode, 0, output + errors)
                     self.assertTrue(select.select([descriptor], [], [], 0)[0])
