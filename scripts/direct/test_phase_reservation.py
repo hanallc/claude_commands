@@ -26,7 +26,6 @@ from unittest import mock
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
 from scripts.agents import worker_lifecycle
 from scripts.lib import atomic_file
-from scripts.lib.test_berth_board import envelope as board_envelope, snapshot as board_snapshot
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
@@ -1451,6 +1450,9 @@ class PhaseRepairTests(unittest.TestCase):
 
     def named_repair_board(self, *, status: str = "active", run: str = "c1",
                            holder: Path | None = None, target_head: str = "a" * 40) -> None:
+        # The partial launcher tree imports this module without the board test helpers.
+        from scripts.lib.test_berth_board import envelope as board_envelope, snapshot as board_snapshot
+
         _ = phase_reservation.enroll(self.directory, "34h", "board_ready")
         self.assertTrue(phase_reservation.record_active(
             self.directory, phase_reservation.Acquisition("r1", "c1", "a" * 40)))
