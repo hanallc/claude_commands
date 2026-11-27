@@ -1230,7 +1230,8 @@ STYLE = '''
 '''
 
 
-SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
+SCRIPT = (page_frame.ACTION_STATUS_SCRIPT + '(() => {\n'
+          + f'const SEND_UNDO_STACK_SCRIPT = {json.dumps(page_frame.SEND_UNDO_STACK_SCRIPT)};\n') + r'''
  const endpoint = '/console/review/new-item';
  const limits = __LIMITS__;
  const original = document.querySelector('#review-new-item');
@@ -1242,6 +1243,8 @@ SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
  const browserDraftId = /^(?:r6|s1)-[0-9a-f]{32}$/;
  const submittedKey = 'console.new-item.submitted';
  const submittedPrefix = submittedKey + '.';
+ const reportDraftPrefix = source => 'console.report.pending-send.' + source + '.';
+ const isReportKind = kind => kind === 'bug' || kind === 'enhancement';
  let nextDraft = 0;
 
  function storedListDraft() {
@@ -1272,6 +1275,22 @@ SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
     const stored = sessionStorage.getItem(key) || '';
     const route = stored.startsWith('{') ? JSON.parse(stored) : {recipient: stored || null};
     return {id, ...route, awaitingSend: state === null ? undefined : state === 'true'};
+   }
+  } catch (_) {}
+  return null;
+ }
+
+ function storedReportDraft(source) {
+  try {
+   const prefix = reportDraftPrefix(source);
+   for (let index = 0; index < sessionStorage.length; index++) {
+    const key = sessionStorage.key(index);
+    if (!key?.startsWith(prefix)) continue;
+    const id = key.slice(prefix.length);
+    if (!id.startsWith('r6-') || !browserDraftId.test(id) || drafts.some(draft => draft.id === id)) continue;
+    const item = JSON.parse(sessionStorage.getItem(key));
+    if (isReportKind(item?.kind))
+     return {id, kind: item.kind, recipient: item.recipient || null, assignee: item.assignee};
    }
   } catch (_) {}
   return null;
@@ -1453,6 +1472,7 @@ function bindDraft(dialog, fresh = false) {
   input.name = name;
   input.value = choice.id;
   input.checked = choice.id === selected;
+  if (name === 'recipient_id') input.dataset.sendReceiver = choice.name;
   const face = node('span', choice.name);
   face.setAttribute('data-button-face', '');
   chip.append(input, face);
@@ -2015,6 +2035,9 @@ function bindDraft(dialog, fresh = false) {
  function finishDraft() {
   clearSubmittedDraft();
   forgetListDraft();
+  if (draftId && ownerPage !== 'list') {
+   try { sessionStorage.removeItem(reportDraftPrefix(source) + draftId); } catch (_) {}
+  }
   draftId = undefined;
   awaitingEarlierSend = awaitingNativeRecovery = false;
  }
@@ -2245,6 +2268,27 @@ function bindDraft(dialog, fresh = false) {
   updateSend();
  }
 
+ function showReportReceipt(saved) {
+  if (!Number.isSafeInteger(saved.list_number) || typeof saved.list_owner !== 'string' ||
+      typeof saved.list_producer !== 'string') return;
+  let host = document;
+  try { host = window.top.document; } catch (_) {}
+  if (!host.defaultView.getSendUndoStack) {
+   const script = host.createElement('script');
+   script.textContent = SEND_UNDO_STACK_SCRIPT;
+   host.head.append(script);
+   script.remove();
+  }
+  const toast = host.createElement('div'), text = host.createElement('span');
+  toast.dataset.sendUndo = '';
+  toast.dataset.reportReceipt = '';
+  text.textContent = 'List item ' + saved.list_number + '. Owner ' + saved.list_owner +
+                     '. Producer ' + saved.list_producer + '.';
+  toast.append(text);
+  host.defaultView.getSendUndoStack().append(toast);
+  toast.animate([{opacity:1},{opacity:1,offset:.75},{opacity:0}], 4000).finished.then(() => toast.remove());
+ }
+
  async function open(trigger, page, key, {kind = 'bug', recipientName = '',
                                         capture = {kind: 'none'}, shownTip = null} = {}) {
   if (dialog.open) {
@@ -2261,12 +2305,13 @@ function bindDraft(dialog, fresh = false) {
   if (!keepDraft || !submittedDraft) pageContext = ownerPage ? collectPageContext() : null;
   launcher = trigger;
   token = '';
-  if (ownerPage === 'list' && !draftId && !keepDraft) {
-   const stored = storedListDraft();
+  if (!draftId && !keepDraft) {
+   const stored = ownerPage === 'list' ? storedListDraft() : storedReportDraft(source);
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
     selectedAssignee = stored.assignee || '';
+    if (stored.kind) kind = stored.kind;
     // The shipped List dialog stores no Send state.
     awaitingNativeRecovery = isShippedListDraft(stored);
     awaitingEarlierSend = awaitingNativeRecovery || stored.awaitingSend === true;
@@ -2373,7 +2418,7 @@ function bindDraft(dialog, fresh = false) {
   try {
    const item = await submissionPayload();
    if (submittedDraft?.payload !== item) {
-    const recipientName = recipientChips.querySelector('input:checked')?.nextElementSibling.textContent;
+    const recipientName = sendReceiver(recipientChips.querySelector('input:checked'));
     const draft = {payload: item, mode: 'live', recipientName, pageContext, selectedKind: form.elements.kind.value,
                    includeScreenshot: includePage.checked};
     if (separateFromNativeDraft && nativeListEdit) {
@@ -2388,8 +2433,9 @@ function bindDraft(dialog, fresh = false) {
    const sendItem = () => {
     posted = true;
     if (usedPreview && captureSession?.image?.key === item.capture_key) captureSession.sent = true;
-    const receiver = !hadEarlierSend && recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
-    return post({...item, token}, {hold: item.kind !== 'scheduled', receiver: receiver || undefined});
+    const choice = recipientChips.querySelector('input:checked');
+    const receiver = !hadEarlierSend && choice?.value === item.recipient_id ? sendReceiver(choice) : undefined;
+    return post({...item, token}, {hold: item.kind !== 'scheduled', receiver});
    };
    let result;
    try {
@@ -2466,6 +2512,7 @@ function bindDraft(dialog, fresh = false) {
   } finally {
    setSending(false);
   }
+  if (saved) showReportReceipt(saved);
   if (saved?.attachment_warning) {
    if (!dialog.open) dialog.showModal();
    showConfirmation(saved);

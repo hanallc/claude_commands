@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from urllib.parse import urlencode
+
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff
@@ -18,6 +20,13 @@ from scripts.review_links import send_hold, setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
+LIST_PAGE_PATH = "/console/list.html"
+
+
+def list_item_fragment(keeper: str, number: int) -> str:
+    return "#" + urlencode({"item": f"{keeper}/L{number}"})
+
+
 OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "placement_disk",
                          "rebuilds", "review", "studio"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
@@ -621,6 +630,85 @@ border-radius:8px;background:var(--card);color:var(--ink)}
 @media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
 ''' + HEADING_STYLE + PAGE_TOP_STYLE)
 
+class VerdictAction(StrEnum):
+    WORKS = "works"
+    NOT_FIXED = "not works"
+
+
+class VerdictItemType(StrEnum):
+    CHANGE = "outcome"
+    LIST_REPAIR = "action"
+
+
+NEGATIVE_VERDICT_LABELS = {
+    VerdictItemType.CHANGE: "Does not work",
+    VerdictItemType.LIST_REPAIR: "Not fixed",
+}
+
+
+class SendWithoutName(StrEnum):
+    SAVE_ONLY = "save without a send"
+    UNAVAILABLE = "receiver name unavailable"
+
+
+@dataclass(frozen=True)
+class SendTo:
+    """The displayed name of the send destination."""
+
+    name: str
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("A send destination needs a name.")
+
+
+type SendReceiver = SendTo | SendWithoutName
+
+
+@dataclass(frozen=True)
+class SendControl:
+    label_html: str
+    attributes: str
+
+
+def send_control(label: str, receiver: SendReceiver, *, show_receiver: bool = False) -> SendControl:
+    """Use one receiver name for the control and its send message."""
+    if receiver is SendWithoutName.SAVE_ONLY:
+        return SendControl(html.escape(label), ' data-send-receiver=""')
+    if receiver is SendWithoutName.UNAVAILABLE:
+        return SendControl(html.escape(label), "")
+    receiver_html = html.escape(receiver.name, quote=True)
+    attributes = f' data-send-receiver="{receiver_html}"'
+    if show_receiver:
+        label = f"{label} {receiver.name}" if label else receiver.name
+    else:
+        attributes += f' aria-label="{html.escape(label, quote=True)}, {receiver_html}"'
+    return SendControl(html.escape(label), attributes)
+
+
+def send_button(label: str, receiver: SendReceiver, attributes: str, *, show_receiver: bool = False,
+                with_words: SendReceiver = SendWithoutName.UNAVAILABLE) -> str:
+    control = send_control(label, receiver, show_receiver=show_receiver)
+    alternative = ""
+    if with_words is not SendWithoutName.UNAVAILABLE:
+        named = send_control("", with_words, show_receiver=True)
+        alternative = f'<template data-send-with-words{named.attributes}></template>'
+    return f'<button{control.attributes} {attributes}>{control.label_html}{alternative}</button>'
+
+
+def verdict_button(item_type: VerdictItemType, action: VerdictAction, *,
+                   primary: bool = False, selected: bool = False,
+                   receiver: SendReceiver = SendWithoutName.UNAVAILABLE,
+                   with_words: SendReceiver = SendWithoutName.UNAVAILABLE) -> str:
+    """Render the verdict for a change or a List repair."""
+    label = "Works" if action is VerdictAction.WORKS else NEGATIVE_VERDICT_LABELS[item_type]
+    pressed = 'aria-pressed="true" ' if selected else ""
+    style = ' class="primary"' if primary else ""
+    disabled = ' disabled' if item_type is VerdictItemType.LIST_REPAIR and action is VerdictAction.NOT_FIXED else ""
+    return send_button(label, receiver, f'{pressed}name="{item_type}" value="{action}"{style}{disabled}',
+                       with_words=with_words)
+
+
 def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
                    before_body: str = '', footer: str = '', form: bool = False, body_class: str = '') -> str:
     """Render a console dialog with its shared assets."""
@@ -1035,11 +1123,13 @@ function sendUndoHost(){
  try{ return window.top.document; }catch{ return document; }
 }
 const pause=(ms,view=window)=>new Promise(resolve=>view.setTimeout(resolve,ms));
+const holdRequestSignal=()=>AbortSignal.timeout(30000);
 const RETRY_LIMIT_MS=120_000,KEEPALIVE_LIMIT=64*1024;
 const heldRequests=new Map();
-function trackHeldRequest(key){
+const newHoldId=()=>Array.from(crypto.getRandomValues(new Uint8Array(12)),
+ byte=>byte.toString(16).padStart(2,'0')).join('');
+function trackHeldRequest(key,id){
  const view=sendUndoHost().defaultView || window;
- const id=Array.from(crypto.getRandomValues(new Uint8Array(12)),byte=>byte.toString(16).padStart(2,'0')).join('');
  const started=Date.now(),elapsed=performance.now();
  const expired=()=>Date.now()-started>=RETRY_LIMIT_MS || performance.now()-elapsed>=RETRY_LIMIT_MS;
  const request={id,hold:id,expired,closed:false,closeToast:null,finish};
@@ -1060,7 +1150,7 @@ function trackHeldRequest(key){
  heldRequests.set(key,request);
  return request;
 }
-function showSendUndo(request,seconds,receiver){
+function showSendUndo(request,seconds,receiver,resumable){
  const {hold}=request,host=sendUndoHost();
  const view=host.defaultView;
  if(!view.getSendUndoStack){
@@ -1079,7 +1169,7 @@ function showSendUndo(request,seconds,receiver){
  const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
  const fade=toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
  const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
- return new Promise(resolve=>{
+ return new Promise((resolve,reject)=>{
   let done=false,removalTimer=0;
   const remove=()=>{
    view.clearTimeout(removalTimer);
@@ -1119,12 +1209,21 @@ function showSendUndo(request,seconds,receiver){
   },()=>{});
   button.addEventListener('click',async()=>{
    button.disabled=true;fade.pause();shrink.pause();
+   const signal=resumable ? holdRequestSignal() : undefined;
    let answer=null;
-   for(let tries=0;tries<2 && !answer;tries++){
-    try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'}); }catch{ await pause(500); }
+   for(let tries=0;tries<2 && !answer && !signal?.aborted;tries++){
+    try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST',signal}); }
+    catch{ if(!signal?.aborted) await pause(500); }
    }
-   if(answer?.ok){finish(true);return;}
+   if(answer?.ok && (!resumable || (await answer.json().catch(()=>null))?.outcome==='undone')){
+    finish(true);return;
+   }
    if(request.closed) return;
+   if(signal?.aborted){
+    done=true;remove();
+    reject(new Error('The Undo response timed out. The send can still leave.'));
+    return;
+   }
    done=true;
    button.remove();bar.remove();fade.cancel();
    if(answer?.status===409){
@@ -1139,11 +1238,11 @@ function showSendUndo(request,seconds,receiver){
   });
  });
 }
-async function heldFetch(url,init={},receiver,onHold){
+async function heldFetch(url,init={},receiver,onHold,holdId){
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
- const key=JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
- const request=heldRequests.get(key) || trackHeldRequest(key);
+ const key=holdId ?? JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
+ const request=heldRequests.get(key) || trackHeldRequest(key,holdId ?? newHoldId());
  headers.set(SEND_REQUEST_HEADER,request.id);
  const keepalive=body.length<=KEEPALIVE_LIMIT && new TextEncoder().encode(body).length<=KEEPALIVE_LIMIT;
  const post=async keepalive=>{
@@ -1159,25 +1258,32 @@ async function heldFetch(url,init={},receiver,onHold){
   return first;
  }
  const {hold,seconds}=await first.json();
+ if(holdId && hold!==holdId) throw new Error('The send hold does not match this request.');
  request.hold=hold;
  let undo=false;
  if(!request.closed && seconds>0){
-  const shown=showSendUndo(request,seconds,receiver);
+  const shown=showSendUndo(request,seconds,receiver,Boolean(holdId));
   onHold?.();
   undo=await shown;
  }
  if(undo===true){request.finish();throw new SendUndone();}
+ return readHeldResult(hold,request,undo,Boolean(holdId));
+}
+async function readHeldResult(hold,request,undo,resumable){
  // A server restart drops the connection; the held send waits in its file, so read its result again.
+ const signal=resumable ? holdRequestSignal() : undefined;
  for(let failures=0;;){
   try{
-   const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
-   if(response.headers.get('X-Send-Hold')!=='pending'){
-    if(response.status!==404 || !request.expired()) request.finish();
-    if(typeof undo==='function') await undo(response);
-    return response;
-   }
+   const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store',signal});
+   if(response.headers.get('X-Send-Hold')==='pending') continue;
+   if(resumable || response.status!==404 || !request?.expired()) request?.finish();
+   if(typeof undo==='function') await undo(response);
+   if(resumable && response.status===404 && response.headers.get('X-Send-Hold-Outcome')==='undone')
+    throw new SendUndone();
+   return response;
   }catch(error){
-   if(++failures>=30){
+   if(error instanceof SendUndone) throw error;
+   if(signal?.aborted || ++failures>=30){
     if(typeof undo==='function') await undo();
     throw error;
    }
@@ -1185,16 +1291,26 @@ async function heldFetch(url,init={},receiver,onHold){
   }
  }
 }
-function sendActionReceiver(form,data){
- const action=data.get('outcome');
- const verdict=action==='works' && data.get('feedback')?.trim() ? 'works-with-words' : action;
- if(action==='approve' && data.get('assignee')){
-  const option=form.elements.assignee?.selectedOptions[0];
-  return option?.value===data.get('assignee') ? option.dataset.sendReceiver : undefined;
- }
- return JSON.parse(form.dataset.sendLabels || '{}')[verdict];
+heldFetch.newId=newHoldId;
+heldFetch.resume=id=>{
+ const request=heldRequests.get(id);
+ return readHeldResult(request?.hold ?? id,request,false,true);
+};
+function sendReceiver(control){
+ const form=control?.form;
+ const assignee=control?.hasAttribute('data-send-assignee') && form?.elements.assignee;
+ const withWords=control?.querySelector('[data-send-with-words]');
+ if(assignee?.value) control=assignee.selectedOptions[0];
+ else if(withWords && form?.elements.feedback?.value.trim()) control=withWords;
+ const receiver=control?.getAttribute('data-send-receiver');
+ return receiver==='' ? null : receiver ?? undefined;
 }
-window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendActionReceiver=sendActionReceiver;
+function updateSendLabel(button){
+ const receiver=sendReceiver(button);
+ if(receiver) button.setAttribute('aria-label',button.textContent+', '+receiver);
+ else button.removeAttribute('aria-label');
+}
+window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendReceiver=sendReceiver;window.updateSendLabel=updateSendLabel;
 })();
 '''
 
@@ -1221,7 +1337,7 @@ function holdCard(card,changed){
   return true;
  }
  return {
-  post:(url,init,receiver)=>heldFetch(url,init,receiver,()=>setHeld(true)),
+  post:(url,init,receiver,id)=>heldFetch(url,init,receiver,()=>setHeld(true),id),
   restore:()=>setHeld(false),
  };
 }

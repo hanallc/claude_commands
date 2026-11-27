@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import Enum
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, cast
@@ -24,7 +25,7 @@ from scripts.production.production_doc import Production, Refusal as ProductionR
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
 from scripts.rebuild import need
-from scripts.review_links import change_page, console, new_item_dialog, page_frame, question_record, review_events, review_items, staff_names
+from scripts.review_links import change_page, console, new_item_dialog, page_frame, question_record, review_events, review_items, review_submissions, staff_names
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
 
@@ -245,24 +246,49 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus, *,
     return PreparedReviews(tuple(changes), queues, orders, tuple(questions), question_tabs, routing.record)
 
 
-def receiver_names(members: staff.StaffSnapshot, recipients: tuple[staff.StaffId, ...]) -> str:
+def receiver_names(members: staff.StaffSnapshot, recipients: tuple[staff.StaffId, ...]) -> page_frame.SendReceiver:
     """Name the complete route when the staff snapshot has every receiver."""
     names: list[str] = []
     for recipient in recipients:
         member = members.by_id(recipient)
-        if member is None:
-            return ""
+        if member is None or not member.name.strip():
+            return page_frame.SendWithoutName.UNAVAILABLE
         names.append(member.name)
-    return " and ".join(names)
+    return page_frame.SendTo(" and ".join(names)) if names else page_frame.SendWithoutName.UNAVAILABLE
 
 
-def verdict_toast_labels(owner: change_routing.ChangeOwner, members: staff.StaffSnapshot) -> dict[str, str | None]:
-    """Give the browser a receiver label for each verdict."""
-    labels: dict[str, str | None] = {}
+def verdict_receivers(owner: change_routing.ChangeOwner, members: staff.StaffSnapshot) -> dict[str, page_frame.SendReceiver]:
+    """Resolve the receiver for each verdict."""
+    labels: dict[str, page_frame.SendReceiver] = {}
     for action, verdict in (("works", "works"), ("works-with-words", "works: words"), ("not works", "not works")):
         recipients = change_page.verdict_recipients(owner, verdict)
-        labels[action] = receiver_names(members, tuple(reversed(recipients))) if recipients else None
+        labels[action] = (receiver_names(members, tuple(reversed(recipients))) if recipients
+                          else page_frame.SendWithoutName.SAVE_ONLY)
     return labels
+
+
+def action_receiver(receivers: Mapping[str, page_frame.SendReceiver], outcome: str,
+                    words: str) -> page_frame.SendReceiver:
+    action = "works-with-words" if outcome == "works" and words.strip() else outcome
+    return receivers.get(action, page_frame.SendWithoutName.UNAVAILABLE)
+
+
+def receiver_field(receiver: page_frame.SendReceiver) -> str:
+    return receiver.name if isinstance(receiver, page_frame.SendTo) else ""
+
+
+def change_receivers(owner: change_routing.ChangeOwner,
+                     members: staff.StaffSnapshot) -> dict[str, page_frame.SendReceiver]:
+    handoff = receiver_names(members, owner.showrunner_recipients)
+    return {**dict.fromkeys(change_page.CHANGE_HANDOFFS, handoff), **verdict_receivers(owner, members)}
+
+
+def change_receiver_controls(receivers: Mapping[str, page_frame.SendReceiver]) -> str:
+    """Supply receiver names for the legacy change form."""
+    return ''.join(
+        f'<template data-change-receiver="{action}"'
+        + page_frame.send_control('', receiver, show_receiver=True).attributes + '></template>'
+        for action, receiver in receivers.items())
 
 
 def section(change: WaitingChange, feedback_rows: int, members: staff.StaffSnapshot | None = None, *,
@@ -282,15 +308,13 @@ def section(change: WaitingChange, feedback_rows: int, members: staff.StaffSnaps
     else:
         form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
             '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
+        controls = ""
         if members is not None and form:
-            handoff = receiver_names(members, page.owner.showrunner_recipients)
-            labels: dict[str, str | None] = {action: handoff for action in change_page.CHANGE_HANDOFFS}
-            labels.update(verdict_toast_labels(page.owner, members))
-            form = form.replace('<form method="post"', '<form method="post" ' + send_route_attributes(labels), 1)
+            controls = change_receiver_controls(change_receivers(page.owner, members))
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 {change_page.review_html(row.get(change_review.CHECK, ''))}
-{anomaly}{question}<p role="status" data-save-state hidden></p>{form}
+{anomaly}{question}<p role="status" data-save-state hidden></p>{controls}{form}
 {change_page.change_details(row, shown, validating=change.slots.validation_requested)}'''
     return f'<section {attributes}>' + change_page.change_content(row, content) + '</section>'
 
@@ -504,11 +528,6 @@ def question_details(question: WaitingQuestion,
             + '</dl>')
 
 
-def send_route_attributes(labels: dict[str, str | None]) -> str:
-    """Put the receiver labels on the form."""
-    return f'data-send-labels="{html.escape(json.dumps(labels), quote=True)}"'
-
-
 def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int,
                      names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     key = html.escape(question.key)
@@ -518,16 +537,24 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
     # Without an owner there is no form, so the choices show as a list the user cannot pick.
     shown_choices = "" if owned else choices.replace('<input type="radio"', '<input type="radio" disabled')
     names = names if isinstance(names, staff_names.StaffNames) else staff_names.read()
-    routes = send_route_attributes(question_toast_labels(question.record, names.members)) if owned else ""
-    form = '<p>No showrunner owns this question.</p>' if not owned else f'''<form method="post" action="{change_page.PAGE_NAME}" {routes}>
+    route = shown_question_route(question.record, names.members) if owned else QuestionRouteReading.UNAVAILABLE
+    receivers = question_receivers(question.record, names.members, route) if owned else {}
+    revision = route.signature if isinstance(route, QuestionRoute) else ""
+    answer = page_frame.send_button("Answer", receivers.get("answer", page_frame.SendWithoutName.UNAVAILABLE),
+                                    'name="outcome" value="answer" disabled data-needs-text')
+    followup = page_frame.send_button("Followup", receivers.get("followup", page_frame.SendWithoutName.UNAVAILABLE),
+                                      'name="outcome" value="followup" disabled data-needs-text')
+    skip = page_frame.send_button("Skip", page_frame.SendWithoutName.SAVE_ONLY, 'name="outcome" value="skip"')
+    form = '<p>No showrunner owns this question.</p>' if not owned else f'''<form method="post" action="{change_page.PAGE_NAME}">
 <input type="hidden" name="row" value="{key}">
-<input type="hidden" name="token" value="{row_token(browser, question.key)}">{choices}
+<input type="hidden" name="token" value="{row_token(browser, question.key)}">
+<input type="hidden" name="question_revision" value="{revision}">{choices}
 <label for="answer-{key}">Your answer</label>
 <p class="answer-help" id="answer-help-{key}">{ANSWER_HELP}</p>
 <textarea id="answer-{key}" name="feedback" rows="{feedback_rows}" aria-describedby="answer-help-{key}"></textarea>
-<div class="question-actions"><button name="outcome" value="answer" disabled data-needs-text>Answer</button>
-<button name="outcome" value="followup" disabled data-needs-text>Followup</button>
-<button name="outcome" value="skip">Skip</button></div></form>'''
+<div class="question-actions">{answer}
+{followup}
+{skip}</div></form>'''
     return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
 <h1>{html.escape(title)}</h1>
 {body}{shown_choices}
@@ -691,11 +718,20 @@ section+section{border:0;margin:0;padding:0}
 </style>"""
 
 
-def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus, *, feedback_closes: bool = False) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
+def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus, *,
+           feedback_closes: bool = False, require_question_revision: bool = True
+           ) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
-    if set(fields) != {"row", "token", "outcome", "feedback"} or any(len(value) != 1 for value in fields.values()):
+    required = {"row", "token", "outcome", "feedback"}
+    if not required <= fields.keys() <= required | {"receiver", "question_revision"} or any(len(value) != 1 for value in fields.values()):
         raise question_record.AnswerRefused("use the answer form on this page")
+    shown = fields.pop("receiver", None)
+    revision = fields.pop("question_revision", [""])[0]
     key = fields["row"][0]
+    outcome, words = fields["outcome"][0], fields["feedback"][0]
+
+    def receiver_matches(receivers: Mapping[str, page_frame.SendReceiver]) -> bool:
+        return shown is None or shown[0] == receiver_field(action_receiver(receivers, outcome, words))
     if not secrets.compare_digest(fields["token"][0].encode(), row_token(browser, key).encode()):
         raise question_record.AnswerRefused("row or page token does not match this page")
     prepared = prepare(browser, status)
@@ -703,12 +739,26 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         question = next((item for item in prepared.questions if item.key == key), None)
         if question is None:
             raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page")
-        outcome = fields["outcome"][0]
         if outcome not in ("answer", "followup", "skip", "question", "feedback"):
             raise question_record.AnswerRefused("use the answer form on this page")
         if outcome != "skip" and not fields["feedback"][0].strip():
             raise question_record.AnswerRefused("enter an answer")
-        return submit_question(question, outcome, fields["feedback"][0], status)
+        if question.tab == "unrouted":
+            raise change_page.QuestionAnswerRefused("No showrunner owns this question.")
+        if require_question_revision and not revision:
+            raise review_items.ReviewRecordChanged("This item changed. Check it again before saving.")
+        with (status.locked(), update_registration.outstanding_lock(
+                update_registration.outstanding_path_for_owner(question.owner))):
+            try:
+                record = update_registration.current_open_question(question.record, "questions")
+            except update_registration.RegistrationFailure as error:
+                raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page") from error
+            route = question_route(record, staff.snapshot())
+            if (revision and revision != route.signature) or not receiver_matches(route.receivers()):
+                raise review_items.ReviewRecordChanged("This item changed. Check it again before saving.")
+            return submit_question(replace(question, record=record), outcome, words, status, route=route)
+    if revision:
+        raise question_record.AnswerRefused("use the answer form on this page")
     found = next((item for item in prepared.changes if item.key == key), None)
     if found is None:
         # A repeated save uses its original signed token.
@@ -732,6 +782,8 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         found = WaitingChange(key, tab, page, row)
     if isinstance(found.page, UnavailableProduction):
         raise question_record.AnswerRefused("the production document is not available")
+    if shown is not None and not receiver_matches(change_receivers(found.page.owner, prepared.record)):
+        raise change_page.QuestionAnswerRefused("This item changed. Check it again before saving.")
     fields["row"] = [found.row["#"]]
     rewritten = urlencode({key: values[0] for key, values in fields.items()})
     delivery = change_page.submit(found.page, rewritten, status, prepared=prepared.queues[found.tab],
@@ -797,11 +849,46 @@ def save_outcome(production: update_registration.QuestionScope, question: Waitin
         return update_registration.answer(production, text, identities=identities, only_open=True)
     if outcome in ("followup", "question"):
         return update_registration.followup(production, text, words, identities=identities)
-    urgency.move_to_end(update_registration.question_queue(production), update_registration.item_key(question.owner, text),
-                        datetime.now(production.zone).replace(tzinfo=None))
+    skip_question(production, question)
     return update_registration.answer_relay(production, production.name, update_registration.question_asker(
         question.record.item, update_registration.OpenItemWithoutAsker(), identities), identities)
 
+
+
+def skip_question(production: update_registration.QuestionScope, question: WaitingQuestion) -> None:
+    urgency.move_to_end(update_registration.question_queue(production),
+                        update_registration.item_key(question.owner, question.record.item["text"]),
+                        datetime.now(production.zone).replace(tzinfo=None))
+
+
+def save_checked_queue_outcome(route: QuestionRoute, question: WaitingQuestion, outcome: change_page.QuestionOutcome,
+                               words: str) -> None:
+    """Save the selected queue record with its checked route."""
+    production = route.production
+    if outcome == "skip":
+        skip_question(production, question)
+        return
+    if outcome in ("answer", "feedback"):
+        asker = update_registration.question_member(production, question.record.item, route.identities)
+
+        def record_result(path: Path, item: update_registration.OutstandingItem, now: datetime) -> None:
+            owner = route.identities.record.by_id(question.owner)
+            update_registration.record_answer(path, owner.name if owner is not None else question.owner, item, now)
+
+        _ = update_registration.write_selected_item(
+            question.record, production, "answer", lambda item, moment: item.update(asked_by=asker.id),
+            close=True, history=record_result)
+        return
+
+    def record_followup(item: update_registration.OutstandingItem, now: datetime) -> None:
+        if "followup" in item:
+            text = question.record.item["text"]
+            raise update_registration.RegistrationFailure("followup", f"{text}: a follow-up already waits for the asker's reply")
+        reason = review_events.require_waiting_why(words)
+        item["followup"] = update_registration.PendingFollowup(text=words.strip(), sent=now.strftime("%Y-%m-%dT%H:%M"))
+        item["waiting_why"] = reason
+
+    _ = update_registration.write_selected_item(question.record, production, "followup", record_followup)
 
 def save_question_record(production: update_registration.QuestionScope, question: WaitingQuestion,
                          outcome: change_page.QuestionOutcome, words: str,
@@ -882,31 +969,79 @@ def question_receiver(owner: staff.StaffId, outcome: change_page.QuestionOutcome
     return relay.recipient if outcome not in ("feedback", "question") and isinstance(relay.recipient, str) else owner
 
 
-def question_toast_labels(record: update_registration.QuestionRecord,
-                          members: staff.StaffSnapshot) -> dict[str, str | None]:
-    """Resolve the same owner or relay that receives an answer or a follow-up."""
+class QuestionRouteReading(Enum):
+    RESOLVE = "resolve the Question route"
+    UNAVAILABLE = "the Question route is unavailable"
+
+
+@dataclass(frozen=True)
+class QuestionRoute:
+    production: update_registration.QuestionScope
+    identities: update_registration.QuestionStaff
+    relay: update_registration.AnswerRelay
+    owner: staff.StaffId
+    owner_receiver: page_frame.SendReceiver
+    answer_receiver: page_frame.SendReceiver
+
+    @property
+    def revision(self) -> tuple[staff.StaffId, page_frame.SendReceiver, update_registration.AnswerRelay, page_frame.SendReceiver]:
+        return self.owner, self.owner_receiver, self.relay, self.answer_receiver
+
+    @property
+    def signature(self) -> str:
+        return hashlib.sha256(repr(self.revision).encode()).hexdigest()[:16]
+
+    def receivers(self) -> dict[str, page_frame.SendReceiver]:
+        return {"question": self.owner_receiver, "feedback": self.owner_receiver,
+                "answer": self.answer_receiver, "followup": self.answer_receiver}
+
+
+def question_route(record: update_registration.QuestionRecord, members: staff.StaffSnapshot) -> QuestionRoute:
+    """Resolve the owner and answer relay from one staff snapshot."""
+    identities = update_registration.QuestionStaff.for_record(members)
+    sent = "review_submission" in record.item
+    production = (review_submissions.sent_question_scope(record.owner, members) if sent else
+                  update_registration.question_scope(record.owner, members))
     owner = receiver_names(members, (record.owner,))
-    labels: dict[str, str | None] = {"question": owner, "feedback": owner}
-    if "review_submission" in record.item:
-        return {**labels, "answer": owner, "followup": owner}
+    relay = (update_registration.AnswerRelay("", update_registration.NoAnswerRelay())
+             if sent else question_relay(record, production, identities))
+    answer = receiver_names(members, (question_receiver(record.owner, "answer", relay),))
+    return QuestionRoute(production, identities, relay, record.owner, owner, answer)
+
+
+def shown_question_route(record: update_registration.QuestionRecord, members: staff.StaffSnapshot
+                         ) -> QuestionRoute | Literal[QuestionRouteReading.UNAVAILABLE]:
     try:
-        scope = update_registration.question_scope(record.owner, members)
-        relay = question_relay(record, scope, update_registration.QuestionStaff.for_record(members))
+        return question_route(record, members)
     except (OSError, ValueError, ProductionRefusal, update_registration.RegistrationFailure):
-        return labels
-    return {**labels, "answer": receiver_names(members, (question_receiver(record.owner, "answer", relay),)),
-            "followup": receiver_names(members, (question_receiver(record.owner, "followup", relay),))}
+        return QuestionRouteReading.UNAVAILABLE
+
+
+def question_receivers(record: update_registration.QuestionRecord, members: staff.StaffSnapshot,
+                       route: QuestionRoute | QuestionRouteReading = QuestionRouteReading.RESOLVE
+                       ) -> dict[str, page_frame.SendReceiver]:
+    """Use the same owner or relay that receives an answer or a follow-up."""
+    if route is QuestionRouteReading.RESOLVE:
+        route = shown_question_route(record, members)
+    if isinstance(route, QuestionRoute):
+        return route.receivers()
+    owner = receiver_names(members, (record.owner,))
+    return {"question": owner, "feedback": owner}
 
 
 def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutcome, words: str,
                     status: change_page.DeliveryStatus, *,
-                    save: ExactQuestionSave | SelectedQuestionSave | QuestionQueueSave = QUESTION_QUEUE_SAVE
+                    save: ExactQuestionSave | SelectedQuestionSave | QuestionQueueSave = QUESTION_QUEUE_SAVE,
+                    route: QuestionRoute | Literal[QuestionRouteReading.RESOLVE] = QuestionRouteReading.RESOLVE
                     ) -> tuple[change_page.MessageDelivery, str]:
     """Save through the production API before the existing sender delivers the message to the asker."""
     if question.tab == "unrouted":
         raise change_page.QuestionAnswerRefused("No showrunner owns this question.")
-    identities = update_registration.QuestionStaff.read()
-    production = update_registration.question_scope(question.owner, identities.record)
+    checked_route = isinstance(route, QuestionRoute)
+    if route is QuestionRouteReading.RESOLVE:
+        route = question_route(question.record, staff.snapshot())
+    identities = route.identities
+    production = route.production
     item = question.record.item
     if "review_submission" in item and outcome != "skip":
         current = replace(review_items.question_item(question.record, identities.record),
@@ -916,7 +1051,7 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
         return send(
             current, question.record, production, "question" if outcome == "followup" else outcome, words, status,
             verify_revision=save.verify_revision if isinstance(save, ExactQuestionSave) else None)
-    relay = question_relay(question.record, production, identities)
+    relay = route.relay
     recipient = question_receiver(question.owner, outcome, relay)
     message = question_message(outcome, production.name, item["text"], relay.unit, words, question.key)
     answer = words if outcome == "answer" else ""
@@ -943,7 +1078,11 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
                 save_question_record(production, question, outcome, words, save, before_write=claim_delivery)
             else:
                 claim_delivery()
-                relay = save_outcome(production, question, outcome, words, identities)
+                if checked_route:
+                    save_checked_queue_outcome(route, question, outcome, words)
+                else:
+                    saved_relay = save_outcome(production, question, outcome, words, identities)
+                    recipient = question_receiver(question.owner, outcome, saved_relay)
         except BaseException as error:
             try:
                 if attempt in status.request_attempts:
@@ -956,7 +1095,6 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
             if isinstance(error, update_registration.RegistrationFailure):
                 raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page") from error
             raise
-        recipient = question_receiver(question.owner, outcome, relay)
         intent = replace(intent, recipients=(recipient,))
         page = replace(page, saved={**saved, "saved": True})
         status.mark_review_saved(page, page.rows[0], replace(slots, verdict=intent), intent)
@@ -979,6 +1117,45 @@ function ordersFor(page,cards){
  return new Map(Object.entries(JSON.parse(page.querySelector('[data-change-orders]').textContent))
   .map(([view,keys])=>[view,keys.map(key=>byKey.get(key)).filter(Boolean)]));
 }
+function bindReceivers(row,form){
+ for(const route of row.querySelectorAll('[data-change-receiver]')){
+  const action=route.dataset.changeReceiver,withWords=action==='works-with-words';
+  const button=form?.querySelector('button[value="'+CSS.escape(withWords ? 'works' : action)+'"]');
+  if(!button) continue;
+  if(withWords){route.dataset.sendWithWords='';button.append(route);}
+  else{
+   const receiver=sendReceiver(route);
+   if(receiver!==undefined) button.dataset.sendReceiver=receiver ?? '';
+   route.remove();
+  }
+  updateSendLabel(button);
+ }
+}
+async function refreshReceivers(row,form){
+ const response=await fetch(location.href,{cache:'no-store'});
+ if(!response.ok) return;
+ const page=new DOMParser().parseFromString(await response.text(),'text/html');
+ const fresh=page.querySelector('section[data-key="'+CSS.escape(row.dataset.key)+'"]');
+ const freshForm=fresh?.querySelector('form');
+ if(!freshForm || !form.isConnected) return;
+ bindReceivers(fresh,freshForm);
+ const revision=freshForm.elements.question_revision;
+ if(revision){
+  if(form.elements.question_revision) form.elements.question_revision.value=revision.value;
+  else form.append(revision);
+ }
+ for(const button of form.querySelectorAll('button[name="outcome"]')){
+  const replacement=freshForm.querySelector('button[value="'+CSS.escape(button.value)+'"]');
+  if(!replacement) continue;
+  const receiver=replacement.getAttribute('data-send-receiver');
+  if(receiver===null) button.removeAttribute('data-send-receiver');
+  else button.dataset.sendReceiver=receiver;
+  button.querySelector('[data-send-with-words]')?.remove();
+  const withWords=replacement.querySelector('[data-send-with-words]');
+  if(withWords) button.append(withWords);
+  updateSendLabel(button);
+ }
+}
 function bindPage(){
  rows=[...content.querySelectorAll('section[data-key]')];
  viewOrders=ordersFor(content,rows);
@@ -990,6 +1167,7 @@ function bindPage(){
  next.addEventListener('click',()=>advance(current));
  rows.forEach(row=>{
   const form=row.querySelector('form');
+  bindReceivers(row,form);
   if(form) form.addEventListener('submit',event=>{event.preventDefault();save(row,form,event.submitter.value);});
   // A choice fills the answer box; the user can edit it, then presses Answer.
   const box=form?.querySelector('textarea');
@@ -999,6 +1177,8 @@ function bindPage(){
   // Answer and Followup send the box text, so they wait for text.
   const needsText=()=>form.querySelectorAll('[data-needs-text]').forEach(button=>button.disabled=!box.value.trim());
   if(box && form.querySelector('[data-needs-text]')){box.addEventListener('input',needsText);needsText();}
+  const works=form?.querySelector('button:has([data-send-with-words])');
+  if(box && works) box.addEventListener('input',()=>updateSendLabel(works));
  });
 }
 function viewRows(){return viewOrders.get(tab) || rows.filter(r=>tab==='' || r.dataset.tab===tab);}
@@ -1042,10 +1222,13 @@ function advance(row){
  go(following?.dataset.key || ''); }
 async function save(row,form,outcome){
  if(form.dataset.saving==='true') return;
- activeSaves++;let saved=false;
+ const button=form.querySelector('button[name="outcome"][value="'+CSS.escape(outcome)+'"]');
+ const receiver=sendReceiver(button);
+ activeSaves++;let saved=false,changedReceiver=false;
  clearNotice();form.dataset.saving='true'; const state=row.querySelector('[data-save-state]'), position=navigation;
  const data=new URLSearchParams(new FormData(form));
  data.set('row',row.dataset.key);data.set('outcome',outcome);data.delete('choice');
+ data.set('receiver',receiver ?? '');
  const skip=kind==='questions' && outcome==='skip';
  if(skip) data.set('feedback','');
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
@@ -1060,9 +1243,12 @@ async function save(row,form,outcome){
  if(early) moveOn();
  try{
   const options={method:'POST',body:data,headers:{Accept:'application/json'}};
-  const response=await heldFetch(form.action,options,skip ? null : sendActionReceiver(form,data));
+  const response=await heldFetch(form.action,options,receiver);
   const reply=await response.json();
-  if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
+  if(!response.ok){
+   changedReceiver=reply.reason==='This item changed. Check it again before saving.';
+   throw new Error(reply.reason || 'The answer could not be saved. Try again.');
+  }
   saved=true;
   if(skip){
    const stillNext=navigation===position+1;
@@ -1097,6 +1283,7 @@ async function save(row,form,outcome){
    saveNotice.append(' ',open);
   }
  }finally{
+  if(changedReceiver) await refreshReceivers(row,form).catch(()=>{});
   form.dataset.saving='false';activeSaves--;
   // Read after the save, so an older response cannot restore the saved item.
   if(saved){await motion.settled();heldPage=null;newestRequest++;pageRefresh.refresh(true);}
