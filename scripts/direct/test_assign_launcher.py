@@ -436,6 +436,100 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(staff.snapshot().rows, before)
         self.assertEqual(self.fixture.agent.submitted, [])
 
+    def test_concurrent_astra_launches_submit_all_reviews_under_one_caller(self) -> None:
+        program = r"""
+import fcntl, os, subprocess, sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+from scripts.direct import assign
+from scripts.herdr import worker_panes
+from scripts.production import staff, worker
+
+parent, name, run = sys.argv[1:]
+run = Path(run)
+assign.sys.argv = ["assign.py", "--new-worker", name]
+flock = fcntl.flock
+run_command = subprocess.run
+
+def record(command, **options):
+    if command[1] == assign.PROGRESS:
+        return subprocess.CompletedProcess(command, 0)
+    return run_command(command, **options)
+
+def observe_lock(fd, mode):
+    try:
+        flock(fd, mode | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if mode & fcntl.LOCK_EX:
+            print("contended", flush=True)
+        if mode & fcntl.LOCK_NB:
+            raise
+        flock(fd, mode)
+
+def open_reviewer(owner, target, role, *, lock, **options):
+    assert owner == parent and target.value == name
+    if name == "review-a":
+        print("opening", flush=True)
+        assert sys.stdin.readline() == "open\n"
+    row = staff.ensure_worker(staff.StaffId(f"00000000-0000-4000-8000-00000000000{name[-1]}"), name, owner)
+    lock.bind(row)
+    return worker_panes.OpenWorker(row, name, name, "idle")
+
+def submit(*args, started, **options):
+    assert started.row.name == name
+    print("active", flush=True)
+    assert sys.stdin.readline() == "finish\n"
+    return worker.DispatchSubmission.SUBMITTED
+
+with (patch.object(fcntl, "flock", side_effect=observe_lock),
+      patch.object(subprocess, "run", side_effect=record),
+      patch.object(assign, "pane_policy"),
+      patch.object(worker_panes, "start_or_resume", side_effect=open_reviewer),
+      patch.object(assign.herdr, "Herdr", return_value=SimpleNamespace(
+          pane_agent_process=lambda *args: SimpleNamespace(pid=os.getpid()))),
+      patch.object(assign.astra_roles, "hold", side_effect=lambda *args: {"staff_id": args[-1]}),
+      patch.object(worker, "dispatch", side_effect=submit)):
+    args = assign.Arguments(new_worker=name, reply_file=str(run / "reply.md"))
+    raise SystemExit(assign.execute_astra_review_herdr(args, run, run, run / "prompt.md", dict(os.environ)))
+"""
+        parent = self.fixture.fixture.parent
+        run = self.fixture.run_dir
+        names = ("review-a", "review-b", "review-c")
+        env = staff.child_environment(os.environ)
+        with ExitStack() as children:
+            def launch(name: str) -> subprocess.Popen[str]:
+                child = subprocess.Popen([sys.executable, "-c", program, parent.id, name, str(run)],
+                    cwd=ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                _ = children.enter_context(child)
+                _ = children.callback(child.kill)
+                return child
+
+            def receive(child: subprocess.Popen[str], message: str) -> None:
+                assert child.stdout is not None
+                self.assertTrue(select.select([child.stdout], [], [], 6)[0], f"Expected {message}.")
+                line = cast(str, child.stdout.readline())
+                if not line:
+                    _, diagnostics = child.communicate(timeout=6)
+                    self.fail(diagnostics)
+                self.assertEqual(line, message + "\n")
+
+            first = launch(names[0])
+            receive(first, "opening")
+            others = [launch(name) for name in names[1:]]
+            for child in others:
+                receive(child, "contended")
+            assert first.stdin is not None
+            _ = first.stdin.write("open\n")
+            first.stdin.flush()
+            for child in (first, *others):
+                receive(child, "active")
+            self.assertEqual({row.name for row in staff.snapshot().find(kind="worker", parent=parent.id)}
+                             & set(names), set(names))
+            for child in (first, *others):
+                output, diagnostics = child.communicate("finish\n", timeout=6)
+                self.assertEqual(child.returncode, worker.DispatchSubmission.SUBMITTED, output + diagnostics)
+
     def test_completed_astra_review_rerun_keeps_its_notice_and_reply(self) -> None:
         for changed_session in (False, True):
             with self.subTest(changed_session=changed_session):
