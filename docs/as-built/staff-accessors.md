@@ -435,7 +435,10 @@ Both `Herdr._codex_launch` and `pane_record.seed` use this method.
 An old staff record can contain a removed worktree with a `ParkedBranch` or `BranchUnrecorded`.
 Production wrap saves the branch before it removes the worktree.
 Wrap removes the unit row after cleanup and the phase note archive when no worker rows remain.
-Deferred retirement removes the stopped unit after its worktree and worker rows are gone.
+Tidy uses the saved unit IDs to preserve open Review items and clean up copies after an interrupted wrap.
+Deferred retirement checks that the unit has stopped and has no worker rows.
+Deferred retirement removes the row when the checkout is absent and the recorded branch is merged or absent.
+Deferred retirement reports remote units as waiting on their worktree host.
 Parked configuration files retain only the retirement date and session.
 Folder moves use the staff row lock.
 Git stores the move lock at `<git-common-dir>/worktrees/<worktree-id>/locked`.

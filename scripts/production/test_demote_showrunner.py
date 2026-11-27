@@ -529,6 +529,13 @@ class DemoteShowrunnerTests(StaffTestCase):
         code, _, errors = self.run_command("--check")
         self.assertEqual(code, 0, errors)
         self.assert_no_actions(before)
+        merged = self.retired_unit("merged", self.child_branch)
+        before = self.staff_file.read_bytes()
+        code, _, errors = self.run_command("--check")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(errors, "")
+        self.assertEqual(staff.by_id(merged.id), merged)
+        self.assert_no_actions(before)
 
     def test_refuses_unmerged_branches_and_accepts_merged_or_missing_branches(self) -> None:
         commit = self.git("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "unmerged work")

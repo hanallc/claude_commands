@@ -66,14 +66,12 @@ def check_units(child: Production, record: staff.StaffSnapshot) -> None:
     unmerged: list[str] = []
     for row in rows:
         try:
-            branch = production_lifecycle.unit_branch(row, resolver)
-            if not isinstance(branch, session_staff.Branch):
-                print(f"anomaly: {row.name}: {' '.join(branch.reason.splitlines())}", file=sys.stderr)
-                continue
-            if production_lifecycle.branch_merge_state(child, branch.name) is production_lifecycle.BranchMergeState.UNMERGED:
-                unmerged.append(branch.name)
+            branch = production_lifecycle.read_wrap_branch(row, resolver)
+            if production_lifecycle.branch_merge_state(child, branch) is production_lifecycle.BranchMergeState.UNMERGED:
+                unmerged.append(branch)
         except (OSError, ValueError, production_lifecycle.LifecycleStop) as error:
-            print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+            reason = " ".join(str(error).splitlines()).removeprefix(f"{row.name}: ")
+            print(f"anomaly: {row.name}: {reason}", file=sys.stderr)
     if unmerged:
         raise Refusal(f"{child.name}: unmerged branches: {', '.join(unmerged)}")
 

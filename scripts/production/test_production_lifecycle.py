@@ -28,6 +28,8 @@ from unittest import mock
 
 
 from scripts.production import fake_unit_host
+from scripts.copies import copies
+from scripts.production import investigation
 from scripts.production import merge_checkpoint, production_lifecycle, promotion as publication
 from scripts.production import showrunners
 from scripts.herdr import worker_panes
@@ -350,9 +352,17 @@ class LifecycleTests(LifecycleFixture):
             first = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
         self.assertTrue((self.state / "showrunner" / self.owner_id("example") / "wrap_release.json").exists())
-        with mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture read twice")):
+        if not retire_showrunner:
+            self.assertIsNone(staff.by_id(alpha.id))
+        with (mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture read twice")),
+              mock.patch.object(investigation, "open_review_investigations",
+                                wraps=investigation.open_review_investigations) as reviews,
+              mock.patch.object(copies, "remove_trees", wraps=copies.remove_trees) as remove_trees):
             result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for unit in (alpha, beta):
+            reviews.assert_any_call(unit.id)
+            remove_trees.assert_any_call(unit.id)
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         for row in (alpha, beta):
             assert isinstance(row.worktree, staff.PresentWorktree)

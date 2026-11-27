@@ -23,8 +23,8 @@ from typing import NamedTuple, cast
 
 
 from scripts.production import ci_points, investigation, session_staff, staff, unit_config
-from scripts.agents import pane_record, stop_resume
-from scripts.lib import git_files, land_main, main_publish, main_push_lock, main_sync, origin_deletion
+from scripts.agents import pane_record, shutdown, stop_resume
+from scripts.lib import conf, git_files, land_main, main_publish, main_push_lock, main_sync, origin_deletion
 from scripts.herdr import herdr, worker_panes
 from scripts.agents.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
@@ -504,7 +504,7 @@ def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | Prod
 
 def wrap_branch_path(row: staff.StaffRow) -> Path:
     assert isinstance(row.parent, staff.ReportsTo)
-    return showrunners.SHOWRUNNER_STATE_DIR / row.parent.id / "wrap_units" / f"{row.id}.json"
+    return tidy_wrapped.wrap_unit_records(row.parent.id) / f"{row.id}.json"
 
 
 def wrap_branch_facts(row: staff.StaffRow) -> dict[str, str]:
@@ -528,6 +528,28 @@ def read_wrap_branch(row: staff.StaffRow, resolver: session_staff.RowResolver) -
         if isinstance(branch, str) and branch and fields == {**wrap_branch_facts(row), "branch": branch}:
             return branch
     raise LifecycleStop("retire", "held", f"{row.name}: saved branch does not match the session and worktree")
+
+
+def require_deferred_branch(unit_fields: dict[str, object], parent_fields: dict[str, object]) -> None:
+    """Check the recorded branch with the same rules as agents retire."""
+    try:
+        row = staff.StaffRow.from_json(unit_fields)
+        parent = staff.StaffRow.from_json(parent_fields)
+        location = row.worktree
+        if isinstance(location, staff.WorktreeUnfilled):
+            raise ValueError("the worktree is unfilled")
+        production = read_production(parent)
+        branch = read_wrap_branch(row, session_staff.RowResolver(staff.StaffSnapshot((row, parent))))
+        unit = shutdown.RetiringUnit(production, row.name, location.path, branch, row)
+        settings = conf.read("production")
+        result = shutdown.retirement_git(unit, "check-ref-format", f"refs/heads/{branch}", settings=settings)
+        if result.returncode:
+            raise ValueError(f"{branch!r}: invalid recorded branch")
+        checked = shutdown.retirement_check(unit, settings=settings)
+        if checked.refusals:
+            raise ValueError(". ".join(checked.refusals))
+    except (subprocess.SubprocessError, Refusal, LifecycleStop, staff.StaffRefused) as error:
+        raise ValueError(str(error)) from error
 
 
 class BranchMergeState(Enum):
@@ -1105,9 +1127,11 @@ def clean_wrap_unit(production: Production, item: PreparedWrapUnit, record: staf
         if has_worktree and not worktree_records.registered_checkout(unit.worktree, production.checkout, unit.branch):
             raise LifecycleStop("retire", "held", f"{unit.name}: the Git worktree identity changed")
         _ = unit_config.park(member.id, unit.worktree, item.retirement)
-        if has_worktree:
+        if has_worktree or not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             write_text_atomic(path, json.dumps({**wrap_branch_facts(member), "branch": unit.branch}) + "\n")
+            sync_folder(path.parent.parent)
+        if has_worktree:
             retire_reservations(unit.worktree)
             _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))
             release_worktree_pair(unit.worktree)
@@ -1130,7 +1154,6 @@ def finish_wrap_unit(unit: UnitRow) -> bool:
             staff.defer_retire((member.id,))
             return False
         staff.retire_unit(member, expected_workers=())
-        wrap_branch_path(member).unlink(missing_ok=True)
         return True
 
 

@@ -2721,8 +2721,37 @@ def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
     return row
 
 
-def _retire_absent_unit(rows: list[StaffRow], pending: set[StaffId], row: StaffRow, locks: ExitStack) -> bool:
-    """Remove a stopped unit after its local worktree and worker rows are gone."""
+@contextmanager
+def _lock_deferred_units(record: StaffSnapshot, ids: Sequence[StaffId]) -> Generator[dict[StaffId, StaffRow]]:
+    """Take the unit locks before the staff record lock."""
+    from scripts.agents import remote
+
+    with ExitStack() as locks:
+        locked: dict[StaffId, StaffRow] = {}
+        for identity in sorted(set(ids)):
+            row = record.by_id(identity)
+            if (row is not None and row.kind == "unit" and worktree_machine(row) == remote.local_machine()
+                    and not any(child.reports_to(identity) for child in record.rows)):
+                try:
+                    _ = locks.enter_context(slot_operation(identity, row.name))
+                except (OSError, StaffRefused) as error:
+                    print(f"staff: keeping {identity}: {error}", file=sys.stderr)
+                else:
+                    locked[identity] = row
+        yield locked
+
+
+def _require_absent_checkout(path: Path) -> None:
+    try:
+        _ = path.lstat()
+    except FileNotFoundError:
+        return
+    raise StaffRefused(f"{path}: the worktree still exists")
+
+
+def _retire_absent_unit(rows: list[StaffRow], pending: set[StaffId], row: StaffRow,
+                        locked: Mapping[StaffId, StaffRow]) -> bool:
+    """Remove a stopped unit after the checkout and branch checks pass."""
     from scripts.agents import remote
 
     if any(child.reports_to(row.id) for child in rows):
@@ -2732,15 +2761,26 @@ def _retire_absent_unit(rows: list[StaffRow], pending: set[StaffId], row: StaffR
         print(f"staff: keeping {row.id}: worktree is unfilled", file=sys.stderr)
         return False
     if location.machine != remote.local_machine():
+        print(f"staff: keeping {row.id}: waiting on worktree host {location.machine}", file=sys.stderr)
         return False
     try:
-        _ = locks.enter_context(slot_operation(row.id, row.name))
-        try:
-            _ = location.path.lstat()
-        except FileNotFoundError:
-            _remove_unit_members(rows, pending, row, {row.id: row})
-            return True
-    except (OSError, StaffRefused) as error:
+        expected = locked.get(row.id)
+        if expected is None or expected.to_json() != row.to_json():
+            raise StaffRefused("the unit or its workers changed before the retirement check")
+        _require_absent_checkout(location.path)
+        parent = _row_by_id(rows, row.parent.id) if isinstance(row.parent, ReportsTo) else None
+        if parent is None or parent.kind != "showrunner" or isinstance(parent.doc, DocUnfilled):
+            raise StaffRefused("the production document is unfilled")
+        if parent.doc.machine != location.machine:
+            raise StaffRefused(f"the production document is on {parent.doc.machine}")
+        # The CLI and the runtime reader can load separate staff classes.
+        check = cast(Callable[[dict[str, object], dict[str, object]], None],
+                     import_module("scripts.production.production_lifecycle").require_deferred_branch)
+        check(row.to_json(), parent.to_json())
+        _require_absent_checkout(location.path)
+        _remove_unit_members(rows, pending, row, {row.id: row})
+        return True
+    except (OSError, ValueError, StaffRefused) as error:
         print(f"staff: keeping {row.id}: {error}", file=sys.stderr)
     return False
 
@@ -2797,13 +2837,14 @@ def retire_pending() -> tuple[StaffId, ...]:
             if row is None:
                 pending.remove(staff_id)
             elif row.kind == "unit":
-                if _retire_absent_unit(rows, pending, row, locks):
+                if _retire_absent_unit(rows, pending, row, locked):
                     removed.append(staff_id)
             elif _wrap_pending_showrunner(rows, row):
                 pending.remove(staff_id)
         return tuple(sorted(pending))
 
-    with ExitStack() as locks:
+    record = initial_snapshot()
+    with _lock_deferred_units(record, record.pending_retire) as locked:
         remaining = _record_transaction(edit)
     if removed:
         _forget_restart(removed)
@@ -2876,14 +2917,14 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
                 raise StaffRefused(f"seed can retire only an absent unit: {staff_id}")
             if row.parent != ReportsTo(retirement.parent):
                 print(f"seed: keeping unit {row.name}: parent changed", file=sys.stderr)
-            elif _retire_absent_unit(rows, pending, row, locks):
+            elif _retire_absent_unit(rows, pending, row, locked):
                 removed.append(staff_id)
             else:
                 pending.add(staff_id)
         return StaffSnapshot(tuple(sorted(rows, key=lambda row: row.id)),
                              tuple(sorted(pending)))
 
-    with ExitStack() as locks:
+    with _lock_deferred_units(initial_snapshot(), [item.staff_id for item in seed_input.retire]) as locked:
         result = _record_transaction(edit)
     if removed:
         _forget_restart(removed)
