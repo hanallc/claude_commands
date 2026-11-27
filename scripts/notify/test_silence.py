@@ -23,7 +23,8 @@ from unittest import mock
 from urllib.parse import parse_qs
 
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.notify import pushover, push_texts, silence
+from scripts.notify import push_reference, push_texts, pushover, silence
+from scripts.notify.push_reference import PushIdentity
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
@@ -291,6 +292,41 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
                 self.assertEqual(posted, [PUSH])
                 self.assertEqual(silence.read_kept(), [])
 
+    def test_confirmed_rejection_retries_on_later_release_after_an_interruption(self) -> None:
+        folder = silence.state_dir()
+        question = folder / "question.md"
+        _ = question.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"new"}\n---\n')
+        keys = folder / "keys"
+        _ = keys.write_text("PUSHOVER_USER=fixture\nPUSHOVER_TOKEN=fixture\n")
+        reference = push_reference.QuestionReference(kind="question", path=str(question), since="new")
+        new: silence.KeptPush = {**PUSH, "key": "shared", "reference": reference}
+        unbound: silence.KeptPush = {**PUSH, "key": "shared"}
+        legacy: silence.KeptPush = {**new, "reference": {**reference, "since": "old"}, "post_started": True}
+        earlier_attempt: silence.KeptPush = {**new, "post_started": True}
+        _ = self.main("on")
+        for push in (earlier_attempt, new, unbound, legacy):
+            self.assertIsInstance(silence.keep_here(push), silence.Kept)
+        post = mock.Mock(side_effect=[(429, b'{"status":0,"errors":["over quota"]}'),
+                                     KeyboardInterrupt, (200, b'{"status":1}')])
+
+        def deliver(kept: silence.KeptPush) -> int:
+            return pushover.post_kept(kept, keys, post)
+
+        with (mock.patch.object(pushover, "LOG_FILE", folder / "log"), redirect_stdout(io.StringIO()),
+              redirect_stderr(io.StringIO())):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = silence.off(self.runner, deliver)
+            prior, rejected, interrupted, old = silence.read_kept()
+            self.assertEqual((prior, rejected, old), (earlier_attempt, {**new, "post_rejection": "over quota"}, legacy))
+            attempt = interrupted.get("post_started", False)
+            self.assertTrue(attempt)
+            self.assertEqual(interrupted, {**unbound, "post_started": attempt})
+            self.assertEqual(silence.end_if_past(self.runner, deliver), 0)
+            self.assertEqual(post.call_count, 2)
+            self.assertEqual(silence.off(self.runner, deliver), 0)
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(silence.read_kept(), [earlier_attempt, interrupted, legacy])
+
     def kept_titles(self) -> list[str]:
         return [push["title"] for push in silence.read_kept()]
 
@@ -317,10 +353,10 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
                                                                         "key": "prompt-2"}]
         for push in pushes:
             _ = silence.keep_here(push)
-        self.assertEqual(silence.drop("stall-watch", "prompt", "Linux"), 1)
+        self.assertEqual(silence.drop(PushIdentity("stall-watch", "prompt"), "Linux"), 1)
         self.assertEqual(self.kept_titles(), ["Other source", "No key", "Other key"])
         # An empty key drops nothing, as an empty key never replaces; a second drop finds nothing.
-        self.assertEqual(silence.drop("build", "", "Linux"), 0)
+        self.assertEqual(silence.drop(PushIdentity("build", ""), "Linux"), 0)
         self.assertEqual(self.main("drop", "--source", "stall-watch", "--key", "prompt"), "0\n")
         self.assertEqual(self.main("drop", "--source", "stall-watch", "--key", "prompt-2"), "1\n")
         self.assertEqual(self.kept_titles(), ["Other source", "No key"])
@@ -490,7 +526,7 @@ class MacTests(unittest.TestCase):
         self.assertEqual(seen[0][-2], "natedev")
         self.assertEqual(seen[0][-1], silence.REMOTE + " on --until '2026-10-21 07:00'")
 
-    def test_a_drop_asks_natedev_and_drops_nothing_when_natedev_cannot_answer(self) -> None:
+    def test_a_drop_distinguishes_remote_failure_from_an_empty_queue(self) -> None:
         asked: list[tuple[list[str], str]] = []
 
         def asker(answer: tuple[int, str]) -> silence.Ask:
@@ -499,12 +535,13 @@ class MacTests(unittest.TestCase):
                 return answer
             return ask
 
-        self.assertEqual(silence.drop("stall-watch", "stall-watch:prompt:x y", "Darwin", asker((0, "2\n"))), 2)
+        self.assertEqual(silence.drop(PushIdentity("stall-watch", "stall-watch:prompt:x y"), "Darwin", asker((0, "2\n"))), 2)
         self.assertEqual(asked[0], ([*silence.SSH, silence.REMOTE + " drop --source stall-watch --key 'stall-watch:prompt:x y'"], ""))
+        self.assertEqual(silence.drop(PushIdentity("stall-watch", "k"), "Darwin", asker((0, "0\n"))), 0)
         for answer in ((255, ""), (0, "not a number\n")):
-            with self.subTest(answer=answer), redirect_stderr(io.StringIO()) as errors:
-                self.assertEqual(silence.drop("stall-watch", "k", "Darwin", asker(answer)), 0)
-            self.assertIn("natedev could not be asked to drop k", errors.getvalue())
+            with (self.subTest(answer=answer),
+                  self.assertRaisesRegex(silence.RemoteDropFailed, "did not confirm the drop for k")):
+                _ = silence.drop(PushIdentity("stall-watch", "k"), "Darwin", asker(answer))
 
 
 if __name__ == "__main__":

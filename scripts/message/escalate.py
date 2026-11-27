@@ -449,9 +449,15 @@ def close(key: str) -> bool:
         if isinstance(held, NoHeld):
             return False
         if isinstance(held, HeldMessage) and held.outcome == "sent" and held.need == "blocked":
+            reference = held.reference if isinstance(held, RegisteredHold) else push_reference.NO_REFERENCE
+            identity = push_reference.PushIdentity(JOB, user_key(key), reference)
+            command = (session_send.send_argv("question-push-clear", identity.sender, identity.key,
+                                             json.dumps(identity.question.reference), "--emergency", send_script=SEND)
+                       if identity.question is not None
+                       else push_texts.user_retire_argv(identity.sender, identity.key, send_script=SEND))
             try:
-                done = subprocess.run(session_send.send_argv("retire", "--to", "user", "--from", JOB,
-                                       "--key", user_key(key), send_script=SEND), capture_output=True, text=True, check=False, timeout=60)
+                done = subprocess.run(command,
+                                      capture_output=True, text=True, check=False, timeout=60)
                 problem = "" if done.returncode == 0 else (
                     failure_detail(done, lines=1)).replace("\n", "; ")
             except (OSError, subprocess.TimeoutExpired) as error:
@@ -508,8 +514,9 @@ def deliver(held: HeldMessage, key: str) -> str:
         return "template revision required"
     rendered = push_texts.render(held.text_id, **dict(held.values))
     command = push_texts.user_send_argv(rendered, sender=JOB, key=user_key(key),
-                                      self_clearing=held.need == "blocked", send_script=SEND,
-                                      question=held.reference["path"] if held.reference["kind"] == "question" else "")
+                                      self_clearing=held.need == "blocked", send_script=SEND)
+    if held.reference["kind"] == "question":
+        command.extend(["--push-reference", json.dumps(held.reference)])
     done = subprocess.run(command, capture_output=True, text=True, check=False,
                           timeout=send_budget.user_seconds(review.user_send_seconds()))
     return "" if done.returncode == 0 else " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"

@@ -1534,6 +1534,38 @@ class WorkerPaneTests(StaffTestCase):
                     self.assertIn(str(first.row.current_session), self.world.requests[-1][1])
                 self.assertEqual(self.world.closed, [])
 
+    def test_standalone_start_and_resume_keep_the_recorded_phase_session(self) -> None:
+        run = self.run_state()
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        key = "CARGO_BERTH_SESSION_ID"
+        expected = f"{self.parent.current_session}.phase-earlier"
+        self.assertEqual(self.world.requests[-1][2].get(key), expected)
+        entries = pane_launch.read(pane_launch.record_directory() / f"{self.world.session}.json")
+        self.assertEqual(entries[opened.pane]["environment"].get(key), expected)
+
+        path = run / "progress_history_state.json"
+        state = cast(dict[str, object], json.loads(path.read_text()))
+        phases = cast(list[dict[str, object]], state["open_phases"])
+        phases.append({"id": "later", "instance_id": "later-phase", "status": "active"})
+        write_text_atomic(path, json.dumps(state))
+        self.assertTrue(self.world.stop(opened.row, self.world))
+        retained = self.start()
+        assert isinstance(retained, worker_panes.OpenWorker)
+        self.assertEqual(self.world.requests[-1][2].get(key), expected)
+
+        state["pass"] = {opened.row.name: {"instance_id": "dispatch-impl", "worker_id": opened.row.id,
+                                         "team_slot": opened.row.name, "kind": "impl", "status": "active",
+                                         "phase": {"id": "earlier", "instance_id": "earlier-phase"}}}
+        write_text_atomic(path, json.dumps(state))
+        self.assertTrue(self.world.stop(retained.row, self.world))
+        account = accounts.CodexWorkersAccount("codex2", self.root / "codex2")
+        resumed = self.start(account=account)
+        assert isinstance(resumed, worker_panes.OpenWorker)
+        self.assertEqual((resumed.terminal, resumed.row.current_session), (opened.terminal, opened.row.current_session))
+        self.assertEqual(self.world.requests[-1][2].get(key), expected)
+        self.assertEqual(self.world.requests[-1][2]["CODEX_HOME"], str(account.home))
+
     def test_unreadable_launch_environment_without_a_current_dispatch_is_uncertain(self) -> None:
         for status in ("missing", "completed", "refused", "error"):
             with self.subTest(status=status):
@@ -1782,7 +1814,7 @@ class WorkerPaneTests(StaffTestCase):
     def test_fresh_codex_publishes_the_first_turn_report_and_sends_no_second_turn(self) -> None:
         cases = (("current", "OpenWorker", "none", "yes"),
                  ("cached", "OpenWorker", "none", "yes"),
-                 ("starting", "ClosedWorker", "starting", "no"),
+                 ("starting", "ClosedWorker", "pane is starting", "no"),
                  ("stopped", "StoppedWorker", "none", "yes"),
                  ("missing", "ClosedWorker", "none", "no"))
         for mode, state_kind, scan_reason, parent_tab in cases:
@@ -3673,6 +3705,7 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(arguments[arguments.index("--model") + 1],
                                  models_registry.launch_settings("direct", "impl", family).model)
                 self.assertEqual(environment["CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"], str(target))
+                self.assertEqual(environment.get("CARGO_BERTH_SESSION_ID"), f"{self.parent.current_session}.phase-earlier")
 
     def test_account_move_to_the_current_account_does_nothing(self) -> None:
         from scripts.accounts import pane_moves
@@ -4144,6 +4177,43 @@ class WorkerPaneTests(StaffTestCase):
         self.world.unknown["w1:p9"] = "unreadable pane in the parent's tab"
         found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
         self.assertIsInstance(found[absent.id], worker_panes.UncertainWorker)
+
+    def test_starting_pane_affects_only_its_worker(self) -> None:
+        starting, ready, absent = self.worker("starting"), self.worker("ready"), self.worker("absent")
+        pane = "w1:p1"
+        self.world.add(starting, pane)
+        self.world.add(ready, "w1:p2")
+        pid, _, _ = self.world.foreground[pane]
+        self.world.foreground[pane] = (pid, "claude", [])
+        ticks = os.sysconf("SC_CLK_TCK")
+        fake_unit_host.process(os.environ, pid, 1, [], {}, started=str(100 * ticks))
+        _ = (self.root / "proc/uptime").write_text("101.0 0.0\n")
+        _ = write_config_fixture(self.root / "conf/shutdown.conf", "start_seconds=20\n")
+
+        with redirect_stderr(io.StringIO()) as errors:
+            found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
+
+        self.assertEqual(found, {
+            starting.id: worker_panes.StartingWorker(starting, pane, "terminal-w1:p1"),
+            ready.id: worker_panes.OpenWorker(ready, "w1:p2", "terminal-w1:p2", herdr.AgentStatus.IDLE),
+            absent.id: worker_panes.ClosedWorker(absent),
+        })
+        self.assertEqual(errors.getvalue(), "herdr agents:w1:p1: pane is starting\n")
+
+    def test_starting_pane_without_a_launch_record_leaves_absence_unproved(self) -> None:
+        starting, ready = self.worker("starting"), self.worker("ready")
+        pane = "w1:p1"
+        self.world.add(starting, pane)
+        self.world.add(ready, "w1:p2")
+        pid, _, _ = self.world.foreground[pane]
+        self.world.foreground[pane] = (pid, "claude", [])
+        fake_unit_host.process(os.environ, pid, 1, [], {}, started=str(100 * os.sysconf("SC_CLK_TCK")))
+        _ = (self.root / "proc/uptime").write_text("101.0 0.0\n")
+        _ = write_config_fixture(self.root / "conf/shutdown.conf", "start_seconds=20\n")
+        with patch.object(pane_launch, "read_valid_entries", return_value={}), redirect_stderr(io.StringIO()):
+            found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
+        self.assertIsInstance(found[starting.id], worker_panes.UncertainWorker)
+        self.assertIsInstance(found[ready.id], worker_panes.OpenWorker)
 
     def test_unreadable_parent_pane_leaves_an_absent_worker_uncertain(self) -> None:
         absent = self.worker("absent")

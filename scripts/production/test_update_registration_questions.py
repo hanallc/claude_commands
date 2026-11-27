@@ -18,7 +18,9 @@ from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import proposal_issue, proposals_folder, staff
-from scripts.review_links import new_item_dialog, reply_proofs, reply_tokens
+from scripts.message import send
+from scripts.notify import push_reference, question_pushes, silence
+from scripts.review_links import change_browser, new_item_dialog, reply_proofs, reply_tokens
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
 from scripts.production.cli_fixture import invoke_cli
@@ -45,6 +47,110 @@ class RegistrationTests(RegistrationFixture):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(config), "REVIEW_LINKS_ROOT": self.env["REVIEW_LINKS_ROOT"],
             "XDG_STATE_HOME": self.env["XDG_STATE_HOME"]})))
+
+    def isolate_pushes(self) -> None:
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "send.conf")
+        self.env["NOTIFY_STATE_DIR"] = str(self.root / "notify")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": self.env["NOTIFY_STATE_DIR"]})))
+        _ = self.enterContext(mock.patch.object(send, "STATE", self.root / "message"))
+
+    def bind_push(self, record: registration.QuestionRecord) -> question_pushes.Binding:
+        reference = push_reference.admission_reference("decision.choices", str(record.path))
+        assert reference["kind"] == "question"
+        with silence.locked():
+            return question_pushes.bind_locked(push_reference.PushIdentity("Override sender", "custom key", reference), emergency=True)
+
+    def test_question_push_retirement_follows_terminal_writes(self) -> None:
+        self.isolate_pushes()
+        identities = registration.QuestionStaff.read()
+        scope = registration.question_scope(self.owner_id, identities.record)
+        for route in ("answer", "feedback", "cli", "accepted reply", "unbound"):
+            with self.subTest(route=route), mock.patch.object(send, "cancel_user_push", return_value=(0, "cancelled")) as cancel:
+                title = "Choose the layout " + route
+                if route == "accepted reply":
+                    token = reply_tokens.RawReplyToken("r" + "b" * 42)
+                    request = f"r1-{'b' * 32}-question-{self.owner_id}"
+                    details = new_item_dialog.ReviewSubmission(
+                        request, "a" * 64, new_item_dialog.NoEvidence(), (),
+                        reply_proof=reply_tokens.LegacyReplyProof(reply_tokens.digest(token)))
+                    parts = registration.QuestionParts(ask=title, context="", items=[], recommend="", choices=[])
+                    record = registration.ask(scope, title, parts, "", registration.Ranking(), identities=identities,
+                        outgoing=registration.QuestionFromReview(title, "The owner answers.", details, lambda _id, _path: None))
+                else:
+                    _ = self.run_ask(title, "Which layout should we use?")
+                    record = registration.read_question_record(self.question_record_path(title), self.owner_id)
+                binding = None if route == "unbound" else self.bind_push(record)
+                if route == "accepted reply":
+                    registration.record_followup_reply(record.item, "Use the desktop layout.", record.owner)
+                    registration.write_question_record(record)
+                    cancel.assert_not_called()
+                    done = self.run_command("answer", "--key", registration.open_item_key(record))
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                elif route == "cli":
+                    for _attempt in range(2):
+                        done = self.run_command("answer", "--item", title)
+                        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                else:
+                    selected = change_browser.WaitingQuestion(change_browser.question_key(record), "example", record,
+                                                               self.doc, record.owner, record.asker)
+                    change_browser.save_question_record(scope, selected, "feedback" if route == "feedback" else "answer",
+                        "Use the desktop layout.", change_browser.SelectedQuestionSave(), before_write=lambda: None)
+                self.assertEqual(push_reference.read_question(record.path).status, "closed")
+                question_pushes.answer_saved(record.path)
+                if binding is None:
+                    cancel.assert_not_called()
+                else:
+                    cancel.assert_called_once_with(binding.identity)
+                    self.assertFalse(question_pushes.binding_path(binding.identity.sender, binding.identity.key).exists())
+
+    def test_failed_question_push_retirement_keeps_the_saved_answer_and_retries(self) -> None:
+        self.isolate_pushes()
+        title = "Choose the layout"
+        _ = self.run_ask(title, "Which layout should we use?")
+        path = self.question_record_path(title)
+        record = registration.read_question_record(path, self.owner_id)
+        binding = self.bind_push(record)
+        with mock.patch.object(send, "cancel_user_push", side_effect=[(3, "fixture cancellation failed"), (0, "cancelled")]) as cancel:
+            with (mock.patch.object(registration, "write_text_atomic", side_effect=OSError("write refused")),
+                  self.assertRaises(OSError)):
+                registration.write_question_record(replace(record, status="closed"))
+            cancel.assert_not_called()
+            self.assertEqual(push_reference.read_question(path).status, "open")
+            done = self.run_command("answer", "--item", title)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual(push_reference.read_question(path).status, "closed")
+            self.assertIsNotNone(question_pushes.read_binding(question_pushes.binding_path(binding.identity.sender, binding.identity.key)))
+            self.assertIn("Answer saved. Push retirement pending", (self.state / "notifier/notifier.log").read_text())
+            self.assertEqual(question_pushes.drain(), 0)
+            self.assertEqual(question_pushes.drain(), 0)
+        self.assertEqual(cancel.call_count, 2)
+
+    def test_question_push_survives_rollback_after_the_notifier_reads(self) -> None:
+        self.isolate_pushes()
+        title = "Choose the layout"
+        _ = self.run_ask(title, "Which layout should we use?")
+        path = self.question_record_path(title)
+        record = registration.read_question_record(path, self.owner_id)
+        binding = self.bind_push(record)
+        binding_file = question_pushes.binding_path(binding.identity.sender, binding.identity.key)
+        identities = registration.QuestionStaff.read()
+        scope = registration.question_scope(self.owner_id, identities.record)
+
+        def refuse_list_write() -> None:
+            self.assertIn("\nstatus: closed\n", path.read_text())
+            self.assertEqual(question_pushes.drain(), 0)
+            raise OSError("list write refused")
+
+        with mock.patch.object(send, "cancel_user_push", return_value=(0, "cancelled")) as cancel:
+            with self.assertRaisesRegex(OSError, "list write refused"):
+                registration.store_questions(scope, [], identities, write_list=refuse_list_write)
+            self.assertEqual(push_reference.read_question(path).status, "open")
+            self.assertEqual(question_pushes.read_binding(binding_file), binding)
+            cancel.assert_not_called()
+            registration.store_questions(scope, [], identities)
+            cancel.assert_called_once_with(binding.identity)
+            self.assertEqual(push_reference.read_question(path).status, "closed")
+            self.assertFalse(binding_file.exists())
 
     def test_f079_new_question_keeps_the_answer_at_a_late_collision(self) -> None:
         identities = registration.QuestionStaff.read()

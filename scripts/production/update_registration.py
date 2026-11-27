@@ -1288,14 +1288,14 @@ def wrap_question_locks(*owners: staff.StaffId, existing_only: bool = False) -> 
 def close_questions(document: Path, identities: QuestionStaff) -> None:
     """Close the production's questions and retain their records for history."""
     owner = identities.owner(document).id
-    with outstanding_lock(outstanding_file(owner, identities=identities)), _question_number_lock(owner), ExitStack() as rollback:
+    with outstanding_lock(outstanding_file(owner, identities=identities)), _question_number_lock(owner):
         closing = [replace(record, status="closed") for record in question_records_for_document(document, identities, strict=True)
                    if record.status == "open" and not pending_review_reply(record)]
         texts = [_question_text(record) for record in closing]
-        with question_numbers() as numbers:
+        with _committed_question_writes() as closed, question_numbers() as numbers, ExitStack() as rollback:
             for record, text in zip(closing, texts, strict=True):
                 _ = rollback.enter_context(record_store.keep_file_on_error(record.path))
-                _write_question_text(record, text, numbers)
+                _write_question_text(record, text, numbers, closed=closed)
 
 
 def _question_fields(path: Path, owner: staff.StaffId) -> Issue | None:
@@ -1350,13 +1350,13 @@ def question_numbers(*, existing_only: bool = False) -> AbstractContextManager[r
 
 def _publish_question(record: QuestionRecord, *, record_history: Callable[[], None] | None = None) -> str:
     """Save the record and assign an ID if this is its first numbered write."""
-    with question_numbers() as numbers:
+    with _committed_question_writes() as closed, question_numbers() as numbers:
         identity = _numbered_question_id(record) or numbers.next_id(record.path.parent)
         numbered = replace(record, item={**record.item, "review_id": identity})
         text = _question_text(numbered)
         if record_history is not None:
             record_history()
-        _write_question_text(numbered, text, numbers)
+        _write_question_text(numbered, text, numbers, closed=closed)
         record.item["review_id"] = identity
         return identity
 
@@ -1428,20 +1428,38 @@ def write_question_record(record: QuestionRecord, *, assign_id: bool = False,
     _write_question_text(record, text)
 
 
+@contextmanager
+def _committed_question_writes() -> Generator[list[Path]]:
+    """Retire pushes after publication and rollback contexts exit successfully."""
+    closed: list[Path] = []
+    yield closed
+    if closed:
+        from scripts.notify import question_pushes
+
+        for path in closed:
+            question_pushes.answer_saved(path)
+
+
 def _write_question_text(record: QuestionRecord, text: str | None,
                          numbers: record_store.LockedRecordNumbers | None = None, *,
-                         write: Callable[[Path, str], None] = write_text_atomic, preview: bool = False) -> None:
+                         write: Callable[[Path, str], None] | None = None, preview: bool = False,
+                         closed: list[Path] | None = None) -> None:
     if text is None:
         return
-    identity = _numbered_question_id(record)
-    if not identity:
-        if not preview:
-            write(record.path, text)
-        return
-    sequence = nullcontext(numbers) if numbers is not None else question_numbers(existing_only=preview)
-    with sequence as locked, locked.write(record.path, identity, record.owner, preview=preview):
-        if not preview:
-            write(record.path, text)
+    write = write_text_atomic if write is None else write
+    with (_committed_question_writes() if closed is None else nullcontext(closed)) as committed:
+        if identity := _numbered_question_id(record):
+            sequence = nullcontext(numbers) if numbers is not None else question_numbers(existing_only=preview)
+            with sequence as locked, locked.write(record.path, identity, record.owner, preview=preview):
+                if not preview:
+                    write(record.path, text)
+        elif not preview:
+            publication = (record_store.record_number_lock(record_store.RecordKind.QUESTION)
+                           if numbers is None else nullcontext())
+            with publication, record_store.keep_file_on_error(record.path):
+                write(record.path, text)
+        if not preview and record.status == "closed":
+            committed.append(record.path)
 
 
 def _question_text(record: QuestionRecord, *, new_record: bool = False) -> str | None:
@@ -1555,7 +1573,7 @@ def move_reply_proof(path: Path, *, run: reply_proofs.ProofMoveRun, legacy_owner
             proofs.append((_staff_question_identity(record), reply_proofs.NoteProof(request=removal.proof.request)))
         return run.apply(path, text, removal, proofs,
                          lambda changed: _write_question_text(record, changed, write=write_locked_atomic,
-                                                              preview=run.dry_run),
+                                                              preview=run.dry_run, closed=[]),
                          open_item=record.status == "open")
 
 
@@ -1600,6 +1618,7 @@ def store_questions(production: QuestionScope, entries: list[OutstandingItem], i
     legacy = {(record.asker, record.item['text']): record for record in existing
               if record.status == 'open' and 'review_id' not in record.item}
     with (_question_number_lock(owner),
+          _committed_question_writes() as closed,
           question_numbers() as numbers,
           ExitStack() as rollback):
         retained: set[Path] = set()
@@ -1645,7 +1664,7 @@ def store_questions(production: QuestionScope, entries: list[OutstandingItem], i
         def write(record: QuestionRecord, text: str | None) -> None:
             if text is not None:
                 _ = rollback.enter_context(record_store.keep_file_on_error(record.path))
-                _write_question_text(record, text, numbers)
+                _write_question_text(record, text, numbers, closed=closed)
 
         for record, text in plans:
             write(record, text)

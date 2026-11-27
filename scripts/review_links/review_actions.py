@@ -8,7 +8,7 @@ import secrets
 import shlex
 import sys
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
@@ -528,18 +528,26 @@ class SubmissionDeliveries:
 
 def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words: str,
                                 status: change_page.DeliveryStatus, *, evidence_page: str = "",
-                                members: staff.StaffSnapshot | staff.ReadStaffAuthority = _READ_STAFF_AUTHORITY
+                                members: staff.StaffSnapshot | staff.ReadStaffAuthority = _READ_STAFF_AUTHORITY,
+                                claims: ExitStack | None = None
                                 ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     """Claim the first message for a published native request."""
-    return prepare_submission_deliveries(saved, words, status, evidence_page=evidence_page, members=members).primary
+    return prepare_submission_deliveries(
+        saved, words, status, evidence_page=evidence_page, members=members, claims=claims).primary
 
 
 def prepare_submission_deliveries(saved: review_submissions.SavedSubmission, words: str,
                                   status: change_page.DeliveryStatus, *, evidence_page: str,
-                                  members: staff.StaffSnapshot | staff.ReadStaffAuthority) -> SubmissionDeliveries:
+                                  members: staff.StaffSnapshot | staff.ReadStaffAuthority,
+                                  claims: ExitStack | None = None) -> SubmissionDeliveries:
     """Save both messages and claim the first message for a native request."""
-    with staff.supplied_snapshot(members) if isinstance(members, staff.StaffSnapshot) else nullcontext():
-        return _claim_submission_delivery(saved.address, status, words=words, evidence_page=evidence_page)
+    with (nullcontext(claims) if claims is not None else ExitStack()) as cleanup:
+        with staff.supplied_snapshot(members) if isinstance(members, staff.StaffSnapshot) else nullcontext():
+            deliveries = _claim_submission_delivery(saved.address, status, cleanup, words=words,
+                                                    evidence_page=evidence_page)
+        if claims is None:
+            _ = cleanup.pop_all()
+        return deliveries
 
 
 def ensure_submission_list_item(address: review_submissions.SubmissionAddress) -> None:
@@ -602,8 +610,8 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
         review_submissions.skip_list_filing(saved, str(error))
 
 
-def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus, *,
-                               words: str = "", evidence_page: str = "") -> SubmissionDeliveries:
+def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus,
+                               claims: ExitStack, *, words: str = "", evidence_page: str = "") -> SubmissionDeliveries:
     # Finish the List row under the recipient locks before taking the delivery lock.
     ensure_submission_list_item(address)
 
@@ -680,6 +688,7 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
         _ = change_page.outbound_review_message(delivery)
         if slots.verdict != intent:
             status.write_slots(page, row, slots.updated('verdict', intent))
+        _ = claims.callback(status.release_owned_claims, (intent.attempt,))
         status.request_attempts[intent.attempt] = change_page.AttemptOwnership(status.path(page, row), 'claimed')
         review_submissions.clear_initial_delivery(address)
     return SubmissionDeliveries(delivery, copy)
@@ -723,7 +732,7 @@ def save_assignee_copy(source: Path, request: str, assignee: staff.StaffId, mess
 
 
 def claim_saved_assignee_copy(delivery: change_page.MessageDelivery | change_page.NoMessageDelivery,
-                              status: change_page.DeliveryStatus
+                              status: change_page.DeliveryStatus, *, claims: ExitStack
                               ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     if isinstance(delivery, change_page.MessageDelivery):
         page, row, attempt = delivery.page, delivery.row, delivery.attempt
@@ -733,6 +742,7 @@ def claim_saved_assignee_copy(delivery: change_page.MessageDelivery | change_pag
                 return change_page.NoMessageDelivery()
             if status.owns_live_claim(page, row, attempt):
                 raise SubmissionDeliveryPending("This item's assignee copy is still sending.")
+            _ = claims.callback(status.release_owned_claims, (attempt,))
             status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, row), 'claimed')
     return delivery
 
@@ -773,19 +783,13 @@ def recover_submission_deliveries(status: change_page.DeliveryStatus, review_pat
     for pending in review_submissions.pending_initial_deliveries(status.root):
         try:
             page = pending.evidence_origin + review_path if pending.evidence_origin else ""
-            deliveries = _claim_submission_delivery(pending.address, status, evidence_page=page)
-            delivery = deliveries.primary
-            try:
-                change_page.deliver(delivery, status)
-            finally:
-                if isinstance(delivery, change_page.MessageDelivery):
-                    status.release_recovery_claims((delivery.attempt,))
-            copy = claim_saved_assignee_copy(deliveries.assignee, status)
-            try:
-                change_page.deliver(copy, status)
-            finally:
-                if isinstance(copy, change_page.MessageDelivery):
-                    status.release_recovery_claims((copy.attempt,))
+            with ExitStack() as claims:
+                deliveries = _claim_submission_delivery(pending.address, status, claims, evidence_page=page)
+                try:
+                    change_page.deliver(deliveries.primary, status)
+                finally:
+                    copy = claim_saved_assignee_copy(deliveries.assignee, status, claims=claims)
+                    change_page.deliver(copy, status)
         except (OSError, ValueError, RuntimeError, staff.StaffRefused) as error:
             print(f"Review first message {pending.address.request_id}: {error}", file=sys.stderr)
 

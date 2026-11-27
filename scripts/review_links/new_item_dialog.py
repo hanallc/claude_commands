@@ -1181,7 +1181,9 @@ def render() -> str:
     <button type="button" data-later-draft hidden>Edit a separate draft</button>
     <button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button>
    </div>
-   <div data-saved-controls hidden><button type="button" data-done aria-describedby="new-item-saved">Done</button></div>
+   <div data-saved-controls hidden>
+    <button type="button" data-done aria-describedby="new-item-saved">Done</button>
+   </div>
   </footer>
 '''
     dialog = page_frame.console_dialog('review-new-item', 'new-item-title', 'New item', body,

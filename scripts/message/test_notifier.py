@@ -544,6 +544,21 @@ class NotifierTests(unittest.TestCase):
             _ = self.successful("tick", send_rc=3)
         self.assertIn("clear-check: fake send result", (self.state_dir / "notifier.log").read_text())
 
+    def test_tick_retries_question_push_retirement_only_when_bindings_exist(self) -> None:
+        notify = self.root / "notify"
+        with mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(notify)}):
+            _ = self.successful("tick")
+            self.assertFalse(self.send_args.exists())
+            bindings = notify / "question-pushes"
+            bindings.mkdir(parents=True)
+            _ = (bindings / "fixture.json").write_text("{}")
+            _ = self.successful("tick")
+            self.assertEqual(self.send_args.read_text().splitlines(), ["question-push-drain"])
+            self.send_args.unlink()
+            _ = (notify / "silence-kept.jsonl").write_text("{}\n")
+            _ = self.successful("tick")
+        self.assertEqual(self.send_args.read_text().splitlines(), ["question-push-release"])
+
     def test_tick_on_another_notifier_state_never_reads_the_real_emergencies(self) -> None:
         state = self.root / "xdg"
         (state / "message").mkdir(parents=True)

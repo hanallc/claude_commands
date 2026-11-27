@@ -1862,10 +1862,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError:
             self.json_response(400, {"error": "Could not read the New item request."})
             return
-        self.review_item_post(server, fields, token, valid_token, limits=limits, size=size)
+        with ExitStack() as claims:
+            self.review_item_post(server, fields, token, valid_token, limits=limits, size=size, claims=claims)
 
     def review_item_post(self, server: ReviewLinksServer, fields: dict[str, object], token: object,
-                         valid_token: bool, *, limits: new_item_dialog.NewItemLimits, size: int) -> None:
+                         valid_token: bool, *, limits: new_item_dialog.NewItemLimits, size: int,
+                         claims: ExitStack) -> None:
         try:
             draft = fields.get("request_id")
             list_page_request = new_item_dialog.is_list_submission_page(fields.get("page"))
@@ -2054,24 +2056,22 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                       or isinstance(details.capture_intent, new_item_dialog.DeferredCaptureIntent))
                 evidence_page = site + review_page.PAGE_PATH if has_saved_evidence else ""
                 status = server.delivery_status
-                # Concurrent Sends wait for the delivery of the same item.
                 with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
+                    try:
+                        deliveries = review_actions.prepare_submission_deliveries(
+                            saved, saved.words, status, evidence_page=evidence_page, members=created.members,
+                            claims=claims)
+                    except review_actions.SubmissionDeliveryPending:
+                        deliveries = review_actions.SubmissionDeliveries()
+                    delivery = deliveries.primary
+                    response["reply_owner"] = (
+                        delivery.page.saved["owner"] if isinstance(delivery, change_page.MessageDelivery)
+                        and isinstance(delivery.page, change_page.ReviewMessagePage) else saved.owner)
                     if (isinstance(saved.record, investigation.Investigation) and saved.record.belongs_on_list
                             and review_submissions.list_filing_was_skipped(saved)):
                         report_row = the_list.NoListReport.ABSENT
                     else:
                         report_row = review_actions.submission_report_row(saved)
-                    deliveries = review_actions.prepare_submission_deliveries(
-                        saved, saved.words, status, evidence_page=evidence_page, members=created.members)
-                    delivery = deliveries.primary
-                    response["reply_owner"] = (
-                        delivery.page.saved["owner"] if isinstance(delivery, change_page.MessageDelivery)
-                        and isinstance(delivery.page, change_page.ReviewMessagePage) else saved.owner)
-                    outcome = self.deliver_review(server, delivery, report_outcome=True)
-                    assignee_delivery = review_actions.claim_saved_assignee_copy(deliveries.assignee, status)
-                    assignee_outcome = (self.deliver_review(server, assignee_delivery, report_outcome=True)
-                                        if isinstance(assignee_delivery, change_page.MessageDelivery)
-                                        else change_page.DeliveryUnconfirmed())
                     if isinstance(report_row, the_list.ListItem):
                         response["list_number"] = report_row.number
                         response["list_owner"] = (report_row.owner.value if isinstance(report_row.owner, the_list.UnassignedOwner)
@@ -2082,14 +2082,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
                         if isinstance(number, int):
                             response["list_number"] = number
-                    if (isinstance(delivery, change_page.MessageDelivery)
-                            and not isinstance(outcome, change_page.DeliveryConfirmed)):
-                        # Recovery can save the confirmation from an earlier send.
-                        message = status.metadata_page(delivery.page)
-                        if (isinstance(message, change_page.ReviewMessagePage)
-                                and message.saved.get("submission_request") == delivery.row
-                                and message.saved.get("submission_delivered")):
-                            outcome = change_page.DeliveryConfirmed()
                 if pending or (main_request is not None and list_page_request
                                and isinstance(screenshot, new_item_dialog.PageScreenshot)):
                     if review_submissions.PAGE_SCREENSHOT not in details.images:
@@ -2127,31 +2119,37 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(503, {"error": "Could not publish the item. Try Send again."})
             return
         respond_first = on_list or main_request is not None
-        delivery_failed = (isinstance(delivery, change_page.MessageDelivery)
-                           and not isinstance(outcome, change_page.DeliveryConfirmed))
-        if (not delivery_failed and isinstance(assignee_delivery, change_page.MessageDelivery)
-                and not isinstance(assignee_outcome, change_page.DeliveryConfirmed)):
-            delivery_failed = True
-            outcome = assignee_outcome
+        claim = delivery if isinstance(delivery, change_page.MessageDelivery) else None
+
+        def send_notices() -> None:
+            with ExitStack() as copy_claims:
+                try:
+                    if claim is not None:
+                        _ = self.deliver_review(server, claim, report_outcome=True)
+                finally:
+                    copy = review_actions.claim_saved_assignee_copy(deliveries.assignee, status, claims=copy_claims)
+                    if isinstance(copy, change_page.MessageDelivery):
+                        _ = self.deliver_review(server, copy, report_outcome=True)
+
+        send = send_notices if claim is not None or isinstance(deliveries.assignee, change_page.MessageDelivery) else None
         try:
             try:
-                if delivery_failed:
-                    reason = outcome.last_error if isinstance(outcome, change_page.FailedDelivery) else (
-                        "The sender has not confirmed delivery.")
-                    self.json_response(503, {"error": f"{reason} Try Send again."})
-                elif respond_first:
+                if respond_first:
                     self.new_item_saved(response, saved.id, edited)
             finally:
-                if respond_first:
-                    if ((pending or on_list) and isinstance(screenshot, new_item_dialog.PageScreenshot)
+                try:
+                    if (respond_first and (pending or on_list) and isinstance(screenshot, new_item_dialog.PageScreenshot)
                             and review_submissions.PAGE_SCREENSHOT not in details.images):
                         server.attach_page_screenshot(saved, screenshot.png)
-                if saved.kind == new_item_dialog.SubmissionKind.BUG and (
-                        isinstance(details.page_state, new_item_dialog.BugPageState)
-                        or (main_request is not None and main_request.page_state is not None)):
-                    server.finish_bug_evidence(created, main_request, screenshot)
-            if not respond_first and not delivery_failed:
-                self.new_item_saved(response, saved.id, edited)
+                    if saved.kind == new_item_dialog.SubmissionKind.BUG and (
+                            isinstance(details.page_state, new_item_dialog.BugPageState)
+                            or (main_request is not None and main_request.page_state is not None)):
+                        server.finish_bug_evidence(created, main_request, screenshot)
+                finally:
+                    if respond_first and send is not None:
+                        _ = server.start_new_item_delivery(send, claim=claim)
+            if not respond_first:
+                self.new_item_saved(response, saved.id, edited, deliver=send, claim=claim)
         finally:
             if isinstance(details.capture_intent, new_item_dialog.DeferredCaptureIntent):
                 server.process_committed_capture(new_item_dialog.read_submission_key(saved.key), details.capture_intent,
@@ -2163,7 +2161,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         try:
             with server.list_store_access(), server.staff_read_scope():
                 saved = new_item.submit_scheduled(request, live_words_limit=live_words_limit)
-                outcome = list_page.deliver_scheduled_assignee_copy(saved.claim.keeper, saved.id, request.request_id)
         except review_submissions.DraftAlreadyFiled as error:
             self.new_item_saved({"id": error.id}, error.id, True)
             return
@@ -2184,29 +2181,40 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             print(f"review-links Scheduled Send: {error}", file=sys.stderr)
             self.json_response(503, {"error": "Could not confirm the Scheduled save. Try again to recover this draft."})
             return
-        if saved.assignment_notices_pending:
-            self.json_response(503, {"error": f"{saved.id} is saved. Try Send again for the assignment notice."})
-            return
-        if not isinstance(outcome, change_page.DeliveryConfirmed):
-            self.json_response(503, {"error": "Could not confirm delivery to the assignee. Try Send again."})
-            return
         claim = saved.claim
-        response = {"id": saved.id, "list_key": f"{claim.keeper}/{saved.id}",
-                    "receipt": new_item.filing_receipt(claim.assignment, saved.id), "readback": claim.readback,
-                    "notice_warning": claim.notice_warning}
-        self.new_item_saved(response, saved.id, False)
+        response: dict[str, object] = {"id": saved.id, "list_key": f"{claim.keeper}/{saved.id}",
+                                       "receipt": new_item.filing_receipt(claim.assignment, saved.id),
+                                       "readback": claim.readback, "notice_warning": claim.notice_warning}
+        root = review_link.review_root()
+
+        def send() -> None:
+            with server.list_store_access(), server.staff_read_scope():
+                try:
+                    if saved.pending_notices:
+                        new_item.deliver_scheduled_notices(root, request.request_id)
+                finally:
+                    _ = list_page.deliver_scheduled_assignee_copy(claim.keeper, saved.id, request.request_id)
+
+        self.new_item_saved(response, saved.id, False, deliver=send)
 
     def pending_draft_response(self) -> None:
         self.json_response(409, {"code": "draft_pending", "error": "Retry the original Send for this draft."})
 
-    def new_item_saved(self, response: Mapping[str, object], identity: str, edited: bool) -> None:
-        if edited and "attachment_warning" not in response:
-            self.json_response(409, {
-                **response, "code": "already_filed",
-                "error": f"This item was already filed as {identity}. Any change after that Send was not sent.",
-            })
-        else:
-            self.json_response(200, response)
+    def new_item_saved(self, response: Mapping[str, object], identity: str, edited: bool, *,
+                       deliver: Callable[[], object] | None = None,
+                       claim: change_page.MessageDelivery | None = None) -> None:
+        try:
+            if edited and "attachment_warning" not in response:
+                self.json_response(409, {
+                    **response, "code": "already_filed",
+                    "error": f"This item was already filed as {identity}. Any change after that Send was not sent.",
+                })
+            else:
+                self.json_response(200, response)
+        finally:
+            if deliver is not None:
+                server = cast(ReviewLinksServer, self.server)
+                _ = server.start_new_item_delivery(deliver, claim=claim)
 
     def new_item_capture(self, capture: new_item_dialog.LivePageCapture, key: str, *, limit: int) -> None:
         """Start a screenshot only for a known page on this server."""
@@ -2414,11 +2422,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             print(f"review-links review delivery retry: {error}", file=sys.stderr)
         finally:
             if isinstance(delivery, change_page.MessageDelivery):
-                try:
-                    with status.locked():
-                        _ = status.request_attempts.pop(delivery.attempt, None)
-                except Exception as error:
-                    print(f"review-links review delivery release: {error}", file=sys.stderr)
+                status.release_owned_claims((delivery.attempt,))
                 server.review_cache.invalidate()
         return change_page.DeliveryUnconfirmed()
 
@@ -3247,20 +3251,24 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.delivery_status.startup_recovery_pending.set()
 
         def recover_pending() -> None:
+            def recover(name: str, operation: Callable[[], None]) -> None:
+                try:
+                    operation()
+                except Exception as error:
+                    print(f"review-links {name} recovery: {error}", file=sys.stderr)
+
             with reply_tokens.serving(self.store_folder):
                 try:
-                    review_actions.recover_interrupted_list_reports()
-                    recover_changes(self.delivery_status)
-                    review_actions.recover_submission_deliveries(self.delivery_status, review_page.PAGE_PATH)
-                except (OSError, ValueError) as error:
-                    print(f"review-links delivery recovery: {error}", file=sys.stderr)
+                    recover("List report", review_actions.recover_interrupted_list_reports)
+                    recover("delivery", partial(recover_changes, self.delivery_status))
+                    recover("first message", partial(
+                        review_actions.recover_submission_deliveries, self.delivery_status, review_page.PAGE_PATH))
                 finally:
                     self.delivery_status.startup_recovery_pending.clear()
-                # A Go goes first: its resend carries the producer's next-step notice in the same message.
-                try:
-                    recover_goes(self.store_folder)
-                finally:
-                    recover_list(self.store_folder)
+                # Recover Go first because its message includes the producer's next-step notice.
+                recover("List Go", partial(recover_goes, self.store_folder))
+                recover("List feedback", partial(recover_list, self.store_folder))
+                recover("Scheduled notice", partial(new_item.recover_scheduled_notices, self.root))
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
         try:
@@ -3273,6 +3281,41 @@ class ReviewLinksServer(ThreadingHTTPServer):
         return send_hold.Holds(self.store_folder / send_hold.HOLD_FOLDER,
                                send_hold.replay_to(self.bound_address, self.server_port),
                                new_item=send_hold.NewItemReplay(review_page.NEW_ITEM_PATH, lambda: self.new_item_token))
+
+    def start_new_item_delivery(self, deliver: Callable[[], object], *,
+                                claim: change_page.MessageDelivery | None) -> threading.Thread | None:
+        """Start delivery after the saved reply leaves the handler."""
+        def send() -> None:
+            try:
+                with reply_tokens.serving(self.store_folder):
+                    _ = deliver()
+            except (OSError, ValueError, RuntimeError) as error:
+                print(f"review-links New item notices: {error}", file=sys.stderr)
+            finally:
+                if claim is not None:
+                    self.delivery_status.release_owned_claims((claim.attempt,))
+
+        try:
+            thread = threading.Thread(target=send, daemon=True)
+            if claim is None:
+                thread.start()
+                return thread
+            status = self.delivery_status
+            # Keep the claim live while ownership moves to the delivery thread.
+            with status.locked():
+                owner = status.request_attempts.get(claim.attempt)
+                if owner is None or owner.request_thread is not threading.current_thread():
+                    return None
+                status.request_attempts[claim.attempt] = replace(owner, request_thread=thread)
+                try:
+                    thread.start()
+                except (OSError, RuntimeError):
+                    status.request_attempts[claim.attempt] = owner
+                    raise
+            return thread
+        except (OSError, RuntimeError) as error:
+            print(f"review-links New item notices could not start: {error}", file=sys.stderr)
+            return None
 
     def recover_page_captures(self) -> None:
         """Recover capture work from committed native submissions."""

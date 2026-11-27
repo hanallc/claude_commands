@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone, tzinfo
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -100,3 +102,32 @@ class PeerCountsTests(unittest.TestCase):
 
         self.assertEqual(page.count("<li>mac Claude sessions unreadable: Claude counts are natedev only</li>"), 1)
         self.assertNotIn("mac unavailable", page)
+
+    def test_peer_response_shows_starting_worker_and_pane_in_the_page_and_json(self) -> None:
+        worker = accounts.StartingWorkerDocument(session="peer-thread", name="peer-worker", state="starting")
+        pane = accounts.StartingPaneDocument(session="agents", pane="w1:p1", state="starting")
+        observed = accounts.LocalRoleSessions({}, {}, (), (), (), False, frozenset(),
+                                             starting_workers=(worker,), starting_panes=(pane,))
+        with (patch.object(accounts, "_local_session_counts", return_value=observed),
+              patch.object(accounts, "_session_counts_machine", return_value="mac"),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(accounts.main(["session-counts-read"]), 0)
+        published = cast(accounts.MachineSessionCounts, json.loads(output.getvalue()))
+        self.assertEqual(published.get("starting_workers"), [worker])
+        self.assertEqual(published.get("starting_panes"), [pane])
+
+        with patch.object(role_map, "ssh_role_map", return_value=output.getvalue()) as fetch:
+            self.assertEqual(fetch_session_counts(), 0)
+        fetch.assert_called_once_with(("session-counts-read",), machine="mac")
+        reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
+        page = accounts_page.board(reading)
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        self.assertIn(">workers</span><br>peer-worker (mac): starting</td>", page)
+        self.assertIn("<li>pane agents:w1:p1 (mac): starting</li>", page)
+        self.assertEqual(document.get("starting_workers"), [{**worker, "machine": "mac"}])
+        self.assertEqual(document.get("starting_panes"), [{**pane, "machine": "mac"}])
+        self.assertTrue(all("starting" not in problem for problem in document["problems"]))
+
+        published["at"] = (PeerCountsClock.now(timezone.utc) - timedelta(minutes=11)).isoformat()
+        _ = self.cache.write_text(json.dumps(published))
+        self.assertNotIn("peer-worker", self.board())

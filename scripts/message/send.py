@@ -54,8 +54,8 @@ it reaches them is `user()`'s business: no caller names the channel.
 same recipient inside the window is skipped; `ack` skips every later send with
 the key until `reopen`. A failed send does not count. A delivered send or a
 message kept for later delivery holds the window, so a retry cannot deliver a
-queued copy twice. While the user's silence is on, a
-kept push with the same key from the same sender replaces the older kept one.
+queued copy twice. During silence, a keyed push can replace a pending push from the same sender.
+The key and the Question reference must match.
 `--through-silence` sends a user push during silence. Review and priority stay the same.
 `--user-asked` sends a requested `nate.adhoc` push as written. Silence rules still apply.
 A normal push does not repeat or need acknowledgement.
@@ -106,10 +106,8 @@ message text as one JSON line in STATE/log.jsonl:
         the user to type a go: the detail gives the auto_mode.refused, quota.paid_credits
         (quota.paid_credits_queued when a workers move is queued) or session.needs_go call
         to send instead
-`retire --to user` forgets the key's last send to the user, prints "retired N queued messages", then "dropped N kept pushes": the
-pushes kept during silence with KEY from SENDER (silence.drop), so an obsolete alert never goes out
-when silence ends. Then one line from pushover.py cancel, which stops the emergency (--need blocked)
-push sent with KEY:
+`retire --to user` forgets the key's last send to the user and removes queued and kept copies without a Question reference.
+It prints the counts, then the result of cancelling emergency repeats for KEY.
   cancelled: the emergency push for KEY stopped                 exit 0
   nothing to cancel: no emergency push for KEY is repeating      exit 0
   FAILED: the emergency push for KEY may still repeat: why       exit 3
@@ -149,11 +147,12 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, Te
 
 from scripts.herdr.place import HerdrPlace
 from scripts.agents import remote as machine_routes
+from scripts.agents import worker_lifecycle
 from scripts.herdr import herdr_types, message_proof as _message_proof
 from scripts.lib import process_group
 from scripts.message.address import CODEX_PREFIX, SESSION_PREFIX, SOCKET_PREFIX, STAFF_PREFIX, USER as USER, WORKER_PREFIX
 from scripts.production import session_staff, staff, unit_lookup, unit_names
-from scripts.lib import conf, models_registry, process_start
+from scripts.lib import conf, models_registry, operation_deadline, process_start
 from scripts.lib.atomic_file import write_bytes_atomic
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
@@ -181,11 +180,13 @@ if TYPE_CHECKING:
     from scripts.whoami.account import named_account_environment
 from scripts.notify import push_texts  # noqa: E402
 from scripts.notify import push_reference
+from scripts.notify import question_pushes
 from scripts.whoami import mac_fallback_token, token_expiry
 from scripts.message import rca  # noqa: E402
 from scripts.message import repeat_guard  # noqa: E402
 from scripts.notify import review  # noqa: E402
 from scripts.notify import silence  # noqa: E402
+from scripts.notify.push_reference import PushIdentity
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
@@ -369,6 +370,7 @@ KeyedMessage = TypedDict(
         "claude_recipient": NotRequired[QueuedClaudeMailbox],
         "send_order": NotRequired[int],
         "once_per_key": NotRequired[bool],
+        "reference": NotRequired[push_reference.PushReference],
     },
 )
 UnkeyedMessage = TypedDict(
@@ -390,6 +392,7 @@ UnkeyedMessage = TypedDict(
         "claude_recipient": NotRequired[QueuedClaudeMailbox],
         "send_order": NotRequired[int],
         "once_per_key": NotRequired[bool],
+        "reference": NotRequired[push_reference.PushReference],
     },
 )
 
@@ -461,16 +464,23 @@ class OnceRemoteDestination(TypedDict):
     recipient: str
 
 
+class LegacyQuestionSend(TypedDict):
+    source: str
+    reference: push_reference.QuestionReference
+
+
 class KeyState(TypedDict):
     # Map each recipient to its claim time. A failed send releases its claim.
     last: dict[str, str]
     pending: NotRequired[dict[str, str | PendingDelivery]]
     acknowledged: NotRequired[str]
     clearing: NotRequired[Emergency]
+    clearings: NotRequired[dict[str, Emergency]]
     once_confirmed: NotRequired[bool]
     once_accepted: NotRequired[bool]
     once_remote: NotRequired[OnceRemoteDestination]
     once_delivery_interrupted: NotRequired[bool]
+    user_question: NotRequired[LegacyQuestionSend]
 
 
 KeyStates = dict[str, KeyState]
@@ -887,6 +897,7 @@ NO_QUEUED_PROCESS_GENERATION = NoQueuedProcessGeneration()
 class SessionIdWithoutLiveRecipient(NamedTuple):
     recipient: ClaudeMailbox
     generation: session_staff.ProvedProcessGeneration | NoQueuedProcessGeneration = NO_QUEUED_PROCESS_GENERATION
+    starting: bool = False
 
     @property
     def address(self) -> str:
@@ -1176,7 +1187,7 @@ def as_str(value: object) -> str:
 def locked() -> Generator[None]:
     STATE.mkdir(parents=True, exist_ok=True)
     with open(STATE / ".lock", "w", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(lock)
         yield
 
 
@@ -1268,6 +1279,11 @@ def _queued_message(value: object) -> QueuedMessage | None:
             _ = read_sender_stamp(values["sender_native_id"])
         except ValueError:
             return None
+    if "reference" in values:
+        try:
+            values["reference"] = push_reference.read_reference(values["reference"])
+        except ValueError:
+            return None
     if key is None:
         return cast(UnkeyedMessage, cast(object, values))
     if isinstance(key, str):
@@ -1312,8 +1328,12 @@ def _new_queue_row(entry: QueuedMessage) -> ReadableQueueRow:
 
 
 def _matches_queued_key(entry: QueuedMessage, key: str,
-                        recipient: StableRecipient | TransportQueueOwner, *, own_path: bool) -> bool:
+                        recipient: StableRecipient | TransportQueueOwner, *, own_path: bool,
+                        push: PushIdentity | None = None) -> bool:
     if entry["key"] != key:
+        return False
+    identity = queued_push_identity(entry)
+    if (identity.question is not None or push is not None) and identity != push:
         return False
     if "claude_recipient" in entry or "stable_recipient" in entry:
         owner = _saved_mailbox_key(entry)
@@ -1321,6 +1341,10 @@ def _matches_queued_key(entry: QueuedMessage, key: str,
     if isinstance(recipient, StableRecipient) and entry["to"].startswith(("session:", "staff:")):
         return own_path and entry["to"] == recipient.value
     return own_path
+
+
+def queued_push_identity(entry: QueuedMessage) -> PushIdentity:
+    return PushIdentity(entry["from"], entry["key"] or "", entry.get("reference", push_reference.NO_REFERENCE))
 
 
 def _queued_not_newer(entry: QueuedMessage, order: QueueOrder | LegacyQueueOrder) -> bool:
@@ -1470,7 +1494,8 @@ def _queue_paths_for_address(to: str, membership: staff.StaffSnapshot | None = N
 def remove_queued_key(to: str, key: str, *,
                       recipient: StableRecipient | TransportQueueOwner = TRANSPORT_QUEUE_OWNER,
                       order: QueueOrder | LegacyQueueOrder = LEGACY_QUEUE_ORDER,
-                      membership: staff.StaffSnapshot | None = None) -> int:
+                      membership: staff.StaffSnapshot | None = None,
+                      push: PushIdentity | None = None) -> int:
     """Remove matching copies no newer than the delivered send."""
     paths = _queue_paths_for_address(to, membership)
     removed = 0
@@ -1486,7 +1511,7 @@ def remove_queued_key(to: str, key: str, *,
                 continue
             kept = [entry for entry in entries
                     if isinstance(entry, QueueRowNeedsInspection)
-                    or not (_matches_queued_key(entry.message, key, recipient, own_path=path in paths)
+                    or not (_matches_queued_key(entry.message, key, recipient, own_path=path in paths, push=push)
                             and _queued_not_newer(entry.message, order))]
             if len(kept) != len(entries):
                 _rewrite_queue(path, kept)
@@ -1495,6 +1520,11 @@ def remove_queued_key(to: str, key: str, *,
 
 
 def retire(to: str, sender: str, key: str) -> int:
+    """Remove copies for a manual command without a Question reference."""
+    return _retire_queue(to, PushIdentity(sender, key))
+
+
+def _retire_queue(to: str, identity: PushIdentity) -> int:
     """Remove obsolete messages for the selected queue owner."""
     if to == USER:
         owner, direct = USER, queue_path(USER)
@@ -1504,8 +1534,8 @@ def retire(to: str, sender: str, key: str) -> int:
         owners = {row["sessionId"] for row in sessions.live_sessions() if row["messagingSocketPath"] == to[4:]}
         if len(owners) != 1:
             return 0
-        identity = owners.pop()
-        owner, direct = f"session:{identity}", queue_path(f"session-{identity}")
+        conversation = owners.pop()
+        owner, direct = f"session:{conversation}", queue_path(f"session-{conversation}")
     else:
         member = sessions.staff_recipient(to, staff.snapshot())
         if not isinstance(member, staff.StaffRow):
@@ -1517,6 +1547,8 @@ def retire(to: str, sender: str, key: str) -> int:
     with locked():
         paths = dict.fromkeys((direct, queue_path(to), *(STATE / "queue").glob("*.jsonl")))
         for path in paths:
+            if identity.question is not None:
+                operation_deadline.check()
             try:
                 entries = _read_queue_rows(path)
             except (OSError, UnicodeError):
@@ -1532,20 +1564,29 @@ def retire(to: str, sender: str, key: str) -> int:
                 saved = _saved_mailbox_key(entry)
                 legacy_owner = (path == direct and "stable_recipient" not in entry and "claude_recipient" not in entry
                                 and not entry["to"].startswith(("uds:", "session:", "staff:")))
-                if (saved == owner or legacy_owner) and (entry["key"] == key
-                        or entry["key"] is None and entry["from"] == sender):
+                queued = queued_push_identity(entry)
+                if to == USER:
+                    matched = queued == identity
+                else:
+                    matched = queued.question is None and (entry["key"] == identity.key
+                        or entry["key"] is None and entry["from"] == identity.sender)
+                if (saved == owner or legacy_owner) and matched:
                     removed += 1
                 else:
                     kept.append(row)
             if len(kept) != len(entries):
+                if identity.question is not None:
+                    operation_deadline.check()
                 _rewrite_queue(path, kept)
     return removed
 
 
-def cancel_user_push(sender: str, key: str) -> tuple[int, str]:
+def cancel_user_push(identity: PushIdentity) -> tuple[int, str]:
     """Stop the user's emergency push sent with key, through the same channel user() sends on."""
-    code, out, err = run([sys.executable, str(USER_CHANNEL), "cancel", "--source", sender, key], "",
-                         user_cancel_timeout())
+    code, out, err = run([sys.executable, str(USER_CHANNEL), "cancel", "--exact-tag-key",
+                         "--source", identity.sender, identity.tag_key], "",
+                         operation_deadline.remaining(user_cancel_timeout()))
+    key = identity.key
     if code == 0 and "pushover: nothing to cancel" in out:
         return 0, f"nothing to cancel: no emergency push for {key} is repeating"
     if code == 0:
@@ -1554,15 +1595,36 @@ def cancel_user_push(sender: str, key: str) -> tuple[int, str]:
     return EXIT["failed"], f"FAILED: the emergency push for {key} may still repeat: {why}"
 
 
-def retire_user(sender: str, key: str) -> tuple[int, list[str]]:
+def retire_user(identity: PushIdentity) -> tuple[int, list[str]]:
     """`retire --to user`: drop the queued and kept copies, forget the key's last send, cancel the push."""
-    removed = retire(USER, sender, key)
+    if identity.question is not None:
+        code, line = retire_recorded_question(identity, emergency=True)
+        return code, [line]
+    removed = _retire_queue(USER, identity)
     # The event is over: a new send with the key pushes at once.
-    forget_sent(key, USER)
-    dropped = silence.drop(sender, key)
-    code, line = cancel_user_push(sender, key)
-    return code, [f"retired {removed} queued message{'s' if removed != 1 else ''}",
-                  f"dropped {dropped} kept push{'es' if dropped != 1 else ''}", line]
+    forget_sent(identity)
+    try:
+        dropped = silence.drop(identity)
+        drop_line = f"dropped {dropped} kept push{'es' if dropped != 1 else ''}"
+        failed = False
+    except silence.RemoteDropFailed as error:
+        drop_line = f"FAILED: {error}"
+        failed = True
+    code, line = cancel_user_push(identity)
+    return EXIT["failed"] if failed else code, [f"retired {removed} queued message{'s' if removed != 1 else ''}", drop_line, line]
+
+
+def retire_question_copies(identity: PushIdentity, *, emergency: bool) -> str:
+    """Drop copies and cancel tagged repeats while the silence lock is held."""
+    removed = _retire_queue(USER, identity)
+    dropped = silence.drop_locked(identity)
+    result = f"retired {removed} queued and {dropped} kept copies for {identity.sender} / {identity.key}"
+    if emergency:
+        code, line = cancel_user_push(identity)
+        if code != 0:
+            raise OSError(f"{result}. {line}")
+    forget_sent(identity)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1580,6 +1642,7 @@ class Emergency(TypedDict):
     # UTC ISO times.
     sent: str
     expires: str
+    question: NotRequired[push_reference.QuestionReference]
 
 
 EMERGENCY_FIELDS = ("key", "sender", "check", "machine", "sent", "expires")
@@ -1609,14 +1672,14 @@ def write_emergencies(records: list[Emergency]) -> None:
 
 
 def record_emergency(record: Emergency) -> None:
-    """Keep a sent emergency push for clear-check; it replaces an older record with its sender and key."""
+    """Keep a sent emergency push for clear-check."""
     with locked():
-        _record_emergency_locked(record)
+        _record_emergency_locked(emergency_identity(record), record)
 
 
-def _record_emergency_locked(record: Emergency) -> None:
+def _record_emergency_locked(identity: PushIdentity, record: Emergency) -> None:
     """Replace one clearing record while the caller holds the state lock."""
-    kept = [old for old in read_emergencies() if (old["sender"], old["key"]) != (record["sender"], record["key"])]
+    kept = [old for old in read_emergencies() if emergency_identity(old) != identity]
     write_emergencies([*kept, record])
 
 
@@ -1635,21 +1698,47 @@ def check_exit(command: str, timeout: float) -> int | None:
             return None
 
 
-def retire_record(record: Emergency) -> tuple[int, str]:
+def emergency_identity(record: Emergency) -> PushIdentity:
+    return PushIdentity(record["sender"], record["key"], push_reference.read_reference(record.get("question")))
+
+
+def retire_record(identity: PushIdentity, host: str) -> tuple[int, str]:
     """Retire the push as `retire --to user` does, on the host that posted it; the exit code and the cancel line."""
-    if record["machine"] == machine():
-        code, lines = retire_user(record["sender"], record["key"])
+    if identity.question is not None:
+        return retire_recorded_question(identity, emergency=True)
+    if host == machine():
+        code, lines = retire_user(identity)
         return code, lines[-1]
     # This host holds the key's window (remote() sends --repeat-minutes 0); the posting host holds the keys.
-    forget_sent(record["key"], USER)
-    forwarded = shlex.join(["retire", "--to", USER, "--from", record["sender"], "--key", record["key"]])
-    command = ["ssh", "-o", "BatchMode=yes", record["machine"], f"{REMOTE} {forwarded}"]
+    forget_sent(identity)
+    forwarded = shlex.join(["retire", "--to", USER, "--from", identity.sender, "--key", identity.key, "--exact-tag-key"])
+    command = ["ssh", "-o", "BatchMode=yes", host, f"{REMOTE} {forwarded}"]
     code, out, err = run(command, "", user_cancel_timeout() + conf.read("send").number("remote_transport_seconds"))
-    last = (out.strip().splitlines() or [""])[-1]
+    lines = out.strip().splitlines()
+    last = next((line for line in lines if line.startswith("FAILED:")), lines[-1] if lines else "")
     if code == 0:
-        return 0, f"on {record['machine']}: {last}"
+        return 0, f"on {host}: {last}"
     why = one_line(err or last) or ("timed out" if code is None else f"exit {code}")
-    return EXIT["failed"], f"on {record['machine']}: the emergency push for {record['key']} may still repeat: {why}"
+    return EXIT["failed"], f"on {host}: the emergency push for {identity.key} may still repeat: {why}"
+
+
+def retire_recorded_question(identity: PushIdentity, *, emergency: bool = False) -> tuple[int, str]:
+    """Retire copies that belong to the specified Question opening."""
+    question = identity.question
+    assert question is not None
+    if not silence.on_mac():
+        try:
+            return 0, question_pushes.retire_matching(identity, emergency=emergency)
+        except (OSError, ValueError) as error:
+            return EXIT["failed"], str(error)
+    command = shlex.join(["question-push-clear", identity.sender, identity.key, json.dumps(question.reference),
+                          *(["--emergency"] if emergency else [])])
+    code, out, err = run([*silence.SSH, f"{REMOTE} {command}"], "",
+                         user_cancel_timeout() + conf.read("send").number("remote_transport_seconds"))
+    if code == 0:
+        forget_sent(identity)
+        return 0, out.strip()
+    return EXIT["failed"], one_line(err or out) or "natedev did not confirm Question push retirement"
 
 
 @contextmanager
@@ -1699,7 +1788,7 @@ def clear_check(timeout: float | ConfiguredCheckTimeout = ConfiguredCheckTimeout
             elif exit_code != 0:
                 lines.append(f"kept: {name}: its check exits {exit_code}")
             else:
-                retired, line = retire_record(record)
+                retired, line = retire_record(emergency_identity(record), record["machine"])
                 if retired == 0:
                     done.append(record)
                     lines.append(f"retired: {name}: its check passed; {line}")
@@ -1842,7 +1931,7 @@ def remote_once_receipt(destination: OnceRemoteDestination, key: str) -> bool:
 
 
 def confirmed_skip(message: Message, repeat: timedelta | None, at: datetime, *,
-                   live: bool = False, aliases: tuple[str, ...] = ()) -> str | None:
+                   live: bool = False, aliases: tuple[str, ...] = (), push: PushIdentity | None = None) -> str | None:
     """Read prior acceptance under a delivery turn; a lock alone never means sent."""
     if message.key is None:
         return None
@@ -1852,25 +1941,27 @@ def confirmed_skip(message: Message, repeat: timedelta | None, at: datetime, *,
             return acknowledged_skip_reason(message.key, state["acknowledged"])
         if repeat is not None:
             pending = pending_deliveries(state)
-            for address in dict.fromkeys((message.to, *aliases)):
+            addresses = (push_slot(state, push),) if push is not None else (message.to, *aliases)
+            for address in dict.fromkeys(addresses):
                 last = state["last"].get(address)
                 attempt = pending.get(address)
                 if last is None or attempt is not None and attempt["started"] == last:
                     continue
                 if at - datetime.fromisoformat(last) < repeat:
                     if live:
-                        return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat)
+                        return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat, push=push)
                     minutes = repeat.total_seconds() / 60
-                    return f"key {message.key!r} last sent to {address} at {last}, inside its {minutes:g}-minute window"
+                    return f"key {message.key!r} last sent to {USER if push else address} at {last}, inside its {minutes:g}-minute window"
     return None
 
 
-def record_acceptance(message: Message, at: datetime) -> None:
+def record_acceptance(message: Message, at: datetime, *, push: PushIdentity | None = None) -> None:
     """Only a confirmed transport or recoverable queue/kept handoff enters the repeat window."""
     if message.key is not None:
         with key_states() as states:
             state = states.setdefault(message.key, {"last": {}})
-            state["last"][message.to] = at.isoformat()
+            slot = message.to if push is None else migrate_push_slot(state, push)
+            state["last"][slot] = at.isoformat()
 
 
 def record_released_acceptances(held: tuple[review_hold.ReviewMessage, ...], fallback_recipient: str, at: float) -> None:
@@ -2227,16 +2318,45 @@ def _owns_attempt(record: Mapping[str, object]) -> bool:
 
 def _finish_clearing(state: KeyState) -> None:
     """Project a clearing record while the caller holds the key lock."""
-    if "clearing" not in state:
-        return
-    _record_emergency_locked(state["clearing"])
-    del state["clearing"]
+    if "clearing" in state:
+        record = state["clearing"]
+        _record_emergency_locked(emergency_identity(record), record)
+        del state["clearing"]
+    if "clearings" in state:
+        for record in state["clearings"].values():
+            _record_emergency_locked(emergency_identity(record), record)
+        del state["clearings"]
+
+
+def push_slot(state: KeyState, push: PushIdentity) -> str:
+    """Find a saved send, including the matching legacy user slot."""
+    slot = push.state_slot
+    if slot in state["last"] or USER not in state["last"]:
+        return slot
+    saved = state.get("user_question")
+    if saved is not None:
+        return USER if PushIdentity(saved["source"], push.key, saved["reference"]) == push else slot
+    return USER if push.question is None else slot
+
+
+def migrate_push_slot(state: KeyState, push: PushIdentity) -> str:
+    slot = push_slot(state, push)
+    if slot != USER:
+        return slot
+    slot = push.state_slot
+    state["last"][slot] = state["last"].pop(USER)
+    _ = state.pop("user_question", None)
+    pending = state.get("pending", {})
+    if USER in pending:
+        pending[slot] = pending.pop(USER)
+    return slot
 
 
 def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None, at: datetime, *,
           delivery_limit: float,
           legacy_aliases: tuple[str, ...] = (), live: bool = False, postmaster_recipient: str = "",
-          clears_when: str = "", posted_on: str = "", emergency: bool = False) -> ClaimGranted | RepeatAccepted | RepeatPending:
+          clears_when: str = "", posted_on: str = "", emergency: bool = False,
+          push: PushIdentity | None = None) -> ClaimGranted | RepeatAccepted | RepeatPending:
     """Check acceptance before recording an attempt under the stable recipient.
 
     The lock prevents overlapping sends with one key from both sending.
@@ -2248,6 +2368,8 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
     with key_states() as states:
         state: KeyState = states.get(message.key, {"last": {}})
         _finish_clearing(state)
+        slot = recipient.value if push is None else migrate_push_slot(state, push)
+        addresses = (slot, *legacy_aliases) if push is None else (slot,)
         for alias in (postmaster_recipient, recipient.value, *legacy_aliases):
             recorded = postmaster_claim(states, message.key, alias, review_delivery=message.review_delivery)
             if not isinstance(recorded, ClaimGranted):
@@ -2255,7 +2377,7 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
         if "acknowledged" in state:
             return RepeatAccepted(acknowledged_skip_reason(message.key, state["acknowledged"]))
         pending = pending_deliveries(state)
-        for alias in (recipient.value, *legacy_aliases):
+        for alias in addresses:
             attempt = pending.get(alias)
             if attempt is None or "owner_pid" not in attempt or attempt["started"] != state["last"].get(alias):
                 continue
@@ -2265,14 +2387,14 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
             if "pending" in state:
                 _ = state["pending"].pop(alias, None)
         # An abandoned delivery must not block a window with no end.
-        timestamps = [state["last"][alias] for alias in (recipient.value, *legacy_aliases)
+        timestamps = [state["last"][alias] for alias in addresses
                       if alias in state["last"]
                       and not (alias in pending and pending[alias]["started"] == state["last"][alias]
                                and at - datetime.fromisoformat(state["last"][alias])
                                >= timedelta(seconds=pending[alias]["limit_seconds"]))]
         last = max(timestamps, key=datetime.fromisoformat) if timestamps else None
         unaccepted = any(alias in pending and pending[alias]["started"] == last
-                         for alias in (recipient.value, *legacy_aliases)) if last is not None else False
+                         for alias in addresses) if last is not None else False
         pending_reason = f"key {message.key!r}: an earlier send to {recipient.value} is pending; not yet accepted"
         if last is not None and message.key.startswith("github.keys_cold:"):
             if unaccepted:
@@ -2282,14 +2404,14 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
             if unaccepted:
                 return RepeatPending(pending_reason)
             if live:
-                return RepeatAccepted(still_live(message.key, message.sender, datetime.fromisoformat(last), repeat))
+                    return RepeatAccepted(still_live(message.key, message.sender, datetime.fromisoformat(last), repeat, push=push))
             minutes = repeat.total_seconds() / 60
             return RepeatAccepted(f"key {message.key!r} last sent to {recipient.value} at {last}, inside its {minutes:g}-minute window")
         attempt = PendingDelivery(started=at.isoformat(), limit_seconds=delivery_limit)
         if isinstance(message.claude_attempt, ClaudeDeliveryAttempt):
             attempt["recipient"] = _attempt_record(message.claude_attempt)
-        accepted_before = state["last"].get(recipient.value)
-        previous = pending.get(recipient.value)
+        accepted_before = state["last"].get(slot)
+        previous = pending.get(slot)
         if (recipient.value == postmaster_recipient and accepted_before is not None
                 and (previous is None or previous["started"] != accepted_before)):
             attempt["accepted_before"] = accepted_before
@@ -2301,34 +2423,37 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
         if clears_when:
             clearing = Emergency(key=message.key, sender=message.sender, check=clears_when, machine=posted_on,
                                  sent=at.isoformat(), expires=(at + emergency_lifetime()).isoformat())
+            if push is not None and push.question is not None:
+                clearing["question"] = push.question.reference
             if message.key.startswith("github.keys_cold:"):
                 # A warm-check command also clears an interrupted cold-key claim.
-                _record_emergency_locked(clearing)
+                _record_emergency_locked(emergency_identity(clearing), clearing)
             elif emergency:
                 attempt["clearing"] = clearing
             else:
-                _record_emergency_locked(clearing)
-        state["last"][recipient.value] = at.isoformat()
-        state.setdefault("pending", {})[recipient.value] = attempt
+                _record_emergency_locked(emergency_identity(clearing), clearing)
+        state["last"][slot] = at.isoformat()
+        state.setdefault("pending", {})[slot] = attempt
         states[message.key] = state
     return ClaimGranted()
 
 
-def accept_sent(key: str, to: str, at: datetime, *, delivered: bool = True) -> None:
+def accept_sent(key: str, to: str, at: datetime, *, delivered: bool = True, push: PushIdentity | None = None) -> None:
     """Confirm only the claim owned by this accepted attempt."""
     with key_states() as states:
         state = states.get(key)
         if state is None:
             return
+        slot = to if push is None else push_slot(state, push)
         pending = state.get("pending", {})
-        owned = pending_deliveries(state).get(to)
+        owned = pending_deliveries(state).get(slot)
         if owned is None or owned["started"] != at.isoformat():
             return
         if not _owns_attempt(owned):
             return
         if delivered and "clearing" in owned:
-            state["clearing"] = owned["clearing"]
-        del pending[to]
+            state.setdefault("clearings", {})[slot] = owned["clearing"]
+        del pending[slot]
         if not pending:
             del state["pending"]
     with key_states() as states:
@@ -2350,37 +2475,51 @@ def emergency_lifetime() -> timedelta:
     return timedelta(seconds=EXPIRE_S)
 
 
-def still_live(key: str, sender: str, sent: datetime, lifetime: timedelta) -> str:
+def still_live(key: str, sender: str, sent: datetime, lifetime: timedelta, *, push: PushIdentity | None = None) -> str:
     """Why an emergency push to the user with this key is skipped: the first one still repeats."""
     zone = user_zone()
-    retire_command = shlex.join(["send.py", "retire", "--to", USER, "--from", sender, "--key", key])
+    arguments = ["send.py", "retire", "--to", USER, "--from", sender, "--key", key]
+    if push is not None and push.question is not None:
+        arguments += ["--reference", json.dumps(push.question.reference)]
+    retire_command = shlex.join(arguments)
     return (f"an emergency push with key {key} went to the user at {sent.astimezone(zone):%H:%M:%S %Z} and is still"
             + f" live until {(sent + lifetime).astimezone(zone):%H:%M:%S %Z}; to send a new one, retire it first:"
             + f" {retire_command}")
 
 
-def forget_sent(key: str, to: str, at: datetime | None = None) -> None:
+def forget_sent(identity: PushIdentity, at: datetime | None = None) -> None:
+    """Forget only this push's saved send."""
+    _forget_delivery(identity.key, USER, at, push=identity)
+
+
+def _forget_delivery(key: str, to: str, at: datetime | None, *, push: PushIdentity | None = None) -> None:
     """Remove this recipient's claim after a failed send.
 
     With `at`, keep the claim when a later attempt owns it.
     """
     with key_states() as states:
         state = states.get(key)
-        if state is None or to not in state["last"] or (at is not None and state["last"][to] != at.isoformat()):
+        if state is None:
             return
-        owned = pending_deliveries(state).get(to)
+        slot = to if push is None else push_slot(state, push)
+        if slot not in state["last"] or (at is not None and state["last"][slot] != at.isoformat()):
+            return
+        owned = pending_deliveries(state).get(slot)
         if at is not None and owned is not None and not _owns_attempt(owned):
             return
         if at is not None and owned is not None and "accepted_before" in owned:
-            state["last"][to] = owned["accepted_before"]
+            state["last"][slot] = owned["accepted_before"]
         else:
-            del state["last"][to]
+            del state["last"][slot]
+            if slot == USER:
+                _ = state.pop("user_question", None)
         if "pending" in state and (at is None or (owned is not None and owned["started"] == at.isoformat())):
-            _ = state["pending"].pop(to, None)
+            _ = state["pending"].pop(slot, None)
             if not state["pending"]:
                 del state["pending"]
         if not state["last"] and not any(field in state for field in (
-                "acknowledged", "once_accepted", "once_confirmed", "once_remote", "once_delivery_interrupted")):
+                "acknowledged", "once_accepted", "once_confirmed", "once_remote", "once_delivery_interrupted",
+                "clearing", "clearings")):
             del states[key]
 
 
@@ -2564,7 +2703,7 @@ def _fixed_staff_relay_plan(message: Message, selection: FixedStaffLookup) -> Re
     plan = _claude_delivery_plan(message, mailbox, registry, records)
     if isinstance(plan, SessionIdWithoutLiveRecipient):
         return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(
-            f"no live Claude session answers to staff ID {selection.to}"))
+            herdr_types.PANE_STARTING if plan.starting else f"no live Claude session answers to staff ID {selection.to}"))
     if isinstance(plan, ClaudeRoutingFailed):
         return plan
     attempt = plan.message.claude_attempt
@@ -2624,7 +2763,9 @@ def relay_socket(message: Message, timeout: float, *,
     address = conversation_recipient(mailbox).address
     if isinstance(attempt.recipient, RelayProcessRecipient) and isinstance(plan, SessionIdWithoutLiveRecipient):
         return message, Result("failed", f"{result.detail}; {dead_socket_reason(message.to)}")
-    if isinstance(plan, SessionIdWithoutLiveRecipient) or plan.message.claude_attempt == attempt:
+    if isinstance(plan, SessionIdWithoutLiveRecipient):
+        return message, Result("queued", herdr_types.PANE_STARTING if plan.starting else result.detail, receiver=address)
+    if plan.message.claude_attempt == attempt:
         return message, Result("queued", result.detail, receiver=address)
     retried = relay(plan.message, max(1.0, timeout - (time.monotonic() - started)))
     if retried.outcome in ("sent", "queued"):
@@ -3000,7 +3141,7 @@ def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
                 and (session is None or not _pending_owner_is_current(session))):
             return ""
         entries.sort(key=lambda entry: entry["time"])
-        newest: dict[tuple[str, str], QueuedMessage] = {}
+        newest: dict[tuple[str, str | PushIdentity], QueuedMessage] = {}
         unkeyed_or_legacy: list[QueuedMessage] = []
         for entry in entries:
             owner = _saved_mailbox_key(entry) if "stable_recipient" in entry or "claude_recipient" in entry else ""
@@ -3008,11 +3149,13 @@ def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
             if queued_once(entry):
                 owner = "once"
             if owner and key is not None:
-                previous = newest.get((owner, key))
+                push = queued_push_identity(entry)
+                group = (owner, key if push.question is None else push)
+                previous = newest.get(group)
                 if (previous is None
                         or "send_order" not in previous and "send_order" not in entry
                         or "send_order" in entry and _queued_not_newer(previous, QueueOrder(entry["send_order"]))):
-                    newest[owner, key] = entry
+                    newest[group] = entry
             else:
                 unkeyed_or_legacy.append(entry)
         entries = sorted([*unkeyed_or_legacy, *newest.values()], key=lambda entry: entry["time"])
@@ -4490,7 +4633,7 @@ def _claude_delivery_plan(message: Message, mailbox: ClaudeMailbox, registry: se
     conversation = conversation_recipient(mailbox).conversation
     candidates = [record for record in records if record["sessionId"] == conversation]
     message_owner = _unique_message_owner(conversation, registry, candidates)
-    with _message_proof.message_lookup(message_owner):
+    with _message_proof.message_lookup(message_owner) as lookup:
         checked = unit_lookup.checked_conversation(conversation, registry=registry, probe_address=False)
     if isinstance(checked, unit_lookup.ClaudeArgvUnavailable):
         try:
@@ -4503,7 +4646,11 @@ def _claude_delivery_plan(message: Message, mailbox: ClaudeMailbox, registry: se
         candidate = candidates[0]
         started = candidate.get("procStart", "")
         path = candidate["messagingSocketPath"]
-        if candidate["pid"] != checked.pid or not started or not path:
+        if candidate["pid"] != checked.pid or not started:
+            return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(checked.reason))
+        if checked.place in lookup.starting_panes:
+            return SessionIdWithoutLiveRecipient(mailbox, starting=True)
+        if not path:
             return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(checked.reason))
         attempt = ClaudeDeliveryAttempt(mailbox, checked.pid, started, path, fallback_pane=checked.place)
         return RelayAttempt(replace(message, to=f"uds:{path}", claude_attempt=attempt))
@@ -5100,8 +5247,8 @@ def parse(argv: list[str]) -> Options:
                             help="to `user` with --need blocked: a shell command that exits 0 when the cause is fixed;"
                             + " the push is then cancelled")
     _ = clears.add_argument("--self-clearing", action="store_true", help=argparse.SUPPRESS)
-    _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue; a kept push to"
-                                           + " the user replaces an older kept one with this key from the same sender"))
+    _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue. During silence,"
+                                           + " replacement matches the sender, key and Question reference."))
     _ = parser.add_argument("--recipient-key", help="stable logical recipient for keyed deduplication across address changes")
     repeat = parser.add_mutually_exclusive_group()
     _ = repeat.add_argument("--repeat-minutes", type=float,
@@ -5280,8 +5427,7 @@ def parse(argv: list[str]) -> Options:
 
 class RetireRequest(NamedTuple):
     to: str
-    sender: str
-    key: str
+    identity: PushIdentity
 
 
 def parse_retire(argv: list[str]) -> RetireRequest:
@@ -5289,11 +5435,20 @@ def parse_retire(argv: list[str]) -> RetireRequest:
     _ = parser.add_argument("--to", required=True)
     _ = parser.add_argument("--from", dest="sender", required=True)
     _ = parser.add_argument("--key", required=True)
+    _ = parser.add_argument("--exact-tag-key", action="store_true", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--reference", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    to = as_str(attr(args, "to"))
+    encoded = optional_str(attr(args, "reference"))
+    if (encoded or attr(args, "exact_tag_key") is True) and to != USER:
+        parser.error("push retirement options require --to user")
+    try:
+        reference = push_reference.read_reference(cast(object, json.loads(encoded)) if encoded else None)
+    except ValueError as error:
+        parser.error(str(error))
     return RetireRequest(
-        as_str(attr(args, "to")),
-        as_str(attr(args, "sender")),
-        as_str(attr(args, "key")),
+        to,
+        PushIdentity(as_str(attr(args, "sender")), as_str(attr(args, "key")), reference),
     )
 
 
@@ -5918,7 +6073,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         plan = _claude_delivery_plan(message, mailbox, registry, running)
         if isinstance(plan, SessionIdWithoutLiveRecipient):
             plan = ClaudeRoutingFailed(unit_lookup.SocketUnavailable(
-                f"no live Claude session answers to staff ID {mailbox.staff_id}"))
+                herdr_types.PANE_STARTING if plan.starting
+                else f"no live Claude session answers to staff ID {mailbox.staff_id}"))
     elif claude_route:
         plan = relay_plan(message, registry, running, membership, mailbox)
     else:
@@ -5958,6 +6114,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
     cold_check = options.clears_when if options.text_id == "github.keys_cold" else ""
     identity = replace(message, to=stable.value)
+    push_identity = PushIdentity(sender, key, options.reference) if key is not None and message.to == USER else None
     postmaster_identity = replace(message, to=attempt_recipient.value)
     recorded = reserve_postmaster_claim(postmaster_identity, started, options.timeout)
     if (isinstance(recorded, ClaimGranted) and key is not None and claude_route
@@ -5967,14 +6124,16 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         claim_result = recorded
     elif unproved_claude or (isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency):
         aliases = legacy_aliases if unproved_claude else (postmaster_identity.to,)
-        skip = None if refused or held is not None else confirmed_skip(identity, window, started, live=live, aliases=aliases)
+        skip = None if refused or held is not None else confirmed_skip(
+            identity, window, started, live=live, aliases=aliases, push=push_identity)
         claim_result = RepeatAccepted(skip) if skip is not None else ClaimGranted()
     else:
         claim_result = ClaimGranted() if refused or held is not None else claim(
             message, attempt_recipient, window, started, delivery_limit=send_budget.seconds(options.timeout) if emergency else options.timeout,
             legacy_aliases=legacy_aliases, live=live, postmaster_recipient=postmaster_identity.to, clears_when=options.clears_when if emergency else cold_check,
             emergency=emergency,
-            posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
+            posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine(),
+            push=push_identity)
     log_route: Route = NO_CLAUDE_ROUTE
     review_session = ""
     review_route: review_hold.OpenReview | review_hold.AlreadyKeptForReview | review_hold.ReleasedMessages
@@ -6073,9 +6232,10 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             result = deliver_codex(message, route, options.timeout, selection=options.selection,
                                    review_recipient=stable.value)
         elif isinstance(route, QueuedStaffRecipient):
-            result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
-                            + " so it is kept for it")
             assert isinstance(plan, SessionIdWithoutLiveRecipient)
+            result = Result("queued", f"{herdr_types.PANE_STARTING}; kept for {route.name} ({route.session_id})"
+                            if plan.starting else f"no live Claude or Codex session answers to {route.name} "
+                            + f"({route.session_id}), so it is kept for it")
             queue_mailbox = conversation_recipient(plan.recipient) if transport_message.review_batch else plan.recipient
             enqueue(replace(transport_message, key=None if transport_message.review_batch and not transport_message.once_per_key
                             else transport_message.key), result.detail, started,
@@ -6131,7 +6291,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             if isinstance(plan, SessionIdWithoutLiveRecipient):
                 result = Result(
                     "queued",
-                    f"no live session answers to {plan.address}, so it is kept under that name",
+                    f"{herdr_types.PANE_STARTING}; kept for {plan.address}" if plan.starting
+                    else f"no live session answers to {plan.address}, so it is kept under that name",
                 )
                 queue_mailbox = conversation_recipient(plan.recipient) if transport_message.review_batch else plan.recipient
                 enqueue(replace(transport_message, key=None if transport_message.review_batch and not transport_message.once_per_key
@@ -6239,12 +6400,12 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                      else tuple(dict.fromkeys((message.to, options.to))))
         for address in addresses:
             _ = remove_queued_key(address, message.key, recipient=attempt_recipient, order=order,
-                                  membership=membership)
+                                  membership=membership, push=push_identity)
     if isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
         if (not refused and held is None and isinstance(claim_result, ClaimGranted)
                 and not isinstance(result, RecordedDeliveryAcceptance)
                 and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
-            record_acceptance(identity, started)
+            record_acceptance(identity, started, push=push_identity)
     else:
         # An undelivered emergency releases its claim for a later attempt.
         # Other queued or kept messages retain their claims until delivery.
@@ -6253,11 +6414,14 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                 and not isinstance(result, (UncertainRelayDelivery, WorkerMessageUnconfirmed))
                 and ((emergency and result.outcome != "sent")
                      or result.outcome in {"failed", "refused", "held", "pending", "closed", "absent"})):
-            forget_sent(key, attempt_recipient.value, started)
+            if push_identity is None:
+                _forget_delivery(key, attempt_recipient.value, started)
+            else:
+                forget_sent(push_identity, started)
         elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
               and not isinstance(result, RecordedDeliveryAcceptance)
               and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
-            accept_sent(key, attempt_recipient.value, started, delivered=result.outcome == "sent")
+            accept_sent(key, attempt_recipient.value, started, delivered=result.outcome == "sent", push=push_identity)
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
         result = user_failure(message, options.action, result, options.need, options.text_id)
     reported_to = native_address if isinstance(plan, SessionIdWithoutLiveRecipient) else message.to
@@ -6352,6 +6516,21 @@ def main(argv: list[str]) -> int:
         print("REFUSED: " + push_texts.TEMPLATE_REQUIRED)
         return EXIT["refused"]
     match argv:
+        case ["question-push-drain"]:
+            return question_pushes.drain()
+        case ["question-push-release"]:
+            return silence.end_if_past()
+        case ["question-push-clear", sender, key, encoded, *flags] if flags in ([], ["--emergency"]):
+            try:
+                reference = push_reference.read_reference(cast(object, json.loads(encoded)))
+            except (OSError, ValueError) as error:
+                print(error, file=sys.stderr)
+            else:
+                if reference["kind"] == "question":
+                    code, line = retire_recorded_question(PushIdentity(sender, key, reference), emergency=bool(flags))
+                    print(line, file=sys.stderr if code else sys.stdout)
+                    return code
+            return EXIT["failed"]
         case ["repeat-notices"]:
             repeat_guard.drain(Path(os.environ.get("SEND_REPEAT_STATE", str(STATE / "repeats"))), attempt_repeat_notice, now().timestamp(),
                                cleanup_seconds=2 * kill_grace())
@@ -6368,10 +6547,10 @@ def main(argv: list[str]) -> int:
         case ["retire", *arguments]:
             request = parse_retire(arguments)
             if request.to == USER:
-                code, lines = retire_user(request.sender, request.key)
+                code, lines = retire_user(request.identity)
                 print("\n".join(lines))
                 return code
-            removed = retire(request.to, request.sender, request.key)
+            removed = _retire_queue(request.to, request.identity)
             print(f"retired {removed} queued message{'s' if removed != 1 else ''}")
         case ["clear-check"]:
             code, lines = clear_check()

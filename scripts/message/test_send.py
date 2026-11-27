@@ -57,6 +57,7 @@ from scripts.message.relay_identity import publish_relay_identity, relay_session
 from scripts.message.relay_test_support import write_relay_record
 from scripts.lib import conf, names, process_start, models_registry
 from scripts.production import fake_unit_host, session_staff, staff, stall_watch, unit_lookup
+from scripts.production.unit_lookup import checked_conversation
 from scripts.message import send_result
 from scripts.message.unit_labels import StaffRowAnomaly
 from scripts.message.recipient_test_support import staff_child_command
@@ -4983,6 +4984,27 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(send.remove_queued_key(old_message.to, "notice", recipient=stable, order=older), 0)
         self.assertEqual(send.queue_path("session-recipient").read_bytes(), before[send.queue_path("session-recipient")])
 
+    def test_pending_keeps_each_question_opening_with_the_same_mailbox_key(self) -> None:
+        self.session("recipient", "Recipient")
+        path = send.queue_path("session-recipient")
+        path.parent.mkdir(exist_ok=True)
+        reference = push_reference.QuestionReference(kind="question", path=str(self.root / "question"), since="old")
+        common = {"time": send.now().isoformat(), "from": "hana", "to": "session:recipient",
+                  "stable_recipient": "session:recipient", "key": "choice", "summary": "", "reason": "fixture"}
+        rows = [
+            {**common, "text": "Stale old copy", "reference": reference, "send_order": 1},
+            {**common, "text": "Latest old copy", "reference": reference, "send_order": 2},
+            {**common, "text": "New opening", "reference": {**reference, "since": "new"}, "send_order": 3},
+            {**common, "text": "Unbound copy", "send_order": 4},
+        ]
+        _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        delivered = send.pending("session:recipient")
+        self.assertIn("Unbound copy", delivered)
+        self.assertIn("Latest old copy", delivered)
+        self.assertIn("New opening", delivered)
+        self.assertNotIn("Stale old copy", delivered)
+        self.assertEqual(send.pending("session:recipient"), "")
+
     def test_pending_returns_the_newest_copy_after_interrupted_queue_replacement(self) -> None:
         self.session("before", "resources")
         member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
@@ -5204,6 +5226,23 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             + f" and is still live until {(sent + timedelta(hours=3)).astimezone(zone):%H:%M:%S %Z}; to send a new one,"
             + " retire it first: send.py retire --to user --from hana --key github-cold\n"))
 
+    def test_unbound_emergency_senders_share_the_keys_repeat_window(self) -> None:
+        key = "shared-fixture"
+        alpha = send.parse(self.emergency("--key", key))._replace(sender="alpha")
+        beta = alpha._replace(sender="beta")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+            self.assertEqual(send.send(alpha).outcome, "sent")
+            self.assertEqual(send.send(beta).outcome, "skipped")
+        channel.assert_called_once()
+
+        with (mock.patch.object(send, "run", return_value=(0, "pushover: cancelled 1\n", "")),
+              mock.patch.object(silence, "drop", return_value=0), redirect_stdout(io.StringIO())):
+            self.assertEqual(send.main(["retire", "--to", "user", "--from", "alpha", "--key", key]), 0)
+
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+            self.assertEqual(send.send(beta).outcome, "sent")
+        channel.assert_called_once()
+
     def test_replaced_emergency_retries_until_delivered_then_keeps_its_live_window(self) -> None:
         started = send.now()
         key = "replaced-emergency"
@@ -5420,12 +5459,37 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             code, lines = self.clear_check()
         self.assertEqual(code, 0)
         self.assertEqual(cast(list[str], channel.call_args.args[0]),
-                         [sys.executable, str(send.USER_CHANNEL), "cancel", "--source", "hana", "github-cold"])
+                         [sys.executable, str(send.USER_CHANNEL), "cancel", "--exact-tag-key", "--source", "hana", "github-cold"])
         self.assertEqual(lines, ["retired: github-cold from hana: its check passed;"
                                  + " cancelled: the emergency push for github-cold stopped"])
         self.assertEqual(self.emergencies(), [])
         self.assertFalse((self.root / send.EMERGENCIES).exists())
         self.assertFalse(self.keyed("github-cold"))
+
+    def test_saved_emergencies_and_repeat_windows_keep_question_openings_separate(self) -> None:
+        key = "shared"
+        options = send.parse(registered_arguments(self.emergency("--key", key)))
+        reference = push_reference.QuestionReference(kind="question", path=str(self.root / "question"), since="old")
+        old = options._replace(reference=reference, clears_when="false")
+        new = options._replace(reference={**reference, "since": "new"}, clears_when="false")
+        at = send.now()
+        with (mock.patch.object(send, "now", return_value=at),
+              mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", ""))):
+            for request in (old, new, options):
+                self.assertEqual(send.send(request).outcome, "sent")
+            for request in (old, new, options):
+                self.assertEqual(send.send(request).outcome, "skipped")
+        self.assertEqual([record.get("question") for record in self.emergencies()],
+                         [old.reference, new.reference, None])
+        with (mock.patch.object(send, "run", return_value=(0, "pushover: cancelled\n", "")),
+              mock.patch.object(silence, "drop", return_value=0)):
+            self.assertEqual(self.clear_check(at)[0], 0)
+        self.assertEqual([record.get("question") for record in self.emergencies()], [old.reference, new.reference])
+        with (mock.patch.object(send, "now", return_value=at + timedelta(seconds=1)),
+              mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", ""))):
+            for request in (old, new):
+                self.assertEqual(send.send(request).outcome, "skipped")
+            self.assertEqual(send.send(options).outcome, "sent")
 
     def test_clear_check_keeps_a_push_whose_check_fails(self) -> None:
         self.record("false")
@@ -5477,7 +5541,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             code, lines = self.clear_check()
         command = cast(list[str], channel.call_args.args[0])
         self.assertEqual(command[:-1], ["ssh", "-o", "BatchMode=yes", "natedev"])
-        self.assertEqual(command[-1], f"{send.REMOTE} retire --to user --from hana --key github-cold")
+        self.assertEqual(command[-1], f"{send.REMOTE} retire --to user --from hana --key github-cold --exact-tag-key")
         self.assertEqual((code, lines), (0, ["retired: github-cold from hana: its check passed; on natedev:"
                                              + " cancelled: the emergency push for github-cold stopped"]))
         self.assertEqual(self.emergencies(), [])
@@ -6152,6 +6216,48 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                     self.assertEqual(send.pending(target).count("Native queue body"), 1)
                     self.assertEqual(send.pending(target), "")
 
+    def test_send_queues_a_starting_claude_session_without_relaying(self) -> None:
+        identity, result = self.send_to_starting_claude(matching=True)
+        self.assertEqual(result, send.Result("queued", f"pane is starting; kept for session:{identity}"))
+        self.assertIn("Wait for startup.", send.queue_path(f"session-{identity}").read_text())
+        self.assertEqual(self.relayed, [])
+
+    def test_send_refuses_startup_evidence_for_another_conversation(self) -> None:
+        identity, result = self.send_to_starting_claude(matching=False)
+        self.assertEqual((result.outcome, result.detail), ("failed", "pane is starting"))
+        self.assertFalse(send.queue_path(f"session-{identity}").exists())
+        self.assertEqual(self.relayed, [])
+
+    def send_to_starting_claude(self, *, matching: bool) -> tuple[str, send.Result]:
+        from scripts.herdr import herdr
+
+        identity = fixture_runtime_id("starting-recipient")
+        reported = identity if matching else fixture_runtime_id("another-recipient")
+        place = HerdrPlace("fixture", "w1:p1")
+        pid = 998071
+        environment = fake_unit_host.environment(self.root)
+        started = str(100 * os.sysconf("SC_CLK_TCK"))
+        fake_unit_host.process(environment, pid, 998070, [], {}, started=started)
+        _ = (self.root / "proc/uptime").write_text("101.0 0.0\n")
+        _ = write_config_fixture(self.root / "config/shutdown.conf", "start_seconds=20\n")
+        _ = (self.root / "sessions" / f"{pid}.json").write_text(json.dumps({
+            "pid": pid, "sessionId": reported, "procStart": started, "name": "starting",
+            "messagingSocketPath": "", "updatedAt": 1,
+        }))
+        pane = {"pane_id": place.pane, "agent_session": {"kind": "id", "value": reported}}
+        info = {"process_info": {"shell_pid": 998070, "foreground_process_group_id": pid,
+                                 "foreground_processes": [{"pid": pid, "name": "claude"}]}}
+        with (mock.patch.dict(os.environ, environment), fake_unit_host.private_process_registry(),
+              mock.patch.object(sessions, "process_liveness", return_value=sessions.LiveSessionProcess(pid, started)),
+              mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+              mock.patch.object(herdr, "herdr_processes", return_value=[]),
+              mock.patch.object(herdr, "process_placement", return_value=place),
+              mock.patch.object(herdr.Herdr, "listed", return_value=[pane]),
+              mock.patch.object(herdr.Herdr, "result", return_value=info),
+              mock.patch.object(unit_lookup, "checked_conversation", new=checked_conversation)):
+            result = send.send(local_options(["--to", f"session:{identity}", "--from", "fixture", "--text", "Wait for startup."]))
+        return identity, result
+
     def test_absent_staff_recipient_keeps_its_queue_until_claude_returns(self) -> None:
         member = self.staff_rows["recipient"]
         route = send.resolve_recipient(member.name, send.LocalOnly(), roster.Roster([], []),
@@ -6280,7 +6386,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(code, expected)
             self.assertEqual(output.getvalue(), f"retired 0 queued messages\ndropped {dropped}\n{line}\n")
             self.assertEqual(cast(list[str], run.call_args.args[0])[1:],
-                             [str(send.USER_CHANNEL), "cancel", "--source", "stall_watch", "prompt-1"])
+                             [str(send.USER_CHANNEL), "cancel", "--exact-tag-key", "--source", "stall_watch", "prompt-1"])
         self.assertIn('"key": "prompt-2"', (self.root / "notify/silence-kept.jsonl").read_text())
 
     def test_registry_argv_key_reaches_the_user_send(self) -> None:
@@ -6836,7 +6942,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 with mock.patch.object(send, "run", return_value=(0, "SENT: fixture\n", "")) as run:
                     self.assertEqual(send.remote(message, "fixture-peer", options).outcome, "sent")
                     delivery = cast(float, run.call_args.args[2])
-                    self.assertEqual(send.retire_record(record)[0], 0)
+                    self.assertEqual(send.retire_record(send.emergency_identity(record), record["machine"])[0], 0)
                     retirement = cast(float, run.call_args.args[2])
                 budgets.append((delivery, retirement))
             self.assertEqual(budgets[1][0] - budgets[0][0], 60)

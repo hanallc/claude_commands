@@ -767,7 +767,19 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission, *,
             yield claim, save
 
     return review_submissions.file_list_draft(request.request_id, digest, prepare=prepare,
-                                              deliver=_deliver_scheduled_notice, load_list_draft=_load_list_draft)
+                                              load_list_draft=_load_list_draft)
+
+
+def deliver_scheduled_notices(root: Path, draft_id: new_item_dialog.ScheduledDraftId) -> None:
+    review_submissions.deliver_list_notices(root, draft_id, _deliver_scheduled_notice)
+
+
+def recover_scheduled_notices(root: Path) -> None:
+    for draft_id in review_submissions.pending_scheduled_notices(root):
+        try:
+            deliver_scheduled_notices(root, draft_id)
+        except (OSError, ValueError) as error:
+            print(f"Review Scheduled notice {draft_id.value}: {error}", file=sys.stderr)
 
 
 def scheduled_notice(item: the_list.ListItem, keeper: staff.StaffId, members: staff.StaffSnapshot) -> str:

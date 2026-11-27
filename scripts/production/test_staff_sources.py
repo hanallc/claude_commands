@@ -366,7 +366,7 @@ class StaffSourcesTests(StaffTestCase):
                     self.assertEqual(evidence.identities, {})
                     self.assertEqual(evidence.workers, ())
                     self.assertEqual(evidence.diagnostics, (
-                        "staff sources: Codex process 42401: pid 42401: Codex launch identity is unavailable; pane is starting",))
+                        "staff sources: Codex process 42401: pid 42401: Codex launch identity is unavailable",))
                 else:
                     self.assertEqual(evidence.diagnostics, ())
                     self.assertEqual(evidence.identities[worker.id], {"codex": worker.current_session})

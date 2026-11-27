@@ -24,9 +24,8 @@ sender is the source; "send.py in hana" shows as "hana". A long body is cut so t
 always fits. A push with no sender is refused and nothing is posted.
 
 While the user's silence is on (silence.py), a push below priority 2 is kept unless it uses --through-silence.
-A kept push prints "pushover: kept: silence until ..." and exits 0, and
-`silence.py off` posts it later. A kept push with the same --key from the same
---source replaces the older kept one.
+A kept push prints "pushover: kept: silence until ..." and exits 0.
+`silence.py off` posts it later. Replacement matches the source, key and Question reference.
 --through-silence preserves review and priority. A normal push does not repeat or need acknowledgement.
 --user-asked sends a requested nate.adhoc push as written. Silence rules still apply.
 
@@ -42,6 +41,7 @@ except FileNotFoundError:
     pass
 
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -53,14 +53,16 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import ClassVar, NotRequired, TypedDict, cast
 
 from scripts.lib import conf
 from scripts.message import session_send
 from scripts.notify import review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
+from scripts.notify import question_pushes
 from scripts.notify import silence
 from scripts.notify import decision_priority
 from scripts.notify.push_catalog import (NATE_ADHOC_TEXT_ID, PAID_CREDIT_ACTION_PREFIX, RESTART_FAILED_TEXT_ID,
@@ -175,7 +177,12 @@ def http_post(url: str, data: bytes) -> tuple[int, bytes]:
         with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:  # pyright: ignore[reportAny]
             return cast(int, response.status), cast(bytes, response.read())  # pyright: ignore[reportAny]
     except urllib.error.HTTPError as error:
-        return error.code, error.read()
+        try:
+            return error.code, error.read()
+        except (OSError, http.client.HTTPException):
+            if 400 <= error.code < 500:
+                return error.code, b""
+            raise
 
 
 def parent_source() -> str:
@@ -583,7 +590,7 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
             paid_credit_account: str = "") -> int:
     """Post an already reviewed version, including expiry sends; do not review again.
 
-    During silence a non-empty `key` makes the kept push replace an older kept one from the same source.
+    A keyed push replaces a pending push from the same source only when their Question references match.
     """
     source, priority, title = draft.source, draft.priority, draft.title
     if not key and draft.reference["kind"] == "question":
@@ -616,18 +623,46 @@ def paid_credit_details(push: silence.KeptPush) -> tuple[str, str]:
 
 def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
     """Keep a reviewed push during silence or post it on natedev."""
+    reference = push.get("reference", push_reference.NO_REFERENCE)
+    if reference["kind"] == "question" and not push["key"]:
+        push = {**push, "key": "question:" + reference["path"]}
+    identity = silence.push_identity(push)
+    if reference["kind"] == "question":
+        try:
+            if _can_keep(push):
+                _ = silence.end_if_past(deliver=lambda kept: post_kept(kept, keys_file, post))
+            with silence.locked():
+                _ = question_pushes.bind_locked(identity, emergency=push["priority"] == "2")
+                return _deliver_here(push, identity, keys_file, post, locked=True)
+        except question_pushes.SettledQuestion as error:
+            print(f"pushover: replaced: {error}")
+            return 5
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"pushover: Question push could not be admitted: {error}", file=sys.stderr)
+            return 1
+    return _deliver_here(push, identity, keys_file, post)
+
+
+def _can_keep(push: silence.KeptPush) -> bool:
+    return (push["priority"] != "2" and push["text_id"] not in TOKEN_ALERT_IDS | {"quota.claude_expiry"}
+            and push.get("silence_policy", silence.SilencePolicy.KEEP_DURING_SILENCE) == silence.SilencePolicy.KEEP_DURING_SILENCE)
+
+
+def _deliver_here(push: silence.KeptPush, identity: push_reference.PushIdentity,
+                  keys_file: Path, post: Post, *, locked: bool = False) -> int:
     source, priority, title, message = push["source"], push["priority"], push["title"], push["message"]
     detail, _ = paid_credit_details(push)
     if push["text_id"] == "quota.claude_expiry" or push["text_id"] in TOKEN_ALERT_IDS:
-        if silence.active():
+        if silence.active_locked() if locked else silence.active():
             return refuse(source, priority, title, message, "silence is active")
-    elif priority != "2" and push.get("silence_policy", silence.SilencePolicy.KEEP_DURING_SILENCE) == silence.SilencePolicy.KEEP_DURING_SILENCE:
-        kept = silence.keep_here(push, deliver=lambda push: post_kept(push, keys_file, post))
+    elif _can_keep(push):
+        kept = (silence.keep_locked(push) if locked else
+                silence.keep_here(push, deliver=lambda kept: post_kept(kept, keys_file, post)))
         if isinstance(kept, silence.Kept):
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))
             print(f"pushover: kept: silence {kept.until}")
             return 0
-    return post_message(source, priority, title, message, keys_file, post, detail, push["key"], push["text_id"])
+    return _post_message(identity, priority, title, message, keys_file, post, detail, push["text_id"]).exit_code
 
 
 def _update_kept_restart_failure(message: str) -> push_texts.RenderedPush | None:
@@ -677,6 +712,8 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     reference = push.get("reference", push_reference.NO_REFERENCE)
     text_id = push["text_id"]
     reason = ""
+    identity = silence.push_identity(push)
+    confirmed_open = False
     title, message = push["title"], push["message"]
     if text_id and not any(entry.id == text_id for entry in push_texts.catalog()):
         reason = f"retired template {text_id}"
@@ -691,17 +728,18 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
         if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
             reason = TOKEN_APPROVAL_REQUIRED
         if reference["kind"] == "question":
+            binding_path = question_pushes.binding_path(push["source"], push["key"])
             try:
-                opening = push_reference.read_question(Path(reference["path"]))
-            except (OSError, ValueError) as error:
+                reason = question_pushes.settled(reference)
+                confirmed_open = not reason
+            except BlockingIOError:
+                return 1
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
                 log(push["source"], push["priority"], push["title"], push["message"],
                     f"anomaly: question record {reference['path']}: {error}",
                     key=push["key"], template=push["text_id"], reference=reference)
-            else:
-                if opening.status == "closed":
-                    reason = "question closed"
-                elif opening.since != reference["since"]:
-                    reason = "question reopened"
+                if binding_path.exists() or reference.get("machine") == "mac":
+                    return 1
     if reason:
         log(push["source"], push["priority"], push["title"], push["message"], "dropped: " + reason,
             key=push["key"], template=push["text_id"], reference=reference)
@@ -712,15 +750,65 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
         message = refresh_paid_credit_action(push, account)
     need = push.get("need") or {"0": "note", "1": "decision", "2": "blocked"}[push["priority"]]
     priority = decision_priority.priority(need, push.get("due", ""))
-    return post_message(push["source"], priority, title, message, keys_file, post, detail,
-                        push["key"], push["text_id"])
+
+    def post_once(url: str, data: bytes) -> tuple[int, bytes]:
+        if priority == "2" and confirmed_open:
+            _ = question_pushes.bind_locked(identity, emergency=True)
+        silence.mark_post_started(push)
+        return post(url, data)
+
+    def rejected(reason: str) -> None:
+        if push.get("post_started", False):
+            silence.mark_post_rejected(push, reason)
+
+    exit_code = 1
+    try:
+        exit_code = post_message(identity.sender, priority, title, message, keys_file, post_once, detail,
+                                 identity.key, text_id, reference=reference, on_rejected=rejected)
+        return exit_code
+    finally:
+        if exit_code != 0 and push.get("post_started", False):
+            log(push["source"], priority, title, message, "kept push post unconfirmed",
+                key=push["key"], template=text_id, reference=reference)
+
+
+@dataclass(frozen=True)
+class PostAccepted:
+    exit_code: ClassVar[int] = 0
+
+
+@dataclass(frozen=True)
+class PostRejected:
+    reason: str
+    exit_code: int = 1
+
+
+@dataclass(frozen=True)
+class PostUnknown:
+    exit_code: ClassVar[int] = 1
+
+
+PostResult = PostAccepted | PostRejected | PostUnknown
 
 
 def post_message(source: str, priority: str, title: str, message: str,
-                 keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "") -> int:
-    """Every push to the phone goes out here, with its sender and template on one last line."""
+                 keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "", *,
+                 reference: push_reference.PushReference = push_reference.NO_REFERENCE,
+                 on_rejected: Callable[[str], None] | None = None) -> int:
+    """Post a push and report a confirmed rejection to the caller."""
+    result = _post_message(push_reference.PushIdentity(source, key, reference), priority, title, message,
+                           keys_file, post, detail, text_id)
+    if isinstance(result, PostRejected) and on_rejected is not None:
+        on_rejected(result.reason)
+    return result.exit_code
+
+
+def _post_message(identity: push_reference.PushIdentity, priority: str, title: str, message: str,
+                  keys_file: Path, post: Post, detail: str, text_id: str) -> PostResult:
+    source = identity.sender
     if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
-        return refuse(source, priority, title, message, TOKEN_APPROVAL_REQUIRED)
+        _ = refuse(source, priority, title, message, TOKEN_APPROVAL_REQUIRED)
+        return PostRejected(TOKEN_APPROVAL_REQUIRED, 2)
     suffix = f", {detail}" if detail else ""
     try:
         with conf.diagnostics(report=False) as diagnostics:
@@ -730,13 +818,13 @@ def post_message(source: str, priority: str, title: str, message: str,
         outcome = f"{REFUSED_BEFORE_SENDING}: {diagnostic}"
         log(source, priority, title, message, outcome + suffix)
         print(f"pushover: {outcome}", file=sys.stderr)
-        return 2
+        return PostRejected(diagnostic, 2)
     for diagnostic in diagnostics:
         print(diagnostic, file=sys.stderr)
     if not sender:
         log(source, priority, title, message, f"{REFUSED_BEFORE_SENDING}: no sender" + suffix)
         print(f"pushover: {REFUSED_BEFORE_SENDING}: no sender. Name the sender with --source NAME.", file=sys.stderr)
-        return 2
+        return PostRejected("no sender", 2)
     footer = _phone_footer(sender, text_id)
     message = message[:MESSAGE_MAX - len(footer)].rstrip() + footer
     keys = read_keys(keys_file)
@@ -744,35 +832,52 @@ def post_message(source: str, priority: str, title: str, message: str,
         outcome = f"{REFUSED_BEFORE_SENDING}: keys missing"
         log(source, priority, title, message, outcome + suffix)
         print(f"pushover: {outcome}. Set PUSHOVER_USER and PUSHOVER_TOKEN in {keys_file}.", file=sys.stderr)
-        return 2
-    data = urllib.parse.urlencode(fields(keys, title, message, priority, key)).encode()
+        return PostRejected("keys missing", 2)
+    data = urllib.parse.urlencode(fields(keys, title, message, priority, identity.tag_key)).encode()
     try:
         status, raw = post(API_URL, data)
-    except (urllib.error.URLError, TimeoutError) as error:
+    except (OSError, http.client.HTTPException) as error:
         log(source, priority, title, message, f"unreachable: {error}" + suffix)
         print(f"pushover: could not reach Pushover: {error}", file=sys.stderr)
-        return 1
+        return PostUnknown()
     try:
         decoded = cast(object, json.loads(raw))
-    except json.JSONDecodeError:
+    except (UnicodeError, json.JSONDecodeError):
         decoded = None
-    reply = cast(Reply, cast(object, decoded)) if isinstance(decoded, dict) else Reply()
-    if status == 200 and reply.get("status") == 1:
+    reply = cast(dict[str, object], decoded) if isinstance(decoded, dict) else {}
+    outcome_code = reply.get("status")
+    if status == 200 and type(outcome_code) is int and outcome_code == 1:
         receipt = reply.get("receipt")
         outcome = f"sent, receipt {receipt}" if receipt else "sent"
         log(source, priority, title, message, outcome + suffix)
         print(f"pushover: {outcome}")
-        return 0
-    errors = "; ".join(reply.get("errors", [])) or f"HTTP {status}"
-    log(source, priority, title, message, f"refused: {errors}" + suffix)
-    print(f"pushover: refused: {errors}", file=sys.stderr)
-    return 1
+        return PostAccepted()
+    errors = reply.get("errors")
+    reason = ("; ".join(error for error in cast(list[object], errors) if isinstance(error, str))
+              if isinstance(errors, list) else "") or f"HTTP {status}"
+    if 400 <= status < 500 or status == 200 and type(outcome_code) is int and outcome_code != 1:
+        log(source, priority, title, message, f"refused: {reason}" + suffix)
+        print(f"pushover: refused: {reason}", file=sys.stderr)
+        return PostRejected(reason)
+    log(source, priority, title, message, f"unconfirmed: {reason}" + suffix)
+    print(f"pushover: unconfirmed: {reason}", file=sys.stderr)
+    return PostUnknown()
 
 
 def cancel(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post, *,
            asker: AskNatedev = ask_natedev) -> int:
-    """Stop every emergency push sent with this key; log the outcome like a post."""
+    """Cancel the exact tag named by the command."""
     source = ""
+    if argv[:1] == ["--exact-tag-key"]:
+        argv = argv[1:]
+    reference: push_reference.PushReference = push_reference.NO_REFERENCE
+    if argv[:1] == ["--reference"] and len(argv) >= 2:
+        try:
+            reference = push_reference.read_reference(cast(object, json.loads(argv[1])))
+        except ValueError as error:
+            print(f"pushover: {error}", file=sys.stderr)
+            return 2
+        argv = argv[2:]
     if len(argv) == 3 and argv[0] == "--source" and argv[1].strip():
         source, argv = argv[1], argv[2:]
     if len(argv) != 1 or not argv[0] or argv[0].startswith("--"):
@@ -780,11 +885,12 @@ def cancel(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post,
         return 2
     if not source:
         source = parent_source()
-    key = argv[0]
-    tag = push_tag(key)
-    title, message = "cancel emergency push", f"key {key}, tag {tag}"
+    identity = push_reference.PushIdentity(source, argv[0], reference)
+    tag = push_tag(identity.tag_key)
+    title = "cancel emergency push"
+    message = f"key {identity.key}, tag {tag}"
     if silence.on_mac():
-        return via_natedev(["cancel", "--source", source, key], "", asker,
+        return via_natedev(["cancel", "--exact-tag-key", "--source", source, identity.tag_key], "", asker,
                            source=source, priority="2", title=title, message=message)
     keys = read_keys(keys_file)
     if keys is None:
@@ -815,6 +921,14 @@ def cancel(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post,
 
 
 def main(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
+    if len(argv) == 2 and argv[0] == "question-opening" and "SSH_CONNECTION" in os.environ:
+        try:
+            opening = push_reference.read_question(Path(argv[1]))
+        except (OSError, ValueError) as error:
+            print(error, file=sys.stderr)
+            return 1
+        print(json.dumps({"status": opening.status, "since": opening.since}))
+        return 0
     if argv == ["deliver"]:
         push = silence.parse_push(sys.stdin.read())
         if push is None:

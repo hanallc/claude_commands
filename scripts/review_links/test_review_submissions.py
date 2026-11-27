@@ -66,8 +66,8 @@ EVIDENCE = submissions.BuildStepEvidence(
          submissions.TipDetail("Run 18 · Test shard 2 of 4")))
 
 
-def identify_fixture_image(extension: str, data: bytes) -> subprocess.CompletedProcess[bytes]:
-    if data != base64.b64decode(PNG):
+def identify_fixture_image(extension: str, path: Path) -> subprocess.CompletedProcess[bytes]:
+    if path.read_bytes() != base64.b64decode(PNG):
         raise AssertionError("Add the image to the test fixtures.")
     return subprocess.CompletedProcess(["identify", extension], 0, stdout=b"PNG\n")
 

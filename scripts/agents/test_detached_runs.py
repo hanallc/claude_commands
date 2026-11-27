@@ -47,7 +47,7 @@ from scripts.lib import atomic_file, conf, process_group, process_start, process
 from scripts.lib.unit_runs_test_support import start_new_command
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
-from scripts.herdr import herdr, herdr_types, pass_notices, turn_end, worker_panes
+from scripts.herdr import herdr, herdr_types, pane_launch, pass_notices, turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import roster, send, send_later, sessions
@@ -540,7 +540,7 @@ class DetachedRunsTests(unittest.TestCase):
                 popen.assert_not_called()
                 self.assertFalse((self.session / detached_runs.DETACHED_RUNS_DIR).exists())
                 self.assertEqual(errors.getvalue().splitlines(), [
-                    "detached_runs: Start with systemd-run --scope or systemd-run --user --scope. "
+                    "detached_runs: Start with systemd-run --scope --collect or systemd-run --user --scope --collect. "
                     + "Use the exact option names in that order.",
                 ])
 
@@ -5209,6 +5209,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
                             self.fixture.world.foreground[pane] = (pid, family, [
                                 family, *worker_panes.launch_arguments(policy, row.current_session, self.fixture.root)])
                             self.fixture.world.processes[pid].environment["CODEX_HOME"] = os.environ["CODEX_HOME"]
+                            self.fixture.world.processes[pid].environment[pane_launch.BERTH_SESSION_ENV] = (
+                                f"{self.fixture.parent.current_session}.phase-40")
                             config = self.fixture.root / "conf/direct.conf"
                             write_text_atomic(config, config.read_text() + "# range: 1..600\nworker_settle_seconds=1\n")
                             launches = len(self.fixture.world.launches)

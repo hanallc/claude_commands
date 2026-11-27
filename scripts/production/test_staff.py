@@ -48,9 +48,12 @@ class StaffCommandTestCase(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        startup = str(CHECKOUT / "scripts/lib/python_startup")
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             **fixture_git_environment(self.root),
             "GIT_CONFIG_SYSTEM": os.devnull,
+            # The fake owner starts outside the checkout and imports test support.
+            "PYTHONPATH": os.pathsep.join(filter(None, (startup, os.environ.get("PYTHONPATH", "")))),
             "ROSTER_RUN_ROOT": str(self.root / "unit"),
             "UNIT_RUN_ROOT": str(self.root / "unit"),
             "SCRATCH_ROOT": str(self.root / "scratch"),

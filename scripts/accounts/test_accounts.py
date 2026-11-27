@@ -1626,6 +1626,78 @@ class AccountsTests(unittest.TestCase):
             observed = read_sessions(accounts.GroupAccounts())
         self.assertEqual(observed.counts[(numbered, "workers")], {row.current_session: "idle"})
 
+    @contextmanager
+    def starting_worker_pane(self, *, record_launch: bool = True) -> Generator[tuple[staff.StaffRow, herdr.HerdrPlace]]:
+        from scripts.herdr import pane_launch
+        from scripts.herdr.test_worker_panes import PaneWorld
+        from scripts.production import fake_unit_host
+        from scripts.production.staff_test_support import unit_membership
+
+        _, target = self.workers_fixture()
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        owner = unit_membership("show", "unit")
+        owner = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.root), expected=owner.worktree)
+        row = fixture_worker("starting-worker", owner.id, backend=staff.CodexBackend(target))
+        world = PaneWorld()
+        environment = fake_unit_host.environment(self.root)
+        environment["HERDR_PANE_RECORD_DIR"] = str(self.root / "launches")
+        with (patch.dict(os.environ, environment), patch.object(worker_panes, "_client", return_value=world),
+              patch.object(herdr, "native_process", side_effect=world.native_process),
+              patch.object(herdr, "_startup_processes", side_effect=world.descendants)):
+            world.add(owner, "w1:p0")
+            pane = "w1:p1"
+            world.add(row, pane, family="codex")
+            if not record_launch:
+                (pane_launch.record_directory() / f"{world.session}.json").unlink()
+            pid, _, _ = world.foreground[pane]
+            world.foreground[pane] = (pid, "codex", [])
+            fake_unit_host.process(environment, pid, 1, [], {}, started=str(100 * os.sysconf("SC_CLK_TCK")))
+            _ = (self.root / "proc/uptime").write_text("101.0 0.0\n")
+            _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", "start_seconds=20\n")
+            yield row, herdr.HerdrPlace(world.session, pane)
+
+    def test_status_shows_a_starting_worker_without_a_read_warning(self) -> None:
+        from scripts.review_links import accounts_page
+
+        with self.starting_worker_pane() as (row, place):
+            reading = accounts.read_status(detail=True)
+            table = accounts.render_status_table(reading)
+            stored = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
+            markup = accounts_page.board(stored)
+            document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(stored)))
+        state = f"{row.name}: starting"
+        self.assertIn(f"worker {state}", reading.detail_lines)
+        self.assertIn("busy 1, idle 0", table)
+        self.assertIn(f">workers</span><br>{state}</td>", markup)
+        self.assertEqual(document.get("starting_workers"),
+                         [{"session": row.current_session, "name": row.name, "state": "starting"}])
+        self.assertNotIn("starting_panes", document)
+        for problem in (*reading.notes, *stored.notes, *document["problems"]):
+            self.assertNotIn("pane is starting", problem)
+            self.assertNotIn(state, problem)
+            self.assertNotIn(f"{place.session}:{place.pane}", problem)
+        self.assertNotIn("pane is starting", markup)
+        self.assertEqual(markup.count(state), 1)
+
+    def test_status_shows_a_starting_pane_without_a_worker(self) -> None:
+        from scripts.review_links import accounts_page
+
+        with self.starting_worker_pane(record_launch=False) as (row, place):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
+            markup = accounts_page.board(reading)
+            document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        location = f"{place.session}:{place.pane}"
+        state = f"pane {location}: starting"
+        self.assertIn(state, reading.detail_lines)
+        self.assertIn(f"<li>{state}</li>", markup.split('<h2>Roles</h2>', 1)[1])
+        self.assertNotIn(f"{row.name}: starting", markup)
+        self.assertNotIn("starting_workers", document)
+        self.assertEqual(document.get("starting_panes"),
+                         [{"session": place.session, "pane": place.pane, "state": "starting"}])
+        for problem in (*reading.notes, *document["problems"]):
+            self.assertNotIn(location, problem)
+            self.assertNotIn(row.name, problem)
+
     def test_peer_counts_age_failure_and_recovery_use_only_the_local_counts(self) -> None:
         row = replace(SharedStatusDocumentTests().row(), label="claude1", roles=("units",),
                       role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0),))

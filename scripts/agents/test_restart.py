@@ -2131,13 +2131,29 @@ from contextlib import nullcontext
 from pathlib import Path
 from threading import Event
 
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+if resource.getrlimit(resource.RLIMIT_CORE) != (0, 0):
+    raise RuntimeError('The child core size limit is not zero')
+
+if sys.platform == 'linux':
+    import ctypes
+
+    # Linux ignores RLIMIT_CORE when it pipes core dumps to a handler.
+    PR_GET_DUMPABLE = 3
+    PR_SET_DUMPABLE = 4
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    prctl.argtypes = (ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong)
+    if prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), 'Could not disable child core dumps')
+    if prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) != 0:
+        raise RuntimeError('The child can still dump core')
+
 number = int(sys.argv.pop(1))
 step = sys.argv.pop(1)
 ready_fd = int(sys.argv[sys.argv.index('--ready-fd') + 1])
 log_fd = int(sys.argv[sys.argv.index('--log-fd') + 1])
 log_path = Path(sys.argv[sys.argv.index('--log') + 1])
 write = os.write
-resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 if step == 'claim':
     claim = log_path.with_suffix('.claim')

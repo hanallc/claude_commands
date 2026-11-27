@@ -501,6 +501,19 @@ clear_check() {
   log_error "clear-check: ${output//$'\n'/ / }"
 }
 
+question_push_job() {
+  local job=$1 output fired
+  if [[ -n ${NOTIFIER_SEND:-} ]]; then
+    output=$("$NOTIFIER_SEND" "$job" 2>&1)
+  else
+    output=$("$PY" "$SEND" "$job" 2>&1)
+  fi
+  if (( $? != 0 )) && [[ -n $output ]]; then
+    fired=$(fired_stamp)
+    log_error "$job: ${output//$'\n'/ / }"
+  fi
+}
+
 ensure_production_backup() {
   [[ -z ${NOTIFIER_STATE_DIR:-} && $(hostname -s) == natedev ]] || return 0
   local name=production-backup command backup_script="${SCRIPT:h:h}/production/log_backup.py"
@@ -563,6 +576,17 @@ cmd_tick() {
     fi
     launch_job "send-repeat-notices-$$-$RANDOM" "${drain_command[@]}" || log_error "repeat drain launcher unavailable"
 
+  fi
+  local notify_state=${NOTIFY_STATE_DIR:-$HOME/.local/state/notify}
+  if [[ -z ${NOTIFIER_STATE_DIR:-} || -n ${NOTIFY_STATE_DIR:-} ]]; then
+    local question_pushes=$notify_state/question-pushes
+    local -a bindings=("$question_pushes"/*.json(N))
+    if (( ${#bindings} )) || [[ -s $notify_state/silence-kept.jsonl ]]; then
+      question_push_job question-push-drain
+    fi
+    if [[ -s $notify_state/silence-kept.jsonl && ! -e $notify_state/silence.json ]]; then
+      question_push_job question-push-release
+    fi
   fi
   [[ -n $EMERGENCIES && -s $EMERGENCIES ]] && clear_check
   return 0

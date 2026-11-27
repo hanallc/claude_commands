@@ -22,7 +22,7 @@ from threading import Lock
 from typing import NamedTuple, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, existing_writer_lock, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
-from scripts.lib.file_lock import exclusive
+from scripts.lib.file_lock import LockResult, exclusive
 from scripts.lib import conf, git_files
 from scripts.lib.showrunner_state import state_root as state_root
 from scripts.agents.remote import local_machine
@@ -873,14 +873,23 @@ class LockedRecordNumbers:
 
 
 @contextmanager
+def record_number_lock(kind: RecordKind, *, wait: bool = True) -> Generator[None]:
+    """Hold the publication lock for a record kind."""
+    path = _sequence_path(kind)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with exclusive(path.with_suffix(".lock"), wait=wait) as result:
+        if result is LockResult.BUSY:
+            raise BlockingIOError(f"{kind} publication is in progress")
+        yield
+
+
+@contextmanager
 def record_numbers(kind: RecordKind, read_id: Callable[[Path], str], *,
                    existing_only: bool = False) -> Generator[LockedRecordNumbers]:
     """Hold one sequence lock across its checks and native publication."""
     path = _sequence_path(kind)
-    if not existing_only:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_suffix(".lock")
-    with existing_writer_lock(lock_path) if existing_only else exclusive(lock_path):
+    lock = existing_writer_lock(path.with_suffix(".lock")) if existing_only else record_number_lock(kind)
+    with lock:
         yield LockedRecordNumbers(kind, read_id, _read_high_water(path))
 
 

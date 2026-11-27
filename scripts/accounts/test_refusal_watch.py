@@ -17,6 +17,7 @@ import io
 import fcntl
 import itertools
 import json
+import math
 import os
 import shlex
 import socket
@@ -217,7 +218,9 @@ class RefusalWatchTests(unittest.TestCase):
 
     def read_session_registry(self, *, dependencies: Callable[[Path], None] | None = None,
                               observe: Callable[[], list[status_sessions.SessionRecord]] | None = None,
+                              for_session: str | None = None, deadline: float = math.inf,
                               ) -> status_sessions.RegistryRead:
+        del for_session, deadline
         directory = status_sessions.sessions_dir()
         try:
             _ = tuple(directory.iterdir())

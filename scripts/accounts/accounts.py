@@ -48,6 +48,7 @@ _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 
 from scripts.whoami import account  # noqa: E402
 from scripts.herdr import herdr_types  # noqa: E402
+from scripts.herdr.place import HerdrPlace  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import atomic_file, conf, file_lock, models_registry, registry_rows, transcripts  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
@@ -3086,8 +3087,10 @@ class AccountOpenWorkerActivity(AccountWorkerActivity, Protocol):
 
 class AccountPaneReader(Protocol):
     OpenWorker: type[AccountOpenWorkerActivity]
+    StartingWorker: type[AccountWorkerActivity]
 
-    def observe_parents(self, parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot
+    def observe_parents(self, parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot, *,
+                        starting_panes: set[HerdrPlace] | None = None
                         ) -> dict[staff.StaffId, list[AccountWorkerActivity]]: ...
 
     def worker_state(self, observed: AccountWorkerActivity) -> Literal["idle", "busy", "unknown"]: ...
@@ -4691,6 +4694,30 @@ class AccountSessionDocument(TypedDict):
     state: session_state.SessionState
 
 
+class StartingWorkerDocument(TypedDict):
+    session: str
+    name: str
+    state: Literal["starting"]
+    machine: NotRequired[str]
+
+
+class StartingPaneDocument(TypedDict):
+    session: str
+    pane: str
+    state: Literal["starting"]
+    machine: NotRequired[str]
+
+
+def starting_worker_text(worker: StartingWorkerDocument) -> str:
+    suffix = f" ({machine})" if (machine := worker.get("machine")) else ""
+    return f"{worker['name']}{suffix}: {worker['state']}"
+
+
+def starting_pane_text(pane: StartingPaneDocument) -> str:
+    suffix = f" ({machine})" if (machine := pane.get("machine")) else ""
+    return f"pane {pane['session']}:{pane['pane']}{suffix}: {pane['state']}"
+
+
 @dataclass(frozen=True)
 class NamedSession:
     """One local session of a role by its staff name; the Accounts page names paused and exited ones."""
@@ -4844,6 +4871,8 @@ class StatusReading:
     first_next_moves: FirstNextMoveEntries | NextMovesUnavailable = field(default_factory=NextMovesUnavailable)
     claude_registry_unreadable: bool = False
     live_claude_accounts: frozenset[tuple[str, str]] = frozenset()
+    starting_workers: tuple[StartingWorkerDocument, ...] = ()
+    starting_panes: tuple[StartingPaneDocument, ...] = ()
 
 
 class StatusAccountDocument(TypedDict):
@@ -4909,6 +4938,8 @@ class StatusDocument(TypedDict):
     accounts: list[StatusAccountDocument]
     board: Board
     problems: list[str]
+    starting_workers: NotRequired[list[StartingWorkerDocument]]
+    starting_panes: NotRequired[list[StartingPaneDocument]]
 
 
 def _reading_is_old(read_at: datetime, now: datetime, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> bool:
@@ -5517,8 +5548,13 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
         if (key := f"account.{row.label}") in colors:
             item["color"] = colors[key]
         accounts.append(item)
-    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts,
-                                     board=_status_board(reading, account_config=account_config, colors=colors), problems=[note.removeprefix("* ") for note in reading.notes]))
+    document = StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts,
+                              board=_status_board(reading, account_config=account_config, colors=colors), problems=[note.removeprefix("* ") for note in reading.notes])
+    if reading.starting_workers:
+        document["starting_workers"] = list(reading.starting_workers)
+    if reading.starting_panes:
+        document["starting_panes"] = list(reading.starting_panes)
+    return json.dumps(document)
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
@@ -6163,16 +6199,20 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
     notes = [render_status_problem(problem) for problem in merge_status_problems(problems)]
     notes.extend(counts.problems)
     notes.extend(counts.peer_count_notes)
-    detail_lines: tuple[str, ...] = ()
+    starting_workers = (*local_sessions.starting_workers, *counts.peer_starting_workers)
+    starting_panes = (*local_sessions.starting_panes, *counts.peer_starting_panes)
+    detail_lines = (*(f"worker {starting_worker_text(worker)}" for worker in starting_workers),
+                    *(starting_pane_text(pane) for pane in starting_panes))
     if detail:
         journal = moves.read_journal()
         live_lines = ((*local_sessions.session_lines, *_workers_status_lines(now, selected_workers, local_sessions.continuation_lines, account_config=account_config))
                       if isinstance(source, RefreshStaleUsage) else ())
-        detail_lines = (*(f"{row.label}: {_role_count_text(row, role)}" for row in rows for role in row.roles if role != "spare"), *live_lines,
+        detail_lines = (*detail_lines, *(f"{row.label}: {_role_count_text(row, role)}" for row in rows for role in row.roles if role != "spare"), *live_lines,
             *_move_status_lines(moves.account_moves(journal), zone, account_config=account_config), *_routing_status_lines(journal, zone))
     return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr), session_inputs,
                          claude_registry_unreadable=counts.claude_registry_unreadable,
-                         live_claude_accounts=local_sessions.live_claude_accounts)
+                         live_claude_accounts=local_sessions.live_claude_accounts,
+                         starting_workers=starting_workers, starting_panes=starting_panes)
 
 
 @dataclass
@@ -6285,6 +6325,8 @@ class DiagnosticStream(io.StringIO):
 def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = False, include_models: bool = False,
                 account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> StatusReading:
     """Read each account once; retain diagnostics before any later failure."""
+    from scripts.herdr import herdr
+
     account_config = read_account_settings(account_config)
     enclosing = _status_diagnostics.get()
     diagnostics = enclosing if isinstance(enclosing, StatusDiagnostics) else StatusDiagnostics()
@@ -6292,7 +6334,8 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     tty = sys.stderr.isatty()
     held = DiagnosticStream(sys.stderr)
     try:
-        with (redirect_stderr(held), role_map.observe_map_reads(_observe_map_provenance),
+        with (redirect_stderr(held), herdr.quiet_starting_panes(),
+              role_map.observe_map_reads(_observe_map_provenance),
               role_map.stored_role_map() if isinstance(source, StoredUsageOnly) else nullcontext()):
             reading = _with_upcoming_moves(_read_status(
                 source, detail=detail, include_models=include_models, account_config=account_config))
@@ -6383,6 +6426,8 @@ class LocalRoleSessions:
     model_session_names: dict[tuple[Path, str], str] = field(default_factory=dict)
     running_claude_folders: frozenset[Path] = frozenset()
     live_claude_accounts: frozenset[tuple[str, str]] = frozenset()
+    starting_workers: tuple[StartingWorkerDocument, ...] = ()
+    starting_panes: tuple[StartingPaneDocument, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -6983,7 +7028,9 @@ def _session_config_dir(pid: int) -> account.ConfiguredClaudeFolder | account.No
 
 
 def _local_session_counts(*, include_models: bool = False) -> LocalRoleSessions:
-    with role_map.stored_role_map():
+    from scripts.herdr import herdr
+
+    with role_map.stored_role_map(), herdr.quiet_starting_panes():
         return _read_local_role_sessions(group_accounts(), include_models=include_models)
 
 
@@ -7137,28 +7184,35 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
         record_claude_model(directory, member.current_session)
         session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     observed_workers = set(live)
+    starting_workers: list[StartingWorkerDocument] = []
+    starting_panes: set[HerdrPlace] = set()
     open_codex_workers: dict[str, Path] = {}
     if include_workers and (parents := session_staff.pane_parents(membership)):
         worker_panes = cast(AccountPaneReader, cast(object, import_module("scripts.herdr.worker_panes")))
 
-        for states in worker_panes.observe_parents(parents, membership).values():
+        for states in worker_panes.observe_parents(parents, membership, starting_panes=starting_panes).values():
             for state in states:
+                opening = (isinstance(state, worker_panes.StartingWorker)
+                           or isinstance(state, worker_panes.OpenWorker) and state.status == "starting")
+                if opening:
+                    starting_workers.append(StartingWorkerDocument(
+                        session=state.row.current_session, name=state.row.name, state="starting"))
                 evidence = session_staff.worker_backend(membership, state.row.id)
                 if not isinstance(evidence, session_staff.RecordedWorker):
-                    session_lines.append(f"worker {state.row.name}: {evidence.reason}")
+                    if not opening:
+                        session_lines.append(f"worker {state.row.name}: {evidence.reason}")
                     continue
-                status = ("starting" if isinstance(state, worker_panes.OpenWorker) and state.status == "starting"
-                          else worker_panes.worker_state(state))
+                status = "starting" if opening else worker_panes.worker_state(state)
                 if status == "unknown":
                     reason = cast(object, getattr(state, "reason", "pane status is unknown"))
                     session_lines.append(f"worker {state.row.name}: {reason}")
                     continue
-                if isinstance(state, worker_panes.OpenWorker) and isinstance(evidence.backend, staff.CodexBackend):
+                if (opening or isinstance(state, worker_panes.OpenWorker)) and isinstance(evidence.backend, staff.CodexBackend):
                     directory = evidence.backend.codex_home
                     counts.setdefault((directory, "workers"), {})[state.row.current_session] = session_state.classify(
                         state.row, session_state.LiveActivity(status), detached=detached)
                     record_name(directory, state.row.current_session, state.row.name)
-                    if include_models:
+                    if include_models and isinstance(state, worker_panes.OpenWorker):
                         open_codex_workers[state.row.current_session] = directory
                     observed_workers.add(state.row.current_session)
     unobserved_workers = [member for member in staff.active(membership, "worker")
@@ -7202,7 +7256,10 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
             record_codex_model(directory, member.current_session, process.pid if process else 0)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), (), bool(registry.unreadable), frozenset(live), models, names,
-                             frozenset(running_claude_folders), live_claude_accounts)
+                             frozenset(running_claude_folders), live_claude_accounts,
+                             starting_workers=tuple(starting_workers),
+                             starting_panes=tuple(StartingPaneDocument(session=place.session, pane=place.pane, state="starting")
+                                                  for place in sorted(starting_panes, key=lambda place: (place.session, place.pane))))
 
 
 def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSessions) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
@@ -7251,6 +7308,8 @@ class MachineSessionCounts(TypedDict):
     claude_registry_unreadable: NotRequired[Literal[True]]
     models: NotRequired[dict[str, dict[str, list[SessionModelCountDocument]]]]
     unknown_model_names: NotRequired[dict[str, dict[str, list[str]]]]
+    starting_workers: NotRequired[list[StartingWorkerDocument]]
+    starting_panes: NotRequired[list[StartingPaneDocument]]
 
 
 def _session_counts_cache() -> Path:
@@ -7265,8 +7324,10 @@ def _session_counts_machine() -> str:
 def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_state.SessionState]], *,
                              claude_registry_unreadable: bool = False,
                              models: Mapping[tuple[Path, str], ObservedSessionModel] | None = None,
-                             names: Mapping[tuple[Path, str], str] | None = None) -> MachineSessionCounts:
-    """Publish the four session states for each account and role."""
+                             names: Mapping[tuple[Path, str], str] | None = None,
+                             starting_workers: Sequence[StartingWorkerDocument] = (),
+                             starting_panes: Sequence[StartingPaneDocument] = ()) -> MachineSessionCounts:
+    """Publish role counts and startup states for this machine."""
     mapped: dict[tuple[str, str], dict[str, tuple[session_state.SessionState, SessionModel, str]]] = {}
     unknown = SessionModelUnknown()
     models = models or {}
@@ -7312,6 +7373,10 @@ def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_st
         document["models"] = model_counts
     if unknown_names:
         document["unknown_model_names"] = unknown_names
+    if starting_workers:
+        document["starting_workers"] = list(starting_workers)
+    if starting_panes:
+        document["starting_panes"] = list(starting_panes)
     return document
 
 
@@ -7352,6 +7417,18 @@ def _decode_model_count(value: object, total: int) -> list[SessionModelCountDocu
         models.append(entry)
         total -= count
     return models
+
+
+def _decode_starting_entries(value: object, label: Literal["name", "pane"]) -> Generator[tuple[str, str]]:
+    if not isinstance(value, list):
+        return
+    for item in cast(list[object], value):
+        if not isinstance(item, dict):
+            continue
+        entry = cast(dict[str, object], item)
+        names = _decode_model_names([entry.get("session"), entry.get(label)], 2)
+        if entry.get("state") == "starting" and len(names) == 2:
+            yield names[0], names[1]
 
 
 def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
@@ -7405,6 +7482,12 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
         document["models"] = models
     if unknown_names:
         document["unknown_model_names"] = unknown_names
+    if starting_workers := [StartingWorkerDocument(session=session, name=name, state="starting")
+                            for session, name in _decode_starting_entries(fields.get("starting_workers"), "name")]:
+        document["starting_workers"] = starting_workers
+    if starting_panes := [StartingPaneDocument(session=session, pane=pane, state="starting")
+                          for session, pane in _decode_starting_entries(fields.get("starting_panes"), "pane")]:
+        document["starting_panes"] = starting_panes
     return document
 
 
@@ -7461,6 +7544,8 @@ class MachineRoleCounts:
     problems: tuple[str, ...]
     claude_registry_unreadable: bool
     peer_count_notes: tuple[str, ...] = ()
+    peer_starting_workers: tuple[StartingWorkerDocument, ...] = ()
+    peer_starting_panes: tuple[StartingPaneDocument, ...] = ()
 
     def __iter__(self) -> Generator[tuple[StatusRow, ...] | tuple[str, ...]]:
         """Keep two-value unpacking for existing callers."""
@@ -7480,6 +7565,8 @@ def _machine_role_counts(
     local, peer = _session_counts_machine(), remote.other_machine()
     peer_registry_unreadable = False
     peer_count_notes: tuple[str, ...] = ()
+    peer_starting_workers: tuple[StartingWorkerDocument, ...] = ()
+    peer_starting_panes: tuple[StartingPaneDocument, ...] = ()
     try:
         with _session_counts_cache().open() as cache:
             document = _decode_session_counts(cache.read(), peer)
@@ -7491,6 +7578,8 @@ def _machine_role_counts(
         age_minutes = max(0, (now - stamp) // timedelta(minutes=1))
         peer_accounts = document["accounts"]
         peer_registry_unreadable = document.get("claude_registry_unreadable", False)
+        peer_starting_workers = tuple({**worker, "machine": peer} for worker in document.get("starting_workers", []))
+        peer_starting_panes = tuple({**pane, "machine": peer} for pane in document.get("starting_panes", []))
     except (OSError, OverflowError, ValueError):
         peer_accounts = {}
         observed = None
@@ -7521,7 +7610,8 @@ def _machine_role_counts(
         problems += (_PEER_SESSIONS_UNREADABLE_NOTE.format(peer=peer, local=local),)
     if claude_registry_unreadable:
         problems += (f"{local}: Claude session registry unreadable. Claude session counts are unknown.",)
-    return MachineRoleCounts(tuple(counted), problems, claude_registry_unreadable, peer_count_notes)
+    return MachineRoleCounts(tuple(counted), problems, claude_registry_unreadable, peer_count_notes,
+                             peer_starting_workers, peer_starting_panes)
 
 
 def _role_count_text(row: StatusRow, role: str) -> str:
@@ -7758,7 +7848,8 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
         if options.action == "session-counts-read":
             observed = _local_session_counts(include_models=True)
             print(json.dumps(_session_counts_document(observed.counts, models=observed.models,
-                names=observed.model_session_names,
+                names=observed.model_session_names, starting_workers=observed.starting_workers,
+                starting_panes=observed.starting_panes,
                 claude_registry_unreadable=observed.claude_registry_unreadable)))
             return 0
         if options.action == "session-counts-fetch":
