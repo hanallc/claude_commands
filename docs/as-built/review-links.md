@@ -2414,18 +2414,28 @@ Closed staff questions without a saved answer stay outside the migration.
 
 #### Question items in the Studio
 
+The List saves a question kind for each item created by a native question.
+Replies on Changes, Bugs, and Investigations keep the ordinary List workflow.
 A question to Nate starts in **Waiting for nate** and appears under **Questions**.
 **Answer question** opens the answer window in the item.
 After Nate answers, the item shows **Working** until the asker closes it.
 The asker can use `the_list close` on that question.
 A question Nate sends from **New item** starts in **Working**.
-The recipient's reply returns to that item and changes its state to **Answered**.
+The recipient's reply or a reply to **Ask question** changes the item to **Answered**.
 The item appears under **Answers** with an unread mark.
-**Mark read** closes the item and sends any words beside the button to the question owner.
+**Mark read** sends any words beside the button to the question owner.
+It closes Nate's own question or returns a question to Nate to **Working**.
+**Tell** sends to the question owner. **Ask question** sends to the recipient named in the form.
+When the recipients differ, each button names its recipient.
 The browser keeps those words until it receives confirmation of the save.
 The saved request keeps one delivery record so a retry sends the same words only once.
-Each state change adds one state entry to the item log.
+The List checks each question transition under the write lock and adds one state entry.
 The Studio uses the same row and **Working** badge for questions and other work.
+
+Migration keeps open questions waiting for Nate and Nate's questions with an unread answer.
+It closes questions Nate already answered and logs “Closed when questions became items”.
+Migration uses the saved List acknowledgment to keep old answers read.
+Review keeps a pending sent question visible until the List saves a confirmed receipt.
 
 New questions and answers use the same writer after the source saves.
 The writer keeps the source key, exchange ID, and question and reply origins.

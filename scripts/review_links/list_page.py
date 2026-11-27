@@ -610,37 +610,48 @@ def titled_item_link(entry: ListRecord, style: str) -> str:
 
 @dataclass(frozen=True)
 class ListFormRequestPrefix:
-    """Identify the form, its unread update, and its feedback recipient."""
+    """Identify the form, its unread update, and the recipients of its words."""
 
     nonce: str
     seen_update: the_list.UnreadUpdate | the_list.NoUnreadUpdate
     recipient: the_list.FeedbackRecipient = the_list.LegacyFeedbackRecipient.KEEPER
     repair: the_list.RepairRevision | the_list.NoRepairRevision = the_list.NoRepairRevision.ABSENT
+    ask: question_record.QuestionRecipient = question_record.DefaultQuestionRecipient.PAGE
 
     @classmethod
     def parse(cls, request: str) -> tuple[ListFormRequestPrefix, str]:
         """Read the signed prefix and its optional retry suffix."""
         match = re.fullmatch(r"(?P<nonce>[a-f0-9]{32})(?P<update>[a-f0-9]{64})?" +
-                             r"(?:!(?P<repair>[a-f0-9]{64}))?(?:~(?P<escaped>\.)?(?P<recipient>[^.\s]+))?" +
+                             r"(?:!(?P<repair>[a-f0-9]{64}))?(?:\^(?P<ask>[^.~\s]+))?" +
+                             r"(?:~(?P<escaped>\.)?(?P<recipient>[^.\s]+))?" +
                              r"(?P<retry>\.[a-f0-9]{32})?", request)
         if match is None:
             raise question_record.AnswerRefused("the List request does not match this page")
         fingerprint = match["update"]
         recipient: the_list.FeedbackRecipient = the_list.LegacyFeedbackRecipient.KEEPER
-        if value := match["recipient"]:
-            try:
+        ask: question_record.QuestionRecipient = question_record.DefaultQuestionRecipient.PAGE
+        try:
+            if value := match["recipient"]:
                 recipient = the_list.staff_id(unquote(value) if match["escaped"] else value, "producer")
-            except the_list.ListError as error:
-                raise question_record.AnswerRefused("the List request does not match this page") from error
+            if value := match["ask"]:
+                fields = cast(object, json.loads(unquote(value)))
+                if not isinstance(fields, dict):
+                    raise ValueError("invalid question recipient")
+                ask = question_record.read_recipient(cast(dict[str, object], fields))
+        except (ValueError, TypeError) as error:
+            raise question_record.AnswerRefused("the List request does not match this page") from error
         update = the_list.UnreadUpdate(fingerprint) if fingerprint else the_list.NoUnreadUpdate.ABSENT
         repair = the_list.RepairRevision(match["repair"]) if match["repair"] else the_list.NoRepairRevision.ABSENT
-        return cls(match["nonce"], update, recipient, repair), match["retry"] or ""
+        return cls(match["nonce"], update, recipient, repair, ask), match["retry"] or ""
 
     def format(self) -> str:
         update = self.seen_update
         unread = update.fingerprint if isinstance(update, the_list.UnreadUpdate) else ""
         repair = "!" + self.repair.digest if isinstance(self.repair, the_list.RepairRevision) else ""
         prefix = self.nonce + unread + repair
+        if self.ask is not question_record.DefaultQuestionRecipient.PAGE:
+            route = json.dumps(question_record.recipient_fields(self.ask), separators=(",", ":"))
+            prefix += "^" + quote(route, safe="").replace(".", "%2E").replace("~", "%7E")
         if self.recipient is the_list.LegacyFeedbackRecipient.KEEPER:
             return prefix
         recipient = self.recipient
@@ -672,14 +683,25 @@ def request_token(root: Path, keeper: str, identity: str, prefix: str) -> str:
     return signed_token(secret, keeper, identity, prefix)
 
 
-def signed_item_request(entry: ListRecord, secret: str) -> tuple[str, str]:
+def _form_ask_recipient(entry: ListRecord) -> question_record.QuestionRecipient:
+    if entry.item.question_kind is not the_list.NoQuestionItem.ORDINARY and entry.item.state is the_list.ItemState.WORKING:
+        return the_list.resolve_question_recipient(entry.keeper, entry.item.producer)
+    return question_record.DefaultQuestionRecipient.PAGE
+
+
+def signed_item_request(entry: ListRecord, secret: str, *,
+                        ask: question_record.QuestionRecipient = question_record.DefaultQuestionRecipient.PAGE
+                        ) -> tuple[str, str]:
     request = ListFormRequestPrefix(secrets.token_hex(16), the_list.unread_update(entry.item),
-                                    feedback_recipient(entry.item), entry.item.repair_revision).format()
+                                    feedback_recipient(entry.item), entry.item.repair_revision,
+                                    _form_ask_recipient(entry) if ask is question_record.DefaultQuestionRecipient.PAGE
+                                    else ask).format()
     return request, signed_token(secret, entry.keeper, entry.item.id, request)
 
 
-def signed_form_fields(entry: ListRecord, secret: str) -> str:
-    request, token = signed_item_request(entry, secret)
+def signed_form_fields(entry: ListRecord, secret: str, *,
+                       ask: question_record.QuestionRecipient = question_record.DefaultQuestionRecipient.PAGE) -> str:
+    request, token = signed_item_request(entry, secret, ask=ask)
     fields = {"keeper": entry.keeper, "id": entry.item.id, "request": request, "token": token}
     return ''.join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
                    for name, value in fields.items())
@@ -752,7 +774,8 @@ def repair_buttons(*, repaired: bool) -> str:
 
 def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapshot, parking_label: str,
                   schedule: DisplayedSchedule, today: datetime, mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
-    hidden = signed_form_fields(entry, secret)
+    ask = _form_ask_recipient(entry)
+    hidden = signed_form_fields(entry, secret, ask=ask)
     if (the_list.question_item(entry.item) is not the_list.NoQuestionItem.ORDINARY
             and entry.item.state is the_list.ItemState.ANSWERED):
         receiver = html.escape(owner_name(members, entry.item.owner), quote=True)
@@ -779,6 +802,17 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
     recipient_name = owner_name(members, feedback_recipient(entry.item))
     recipient_label = html.escape(recipient_name, quote=True)
     words_label = html.escape(f"Your words for {recipient_name} about this item", quote=True)
+    question_receiver = ''
+    ask_label = "Ask question"
+    if ask is not question_record.DefaultQuestionRecipient.PAGE:
+        ask_name = owner_name(members, ask.keeper if isinstance(ask, question_record.KeeperForUnavailableProducer) else ask)
+        escaped = html.escape(ask_name, quote=True)
+        question_receiver = f' data-question-recipient-name="{escaped}"'
+        if ask_name != recipient_name:
+            ask_label = f"Ask {escaped}"
+            words_label = "Your words about this item"
+    remove = ('<button name="action" value="remove">Remove</button>'
+              if entry.item.question_kind is the_list.NoQuestionItem.ORDINARY else '')
     repair = ''
     repair_receiver = ''
     if isinstance(entry.item.report, the_list.ListReport):
@@ -789,9 +823,10 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
         recipients = html.escape(" and ".join(dict.fromkeys((owner, recipient_name))), quote=True)
         repair_receiver = f' data-repair-receiver="{recipients}"'
         repair = repair_buttons(repaired=repaired)
-    return (f'<form method="post" data-feedback-form data-recipient-name="{recipient_label}"{repair_receiver}>' + hidden
+    return (f'<form method="post" data-feedback-form data-recipient-name="{recipient_label}"{repair_receiver}{question_receiver}>'
+            + hidden
             + f'<p data-parked-detail{parked}>{note}</p>'
-            + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read + top
+            + '<div class="list-actions">' + remove + read + top
             + f'<div class="list-parking-actions">{start_now}<button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
             + '<div class="list-park">' + record_table.park_control(
                 picker_label, field="until", action="action", value="park", identity="park-" + key, allow_delivery=True)
@@ -799,7 +834,7 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + f'placeholder="{words_label}" aria-label="{words_label}"></textarea>'
             + repair + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
-            + ('' if scheduled else '<button name="action" value="question" disabled>Ask question</button>')
+            + ('' if scheduled else f'<button name="action" value="question" disabled>{ask_label}</button>')
             + f'<button name="action" value="tell" disabled>Tell {recipient_label}</button></div>'
             + '<template data-schedule-template>' + schedule_editor + '</template></form>')
 
@@ -1321,7 +1356,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     sections = review_links(item, reviews, today)
     failed: frozenset[str] = visibility.failed if isinstance(visibility, the_list.QuestionAttention) else frozenset()
     questions = panel_questions(item, today, unread_answers, failed) if isinstance(schedule, the_list.NoSchedule) else ''
-    waits_for_answer = (the_list.question_item(item) is list_exchange.Direction.QUESTION_TO_NATE
+    waits_for_answer = (the_list.question_item(item) is the_list.QuestionItemKind.TO_NATE
                         and item.state is the_list.ItemState.WAITING_FOR_NATE)
     form = '' if waits_for_answer else feedback_form(
         entry, secret, members=names.members, parking_label=parking_label, schedule=schedule, today=today, mark=mark)
@@ -1637,7 +1672,8 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
 
 def _mark_seen_update_read(keeper: staff.StaffId, item: the_list.ListItem,
                            update: the_list.UnreadUpdate | the_list.NoUnreadUpdate) -> None:
-    if isinstance(update, the_list.UnreadUpdate) and update == the_list.unread_update(item):
+    if (item.question_kind is the_list.NoQuestionItem.ORDINARY
+            and isinstance(update, the_list.UnreadUpdate) and update == the_list.unread_update(item)):
         try:
             _ = the_list.mark_read(keeper, item.id, source=the_list.PAGE_SOURCE, update=update)
         except (OSError, the_list.ListError):
@@ -1669,7 +1705,8 @@ def _replay_ask(keeper: staff.StaffId, item: the_list.ListItem, receipt: the_lis
 
 
 def _submit_ask(keeper: staff.StaffId, identity: str, request: the_list.PageRequest,
-                status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+                status: change_page.DeliveryStatus, recipient: question_record.QuestionRecipient
+                ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     """Serialize the receipt check and submission of List Ask requests."""
     with exclusive(the_list.folder(keeper) / f".{identity}.ask.lock"):
         item = the_list.load(keeper, identity)
@@ -1677,7 +1714,7 @@ def _submit_ask(keeper: staff.StaffId, identity: str, request: the_list.PageRequ
                         if entry.source == the_list.PAGE_SOURCE and isinstance(entry.what, the_list.QuestionRequestReceipt)
                         and entry.what.request.request == request.request), None)
         if receipt is None:
-            return the_list.ask_question(keeper, identity, request, status)
+            return the_list.ask_question(keeper, identity, request, status, recipient=recipient)
         if receipt.request != request:
             raise the_list.ListError("this request already has a different action or words")
         return _replay_ask(keeper, item, receipt, status)
@@ -1816,7 +1853,7 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         if item.state is the_list.ItemState.SCHEDULED:
             raise question_record.AnswerRefused("Ask the question after the item starts.")
         status = change_page.DeliveryStatus(root) if status is None else status
-        question = _submit_ask(keeper, identity, the_list.PageRequest(request, "question", words), status)
+        question = _submit_ask(keeper, identity, the_list.PageRequest(request, "question", words), status, prefix.ask)
         if isinstance(question, change_page.MessageDelivery):
             _mark_seen_update_read(keeper, item, prefix.seen_update)
             return ListQuestionDelivery(question, status)
@@ -3587,15 +3624,22 @@ function bindFeedbackForm(form){
     (!retryRepair && !normalizeRepairWords(words.value));
    if(!tell) return;
    const name=matching('tell')?.recipientName ?? signed.recipientName;
-   const wordsLabel=canReject ? 'Your words about this repair' : 'Your words for '+name+' about this item';
+   const askName=matching('question')?.questionRecipientName ?? signed.questionRecipientName;
+   const split=askName && askName!==name;
+   const wordsLabel=canReject ? 'Your words about this repair'
+    : split ? 'Your words about this item' : 'Your words for '+name+' about this item';
    tell.textContent='Tell '+name;
    words.placeholder=wordsLabel;
    words.setAttribute('aria-label',wordsLabel);
    tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();
-   if(ask) ask.disabled=tell.disabled;
+   if(ask){
+    ask.textContent=split ? 'Ask '+askName : 'Ask question';
+    ask.disabled=tell.disabled;
+   }
   };
   // Keep the signed update and recipient from the rendered form.
-  const signed={request:form.elements.request.value,token:form.elements.token.value,recipientName:form.dataset.recipientName};
+  const signed={request:form.elements.request.value,token:form.elements.token.value,
+   recipientName:form.dataset.recipientName,questionRecipientName:form.dataset.questionRecipientName};
   let fresh=signed;
   const newRequest=()=>({
    ...signed,
@@ -3773,7 +3817,8 @@ function bindFeedbackForm(form){
     }
     const options={method:'POST',body:data};
     const receiver=action==='works' ? sendActionReceiver(form,data)
-     : action==='tell' ? attempt.recipientName : current.dataset.sendReceiver;
+     : action==='tell' ? attempt.recipientName
+     : asksQuestion && attempt.questionRecipientName ? attempt.questionRecipientName : current.dataset.sendReceiver;
     const requestTimeoutSeconds=listRequestSeconds();
     const response=await (action==='works' || usesWords || heldSave
      ? hold.post(actionPath,{...options,requestTimeoutSeconds},saveAction ? null : receiver)
