@@ -103,9 +103,9 @@ def published_console_page(root: Path, path: str) -> str:
 
 
 CONSOLE_DOCUMENTS = {
-    accounts_page.PAGE_PATH: "accounts", images.PAGE_PATH: "images", list_page.PAGE_PATH: "list",
+    accounts_page.PAGE_PATH: "accounts", images.PAGE_PATH: "images", list_page.PAGE_PATH: "studio",
     review_page.PAGE_PATH: "review", f"/console/{change_page.REBUILDS_NAME}": "rebuilds",
-    placement_disk.PAGE_PATH: "placement_disk", studio_page.PAGE_PATH: "list",
+    placement_disk.PAGE_PATH: "placement_disk", studio_page.PAGE_PATH: "studio",
 }
 
 # Keep the old action path for open tabs and held sends.
@@ -123,12 +123,17 @@ def capture_page_key(root: Path, place: str) -> str:
     return key
 
 
+def capture_matches_page(root: Path, place: str, page: str) -> bool:
+    """Match a capture to its page, including old List requests."""
+    return capture_page_key(root, place) == ("studio" if page == "list" else page)
+
+
 def deferred_capture_request(root: Path, page: str, value: object
                              ) -> new_item_dialog.PageCaptureRequest | new_item_dialog.UnavailableCapture:
     """Check if the saved item can get a screenshot."""
     try:
         request = new_item_dialog.read_page_capture(value)
-        if capture_page_key(root, request.place) == page:
+        if capture_matches_page(root, request.place, page):
             return request
     except ValueError:
         pass
@@ -961,7 +966,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         server = cast(ReviewLinksServer, self.server)
         root = server.root
         route = urlsplit(self.path)
-        fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query == "page=list"
+        fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query in ("page=studio", "page=list")
         held = route.path.startswith(send_hold.HOLD_PATH + "/")
         fixture_page = route.path in LIST_ACTION_PATHS or route.path.startswith(f"{studio_page.AVATAR_PATH}/")
         if server.mode is ServerMode.LIST_FIXTURE and not fixture_page and not fixture_options and not held:
@@ -1770,9 +1775,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                          valid_token: bool, *, limits: new_item_dialog.NewItemLimits, size: int) -> None:
         try:
             draft = fields.get("request_id")
-            list_draft_id = (draft if fields.get("page") == "list" and isinstance(draft, str)
+            list_page_request = new_item_dialog.is_list_submission_page(fields.get("page"))
+            list_draft_id = (draft if list_page_request and isinstance(draft, str)
                              and review_submissions.is_draft_id(draft) else "")
-            browser_draft = fields.get("page") != "list" and review_submissions.is_draft_id(draft)
+            browser_draft = not list_page_request and review_submissions.is_draft_id(draft)
             # A restart retry can use the token saved with the draft.
             if not valid_token and (
                     "capture_key" not in fields or "page_capture" in fields or "discard_capture" in fields
@@ -1836,7 +1842,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 if len(key) > 32 or has_capture_metadata:
                     page = fields.get("page")
                     if (not isinstance(draft, str)
-                            or not (review_submissions.is_draft_id(draft) or page == "list"
+                            or not (review_submissions.is_draft_id(draft) or list_page_request
                                     and review_submissions.DRAFT_ID.fullmatch(draft))
                             or not new_item_dialog.capture_key_matches_draft(key, draft)):
                         raise new_item_dialog.SubmissionError("The screenshot belongs to another draft.")
@@ -1855,7 +1861,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError:
             self.json_response(400, {"error": "Could not read the New item request."})
             return
-        legacy_page_draft = (isinstance(request, new_item_dialog.NewItemRequest) and request.page != "list"
+        legacy_page_draft = (isinstance(request, new_item_dialog.NewItemRequest) and not list_page_request
                              and review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None)
         authorization = None
         if browser_draft and isinstance(token, str):
@@ -1936,7 +1942,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     if edited:
                         warnings.append("The item keeps the values from the first Send.")
                     response["attachment_warning"] = "\n".join(warnings)
-                on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and request.page == "list"
+                on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and list_page_request
                 if list_draft_id and edited:
                     request = None
                     screenshot = new_item_dialog.NO_PAGE_SCREENSHOT
@@ -1944,7 +1950,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         and review_submissions.PAGE_SCREENSHOT in details.images):
                     server.page_captures.mark_filed(key, screenshot)
                 main_request = request if isinstance(request, new_item_dialog.NewItemRequest) and (
-                    request.page == "list" or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
+                    list_page_request or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
                 has_saved_evidence = ((legacy_page_draft and key) or details.images
                                       or isinstance(details.page_state, new_item_dialog.BugPageState)
                                       or (main_request is not None and main_request.page_state is not None)
@@ -1979,7 +1985,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                 and message.saved.get("submission_request") == delivery.row
                                 and message.saved.get("submission_delivered")):
                             outcome = change_page.DeliveryConfirmed()
-                if pending or (main_request is not None and main_request.page == "list"
+                if pending or (main_request is not None and list_page_request
                                and isinstance(screenshot, new_item_dialog.PageScreenshot)):
                     if review_submissions.PAGE_SCREENSHOT not in details.images:
                         screenshot = server.page_captures.file(key, saved, allow_pending=pending)
@@ -2170,7 +2176,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                            review_records=(list_page.LinkedReviewRead.AFTER_RENDER
                                                            if live and reviews is list_page.LinkedReviewRead.FROM_DISK
                                                            else reviews))
-                content = owned_document(content, "list")
+                content = owned_document(content, "studio")
         except (OSError, ValueError) as error:
             print(f"review-links studio: {error}", file=sys.stderr)
             self.html_response(503, change_page.document(f"<p>{studio_page.TITLE} page is not available.</p>"))
@@ -3216,7 +3222,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
             })
         except ValueError:
             return False
-        if capture_page_key(self.root, capture.place) != page:
+        if not capture_matches_page(self.root, capture.place, page):
             return False
         firefox = shutil.which("firefox")
         if not firefox or not self.capture_slot.acquire(blocking=False):

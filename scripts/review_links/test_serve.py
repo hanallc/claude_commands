@@ -11,6 +11,7 @@ import errno
 import fcntl
 import base64
 import hashlib
+import html
 import importlib.util
 import io
 import ipaddress
@@ -799,17 +800,24 @@ class ReviewLinksServerTests(unittest.TestCase):
         other = case.ready_submission_recipient()
         _ = write_config_fixture(conf.path("console"),
                                  "page.review.owner=missing-owner\nowner.default=missing-default\n")
+        producer = fixture_member("producer", name="morty")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         with patch.object(self.server, "review_cache", cache):
             review = self.request(review_page.PAGE_PATH)
             options = self.new_item_http(query="?page=review")
+            routing = self.new_item_http(query="?page=review", headers={"X-New-Item-Route": "producer"})
         self.assertEqual(review.status, 200)
         self.assertEqual(review.body.count(b'data-owner-new aria-label="New item"'), 1)
         self.assertEqual(review.body.count(b'<dialog id="review-new-item"'), 1)
         self.assertEqual(options.status, 200)
         fields = cast(dict[str, object], json.loads(options.body))
         self.assertEqual((fields["page_owner"], fields["page_owner_reason"]), ("", ""))
-        self.assertEqual(fields["recipients"], [{"id": other.id, "name": other.name, "proposal": True}])
+        self.assertCountEqual(cast(list[dict[str, object]], fields["recipients"]),
+                              [{"id": row.id, "name": row.name, "proposal": True} for row in (other, producer)])
+        self.assertEqual(routing.status, 200)
+        defaults = cast(dict[str, object], json.loads(routing.body))
+        self.assertEqual((defaults["page_owner"], defaults["page_assignee"]), ("", ""))
+        self.assertEqual(defaults["recipients"], [{"id": producer.id, "name": producer.name, "proposal": True}])
 
     def test_page_proposal_refuses_a_showrunner_with_a_native_folder(self) -> None:
         case = self.review_fixture()
@@ -1519,28 +1527,30 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture()
         default = case.ready_submission_recipient()
         morty = fixture_member("producer", name="morty")
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\nowner.default={default.id}\n")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\npage.studio.owner={morty.id}\nowner.default={default.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         listing = self.request(studio_page.PAGE_PATH)
         self.assertEqual(listing.status, 200)
-        self.assertIn(b'data-page-owner="list"', listing.body)
+        self.assertIn(b'data-page-owner="studio"', listing.body)
         self.assertNotIn(b'data-list-new', listing.body)
         self.assertEqual(listing.body.count(b'data-owner-new aria-label='), 1)
-        owner_control = listing.body.partition(b'data-page-owner="list">')[2].partition(b"</div>")[0]
+        owner_control = listing.body.partition(b'data-page-owner="studio">')[2].partition(b"</div>")[0]
         self.assertRegex(owner_control, rb'data-color-text="role.producer"[^>]*>morty</span>')
         self.assertIn(b'aria-label="New item for morty"', listing.body)
         self.assertEqual(listing.body.count(b'<dialog id="review-new-item"'), 1)
-        options = self.new_item_http(query="?page=list")
+        options = self.new_item_http(query="?page=studio")
         self.assertEqual(options.status, 200)
         fields = cast(dict[str, object], json.loads(options.body))
         expected = [{"id": morty.id, "name": "morty", "proposal": True},
                     {"id": default.id, "name": default.name, "proposal": True}]
         self.assertEqual(fields["page_owner"], morty.id)
         self.assertCountEqual(cast(list[dict[str, object]], fields["recipients"]), expected)
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={default.id}\nowner.default={default.id}\n")
-        current_options = cast(dict[str, object], json.loads(self.new_item_http(query="?page=list").body))
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\npage.studio.owner={default.id}\nowner.default={default.id}\n")
+        current_options = cast(dict[str, object], json.loads(self.new_item_http(query="?page=studio").body))
         self.assertEqual(current_options["page_owner"], default.id)
         self.assertCountEqual(cast(list[dict[str, object]], current_options["recipients"]), expected)
+        legacy_options = cast(dict[str, object], json.loads(self.new_item_http(query="?page=list").body))
+        self.assertEqual(legacy_options["page_owner"], morty.id)
 
         producer = fixture_member("producer", name="list-producer")
         with (patch.object(self.server, "review_cache", cache),
@@ -3213,7 +3223,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         keeper = self.map_list_recipient(request.recipient_id)
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
         server = self.server
-        page_capture = replace(FIXTURE_CAPTURE, place=list_page.PAGE_PATH)
+        page_capture = replace(FIXTURE_CAPTURE, place=studio_page.PAGE_PATH)
         url = f"http://127.0.0.1:{self.port}{page_capture.place}"
         attempt = replace(request, page="list", kind=new_item_dialog.SubmissionKind.INVESTIGATION,
                           request_id="r6-" + uuid4().hex, page_state=None,
@@ -3221,8 +3231,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         key = attempt.request_id + uuid4().hex
         token = server.new_item_token
         padding = b" " * (1024 * 1024)
-        body = json.dumps({**asdict(attempt), "token": token, "capture_key": key,
-                           "defer_capture": asdict(page_capture)}).encode() + padding
+        fields = {**asdict(attempt), "token": token, "capture_key": key, "defer_capture": asdict(page_capture)}
+        body = json.dumps(fields).encode() + padding
+        studio_retry = json.dumps({**fields, "page": "studio"}).encode() + padding
         configuration = conf.path("review_links")
         self.addCleanup(configuration.write_bytes, configuration.read_bytes())
         handler = cast(type[serve.ReviewLinksHandler], server.RequestHandlerClass)
@@ -3248,7 +3259,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 _ = self.new_item_http(body, finished=True)
             total = conf.read("review_links").whole("new_item.max_total_image_bytes")
             _ = write_config_fixture(configuration, "new_item.max_total_image_bytes=1\n")
-            retry = self.new_item_http(body, finished=True)
+            retry = self.new_item_http(studio_retry, finished=True)
             self.assertEqual(retry.status, 200, retry.body)
             confirmed = cast(dict[str, str], json.loads(retry.body))
             self.assertEqual(confirmed["key"], lost["key"])
@@ -3260,7 +3271,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual((refused.status, json.loads(refused.body)),
                              (400, {"error": "Invalid New item request size."}))
             _ = write_config_fixture(configuration, f"new_item.max_total_image_bytes={total}\n")
-            original_limit = self.new_item_http(body, finished=True)
+            original_limit = self.new_item_http(studio_retry, finished=True)
             self.assertEqual(original_limit.status, retry.status, original_limit.body)
             self.assertEqual(json.loads(original_limit.body)["key"], confirmed["key"])
             changed = json.dumps({**asdict(attempt), "token": token, "capture_key": key,
@@ -7126,7 +7137,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertNotIn(top, cast(dict[str, str], json.loads(state.body))["detail_html"])
                     page = self.request(studio_page.PAGE_PATH).body.decode()
                     self.assertIn('<span class="list-top-mark" role="img" aria-label="Top priority"', page)
-                    self.assertIn(f'<b>#{item.number} {item.title}</b>', page)
+                    link = html.escape(list_page.item_link(morty.id, item.number))
+                    self.assertIn(f'<a class="list-top-link" data-record-jump href="{link}">'
+                                  + f'#{item.number} {item.title}</a>', page)
 
     def test_studio_pictures_are_guarded_named_files_under_the_avatar_root(self) -> None:
         avatars = self.root.parent.resolve() / "studio-avatars"
@@ -7636,6 +7649,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                          sorted([unit.id, morty.id]))
         self.assertEqual(record["sent"], {unit.id: True, morty.id: True})
         message = cast(str, delivery.call_args.args[2])
+        self.assertTrue(message.startswith(f"Studio: nate pressed Go for item {item.number}."))
         self.assertIn("What: Merge needsme to main.", message)
         self.assertIn(f"{go_ledger.CHECK_COMMAND} {go_id}", message)
         saved = the_list.load(morty.id, item.id)
@@ -7906,8 +7920,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         unit = replace(unit, parent=staff.ReportsTo(runner.id))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty, unit, runner))))
         _ = the_list.update(morty.id, item.id, {"owner": unit.id}, source="morty")
+        retried_messages: list[str] = []
         def unit_offline(recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
             if recipient == unit.id:
+                retried_messages.append(_message)
                 raise OSError("The session is offline.")
         code, _reply, delivery = self.post_go(body, send_error=unit_offline)
         self.assertEqual(code, 200)
@@ -7921,6 +7937,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual((record["sent"], record["reported"]), ({unit.id: False, morty.id: True}, {unit.id: True, morty.id: False}))
         self.assertEqual(go_ledger.unsent(self.root), (go_id,))
         closed = the_list.load(morty.id, item.id).asks[0]
+        legacy = {name: value for name, value in record.items() if name != "origin"}
+        _ = entry.write_text(json.dumps(legacy))
+        retried_messages.clear()
         not_delivered = lambda: [change.what for change in the_list.load(morty.id, item.id).log
                                  if isinstance(change.what, the_list.GoNotDelivered)]
         self.assertEqual(not_delivered(), [the_list.GoNotDelivered(closed, unit.id)])
@@ -7930,6 +7949,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                                    client="192.0.2.9", page="page", moment=the_list.now())
         self.assertEqual(go_ledger.unsent(self.root), tuple(sorted((go_id, waiting["go_id"]))))
         self.assertEqual(self.restart_and_recover_goes(unit_offline), [unit.id] * 3, "no new alert to the showrunner")
+        original = cast(str, delivery.call_args_list[0].args[2])
+        self.assertEqual(retried_messages, [original.replace("Studio:", "List page:", 1)] * 3)
         self.assertEqual(not_delivered(), [the_list.GoNotDelivered(closed, unit.id)])
         self.assertEqual(go_ledger.unsent(self.root), (go_id,), "no ask holds the waiting go id, so the start removed it")
         self.assertTrue(the_list.load(morty.id, item.id).asks[1].is_open)
@@ -8119,7 +8140,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(saved.log[:-1], parked.log)
                 self.assertEqual(saved.log[-1].what,
                                  the_list.UnparkNoChangeReceipt(
-                                     the_list.PageRequest(request, "unpark", "List page: nate unparked item 1."),
+                                     the_list.PageRequest(request, "unpark", "Studio: nate unparked item 1."),
                                      the_list.UnparkNoChangeReason.EXPIRED))
                 reparked = the_list.park(morty.id, item.id, new_time, source="morty")
                 delivered.clear()
@@ -10235,7 +10256,7 @@ class ServerStartupTests(unittest.TestCase):
         _ = staff_file.write_text(json.dumps({"schema": 2, "rows": [producer.to_json()]}))
         configuration = temporary / "config"
         _ = copy_config_fixture(checkout / "config", configuration)
-        _ = write_config_fixture(configuration / "console.conf", f"page.list.owner={keeper}\n")
+        _ = write_config_fixture(configuration / "console.conf", f"page.list.owner={keeper}\npage.studio.owner={keeper}\n")
         with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(store / "records"),
                                      "STAFF_FILE": str(staff_file), "CONF_DIR": str(configuration)}):
             item = the_list.add(keeper, "Private List item", owner=the_list.UnassignedOwner.NATE,
@@ -10277,11 +10298,13 @@ class ServerStartupTests(unittest.TestCase):
                     page = response.read()
                     self.assertIn(b"Private List item", page)
                     self.assertIn(b'data-owner-new aria-label=', page)
-                    connection.request("GET", review_page.NEW_ITEM_PATH + "?page=list")
+                    connection.request("GET", review_page.NEW_ITEM_PATH + "?page=studio",
+                                       headers={"X-New-Item-Route": "producer"})
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
                     options = cast(dict[str, object], json.loads(response.read()))
                     self.assertEqual(options["recipients"], [{"id": keeper, "name": "morty", "proposal": True}])
+                    self.assertEqual(options["page_owner"], keeper)
                     self.assertEqual(options["token"], "")
                     self.assertEqual(options["send_disabled"], "Sending is off on a practice List.")
                     connection.request("GET", review_page.NEW_ITEM_PATH + "?page=review")

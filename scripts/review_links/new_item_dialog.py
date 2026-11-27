@@ -371,6 +371,11 @@ class PageRecipient(StrEnum):
     PRODUCER = "producer"
 
 
+def is_list_submission_page(page: object) -> bool:
+    """Recognize the Studio and requests from the former List page."""
+    return page in ("studio", "list")
+
+
 class DefaultSubmissionNotice(StrEnum):
     FILED_KIND_FROM_REVIEW = "filed-kind-from-review"
 
@@ -1415,6 +1420,7 @@ function bindDraft(dialog, fresh = false) {
                  dialog.querySelector('[data-cancel]')];
  let launcher, opening, token, recipients, images = [], sending = false;
  let draftId, keepDraft = false, ownerPage = '';
+ const isListPage = () => ownerPage === 'studio' || ownerPage === 'list';
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
  let pageOwner = '';
@@ -1508,7 +1514,7 @@ function bindDraft(dialog, fresh = false) {
 
  function canEditSeparateListDraft() {
   const canResume = separateListEdit && !words.value && !images.length;
-  return ownerPage === 'list' && token && !savedItem && !submittedDraft &&
+  return isListPage() && token && !savedItem && !submittedDraft &&
     !separateFromNativeDraft && (awaitingNativeRecovery || canResume);
  }
 
@@ -2024,7 +2030,7 @@ function bindDraft(dialog, fresh = false) {
  }
 
  function storeListDraft() {
-  if (ownerPage !== 'list' || !draftId || isEditingLater() ||
+  if (!isListPage() || !draftId || isEditingLater() ||
       separateFromNativeDraft || !sendNotice.hidden) return;
   try {
    const saved = assignees ? JSON.stringify({recipient: selectedRecipient || null, assignee: selectedAssignee})
@@ -2102,7 +2108,7 @@ function bindDraft(dialog, fresh = false) {
  }
 
  function forgetListDraft() {
-  if (ownerPage === 'list' && draftId && !separateFromNativeDraft) {
+  if (isListPage() && draftId && !separateFromNativeDraft) {
    try {
     sessionStorage.removeItem(listDraftPrefix + draftId);
     sessionStorage.removeItem(listStatePrefix + draftId);
@@ -2113,7 +2119,7 @@ function bindDraft(dialog, fresh = false) {
  function finishDraft() {
   clearSubmittedDraft();
   forgetListDraft();
-  if (draftId && ownerPage !== 'list') {
+  if (draftId && !isListPage()) {
    try { sessionStorage.removeItem(reportDraftPrefix(source) + draftId); } catch (_) {}
   }
   draftId = undefined;
@@ -2173,7 +2179,7 @@ function bindDraft(dialog, fresh = false) {
   draft.mode = draft.mode === 'screenshot-expired' ? 'screenshot-expired' : 'retry';
   draftId = original.request_id;
   ownerPage = original.page ?? '';
-  if (ownerPage === 'list') {
+  if (isListPage()) {
    const stored = storedListDraft();
    separateFromNativeDraft = isShippedListDraft(stored) && stored.id !== draftId;
    if (separateFromNativeDraft) {
@@ -2384,7 +2390,7 @@ function bindDraft(dialog, fresh = false) {
   launcher = trigger;
   token = '';
   if (!draftId && !keepDraft) {
-   const stored = ownerPage === 'list' ? storedListDraft() : storedReportDraft(source);
+   const stored = isListPage() ? storedListDraft() : storedReportDraft(source);
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
@@ -2487,7 +2493,7 @@ function bindDraft(dialog, fresh = false) {
  form.addEventListener('submit', async event => {
   event.preventDefault();
   if (send.disabled) return;
-  const onList = ownerPage === 'list';
+  const onList = isListPage();
   const hadEarlierSend = awaitingEarlierSend;
   let saved, usedPreview = false, posted = false;
   setError('');

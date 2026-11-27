@@ -1523,7 +1523,8 @@ If a refresh removes an open item, its row closes.
 `/console/studio.html` reads the numbered List records on each request.
 The page uses the shared status line in `page_frame.py`.
 The page owner button opens the shared New item dialog.
-For a new draft, **To** selects the owner configured in `page.list.owner`.
+For a new draft on the Studio, **To** selects the producer from `page.studio.owner`.
+If the Studio has no configured producer, **To** has no selection.
 For a Review kind, **Send** files and delivers the Review item to the selected recipient.
 The List assigns numbers when its own record writer creates an item.
 The browser stores the recipient selection with the draft ID and restores both after a reload.
@@ -1837,8 +1838,8 @@ The item dialog shows Remove, Park, and a text box for Ask question and `Tell <p
 The text box uses `Your words for <producer> about this item` as its placeholder and accessible name.
 The page reads the producer name from the staff snapshot.
 A producer without a staff row shows as its staff ID.
-The List New item button uses the configured page owner or its fallback.
-The owner corner shows that recipient.
+The Studio header and its copy above the open Review card use the same New item button.
+The dialog selects the configured Studio producer for a new draft.
 Ask question and Tell sit below the box at its right edge, beside the send status.
 Both buttons stay disabled until the box contains words.
 Clearing the box disables both buttons.
@@ -1992,6 +1993,10 @@ The server clears that claim without a failure notice.
 If the server cannot start the send for another reason, it clears the claim and logs the error.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 Remove sits at the left edge of the open row above the four-line text box.
+Remove saves the exact text from the box as closing words and adds it after the removal line in the notice.
+A blank box uses the short Studio notice and the default closing words.
+Remove accepts a retry if trimming its reason gives the reason in an older receipt.
+After a confirmed Remove, the page clears the submitted draft if it still matches.
 Park and Remove collapse the row after the save.
 The table applies the saved state before the next refresh.
 Park, Remove, Tell, Ask question, and Mark read show a message if the page cannot confirm the save.
@@ -2167,7 +2172,7 @@ The log and retry use the original recipient after reassignment.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.
 After a lost Park or Remove response, the List reads the current item before it restores the row.
-For Park, it checks the receipt for the exact request even when the item already has a parking time.
+It checks the receipt for the exact request, including a Remove that saved without a notice.
 Changed feedback uses the fresh signed request from the page.
 A successful send clears the saved request ID and only the text that the user sent.
 Each successful POST returns a fresh signed request ID for the next action.
@@ -2344,12 +2349,17 @@ The button posts the action `top`. `the_list.make_top_priority` names the item a
 The List path refuses `top`. The refresh after the save moves the flag and the band.
 
 The band appears on a producer tab and stays hidden on All.
-It shows the Top priority label with the flag, the item number and title in bold, the next step below, and the state and the short ETA on the right.
+It shows the Top priority label with the flag, a link with the item number and title, the next step, the state, and the ETA.
+Click the link or press Enter while it has focus to open the item and save its place in the address.
+The link uses the same filter rules as other item links to show an item outside the current results.
+The title keeps its usual color and weight and uses the same hover and focus style as other item links.
+A refresh keeps focus on the same top item link. If that link is gone, focus moves to Search.
 A producer with no top item shows **No top priority item** and **Open an item and click "Make top priority".**
 The page renders one band for each top item and one band for no top item.
 A `:has()` rule for each band shows the band of the pressed Producer tab, so a tab click makes no request.
-`CONSOLE_DOCUMENTS` maps the Studio path to `list`, so New item and its screenshot use the List owner, `page.list.owner`.
-`page.studio.owner` sets the owner when the console shows the Studio as unavailable.
+`CONSOLE_DOCUMENTS` maps the Studio path to `studio` for screenshot capture.
+The Studio header and New item dialog use `page.studio.owner`.
+The List records stay in the store selected by `page.list.owner`.
 The Studio uses the List status age limit and has no `status.studio` key.
 
 ### Images page

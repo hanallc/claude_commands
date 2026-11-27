@@ -1482,8 +1482,8 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         else:
             park_request = prefix.format() + retry
         saved["park_request_saved"] = the_list.has_park_receipt(item, park_request)
-        notice = the_list.feedback_requests(item).get(park_request)
-        saved["remove_request_saved"] = notice is not None and notice.action == "remove"
+        saved["remove_request_saved"] = (
+            the_list.remove_receipt(item, park_request) is not the_list.NoPageRequest.ABSENT)
     if not_fixed_request:
         prefix, retry = ListFormRequestPrefix.parse(not_fixed_request)
         request = prefix.format() + retry
@@ -1658,7 +1658,9 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
         if not secrets.compare_digest(token, bootstrap.encode()):
             raise question_record.AnswerRefused("the List token does not match this page")
     action, words, until = fields["action"][0], fields["words"][0], fields["until"][0]
-    if action != the_list.ReportVerdict.NOT_FIXED:
+    if action == "remove":
+        words = words if words.strip() else ""
+    elif action != the_list.ReportVerdict.NOT_FIXED:
         words = words.strip()
     if action == "top" and top_priority is TopPriority.HIDDEN:
         raise question_record.AnswerRefused("this page has no top priority items")
@@ -1716,9 +1718,16 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         target = f"run {submitted.run_number} of item {item.number}" if one_run else f"item {item.number}"
         saved_words = submitted.receipt_words(action, words) if submitted.scope else words
         recipient = prefix.recipient if item.state is the_list.ItemState.SCHEDULED else the_list.LegacyFeedbackRecipient.KEEPER
-        notice = the_list.PageItemNotice(request, f"List page: nate removed {target}.", "remove", saved_words,
-                                        recipient=recipient)
-        changed = the_list.close(keeper, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE,
+        message = f"Studio: nate removed {target}." + (f"\n\n{words}" if words else "")
+        receipt = the_list.remove_receipt(item, request)
+        if receipt is not the_list.NoPageRequest.ABSENT:
+            message = receipt.words
+            trimmed = words.strip()
+            legacy_words = submitted.receipt_words(action, trimmed) if submitted.scope else trimmed
+            if legacy_words == receipt.form_words:
+                saved_words = legacy_words
+        notice = the_list.PageItemNotice(request, message, "remove", saved_words, recipient=recipient)
+        changed = the_list.close(keeper, identity, words or "Removed by nate on the Studio.", source=the_list.PAGE_SOURCE,
                                  notice=notice, schedule_scope=submitted.scope, expected_schedule=expected)
     elif action == "park":
         if until != the_list.ParkUntilDelivered.DELIVERED and the_list.ISO_TIME.fullmatch(until) is None:
@@ -1730,7 +1739,7 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
             label = parking_notice_label(parked_until, zone)
             saved_words = submitted.receipt_words(action, words) if submitted.scope else words
             recipient = prefix.recipient if item.state is the_list.ItemState.SCHEDULED else the_list.LegacyFeedbackRecipient.KEEPER
-            notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} {label}.", "park",
+            notice = the_list.PageItemNotice(request, f"Studio: nate parked item {item.number} {label}.", "park",
                                             saved_words, recipient=recipient)
             return the_list.park(keeper, identity, parked_until, source=the_list.PAGE_SOURCE,
                                  notice=notice, check_deadline=check_deadline,
@@ -1739,14 +1748,15 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         changed = (save_park(the_list.ParkUntilDelivered.DELIVERED) if until == the_list.ParkUntilDelivered.DELIVERED
                    else review_actions.save_timed_park(until, zone, save_park, require_offset=len(until) != 10))
     elif action == "unpark":
-        notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words)
+        notice = the_list.PageItemNotice(request, f"Studio: nate unparked item {item.number}.", "unpark", words)
         changed = the_list.unpark(keeper, identity, source=the_list.PAGE_SOURCE, notice=notice).item
     elif action == "top":
         _ = the_list.make_top_priority(keeper, identity)
         return change_page.NoMessageDelivery()
     elif action == "tell" and words and len(words) <= 10000:
         saved = the_list.save_feedback(keeper, identity, the_list.PageFeedback(
-            request, words, read_update=prefix.seen_update, recipient=prefix.recipient))
+            request, words, read_update=prefix.seen_update, recipient=prefix.recipient,
+            origin=the_list.PageNoticeOrigin.STUDIO))
         _mark_seen_update_read(keeper, item, saved.read_update)
         return ListFeedbackDelivery(keeper, identity, request) if saved.state == "pending" else change_page.NoMessageDelivery()
     else:
@@ -1794,7 +1804,7 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
         tries = settings.whole("delivery_tries")
         heading = {the_list.ReportVerdict.NOT_FIXED: "Not fixed",
                    "tell": "nate's words"}.get(feedback.action)
-        message = (f"List page: {heading} for item {item.number}\n{feedback.words}"
+        message = (f"{feedback.origin}: {heading} for item {item.number}\n{feedback.words}"
                    if heading is not None else feedback.words)
         source = the_list.folder(delivery.keeper) / f"{item.id}.md"
         key = change_page.review_delivery_key(source, item.id, feedback.request)
@@ -1915,7 +1925,7 @@ def deliver_go(ledger: Path, go_id: str) -> None:
     settings = conf.read("review_links")
     tries = settings.whole("delivery_tries")
     pause = settings.number("delivery_pause_seconds")
-    message = go_ledger.message(item, ask, go_id, target.name if target is not None else ask.target)
+    message = go_ledger.message(item, ask, entry, target.name if target is not None else ask.target)
     source = the_list.folder(keeper) / f"{item.id}.md"
     key = change_page.review_delivery_key(source, item.id, go_id)
     next_step = the_list.go_next_step_request(go_id)
@@ -2150,7 +2160,10 @@ def top_bands(top_items: Iterable[ListRecord], today: datetime, names: staff_nam
         item = entry.item
         value = f"staff:{item.producer}"
         values.append(css_string(value))
-        bands.append(top_band(value, f'<div class="list-top-what"><b>#{item.number} {html.escape(item.title)}</b>'
+        link = html.escape(item_link(entry.keeper, item.number))
+        bands.append(top_band(value, '<div class="list-top-what">'
+                              + f'<a class="list-top-link" data-record-jump href="{link}">'
+                              + f'#{item.number} {html.escape(item.title)}</a>'
                               + '<div class="list-top-next">' + field_html("next_step", item.next_step, today, names)
                               + '</div></div>'
                               + f'<div class="list-top-meta"><span class="list-state {STATE_TONES.get(item.state, "muted")}">'
@@ -2296,7 +2309,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{studio_page.PAGE_PATH}?{html.escape(counts_query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    content = (STYLE + studio_page.STYLE + page_frame.title(studio_page.TITLE, "list", SCRIPT_VERSION)
+    content = (STYLE + studio_page.STYLE + page_frame.title(studio_page.TITLE, "studio", SCRIPT_VERSION)
                + '<p data-review-refresh-error role="status" hidden></p>'
                + f'<div data-list data-list-path="{studio_page.PAGE_PATH}" data-refresh-seconds="{seconds}"'
                + f' data-zone="{html.escape(zone.key, quote=True)}"'
@@ -2453,8 +2466,9 @@ scrollbar-width:thin;scrollbar-color:var(--ink-3) transparent}
 .item-links ul{list-style:none;padding:0;margin:0 0 16px}
 .item-links li{padding:6px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}
 .item-links li:first-child{padding-top:0;border-top:0}
-.item-links .item-link-label{color:var(--accent);font-weight:600;text-decoration:none}
-.item-links .item-link-label:is(:hover,:focus-visible){text-decoration:underline}
+.item-links .item-link-label{color:var(--accent);font-weight:600}
+:is(.item-links .item-link-label,.list-top-link){text-decoration:none}
+:is(.item-links .item-link-label,.list-top-link):is(:hover,:focus-visible){text-decoration:underline}
 .item-link-field{color:var(--ink-2);margin-inline-start:8px}
 .item-link-address{display:block;color:var(--ink-3);font-size:12px;margin-top:2px}
 .list-actions{position:relative}
@@ -3521,13 +3535,19 @@ function bindFeedbackForm(form){
    if(action==='park' || (action==='schedule' && schedule.startChanged)) scheduleEditor?.retainDate();
    retainDraft();
    const stampAtSubmit=draftStamp;
-   const clearConfirmedScheduleDraft=()=>{
-    if(!scheduleWrite && !schedule?.scope) return;
+   const clearConfirmedDraft=()=>{
+    const clearSchedule=scheduleWrite || Boolean(schedule?.scope);
+    const remove=action==='remove';
+    if(!clearSchedule && !remove) return;
     unconfirmed.delete(attempt);
     const latest=drafts.get(key);
     if(draftStamp!==stampAtSubmit || latest?.stamp!==stampAtSubmit) return;
-    drafts.set(key,{...latest,schedule:undefined});
+    const clearWords=remove && latest.words===attempt.words && words.value===attempt.words;
+    if(clearWords) words.value='';
+    drafts.set(key,{...latest,words:clearWords ? '' : latest.words,
+     schedule:clearSchedule ? undefined : latest.schedule});
     retiredDraft=true;
+    if(clearWords) persistDraft();
    };
    const request=tableView.startItemRequest(key);
    item.listRequest=request;
@@ -3610,7 +3630,7 @@ function bindFeedbackForm(form){
     }
     if(item.listRequest!==request) return;
     saved=true;
-    clearConfirmedScheduleDraft();
+    clearConfirmedDraft();
     if(stale){
      if(tableView.openItem?.dataset.key===key) return;
      hold.restore();
@@ -3689,7 +3709,7 @@ function bindFeedbackForm(form){
     focusDraft=undone;
     if(undone) refused=true;
     if(saved){
-     clearConfirmedScheduleDraft();
+     clearConfirmedDraft();
      if(stale) return;
      if(hold.restore()) tableView.applyAction();
      tableView.preserveRecordRowTop(()=>{
@@ -3707,7 +3727,7 @@ function bindFeedbackForm(form){
     if(retried || (!refused && (parkingReceipt || action==='remove'))){
      try{
       const query=new URLSearchParams({'item-state':data.get('id'),keeper:data.get('keeper')});
-      if(parkingReceipt || scopedRemove) query.set('park-request',attempt.request);
+      if(parkingReceipt || action==='remove') query.set('park-request',attempt.request);
       const response=await fetch(actionPath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
       if(!response.ok) throw new Error('HTTP '+response.status);
       current=await response.json();
@@ -3723,10 +3743,13 @@ function bindFeedbackForm(form){
      if(parkingReceipt || action==='remove'){
       if(current){
        applySavedState(current,{metadataOnly:true});
-       const receipt=scopedRemove ? current.remove_request_saved : current.park_request_saved;
+       const receipt=action==='remove' ? current.remove_request_saved : current.park_request_saved;
        confirmedByReadback=receipt===true || !scopedRemove && confirmed.state==='Closed';
        restore=!confirmedByReadback && confirmed.state!=='Closed';
-       if(confirmedByReadback){saved=true;clearConfirmedScheduleDraft();}
+       if(confirmedByReadback){
+        saved=true;
+        if(action!=='remove' || receipt===true) clearConfirmedDraft();
+       }
        if(!stale){
         presentListDetail(item,current);
         if(confirmedByReadback) closeSavedCard();
@@ -3945,6 +3968,7 @@ function applyListSnapshot(fresh){
  const focus=field?.id,start=field?.selectionStart,end=field?.selectionEnd;
  const direction=field?.selectionDirection;
  const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
+ const topLink=field?.matches('.list-top-link') ? field.getAttribute('href') : null;
  const action=field?.matches('button[name="action"]') ? field.value : '';
  const copyCommand=field?.matches('.list-command [data-copy-code]');
  const focusedRow=action || copyCommand || field?.matches('.list-toggle') ? recordFromDetail(field) : null;
@@ -3975,6 +3999,10 @@ function applyListSnapshot(fresh){
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number')
    field.setSelectionRange(start,end,direction);}
  if(reviewLink && !field?.isConnected) restoreReviewLink(reviewLink);
+ if(topLink && !field.isConnected){
+  const link=content.querySelector('.list-top-link[href="'+CSS.escape(topLink)+'"]');
+  (link?.getClientRects().length ? link : content.querySelector('#list-search')).focus({preventScroll:true});
+ }
  if(focusedRow && !field?.isConnected){
   const match=rowIn(content,focusedRow.dataset.key);
   const row=match && !match.hidden ? match : null;
