@@ -145,7 +145,7 @@ const INFO = icon("M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20M12 16v-4M12 8h.01");
 // Use the shared style and controls for session tooltips.
 const stepTip = (() => {
 __STEP_TIP_SCRIPT__
-  return {field, staffTitle, tipRowsHtml, hoverTips, roleName};
+  return {field, staffTitle, tipRowsHtml, hoverTips, staffName};
 })();
 
 function size(bytes) {
@@ -359,7 +359,7 @@ function sessionRows(report, keepBytes, limit) {
   };
   const state = row => row.state === "ended" ? '<span class="tag go">ended</span>'
     : `<span class="dim">${row.state === "running" ? "running" : "—"}</span>`;
-  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${stepTip.roleName(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
+  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${stepTip.staffName(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
     + `<td class="share">${row.size && largest ? `<i style="width:${(100 * row.size / largest).toFixed(1)}%"></i>` : ""}</td>`
     + `<td class="held">${held(row)}</td><td>${state(row)}</td></tr>`;
   const {shown, smaller} = sessionsAtLeast(report, limit);
@@ -702,6 +702,7 @@ async function askMeasure(current,force=false) {
   if(!current()) return;
   if(!response.ok) throw new Error(answer.reason || `HTTP ${response.status}`);
   showActionFailure(measureFailure);
+  if(answer.staff_names) globalThis.staffNames?.set(answer.staff_names);
   sessionReport=answer.sessions || null;renderCards();
   if(force) measuring.target=answer.target;
   else if(answer.state!=="current" && !measuring)
