@@ -100,8 +100,10 @@ class ProducerAdmissionWorld:
         return self.pane
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
-                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
-        del name, timeout_ms
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *,
+                    publication: herdr.LaunchPublicationTiming = herdr.LaunchPublicationTiming.ON_START,
+                    ) -> herdr.PromptSubmissionNotRequired:
+        del name, timeout_ms, publication
         self.openings.append(opening)
         if kind != self.kind or pane != self.pane:
             raise AssertionError("unexpected producer launch")
