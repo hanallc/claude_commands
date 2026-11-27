@@ -746,14 +746,17 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
         silence.mark_post_started(push)
         return post(url, data)
 
-    result: PostResult | None = None
+    def rejected(reason: str) -> None:
+        if push.get("post_started", False):
+            silence.mark_post_rejected(push, reason)
+
+    exit_code = 1
     try:
-        result = _post_message(identity, priority, title, message, keys_file, post_once, detail, text_id)
-        if isinstance(result, PostRejected) and push.get("post_started", False):
-            silence.mark_post_rejected(push, result.reason)
-        return result.exit_code
+        exit_code = post_message(identity.sender, priority, title, message, keys_file, post_once, detail,
+                                 identity.key, text_id, reference=reference, on_rejected=rejected)
+        return exit_code
     finally:
-        if (result is None or isinstance(result, PostUnknown)) and push.get("post_started", False):
+        if exit_code != 0 and push.get("post_started", False):
             log(push["source"], priority, title, message, "kept push post unconfirmed",
                 key=push["key"], template=text_id, reference=reference)
 
@@ -778,10 +781,15 @@ PostResult = PostAccepted | PostRejected | PostUnknown
 
 
 def post_message(source: str, priority: str, title: str, message: str,
-                 keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "") -> int:
-    """Post an unbound push and return its exit code."""
-    return _post_message(push_reference.PushIdentity(source, key), priority, title, message,
-                         keys_file, post, detail, text_id).exit_code
+                 keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "", *,
+                 reference: push_reference.PushReference = push_reference.NO_REFERENCE,
+                 on_rejected: Callable[[str], None] | None = None) -> int:
+    """Post a push and report a confirmed rejection to the caller."""
+    result = _post_message(push_reference.PushIdentity(source, key, reference), priority, title, message,
+                           keys_file, post, detail, text_id)
+    if isinstance(result, PostRejected) and on_rejected is not None:
+        on_rejected(result.reason)
+    return result.exit_code
 
 
 def _post_message(identity: push_reference.PushIdentity, priority: str, title: str, message: str,

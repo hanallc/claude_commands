@@ -5223,6 +5223,23 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             + f" and is still live until {(sent + timedelta(hours=3)).astimezone(zone):%H:%M:%S %Z}; to send a new one,"
             + " retire it first: send.py retire --to user --from hana --key github-cold\n"))
 
+    def test_unbound_emergency_senders_share_the_keys_repeat_window(self) -> None:
+        key = "shared-fixture"
+        alpha = send.parse(self.emergency("--key", key))._replace(sender="alpha")
+        beta = alpha._replace(sender="beta")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+            self.assertEqual(send.send(alpha).outcome, "sent")
+            self.assertEqual(send.send(beta).outcome, "skipped")
+        channel.assert_called_once()
+
+        with (mock.patch.object(send, "run", return_value=(0, "pushover: cancelled 1\n", "")),
+              mock.patch.object(silence, "drop", return_value=0), redirect_stdout(io.StringIO())):
+            self.assertEqual(send.main(["retire", "--to", "user", "--from", "alpha", "--key", key]), 0)
+
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+            self.assertEqual(send.send(beta).outcome, "sent")
+        channel.assert_called_once()
+
     def test_replaced_emergency_retries_until_delivered_then_keeps_its_live_window(self) -> None:
         started = send.now()
         key = "replaced-emergency"
