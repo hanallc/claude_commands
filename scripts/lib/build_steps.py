@@ -1,6 +1,6 @@
 """Read the display names, prose names and descriptions of build steps."""
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import MappingProxyType
@@ -155,44 +155,6 @@ def gate_target_kind(target: str) -> Literal["natedev", "mac-linux", "aws"] | No
     return None
 
 
-# Short env options that take the next word or the rest of the option as a value.
-ENV_VALUE_LETTERS = "CSau"
-# Long env options that take a value. Env accepts unique prefixes of these names.
-ENV_VALUE_OPTIONS = ("--argv0", "--chdir", "--split-string", "--unset")
-
-
-def option_names(words: Sequence[str], value_letters: str,
-                 long_value: Callable[[str, str], bool]) -> tuple[list[str], int]:
-    """Return the option names and the index of the first word after the options.
-
-    Return each letter of a short option as a name until a letter takes a value.
-    Use long_value to check if a long option takes the next word as a value.
-    """
-    names: list[str] = []
-    index = 0
-    while index < len(words) and words[index].startswith("-") and words[index] not in ("-", "--"):
-        word = words[index]
-        index += 1
-        if word.startswith("--"):
-            name, equal, _ = word.partition("=")
-            names.append(name)
-            index += 1 if not equal and long_value(name, words[index] if index < len(words) else "") else 0
-            continue
-        for position, letter in enumerate(word[1:], start=2):
-            names.append("-" + letter)
-            if letter in value_letters:
-                index += 0 if word[position:] else 1
-                break
-    return names, index
-
-
-def env_parts(words: Sequence[str]) -> tuple[list[str], Sequence[str]]:
-    """Return the env option names and the original words after them."""
-    names, end = option_names(words, ENV_VALUE_LETTERS,
-                              lambda name, _next: any(option.startswith(name) for option in ENV_VALUE_OPTIONS))
-    return names, words[end:]
-
-
 # A program that runs the script named after its options.
 INTERPRETER = re.compile(r"python[0-9.]*|py|bash|sh")
 # Interpreter options that take the next argument, or the rest of their cluster, as their value.
@@ -200,12 +162,10 @@ VALUE_OPTIONS = frozenset("XW")
 LONG_VALUE_OPTIONS = frozenset({"--check-hash-based-pycs", "--init-file", "--rcfile"})
 
 
-def parse_command_program(argv: Sequence[str], *, keep_path: bool = False,
-                          module_name: str | None = None) -> tuple[str, Sequence[str]] | OtherCommand:
+def parse_command_program(argv: Sequence[str], *, keep_path: bool = False) -> tuple[str, Sequence[str]] | OtherCommand:
     """Return the program name and arguments after Python or shell interpreter options.
 
     Return OtherCommand for inline code, standard input, or a missing program.
-    If module_name is set, accept only that Python module at the -m position.
     """
     index = 0
     while index < len(argv):
@@ -218,10 +178,6 @@ def parse_command_program(argv: Sequence[str], *, keep_path: bool = False,
             index += 1
             if option == "-":
                 return OTHER_COMMAND
-            if option == "--":
-                if index < len(argv) and argv[index] == "-":
-                    return OTHER_COMMAND
-                break
             if option.startswith("--"):
                 index += 1 if option in LONG_VALUE_OPTIONS else 0
                 continue
@@ -231,8 +187,7 @@ def parse_command_program(argv: Sequence[str], *, keep_path: bool = False,
                     return OTHER_COMMAND
                 if flag == "m":
                     module = rest or (argv[index] if index < len(argv) else "")
-                    if not module or keep_path or (module_name is not None
-                                                   and (module != module_name or name in {"bash", "sh"})):
+                    if not module or keep_path:
                         return OTHER_COMMAND
                     return module.rsplit(".", 1)[-1] + ".py", argv[index + (0 if rest else 1):]
                 if flag in VALUE_OPTIONS:

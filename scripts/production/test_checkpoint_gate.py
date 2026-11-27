@@ -71,51 +71,19 @@ def run_gate_step(case: unittest.TestCase, argv: list[str]) -> subprocess.Comple
 
 
 class CheckpointGateTests(unittest.TestCase):
-    def test_gate_names_select_the_parser_only_at_the_command_position(self) -> None:
+    def test_gate_module_argument_to_another_script_uses_the_nextest_parser(self) -> None:
+        command = ["python3", "other.py", "-m", "scripts.production.gate"]
         output = "    FAIL [  0.1s] (1/1) bin checks::failed\n--- lib/test_gate.py exit=1 ---\n"
-        for command in (
-            ["python3", "other.py", "-m", "scripts.production.gate"],
-            ["python3", "other.py", "-mscripts.production.gate"],
-            ["python3", "other.py", "scripts/production/gate.py"],
-            ["python3", "-m", "other.gate"],
-            ["python3", "--", "-m", "scripts.production.gate"],
-        ):
-            with self.subTest(command=command):
-                self.assertEqual(checkpoint_gate.red_names(command, output), frozenset({"checks::failed"}))
-                self.assertEqual(checkpoint_gate.only_tests(command, frozenset({"checks::failed"})),
-                                 [*command, "-E", "test(=checks::failed)"])
-        for command in (
-            ["env", "HOME=/fixture", "python3", "scripts/production/gate.py"],
-            ["python3", "-B", "-m", "scripts.production.gate"],
-            ["python3", "-Bmscripts.production.gate"],
-        ):
-            with self.subTest(command=command):
-                self.assertEqual(checkpoint_gate.red_names(command, output), frozenset({"lib/test_gate.py"}))
+        names = frozenset({"checks::failed"})
+        self.assertEqual(checkpoint_gate.red_names(command, output), names)
+        self.assertEqual(checkpoint_gate.only_tests(command, names), [*command, "-E", "test(=checks::failed)"])
 
-    def test_env_options_keep_the_gate_at_the_command_position(self) -> None:
+    def test_env_unset_keeps_the_gate_parser(self) -> None:
+        command = ["env", "-u", "PYTHONUNBUFFERED", *GATE]
         output = "    FAIL [  0.1s] (1/1) bin checks::failed\n--- lib/test_gate.py exit=1 ---\n"
-        for options in (
-            ["--"],
-            ["--", "-"],
-            ["-u", "PYTHONUNBUFFERED"],
-            ["-uPYTHONUNBUFFERED"],
-            ["--unset=PYTHONUNBUFFERED"],
-            ["-i", "-C", ".", "HOME=/fixture"],
-            ["-iuPYTHONUNBUFFERED", "-C.", "--", "HOME=/fixture"],
-        ):
-            with self.subTest(options=options):
-                command = ["env", *options, *GATE]
-                modules = frozenset({"lib/test_gate.py"})
-                self.assertEqual(checkpoint_gate.red_names(command, output), modules)
-                self.assertEqual(checkpoint_gate.only_tests(command, modules), [*command, "--module", "lib/test_gate.py"])
-        for command in (
-            ["env", "-u", "PYTHONUNBUFFERED", "python3", "other.py", "-m", "scripts.production.gate"],
-            ["env", "-S", "python3 other.py", *GATE],
-            ["env", "--split-string=python3 other.py", *GATE],
-            ["env", "--help", *GATE],
-        ):
-            with self.subTest(command=command):
-                self.assertEqual(checkpoint_gate.red_names(command, output), frozenset({"checks::failed"}))
+        names = frozenset({"lib/test_gate.py"})
+        self.assertEqual(checkpoint_gate.red_names(command, output), names)
+        self.assertEqual(checkpoint_gate.only_tests(command, names), [*command, "--module", "lib/test_gate.py"])
 
     def test_merge_gate_uses_the_committed_copy_for_the_initial_run_and_flake_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

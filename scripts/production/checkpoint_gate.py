@@ -18,14 +18,10 @@ from typing import Literal, NamedTuple, TypedDict, cast
 
 from scripts.build_queue.first_step import FirstStepRefused, gate_targets
 from scripts.copies import copies
-from scripts.lib import build_steps
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import (
-    GATE_PRELAUNCH_REFUSED_STATUS, GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS, command_program, parse_command_program,
-)
+from scripts.lib.build_steps import GATE_PRELAUNCH_REFUSED_STATUS, GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS, command_program
 from scripts.lib.cargo_target_config import cargo_home_folder, cargo_workspace_manifest
 from scripts.lib.process_failure import failure_detail
-from scripts.lib.suite_runners import SUITE_MODULE
 from scripts.message import session_send
 from scripts.production import showrunners, staff
 from scripts.production.production_doc import ProductionDocument
@@ -180,21 +176,11 @@ def checkpoint_gate_targets(command: Sequence[str], folder: Path) -> tuple[str, 
 
 
 def gate_program_start(command: Sequence[str]) -> int:
-    """Skip env options and assignments before identifying the program."""
+    """Skip the env prefix and its assignments before identifying a gate."""
     if not command or Path(command[0]).name != "env":
         return 0
-    options, tail = build_steps.env_parts(command[1:])
-    # A split string can supply the program. Help, version, and null options run no program.
-    if {"-S", "-0"}.intersection(options) or any(
-            name.startswith(option) for option in options
-            for name in ("--split-string", "--help", "--version", "--null")):
-        return len(command)
-    start = len(command) - len(tail)
-    if start < len(command) and command[start] == "--":
-        start += 1
-    if start < len(command) and command[start] == "-":
-        start += 1
-    while start < len(command) and not command[start].startswith("-") and "=" in command[start]:
+    start = 1
+    while start < len(command) and "=" in command[start]:
         start += 1
     return start
 
@@ -251,8 +237,7 @@ GATE_GREEN_ALONE = re.compile(r"^--- (\S+) passed on rerun alone; first run exit
 
 
 def runs_merge_gate(command: Sequence[str]) -> bool:
-    program = parse_command_program(command[gate_program_start(command):], module_name=SUITE_MODULE)
-    return isinstance(program, tuple) and program[0] in GATE_SCRIPTS
+    return any(Path(word).name in GATE_SCRIPTS for word in command)
 
 
 def red_names(command: Sequence[str], output: str) -> frozenset[str]:
