@@ -231,17 +231,18 @@ def _cancel_closed_worker_passes(row: staff.StaffRow, stopped: stop_resume.NotRu
                 return _result_code(stop_resume.StopUnproved(stopped.session_id, observed.reason))
             if isinstance(observed, herdr.LiveConversation):
                 return _result_code(stop_resume.StopFailed(stopped.session_id, "the worker resumed before pass cancellation"))
-            ended = progress_history.cancel_worker_passes_in_runs(runs, current.id)
+            ended = sum(cancellation.count for cancellation in progress_history.cancel_worker_passes_in_runs(runs, current.id))
             if ended:
                 passes = "pass" if ended == 1 else "passes"
                 print(f"{current.name}: ended {ended} open {passes} as canceled")
-                return 0
-            for run in runs:
-                remaining = progress_history.active_dispatch(current.id, run)
+            remaining_dispatches = [progress_history.active_dispatch(current.id, run) for run in runs]
+            for remaining in remaining_dispatches:
                 if isinstance(remaining, progress_history.ActiveDispatchUnavailable):
                     return _result_code(stop_resume.StopFailed(stopped.session_id, remaining.reason))
                 if isinstance(remaining, progress_history.ActiveDispatch):
                     return _result_code(stop_resume.StopFailed(stopped.session_id, "an open pass is pending completion"))
+            if ended:
+                return 0
     return _result_code(stopped)
 
 

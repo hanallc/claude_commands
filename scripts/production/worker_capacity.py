@@ -108,14 +108,19 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
         if isinstance(state, worker_panes.OpenWorker):
             return WorkerNotStopped(row.name, "the stop did not prove that the worker stopped")
         canceled: int | PassesNotCanceled
+        detached_directories = [run / detached_runs.DETACHED_RUNS_DIR]
         try:
             pass_runs = worker_panes.worker_pass_runs(row, run, record, scanned=scanned)
-            canceled = progress_history.cancel_worker_passes_in_runs(pass_runs, row.id)
+            canceled = 0
+            for cancellation in progress_history.cancel_worker_passes_in_runs(pass_runs, row.id):
+                canceled += cancellation.count
+                if cancellation.run != run:
+                    detached_directories.append(cancellation.run / detached_runs.DETACHED_RUNS_DIR)
         except (OSError, ValueError, SystemExit, recorder_state.OldRecorderState) as error:
             canceled = PassesNotCanceled(" ".join(str(error).split()))
-        runs = run / detached_runs.DETACHED_RUNS_DIR
-        detached = tuple(f"{record['run_id']}: result {runs / (record['run_id'] + '.json')}; log {record['log']}"
-                         for record in detached_runs.live_runs_for_staff(runs, frozenset({row.id})))
+        detached = tuple(f"{command['run_id']}: result {directory / (command['run_id'] + '.json')}; log {command['log']}"
+                         for directory in detached_directories
+                         for command in detached_runs.live_runs_for_staff(directory, frozenset({row.id})))
         pane: PaneOpen | None = None
         try:
             recovery = turn_end.recover_stopped_in_run(run, row.id, hold=hold)

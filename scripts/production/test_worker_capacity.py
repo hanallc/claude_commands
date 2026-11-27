@@ -172,6 +172,32 @@ class WorkerCapacityTests(StaffTestCase):
         self.assertEqual(self.sent, [(str(self.parent.id), worker_capacity.SENDER, "\n".join([
             HEADING, "Passes ended as canceled: implementer. Continue that work yourself from the worktree."]))])
 
+    def test_the_report_names_live_commands_from_each_run_with_a_canceled_pass(self) -> None:
+        older = self.root / "older-run"
+        untouched = self.root / "untouched-run"
+        primary_commands = self.run_dir / detached_runs.DETACHED_RUNS_DIR
+        older_commands = older / detached_runs.DETACHED_RUNS_DIR
+        self.cancel.side_effect = [1, 1, 0]
+        self.live_runs.side_effect = [
+            [{"run_id": "primary-command", "log": "/logs/primary-command.log"}],
+            [{"run_id": "older-command", "log": "/logs/older-command.log"}],
+        ]
+        opened = self.open_worker()
+        with mock.patch.object(worker_panes, "worker_pass_runs", return_value=(self.run_dir, older, untouched)):
+            self.assertEqual(self.stop([opened], opened, worker_panes.ClosedWorker(self.codex)), 0)
+        self.assertEqual(self.sent, [(str(self.parent.id), worker_capacity.SENDER, "\n".join([
+            HEADING, "Stopped: implementer.",
+            "Passes ended as canceled: implementer. Continue that work yourself from the worktree.",
+            f"Detached run of implementer continues: primary-command: result {primary_commands / 'primary-command.json'}; "
+            + "log /logs/primary-command.log.",
+            f"Detached run of implementer continues: older-command: result {older_commands / 'older-command.json'}; "
+            + "log /logs/older-command.log.",
+        ]))])
+        self.assertEqual(self.live_runs.call_args_list, [
+            mock.call(primary_commands, frozenset({self.codex.id})),
+            mock.call(older_commands, frozenset({self.codex.id})),
+        ])
+
     def test_a_worker_not_proved_stopped_keeps_its_pass_and_faults_go_to_the_fault_reader(self) -> None:
         opened = self.open_worker()
         unknown = worker_panes.ProcessUnknownWorker(self.codex, "p1", "t1", "process unreadable")

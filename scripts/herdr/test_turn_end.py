@@ -215,8 +215,7 @@ class TurnEndTests(unittest.TestCase):
         row = self.case.fixture.worker("closed")
         self.assertEqual(self.stop_closed_worker(row), f"{row.current_session}: unchanged\n")
 
-    def test_agents_stop_cancels_an_older_parked_pass(self) -> None:
-        row, _, _ = self.parked_worker_with_run()
+    def begin_newer_pass(self, row: staff.StaffRow) -> tuple[Path, str]:
         older = self.case.run_dir
         newer = older.with_name("newer-run")
         state = worker_panes.run_state(older)
@@ -226,6 +225,12 @@ class TurnEndTests(unittest.TestCase):
         instance = progress_history.begin_dispatch(newer, slot=row.name, phase="8", role="impl",
             worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"],
             prompt=self.case.prompt, kind="impl", lens="")
+        return newer, instance
+
+    def test_agents_stop_cancels_an_older_parked_pass(self) -> None:
+        row, _, _ = self.parked_worker_with_run()
+        older = self.case.run_dir
+        newer, instance = self.begin_newer_pass(row)
         progress_history.complete_dispatch(newer, row.name, instance)
         self.assertTrue(progress_history.parked_worker_pass(worker_panes.worker_pass(row, older)))
 
@@ -234,6 +239,23 @@ class TurnEndTests(unittest.TestCase):
             self.assertEqual(self.stop_closed_worker(row), f"{row.name}: ended 1 open pass as canceled\n")
         self.assertEqual(worker_panes.worker_pass(row, older)["status"], "canceled")
         self.assertTrue(progress_history.dispatch_completed(newer, row.name, instance))
+
+    def test_agents_stop_fails_if_another_pass_is_pending_completion(self) -> None:
+        row, _, _ = self.parked_worker_with_run()
+        older = self.case.run_dir
+        newer, instance = self.begin_newer_pass(row)
+        completion = progress_history.HookCompletion(turn_end.TurnOutcome.DONE, str(newer / "reply.md"))
+        progress_history.save_hook_completion(newer, instance, completion)
+
+        with (patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(older.parent)}),
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            code = shutdown.main(["stop", f"{self.case.fixture.parent.name}/{row.name}"])
+        self.assertEqual(worker_panes.worker_pass(row, older)["status"], "canceled")
+        self.assertEqual(worker_panes.worker_pass(row, newer)["status"], "active")
+        self.assertEqual(output.getvalue(), f"{row.name}: ended 1 open pass as canceled\n")
+        self.assertEqual(code, 1)
+        self.assertEqual(errors.getvalue(), f"{row.current_session}: an open pass is pending completion\n")
 
     def test_agents_stop_keeps_the_pass_when_an_open_worker_exits_before_the_signal(self) -> None:
         self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
