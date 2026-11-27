@@ -7163,6 +7163,9 @@ def prepare_agent_environment(cwd: str, environment: dict[str, str],
         launch_environment = {key: value for key, value in loaded.env.items()
                               if key not in unset_environment
                               and key not in {"STAFF_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"}}
+    berth_key = pane_launch.BERTH_SESSION_ENV
+    if berth_key in environment and berth_key not in unset_environment:
+        launch_environment[berth_key] = environment[berth_key]
     return PreparedAgentEnvironment(Path(cwd).resolve(), launch_environment,
                                     unset_environment | (os.environ.keys() - launch_environment.keys()))
 

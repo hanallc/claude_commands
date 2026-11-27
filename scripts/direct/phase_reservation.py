@@ -9,8 +9,8 @@ a clear `cargo-berth check` acquires turns it `Active`. Each phase checks as its
 session, `<director session id>.phase-<phase>`, so a phase opened beside another holds its own
 reservation; a path a sibling phase already holds answers `left_unmapped` with the sibling's
 reservation, which is never recorded here (`docs/direct/phase_reservation.md` →
-<PhaseReservationContract/>). A `left_unmapped` reservation belongs to this phase when the map names it and its run for the director's bare session id.
-No other open phase may hold it through an `Active` state, a pending release, or its berth session map.
+<PhaseReservationContract/>). The map must name the reservation and run for this phase or the director's bare session.
+An open sibling can hold the reservation through an `Active` state, a pending release, or its berth session map.
 Codex workers edit through `apply_patch`, so the Codex
 pre-edit hook (`scripts/hooks/pre-tool-use-berth.py`) runs that check and writes `Active`
 here. `record-active` is the checkpoint-time backstop for a first touch the hook did not see:
@@ -252,7 +252,7 @@ def _own_acquisition(answer: CheckAnswer, root: Path, phases: list[OpenPhase], s
                     phase: OpenPhase) -> Acquisition | _UnownedAcquisition | None:
     """Identify this phase's acquisition or the reason it cannot record it.
 
-    Accept `left_unmapped` if the bare session maps the reservation and run and no sibling holds it.
+    Accept `left_unmapped` if the phase or bare session maps the reservation and run and no sibling holds it.
     A sibling can hold it through an `Active` state, a pending release, or its berth session map.
     """
     acquisition = answer.acquisition
@@ -268,9 +268,11 @@ def _own_acquisition(answer: CheckAnswer, root: Path, phases: list[OpenPhase], s
         mapped = session_reservation(root, phase_session_id(session_id, sibling.phase))
         if mapped is not None and mapped[0] == acquisition.reservation_id:
             return _UnownedAcquisition.SIBLING
-    if session_reservation(root, session_id) != (acquisition.reservation_id, acquisition.coordination_run_id):
-        return _UnownedAcquisition.UNMAPPED
-    return acquisition
+    expected = (acquisition.reservation_id, acquisition.coordination_run_id)
+    if (session_reservation(root, phase_session_id(session_id, phase.phase)) == expected
+            or session_reservation(root, session_id) == expected):
+        return acquisition
+    return _UnownedAcquisition.UNMAPPED
 
 
 def record_own_acquisition(answer: CheckAnswer, root: Path, phases: list[OpenPhase], session_id: str,
@@ -297,7 +299,11 @@ def _record_own_acquisition_locked(answer: CheckAnswer, root: Path, phases: list
 
 def check(root: Path, scopes: list[str], session_id: str) -> CheckAnswer:
     """Run `cargo-berth check <scopes> --json` from the repository root as `session_id`."""
-    environment = {**os.environ, SESSION_ENVIRONMENT: session_id} if session_id else dict(os.environ)
+    environment = dict(os.environ)
+    if session_id:
+        environment[SESSION_ENVIRONMENT] = session_id
+    else:
+        _ = environment.pop(SESSION_ENVIRONMENT, None)
     try:
         result = subprocess.run(["cargo-berth", "check", *scopes, "--json"], cwd=root, env=environment,
                                 capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
@@ -378,6 +384,10 @@ def phase_directory(session_dir: Path, phase: str) -> Path:
 def phase_session_id(session_id: str, phase: str) -> str:
     """The berth session a phase checks under, so two open phases each hold a reservation of their own."""
     return f"{session_id}.phase-{phase_directory_name(phase)}" if session_id else ""
+
+
+def _unmapped_message(acquisition: Acquisition) -> str:
+    return f"phase reservation: the reservation is not mapped to a session: {acquisition.reservation_id}"
 
 
 def _adopt_session_level_files(session_dir: Path) -> None:
@@ -1010,7 +1020,7 @@ def _repair_record(session_dir: Path, phase: str, directory: Path, root: Path) -
     if _string(state.get("kind")) == PENDING:
         print("phase reservation: checkpoint release confirmation is pending; record unchanged", file=sys.stderr)
         return 2
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    session_id = staff.caller_identity()
     source = phase_session_id(session_id, phase)
     mapped = session_reservation(root, source)
     if mapped is None and session_id and all(each.directory == directory for each in open_phases(session_dir)):
@@ -1130,14 +1140,14 @@ def _record_active_from_changes_locked(session_dir: Path, directory: Path, reque
             return 1
         print("phase reservation: nothing of this phase changed since its baseline; still awaiting first touch")
         return 0
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    session_id = staff.caller_identity()
     answer = check(root, scopes, phase_session_id(session_id, phase.phase))
     if answer.status != CLEAR or answer.acquisition is None:
         print(f"phase reservation: cargo-berth check answered {answer.status}: {answer.message}", file=sys.stderr)
         return 1
     acquisition = _record_own_acquisition_locked(answer, root, phases, session_id, phase)
     if acquisition is _UnownedAcquisition.UNMAPPED:
-        message = f"phase reservation: the reservation is not mapped to a session: {answer.acquisition.reservation_id}"
+        message = _unmapped_message(answer.acquisition)
         if recorded:
             print(f"{message}; {stale}", file=sys.stderr)
             return 1
@@ -1202,7 +1212,7 @@ def _claim_files_locked(session_dir: Path, directory: Path, root: Path) -> int:
     if not scopes:
         print("phase reservation: no repository or no files to claim; still awaiting first touch")
         return 0
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    session_id = staff.caller_identity()
     answer = phase_check(root, scopes, session_id, phase)
     if answer.status in FAILS_OPEN:
         print(f"phase reservation: cargo-berth check answered {answer.status}; still awaiting first touch")
@@ -1211,6 +1221,9 @@ def _claim_files_locked(session_dir: Path, directory: Path, root: Path) -> int:
         print(f"phase reservation: cargo-berth check answered {answer.status}: {answer.message}", file=sys.stderr)
         return 1
     acquisition = _record_own_acquisition_locked(answer, root, phases, session_id, phase)
+    if acquisition is _UnownedAcquisition.UNMAPPED and answer.acquisition is not None:
+        print(_unmapped_message(answer.acquisition))
+        return 0
     if not isinstance(acquisition, Acquisition):
         print("phase reservation: a sibling phase's reservation holds every file; still awaiting first touch")
         return 0
