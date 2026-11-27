@@ -2427,8 +2427,10 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
  }
  return measuredFetch(url,options);
 };</script>"""
-        markup = (replace(initial, refresh_seconds=0).render(show='all').decode().replace('<head>','<head>'+spy,1)
-                  .replace('</body>',probe+'</body>'))
+        page = initial.render(show='all').decode()
+        page, replacements = re.subn(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', page, count=1)
+        self.assertEqual(replacements, 1)
+        markup = page.replace('<head>', '<head>'+spy, 1).replace('</body>', probe+'</body>')
 
         class Probe(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
