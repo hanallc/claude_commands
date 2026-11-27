@@ -11,6 +11,7 @@ from enum import Enum, StrEnum
 from typing import Literal, cast
 
 from scripts.production import staff
+from scripts.production.record_store import SubmissionConflict as SubmissionConflict, SubmissionError as SubmissionError
 from scripts.review_links import page_frame, reply_tokens
 
 
@@ -27,16 +28,6 @@ MAX_BUG_PAGE_STATE_BYTES = 512 * 1024
 MAX_PAGE_URL_LENGTH = 8192
 BUILD_EVIDENCE_LIMITS = {"title": 300, "label": 200, "text": 4_000, "tipEntries": 64}
 IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif", "image/webp": "webp"}
-
-
-class SubmissionError(ValueError):
-    """The request cannot be saved or applied to this item."""
-
-
-class SubmissionConflict(SubmissionError):
-    """The request ID already names different item data."""
-
-    status: Literal[409] = 409
 
 
 class SubmissionScreenshotExpired(SubmissionConflict):

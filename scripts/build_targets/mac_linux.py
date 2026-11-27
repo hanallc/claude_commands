@@ -42,6 +42,9 @@ from scripts.aws_target import gate_box, ledger
 from scripts.build_queue import execution_identity
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
+from scripts.build_targets.gate_targets import (
+    SSH_CONNECT_TIMEOUT_SECONDS as SSH_CONNECT_TIMEOUT_SECONDS, SSH_OPTIONS as SSH_OPTIONS,
+)
 from scripts.buildlog import machine_facts, store
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start
 from scripts.mac_test import claim_state, eligibility
@@ -63,7 +66,6 @@ GUEST_CLAIM_TARGET = eligibility.MAC_LINUX_CLAIM_TARGET
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 RUNNER_PATH = 'scripts/build_targets/mac_linux.py'
 BOOTSTRAP_DIR = '.git/mac-linux'
-SSH_CONNECT_TIMEOUT_SECONDS = 8
 CONNECT_ATTEMPTS = 3
 # Give the guest port forward time to accept a new connection.
 CONNECT_RETRY_SECONDS = 1
@@ -73,7 +75,6 @@ INNER_CONNECT_STATUS = 254
 GUEST_ACCEPTED = 'mac-linux command accepted'
 INNER_CONNECT_ERROR = re.compile(
     r'ssh: connect to host [^\s]+ port [0-9]+: Connection (?:reset by peer|refused)\r?\n?')
-SSH_OPTIONS = ('-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no')
 # Allow time for setup, cleanup, and result transfer.
 TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
