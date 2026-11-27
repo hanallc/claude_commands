@@ -1063,7 +1063,7 @@ class ImagesTests(ImagesFixture):
             assert isinstance(result, images.ImageAnswerSent)
             self.assertTrue(result.draft_confirmed)
 
-    def test_same_round_reuses_earlier_feedback_after_a_different_answer(self) -> None:
+    def test_three_tabs_can_restore_an_earlier_answer_in_the_same_round(self) -> None:
         keep = "Keep the red row."
         remove = "Remove the red row."
         start = datetime(2026, 11, 24, 23, 58, tzinfo=UTC)
@@ -1078,12 +1078,12 @@ class ImagesTests(ImagesFixture):
                     with patch.object(images, "datetime", wraps=datetime) as clock:
                         clock.configure_mock(**{"now.return_value": start + timedelta(days=index)})
                         self.submit(self.feedback_body(record, words) + f"&feedback_round={round_id}")
-                self.assertEqual(len(self.sent), 4 if linked else 2)
-                times = [start, start + timedelta(days=1)]
+                self.assertEqual(len(self.sent), 6 if linked else 3)
+                times = [start + timedelta(days=index) for index in range(3)]
                 if linked:
                     source = the_list.folder(keeper.id) / f"{item.id}.md"
                     self.assertEqual(behavior_request.verified_dates(source, {keep, remove}),
-                                     {keep: times[0].date(), remove: times[1].date()})
+                                     {keep: times[2].date(), remove: times[1].date()})
                     records = [entry for entry in the_list.load(keeper.id, item.id).log
                                if isinstance(entry, the_list.ImageAnswerChange)]
                     self.assertEqual([entry.time for entry in records], times)
@@ -1091,7 +1091,7 @@ class ImagesTests(ImagesFixture):
                     paths = images.decision_root(self.root).glob(f"{record['id']}-*.json")
                     decisions = [images.read_image_decision(self.root, path) for path in paths]
                     self.assertCountEqual(decisions, [images.ImageDecision(record["id"], "feedback", words, moment)
-                                                   for words, moment in zip((keep, remove), times, strict=True)])
+                                                   for words, moment in zip((keep, remove, keep), times, strict=True)])
 
     def test_signed_resubmission_with_a_legacy_marker_creates_a_record(self) -> None:
         record = self.register()
@@ -1929,9 +1929,9 @@ class ImageQuestionTests(ImagesFixture):
         self.submit(post("Shorten the red row.", set()))
         images.answer_question(self.root, identity, "Q1", "The gate passed.")
         self.submit(post("Remove the red row.", {"Q1"}))
-        self.submit(keep)
-        with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
-            self.submit(post("Move the red row.", set()))
+        for stale in (keep, post("Move the red row.", set())):
+            with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
+                self.submit(stale)
         paths = images.decision_root(self.root).glob(f"{identity}-*.json")
         self.assertEqual(len(list(paths)), 3)
 

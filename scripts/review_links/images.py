@@ -126,6 +126,9 @@ class _AnswerDraft:
             parts.append(round_id)
         return change_page.review_delivery_key(folder / image_store.RECORD, folder.name, json.dumps(parts), purpose=purpose)
 
+    def new_decision_key(self, folder: Path, saved: image_store.ImageAnswers, round_id: str, position: int) -> str:
+        return self.delivery_key(folder, saved, round_id, purpose=f"images-answer:{position}")
+
 
 def images_root(root: Path) -> Path:
     return root / image_store.IMAGES_FOLDER
@@ -618,42 +621,39 @@ def _legacy_answer_words(identity: str, item: str, message: str, answer: str) ->
 
 def _existing_answer_attempt(folder: Path, saved: image_store.ImageAnswers, draft: _AnswerDraft,
                              round_id: str, *, retry_key: str | None = None) -> str | _AnswerAttemptLookup:
-    """Find an attempt for this image, round, answer, and feedback."""
+    """Find the saved request or match the newest attempt for this image."""
     attempts = saved["attempts"]
     if retry_key is not None:
         return retry_key if retry_key in attempts else _AnswerAttemptLookup.REFUSED
 
     bound_key = draft.form_attempt_key(folder, saved) if draft.request_id else None
-    if bound_key is not None:
-        proof = attempts[bound_key].get("signed_answer")
-        if proof is None:
-            return _AnswerAttemptLookup.REFUSED
-        # A saved request ID selects its original round.
-        round_id = proof["round_id"]
-        candidates = {bound_key: attempts[bound_key]}
-    else:
-        if draft.request_id and draft.request_key(folder, saved) in saved.get("stale_form_request_keys", []):
-            return _AnswerAttemptLookup.REFUSED
-        candidates = attempts
+    if (bound_key is None and draft.request_id
+            and draft.request_key(folder, saved) in saved.get("stale_form_request_keys", [])):
+        return _AnswerAttemptLookup.REFUSED
+    key = bound_key if bound_key is not None else next(reversed(attempts), None)
+    if key is None:
+        return _AnswerAttemptLookup.NEW
 
-    identity = (round_id, draft.action, draft.words)
-    matches = [key for key, attempt in candidates.items()
-               if (proof := attempt.get("signed_answer")) is not None
-               and (proof["round_id"], proof["answer"], proof["feedback"]) == identity]
-    if matches:
-        # Older versions could save more than one attempt for the same identity.
-        return next((key for key in matches if not _answer_delivered(attempts[key])), matches[0])
+    attempt = attempts[key]
+    proof = attempt.get("signed_answer")
+    if proof is not None:
+        # A saved request ID selects its original round.
+        if bound_key is not None:
+            round_id = proof["round_id"]
+        if (proof["round_id"], proof["answer"], proof["feedback"]) == (round_id, draft.action, draft.words):
+            return key
     if bound_key is not None:
         return _AnswerAttemptLookup.REFUSED
+    if proof is not None:
+        return _AnswerAttemptLookup.NEW
 
-    round_key = draft.delivery_key(folder, saved, round_id, purpose="images-answer")
-    if round_key in attempts and "signed_answer" not in attempts[round_key]:
-        return round_key
+    if key in (draft.new_decision_key(folder, saved, round_id, len(attempts) - 1),
+               draft.delivery_key(folder, saved, round_id, purpose="images-answer")):
+        return key
     # Older unsigned records can omit the round from the delivery key.
-    for key in (draft.delivery_key(folder, saved, round_id), draft.delivery_key(folder, saved, None)):
-        attempt = attempts.get(key)
-        if attempt is not None and "signed_answer" not in attempt and feedback_round(set(attempt["answered"])) == round_id:
-            return key
+    if feedback_round(set(attempt["answered"])) == round_id and key in (
+            draft.delivery_key(folder, saved, round_id), draft.delivery_key(folder, saved, None)):
+        return key
     return _AnswerAttemptLookup.NEW
 
 
@@ -694,7 +694,7 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
                 saved.setdefault("stale_form_request_keys", []).append(form_key)
                 image_store.write_answers(directory, saved)
             raise question_record.AnswerRefused(STALE_ANSWER)
-        key = form_key or draft.delivery_key(folder, saved, round_id, purpose="images-answer")
+        key = form_key or draft.new_decision_key(folder, saved, round_id, len(attempts))
         previous = answered
         if record is None:
             message = ANSWER_PREFIX + ANSWERS[answer] + f"\nPicture {identity} was removed."
@@ -724,6 +724,12 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
                                                 "time": datetime.now(UTC).isoformat(), "round_id": round_id}
         if form_key and not attempt["recipients"]:
             proof["form_request_key"] = form_key
+        else:
+            # A renewed answer needs a separate signed record.
+            previous_proof = next((prior for entry in reversed(attempts.values())
+                                  if (prior := entry.get("signed_answer")) is not None), None)
+            if previous_proof is not None:
+                proof["previous_answer_key"] = _signed_answer_key(saved, previous_proof)
         attempt["signed_answer"] = proof
     new_attempt = key not in attempts
     request_keys = attempt.get("form_request_keys", [])
