@@ -6999,8 +6999,11 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
         cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
         self.addCleanup(cache.close)
         created = cache.create_submission(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, producer.id))
-        self.assertTrue(review_submissions.answer(created.saved.key, 'The test passed.', created.saved.reply_token))
-        card = review_page.build_snapshot(self.root).body(created.key).decode()
+        with patch.object(the_list, 'file_exchanges', side_effect=OSError('The List save failed.')):
+            self.assertTrue(review_submissions.answer(created.saved.key, 'The test passed.', created.saved.reply_token))
+        snapshot = review_page.build_snapshot(self.root)
+        self.assertIn(created.key, {row['key'] for row in snapshot.entries})
+        card = snapshot.body(created.key).decode()
         self.assertRegex(card, r'Sends to <span[^>]*data-color-text="role.producer"'
                          + r' style="color:#90fe42">fixture-producer</span>')
 

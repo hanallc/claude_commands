@@ -1131,8 +1131,8 @@ An older change with only the showrunner's reply in its log shows both the feedb
 If a delivery slot write fails, a retry of the same Send keeps its ID and uses the existing log entry.
 Ask question sends the words to the owner.
 A question from Open moves the item to Waiting.
-The owner’s answer returns that item to Open.
-The answer stays in the item log.
+An answer without a filed List item returns the Review item to Open.
+An answer with a filed List item returns to that item.
 Owners use `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` for all five types.
 The Console text check runs before the answer is saved.
 
@@ -2301,24 +2301,31 @@ New anonymous log exchanges use a digest of the prompt, its time, and the reply 
 Verified Feedback replies remain in Review outside the unresolved question count.
 The preview reports each unresolved source key and its reply count.
 Review keeps an Investigation or native Question visible while an outgoing question waits or a reply remains unresolved.
-Review hides a card only after a confirmed List receipt covers every reply and the current answer.
-An Open Change with only one confirmed slot answer can move to the List when the answerer is unknown.
+Review hides a card when verified List exchanges cover every reply and the current answer.
+An Open Change with one verified slot answer on the List can move to the List when the answerer is unknown.
 A later slot change leaves the filed reply binding and answer text intact.
 A filed question can receive an answer or close after withdrawal.
 The writer also updates read state and verified question metadata.
 The writer rereads the source under its filing lock.
 The List allocator records the destination before it advances the counter.
 The writer saves pending exchanges before it writes the List item.
+A new unread Review answer adds one log entry with its words, time, and author in the same save.
+The List shows **New answer** and uses its existing **Needs me** rule.
+Mark read clears the mark and keeps the log entry.
+A reply to a question asked on the List keeps its existing route.
 A retry uses the recorded destination and pending exchanges.
+A repeated Proposal or Efficiency reply can finish filing after the reply saves.
+A retry keeps the saved answer entry and its read state.
 Old bindings keep their encoded form for receipt checks.
 Migration rewrites verified bindings in place and issues receipts after the new List data is durable.
 An unverified Investigation binding remains visible in Review and requires a separate repair.
-Review checks a save receipt before it hands off each exchange.
+Review uses the exchange on the saved List item even if the save receipt is missing.
+Review reads the List file without taking the writer lock.
 A failed pending exchange read leaves that card in Review.
-A unique reply digest can verify a moved log event without a change to the receipt.
+A unique reply digest can verify a moved log event.
 Review locates a moved log question in the verified reply's request interval.
 A new reply uses its digest as its ID when a saved reply owns the position ID.
-The handoff hides only the recorded reply event.
+The handoff hides each filed reply in the card body and log.
 Review keeps separate decisions and unread replies that remain in Review.
 Old links to a filed Review answer open its Studio item.
 Use **Answer question** on a Studio item to answer an open staff question.

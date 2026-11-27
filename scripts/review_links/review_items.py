@@ -320,6 +320,15 @@ class FiledReviewExchange:
     open_staff_question: bool
     filed_slot_id: str = ""
     filed_investigation_answer: bool = False
+    filed_followup_indices: frozenset[int] = frozenset()
+
+
+@dataclass(frozen=True)
+class FollowupLogCopy:
+    """Link a displayed copy of a native follow-up reply to its saved pair."""
+
+    followup_index: int
+    log_index: int
 
 
 @dataclass(frozen=True)
@@ -347,6 +356,7 @@ class ReviewItem:
     answer_time: question_path.AnswerTime | AnswerTimeFromLog = AnswerTimeFromLog.USE_LOG
     body_answer_events: frozenset[int] = frozenset()
     exchange_handoff: FiledReviewExchange | NoFiledReviewExchange = NoFiledReviewExchange.ABSENT
+    followup_log_copies: tuple[FollowupLogCopy, ...] = ()
 
     def for_you(self, now: datetime) -> bool:
         """Count Open records whose next action belongs to the user."""
@@ -784,6 +794,7 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
                      if event.words.casefold().startswith(prompt_prefixes) and event.feedback_request_id}
     body_answer_events: set[int] = set()
     body_log_positions: set[int] = set()
+    followup_log_copies: list[FollowupLogCopy] = []
     for index, exchange in enumerate(exchanges):
         if (response is None or index != 0) and exchange.get('question_id', '') not in named_prompts and not any(
                 (prefix + exchange['followup']).casefold() in legacy_words for prefix in prompt_prefixes):
@@ -801,6 +812,7 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
             if in_body:
                 body_answer_events.add(len(logs))
             stamp = exchange.get('replied_at')
+            followup_log_copies.append(FollowupLogCopy(index, len(logs)))
             logs.append(ReviewLog(moment(stamp, zone) if stamp is not None else filed, asker_name, exchange['reply']))
     if response is not None and len(exchanges) - 1 not in positions:
         body_log_positions.update(index for index, event in legacy_events.items()
@@ -827,7 +839,8 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
         ReviewTimes(filed, max(event.time for event in logs), later), tuple(logs),
         actions if state != ReviewState.DONE and not unowned else (), source, entry.urgency, '',
         update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line(),
-        review_events.waiting_why(fields.get('waiting_why', '')), response, status_time, frozenset(body_answer_events))
+        review_events.waiting_why(fields.get('waiting_why', '')), response, status_time, frozenset(body_answer_events),
+        followup_log_copies=tuple(followup_log_copies))
 
 
 def store_paths(folders: tuple[Path, ...], sources: list[Path] | None) -> Iterator[Path]:
@@ -1006,13 +1019,20 @@ def can_move_wait(item: ReviewItem) -> bool:
 
 
 def list_reply(item: ReviewItem) -> str:
-    """Read the latest reply from the native evidence for the List."""
+    """Read the latest reply that the List still needs from Review."""
     source = item.source
+    handoff = item.exchange_handoff
     if isinstance(source, ChangeSource):
         question = source.slots.question
-        return question.answer if isinstance(question, delivery_state.AnsweredQuestion) else ''
+        if not isinstance(question, delivery_state.AnsweredQuestion):
+            return ''
+        return '' if isinstance(handoff, FiledReviewExchange) and handoff.filed_slot_id == question.question_id else question.answer
+    if isinstance(handoff, FiledReviewExchange) and handoff.filed_investigation_answer:
+        return ''
     for index in reversed(range(len(item.log))):
         words = item.log[index].words
+        if isinstance(handoff, FiledReviewExchange) and index in handoff.answer_events:
+            return ''
         if words.startswith('Answer: '):
             return words.removeprefix('Answer: ')
         if index in item.body_answer_events:

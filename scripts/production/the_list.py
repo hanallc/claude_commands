@@ -720,7 +720,7 @@ class ListItem:
             return
         # A Closed item can have an unread answer after its last close.
         for entry in reversed(self.log):
-            if isinstance(entry.what, QuestionAnswered):
+            if isinstance(entry.what, (QuestionAnswered, ReturnedAnswer)):
                 if entry.time == self.unread_since:
                     return
                 break
@@ -841,6 +841,23 @@ class QuestionAnswered:
 
 
 @dataclass(frozen=True)
+class ReturnedAnswerId:
+    """Identify the filed exchange that supplied the answer."""
+
+    source_key: str
+    exchange_id: str
+
+
+@dataclass(frozen=True)
+class ReturnedAnswer:
+    identity: ReturnedAnswerId
+    words: str
+
+
+type UnreadAnswerId = str | ReturnedAnswerId
+
+
+@dataclass(frozen=True)
 class QuestionClosed:
     question: question_record.Question
 
@@ -914,7 +931,7 @@ class GoNotDelivered:
 
 
 PageActivity = PageFeedback | PageRequest | QuestionRequestReceipt | UnparkNoChangeReceipt
-ListEvent = (FieldChange | QuestionAnswered | QuestionClosed | MarkedRead | Reopened | Unparked
+ListEvent = (FieldChange | QuestionAnswered | ReturnedAnswer | QuestionClosed | MarkedRead | Reopened | Unparked
              | ReviewLinksChanged | EvidenceCopyRemoved | AskOpened | AskWithdrawn | GoGiven | GoNotDelivered | PageActivity)
 LogContent = str | ListEvent
 
@@ -1820,6 +1837,9 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"action": content.action, "fields": _log_fields(content.fields)}
     if isinstance(content, QuestionAnswered):
         return {"action": "Answered", "question_id": _question_id(content.question_id)}
+    if isinstance(content, ReturnedAnswer):
+        return {"action": "Returned answer", "source_key": content.identity.source_key,
+                "exchange_id": content.identity.exchange_id, "words": content.words}
     if isinstance(content, QuestionClosed):
         return {"action": "Question closed with item", "question": question_record.stored(content.question)}
     if isinstance(content, MarkedRead):
@@ -1903,6 +1923,11 @@ def _read_log_line(line: str, number: int, read_schedule: Callable[[object], Sch
                 content = _read_field_change(action, values, number, read_schedule)
             case {"action": "Answered", "question_id": question_id} if len(fields) == 2:
                 content = QuestionAnswered(_question_id(question_id))
+            case {"action": "Returned answer", "source_key": str(key), "exchange_id": str(exchange_id),
+                  "words": str(words)} if len(fields) == 4:
+                _log_line(key, "exchange source key")
+                _log_line(exchange_id, "exchange ID")
+                content = ReturnedAnswer(ReturnedAnswerId(key, exchange_id), words)
             case {"action": "Question closed with item", "question": value} if len(fields) == 2:
                 question = question_record.read(value)
                 if question.answer is not None:
@@ -2366,11 +2391,28 @@ def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, 
 
 def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.FiledExchange, ...]) -> ListItem:
     saved = {(exchange.source_key, exchange.exchange_id): exchange for exchange in item.filed_exchanges}
+    returns: list[ItemChange] = []
     for exchange in exchanges:
         key = (exchange.source_key, exchange.exchange_id)
         previous = saved.get(key)
-        saved[key] = previous.updated(exchange) if previous is not None else exchange
-    return replace(item, filed_exchanges=tuple(saved.values()))
+        current = previous.updated(exchange) if previous is not None else exchange
+        saved[key] = current
+        answer = current.answer
+        if (current.source in (list_exchange.Source.SCOPED_REPLY, list_exchange.Source.STAFF_QUESTION)
+                and current.direction is list_exchange.Direction.ANSWER_TO_NATE
+                and isinstance(answer, list_exchange.ExchangeAnswer) and answer.read is list_exchange.AnswerRead.UNREAD
+                and isinstance(answer.time, datetime)
+                and (previous is None or isinstance(previous.answer, list_exchange.QuestionWithoutAnswer))):
+            author = current.answerer
+            source = author.name if isinstance(author, list_exchange.RecordedAnswerer) else author
+            returns.append(ItemChange(answer.time, ReturnedAnswer(ReturnedAnswerId(*key), answer.text), source))
+    changed = replace(item, filed_exchanges=tuple(saved.values()))
+    if not returns:
+        return changed
+    returns.sort(key=lambda entry: entry.time)
+    latest = returns[-1].time
+    unread_since = max(item.unread_since, latest) if isinstance(item.unread_since, datetime) else latest
+    return replace(changed, log=(*item.log, *returns), updated=max(item.updated, latest), unread_since=unread_since)
 
 
 @dataclass(frozen=True)
@@ -2420,8 +2462,11 @@ def _read_pending_exchanges(reservation: Path) -> tuple[list_exchange.FiledExcha
         return ()
 
 
-def pending_exchanges(key: str) -> tuple[list_exchange.FiledExchange, ...]:
-    return _read_pending_exchanges(_exchange_path(key))
+def pending_exchanges(key: str, *, sources: list[Path] | None = None) -> tuple[list_exchange.FiledExchange, ...]:
+    reservation = _exchange_path(key)
+    if sources is not None:
+        sources.append(reservation.with_suffix(".pending"))
+    return _read_pending_exchanges(reservation)
 
 
 def exchange_history(key: str) -> tuple[list_exchange.FiledExchange, ...]:
@@ -3965,14 +4010,15 @@ def _unread_changes(item: ListItem, *, include_park_receipts: bool = False) -> G
             return
 
 
-def unread_answer_ids(item: ListItem) -> frozenset[str]:
+def unread_answer_ids(item: ListItem) -> frozenset[UnreadAnswerId]:
     """Find unread answers after accounting for parking actions."""
     read_times: list[datetime] = []
-    answers: set[str] = set()
+    answers: set[UnreadAnswerId] = set()
     for change in _unread_changes(item, include_park_receipts=True):
         content = change.what
-        if isinstance(content, QuestionAnswered) and question_path.answer_is_unread(change.time, read_times):
-            answers.add(content.question_id)
+        if isinstance(content, (QuestionAnswered, ReturnedAnswer)):
+            if question_path.answer_is_unread(change.time, read_times):
+                answers.add(content.question_id if isinstance(content, QuestionAnswered) else content.identity)
         elif (isinstance(content, FieldChange) and content.action == "Parked"
               and content.fields.get("parked_until", NoTimestamp.UNSET) is not NoTimestamp.UNSET
               or isinstance(content, PageRequest) and content.action == "park"):

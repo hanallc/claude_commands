@@ -31,7 +31,7 @@ from scripts.production import (
 )
 from scripts.production.issues import Issue
 from scripts.review_links import (
-    answer_sources, change_browser, change_page, image_store, images, new_item_dialog, question_path, question_record,
+    answer_sources, change_browser, change_page, image_store, images, list_page, new_item_dialog, question_path, question_record,
     reply_tokens, review_items, review_page, staff_names,
 )
 from scripts.review_links.review_events import ReviewLog, encode, rows
@@ -328,23 +328,59 @@ class AnswerSourceTests(unittest.TestCase):
             "followups": [{"followup": "Which plan?", "reply": "Use plan A."}],
         })
         row = the_list.folder(KEEPER.id) / "L1.md"
-        seen: list[str] = []
+        during_sync: list[list[str]] = []
         original = atomic_file.sync_folder
 
         def sync(folder: Path) -> None:
-            if folder == row.parent and row.exists() and not seen:
+            if folder == row.parent and row.exists() and not during_sync:
                 self.assertTrue(the_list.load(KEEPER.id, "L1").filed_exchanges)
-                seen.extend(item.key for item in review_items.read(self.review, members=MEMBERS, show="open"))
+                during_sync.append([item.key for item in review_items.read(self.review, members=MEMBERS, show="open")])
                 raise OSError("List directory sync failed after replacement.")
             original(folder)
 
         with patch.object(atomic_file, "sync_folder", sync):
             self.assertEqual(self.migrate(apply=True)[0], 1)
-        self.assertEqual(seen, [key])
+        self.assertEqual(during_sync, [[]])
         self.assertFalse(row.exists())
+        self.assertEqual([item.key for item in review_items.read(self.review, members=MEMBERS, show="open")], [key])
         self.assertEqual(self.migrate(apply=True)[0], 0)
         self.assertTrue(row.exists())
         self.assertEqual(review_items.read(self.review, members=MEMBERS, show="open"), [])
+
+    def test_review_uses_the_saved_answer_during_a_list_retry(self) -> None:
+        words = "Use the compact layout."
+        key = self.native("during-retry", {"since": FILED, "text": "Choose a layout", "question": "Which layout?",
+            "review_id": "Q1", "review_submission": new_item_dialog.stored_submission(origin("request-1234567890")),
+            "followups": [{"followup": "Which layout?", "reply": words, "replied_at": FIRST_REPLY.isoformat()}],
+        })
+        _ = change_page.console_folder(self.review)
+
+        def fail_receipt(path: Path, content: str, *, new_file_mode: int | None = None) -> None:
+            if path.suffix == ".saved":
+                raise OSError("Could not save the List receipt.")
+            atomic_file.write_text_atomic(path, content, new_file_mode=new_file_mode)
+
+        with patch.object(the_list, "write_text_atomic", fail_receipt):
+            self.assertEqual(self.migrate(apply=True)[0], 1)
+        row, = the_list.records(KEEPER.id)
+        exchange, = row.filed_exchanges
+        destination = investigation.ListDestination(KEEPER.id, row.number)
+        self.assertFalse(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)))
+        observed: list[tuple[bytes, set[str]]] = []
+
+        def read_during_retry(path: Path, content: str, *, new_file_mode: int | None = None) -> None:
+            if path.suffix == ".saved":
+                list_html = list_page.render(self.review, include_counts=False)
+                snapshot = review_page.build_snapshot(self.review)
+                observed.append((list_html, {entry["key"] for entry in snapshot.entries}))
+            atomic_file.write_text_atomic(path, content, new_file_mode=new_file_mode)
+
+        with patch.object(the_list, "write_text_atomic", read_during_retry):
+            self.assertEqual(self.migrate(apply=True)[0], 0)
+        (list_html, review_keys), = observed
+        self.assertIn(words.encode(), list_html)
+        self.assertNotIn(key, review_keys)
+        self.assertEqual(the_list.load(KEEPER.id, row.id), row)
 
     def test_stale_inventory_cannot_file_a_withdrawn_question(self) -> None:
         for file_open_first in (False, True):
@@ -820,9 +856,12 @@ class AnswerSourceTests(unittest.TestCase):
                            else patch.object(the_list, "_save", side_effect=OSError("The List write failed.")))
                 with failure:
                     self.assertEqual(self.migrate_change(original)[0], 1)
-                projected, = answer_sources.apply_review_handoffs([original], user_zone(), members=MEMBERS)
-                self.assertIs(projected.exchange_handoff, review_items.NoFiledReviewExchange.ABSENT)
-                self.assertTrue(projected.unread_answer)
+                if fail_receipt:
+                    _ = self.check_change_handoff(original, frozenset({1}), unread=False)
+                else:
+                    projected, = answer_sources.apply_review_handoffs([original], user_zone(), members=MEMBERS)
+                    self.assertIs(projected.exchange_handoff, review_items.NoFiledReviewExchange.ABSENT)
+                    self.assertTrue(projected.unread_answer)
                 later = self.change_with_log((*log,
                     ReviewLog(SECOND_ASK, "nate", "question: How long?", "later"),
                     ReviewLog(SECOND_REPLY, "nate", "feedback: Check the result.", "feedback")),
@@ -1046,7 +1085,7 @@ class AnswerSourceTests(unittest.TestCase):
         return {exchange.question: exchange.answer.text for exchange in row.filed_exchanges
                 if isinstance(exchange.answer, list_exchange.ExchangeAnswer)}
 
-    def test_investigation_stays_visible_until_the_pending_reply_has_a_receipt(self) -> None:
+    def test_investigation_hides_when_the_list_saves_its_last_reply(self) -> None:
         with (patch.object(console_text, "require"),
               patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed."))):
             report = investigation.file(OWNER.id, "Choose a route", "Which route?", waiting_why="Check the route.")
@@ -1069,12 +1108,11 @@ class AnswerSourceTests(unittest.TestCase):
 
         with patch.object(console_text, "require"), patch.object(the_list, "write_text_atomic", fail_receipt):
             _ = investigation.answer(OWNER.id, report.id, "Ten minutes.")
-        visible, = review_items.read(self.review, members=MEMBERS, show="open")
-        self.assertEqual(visible.key, key)
-        self.assertTrue(visible.unread_answer)
-        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("test"), MEMBERS, 4, {}, user_zone(),
-                                             staff_names.StaffNames(MEMBERS))
-        self.assertIn("Ten minutes.", review_page.details(visible, inputs))
+        row, = the_list.records(KEEPER.id)
+        self.assertEqual(self.saved_pairs(row), {"Which route?": "Use the north route.", "How long?": "Ten minutes."})
+        receipted = the_list.confirmed_exchanges(key, waiting_handoff.destination, row.filed_exchanges)
+        self.assertEqual({exchange.question for exchange in receipted}, {"Which route?"})
+        self.assertFalse(review_items.read(self.review, members=MEMBERS, show="open"))
         self.assertEqual(self.migrate(apply=True)[0], 0)
         self.assertFalse(review_items.read(self.review, members=MEMBERS, show="open"))
 
@@ -1199,9 +1237,7 @@ class AnswerSourceTests(unittest.TestCase):
                     with patch.object(the_list, "write_text_atomic", fail_receipt):
                         self.assertEqual(self.migrate_change(item)[0], 1)
                     self.assertIn(digest, receipt.read_text())
-                    projected, = answer_sources.apply_review_handoffs([item], user_zone(), members=MEMBERS)
-                    self.assertIs(projected.exchange_handoff, review_items.NoFiledReviewExchange.ABSENT)
-                    self.assertTrue(projected.unread_answer)
+                    _ = self.check_change_handoff(item, frozenset({1}), unread=False)
                 self.assertEqual(self.migrate_change(item)[0], 0)
                 upgraded, = the_list.load(KEEPER.id, f"L{number}").filed_exchanges
                 self.assertEqual(upgraded, replace(saved, legacy_binding=""))
@@ -1348,7 +1384,13 @@ class AnswerSourceTests(unittest.TestCase):
             visible = {item.key: item for item in review_items.read(self.review, members=MEMBERS, show="open")}
             handoff = visible[key].exchange_handoff
             assert isinstance(handoff, review_items.FiledReviewExchange)
-            self.assertFalse(handoff.answer_events)
+            log_offset = len(visible[key].log) - len(log)
+            reply_index, = (index for index, event in enumerate(log) if event.words == reply.words)
+            self.assertNotIn(log_offset + reply_index, handoff.answer_events)
+            self.assertFalse(handoff.hides_card)
+            inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("test"), MEMBERS, 4, {}, user_zone(),
+                                                 staff_names.StaffNames(MEMBERS))
+            self.assertEqual(review_page.details(visible[key], inputs).count("Ten minutes."), 1)
             self.assertEqual(dict(answer_sources.read_exchanges(self.review, members=MEMBERS).unresolved)[key], 1)
 
     def test_handoff_survives_reply_relocation(self) -> None:
@@ -1366,9 +1408,7 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertEqual(the_list.exchange_history(key), (saved,))
         self.assertEqual(receipt.read_bytes(), original)
         receipt.unlink()
-        item, = review_items.read(self.review, members=MEMBERS, show="open")
-        self.assertTrue(item.unread_answer)
-        self.assertIs(item.exchange_handoff, review_items.NoFiledReviewExchange.ABSENT)
+        self.assertFalse(review_items.read(self.review, members=MEMBERS, show="open"))
         _ = receipt.write_bytes(original)
         _ = self.legacy_report(1, (note, reply, reply), kind=investigation.InvestigationKind.INVESTIGATION)
         item, = review_items.read(self.review, members=MEMBERS, show="open")
@@ -2187,10 +2227,10 @@ class AnswerSourceTests(unittest.TestCase):
         waiting = replace(second, state=review_items.ReviewState.WAITING, exchange_handoff=first_handoff)
         pending = the_list.pending_exchanges
 
-        def fail_selected(key: str) -> tuple[list_exchange.FiledExchange, ...]:
+        def fail_selected(key: str, *, sources: list[Path] | None = None) -> tuple[list_exchange.FiledExchange, ...]:
             if key == second.key:
                 raise OSError("The pending exchange could not be read.")
-            return pending(key)
+            return pending(key, sources=sources)
 
         for items in ([first, waiting], [waiting, first]):
             with (patch.object(the_list, "pending_exchanges", side_effect=fail_selected),
@@ -2233,7 +2273,7 @@ class AnswerSourceTests(unittest.TestCase):
                 else:
                     self.assertFalse(receipt.exists())
 
-    def test_unknown_change_slot_requires_its_receipt_before_the_card_hides(self) -> None:
+    def test_unknown_change_slot_hides_with_a_saved_exchange(self) -> None:
         slot = delivery_state.AnsweredQuestion("current", "Which road?", "East.")
         item = self.change_with_log((), slot)
         assert isinstance(item.source, review_items.ChangeSource)
@@ -2265,9 +2305,7 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertFalse(handoff.hides_card)
 
         _ = receipt.unlink()
-        visible, = answer_sources.apply_review_handoffs([item], user_zone(), members=MEMBERS)
-        self.assertFalse(review_items.on_list(visible))
-        self.assertTrue(visible.unread_answer)
+        self.assertTrue(self.check_change_handoff(item, frozenset({0}), unread=False).hides_card)
         self.assertEqual(self.migrate_change(item)[0], 0)
         self.assertEqual(receipt.read_bytes(), exact_receipt)
         self.assertTrue(self.check_change_handoff(item, frozenset({0}), unread=False).hides_card)
@@ -2423,7 +2461,7 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertEqual(the_list.exchange_history(key), saved)
         self.assertEqual(the_list.confirmed_exchanges(key, destination, saved), set(saved))
 
-    def test_random_reply_claims_and_review_receipts(self) -> None:
+    def test_random_reply_claims_and_filed_review_handoffs(self) -> None:
         choices = random.Random(46712)
         hidden = visible = 0
         unknown_with_copy = unknown_without_copy = 0
@@ -2523,13 +2561,12 @@ class AnswerSourceTests(unittest.TestCase):
                 projected, = answer_sources.apply_review_handoffs([item], user_zone(), members=MEMBERS)
                 handoff = projected.exchange_handoff
                 hides_card = isinstance(handoff, review_items.FiledReviewExchange) and handoff.hides_card
-                self.assertEqual(hides_card, current and kept)
+                self.assertEqual(hides_card, current)
                 if hides_card:
                     assert isinstance(handoff, review_items.FiledReviewExchange)
                     row = the_list.load(handoff.destination.keeper, f"L{handoff.destination.number}")
-                    actual = the_list.confirmed_exchanges(report_key, handoff.destination, row.filed_exchanges)
-                    filed = {(entry.answer.text, entry.answer.time) for entry in actual
-                             if isinstance(entry.answer, list_exchange.ExchangeAnswer)}
+                    filed = {(entry.answer.text, entry.answer.time) for entry in row.filed_exchanges
+                             if entry.source_key == report_key and isinstance(entry.answer, list_exchange.ExchangeAnswer)}
                     for event in report_log:
                         if event.words.startswith("Answer: "):
                             self.assertIn((event.words[8:], event.time), filed)

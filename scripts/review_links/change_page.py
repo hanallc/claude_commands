@@ -3547,7 +3547,7 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
     def file_exchange() -> None:
         with review_items.after_store_write(item.key):
             members = staff.snapshot()
-            current = review_items.read_current(status.root, item, members)
+            current = review_items.read_current(status.root, item, members, include_filed=True)
             file_saved_review = cast(Callable[[review_items.ReviewItem, staff.StaffSnapshot, Path], None],
                                      import_module("scripts.review_links.answer_sources").file_saved_review)
             file_saved_review(current, members, status.root)
@@ -3565,7 +3565,10 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
         slots = status.slots(page, row)
         selected = slots.question
         tracked = not isinstance(selected, NoQuestion) or bool(question_id)
+        file_decision_reply = isinstance(source, (review_items.ProposalSource, review_items.EfficiencySource))
         if tracked and isinstance(status.question_for_reply(slots, question_id, text), AnsweredQuestion):
+            if file_decision_reply:
+                file_exchange()
             return False
 
         save: Callable[[], bool | investigation.Investigation | None]
@@ -3582,20 +3585,21 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
 
         with status.locked():
             slots = status.slots(page, row)
-            question = slots.question
-            if tracked and isinstance(status.question_for_reply(slots, question_id, text), AnsweredQuestion):
-                return False
-            if question != selected:
-                raise question_record.AnswerRefused("The current question changed.")
-            page = status.metadata_page(page)
-            try:
-                changed = save() is not False
-            except decision_store.NoOpenQuestion as error:
-                raise question_record.AnswerRefused(str(error)) from error
-            if isinstance(question, OpenQuestion):
-                status.write_slots(page, row, replace(slots, question=AnsweredQuestion(question.question_id,
-                                                                                       question.text, text)))
-        if isinstance(source, (review_items.ProposalSource, review_items.EfficiencySource)):
+            question = status.question_for_reply(slots, question_id, text) if tracked else slots.question
+            if tracked and isinstance(question, AnsweredQuestion):
+                changed = False
+            else:
+                if question != selected:
+                    raise question_record.AnswerRefused("The current question changed.")
+                page = status.metadata_page(page)
+                try:
+                    changed = save() is not False
+                except decision_store.NoOpenQuestion as error:
+                    raise question_record.AnswerRefused(str(error)) from error
+                if isinstance(question, OpenQuestion):
+                    status.write_slots(page, row, replace(slots, question=AnsweredQuestion(question.question_id,
+                                                                                           question.text, text)))
+        if file_decision_reply:
             file_exchange()
         return changed
     if isinstance(source,review_items.ChangeSource):
