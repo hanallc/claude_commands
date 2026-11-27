@@ -1399,16 +1399,20 @@ def _reload_review(root: Path, item: review_items.ReviewItem, members: staff.Sta
         current = review_items.read_current(root, item, members, include_filed=True)
     except review_items.ReviewRecordMissing:
         return ()
+    if isinstance(current.source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
+        # A move can file a report after the caller reads its List links.
+        links = _list_review_links(list_page.records(include_closed=True))
     return _review_item_exchanges(current, links, zone, members, the_list.exchange_history(_review_source_key(current)),
                                   filing=filing)
 
 
 def _review_source_key(item: review_items.ReviewItem) -> str:
     source = item.source
+    if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
+        return _native_question_origin(source.record).source_key
     origin = review_items.submission_origin(item)
     if isinstance(origin, new_item_dialog.ReviewSubmission):
-        kind = ("question" if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource))
-                else "proposal" if isinstance(source, review_items.ProposalSource) else item.type.value.lower())
+        kind = "proposal" if isinstance(source, review_items.ProposalSource) else item.type.value.lower()
         return f"submission/{kind}/{origin.request_id}"
     return item.key
 
@@ -1435,10 +1439,7 @@ def _native_question_exchanges(record: update_registration.QuestionRecord, key: 
                                history: tuple[list_exchange.FiledExchange, ...] = (),
                                unresolved: list[tuple[str, int]] | None = None, *,
                                filing: the_list.QuestionFiling = the_list.QuestionFiling.LIVE) -> AcceptedExchanges:
-    kind = (the_list.QuestionItemKind.FROM_NATE
-            if isinstance(review_submissions.native_origin(record), new_item_dialog.ReviewSubmission)
-            else the_list.QuestionItemKind.TO_NATE)
-    origin = the_list.NativeQuestionItem(kind, key)
+    origin = _native_question_origin(record)
     route = resolve_legacy_question_destination(origin, links, record=record, filing=filing)
     destinations = (route.destination,) if isinstance(route, ResolvedQuestionDestination) else ()
     accepted = ExchangeVerifier(record, zone, members, history).resolve(key, destinations, unresolved)
@@ -1487,6 +1488,22 @@ def _moved_question_link(path: Path, record: update_registration.QuestionRecord,
 
 class NativeQuestionRecord(StrEnum):
     ABSENT = "no native Review record for this question"
+
+
+def _native_question_origin(record: update_registration.QuestionRecord) -> the_list.NativeQuestionItem:
+    submission = review_submissions.native_origin(record)
+    if isinstance(submission, new_item_dialog.ReviewSubmission):
+        return the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE,
+                                           f"submission/question/{submission.request_id}")
+    return the_list.NativeQuestionItem(the_list.QuestionItemKind.TO_NATE, review_items.question_record_key(record))
+
+
+def _resolve_current_question_destination(
+    record: update_registration.QuestionRecord, origin: the_list.NativeQuestionItem,
+) -> ResolvedQuestionDestination | QuestionRoute:
+    """Read the List under the caller's question filing locks."""
+    links = _list_review_links(list_page.records(include_closed=True))
+    return resolve_legacy_question_destination(origin, links, record=record, filing=the_list.QuestionFiling.LIVE)
 
 
 def resolve_legacy_question_destination(
@@ -1902,6 +1919,50 @@ def _migration_list_records() -> tuple[list[list_page.ListRecord], ReviewListLin
     return entries, links
 
 
+def move_question_wait(root: Path, item: review_items.ReviewItem, members: staff.StaffSnapshot,
+                       owner: staff.StaffId) -> investigation.ListDestination | investigation.NoListDestination:
+    """File a Question report under the same locks as exchange filing."""
+    with investigation.recipient_locks(owner), update_registration.wrap_question_locks(owner):
+        try:
+            current = review_items.read_current(root, item, members, include_filed=True)
+        except review_items.ReviewRecordMissing:
+            return investigation.NoListDestination.ABSENT
+        if not review_items.can_move_wait(current):
+            return investigation.NoListDestination.ABSENT
+        assert isinstance(current.source, (review_items.QuestionSource, review_items.UnownedQuestionSource))
+        record = current.source.record
+        origin = _native_question_origin(record)
+        with the_list.lock_exchange_source(origin.source_key):
+            resolved = _resolve_current_question_destination(record, origin)
+            if resolved is QuestionRoute.UNRESOLVED:
+                return investigation.NoListDestination.ABSENT
+            if the_list.exchange_reservation(origin.source_key) is not the_list.NextNumber.AVAILABLE:
+                return investigation.NoListDestination.ABSENT
+            route = the_list.report_route(current.owner, members)
+            keeper = route.keeper
+            target: investigation.ListDestination | the_list.NewReportItem = the_list.NewReportItem.ALLOCATE
+            if isinstance(resolved, ResolvedQuestionDestination):
+                if isinstance(resolved.origin, the_list.NativeQuestionItem):
+                    return investigation.NoListDestination.ABSENT
+                target = resolved.destination
+                keeper = target.keeper
+                previous = the_list.load(keeper, f"L{target.number}")
+                if any(exchange.source_key == origin.source_key for exchange in previous.filed_exchanges):
+                    return investigation.NoListDestination.ABSENT
+                if isinstance(previous.report, the_list.ListReport):
+                    if previous.report.kind is not the_list.ReportKind.QUESTION or previous.report.evidence_key != current.key:
+                        return investigation.NoListDestination.ABSENT
+                elif current.key not in previous.reviews or previous.state is the_list.ItemState.CLOSED:
+                    return investigation.NoListDestination.ABSENT
+            number = the_list.file_report(
+                keeper, the_list.ListReport(the_list.ReportKind.QUESTION, current.key, record.item["text"]),
+                ' '.join(current.title.split()), owner=current.owner or the_list.UnassignedOwner.NOT_RECORDED,
+                producer=route.producer, unit=route.unit, source='moved from Review',
+                state=the_list.ItemState.WORKING, reservation=target)
+            update_registration.record_review_log(record, f'moved to List item {number}')
+            return investigation.ListDestination(keeper, number)
+
+
 def _resolved_question_origin(destination: investigation.ListDestination, links: ReviewListLinks,
                               records: dict[str, update_registration.QuestionRecord],
                               candidates: Iterable[the_list.NativeQuestionItem]) -> the_list.NativeQuestionItem | the_list.NoQuestionItem:
@@ -1930,15 +1991,13 @@ def file_saved_question(record: update_registration.QuestionRecord, members: sta
     physical = review_items.question_record_key(record)
     with review_items.after_store_write(physical):
         entries = list_page.records(include_closed=True)
-        links = _list_review_links(entries)
         zone = user_zone()
 
         def reload() -> Iterable[Exchange]:
             for current in update_registration.selected_question_records(
                     [record.path], ("open", "closed"), None, owner=record.owner):
-                origin = current.item.get("review_submission")
-                key = (f"submission/question/{new_item_dialog.read_submission(origin).request_id}"
-                       if origin is not None else physical)
+                key = _native_question_origin(current).source_key
+                links = _list_review_links(list_page.records(include_closed=True))
                 return _native_question_exchanges(current, key, links, zone, members, the_list.exchange_history(key))
             return ()
 
@@ -1953,23 +2012,44 @@ def file_saved_submission(scoped: new_item_dialog.ScopedSubmissionKey, members: 
 
 
 def file_list_submission_question(record: update_registration.QuestionRecord,
-                                  origin: the_list.NativeQuestionItem, destination: investigation.ListDestination,
+                                  reservation: Path, file_row: Callable[[], investigation.ListDestination],
                                   members: staff.StaffSnapshot) -> None:
     """File the question under the recipient locks before the first notice."""
+    origin = _native_question_origin(record)
     key = origin.source_key
-    item = the_list.load(destination.keeper, f"L{destination.number}")
-    links = _list_review_links((list_page.ListRecord(destination.keeper, item),))
+    with the_list.lock_exchange_source(key):
+        route = _resolve_current_question_destination(record, origin)
+        if route is QuestionRoute.NEW:
+            destination = file_row()
+        elif isinstance(route, ResolvedQuestionDestination):
+            destination = route.destination
+            if the_list.reserved_review_number(reservation) == destination.number:
+                destination = file_row()
+        else:
+            raise OSError(f"Cannot resolve the List destination for {key}.")
+
+    if not record.path.is_file():
+        raise OSError(f"Cannot find the saved question {key}.")
     zone = user_zone()
+    entries = list_page.records(include_closed=True)
+    links = _list_review_links(entries)
 
     def reload() -> AcceptedExchanges:
         return _native_question_exchanges(record, key, links, zone, members, the_list.exchange_history(key))
 
-    filed = item.filed_exchanges
-    for plan in _plans(reload(), ((destination, exchange) for exchange in filed)):
-        if file_source(plan, members, reload, submission_question=origin) == destination:
-            return
-    if update_registration.pending_review_reply(record):
-        raise OSError(f"Cannot file the open question on L{destination.number}.")
+    filed = ((destination, exchange) for entry in entries
+             if entry.keeper == destination.keeper and entry.item.number == destination.number
+             for exchange in entry.item.filed_exchanges)
+    for plan in _plans(reload(), filed):
+        if file_source(plan, members, reload) == destination:
+            if isinstance(route, ResolvedQuestionDestination) and route.origin is the_list.NoQuestionItem.ORDINARY:
+                return
+            break
+    else:
+        if update_registration.pending_review_reply(record):
+            raise OSError(f"Cannot file the open question on L{destination.number}.")
+    if the_list.load(destination.keeper, f"L{destination.number}").native_question != origin:
+        raise OSError(f"Cannot confirm the question source for L{destination.number}.")
 
 
 def file_saved_investigation(record: investigation.Investigation) -> None:

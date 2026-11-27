@@ -2292,7 +2292,12 @@ A Question report filed by `move-review-waits` keeps its ordinary List workflow.
 - `_native_question_exchanges` calls the resolver during both staff and submitted question planning.
 - `_reload_review` uses that path again during apply and live Review filing.
 - `file_saved_question` and `file_list_submission_question` use that path for live saves and recovery.
+- `file_list_submission_question` also calls the resolver before it reserves a number for a New item.
+- `move-review-waits` calls the resolver under the question and exchange locks before it files a Question report.
 - `_keyless_question_origin` and the final migration pass call it through `_resolved_question_origin`.
+
+The move defers a question if a List filing already owns its destination.
+The move writes no marker while the filing waits for its receipt.
 
 Find unresolved completed questions in Review under **Done**.
 The Studio displays a keyless row as an ordinary item and logs that it needs a source key.

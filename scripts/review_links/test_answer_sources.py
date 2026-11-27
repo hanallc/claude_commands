@@ -1106,35 +1106,60 @@ class AnswerSourceTests(unittest.TestCase):
         snapshot = review_page.build_snapshot(self.review)
         self.assertNotIn(key, {row["key"] for row in snapshot.entries})
 
-    def test_linked_sent_question_hides_when_its_answer_log_saves_without_a_receipt(self) -> None:
-        words = "Use plan A."
-        key = self.native("linked-pending", {"since": FILED, "text": "Choose a plan", "question": "Which plan?",
-            "review_id": "Q1", "review_submission": new_item_dialog.stored_submission(origin("request-1234567890")),
-            "followups": [{"followup": "Which plan?", "reply": words, "replied_at": FIRST_REPLY.isoformat()}],
+    def test_move_review_wait_defers_a_question_until_its_list_receipt_saves(self) -> None:
+        request = f"r6-{'4' * 32}-question-{OWNER.id}"
+        key = self.native("move-without-list-receipt", {
+            "since": FILED, "text": "Choose a plan", "question": "Which plan?", "review_id": "Q1",
+            "review_submission": new_item_dialog.stored_submission(origin(request)),
+            "followup": {"text": "Which plan?", "sent": FILED},
         })
-        row = the_list.add(KEEPER.id, "Review the plan", owner=OWNER.id, source="nate", changes={})
-        _ = the_list.link(KEEPER.id, row.id, (key,), source="nate")
-        _ = change_page.console_folder(self.review)
-        self.assertIn(key, {entry["key"] for entry in review_page.build_snapshot(self.review).entries})
+        path = record_store.default_question_folder(OWNER.id) / key.rsplit("/", 1)[-1]
 
-        def fail_receipt(path: Path, content: str, *, new_file_mode: int | None = None) -> None:
+        def write(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
             if path.suffix == ".saved":
                 raise OSError("Could not save the List receipt.")
-            atomic_file.write_text_atomic(path, content, new_file_mode=new_file_mode)
+            atomic_file.write_text_atomic(path, text, new_file_mode=new_file_mode)
 
-        with patch.object(the_list, "write_text_atomic", fail_receipt):
+        with patch.object(the_list, "write_text_atomic", side_effect=write):
             self.assertEqual(self.migrate(apply=True)[0], 1)
-        saved, = the_list.records(KEEPER.id)
-        self.assertEqual(saved.id, row.id)
-        exchange, = saved.filed_exchanges
-        answer, = (event.what for event in saved.log if isinstance(event.what, the_list.ReturnedAnswer))
-        self.assertEqual(answer, the_list.ReturnedAnswer(
-            the_list.ReturnedAnswerId(exchange.source_key, exchange.exchange_id), words))
-        destination = investigation.ListDestination(KEEPER.id, saved.number)
-        self.assertFalse(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)))
-        snapshot = review_page.build_snapshot(self.review)
-        self.assertNotIn(key, {entry["key"] for entry in snapshot.entries})
-        self.assertEqual(snapshot.filed_item_url(self.review, key), review_page.report_url(destination))
+        item, = the_list.records(KEEPER.id, include_closed=True)
+        destination = investigation.ListDestination(KEEPER.id, item.number)
+        source = f"submission/question/{request}"
+        self.assertEqual(the_list.confirmed_exchanges(source, destination, item.filed_exchanges), frozenset())
+        before = path.read_bytes()
+        pending = next(card for card in review_items.read(self.review, members=MEMBERS) if card.key == key)
+        self.assertTrue(review_items.can_move_wait(pending))
+        self.assertEqual(the_list.move_review_waits(self.review, MEMBERS), [])
+        self.assertEqual(the_list.records(KEEPER.id, include_closed=True), [item])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        self.assertEqual(the_list.confirmed_exchanges(source, destination, item.filed_exchanges),
+                         frozenset(item.filed_exchanges))
+        self.assertEqual(the_list.move_review_waits(self.review, MEMBERS), [])
+        self.assertEqual(the_list.records(KEEPER.id, include_closed=True), [item])
+        self.assertEqual(path.read_bytes(), before)
+        store = list_draft.list_records(KEEPER.id, the_list.ListError)
+        with store.locked():
+            self.assertEqual(store.next_number(), item.number + 1)
+
+    def test_question_filing_rechecks_a_move_that_finished_after_planning(self) -> None:
+        request = f"r6-{'5' * 32}-question-{OWNER.id}"
+        key = self.native("move-after-planning", {
+            "since": FILED, "text": "Choose a plan", "question": "Which plan?", "review_id": "Q1",
+            "review_submission": new_item_dialog.stored_submission(origin(request)),
+            "followup": {"text": "Which plan?", "sent": FILED},
+        })
+        inventory = answer_sources.read_exchanges(self.review, members=MEMBERS)
+        exchange, = inventory.exchanges
+        self.assertIs(exchange.question_route, answer_sources.QuestionRoute.NEW)
+        destination, = the_list.move_review_waits(self.review, MEMBERS)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(answer_sources.migrate(inventory, MEMBERS, apply=True), 0)
+        item, = the_list.records(KEEPER.id, include_closed=True)
+        self.assertEqual(item.number, destination.number)
+        self.assertEqual(item.report, the_list.ListReport(the_list.ReportKind.QUESTION, key, "Choose a plan"))
+        self.assertIs(item.native_question, the_list.NoQuestionItem.ORDINARY)
+        self.assertEqual([filed.source_key for filed in item.filed_exchanges], [exchange.source_key])
 
     def test_migration_closes_questions_that_nate_already_answered(self) -> None:
         fields: update_registration.OutstandingItem = {"since": FILED, "text": "Choose a plan",
