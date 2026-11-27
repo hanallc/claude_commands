@@ -1348,11 +1348,9 @@ def _launch_home(entry: pane_launch.NativePaneLaunch) -> staff.SessionHome:
     return home
 
 
-def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, account: str, *,
-                  unset_environment: frozenset[str] = herdr.NO_ENVIRONMENT_REMOVALS) -> list[str]:
+def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, account: str) -> list[str]:
     """Build the account command for a shell in another pane."""
     unset, environment = _pane_environment(tab, entry)
-    unset.extend(sorted(unset_environment))
     kind = pane_launch.saved_kind(entry)
     implicit = pane_launch.implicit_claude_home(entry)
     if kind == "claude":
@@ -1463,11 +1461,10 @@ def _resume_liveness(identity: str, *, deadline: float = math.inf
     return live
 
 
-def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, account: str, message: str, *,
-                   unset_environment: frozenset[str] = herdr.NO_ENVIRONMENT_REMOVALS) -> sessions.LiveSessionProcess:
+def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, account: str, message: str) -> sessions.LiveSessionProcess:
     """Run the account command in the session's own pane, with one resume message."""
     client = herdr.Herdr(herdr.shared_session())
-    command = _pane_command(tab, entry, account, unset_environment=unset_environment)
+    command = _pane_command(tab, entry, account)
     settings = conf.read("shutdown")
     start_seconds = settings.number("start_seconds")
     _ = settings.number("stay_seconds")
@@ -1975,7 +1972,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             _ = entry.pop("config_dir", None)
         unset_environment = herdr.NO_ENVIRONMENT_REMOVALS
         worker_run: Path | None = None
-        if row is not None and row.kind == "worker":
+        if row is not None and row.kind == "worker" and kind == "codex":
             from scripts.herdr import worker_panes
 
             worker_run = worker_panes.worker_run(row, record=names.tab_record)
@@ -2026,12 +2023,13 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         from scripts.production import worker
 
         try:
-            if row is not None and worker_run is not None:
+            if row is not None and row.kind == "worker":
                 from scripts.agents import detached_runs
                 from scripts.herdr import worker_panes
 
-                own = worker.own_pass(row, names.tab_record, run=worker_panes.DispatchRun(worker_run))
-                detached = detached_runs.resume_context(worker_run / detached_runs.DETACHED_RUNS_DIR, row.name)
+                run = worker_run if worker_run is not None else worker_panes.worker_run(row, record=names.tab_record)
+                own = worker.own_pass(row, names.tab_record, run=worker_panes.DispatchRun(run))
+                detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
             elif isinstance(mode, WorkersHeld):
                 workers = mode
             elif row is not None and not keep_workers:
@@ -2087,7 +2085,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 raise herdr_types.HerdrFailure(live.reason)
             if isinstance(live, sessions.SessionNotLive):
                 attempt_pane = tab.pane_id
-                live = _start_session(tab, entry, label, message, unset_environment=unset_environment)
+                live = _start_session(tab, entry, label, message)
             started = live
         selected_home = staff.SessionHome(target_dir.absolute())
         if row is not None and row.home != selected_home:

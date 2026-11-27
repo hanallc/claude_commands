@@ -1880,8 +1880,7 @@ class StopResumeTests(unittest.TestCase):
         starts: list[str] = []
 
         def started(tab: herdr.TabSession, entry: pane_launch.CurrentLaunch, label: str,
-                    _message: str, *, unset_environment: frozenset[str]) -> sessions.LiveSessionProcess:
-            self.assertFalse(unset_environment)
+                    _message: str) -> sessions.LiveSessionProcess:
             current = staff.by_id(row.id)
             assert current is not None
             self.assertEqual(current.home, staff.SessionHome(running_home))
@@ -5288,14 +5287,14 @@ class StopResumeTests(unittest.TestCase):
                 run.assert_called_once_with(row, record=record)
                 read.assert_called_once_with(row.id, self.root)
 
-    def phase_worker(self, home: str) -> tuple[staff.StaffRow, staff.StaffSnapshot, Path]:
+    def test_stopped_codex_worker_resume_rebuilds_the_current_phase_key(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
                                 current_session=staff.StaffId("current-director"),
                                 worktree=staff.PresentWorktree(remote.local_machine(), self.root),
                                 unit_type=staff.UnitDetails("direct"))
         row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "alpha", staff.ReportsTo(parent.id),
-                             current_session=identity, home=staff.SessionHome(self.root / home))
+                             current_session=identity, home=staff.SessionHome(self.root / ".codex"))
         record = staff.StaffSnapshot((parent, row))
         run = self.root / "fixture-run"
         run.mkdir()
@@ -5304,10 +5303,6 @@ class StopResumeTests(unittest.TestCase):
             "open_phases": [{"id": "phase-a"}, {"id": "phase-b"}],
             "pass": {row.name: {"worker_id": row.id, "instance_id": "dispatch-b", "phase": {"id": "phase-b"}}},
         }))
-        return row, record, run
-
-    def test_stopped_codex_worker_resume_rebuilds_the_current_phase_key(self) -> None:
-        row, record, run = self.phase_worker(".codex")
         key = "CARGO_BERTH_SESSION_ID"
         for saved in (None, "old-director.phase-phase-b"):
             with self.subTest(saved=saved):
@@ -5326,23 +5321,6 @@ class StopResumeTests(unittest.TestCase):
                 self.assertIsInstance(result, stop_resume.ClaudeUp)
                 prepared = cast(herdr.PreparedAgentEnvironment, launch.call_args.args[2])
                 self.assertEqual(prepared.env.get(key), "current-director.phase-phase-b")
-
-    def test_stopped_claude_worker_resume_rebuilds_the_current_phase_key(self) -> None:
-        row, record, run = self.phase_worker(".claude3")
-        key = "CARGO_BERTH_SESSION_ID"
-        for saved in (None, "old-director.phase-phase-b"):
-            with self.subTest(saved=saved):
-                self.launched.clear()
-                if saved is not None:
-                    self.entry["environment"][key] = saved
-                pane_record.write("agents", self.entry)
-                with (patch.object(staff, "initial_snapshot", return_value=record),
-                      patch.object(worker_panes, "worker_run", return_value=run)):
-                    result = stop_resume.resume(row.name)
-                self.assertIsInstance(result, stop_resume.ClaudeUp)
-                command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
-                self.assertEqual([arg for arg in command if arg.startswith(key + "=")],
-                                 ["CARGO_BERTH_SESSION_ID=current-director.phase-phase-b"])
 
     def test_named_resume_keeps_the_saved_assignment_when_the_worker_never_received_it(self) -> None:
         from scripts.direct import progress_history

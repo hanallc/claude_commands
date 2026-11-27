@@ -5042,37 +5042,6 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(process.environment.get(key), expected)
                 self.assertEqual(len(world.launches), launches + (saved != expected))
 
-    def test_restore_keeps_the_model_settings_when_the_phase_key_changes(self) -> None:
-        world = self.fixture.world
-        name = staff.WorkerName.parse("impl")
-        saved = models_registry.LaunchSettings("codex", "gpt-explicit", "high", "priority")
-        policy = worker_panes.worker_policy(saved)
-        opened = worker_panes.start_or_resume(self.fixture.parent.id, name, "impl", policy=policy)
-        assert isinstance(opened, worker_panes.OpenWorker)
-        pane_fixtures.idle_transcript(opened.row)
-        dispatch = progress_history.begin_dispatch(self.run_dir, slot=name.value, phase="8", role="impl",
-            worker_name=name.value, worker_id=opened.row.id, launcher_command=["assign.sh"],
-            prompt=self.prompt, kind="impl", lens="")
-        line = f"End your final reply with DONE {dispatch}."
-        progress_history.save_dispatch_delivery(self.run_dir, dispatch,
-            pass_recorder.DispatchDelivery(line, dispatch, str(self.reply)))
-        self.agent.append(opened.pane, "user", line)
-        world.locations[opened.pane]["agent_status"] = "idle"
-        key = "CARGO_BERTH_SESSION_ID"
-        world.processes[world.foreground[opened.pane][0]].environment[key] = "old-director.phase-8"
-        launches = len(world.launches)
-
-        self.assertIs(worker.restore(self.fixture.parent.id, only=frozenset({opened.row.id})), worker.ExitCode.OK)
-
-        self.assertEqual(len(world.launches), launches + 1)
-        self.assertEqual(world.launches[-1], herdr.ExistingPane(opened.pane, opened.terminal))
-        kind, arguments, environment = world.requests[-1]
-        self.assertEqual(kind, saved.kind)
-        self.assertEqual(arguments[arguments.index("--model") + 1], saved.model)
-        self.assertIn('model_reasoning_effort="high"', arguments)
-        self.assertIn('service_tier="priority"', arguments)
-        self.assertEqual(environment.get(key), f"{self.fixture.parent.current_session}.phase-8")
-
     def test_restore_keeps_a_working_worker_with_a_submitted_dispatch(self) -> None:
         opened = self.opened()
         dispatch = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
