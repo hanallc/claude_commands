@@ -648,6 +648,9 @@ A removed Python file uses import facts from the base.
 A syntax error in a test module requires a full run. Non-test syntax errors do not block selection.
 The selector reads source without importing or evaluating it.
 The cache holds imports and complete path tokens for each test-module blob.
+The gate state folder stores each version pair in `affected-module-facts-<format>-<extractor>.sqlite` with a matching `.lock` file.
+The selector checks both versions inside the database before it uses the facts.
+Older files stay in the folder for manual removal.
 The current and base graphs share one cache read and one cache update.
 A warm selection reads base blobs only when the cache lacks their facts.
 Dirty sources never enter the cache or cause cache writes.

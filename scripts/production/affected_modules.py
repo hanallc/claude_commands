@@ -120,7 +120,7 @@ def git_output(repo: Path, *arguments: str) -> str:
 # Bump the extractor version whenever source-fact semantics change.
 CACHE_FORMAT_VERSION = 4
 EXTRACTOR_VERSION = 11
-FACT_CACHE_NAME = "affected-module-facts.sqlite"
+FACT_CACHE_NAME = f"affected-module-facts-{CACHE_FORMAT_VERSION}-{EXTRACTOR_VERSION}.sqlite"
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_.\-/]+")
 
 

@@ -815,6 +815,28 @@ def shadow(root):
         self.assertCountEqual(writes, [("insert", new_blob), ("delete", old_blob)])
         self.assertEqual(actual, affected.dependency_graph(self.repo))
 
+    def test_fact_cache_name_includes_both_versions(self) -> None:
+        self.assertEqual(affected.FACT_CACHE_NAME,
+                         f"affected-module-facts-{affected.CACHE_FORMAT_VERSION}-{affected.EXTRACTOR_VERSION}.sqlite")
+
+    def test_fact_cache_keeps_other_versions_in_the_same_folder(self) -> None:
+        cache = self.cache_file()
+        cache.parent.mkdir()
+        old_format = affected.CACHE_FORMAT_VERSION - 1
+        old = cache.with_name(f"affected-module-facts-{old_format}-{affected.EXTRACTOR_VERSION}.sqlite")
+        facts = {"example": affected.extract_facts("VALUE = 1\n", "example.py")}
+        self.assertTrue(affected.write_fact_cache(old, facts, None, set(facts)))
+        with closing(sqlite3.connect(old)) as database, database:
+            _ = database.execute("UPDATE cache_version SET format = ?", (old_format,))
+        before = (old.read_bytes(), old.stat().st_mtime_ns)
+
+        with mock.patch.object(affected, "read_fact_cache", wraps=affected.read_fact_cache) as read:
+            _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
+
+        read.assert_called_once_with(cache)
+        self.assertTrue(affected.read_fact_cache(cache))
+        self.assertEqual((old.read_bytes(), old.stat().st_mtime_ns), before)
+
     def test_invalid_cache_rebuilds_without_changing_selection(self) -> None:
         self.write("scripts/subject.py", "VALUE = 1\n")
         self.add_test("checks/test_reader.py", "from scripts import subject\n")
