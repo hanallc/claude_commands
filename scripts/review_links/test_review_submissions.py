@@ -20,7 +20,7 @@ from dataclasses import asdict, replace
 from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from threading import Event
 from typing import TextIO, cast, final, override
 from unittest.mock import patch
@@ -31,6 +31,7 @@ from scripts.agents import pane_record
 from scripts.agents.remote import local_machine
 from scripts.lib import atomic_file, conf, urgency
 from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import review
 from scripts.production import change_review, investigation, next_item, production_admission, production_lifecycle, proposal_issue, proposals_folder, record_store, session_staff, showrunners, staff, tidy_wrapped, update_registration
@@ -1338,7 +1339,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         def fail_first_sync(path: Path) -> None:
             if path == self.issues and self.proposals() and not published.is_set():
                 published.set()
-                if not roll_back.wait(5):
+                if not roll_back.wait(TEST_HANG_GUARD_SECS):
                     raise AssertionError("The test did not release the first Send.")
                 raise OSError("Native publication failed.")
             sync_folder(path)
@@ -1359,15 +1360,19 @@ class ReviewSubmissionTests(unittest.TestCase):
               ThreadPoolExecutor(max_workers=2) as executor):
             first = executor.submit(submissions.submit, payload)
             try:
-                self.assertTrue(published.wait(5))
+                self.assertTrue(published.wait(TEST_HANG_GUARD_SECS), "the first Send did not publish the proposal")
                 second = executor.submit(retry)
-                self.assertEqual(retry_state.get(timeout=5), "request lock")
+                try:
+                    state = retry_state.get(timeout=TEST_HANG_GUARD_SECS)
+                except Empty:
+                    self.fail("the retry did not request the recipient lock")
+                self.assertEqual(state, "request lock")
                 self.assertFalse((folder / "receipt.json").exists())
             finally:
                 roll_back.set()
             with self.assertRaisesRegex(OSError, "Native publication failed"):
-                _ = first.result(timeout=5)
-            saved = second.result(timeout=5)
+                _ = LauncherHangGuard("first Send rollback").result(first)
+            saved = LauncherHangGuard("retry after rollback").result(second)
         self.assertEqual(saved.id, "P2")
         self.assertEqual(self.proposals()[0].path, saved.path)
         self.assertTrue((folder / "receipt.json").is_file())
