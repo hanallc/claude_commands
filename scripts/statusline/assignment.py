@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from scripts.production import staff
 
 NO_READ_DEADLINE = 2**63 - 1
+REVIEW_COUNTS_VERSION = "review-counts=5"
 
 
 class RenderSources:
@@ -192,15 +193,19 @@ def state_directory() -> Path:
     return Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 
 
-def cached_review_row(cache: Path, source: str, sources: RenderSources) -> str | None:
-    """Read the Review row with its existing cache rules."""
+def cached_review_row(cache: Path, source: str, sources: RenderSources, *, allow_stale: bool = False) -> str | None:
+    """Read a Review row from the current count version."""
     try:
         with cache.open(encoding="utf-8") as stored:
             observed = os.fstat(stored.fileno())
             lines = stored.read().splitlines()
     except (OSError, UnicodeError):
         return None
-    due = lines[1] if len(lines) > 1 else ""
+    if len(lines) < 3 or lines[-1] != REVIEW_COUNTS_VERSION:
+        return None
+    if allow_stale:
+        return lines[0]
+    due = lines[1]
     if due:
         try:
             if not due.isascii() or not due.isdecimal():
@@ -211,7 +216,7 @@ def cached_review_row(cache: Path, source: str, sources: RenderSources) -> str |
     else:
         deadline = NO_READ_DEADLINE
     cached_source = ""
-    for path in lines[2:]:
+    for path in lines[2:-1]:
         if path.startswith("source="):
             cached_source = path
             continue
@@ -224,7 +229,7 @@ def cached_review_row(cache: Path, source: str, sources: RenderSources) -> str |
             sources.record(Path(path), "missing")
         except OSError:
             sources.complete = False
-    if not lines or cached_source != source or time.time() >= deadline:
+    if cached_source != source or time.time() >= deadline:
         return None
     sources.record(cache, stat_stamp(observed))
     sources.deadline = min(sources.deadline, deadline)
@@ -277,12 +282,11 @@ def read_counts(record: staff.StaffSnapshot, session_id: str) -> RenderRead[str]
                 sources.complete = False
                 if owner is not None:
                     continue
-            with suppress(OSError, UnicodeError), cache.open(encoding="utf-8") as stored:
-                line = stored.readline()
             candidate = RenderSources()
-            clean = cached_review_row(cache, source, candidate)
-            if clean is None or clean != (line or "").rstrip("\n"):
+            line = cached_review_row(cache, source, candidate)
+            if line is None:
                 candidate.complete = False
+                line = cached_review_row(cache, source, candidate, allow_stale=True)
         sources.merge(candidate)
         if line and (line := line.strip()):
             lines.append(f"{target} {line}\n")

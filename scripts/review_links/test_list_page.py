@@ -1034,7 +1034,8 @@ window.fetch=async (path,options={})=>{
   launcher.click();
   await until(dialog,()=>dialog.querySelector('[name="recipient_id"]:checked'));
   type('The first Send');
-  check(pendingCapture && !send.disabled,'Send is available while the screenshot is pending.');
+  check(!dialog.querySelector('[data-capture-slot]').hidden && !dialog.querySelector('[data-taking]').hidden &&
+        !send.disabled,'Send is available while the screenshot is pending.');
   send.click();
   await until(dialog,()=>!dialog.querySelector('.new-item-error').hidden && !send.disabled);
   dialog.querySelector('[data-later-draft]').click();
@@ -1048,7 +1049,10 @@ window.fetch=async (path,options={})=>{
   const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(savedKey)+'"]');
   await until(document.body,()=>row() && !row().hidden);
   await frame();
-  check(sends.length===3 && sends.every(send=>JSON.stringify(send)===JSON.stringify(sends[0])),
+  const captureMetadata=({document_gzip, ...request}={})=>request;
+  check(pendingCapture && sends.length===3 && sends.every(send=>
+   JSON.stringify({...send,defer_capture:captureMetadata(send.defer_capture)})===
+   JSON.stringify({...sends[0],defer_capture:captureMetadata(sends[0].defer_capture)})),
         'Both retries use the original draft and capture key.');
   check(location.href===address && scrollY===top,'The refresh keeps the List address and scroll position.');
   check(dialog.open && words.value==='The words for a new Send' && document.activeElement===send,
@@ -1545,7 +1549,406 @@ if(example.filterOn){
         browser.navigate(place)
         self.assertIs(evaluate(opened), True)
 
-    def browser_row_expansion(self, steps: str) -> None:
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_chips_have_counts_and_match_every_selected_tag(self) -> None:
+        for number, tags in enumerate((("review flow", "keyboard"), ("review flow",), ("keyboard",), ()), 1):
+            item = self.add(f"Item {number}", number=number)
+            for name in tags:
+                _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(name), source="morty")
+        self.browser_row_expansion(r'''
+ const tagRow=document.querySelector('#list-tag');
+ const all=tagRow.querySelector('[data-tag-all]');
+ const tag=name=>[...tagRow.querySelectorAll('[data-tag-filter]')].find(chip=>chip.dataset.listTag===name);
+ const visible=()=>rows.filter(row=>!row.hidden).map(row=>row.dataset.number).sort().join(',');
+ const pressed=node=>node.getAttribute('aria-pressed')==='true';
+ const first=rows.find(row=>row.dataset.number==='1');
+ const title=first.querySelector('[data-label="Item"]');
+ const review=title.querySelector('[data-tag-row][data-list-tag="review flow"]');
+ check(title.querySelector('strong').textContent==='Item 1' && review && title.children.length===2,
+       'Tag chips are under the title.');
+ check(pressed(all) && all.querySelector('b').textContent==='4' &&
+       tag('review flow').querySelector('b').textContent==='2' && tag('keyboard').querySelector('b').textContent==='2',
+       'The Tag row shows All followed by the tags and their counts.');
+ review.click();
+ check(visible()==='1,2' && pressed(tag('review flow')) && !pressed(all) && !recordIsOpen(first),
+       'A row chip selects the tag without opening the item.');
+ const input=tagRow.querySelector('[data-tag-input]');
+ input.value='KEY';
+ input.dispatchEvent(new Event('input',{bubbles:true}));
+ const choices=[...tagRow.querySelectorAll('[data-tag-choice]')];
+ check(choices.length===1 && choices[0].dataset.listTag==='keyboard','The search matches the first letters.');
+ choices[0].click();
+ check(visible()==='1' && pressed(tag('review flow')) && pressed(tag('keyboard')),
+       'Two selected tags require both tags on each item.');
+ all.click();
+ check(visible()==='1,2,3,4' && pressed(all),'All clears the Tag selection.');
+''')
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_editor_adds_suggestions_and_displays_validation_errors(self) -> None:
+        item = self.add("Edit tags", number=1)
+        other = self.add("Existing tags", number=2)
+        _ = the_list.add_tag(MORTY.id, other.id, the_list.Tag("review flow"), source="morty")
+        self.check_list_tag_editor(r'''
+ let original=summary();
+ enter('  Phone   Layout  ');
+ await wait(()=>summary()!==original && tags().join()==='phone layout');
+ check(!input().value && document.activeElement===input(),'A new tag clears the field and keeps focus.');
+ type('Re');
+ const choices=[...editor().querySelectorAll('[data-tag-choices] button')];
+ check(choices.map(button=>button.textContent).join('|')==='review flow|Create "re"',
+       'An existing match appears before Create.');
+ original=summary();
+ choices[0].click();
+ await wait(()=>summary()!==original && tags().join()==='phone layout,review flow');
+ check(!input().value && document.activeElement===input(),'Selecting a suggestion keeps the field ready.');
+ for(const [text,error] of [['bad,tag','a tag cannot contain a comma'],
+  ['a\u0000b','a tag cannot contain a control character'],
+  ['none',"'none' is reserved for an empty tag list"],['','tag must have one nonempty line']]){
+  enter(text);
+  await wait(()=>editor().querySelector('[data-tag-error]').textContent===error);
+  check(input().value===text && tags().join()==='phone layout,review flow',
+        'The Tag error preserves the text and saved tags.');
+ }
+''')
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("phone layout"), the_list.Tag("review flow")))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_editor_removes_with_cross_and_backspace_and_can_undo(self) -> None:
+        item = self.add("Edit tags", number=1)
+        for text in ("review flow", "keyboard"):
+            _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(text), source="morty")
+        self.check_list_tag_editor(r'''
+ const notice=()=>document.querySelector('.list-tag-notice');
+ const undo=()=>notice()?.querySelector('button');
+ let original=summary();
+ editor().querySelector('[aria-label="Remove tag keyboard"]').click();
+ await wait(()=>summary()!==original && tags().join()==='review flow' && undo());
+ check(notice().textContent.includes('Removed "keyboard".') && notice().getAnimations().length===1,
+       'The chip goes away and the Undo notice fades.');
+ original=summary();
+ undo().click();
+ await wait(()=>summary()!==original && tags().join()==='review flow,keyboard' && !undo());
+ check(editor().querySelector('[aria-label="Remove tag keyboard"]'),'Undo adds the chip back.');
+ original=summary();
+ input().focus();input().dispatchEvent(new KeyboardEvent('keydown',{key:'Backspace',bubbles:true,cancelable:true}));
+ await wait(()=>summary()!==original && tags().join()==='review flow' && undo());
+ check(undo().getAttribute('aria-label')==='Undo removal of keyboard' && document.activeElement===input(),
+       'Backspace removes the last tag and keeps focus.');
+''')
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("review flow"),))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_removal_elsewhere_clears_the_chip_without_undo(self) -> None:
+        item = self.add("Read the current tags", number=1)
+        tag = the_list.Tag("review flow")
+        _ = the_list.add_tag(MORTY.id, item.id, tag, source="morty")
+        self.check_list_tag_editor(r"""
+ const [keeper,id]=row().dataset.key.split('/');
+ const query=new URLSearchParams({'tag-fields':id,keeper});
+ const signed=await (await fetch(location.pathname+'?'+query)).json();
+ const body=new URLSearchParams({...signed,keeper,id,until:'',action:'remove-tag',words:'review flow'});
+ const other=await fetch(location.pathname,{method:'POST',body});
+ check(other.ok && (await other.json()).tags.length===0,'Another session removes the tag.');
+ const chip=editor().querySelector('[data-tag-remove]');
+ check(chip && tags().join()==='review flow','The first page still shows the stale chip.');
+ chip.click();
+ await wait(()=>!tags().length && editor().querySelector('[data-tag-pending]').hidden);
+ check(!row().querySelector('[data-row-tags]') && !editor().querySelector('[data-tag-remove]'),
+       'The save clears the stale chip from the row and editor.');
+ check(!document.querySelector('[aria-label="Undo removal of review flow"]'),
+       'A removal that saves nothing has no Undo.');
+""")
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.tags, ())
+        self.assertEqual([entry.what for entry in saved.log if isinstance(entry.what, the_list.TagsChanged)],
+                         [the_list.TagsChanged((tag,)), the_list.TagsChanged(())])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_edits_wait_for_each_save_in_order(self) -> None:
+        item = self.add("Queue tag edits", number=1)
+        self.check_list_tag_editor(r"""
+ const sent=[],fetchPage=window.fetch;
+ let release;
+ const held=new Promise(resolve=>{release=resolve;});
+ window.fetch=async (url,options)=>{
+  const action=options?.body?.get?.('action');
+  if(action!=='add-tag') return fetchPage(url,options);
+  sent.push(options.body.get('words'));
+  const response=await fetchPage(url,options);
+  if(sent.length===1) await held;
+  return response;
+ };
+ enter('first tag');
+ enter('second tag');
+ const pending=()=>editor().querySelector('[data-tag-pending]');
+ check(!pending().hidden && pending().textContent==='2 tag edits pending.',
+       'The field reports both pending edits.');
+ await Promise.resolve();
+ check(sent.join()==='first tag','Only the first request starts before its response.');
+ release();
+ await wait(()=>pending().hidden && tags().join()==='first tag,second tag');
+ check(sent.join()==='first tag,second tag' && !input().value && document.activeElement===input(),
+       'Both edits finish in order and the field stays ready.');
+""")
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual([entry.what for entry in saved.log[-2:]], [
+            the_list.TagsChanged((the_list.Tag("first tag"),)),
+            the_list.TagsChanged((the_list.Tag("first tag"), the_list.Tag("second tag")))])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_backspace_uses_pending_removals(self) -> None:
+        item = self.add("Remove two tags", number=1)
+        for text in ("alpha", "beta"):
+            _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(text), source="morty")
+        self.check_list_tag_editor(r"""
+ const removed=[],fetchPage=window.fetch;
+ let release;
+ const held=new Promise(resolve=>{release=resolve;});
+ window.fetch=async (url,options)=>{
+  if(options?.body?.get?.('action')!=='remove-tag') return fetchPage(url,options);
+  removed.push(options.body.get('words'));
+  if(removed.length===1) await held;
+  return fetchPage(url,options);
+ };
+ const backspace=()=>input().dispatchEvent(new KeyboardEvent('keydown',{key:'Backspace',bubbles:true,cancelable:true}));
+ backspace();
+ await Promise.resolve();
+ backspace();
+ release();
+ await wait(()=>editor().querySelector('[data-tag-pending]').hidden);
+ check(removed.join()==='beta,alpha' && tags().length===0,'Each Backspace removes the last remaining tag.');
+ const undo=[...document.querySelectorAll('.list-tag-notice button')];
+ check(undo.map(button=>button.getAttribute('aria-label')).join()==='Undo removal of beta,Undo removal of alpha',
+       'Each removed tag has one Undo notice.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, ())
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_success_clears_an_older_queued_error(self) -> None:
+        item = self.add("Replace a tag error", number=1)
+        self.check_list_tag_editor(r"""
+ const fetchPage=window.fetch;
+ let release;
+ const held=new Promise(resolve=>{release=resolve;});
+ window.fetch=async (url,options)=>{
+  if(options?.body?.get?.('words')==='bad,tag') await held;
+  return fetchPage(url,options);
+ };
+ enter('bad,tag');
+ enter('valid');
+ release();
+ await wait(()=>editor().querySelector('[data-tag-pending]').hidden && tags().join()==='valid');
+ const error=editor().querySelector('[data-tag-error]');
+ check(error.hidden && !error.textContent,'Only the latest edit can show an error.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("valid"),))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_removal_reads_the_record_after_a_lost_response(self) -> None:
+        item = self.add("Read the tag after a lost response", number=1)
+        _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag("review flow"), source="morty")
+        self.check_list_tag_editor(r"""
+ const calls=[],fetchPage=window.fetch;
+ window.fetch=async (url,options)=>{
+  if(options?.body?.get?.('action')==='remove-tag'){
+   calls.push('remove');
+   const response=await fetchPage(url,options);
+   check(response.ok,'The server saved the removal.');
+   throw new Error('The save response was lost.');
+  }
+  const query=new URL(url,location.href).searchParams;
+  if(query.has('item-state')){
+   calls.push('read');
+   return fetchPage(url,options);
+  }
+  if(String(url)===location.pathname) throw new Error('The full page refresh is unavailable.');
+  return fetchPage(url,options);
+ };
+ editor().querySelector('[data-tag-remove]').click();
+ const error=()=>editor().querySelector('[data-tag-error]');
+ await wait(()=>!error().hidden);
+ check(calls.join()==='remove,read','The browser immediately reads the saved item.');
+ check(!row().querySelector('[data-row-tags]') && !editor().querySelector('[data-tag-remove]'),
+       'The row and editor show the tags from the saved item.');
+ check(error().textContent==='The save response was lost.' &&
+       document.querySelector('[aria-label="Undo removal of review flow"]'),
+       'The browser shows the error and offers Undo for the removal.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, ())
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_counts_follow_the_other_filters(self) -> None:
+        for number, owner, state, tags in (
+                (1, OWNER.id, the_list.ItemState.WORKING, ("review flow", "keyboard")),
+                (2, OWNER.id, the_list.ItemState.BLOCKED, ("blocked tag",)),
+                (3, OTHER.id, the_list.ItemState.WORKING, ("other tag",))):
+            item = self.add(f"Item {number}", state, number=number, owner=owner)
+            for tag in tags:
+                _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(tag), source="morty")
+        probe = r"""
+ const count=selector=>document.querySelector('#list-tag '+selector).querySelector('b').textContent;
+ const tagCount=tag=>count('[data-tag-filter][data-list-tag="'+tag+'"]');
+ selectOwner(OWNER);
+ check(count('[data-tag-all]')==='2' && tagCount('other tag')==='0' && tagCount('blocked tag')==='1',
+       'Owner limits the All and tag counts.');
+ chip('show','working').click();
+ check(count('[data-tag-all]')==='1' && tagCount('blocked tag')==='0' && tagCount('review flow')==='1',
+       'Show also limits the tag counts.');
+ document.querySelector('[data-tag-filter][data-list-tag="keyboard"]').click();
+ check(count('[data-tag-all]')==='1' && tagCount('review flow')==='1' &&
+       rows.filter(row=>!row.hidden).map(row=>row.dataset.number).join()==='1',
+       'Tag counts use the other filters and the rows still require the selected tag.');
+"""
+        self.browser_row_expansion(probe.replace("OWNER", json.dumps(OWNER.id)))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_menu_stays_inside_the_card_at_390_pixels(self) -> None:
+        item = self.add("Mobile tag editor", number=1)
+        other = self.add("Long tag", number=2)
+        _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag("existing tag first"), source="morty")
+        _ = the_list.add_tag(MORTY.id, other.id,
+            the_list.Tag("suggest a tag name long enough to need the full width"), source="morty")
+        self.browser_row_expansion(r"""
+ const row=rows.find(row=>row.dataset.number==='1');
+ toggle(row).click();
+ const detail=recordDetails(row),editor=detail.querySelector('[data-tag-editor]');
+ const field=editor.querySelector('input'),menu=editor.querySelector('[data-tag-choices]');
+ const card=detail.querySelector('.list-panel');
+ check(innerWidth===390,'The viewport is 390 pixels wide.');
+ for(const theme of ['dark','light']){
+  document.documentElement.dataset.theme=theme;
+  field.value='suggest';field.dispatchEvent(new Event('input',{bubbles:true}));
+  const bounds=card.getBoundingClientRect(),box=menu.getBoundingClientRect();
+  check(!menu.hidden && menu.querySelector('[data-tag-choice]') && box.width>0 &&
+        box.left>=bounds.left && box.right<=bounds.right && box.top>=bounds.top && box.bottom<=bounds.bottom,
+        'The '+theme+' menu fits within the card.');
+ }
+""", window_size=(390, 980))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_editor_uses_one_template_and_treats_tags_as_text(self) -> None:
+        first = self.add("One template", number=1)
+        _ = self.add("Keep this item closed", number=2)
+        tag = the_list.Tag('<em data-example="tag">tag text</em>')
+        _ = the_list.add_tag(MORTY.id, first.id, tag, source="morty")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        self.assertEqual(markup.count("data-tag-editor>"), 1)
+        self.assertNotIn("data-tag-token=", markup)
+        probe = r"""
+ const label=TAG;
+ const row=rows.find(row=>row.dataset.number==='1');
+ const editor=()=>recordDetails(row).querySelector('[data-tag-editor]');
+ const exact=chip=>chip.dataset.listTag===label &&
+  chip.querySelector('[data-tag-label]').textContent===label && !chip.querySelector('em');
+ check(exact(row.querySelector('[data-tag-row]')) && exact(document.querySelector('[data-tag-filter]')),
+       'The title and filter show the tag as text.');
+ check(!editor(),'A closed row has no editor.');
+ toggle(row).click();
+ check(exact(editor().querySelector('[data-tag-remove]')) &&
+       document.querySelectorAll('[data-tag-editor]').length===1,'The open row has one editor with text chips.');
+ toggle(row).click();
+ check(!editor(),'Closing the row removes the editor.');
+ toggle(rows.find(row=>row.dataset.number==='2')).click();
+ const field=document.querySelector('[data-tag-editor] input');
+ field.value='<em';field.dispatchEvent(new Event('input',{bubbles:true}));
+ check(exact(document.querySelector('[data-tag-editor] [data-tag-choice]')),
+       'The editor suggestion shows the tag as text.');
+"""
+        self.browser_row_expansion(probe.replace("TAG", json.dumps(tag.text)))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_editor_saves_on_a_waiting_row_without_feedback_actions(self) -> None:
+        item = self.add("Wait for an answer", number=1)
+        root = self.root / "reviews"
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            delivery = list_page.submit(root, urlencode(self.fields(item, "question", words="What changed?")))
+            list_page.deliver(delivery)
+        waiting = the_list.load(MORTY.id, item.id)
+        entries = [list_page.ListRecord(MORTY.id, replace(waiting, number=number)) for number in range(1, 321)]
+        with (patch.object(list_page, "records", return_value=entries),
+              patch.object(list_page, "top_priority_mark", return_value=list_page.TopPriorityMark.HIDDEN),
+              patch.object(the_list, "question_visibility", return_value=the_list.WaitingForAnswer())):
+            markup = list_page.render(root, include_counts=False).decode()
+        self.assertEqual(markup.count('data-waiting-for-answer="true"'), 320)
+        self.assertEqual(markup.count('name="token"'), 0)
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(item.number))
+        self.check_list_tag_editor(r"""
+ const detail=recordDetails(row());
+ check(!detail.querySelector('[data-feedback-form]'),'The waiting item has no feedback controls.');
+ enter('waiting tag');
+ await wait(()=>tags().join()==='waiting tag');
+ const requests=performance.getEntriesByType('resource').filter(entry=>
+  new URL(entry.name).searchParams.has('tag-fields'));
+ check(requests.length===1,'The opened item requests its signed fields once.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("waiting tag"),))
+
+    def check_list_tag_editor(self, steps: str) -> None:
+        root = self.root / "reviews"
+        config = self.root / "config" / "review_links.conf"
+        _ = config.write_text(config.read_text().replace("undo_seconds=0", "undo_seconds=10"))
+        results: list[list[str]] = []
+        complete = threading.Event()
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const row=()=>document.querySelector('[data-list-item][data-number="1"]');
+ const summary=()=>row().querySelector('.list-row');
+ const editor=()=>recordDetails(row()).querySelector('[data-tag-editor]');
+ const input=()=>editor().querySelector('[data-tag-input]');
+ const tags=()=>JSON.parse(row().dataset.tags ?? '[]');
+ const type=text=>{input().value=text;input().dispatchEvent(new Event('input',{bubbles:true}));};
+ const enter=text=>{type(text);input().dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));};
+ const wait=ready=>new Promise((resolve,reject)=>{
+  const observer=new MutationObserver(read);
+  const timer=setTimeout(()=>{observer.disconnect();reject(new Error('The tag edit did not finish. Tags: '+tags().join(', ')));},8000);
+  function read(){if(ready()){observer.disconnect();clearTimeout(timer);resolve();}}
+  observer.observe(document.body,{attributes:true,childList:true,subtree:true,characterData:true});read();
+ });
+ try{
+  row().querySelector('.list-toggle').click();
+  input().focus();
+''' + steps + '''
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+
+        class TagProbe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == list_page.PAGE_PATH:
+                    markup = list_page.render(root, include_counts=False).decode()
+                    self.html_response(200, markup.replace("</body>", probe + "</body>").encode())
+                    return None
+                return super().send_head()
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == "/results":
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                    self.json_response(200, {})
+                    complete.set()
+                else:
+                    super().do_POST()
+
+        with (patch.object(serve, "ReviewLinksHandler", TagProbe),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                page = f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}"
+                browser = self.firefox_view(page, None, 1440, 1000, complete)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+
+    def browser_row_expansion(self, steps: str, *,
+                              window_size: tuple[int, int] | None = None) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         probe = r'''<script>
 (async()=>{
@@ -1562,7 +1965,7 @@ const result=document.createElement('p');
 result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>'''
-        self.browser_actions(markup, "", probe)
+        self.browser_actions(markup, "", probe, window_size=window_size)
 
     def test_new_item_opens_above_the_review_box_and_its_screenshot_shows_the_box(self) -> None:
         from scripts.review_links.test_page_frame import WINDOW_BROWSERS, WINDOW_PROBE, window_probe_results
@@ -1589,17 +1992,19 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
   const link=document.querySelector('a[data-list-review-card]');
   link.click();
   await until(()=>dialog.open && dialog.querySelector('iframe'),'the review box');
+  await until(()=>dialog.querySelector('iframe').contentDocument?.body?.textContent.includes('Review card fixture'),
+   'the loaded review card');
   await painted();
   check(onTop(dialog.querySelector('.list-review-close')),'The action area does not cover the review box Close button.');
   check(dialog.getBoundingClientRect().top>=actionsBottom(),'The review box starts below the action area.');
   check(pressNewItem('over the review box')!==null,'The press reaches New item.');
   const capture=await newItemOver(dialog,'the review box');
-  const address=location.pathname+location.search+location.hash;
-  check(capture.place===address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent(link.getAttribute('href')),
-   'The screenshot address names the open review box: '+capture.place);
+  const snapshot=await capturedDocument(capture);
+  const review=snapshot.querySelector('[data-list-review-dialog][open][data-capture-modal] iframe[srcdoc]');
+  check(capture.place===location.pathname && review?.getAttribute('srcdoc').includes('Review card fixture'),
+   'The snapshot includes the open review box and the loaded card.');
+  check(!snapshot.querySelector('#review-new-item'),'The snapshot omits New item.');
   await closeNewItem(dialog,'the review box');
-  await opensAgain(capture.place,doc=>doc.querySelector('[data-list-review-dialog]')?.open===true
-   && doc.querySelector('[data-list-review-dialog] iframe')!==null,'the review box');
   dialog.querySelector('.list-review-close').click();
   await until(()=>!dialog.open,'the review box to close');
   frameElement.style.width='390px';
@@ -3467,9 +3872,13 @@ document.body.append(result);
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_keeps_the_first_paint_rows_and_chip_counts_for_query_filters(self) -> None:
         upper, lower = "\u1c89", "\u1c8a"
-        for number, character, owner in (
-                (1, upper, OWNER.id), (2, lower, OWNER.id), (3, upper, OTHER.id), (4, upper, OWNER.id)):
+        smile = "\U0001f642"
+        for number, character, owner, tags in (
+                (1, upper, OWNER.id, ("alpha", "shared", "a\ufffdb", smile)), (2, lower, OWNER.id, ("alpha",)),
+                (3, upper, OTHER.id, ("beta", "shared")), (4, upper, OWNER.id, ())):
             item = self.add(f"Check \0 {character}", owner=owner, number=number)
+            for tag in tags:
+                _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(tag), source="morty")
             if number != 4:
                 _ = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
             if number == 3:
@@ -3478,17 +3887,22 @@ document.body.append(result);
         fragment = urlencode({"show": "working", "owner": OTHER.id, "q": "unmatched"})
         key_query = urlencode({"show": "working", "key": f"{MORTY.id}/L4"})
         key_fragment = urlencode({"key": f"{MORTY.id}/L1"})
+        owner_query = urlencode({"owner": OWNER.id})
+        tag_query = urlencode({"tag": json.dumps(["alpha", "shared", smile, "a\u0000b", "a\ud800b"])})
+        tag_fragment = urlencode({"tag": json.dumps(["beta"])})
         numbers = ["1", "2"] if search_fold.fold(upper) == search_fold.fold(lower) else ["1"]
         unread_alias = "show=unread&unread=0"
         all_rows = ["1", "2", "3", "4"]
         unread_rows = ["1", "2", "4"]
         before = r'''<script>
-const [address,firstRows,loadedRows,allCount,firstUnread,loadedUnread]=CASE;
+const [address,firstRows,loadedRows,allCount,firstUnread,loadedUnread,firstTags]=CASE;
 history.replaceState(null,'',address);
 const snapshot=()=>({
  rows:[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).sort(),
  chips:[...document.querySelectorAll('[data-filter-count]')].map(chip=>
   [chip.id,chip.dataset.filterCount,chip.getAttribute('aria-pressed')]),
+ tags:[...document.querySelectorAll('#list-tag [data-list-tag]')].map(chip=>
+  [chip.dataset.listTag,Number(chip.querySelector('b').textContent),chip.getAttribute('aria-pressed')==='true']),
  unread:document.querySelector('#list-unread').checked,
 });
 const firstPaint=snapshot();
@@ -3500,6 +3914,8 @@ const loaded=snapshot();
 check(JSON.stringify(firstPaint.rows)===JSON.stringify(firstRows),'The server shows the matching rows.');
 check(JSON.stringify(loaded.rows)===JSON.stringify(loadedRows),'Script start shows the matching rows.');
 check(firstPaint.unread===firstUnread && loaded.unread===loadedUnread,'Unread has the expected state.');
+if(firstTags)
+ check(JSON.stringify(firstPaint.tags)===JSON.stringify(firstTags),'The server shows the expected tag counts and selection.');
 if(firstUnread===loadedUnread)
  check(JSON.stringify(firstPaint)===JSON.stringify(loaded),'Script start keeps the rows and chip counts.');
 check(document.querySelector('#filter-show-all').dataset.filterCount===String(allCount),'The All chip has the expected count.');
@@ -3518,10 +3934,18 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 ("show=unread", "", unread_rows, unread_rows, 3, True, True),
                 (unread_alias, "unread=0", unread_rows, unread_rows, 3, True, True),
                 (key_query, key_fragment, ["4"], ["4"], 1, False, False),
+                (owner_query, "", ["1", "2", "4"], ["1", "2", "4"], 3, False, False),
+                (tag_query, tag_fragment, ["1"], ["1"], 1, False, False),
         ):
             with self.subTest(query=server_query, fragment=browser_fragment):
                 address = ("?" + server_query if server_query else "") + ("#" + browser_fragment if browser_fragment else "")
-                case = json.dumps((address, first_rows, loaded_rows, all_count, first_unread, loaded_unread))
+                first_tags = {
+                    owner_query: [("All", 3, True), ("alpha", 2, False), ("a\ufffdb", 1, False),
+                                  ("beta", 0, False), ("shared", 1, False), (smile, 1, False)],
+                    tag_query: [("All", 4, False), ("alpha", 2, True), ("a\ufffdb", 1, False),
+                                ("beta", 1, False), ("shared", 2, True), (smile, 1, True)],
+                }.get(server_query)
+                case = json.dumps((address, first_rows, loaded_rows, all_count, first_unread, loaded_unread, first_tags))
                 markup = list_page.render(self.root / "reviews", include_counts=False, query=server_query).decode()
                 page = markup.replace(script, before.replace("CASE", case) + script, 1)
                 page = page.replace("</body>", after + "</body>", 1)
@@ -9448,6 +9872,44 @@ window.fetch=async(_url,options)=>{
                                      add_item=False, reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_not_fixed_opens_a_new_hold_after_a_confirmed_save_failure(self) -> None:
+        _ = self.file_repaired_report("Fix the menu")
+        steps = r"""
+ const originalFetch=window.fetch,holds=[];
+ const button=form.querySelector('[value="not works"]'),words=form.elements.words;
+ let receiptReads=0;
+ const until=async(condition,message)=>{
+  const end=performance.now()+4000;
+  while(!condition()){
+   if(performance.now()>end) throw new Error(message);
+   await new Promise(requestAnimationFrame);
+  }
+ };
+ window.fetch=async(path,options={})=>{
+  if(String(path).startsWith('/send-hold/'))
+   return Response.json({reason:'The List write failed.'},{status:503});
+  if(new URL(path,location.href).searchParams.has('not-fixed-request')){
+   receiptReads++;
+   return Response.json({not_fixed_receipt:{request:requests[0].get('request'),state:'absent'}});
+  }
+  if(options.method!=='POST') return originalFetch(path,options);
+  const hold=new Headers(options.headers).get('X-Undo-Request');
+  holds.push(hold);
+  requests.push(new URLSearchParams(options.body));
+  return Response.json({hold,seconds:0},{status:202,headers:{'X-Send-Hold':'held'}});
+ };
+ words.value='The label is still missing.';words.dispatchEvent(new Event('input'));
+ submit('not works');
+ await until(()=>!form.dataset.sending && !button.disabled,'The first Send did not finish.');
+ button.click();
+ await until(()=>requests.length===2 && !form.dataset.sending,'Retry did not finish.');
+ check(receiptReads===1,'Retry checks the saved receipt.');
+ check(holds[0] && holds[1] && holds[0]!==holds[1],'Retry starts a new hold.');
+ check(requests[0].toString()===requests[1].toString(),'Retry keeps the original request.');
+"""
+        self.browser_action_sequence(steps, add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_not_fixed_recovers_when_the_held_post_response_is_lost(self) -> None:
         _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\nundo_seconds=10\n")
         settings = conf.read("review_links")
@@ -9874,6 +10336,121 @@ window.fetch=async(_url,options)=>{
  check(order()===before && recordIsOpen(row) && words.value===text && all.dataset.filterCount==='2',
   'Failure restores the open item, its draft, and the chip count.');
 ''', add_item=False, window_size=(500, 900))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_tell_posts_again_after_a_save_failure_and_the_old_limit(self) -> None:
+        self.check_list_retry_after_save_failure("tell", after_limit=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_tell_gets_full_undo_on_an_explicit_retry_after_a_save_failure(self) -> None:
+        self.check_list_retry_after_save_failure("tell")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_automatic_park_retry_gets_full_undo_after_a_save_failure(self) -> None:
+        self.check_list_retry_after_save_failure("park-until-delivered")
+
+    def check_list_retry_after_save_failure(
+        self, action: Literal["tell", "park-until-delivered"], *, after_limit: bool = False,
+    ) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\nframe_retry_seconds=0.5\n")
+        item = self.add("Check the assigned item", number=1)
+        root = self.root / "reviews"
+        save_action = list_page.save_action
+        failed_once = False
+
+        def save_with_first_write_failure(
+            root: Path, body: str, status: change_page.DeliveryStatus, *,
+            review_records: list_page.ImmediateReviewRecords, include_detail: bool, top_priority: list_page.TopPriority,
+        ) -> tuple[list_page.ListActionSubmission, list_page.SavedActionState | None]:
+            nonlocal failed_once
+            if failed_once:
+                return save_action(root, body, status, review_records=review_records,
+                                   include_detail=include_detail, top_priority=top_priority)
+            failed_once = True
+            with patch.object(record_store.NumberedRecords, "write", side_effect=OSError("List is unavailable.")):
+                return save_action(root, body, status, review_records=review_records,
+                                   include_detail=include_detail, top_priority=top_priority)
+
+        script = r"""
+(async()=>{
+ const row=document.querySelector('[data-number="1"]');
+ row.querySelector('.list-toggle').click();
+ const form=recordDetails(row).querySelector('[data-feedback-form]');
+ const action=ACTION,automatic=action==='park-until-delivered';
+ const button=form.querySelector('[value="'+action+'"]'),words=form.elements.words;
+ const toast=()=>document.querySelector('[data-send-undo]:has(button)');
+ const originalFetch=window.fetch,posts=[];
+ const until=async(test,message)=>{
+  const end=performance.now()+4000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(message);
+   await new Promise(requestAnimationFrame);
+  }
+ };
+ let firstResult;
+ window.fetch=async(path,options={})=>{
+  const response=await originalFetch(path,options);
+  const data=new URLSearchParams(options.body);
+  if(options.method==='POST' && data.get('action')===(automatic ? 'park' : 'tell'))
+   posts.push({held:await response.clone().json(),body:data.toString()});
+  if(String(path)==='/send-hold/'+posts[0]?.held.hold && response.status!==202)
+   firstResult=response.status;
+  return response;
+ };
+ const text='Check the result.';
+ words.value=text;words.dispatchEvent(new Event('input'));
+ button.click();
+ await until(toast,'The first send did not show Undo.');
+ const first=posts[0].held;
+ const release=await originalFetch('/send-hold/'+first.hold+'/send',{method:'POST'});
+ if(release.status!==200) throw new Error('The fixture could not release the send.');
+ toast().getAnimations()[0].finish();
+ await until(()=>firstResult!==undefined,'The browser did not read the failed result.');
+ if(firstResult!==503 || words.value!==text) throw new Error('The failed send did not keep the draft.');
+ if(!automatic){
+  await until(()=>!form.dataset.sending,'The failed Tell did not finish.');
+  await until(()=>!document.querySelector('[data-record-motion]'),'The row did not finish its animation.');
+  if(AFTER_LIMIT){
+   const now=Date.now.bind(Date);
+   Date.now=()=>now()+121000;
+  }
+  button.click();
+ }
+ await until(()=>posts.length===2,'The retry did not POST after the save failure.');
+ const next=posts[1].held;
+ if(next.hold===first.hold || next.seconds!==60)
+  throw new Error('The retry did not get a new hold with the full Undo time.');
+ if(automatic && posts[0].body!==posts[1].body)
+  throw new Error('The automatic retry changed the signed form.');
+ await until(toast,'The retry did not show Undo.');
+ toast().querySelector('button').click();
+ await until(()=>!form.dataset.sending,'The retry did not finish Undo.');
+ if(words.value!==text) throw new Error('Undo did not keep the draft.');
+ return true;
+})().catch(error=>error.message)
+""".replace("AFTER_LIMIT", json.dumps(after_limit)).replace("ACTION", json.dumps(action))
+        with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root)}),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(list_page, "recover_pending"),
+              patch.object(list_page, "save_action", side_effect=save_with_first_write_failure),
+              patch.object(change_page, "send_to_staff", return_value=None) as send,
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            chrome = self.chrome()
+            try:
+                chrome.navigate(f"http://127.0.0.1:{server.server_port}{studio_page.PAGE_PATH}")
+                reply = chrome.command("Runtime.evaluate", {"expression": script, "awaitPromise": True,
+                                       "returnByValue": True}, chrome.session)
+                self.assertIs(cast(dict[str, object], reply["result"])["value"], True)
+            finally:
+                chrome.navigate("about:blank")
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+        send.assert_not_called()
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_tell_undo_toast_names_the_signed_producer(self) -> None:

@@ -241,13 +241,20 @@ def read_pending_followup(value: object, where: str) -> PendingFollowup | None:
     if not isinstance(value, dict):
         raise InputError(f"{where}.followup: expected an object")
     fields = cast(dict[str, object], value)
-    check_keys(fields, {"text", "sent"}, where + ".followup")
+    check_keys(fields, {"text", "sent", "recipient"}, where + ".followup")
     text, sent = fields.get("text"), fields.get("sent")
     if not isinstance(text, str) or not text.strip():
         raise InputError(f"{where}.followup.text: expected the follow-up text")
     if not isinstance(sent, str) or not STARTED.match(sent):
         raise InputError(f"{where}.followup.sent: expected YYYY-MM-DDTHH:MM")
-    return PendingFollowup(text=text, sent=sent)
+    pending = PendingFollowup(text=text, sent=sent)
+    if "recipient" in fields:
+        recipient = fields["recipient"]
+        if (not isinstance(recipient, str) or not recipient or recipient != recipient.strip()
+                or has_line_break(recipient)):
+            raise InputError(f"{where}.followup.recipient: expected a staff ID")
+        pending["recipient"] = staff.StaffId(recipient)
+    return pending
 
 
 def read_followups(value: object, where: str) -> tuple[Followup, ...]:
@@ -401,9 +408,10 @@ class QuestionParts(TypedDict):
 
 
 class PendingFollowup(TypedDict):
-    """A follow-up that waits for the asker's reply."""
+    """A follow-up that waits for a reply."""
     text: str
     sent: str
+    recipient: NotRequired[staff.StaffId]
 
 
 class FollowupExchange(TypedDict):
@@ -611,6 +619,9 @@ class AnswerRelay:
     recipient: staff.StaffId | NoAnswerRelay
     unit: str = ""
 
+    def recipient_or_owner(self, owner: staff.StaffId) -> staff.StaffId:
+        return self.recipient if isinstance(self.recipient, str) else owner
+
 
 def answer_relay(production: QuestionScope, name: str, asker: QuestionAsker,
                  identities: QuestionStaff | None = None) -> AnswerRelay:
@@ -656,6 +667,11 @@ def answer_relay(production: QuestionScope, name: str, asker: QuestionAsker,
     if isinstance(asker, ShowrunnerAsker):
         return target("relay: none; this showrunner asked it")
     return target(f"relay: to {asker.unit}", asker.unit, asker.unit)
+
+
+def question_relay(record: QuestionRecord, production: QuestionScope, identities: QuestionStaff) -> AnswerRelay:
+    return answer_relay(production, production.name, question_asker(record.item, OpenItemWithoutAsker(), identities),
+                        identities)
 
 
 
@@ -1369,6 +1385,8 @@ def _file_question(record: QuestionRecord,
                    before_write: Callable[[str, Path], None] = lambda _id, _path: None, *,
                    reply_proof: reply_tokens.ReplyProof = reply_tokens.MISSING_REPLY_PROOF
                    ) -> QuestionRecord:
+    if "review_submission" in record.item and "followup" in record.item:
+        _ = record.item["followup"].setdefault("recipient", record.owner)
     with _question_number_lock(record.owner), question_numbers() as numbers:
         folder = record.path.parent
         names = {path.name for path in _known_question_paths(record.owner, folder, strict=True)}
@@ -2365,9 +2383,18 @@ def write_selected_item(selected: OpenItemRecord, production: QuestionScope, act
 _NO_QUESTION_RELAY = AnswerRelay("", NoAnswerRelay())
 
 
+@dataclass(frozen=True)
+class FollowupToAsker:
+    """Use the question's relay to select the recipient."""
+
+
+_FOLLOWUP_TO_ASKER = FollowupToAsker()
+
+
 def act_on_question(production: QuestionScope, selector: str | ByQuestionKey, action: QuestionMutation,
                     identities: QuestionStaff, *, words: str = "", only_open: bool = False,
-                    adopt: bool = False) -> AnswerRelay:
+                    adopt: bool = False, followup_recipient: staff.StaffId | FollowupToAsker = _FOLLOWUP_TO_ASKER
+                    ) -> AnswerRelay:
     """Apply an action only after resolving and checking its selected item."""
     with select_question(production, selector, action, identities, only_open=only_open) as selected:
         if isinstance(selected, QuestionRecord) and "review_submission" in selected.item:
@@ -2402,7 +2429,10 @@ def act_on_question(production: QuestionScope, selector: str | ByQuestionKey, ac
             adopt_state()
             return _NO_QUESTION_RELAY
 
+        followup_relay = _NO_QUESTION_RELAY
+
         def change(item: OutstandingItem, now: datetime) -> None:
+            nonlocal followup_relay
             match action:
                 case "answer" | "withdraw":
                     if isinstance(selected, QuestionRecord):
@@ -2413,7 +2443,14 @@ def act_on_question(production: QuestionScope, selector: str | ByQuestionKey, ac
                 case "followup":
                     if "followup" in item:
                         raise RegistrationFailure(action, f"{title}: a follow-up already waits for the asker's reply")
-                    item["followup"] = PendingFollowup(text=words.strip(), sent=now.strftime("%Y-%m-%dT%H:%M"))
+                    if isinstance(followup_recipient, str):
+                        followup_relay = AnswerRelay("", followup_recipient)
+                    else:
+                        followup_relay = answer_relay(
+                            production, name, question_asker(item, OpenItemWithoutAsker(), identities), identities)
+                    recipient = followup_relay.recipient_or_owner(selected.owner)
+                    item["followup"] = PendingFollowup(text=words.strip(), sent=now.strftime("%Y-%m-%dT%H:%M"),
+                                                       recipient=recipient)
                     item["waiting_why"] = review_events.require_waiting_why(words)
 
         def record_result(path: Path, item: OutstandingItem, now: datetime) -> None:
@@ -2426,11 +2463,12 @@ def act_on_question(production: QuestionScope, selector: str | ByQuestionKey, ac
         updated = write_selected_item(selected, production, action, change, close=close,
                                       history=record_result if close else None)
         adopt_state()
-        if action in ("answer", "followup"):
+        if action == "followup":
+            return followup_relay
+        if action == "answer":
             relay = answer_relay(production, name, question_asker(updated, OpenItemWithoutAsker(), identities), identities)
-            if action == "answer":
-                print(relay.line)
-                report(action, "ok", f"{name}: {title}")
+            print(relay.line)
+            report(action, "ok", f"{name}: {title}")
             return relay
         report(action, "ok", title if action == "mark-important" else f"{name}: {title}")
         return _NO_QUESTION_RELAY
@@ -2456,12 +2494,13 @@ def withdraw(production: QuestionScope, words: str | ByQuestionKey, *, identitie
 
 
 def followup(production: QuestionScope, text: str | ByQuestionKey, words: str, *,
-             identities: QuestionStaff | None = None) -> AnswerRelay:
+             identities: QuestionStaff | None = None,
+             recipient: staff.StaffId | FollowupToAsker = _FOLLOWUP_TO_ASKER) -> AnswerRelay:
     """Send the asker a follow-up and record that the Question waits for a reply."""
     if not words.strip():
         raise RegistrationFailure("followup", "the follow-up is empty")
     identities = identities if identities is not None else QuestionStaff.read()
-    return act_on_question(production, text, "followup", identities, words=words)
+    return act_on_question(production, text, "followup", identities, words=words, followup_recipient=recipient)
 
 
 def set_waiting_why(record: QuestionRecord, text: str) -> None:
@@ -2517,7 +2556,8 @@ def review_sent_question(record: QuestionRecord, scope: QuestionScope,
         if pending is not None:
             events = review_events.append(events, review_events.ReviewLog(now, "nate", "Superseded followup: " + pending["text"]))
         if action == "question":
-            current.item["followup"] = PendingFollowup(text=words, sent=now.strftime("%Y-%m-%dT%H:%M"))
+            current.item["followup"] = PendingFollowup(text=words, sent=now.strftime("%Y-%m-%dT%H:%M"),
+                                                       recipient=record.owner)
             current.item["waiting_why"] = review_events.require_waiting_why(words)
         else:
             current = replace(current, status="closed")

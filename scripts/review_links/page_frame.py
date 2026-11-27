@@ -229,24 +229,9 @@ document.addEventListener('DOMContentLoaded',()=>{
 
 # A modal window keeps a copy of the action area in view.
 # Keep the parts of the window below the copy where they meet horizontally.
-# The screenshot address names the open window.
 ACTIONS_SCRIPT = """<script>
 (()=>{
  const root=document.documentElement, windows=[];
- let clicked=null, reopen='', reopenClick=null;
- // Remove the window name from the address before the page reads it.
- const named=location.hash.match(/(?:^#|&)console-window=([^&]*)/);
- if(named){
-  try{reopen=decodeURIComponent(named[1]);}catch(_){}
-  const hash=location.hash.replace(named[0],named[0].startsWith('#') ? '#' : '').replace(/^#&/,'#');
-  history.replaceState(history.state,'',location.pathname+location.search+(hash==='#' ? '' : hash));
- }
- document.addEventListener('click',event=>{
-  clicked=event.target instanceof Element ? event.target : null;
-  setTimeout(()=>{clicked=null;});
- },true);
- // A link that opens no window must not move the page.
- addEventListener('click',event=>{if(event===reopenClick) event.preventDefault();});
  // A page action button opens its dialog. When the dialog closes, focus goes back to the button.
  // A press on the copy inside the open dialog moves the focus to the first control of the dialog.
  document.addEventListener('click',event=>{
@@ -298,9 +283,7 @@ ACTIONS_SCRIPT = """<script>
    const copy=home.cloneNode(true);
    copy.toggleAttribute('data-page-window-actions',true);
    copy.querySelectorAll('[id]').forEach(node=>node.removeAttribute('id'));
-   // The control that opened the window names it in a screenshot address.
-   const launcher=clicked?.closest('[data-window-place],a[href]');
-   windows.push({dialog,copy,place:launcher ? launcher.dataset.windowPlace ?? launcher.getAttribute('href') : ''});
+   windows.push({dialog,copy});
    // The copy comes last, so the window keeps its own first focus.
    dialog.append(copy);
    // The window has its box only after it opens. The measure runs before the browser shows it.
@@ -317,33 +300,7 @@ ACTIONS_SCRIPT = """<script>
  addEventListener('scroll',()=>place(false),{passive:true});
  // A picture in a window gets its width when it loads.
  document.addEventListener('load',()=>place(),true);
- window.pageCapturePlace=(except)=>{
-  const address=location.pathname+location.search+location.hash;
-  const shown=windows.filter(entry=>entry.dialog!==except && entry.dialog.open).at(-1)?.place;
-  return shown ? address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent(shown) : address;
- };
- function openNamed(){
-  if(!reopen) return true;
-  let launcher=null;
-  try{
-   launcher=document.querySelector('[data-window-place="'+CSS.escape(reopen)+'"]')
-    || document.querySelector('a[href="'+CSS.escape(reopen)+'"]');
-  }catch(_){reopen='';return true;}
-  if(!launcher) return false;
-  reopen='';
-  reopenClick=new MouseEvent('click',{bubbles:true,cancelable:true,button:0,view:window});
-  launcher.dispatchEvent(reopenClick);
-  reopenClick=null;
-  return true;
- }
- if(reopen){
-  // The page can add its controls after it loads its data. The screenshot waits only for the load event.
-  const watch=new MutationObserver(()=>{if(openNamed()) watch.disconnect();});
-  document.addEventListener('DOMContentLoaded',()=>{
-   if(!openNamed()) watch.observe(root,{childList:true,subtree:true});
-  },{once:true});
-  addEventListener('load',()=>{openNamed();watch.disconnect();reopen='';},{once:true});
- }
+ window.pageCaptureWindows=()=>windows.map(entry=>entry.dialog);
  addEventListener('page-top-resize',()=>place());
 })();
 </script>"""
@@ -1259,11 +1216,11 @@ function showSendUndo(request,seconds,receiver,resumable,onExpiry){
   });
  });
 }
-async function heldFetch(url,{requestTimeoutSeconds,...init}={},receiver,onHold,holdId){
+async function heldFetch(url,{requestTimeoutSeconds,retryBody,...init}={},receiver,onHold,holdId){
  const postSignal=init.signal ?? (requestTimeoutSeconds===undefined ? undefined : AbortSignal.timeout(requestTimeoutSeconds*1000));
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
- const key=holdId ?? JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
+ const key=holdId ?? JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),retryBody ?? body]);
  const request=heldRequests.get(key) || trackHeldRequest(key,holdId ?? newHoldId());
  headers.set(SEND_REQUEST_HEADER,request.id);
  const keepalive=body.length<=KEEPALIVE_LIMIT && new TextEncoder().encode(body).length<=KEEPALIVE_LIMIT;
@@ -1298,7 +1255,8 @@ async function heldFetch(url,{requestTimeoutSeconds,...init}={},receiver,onHold,
  if(undo===true){request.finish();throw new SendUndone();}
  return readHeldResult(hold,request,undo,resumable,{requestTimeoutSeconds,undoExpired});
 }
-async function readHeldResult(hold,request,undo,resumable,{requestTimeoutSeconds,undoExpired=false,configuredUndoSeconds=0}){
+async function readHeldResult(hold,request,undo,resumable,
+ {requestTimeoutSeconds,undoExpired=false,configuredUndoSeconds=0}){
  let signal;
  if(requestTimeoutSeconds!==undefined){
   // A pending result does not give the remaining Undo time.

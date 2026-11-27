@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from functools import cache
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 
 from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
@@ -1192,12 +1192,43 @@ def _stage_initial_delivery(folder: Path, address: SubmissionAddress,
         atomic_file.sync_folder(folder)
 
 
-class ListFilingRoute(TypedDict):
+class ListFilingFields(TypedDict):
     keeper: staff.StaffId
     owner: staff.StaffId
     producer: staff.StaffId
-    unit: str
     source: str
+
+
+class ListFilingWithFixedUnit(ListFilingFields):
+    unit_kind: Literal["fixed-id"]
+    unit: Literal[""]
+    unit_id: staff.StaffId
+
+
+class LegacyListUnitName(str):
+    """The nonempty unit name from a legacy List filing plan."""
+
+    def __new__(cls, name: str) -> LegacyListUnitName:
+        if not name:
+            raise ValueError("A legacy List unit name must not be empty.")
+        return super().__new__(cls, name)
+
+
+class ListFilingWithLegacyUnit(ListFilingFields):
+    unit_kind: Literal["legacy-name"]
+    unit: LegacyListUnitName
+
+
+class ListFilingWithoutUnit(ListFilingFields):
+    unit_kind: Literal["no-unit"]
+    unit: Literal[""]
+
+
+type ListFilingRoute = ListFilingWithFixedUnit | ListFilingWithLegacyUnit | ListFilingWithoutUnit
+
+
+class NoListFilingUnit(Enum):
+    ABSENT = "no List unit"
 
 
 @dataclass(frozen=True)
@@ -1206,7 +1237,7 @@ class PendingProducerFiling:
 
     owner: staff.StaffId
     producer: staff.StaffId
-    unit: str
+    unit: staff.StaffId | LegacyListUnitName | NoListFilingUnit
     source: str
 
 
@@ -1218,15 +1249,20 @@ class ListFilingUnavailable:
     retry: ListCommandAssignee | ListWindowAssignee | PendingProducerFiling = ListWindowAssignee.RECIPIENT
 
 
+@dataclass(frozen=True)
+class UnavailableListProducerMapping(ListFilingUnavailable):
+    """The producer map cannot supply a producer for this filing."""
+
+
 def _list_filing_producer(member: staff.StaffRow, members: staff.StaffSnapshot
-                         ) -> staff.StaffRow | ListFilingUnavailable:
+                         ) -> staff.StaffRow | UnavailableListProducerMapping:
     """Use the nearest map row or producer on the owner chain without Git recovery."""
     config = conf.read(producer_map.STEM)
     if not isinstance(config.settings, dict) and config.settings.missing:
         repository = Path(__file__).resolve().parents[2] / "config" / f"{producer_map.STEM}.conf"
         config = conf.read(repository)
     if not isinstance(config.settings, dict):
-        return ListFilingUnavailable(f"Cannot read the producer map at {config.source}: {config.settings.reason}")
+        return UnavailableListProducerMapping(f"Cannot read the producer map at {config.source}: {config.settings.reason}")
 
     keys = {key.lower(): key for key in config.settings}
     producers = {row.id: row for row in staff.active(members, "producer")}
@@ -1244,13 +1280,14 @@ def _list_filing_producer(member: staff.StaffRow, members: staff.StaffSnapshot
         try:
             name = config.value(key, str, recover_invalid=False, allow_blank=True)
         except conf.Unusable as error:
-            return ListFilingUnavailable(f"Cannot read the producer map at {error}")
+            return UnavailableListProducerMapping(f"Cannot read the producer map at {error}")
         identity = staff.StaffId(name.lower())
         if identity in producers:
             return producers[identity]
         stale = members.by_id(identity)
-        return ListFilingUnavailable(producer_map.StaleRow(holder, stale.name if stale is not None else identity).reason())
-    return ListFilingUnavailable(f"{member.name} has no producer yet.")
+        reason = producer_map.StaleRow(holder, stale.name if stale is not None else identity).reason()
+        return UnavailableListProducerMapping(reason)
+    return UnavailableListProducerMapping(f"{member.name} has no producer yet.")
 
 
 def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipient: staff.StaffRow,
@@ -1269,9 +1306,18 @@ def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipi
     producer = _list_filing_producer(member, members)
     if isinstance(producer, ListFilingUnavailable):
         return replace(producer, retry=assignee)
-    unit = member.name if member.kind == "unit" else ""
-    return ListFilingRoute(keeper=keeper.id, owner=recipient.id, producer=producer.id,
-                           unit=unit, source=source)
+    unit = member.id if member.kind == "unit" else NoListFilingUnit.ABSENT
+    return _list_filing_route(keeper.id, recipient.id, producer.id, source, unit)
+
+
+def _list_filing_route(keeper: staff.StaffId, owner: staff.StaffId, producer: staff.StaffId, source: str,
+                       unit: staff.StaffId | LegacyListUnitName | NoListFilingUnit) -> ListFilingRoute:
+    fields = ListFilingFields(keeper=keeper, owner=owner, producer=producer, source=source)
+    if isinstance(unit, LegacyListUnitName):
+        return ListFilingWithLegacyUnit(**fields, unit_kind="legacy-name", unit=unit)
+    if unit is NoListFilingUnit.ABSENT:
+        return ListFilingWithoutUnit(**fields, unit_kind="no-unit", unit="")
+    return ListFilingWithFixedUnit(**fields, unit_kind="fixed-id", unit="", unit_id=unit)
 
 
 def assigned_member(assignment: new_item_dialog.Assignment, recipient: staff.StaffRow,
@@ -1290,8 +1336,7 @@ def _plan_producer_filing(filing: PendingProducerFiling,
     keeper = list_producer(conf.read_or_repository("console"), members)
     if isinstance(keeper, PageOwnerUnavailable):
         return ListFilingUnavailable("The List has no active producer.", filing)
-    return ListFilingRoute(keeper=keeper.id, owner=filing.owner, producer=filing.producer,
-                           unit=filing.unit, source=filing.source)
+    return _list_filing_route(keeper.id, filing.owner, filing.producer, filing.source, filing.unit)
 
 
 @dataclass(frozen=True)
@@ -1299,8 +1344,7 @@ class NoListFiling:
     """This request has no List row to write or skip."""
 
 
-def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUnavailable | NoListFiling:
-    """Read the saved List filing route or the assignee that still needs a route."""
+def _list_filing_fields(saved: SavedSubmission) -> dict[str, object] | NoListFiling:
     folder = _request_folder(saved.request_id)
     try:
         routing = (folder / "list-filing.json").read_text(encoding="utf-8")
@@ -1309,11 +1353,24 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
     fields = cast(object, json.loads(routing))
     if not isinstance(fields, dict):
         raise OSError(f"Invalid List route for request {saved.request_id}.")
-    values = cast(dict[str, object], fields)
-    if isinstance(values.get("skipped"), str):
+    return cast(dict[str, object], fields)
+
+
+def list_filing_was_skipped(saved: SavedSubmission) -> bool:
+    """Read the final decision to keep the saved note in Review."""
+    values = _list_filing_fields(saved)
+    return isinstance(values, dict) and isinstance(values.get("skipped"), str)
+
+
+def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUnavailable | NoListFiling:
+    """Read the saved List filing route or the assignee that still needs a route."""
+    values = _list_filing_fields(saved)
+    if isinstance(values, NoListFiling) or isinstance(values.get("skipped"), str):
         return NoListFiling()
     reason = values.get("unavailable")
     if isinstance(reason, str):
+        if values.get("producer_mapping_unavailable") is True:
+            return UnavailableListProducerMapping(reason)
         if "owner" in values:
             owner, producer = values["owner"], values.get("producer")
             unit, source = values.get("unit"), values.get("source")
@@ -1321,7 +1378,7 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
                     and isinstance(unit, str) and isinstance(source, str)):
                 raise OSError(f"Invalid List route for request {saved.request_id}.")
             return ListFilingUnavailable(reason, PendingProducerFiling(
-                staff.StaffId(owner), staff.StaffId(producer), unit, source))
+                staff.StaffId(owner), staff.StaffId(producer), _saved_list_filing_unit(unit, values, saved), source))
         assignee = (list_command_assignee(values["assignee"]) if "assignee" in values
                     else ListWindowAssignee.RECIPIENT)
         return ListFilingUnavailable(reason, assignee)
@@ -1330,13 +1387,25 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
     if not (isinstance(keeper, str) and isinstance(owner, str) and isinstance(producer, str)
             and isinstance(unit, str) and isinstance(source, str)):
         raise OSError(f"Invalid List route for request {saved.request_id}.")
-    return ListFilingRoute(keeper=staff.StaffId(keeper), owner=staff.StaffId(owner), producer=staff.StaffId(producer),
-                           unit=unit, source=source)
+    return _list_filing_route(staff.StaffId(keeper), staff.StaffId(owner), staff.StaffId(producer),
+                              source, _saved_list_filing_unit(unit, values, saved))
+
+
+def _saved_list_filing_unit(unit: str, values: dict[str, object], saved: SavedSubmission
+                            ) -> staff.StaffId | LegacyListUnitName | NoListFilingUnit:
+    if "unit_id" in values:
+        unit_id = values["unit_id"]
+        if unit or not isinstance(unit_id, str) or not unit_id:
+            raise OSError(f"Invalid List unit reference for request {saved.request_id}.")
+        return staff.StaffId(unit_id)
+    return LegacyListUnitName(unit) if unit else NoListFilingUnit.ABSENT
 
 
 def retry_list_filing_route(saved: SavedSubmission, unavailable: ListFilingUnavailable,
                             members: staff.StaffSnapshot) -> ListFilingRoute:
     """Resolve the assignee again and save the route before reserving a List number."""
+    if isinstance(unavailable, UnavailableListProducerMapping):
+        raise new_item_dialog.PermanentListFilingRefusal(unavailable.reason)
     retry = unavailable.retry
     if isinstance(retry, PendingProducerFiling):
         route = _plan_producer_filing(retry, members)
@@ -1345,6 +1414,8 @@ def retry_list_filing_route(saved: SavedSubmission, unavailable: ListFilingUnava
         if recipient is None:
             raise OSError(f"The recipient for {saved.id} is unavailable.")
         route = _plan_list_filing(retry, recipient, members)
+    if isinstance(route, UnavailableListProducerMapping):
+        raise new_item_dialog.PermanentListFilingRefusal(route.reason)
     if isinstance(route, ListFilingUnavailable):
         raise OSError(f"Cannot file {saved.id} on the List: {route.reason}")
     _write_request_file(_request_folder(saved.request_id) / "list-filing.json", route)
@@ -1361,6 +1432,25 @@ def skip_list_filing(saved: SavedSubmission, reason: str) -> None:
     list_filing_reservation(saved).unlink(missing_ok=True)
     _write_request_file(_request_folder(saved.request_id) / "list-filing.json", {"skipped": reason})
     print(f"Review List filing {saved.id}: {reason}", file=sys.stderr)
+
+
+def _finish_skipped_native_report(saved: SavedSubmission, record: investigation.Investigation
+                                  ) -> investigation.Investigation:
+    """Complete a saved decision to send the notice from Review."""
+    reservation = list_filing_reservation(saved)
+    reservation.unlink(missing_ok=True)
+    atomic_file.sync_folder(reservation.parent)
+    store = investigation.Investigations(record.owner, "investigations", "I", "investigation",
+                                         investigation.InvestigationError)
+    fields, body = store.read(record.id, path=saved.path)
+    origin = cast(dict[str, object], json.loads(fields["review_submission"]))
+    if reply_proofs.has_legacy_submission(origin):
+        raise investigation.InvestigationError("Move the reply proof before editing this note.")
+    _ = fields.pop("purpose")
+    with investigation.investigation_numbers() as numbers:
+        with numbers.write(saved.path, record.id, record.owner, folder=store.folder()):
+            store.write(record.id, fields, body, path=saved.path)
+    return replace(record, purpose=investigation.InvestigationPurpose.INVESTIGATE)
 
 
 @dataclass(frozen=True)
@@ -2533,7 +2623,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None, lim
                 if isinstance(initial_delivery, InitialDelivery):
                     source = ("nate via /new_item" if isinstance(notice, new_item_dialog.SubmissionNotice)
                               and notice.from_command else "nate via New item")
-                    unit = member.name if member.kind == "unit" else ""
+                    unit = member.id if member.kind == "unit" else NoListFilingUnit.ABSENT
                     route = _plan_producer_filing(PendingProducerFiling(member.id, recipient.id, unit, source), current)
             elif list_page_request and isinstance(initial_delivery, InitialDelivery):
                 route = _plan_list_filing(initial_delivery.list_assignee, recipient, current)
@@ -2576,15 +2666,21 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None, lim
                     _write_draft_index(folder, ClaimedDraft(saved))
                 _write_location(pending_file, saved)
                 if isinstance(route, dict):
-                    _write_request_file(folder / "list-filing.json", route)
-                elif isinstance(route, ListFilingUnavailable):
-                    fields = {"unavailable": route.reason}
-                    retry = route.retry
-                    if isinstance(retry, ListCommandAssignee):
-                        fields["assignee"] = retry.id
-                    elif isinstance(retry, PendingProducerFiling):
-                        fields.update(owner=retry.owner, producer=retry.producer, unit=retry.unit, source=retry.source)
+                    fields = {key: value for key, value in route.items() if key != "unit_kind"}
                     _write_request_file(folder / "list-filing.json", fields)
+                elif isinstance(route, ListFilingUnavailable):
+                    pending_route: dict[str, object] = {"unavailable": route.reason}
+                    retry = route.retry
+                    if isinstance(route, UnavailableListProducerMapping):
+                        pending_route["producer_mapping_unavailable"] = True
+                    elif isinstance(retry, ListCommandAssignee):
+                        pending_route["assignee"] = retry.id
+                    elif isinstance(retry, PendingProducerFiling):
+                        pending_route.update(owner=retry.owner, producer=retry.producer, source=retry.source)
+                        pending_route["unit"] = retry.unit if isinstance(retry.unit, LegacyListUnitName) else ""
+                        if isinstance(retry.unit, str) and not isinstance(retry.unit, LegacyListUnitName):
+                            pending_route["unit_id"] = retry.unit
+                    _write_request_file(folder / "list-filing.json", pending_route)
                 if isinstance(list_preview, RequestedListPreview) and isinstance(screenshot, new_item_dialog.PageScreenshot):
                     _write_request_file(folder / "list-preview.json",
                                         {"key": list_preview.key, "digest": screenshot.digest})
@@ -2601,6 +2697,15 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None, lim
                     found = _read_native_submission(address, saved.path, saved.owner)
                     if isinstance(found, LocatedSubmission):
                         _check_same_request(found.destination, request, payload_hash, draft=legacy_draft)
+                        if isinstance(found.details.reply_proof, reply_tokens.MissingReplyProof):
+                            # The note can exist after a temporary file cleanup error.
+                            identity = found.details.proof_identity(found.destination.id)
+                            with reply_proofs.publishing(identity, reply_proofs.NoteProof(reply=proof), moving=True):
+                                pass
+                            restored = _read_native_submission(address, saved.path, saved.owner)
+                            if not isinstance(restored, LocatedSubmission):
+                                raise OSError("The saved Review record is unavailable.")
+                            found = restored
                         filed = replace(found.destination, browser_token_digest=saved.browser_token_digest)
                         return _complete_receipt(folder, filed, saved, found.record, first_send=True)
                 _discard_unfiled_send(folder)
@@ -2627,9 +2732,30 @@ class SavedSubmissionMissing(SubmissionError):
 def submission_for_delivery(address: SubmissionAddress) -> Generator[LocatedSubmission | NoNativeSubmission]:
     """Read the current native owner under the same locks as a move."""
     with _locked_request(address) as lookup:
-        if isinstance(lookup.native, NoNativeSubmission) and isinstance(lookup.hint, UnreadableRequestFile):
+        located = lookup.native
+        if isinstance(located, NoNativeSubmission) and isinstance(lookup.hint, UnreadableRequestFile):
             raise lookup.hint.error
-        yield lookup.native
+        if not isinstance(located, LocatedSubmission) or not isinstance(located.record, investigation.Investigation):
+            yield located
+            return
+        record = located.record
+        if not record.belongs_on_list or isinstance(record.list_destination, investigation.ListDestination):
+            yield located
+            return
+        saved = located.saved()
+        if list_filing_was_skipped(saved):
+            yield replace(located, record=_finish_skipped_native_report(saved, record))
+            return
+        try:
+            yield located
+        except (OSError, new_item_dialog.PermanentListFilingRefusal) as error:
+            refusal = error if isinstance(error, new_item_dialog.PermanentListFilingRefusal) else error.__cause__
+            if not isinstance(refusal, new_item_dialog.PermanentListFilingRefusal):
+                raise
+            reason = str(refusal)
+            _write_request_file(_request_folder(saved.request_id) / "list-filing.json", {"skipped": reason})
+            _ = _finish_skipped_native_report(saved, record)
+            print(f"Review List filing {saved.id}: {reason}", file=sys.stderr)
 
 
 @contextmanager

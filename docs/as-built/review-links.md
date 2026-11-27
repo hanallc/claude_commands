@@ -595,7 +595,17 @@ That function returns `/console/rebuilds.html`.
 `?page=rebuilds` still selects that page for commit details.
 The shell refreshes its grouped details while that page is visible.
 The status line shows session counts under `Review:`.
-It names waiting rebuilds and counts other open actions under `For you:`.
+The question count includes questions from staff that wait for Nate's answer.
+The same count includes questions from Nate that wait for the session's answer.
+Review saves the delivery recipient with each pending follow-up.
+The footer uses that recipient for the count.
+For older follow-ups without a saved recipient, the footer uses the question's relay.
+Older questions from New item use the record owner.
+Ask question in Review sends to the showrunner.
+Followup on the legacy Questions form uses the question's relay.
+When staff answer a question from Nate, Review shows the answer under Responses and the footer count drops.
+The List's other-page counts include only questions that wait for Nate.
+The status line names waiting rebuilds and counts other open actions under `For you:`.
 `assignment.py` reads both rows before it replaces itself with jq.
 The Mac requests `/console/for-you.json?view=count` for the rebuild machines and counts without command text.
 The `for_you.host` setting in `console.conf` names the Tailscale peer that serves this data.
@@ -906,19 +916,30 @@ If a named local document cannot be read, Send reports the reason and leaves the
 Send checks native ID allocation and reads the folder registry before it saves a request binding or an image.
 The page owner dialog lists the evidence under **Sent with your words**.
 The server starts a screenshot when the dialog opens with **Include a screenshot** selected.
-The screenshot shows the page as the user sees it, with the window under New item open.
-`window.pageCapturePlace()` adds `console-window=NAME` to the address for the top open window.
-NAME is the `data-window-place` value or the `href` of the control that opened the window.
-When the page loads, the frame removes the parameter from the address and clicks that control again.
-A link that the frame clicks again does not move the page.
-A Review or List row that is open keeps its own place in the address (`item=`).
+The browser copies the live document before it opens New item.
+The copy keeps open rows, open windows, loaded text, form values, canvas pixels, scroll positions, and the focus ring.
+The copy omits page scripts and the New item window.
+The server renders the copy in Firefox at the same viewport size and theme.
+The console address supplies the base for relative asset paths.
+The server restores scroll positions and focus after layout.
+The browser compresses the copy with gzip.
+The screenshot uses a maximum of 5 MiB of compressed data and 32 MiB of decompressed HTML.
+If the snapshot exceeds either limit, Send uses page data and visible text.
+The draft keeps one copy of the snapshot while editing or sending.
+Closing the draft or confirming a filing releases the browser snapshot and its page context.
+If a filing leaves edits in the dialog, the next draft captures fresh page data and a fresh snapshot.
+Closing the draft aborts the preview upload and polling. The browser asks the server to discard the unfiled capture by key.
+Expiry removes an unfiled capture if the discard request reaches the server before it reserves the key.
+A retry after closing uses the saved capture key and viewport.
 The dialog keeps **Send** available while it takes the screenshot.
 Send uses page data if the preview is still pending.
 Send saves the capture intent with the native item and links the List draft to it.
 The capture key belongs to the browser draft, even when The List saves a different request ID.
-The server recreates a missing capture lookup from the native item after a restart.
+The private capture store retains the snapshot until Firefox finishes or the capture expires.
+After a restart, it resumes a pending snapshot from that store.
+If the screenshot is already attached, the server can restore a missing lookup from the native item.
 The item retains its page data if the screenshot is unavailable.
-An invalid capture object, address, or viewport makes the screenshot unavailable.
+An invalid snapshot, source address, or viewport makes the screenshot unavailable.
 An address for a different page also makes the screenshot unavailable.
 Send rejects an invalid capture key or a key that belongs to another draft or item.
 The server attaches the screenshot when the capture finishes, even if you leave the page.
@@ -1609,11 +1630,19 @@ Owner is the recipient.
 The command sends the assignee ID so the server can find the producer and unit.
 For a List window Send, the server uses the recipient's producer.
 Send reads the producer map from disk without Git recovery.
-If the server cannot read a usable map or find a producer, it files the Review item and sends the notice.
-The same path applies if the producer retires before the List write.
+If the producer map cannot supply a producer, the server keeps the saved note in Review and sends its notice.
+The same path applies if a readable staff record has no producer row for the saved producer.
+For a Review item with a separate List row, the same path applies if that producer retires.
 The server logs the reason it skipped the List row.
-The command saves its draft ID and recipient before the POST.
-While the result is uncertain, a retry sends the saved ID and recipient before any routing checks for a new filing.
+The window keeps the dialog open and names the saved Review item if it could not file a List row.
+The command reports the same result.
+The command saves its draft ID, recipient ID, and assignee ID before the POST.
+A retry of the same command uses those saved IDs even if the assignee name changes.
+The saved assignee ID can recover a draft after removal of the staff row.
+A legacy draft matches the same request by the typed reference, normalized reference, or resolved staff ID.
+The command refuses a matching legacy draft if its filename cannot prove the assignee ID.
+The command ignores other legacy drafts.
+The server resolves the assignee by ID if the first request did not file.
 The command clears the draft after success or a confirmed refusal before filing.
 The result names the type and assignee.
 It includes the List number if the server filed a row.
@@ -1639,7 +1668,7 @@ The page uses the order from the latest server response.
 A column button sorts all matching items by its values.
 A second click reverses that order.
 
-By default, the List starts with All selected in the Owner, Producer, and Show rows.
+By default, the List starts with All selected in the Owner, Producer, Tag, and Show rows.
 Owner and Producer list staff in name order after All and omit every trailing `-unit` from names.
 If the resulting name is empty, the chip shows the original staff ID.
 The address keeps the original staff IDs, including `all` when it identifies a staff member.
@@ -1653,6 +1682,35 @@ The List restores these words on reload.
 The List ignores form text that the browser restores without an input event.
 The chip order is All, Needs me, Producer answering, Working, Blocked, Parked, and Scheduled.
 The List excludes Closed records from rows, filters, and counts.
+
+Tags appear as chips under each item title.
+The Tag row counts open items that match the words and the other filters.
+The server applies the `tag` query before the first paint.
+The server and browser ignore query tags that contain control characters or lone surrogates.
+Select a chip in the Tag row or under a title to filter the items.
+Each item must have every selected tag.
+Type the first letters of a tag to find it in the suggestions.
+Select All in the Tag row to clear the tag selection.
+
+Opening an item creates its Tags section from a shared template.
+The editor reuses signed List action data when the item has it.
+Otherwise, it requests signed data for the keeper and item when the item opens.
+The Tags section appears before Links.
+Type a tag and press Enter, or select a suggestion.
+The suggestions show matching tags first and offer Create for a new tag.
+The field keeps focus after a save.
+The field shows the tag validation error for invalid text.
+Tags cannot contain Unicode control characters (`Cc`) or lone surrogates (`Cs`).
+Select × to remove a tag, or press Backspace in the empty field to remove the last tag.
+The editor offers Undo only for a removal that the server confirms.
+If another session already removed the tag, the editor shows the current tags.
+Select Undo before the notice fades to add the tag again.
+The same signed List action path uses `the_list.add_tag` and `the_list.remove_tag` to save the record header.
+The List sends tag edits for one item in order and shows the pending count.
+Backspace uses the tag order after the pending edits.
+If a save fails, the List reads the item's current tags.
+The editor shows a save error only for the latest edit.
+
 Parked includes items with an active park, no unread answer, and no open Go request.
 Needs me includes each item with an unread answer or an open Go request.
 It also includes each unparked item with an unread delivery release.
@@ -1723,6 +1781,7 @@ Old records without the reviews field load with no links.
 Each List record stores a `producer`: the fixed staff ID of a staff row with the producer role.
 `the_list.py add` and `update` take `--producer <name or staff id>`.
 The option refuses a name or ID that does not resolve to exactly one current producer row.
+New assignments, batch creation, and reopen require a current producer staff row.
 Morty's adds without `--producer` assign the item to morty.
 Another producer's adds without `--producer` assign the item to the caller.
 That producer can name only itself in `--producer`.
@@ -2982,10 +3041,16 @@ Send and Retry attempt the saved copy even when an assignment notice needs a ret
 The copy omits the main recipient's reply command.
 Retry sends only copies whose delivery is unconfirmed.
 For a List Send, the server saves the List route before it writes the native record.
+The route stores the unit ID. The List write reads the current unit name from the staff record.
+Pending routes with only a unit name retain the name saved with the route.
 The server holds the recipient locks while it reserves a List number and saves the linked row.
 It releases the recipient locks before it takes the delivery lock.
 Recovery reuses the reserved number if the process stops during the List write or before the notice claim.
-If the producer retires before the row saves, recovery logs the reason, skips the row, and sends the notice.
+If the saved producer retires before a native List report files, recovery keeps its purpose, route, and reservation.
+If a readable staff record has no row for the saved producer, recovery skips the List row and clears its reservation.
+Recovery keeps the saved note in Review and sends its notice.
+For a Review item with a separate List row, recovery skips the row if its producer retires and sends the notice.
+Recovery logs the reason for the skip.
 If the staff authority is temporarily unavailable, the server leaves the List write and notice pending.
 Recovery still clears the first-message markers for items that already have an answer.
 The delivery claim reads the native owner under the same lock as wrap.
@@ -3189,9 +3254,12 @@ A change browser answer goes back in the list with an **Open it** button.
 Undo after Unpark restores the row to Parked.
 Held Unpark hides a linked parked row during the hold. Undo restores the row and its link.
 Undo returns to a skipped question if the user stays at the next question.
-The page tracks the request from the first POST until the server confirms the result or Undo.
+The page tracks the request from the first POST until it receives a held result or confirms Undo.
 The action POST uses `keepalive` for bodies of 64 KiB or less. Larger bodies use a regular POST.
 If the keepalive POST rejects before a response, the page retries once without `keepalive` and uses the same request ID.
+The page also keeps the request ID after a direct 5xx response to the POST.
+The page stops retrying the same hold after two minutes.
+The page keeps this limit for a missing result unless the action has its own saved hold ID.
 When the console page or the card frame closes, the page removes the toast and posts `/send-hold/<id>/send`.
 The server sends the request at once. If the release arrives first, the server records it until the POST arrives.
 A failed Undo leaves release on close active.
@@ -3207,6 +3275,9 @@ The toast still reads the result and shows any delivery failure.
 The page reads `GET /send-hold/<id>`, with the same Tailscale and origin checks as the New item options.
 The server answers 202 with `X-Send-Hold: pending` until the send ends.
 It then gives the saved response, so each page shows its normal result.
+A repeated POST to a released hold gives zero Undo time. The next read returns the cached result.
+A retry after a held save returns a failure starts a new hold with the full Undo time.
+The automatic Park retry keeps the signed form and starts a new hold after it receives a failed save result.
 A read that loses its connection tries again each second. After 30 failed reads, the page shows the error.
 A failed connection to itself gives a 503 result.
 Before the replay, the server writes a 503 result: "The send may have left. Check before you send again."
@@ -3223,8 +3294,11 @@ If the server cannot write the result after a replay, the page reads that result
 After a restart, that page reads "may have left".
 If the server cannot write the undone mark, the Undo answers 503 and the send still leaves.
 A page can read a result again until the sweep deletes it, 10 minutes after the send.
-A New item that waited through a restart gets the stale token answer. The Studio shows it.
-Other pages load a new token and send again, with a new Undo time.
+A held New item with current authorization uses the new token after a server restart.
+A New item hold that needs authorization waits for a valid token.
+After a lost response, the browser can submit the new token with the same hold ID.
+A received stale token result ends the browser hold.
+New item keeps the draft ID across holds and retries unconfirmed delivery for the same filed item.
 The `.review-link-` prefix keeps the folder private: a GET of a saved request gets 404.
 An undo needs the console host and origin, as other POST requests do.
 

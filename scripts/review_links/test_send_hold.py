@@ -12,7 +12,7 @@ import time
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest.mock import patch
 
 from scripts.review_links import page_frame, send_hold
@@ -479,6 +479,73 @@ UNDO_CORNER_PROBE = r"""<script>
 
 
 class HeldSendScriptTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_a_direct_draft_conflict_ends_the_hold_attempt(self) -> None:
+        self.check_a_received_refusal_ends_the_hold_attempt("post-conflict")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_a_held_draft_conflict_ends_the_hold_attempt(self) -> None:
+        self.check_a_received_refusal_ends_the_hold_attempt("held-conflict")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_a_received_token_refusal_ends_the_hold_attempt(self) -> None:
+        self.check_a_received_refusal_ends_the_hold_attempt("held-token-refusal")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_a_direct_503_keeps_the_hold_attempt_until_its_limit(self) -> None:
+        probe = r"""<script>
+(async()=>{
+ const realFetch=window.fetch.bind(window),posts=[],failures=[];
+ const send=()=>heldFetch('/new-item',{method:'POST',body:'words'});
+ window.fetch=async(path,options)=>{
+  posts.push(new Headers(options.headers).get('X-Undo-Request'));
+  return Response.json({filed:true},{status:503});
+ };
+ if((await send()).status!==503 || (await send()).status!==503)
+  failures.push('Both attempts return the direct 503 response.');
+ const now=Date.now.bind(Date);
+ Date.now=()=>now()+121000;
+ const failure=await send().then(()=>'',error=>error.message);
+ if(failure!=='The retry time ended. The send may have left.' || posts.length!==2 || posts[0]!==posts[1])
+  failures.push('A direct 503 keeps the hold ID and its time limit.');
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})().catch(error=>fetch('/results',{method:'POST',body:JSON.stringify([String(error)])}));
+</script>"""
+        page = f"<!doctype html><html><body><script>{page_frame.HELD_SEND_SCRIPT}</script>{probe}</body></html>"
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    def check_a_received_refusal_ends_the_hold_attempt(
+        self, case: Literal["post-conflict", "held-conflict", "held-token-refusal"],
+    ) -> None:
+        probe = r"""<script>
+(async()=>{
+ const realFetch=window.fetch.bind(window),posts=[],failures=[];
+ const scenario=SCENARIO,stale=scenario==='held-token-refusal';
+ const refusal=()=>stale
+  ? Response.json({code:'stale_token'},{status:403,headers:{'X-Send-Hold':'retry'}})
+  : Response.json({code:'draft_pending'},{status:409});
+ window.fetch=async(path,options={})=>{
+  if(options.method==='POST'){
+   const hold=new Headers(options.headers).get('X-Undo-Request');
+   posts.push(hold);
+   if(posts.length===1 && scenario==='post-conflict') return refusal();
+   return Response.json({hold,seconds:0},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  if(posts.length===1) return refusal();
+  return Response.json({saved:true});
+ };
+ const send=()=>heldFetch('/new-item',{method:'POST',body:'words'});
+ if((await send()).status!==(stale ? 403 : 409)) failures.push('The first attempt returns the refusal.');
+ const now=Date.now.bind(Date);
+ Date.now=()=>now()+121000;
+ if(!(await send()).ok) failures.push('The next attempt can send.');
+ if(posts.length!==2 || posts[0]===posts[1]) failures.push('The next attempt uses a new hold.');
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})().catch(error=>fetch('/results',{method:'POST',body:JSON.stringify([String(error)])}));
+</script>""".replace("SCENARIO", json.dumps(case))
+        page = f"<!doctype html><html><body><script>{page_frame.HELD_SEND_SCRIPT}</script>{probe}</body></html>"
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_the_undo_toast_uses_the_bottom_right_corner(self) -> None:
         script = f"<script>{page_frame.HELD_SEND_SCRIPT}</script>"

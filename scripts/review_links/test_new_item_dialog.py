@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -21,7 +22,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import run_process_group
 from scripts.production import investigation, staff
 from scripts.review_links import (console_theme, new_item_dialog, page_frame, reply_tokens, review_page,
-                                  review_submissions, serve)
+                                  review_submissions)
 from scripts.review_links.browser_test_support import firefox_probe_results
 from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, identify_fixture_image
 
@@ -103,6 +104,7 @@ async function open({kind, page = 'builds'} = {}) {
   });
   observer.observe(loading, {attributes:true, attributeFilter:['hidden']});
  });
+ await dialog.waitForPageSnapshotForTest();
  if (kind) selectType(kind);
 }
 const closeToLauncher = () => !dialog.open && document.activeElement === launch;
@@ -138,6 +140,17 @@ async function confirmEarlierSend() {
  const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
  send.click();
  return await saved;
+}
+function whenSendReady() {
+ if (!send.disabled) return Promise.resolve();
+ return new Promise(resolve => {
+  const observer = new MutationObserver(() => {
+   if (send.disabled) return;
+   observer.disconnect();
+   resolve();
+  });
+  observer.observe(send, {attributes:true,attributeFilter:['disabled']});
+ });
 }
 async function sendSaved() {
  const created = new Promise((resolve, reject) => {
@@ -237,6 +250,7 @@ async function sendSaved() {
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);
     const payload = JSON.parse(options.body);
     if (payload.page_capture) return Promise.resolve(Response.json({error:'No Firefox.'}, {status:503}));
+    if (payload.discard_capture) return Promise.resolve(Response.json({}));
     attempted.push(payload);
     if (attempted.length === 1) {
      return Promise.resolve(new Response(
@@ -300,6 +314,11 @@ async function sendSaved() {
      return Promise.reject(new Error('The Send response was lost.'));
     }
     const payload = JSON.parse(options.body);
+    if (payload.discard_capture) {
+     ownerPosts.push(payload);
+     discarded?.();
+     return json({});
+    }
     ownerPosts.push(payload);
     if (payload.page_capture) {
      if (restartScenario) {
@@ -307,10 +326,6 @@ async function sendSaved() {
       previewGate = Promise.resolve();
      }
      return pngAvailable ? json({capture_key: captureKey}, 202) : json({error:'No Firefox.'}, 503);
-    }
-    if (payload.discard_capture) {
-     discarded?.();
-     return json({});
     }
     if (expireNextSend) {
      expireNextSend = false;
@@ -406,7 +421,7 @@ async function sendSaved() {
    await sendOwner();
    const capturedSend = ownerPosts.at(-1);
    check(beforeCapturedSend === 3 && requestsSince(beforeCapturedSend) === 'capture,discard,send' &&
-         ownerPosts[beforeCapturedSend + 1].discard_capture === captureKey &&
+         discardsSince(beforeCapturedSend).every(post => captures.some(capture => capture.capture_key === post.discard_capture)) &&
          capturedSend.capture_key === captureKey && capturedSend.images.length === 0 &&
          capturedSend.evidence.kind === 'none',
          'Send includes the new capture without the fallback rows.' + ' Requests: ' + requestsSince(beforeCapturedSend));
@@ -420,7 +435,8 @@ async function sendSaved() {
    const skipped = ownerPosts.findLast(post => post.request_id);
    check(requestsSince(beforeSkipped) === 'capture,capture,discard,discard,send' &&
          !skipped.capture_key && skipped.evidence.kind === 'none' &&
-         discardsSince(beforeSkipped).every(post => post.discard_capture === captureKey),
+         discardsSince(beforeSkipped).every(post =>
+          ownerPosts.some(capture => capture.page_capture && capture.capture_key === post.discard_capture)),
          'Send with the box unchecked discards the capture.' + ' Requests: ' + requestsSince(beforeSkipped));
 
    const beforeCancel = ownerPosts.length;
@@ -430,7 +446,8 @@ async function sendSaved() {
    dialog.querySelector('[data-cancel]').click();
    await canceled;
    check(requestsSince(beforeCancel) === 'capture,capture,discard,discard' &&
-         ownerPosts.at(-1).discard_capture === captureKey && !dialog.open,
+         discardsSince(beforeCancel).every(post =>
+          ownerPosts.some(capture => capture.page_capture && capture.capture_key === post.discard_capture)) && !dialog.open,
          'Closing the dialog discards the capture.' + ' Requests: ' + requestsSince(beforeCancel));
 
    pngAvailable = false;
@@ -443,9 +460,10 @@ async function sendSaved() {
    const beforeFallback = ownerPosts.length;
    await openOwner();
    await sendOwner();
-   const fallbackSend = ownerPosts.at(-1);
+   const fallbackSend = ownerPosts.findLast(post => post.request_id);
    const fallback = fallbackSend.evidence;
-   check(requestsSince(beforeFallback) === 'capture,capture,capture,send' && !fallbackSend.capture_key && fallback.kind === 'page-data' &&
+   check(ownerPosts.slice(beforeFallback).filter(post => post.request_id).length === 1 &&
+         !fallbackSend.capture_key && fallback.kind === 'page-data' &&
          fallback.rows.some(row=>row.includes('hana nextest')), 'No Firefox sends visible rows.' + ' Requests: ' + requestsSince(beforeFallback));
    const running = fallback.sections?.find(section => section.label === 'Running');
    check(running?.columns[0] === 'Step' && running.columns[1] === 'Stage' &&
@@ -471,7 +489,7 @@ async function sendSaved() {
          ownerPosts.length === at + 2 && ownerPosts[at].kind === 'question' &&
          ownerPosts[at].capture_key === oldKey && ownerPosts[at].token !== ownerToken &&
          ownerPosts[at + 1].token === ownerToken &&
-         ownerPosts[at + 1].page_capture.place === previousCapture.place,
+         ownerPosts[at + 1].page_capture.document_gzip === previousCapture.document_gzip,
          'The restart keeps the Question words and takes a screenshot with the new token.');
    releasePreview();
    await whenShown(shot);
@@ -513,6 +531,7 @@ async function sendSaved() {
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    type('Keep this draft and its image.');
    paste();
+   await whenShown(noScreenshot);
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'The page Send files before the response is lost.');
    const ownerRequest = ownerPosts.findLast(post => post.request_id);
@@ -530,6 +549,7 @@ async function sendSaved() {
    const retried = ownerPosts.findLast(post => post.request_id);
    check(JSON.stringify(retried) === JSON.stringify(ownerRequest),
          'Retry sends the original ID, page, and pasted image.');
+   await whenSendReady();
    check((await sendSaved()).detail.id === 'I3' &&
          ownerPosts.findLast(post => post.request_id).request_id !== ownerRequest.request_id &&
          ownerPosts.findLast(post => post.request_id).images[0].base64_data === png,
@@ -538,9 +558,10 @@ async function sendSaved() {
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    type('The first item before replacement.');
    dropPageReply = true;
+   await whenShown(noScreenshot);
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'The first item files before the response is lost.');
-   const firstDraft = ownerPosts.at(-1);
+   const firstDraft = ownerPosts.findLast(post => post.request_id);
    stageLaterEdit(() => {
     type('The replacement item.');
     to()[1].click();
@@ -551,10 +572,12 @@ async function sendSaved() {
          to().find(input => input.checked).value === firstDraft.recipient_id,
          'Reopen locks the submitted recipient and words.');
    check((await confirmEarlierSend()).detail.id === 'I4' && dialog.open &&
-         textarea.value === 'The replacement item.' && to()[1].checked,
+         textarea.value === 'The replacement item.',
          'Retry confirms the saved ID and restores the changed recipient and words.');
    check(JSON.stringify(ownerPosts.findLast(post => post.request_id)) === JSON.stringify(firstDraft),
          'Retry uses the original payload.');
+   await whenSendReady();
+   check(to()[1].checked, 'The replacement retains the selected recipient.');
    const replacement = (await sendSaved()).detail;
    check(replacement.id === 'I5' && ownerPosts.at(-1).request_id !== firstDraft.request_id,
          'The next Send files the changed words for the selected recipient.');
@@ -575,12 +598,12 @@ async function sendSaved() {
    pageTitle.textContent = 'First queue state';
    await openOwner();
    const firstReport = (await sendOwner()).detail;
-   const firstReportRequest = ownerPosts.at(-1);
+   const firstReportRequest = ownerPosts.findLast(post => post.request_id);
    pageTitle.textContent = 'Second queue state';
    await openOwner();
    const secondReport = (await sendOwner()).detail;
    check(firstReport.id !== secondReport.id, 'F015 files a new item after a confirmed Send.');
-   check(firstReportRequest.request_id !== ownerPosts.at(-1).request_id, 'F015 starts a new draft ID after success.');
+   check(firstReportRequest.request_id !== ownerPosts.findLast(post => post.request_id).request_id, 'F015 starts a new draft ID after success.');
    await openOwner();
    morty().click();
    dialog.querySelector('[name="kind"][value="investigation"]').click();
@@ -609,6 +632,7 @@ async function sendSaved() {
     const retry = ownerPosts.findLast(post => post.request_id);
     check(JSON.stringify(retry) === JSON.stringify(first), 'Retry sends the submitted screenshot choice and kind.');
     if (!checked) await whenShown(shot);
+    await whenSendReady();
     await sendSaved();
     const next = ownerPosts.findLast(post => post.request_id);
     check(next.request_id !== first.request_id && Boolean(next.capture_key) === !checked &&
@@ -655,6 +679,7 @@ async function sendSaved() {
     if (url === '/console/review/new-item' && options?.method === 'POST') {
      const payload = JSON.parse(options.body);
      if (payload.page_capture) return json({error:'No Firefox.'}, 503);
+     if (payload.discard_capture) return json({});
      listPosts.push(payload);
     }
     return originalFetch(url, options);
@@ -856,6 +881,12 @@ OWNER_OPTIONS_PROBE = r"""
 """
 
 
+SNAPSHOT_READY_HOOK = (
+    b" dialog.waitForPageSnapshotForTest = () => pageCapture.status === 'preparing' ? pageCapture.ready : undefined;\n"
+    b" return draft;"
+)
+
+
 RESTORED_SEND_PROBE = r"""
 (async () => {
  const failures = [];
@@ -912,7 +943,7 @@ RESTORED_SEND_PROBE = r"""
   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
  }
  try {
-  button.closest('[data-page-owner]').dataset.pageOwner = original ? 'review' : '__FIRST_PAGE__';
+  button.closest('[data-page-owner]').dataset.pageOwner = original && !captureChoice ? 'review' : '__FIRST_PAGE__';
   button.click();
   const include = dialog.querySelector('[name="include_page"]');
   const withCapture = captureChoice || deferred;
@@ -997,10 +1028,21 @@ RESTORED_SEND_PROBE = r"""
           'Retry preserves the draft ID, words, images, and page data after the screenshot choice.');
     check(scenario === 'omit' ? !capture_key && !defer_capture
      : capture_key !== previousKey && capture_key.startsWith(original.request_id) &&
-       defer_capture.place === new URL(original.page_state.url).pathname + new URL(original.page_state.url).search,
-     'Retry uses the chosen screenshot action for the original page.');
+       defer_capture.place === location.pathname && !!defer_capture.document_gzip,
+     'Retry uses the chosen action with a snapshot of the open page.');
    } else {
-    check(JSON.stringify(posted) === JSON.stringify(original), 'Retry sends the original payload.');
+    const requestFields = ({defer_capture, ...payload}) => {
+     if (!defer_capture) return payload;
+     const {document_gzip, ...request} = defer_capture;
+     return {...payload, defer_capture:request};
+    };
+    check(JSON.stringify(requestFields(posted)) === JSON.stringify(requestFields(original)),
+          'Retry sends the original fields and capture key.');
+    if (original.defer_capture) {
+     check(scenario === 'reopen' ? !posted.defer_capture.document_gzip
+         : posted.defer_capture.document_gzip === original.defer_capture.document_gzip,
+           'Retry keeps the snapshot bytes only until the dialog closes.');
+    }
    }
    if (warning) {
     const done = dialog.querySelector('[data-done]');
@@ -1015,6 +1057,7 @@ RESTORED_SEND_PROBE = r"""
     done.click();
    }
    if (deferred) {
+    await ready(() => !!recipient('builds-staff') && !send.disabled);
     check(dialog.open && !words.readOnly && words.value === 'Keep my later edit.' && recipient('builds-staff').checked,
           'The later edits return in a separate draft after the receipt.');
     const next = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
@@ -1043,8 +1086,10 @@ def fixture_page(width: int, *, photo: bool, script: str = PROBE) -> bytes:
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Builds</title>'
             f'<style>{console_theme.CSS}</style></head><body>{SHELL}</body></html>').encode()
     owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
-    return page_frame.with_owner(page, "builds", owner, staff.StaffSnapshot((owner,)), new_item_dialog.render).replace(
-        b'</body>', b'<script>' + probe.encode() + b'</script></body>')
+    rendered = page_frame.with_owner(page, "builds", owner, staff.StaffSnapshot((owner,)), new_item_dialog.render)
+    if script == PROBE:
+        rendered = rendered.replace(b" return draft;", SNAPSHOT_READY_HOOK, 1)
+    return rendered.replace(b"</body>", b"<script>" + probe.encode() + b"</script></body>")
 
 
 ROW_EVIDENCE_PROBE = r"""
@@ -1139,7 +1184,16 @@ def row_evidence_page() -> bytes:
     return fixture_page(1440, photo=False, script=ROW_EVIDENCE_PROBE.replace("__CAPTURE__", json.dumps(captured)))
 
 
-BUG_PROBE = r"""
+CAPTURE_TEXT = r"""
+async function captureText(capture) {
+ const bytes = Uint8Array.from(atob(capture.document_gzip), char => char.charCodeAt(0));
+ const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+ return new Response(stream).text();
+}
+"""
+
+
+BUG_PROBE = CAPTURE_TEXT + r"""
 const failures = [];
 const check = (value, description) => { if (!value) failures.push(description); };
 const wire = [], fetchHTTP = window.fetch;
@@ -1163,6 +1217,7 @@ window.fetch = async (path, options) => {
   throw new TypeError('The Send response was lost.');
  }
  const payload = JSON.parse(options.body);
+ if (payload.discard_capture) return Response.json({});
  wire.push(payload);
  if (payload.page_capture) {
   if (!holdCapture) return Response.json({error:'No Firefox.'},{status:503});
@@ -1190,7 +1245,7 @@ const open = () => new Promise(resolve => {
  });
  observer.observe(recipients, {childList:true,subtree:true});
  trigger.click();
-});
+}).then(() => dialog.waitForPageSnapshotForTest());
 const type = text => {
  words.value = text;
  words.dispatchEvent(new Event('input', {bubbles:true}));
@@ -1247,7 +1302,7 @@ const send = async () => {
   }
   check(checkbox.checked && checkbox.labels[0].textContent.trim() === 'Include a screenshot',
         'The screenshot box is checked by default.');
-  check(wire.length === 1 && wire[0].page_capture.place === location.pathname+location.search+location.hash,
+  check(wire.length === 1 && (await captureText(wire[0].page_capture)).includes('Could not load …/brain.'),
         'Opening the Bug dialog starts the screenshot of the current page.');
   type('Review takes over two seconds with the builds filter. It also shows a load error.');
   if (__PHOTO__) {
@@ -1279,7 +1334,7 @@ const send = async () => {
    await send();
    check(wire.length === 4 && wire[3].capture_key === wire[2].capture_key &&
          wire[3].capture_key.startsWith(wire[3].request_id) &&
-         wire[3].defer_capture.place === wire[2].page_capture.place && wire[3].evidence.kind === 'page-data',
+         wire[3].defer_capture.document_gzip === wire[2].page_capture.document_gzip && wire[3].evidence.kind === 'page-data',
          'Send carries the draft capture key before the capture response arrives.');
    const evidence = wire[3].evidence;
    const bytes = new TextEncoder().encode(JSON.stringify(evidence)).length;
@@ -1372,7 +1427,7 @@ const send = async () => {
 
 def bug_fixture_page(*, photo: bool = False, script: str = BUG_PROBE) -> bytes:
     probe = script.replace("__PHOTO__", json.dumps(photo))
-    return (f'<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
+    page = (f'<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Review</title>'
             f'{page_frame.PAGE_SCRIPT_ERRORS}<style>{console_theme.CSS}{page_frame.OWNER_STYLE.removeprefix("<style>").removesuffix("</style>")}'
             'main{width:min(1220px,calc(100% - 48px));margin:28px auto}.notice{color:var(--error)}</style></head><body>'
@@ -1384,13 +1439,352 @@ def bug_fixture_page(*, photo: bool = False, script: str = BUG_PROBE) -> bytes:
             '<div role="group" aria-label="Owner" data-filter-row="owner"><button data-filter-value="staff:builds" aria-pressed="true">builds</button></div>'
             '<p class="notice">Could not load …/brain.</p></main>'
             f'{new_item_dialog.render()}<script>{probe}</script></body></html>').encode()
+    if script in (BUG_PROBE, LIVE_VIEW_PROBE):
+        page = page.replace(b" return draft;", SNAPSHOT_READY_HOOK, 1)
+    return page
+
+
+NEW_ITEM_HOLD_PROBE = r"""
+const nativeFetch = window.fetch;
+const dialog = document.querySelector('#review-new-item');
+const send = dialog.querySelector('[type=submit]'), words = dialog.querySelector('textarea');
+const launch = document.querySelector('[data-owner-new]');
+launch.closest('[data-page-owner]').dataset.pageOwner = __PAGE__;
+const posts = [], results = [];
+const scenario = __SCENARIO__, page = __PAGE__;
+const endpoint = __ENDPOINT__;
+let loseReply = false, attempts = 0;
+let missingResultPath;
+const check = (condition, message) => { if (!condition) throw new Error(message); };
+async function until(condition, message) {
+ const limit = performance.now() + 5000;
+ while (!condition()) {
+  check(performance.now() < limit, message);
+  await new Promise(resolve => setTimeout(resolve, 10));
+ }
+}
+const toast = () => document.querySelector('[data-send-undo] button')?.parentElement;
+const busy = () => send.form.getAttribute('aria-busy') !== 'false';
+const errorText = () => dialog.querySelector('.new-item-error').textContent;
+const lastPost = () => posts.at(-1);
+const lastResult = () => results.at(-1);
+const resultPath = id => '/send-hold/' + id;
+
+async function release(id) {
+ const response = await nativeFetch(resultPath(id) + '/send', {method:'POST'});
+ check(response.ok, 'The server did not release the hold.');
+ const limit = performance.now() + 5000;
+ while (performance.now() < limit) {
+  const result = await nativeFetch(resultPath(id), {cache:'no-store'});
+  if (result.headers.get('X-Send-Hold') !== 'pending') return result;
+  await new Promise(resolve => setTimeout(resolve, 10));
+ }
+ throw new Error('The server did not complete the hold.');
+}
+
+window.fetch = async (path, options = {}) => {
+ const payload = options.body && JSON.parse(options.body);
+ if (payload?.page_capture) return new Promise(() => {});
+ if (payload?.discard_capture) return Response.json({});
+ const requestId = new Headers(options.headers).get('X-Undo-Request');
+ if (requestId) attempts++;
+ const response = !options.method && String(path) === missingResultPath
+  ? Response.json({reason:'The held result is missing.'},
+                  {status:404,headers:{'X-Send-Hold-Outcome':'missing'}})
+  : await nativeFetch(path, options);
+ if (requestId) {
+  const hold = await response.clone().json();
+  check(response.status === 202 && hold.hold === requestId, 'The server must retain the hold.');
+  posts.push({requestId, payload, seconds: hold.seconds});
+  if (loseReply && scenario === 'lost-refusal' && posts.length === 1) {
+   const refused = await release(requestId);
+   check(refused.status === 403 && (await refused.json()).code === 'stale_token',
+         'The server did not save the refusal after the lost reply.');
+  }
+  if (loseReply) throw new TypeError('The held Send response was lost.');
+ } else if (String(path).startsWith('/send-hold/') && !options.method) {
+  if (response.headers.get('X-Send-Hold') !== 'pending') {
+   results.push({status:response.status, body:await response.clone().json()});
+  }
+ }
+ return response;
+};
+
+async function openDraft(capture) {
+ launch.click();
+ words.value = 'Check the Undo period for this Send.';
+ words.dispatchEvent(new Event('input', {bubbles:true}));
+ if (page === 'list') {
+  const recipient = () => dialog.querySelector('[name=recipient_id]');
+  await until(recipient, 'The List producer did not load.');
+  recipient().click();
+ }
+ const include = send.form.elements.include_page;
+ if (include.checked !== capture) include.click();
+ await until(() => !send.disabled, 'The first Send is unavailable.');
+}
+
+async function afterLostReply() {
+ await until(() => posts.length === 2 && dialog.open && !send.disabled && send.textContent === 'Retry',
+             'The lost reply did not restore Retry.');
+ check(posts.every(post => post.requestId === posts[0].requestId),
+       'The automatic network retry changed the Undo ID.');
+}
+
+async function finishUndoPeriod(id) {
+ await until(toast, 'Send did not show Undo.');
+ const response = await release(id);
+ toast().getAnimations()[0].finish();
+ return response;
+}
+
+const restart = async () => {
+ const response = await nativeFetch('/probe-restart', {method:'POST'});
+ check(response.ok, 'The server did not restart its hold store.');
+};
+
+function advanceBrowserClock() {
+ const now = Date.now.bind(Date);
+ Date.now = () => now() + 121_000;
+}
+
+async function checkRetainedHold() {
+ await openDraft(true);
+ loseReply = true;
+ send.click();
+ await afterLostReply();
+ const first = posts[0];
+ check(first.payload.defer_capture?.document_gzip, 'The original hold must contain the screenshot.');
+ dialog.querySelector('[data-cancel]').click();
+ await restart();
+ loseReply = false;
+ launch.click();
+ await until(() => !send.disabled && send.textContent === 'Retry', 'Retry is unavailable after restart.');
+ send.click();
+ await until(() => posts.length === 3, 'Retry did not reach the server.');
+ const retry = lastPost();
+ check(retry.requestId === first.requestId && retry.seconds === first.seconds - 17,
+       'Retry must keep the Undo ID and the original remaining Undo time.');
+ check(retry.payload.token !== first.payload.token && !retry.payload.defer_capture?.document_gzip,
+       'Retry must send the new token without retaining the screenshot bytes.');
+ await finishUndoPeriod(retry.requestId);
+ await until(() => !busy(), 'Retry did not finish.');
+ check(lastResult()?.status === 200, 'Retry did not file the item.');
+}
+
+async function checkLostRefusal() {
+ await openDraft(false);
+ await restart();
+ loseReply = true;
+ send.click();
+ await afterLostReply();
+ loseReply = false;
+ const first = posts[0];
+ send.click();
+ await until(() => !busy() && posts.length === 3, 'Retry of the lost refusal did not finish.');
+ check(lastPost().requestId === first.requestId && lastPost().payload.token !== first.payload.token,
+       'Retry must send the new token with the original Undo ID.');
+ check(lastResult()?.status === 200, 'Retry did not file the item.');
+}
+
+async function checkReceivedRefusal() {
+ await openDraft(false);
+ await restart();
+ send.click();
+ await until(() => posts.length === 1, 'The first Send did not reach the server.');
+ await finishUndoPeriod(lastPost().requestId);
+ await until(() => dialog.open && !busy() && !send.disabled, 'The refusal did not restore Send.');
+ const first = lastPost();
+ check(lastResult()?.status === 403 && lastResult().body.code === 'stale_token' && send.textContent === 'Send',
+       'The browser did not receive and finish the refused Send.');
+ if (scenario === 'received-refusal-after-limit') advanceBrowserClock();
+ send.click();
+ await until(() => posts.length === 2, 'The next Send did not reach the server. ' + errorText());
+ const next = lastPost();
+ check(next.requestId !== first.requestId && next.seconds === 60,
+       'The next Send must have a new Undo ID and the full Undo time.');
+ const {token:oldToken, ...oldDraft} = first.payload;
+ const {token:newToken, ...newDraft} = next.payload;
+ check(newToken !== oldToken && !newDraft.capture_key && JSON.stringify(newDraft) === JSON.stringify(oldDraft),
+       'The next Send must keep the same draft with screenshots disabled.');
+ await until(toast, 'The next Send did not show Undo.');
+ toast().querySelector('button').click();
+ await until(() => dialog.open && !busy(), 'The next Send did not finish Undo.');
+}
+
+async function checkCompletedResults() {
+ const options = await nativeFetch(endpoint + '?page=list', {headers:{'X-New-Item-Route':'producer'}});
+ const {token, recipients} = await options.json();
+ const draft = {request_id:'r6-' + crypto.randomUUID().replaceAll('-', ''),
+                kind:'investigation', recipient_id:recipients[0].id,
+                words:'Check that a result ends the Undo period.', page:'list', page_recipient:'producer',
+                evidence:{kind:'none'}, images:[]};
+ const key = JSON.stringify(draft);
+ for (const outcome of ['success', 'already_filed', 'undone', 'undone']) {
+  const previous = lastPost();
+  const payload = {...draft, token};
+  if (outcome !== 'success') payload.words += ' Edit after filing.';
+  const pending = heldFetch(endpoint, {method:'POST', headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify(payload), retryBody:key}).catch(error => error);
+  await until(() => lastPost() !== previous, 'The next Send did not reach the server.');
+  const current = lastPost();
+  check(current.requestId !== previous?.requestId && current.seconds === 60,
+        'A completed Send must give the next Send a new Undo ID and the full Undo time.');
+  if (outcome === 'undone') {
+   await until(toast, 'Send did not show Undo.');
+   toast().querySelector('button').click();
+   check(await pending instanceof SendUndone, 'The browser did not receive successful Undo.');
+  } else {
+   await finishUndoPeriod(current.requestId);
+   const response = await pending;
+   const body = await response.json();
+   const expected = outcome === 'success' ? response.status === 200 : response.status === 409 && body.code === outcome;
+   check(expected && /^I[1-9][0-9]*$/.test(body.id),
+         'Expected ' + outcome + '. Received ' + response.status + ' ' + JSON.stringify(body));
+  }
+ }
+}
+
+async function checkUnknownResult() {
+ await openDraft(false);
+ loseReply = true;
+ send.click();
+ await afterLostReply();
+ loseReply = false;
+ advanceBrowserClock();
+ send.click();
+ await until(() => dialog.open && !busy() && errorText().includes('The retry time ended'),
+             'Retry did not report the time limit.');
+ check(attempts === 2 && results.length === 0 && send.textContent === 'Retry',
+       'The expired Retry must keep the unknown result without another POST.');
+}
+
+async function checkMissingResult() {
+ await openDraft(false);
+ send.click();
+ await until(() => posts.length === 1 && toast(), 'The first Send did not show Undo.');
+ const first = lastPost();
+ const undo = await nativeFetch(resultPath(first.requestId) + '/undo', {method:'POST'});
+ check(undo.ok, 'The fixture did not cancel the first hold.');
+ missingResultPath = resultPath(first.requestId);
+ toast().getAnimations()[0].finish();
+ await until(() => dialog.open && !busy() && !send.disabled, 'The missing result did not restore Send.');
+ check(lastResult()?.status === 404, 'The browser did not read the missing result.');
+ advanceBrowserClock();
+ send.click();
+ await until(() => posts.length === 2 && toast(), 'Send did not start a new hold. ' + errorText());
+ const next = lastPost();
+ check(next.requestId !== first.requestId && next.seconds === 60, 'Send must start a full Undo period.');
+ check(next.payload.request_id === first.payload.request_id, 'Send keeps the same draft ID.');
+ toast().querySelector('button').click();
+ await until(() => dialog.open && !busy(), 'The new Undo did not finish.');
+}
+
+(async () => {
+ const failures = [];
+ try {
+  if (scenario === 'retained') await checkRetainedHold();
+  else if (scenario === 'lost-refusal') await checkLostRefusal();
+  else if (scenario === 'completed-results') await checkCompletedResults();
+  else if (scenario === 'unknown-result') await checkUnknownResult();
+  else if (scenario === 'missing-result') await checkMissingResult();
+  else await checkReceivedRefusal();
+ } catch (error) {
+  failures.push(String(error));
+ } finally {
+  await nativeFetch('/results', {method:'POST',body:JSON.stringify(failures)});
+ }
+})();
+"""
+
+
+LIVE_VIEW_PROBE = CAPTURE_TEXT + r"""
+const failures = [];
+const check = (value, description) => { if (!value) failures.push(description); };
+const fetchHTTP = window.fetch, wire = [];
+window.fetch = async (path, options = {}) => {
+ if (!options.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:true}]});
+ const payload = JSON.parse(options.body);
+ if (payload.discard_capture) return Response.json({});
+ wire.push(payload);
+ if (payload.page_capture) return new Promise(() => {});
+ return Response.json({id:'I1',key:'bug/owner/I1'});
+};
+const dialog = document.querySelector('#review-new-item');
+const words = dialog.querySelector('textarea');
+const send = dialog.querySelector('[type=submit]');
+const open = async () => {
+ document.querySelector('[data-owner-new]').click();
+ for (let step = 0; step < 120 && !dialog.querySelector('[data-recipients] input:checked'); step++) {
+  await new Promise(requestAnimationFrame);
+ }
+ await dialog.waitForPageSnapshotForTest();
+};
+(async () => {
+ try {
+  const main = document.querySelector('main');
+  main.insertAdjacentHTML('beforeend', `
+   <details id="question" open><summary>Question</summary>
+   <div id="question-body" style="height:60px;overflow:auto">
+   <div style="height:200px">Loaded question body</div><div style="height:260px">Last paragraph</div></div>
+   <textarea id="answer"></textarea><input id="who"><input id="important" type="checkbox">
+   <select id="state"><option>Open</option><option>Validating</option></select></details>
+   <canvas id="drawing" width="20" height="10"></canvas><div style="height:1600px"></div>`);
+  const field = selector => document.querySelector(selector);
+  field('#answer').value = 'An unsent answer.';
+  field('#who').value = 'Typed name';
+  field('#important').checked = true;
+  field('#state').selectedIndex = 1;
+  field('#question-body').scrollTop = 150;
+  field('#who').focus({preventScroll:true,focusVisible:true});
+  const focusVisible = field('#who').matches(':focus-visible') ? 'visible' : 'hidden';
+  field('#drawing').getContext('2d').fillRect(0, 0, 8, 10);
+  const pixels = field('#drawing').toDataURL();
+  scrollTo({top:240,behavior:'instant'});
+  await open();
+  check(wire.length === 1, 'Opening New item sends one live snapshot.');
+  const snapshot = new DOMParser().parseFromString(await captureText(wire[0].page_capture), 'text/html');
+  const copy = selector => snapshot.querySelector(selector);
+  check(!copy('script,#review-new-item,[data-new-item-draft]'), 'The snapshot omits scripts and New item.');
+  check(copy('#question[open]') && copy('#question-body').textContent.includes('Loaded question body'),
+        'The snapshot keeps the loaded question open.');
+  check(copy('#answer').value === 'An unsent answer.' && copy('#who').value === 'Typed name',
+        'The snapshot keeps the typed text.');
+  check(copy('#who').dataset.captureFocus === focusVisible, 'The snapshot records the focus state.');
+  check(copy('#important').checked && copy('#state').value === 'Validating',
+        'The snapshot keeps the selected values.');
+  check(copy('html').dataset.captureScroll === '0 240' && copy('#question-body').dataset.captureScroll === '0 150',
+        'The snapshot keeps the window and element scroll.');
+  check(copy('img#drawing').getAttribute('src') === pixels, 'The snapshot keeps the canvas pixels.');
+  dialog.querySelector('[data-cancel]').click();
+
+  const large = document.createElement('div');
+  large.hidden = true;
+  large.textContent = 'A'.repeat(32 * 1024 * 1024);
+  main.append(large);
+  await open();
+  const fallback = dialog.querySelector('[data-fallback]');
+  check(wire.length === 1 && !fallback.hidden && fallback.textContent === 'Screenshot unavailable.',
+        'A snapshot over the limit shows the fallback message without sending the snapshot.');
+  words.value = 'Send the page data.';
+  words.dispatchEvent(new Event('input', {bubbles:true}));
+  check(!send.disabled, 'Send is available after a snapshot exceeds the limit.');
+  send.click();
+  for (let step = 0; step < 120 && wire.length < 2; step++) await new Promise(requestAnimationFrame);
+  check(wire[1]?.evidence.kind === 'page-data' && !wire[1]?.capture_key, 'Send uses the page data.');
+ } catch (error) { failures.push(String(error)); }
+ await fetchHTTP('/results', {method:'POST',body:JSON.stringify(failures)});
+ parent.postMessage('finished',location.origin);
+})();
+"""
 
 
 UNDO_PROBE = r"""
 const failures = [];
 const check = (value, description) => { if (!value) failures.push(description); };
 const wire = [], fetchHTTP = window.fetch, host = window.top.document;
-const outcome = __OUTCOME__;
+const outcome = __OUTCOME__, withoutScreenshot = outcome === 'post-timeout';
+const holdIds = [];
 const held = '/send-hold/' + 'a'.repeat(24), saved = {id:'I1',key:'bug/owner/I1'};
 let realSends = 0;
 window.fetch = async (path, options = {}) => {
@@ -1407,7 +1801,14 @@ window.fetch = async (path, options = {}) => {
  const payload = JSON.parse(options.body);
  // The screenshot stays pending, so the first Send keeps its item for a retry.
  if (payload.page_capture) return new Promise(() => {});
+ if (payload.discard_capture) return Response.json({});
  wire.push([payload, new Headers(options.headers).get('X-Undo-Hold')]);
+ holdIds.push(new Headers(options.headers).get('X-Undo-Request'));
+ if (withoutScreenshot) {
+  if (wire.length > 1) return Response.json(saved);
+  return new Promise((_, reject) =>
+   options.signal?.addEventListener('abort', () => reject(options.signal.reason), {once:true}));
+ }
  if (wire.length === 1) return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
  return Response.json(saved);
 };
@@ -1432,12 +1833,15 @@ const type = text => {
   await until(() => dialog.querySelector('[data-recipients] input:checked'), 'The dialog did not load its recipients.');
   dialog.querySelector('[name="recipient_id"][value="chosen"]').click();
   type('The first words.');
-  const input = new DataTransfer();
-  const bytes = Uint8Array.from(atob('__PNG__'), character => character.charCodeAt(0));
-  input.items.add(new File([bytes], 'pasted.png', {type:'image/png'}));
-  const paste = new ClipboardEvent('paste', {cancelable:true});
-  Object.defineProperty(paste, 'clipboardData', {value:input});
-  words.dispatchEvent(paste);
+  if (withoutScreenshot) dialog.querySelector('[name="include_page"]').click();
+  else {
+   const input = new DataTransfer();
+   const bytes = Uint8Array.from(atob('__PNG__'), character => character.charCodeAt(0));
+   input.items.add(new File([bytes], 'pasted.png', {type:'image/png'}));
+   const paste = new ClipboardEvent('paste', {cancelable:true});
+   Object.defineProperty(paste, 'clipboardData', {value:input});
+   words.dispatchEvent(paste);
+  }
   const image = dialog.querySelector('[data-previews] img')?.src;
   await until(() => !send.disabled, 'Send did not become available.');
   const events = [];
@@ -1446,6 +1850,16 @@ const type = text => {
   }
   send.click();
   check(!dialog.open && document.activeElement === launch, 'Send closes the dialog and returns focus at once.');
+  if (withoutScreenshot) {
+   await until(() => dialog.open && !error.hidden && !send.disabled, 'The first POST did not time out.');
+   check(wire.length === 1 && !wire[0][0].capture_key, 'The first Send has no screenshot.');
+   send.click();
+   await until(() => events.length === 2, 'The retry did not report the saved item.');
+   check(holdIds.length === 2 && holdIds[0] && holdIds[1] === holdIds[0],
+         'The retry keeps the hold ID.');
+   check(wire[0][0].request_id === wire[1][0].request_id, 'The retry keeps the draft ID.');
+   return;
+  }
   const toast = () => host.querySelector('[data-send-undo]');
   await until(() => toast()?.querySelector('button'), 'The Undo toast did not show.');
   check(toast().querySelector('span').textContent === 'Sent to chosen producer.',
@@ -1536,7 +1950,7 @@ function storeShippedPointer(id, value) {
 }
 history.replaceState(null, '', '/console/list.html' + location.search);
 const posts = [], fetchHTTP = window.fetch;
-let captures = 0, lostHold;
+let lostHold;
 window.fetch = async (path, options) => {
  if (!reloadAfterSend && path.endsWith('?capture_key=' + firstKey)) {
   return fetchHTTP(path.replace(firstKey, readyKey), options);
@@ -1548,7 +1962,7 @@ window.fetch = async (path, options) => {
    throw new TypeError('The Send response was lost.');
   }
   const item = JSON.parse(options.body);
-  if (!reloadAfterSend && item.page_capture && ++captures === 1) {
+  if (!reloadAfterSend && item.page_capture && posts.length < 2) {
    return Response.json({capture_key:firstKey}, {status:202});
   }
   if (shippedUnsent && item.page_capture) return Response.json({error:'No Firefox.'}, {status:503});
@@ -1707,6 +2121,7 @@ async function checkListRetry() {
   send.click();
   await waitFor(sendFinished);
   if (restored) {
+   if (dialog.open) await waitFor(() => dialog.querySelector('[name="recipient_id"]:checked'));
    check(editable() && !words.readOnly, 'A saved item response unlocks the draft.');
    check(posts.length === 1 && posts[0].request_id === restored.request_id && posts[0].kind === restored.kind &&
          posts[0].recipient_id === restored.recipient_id && posts[0].words === restored.words && !posts[0].images.length,
@@ -1986,6 +2401,7 @@ class DialogFixture:
     reject_first_send: bool = True
     retire_recipient_on_restart: bool = False
     owner_reason: str = ""
+    list_row_saved: bool = True
 
     def __post_init__(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -2100,6 +2516,9 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 return
             fixture = self.fixture()
             fields = cast(dict[str, object], json.loads(data))
+            if "discard_capture" in fields:
+                self.send_json(200, {})
+                return
             if "page_capture" in fields:
                 if isinstance(fixture.screenshot, new_item_dialog.PageScreenshot):
                     self.send_json(202, {"capture_key": CAPTURE_KEY})
@@ -2117,7 +2536,10 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 intent: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT
                 if "defer_capture" in fields:
                     key = new_item_dialog.read_capture_key(fields["capture_key"])
-                    capture = serve.deferred_capture_request(fixture.root, request.page, fields["defer_capture"])
+                    value = fields["defer_capture"]
+                    capture = (new_item_dialog.read_live_page_capture(cast(object, value)).request
+                               if isinstance(value, dict) and "document_gzip" in value
+                               else new_item_dialog.read_page_capture(cast(object, value)))
                     intent = new_item_dialog.DeferredCaptureIntent(key, request.request_id, capture)
                 with (patch.dict(os.environ, fixture.environment()),
                       patch.object(Path, "home", return_value=fixture.root),
@@ -2142,10 +2564,13 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             if fixture.reject_first_send and len(fixture.posts) == 1:
                 self.send_json(503, {"error": "Fixture rejected the first send."})
                 return
+            receipt: dict[str, object] = {"id": item.id, "version": "fixture-version"}
+            if request.page == "list" and fixture.list_row_saved:
+                receipt["list_number"] = 1
             if isinstance(item, review_submissions.EditedSubmission):
-                self.send_json(409, {"code": "already_filed", "id": item.id})
+                self.send_json(409, {**receipt, "code": "already_filed"})
                 return
-            self.send_json(201, {"id": item.id, "key": item.key, "state": "Waiting"})
+            self.send_json(201, {**receipt, "key": item.key, "state": "Waiting"})
 
         @override
         def log_message(self, format: str, *args: object) -> None:
@@ -2272,6 +2697,66 @@ window.fetch = (path, options) => {
         new_item_dialog.require_reply_token(restored.with_reply_proof(proof), token)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_list_send_reports_when_only_the_review_item_is_saved(self) -> None:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        fixture = DialogFixture(temporary, reject_first_send=False, list_row_saved=False)
+        configuration = temporary / "config"
+        configuration.mkdir()
+        _ = (configuration / "console.conf").write_text(f"page.list.owner={OWNER}\n")
+        owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
+        probe = r"""
+(async () => {
+ const failures = [];
+ try {
+  const dialog = document.querySelector('#review-new-item');
+  const words = dialog.querySelector('textarea');
+  const send = dialog.querySelector('[type="submit"]');
+  const status = dialog.querySelector('[data-recipients-status]');
+  const loading = dialog.querySelector('[data-recipients-loading]');
+  const waitFor = test => new Promise((resolve, reject) => {
+   const deadline = setTimeout(() => {
+    observer.disconnect();
+    reject(new Error(status.textContent || dialog.querySelector('.new-item-error').textContent));
+   }, 10000);
+   const ready = () => {
+    if (!test()) return;
+    clearTimeout(deadline);
+    observer.disconnect();
+    resolve();
+   };
+   const observer = new MutationObserver(ready);
+   observer.observe(dialog, {attributes:true, childList:true, subtree:true});
+   ready();
+  });
+  document.querySelector('[data-owner-new]').click();
+  await waitFor(() => loading.hidden);
+  dialog.querySelector('[name="include_page"]').click();
+  dialog.querySelector('[name="kind"][value="investigation"]').click();
+  words.value = 'Check the missing List row.';
+  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+  if (send.disabled) throw new Error('The List Send is disabled.');
+  send.click();
+  await waitFor(() => send.form.getAttribute('aria-busy') === 'false');
+  if (!dialog.open) failures.push('The dialog closed without showing the missing List row.');
+  if (!dialog.textContent.includes('Saved I1 in Review. No List row was filed.')) {
+   failures.push('The result does not name the missing List row.');
+  }
+  if (words.value || !send.disabled) failures.push('The dialog can send the saved words again.');
+ } catch (error) {
+  failures.push(String(error));
+ }
+ await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
+ parent.postMessage('finished', location.origin);
+})();
+"""
+        page = fixture_page(1440, photo=False, script=probe).replace(
+            b'data-page-owner="builds"', b'data-page-owner="list"')
+        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))):
+            capture_dialogs(temporary / "list-result.png", {1440: fixture}, pages={1440: page})
+        self.assertEqual(fixture.results, [])
+        self.assertEqual(len(fixture.posts), 1)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_list_token_refresh_clears_a_retired_recipient(self) -> None:
         fixture = self.check_recipient_draft("refresh")
         self.assertEqual([post["recipient_id"] for post in fixture.wire_posts], [OTHER_RECIPIENT])
@@ -2365,6 +2850,418 @@ window.fetch = (path, options) => {
                 attachment = review_submissions.image_folder(submission) / reference.id / reference.file
             self.assertEqual(attachment.read_bytes(), image.png)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for live page capture.")
+    def test_capture_keeps_the_live_view_and_falls_back_over_the_limit(self) -> None:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        fixture = DialogFixture(temporary)
+        page = bug_fixture_page(script=LIVE_VIEW_PROBE)
+        capture_dialogs(temporary / "live-view.png", {1440: fixture}, pages={1440: page})
+        self.assertEqual(fixture.results, [])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for live page capture.")
+    def test_draft_end_paths_release_the_live_page_capture(self) -> None:
+        self._check_capture_lifecycle(
+            "cancel-preparation", "cancel-post", "cancel-poll", "undo-send", "undo-cancel",
+            "lost", "already-filed", "retained", "list-row", "list-no-row", "cancel-reopen", "error-close",
+            "continuation-compression", "continuation-token",
+        )
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for live page capture.")
+    def test_a_continued_draft_does_not_capture_another_page(self) -> None:
+        self._check_capture_lifecycle("continuation-other-page")
+
+    def _check_capture_lifecycle(self, *outcomes: str) -> None:
+        probe = r"""
+const failures = [], fetchHTTP = window.fetch;
+const outcome = __OUTCOME__;
+const dialog = document.querySelector('#review-new-item'), heading = document.querySelector('main h1');
+const launch = document.querySelector('[data-owner-new]'), words = dialog.querySelector('textarea');
+const send = dialog.querySelector('[type=submit]'), shot = dialog.querySelector('[data-shot]');
+const close = dialog.querySelector('[data-cancel]'), notice = dialog.querySelector('.new-item-error');
+const saved = {id:'I1',key:'bug/owner/I1',version:'fixture'};
+const hold = 'a'.repeat(24);
+const uploads = [], reads = [], sends = [], discarded = [], revoked = [];
+const tokenReads = [];
+const continuesFiledDraft = ['already-filed','continuation-compression','continuation-token'].includes(outcome);
+let serverToken = 'fixture', lostHold;
+const readyImage = () => new Response(new Blob(['fixture PNG'], {type:'image/png'}));
+const lateImage = Promise.withResolvers();
+const releasePreparation = Promise.withResolvers();
+let preparationReady = false;
+let preparations = 0;
+const revoke = URL.revokeObjectURL;
+URL.revokeObjectURL = url => { revoked.push(url); revoke(url); };
+
+function check(value, description) {
+ if (!value) throw new Error(description);
+}
+async function until(test, description) {
+ const deadline = performance.now() + 5000;
+ while (!test()) {
+  if (performance.now() > deadline) throw new Error(description);
+  await new Promise(resolve => setTimeout(resolve, 10));
+ }
+}
+function waitForResponse(request) {
+ const {signal, gate} = request;
+ return new Promise((resolve, reject) => {
+  const aborted = () => {
+   request.aborted = true;
+   reject(signal.reason);
+  };
+  if (signal?.aborted) return aborted();
+  signal?.addEventListener('abort', aborted, {once:true});
+  gate.promise.then(value => {
+   signal?.removeEventListener('abort', aborted);
+   resolve(value);
+  });
+ });
+}
+if (['cancel-preparation','continuation-compression'].includes(outcome)) {
+ const blockedPreparation = outcome === 'cancel-preparation' ? 1 : 2;
+ const blob = Response.prototype.blob;
+ Response.prototype.blob = async function() {
+  const preparation = ++preparations;
+  const result = await blob.call(this);
+  if (preparation === blockedPreparation) {
+   preparationReady = true;
+   await releasePreparation.promise;
+  }
+  return result;
+ };
+}
+window.fetch = async (path, options = {}) => {
+ path = String(path);
+ if (path === '/send-hold/' + hold + '/undo') return Response.json({outcome:'undone'});
+ if (path.includes('capture_key=') && !options.body) {
+  const key = new URL(path, location.href).searchParams.get('capture_key');
+  const request = {key, signal:options.signal, gate:Promise.withResolvers()};
+  reads.push(request);
+  if (outcome === 'cancel-poll' && reads.length === 1) return Response.json({}, {status:202});
+  if (outcome === 'cancel-poll') return waitForResponse(request);
+  if (outcome === 'cancel-reopen' && reads.length === 1) {
+   return {ok:true, status:200, blob:() => { request.reading = true; return lateImage.promise; }};
+  }
+  return readyImage();
+ }
+ if (!options.body) {
+  tokenReads.push(serverToken);
+  return Response.json({token:serverToken,page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:true}]});
+ }
+ const payload = JSON.parse(options.body);
+ if (payload.page_capture) {
+  const request = {payload, signal:options.signal, gate:Promise.withResolvers()};
+  uploads.push(request);
+  if (payload.token !== serverToken) {
+   return Response.json({code:'stale_token',error:'The New item token expired.'},{status:403});
+  }
+  if (outcome === 'continuation-token' && uploads.length === 2) {
+   return Response.json({capture_key:payload.capture_key});
+  }
+  if (['cancel-poll','cancel-reopen','list-row'].includes(outcome)) {
+   return Response.json({capture_key:payload.capture_key});
+  }
+  return waitForResponse(request);
+ }
+ if (payload.discard_capture) {
+  discarded.push(payload.discard_capture);
+  return Response.json({});
+ }
+ if (lostHold && new Headers(options.headers).get('X-Undo-Request') === lostHold && !options.keepalive) {
+  lostHold = null;
+  throw new TypeError('The Send response was lost.');
+ }
+ sends.push({payload, signal:options.signal, holdId:new Headers(options.headers).get('X-Undo-Request')});
+ if (sends.length === 1) {
+  if (outcome.startsWith('undo-')) {
+   return Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  if (['lost','retained','error-close'].includes(outcome)) {
+   if (options.keepalive) lostHold = new Headers(options.headers).get('X-Undo-Request');
+   throw new TypeError('The Send response was lost.');
+  }
+  if (continuesFiledDraft) {
+   heading.textContent = 'Fresh page evidence';
+   if (outcome === 'continuation-token') serverToken = 'after-restart';
+   return Response.json({...saved,code:'already_filed'},{status:409});
+  }
+ }
+ if (outcome === 'list-no-row' || outcome === 'retained') return Response.json(saved);
+ return Response.json({...saved,list_number:17});
+};
+const type = text => {
+ words.value = text;
+ words.dispatchEvent(new Event('input',{bubbles:true}));
+};
+async function sendWords() {
+ check(!send.disabled, 'Send is available.');
+ const count = sends.length;
+ send.click();
+ await until(() => sends.length > count, 'Send did not reach the server.');
+ await until(() => send.form.getAttribute('aria-busy') === 'false', 'Send did not settle.');
+}
+function checkReleased() {
+ const {owners, activePreview, pendingBytes} = dialog.captureStateForTest();
+ check(!owners && !activePreview && !pendingBytes, 'The completed draft releases the capture resources.');
+ check(!shot.hasAttribute('href') && !shot.querySelector('img').hasAttribute('src'), 'The preview links are clear.');
+}
+async function checkContinuation(original, replacement, replacementUpload) {
+ check(replacement.evidence.kind === 'page-data' && replacement.evidence.title === 'Fresh page evidence' &&
+       replacement.page_state?.title === 'Fresh page evidence', 'Continuation sends the fresh page evidence.');
+ check(replacement.request_id !== original.request_id && replacement.capture_key !== original.capture_key &&
+       replacement.capture_key?.startsWith(replacement.request_id), 'Continuation uses fresh draft and capture IDs.');
+ const expected = replacementUpload.payload.page_capture.document_gzip;
+ const gzip = Uint8Array.from(atob(expected), character => character.charCodeAt(0));
+ const html = await new Response(new Blob([gzip]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+ check(replacement.defer_capture?.document_gzip === expected && html.includes('<h1>Fresh page evidence</h1>'),
+       'Continuation sends the snapshot that matches the fresh page evidence.');
+}
+async function checkOtherPage() {
+ const earlier = {request_id:'r6-' + 'a'.repeat(32), kind:'bug', page:'builds',
+                  page_recipient:'selected', recipient_id:'owner', words:'Report a Builds error.',
+                  evidence:{kind:'none'}, images:[]};
+ sessionStorage.setItem('console.new-item.submitted', JSON.stringify({
+  payload:earlier, mode:'retry', selectedKind:'bug', includeScreenshot:true
+ }));
+ launch.closest('[data-page-owner]').dataset.pageOwner = 'images';
+ heading.textContent = 'Images';
+ launch.click();
+ await until(() => send.textContent === 'Retry' && !send.disabled, 'Retry did not restore the Builds draft.');
+ const later = dialog.querySelector('[data-later-draft]');
+ later.click();
+ type('Keep these Builds edits.');
+ later.click();
+ await sendWords();
+ await until(() => send.textContent === 'Send' && !send.disabled, 'The continued draft did not open.');
+ check(words.value === 'Keep these Builds edits.', 'The continued draft keeps the edits.');
+ await sendWords();
+ const [first, second] = sends.map(request => request.payload);
+ check(first.request_id === earlier.request_id && second.request_id !== first.request_id &&
+       second.page === 'builds', 'Retry preserves the Builds route for the continued draft.');
+ check(!uploads.length && !second.capture_key && !second.defer_capture && !second.page_state,
+       'The Builds draft does not capture Images.');
+}
+(async () => {
+ try {
+  if (outcome === 'continuation-other-page') {
+   await checkOtherPage();
+   return;
+  }
+  if (['list-row','list-no-row','retained'].includes(outcome)) {
+   launch.closest('[data-page-owner]').dataset.pageOwner = 'list';
+  }
+  launch.click();
+  if (outcome === 'cancel-preparation') {
+   await until(() => preparationReady, 'Snapshot preparation did not start.');
+   close.click();
+   releasePreparation.resolve();
+   await new Promise(resolve => setTimeout(resolve, 50));
+   check(!uploads.length, 'Late preparation cannot start an upload.');
+   checkReleased();
+   return;
+  }
+  await until(() => uploads.length, 'The preview POST did not start.');
+  const upload = uploads[0], key = upload.payload.capture_key;
+  const png = () => new Blob(['fixture PNG'], {type:'image/png'});
+  if (outcome === 'cancel-poll') {
+   await until(() => reads.length === 2, 'The preview did not poll again.');
+   close.click();
+   check(reads[1].aborted && reads[1].signal === upload.signal, 'Cancel aborts the preview poll.');
+   check(discarded.includes(key), 'Cancel discards the capture by its request key.');
+   checkReleased();
+   return;
+  }
+  if (outcome === 'cancel-post') {
+   close.click();
+   const discardedBeforeResponse = discarded.includes(key);
+   upload.gate.resolve(Response.json({capture_key:key}));
+   await new Promise(resolve => setTimeout(resolve, 50));
+   check(upload.aborted && upload.signal?.aborted && !reads.length, 'Cancel aborts the preview POST before preview retrieval.');
+   check(discardedBeforeResponse, 'Cancel discards the capture before a POST response arrives.');
+   checkReleased();
+   return;
+  }
+  if (outcome === 'cancel-reopen') {
+   await until(() => reads[0]?.reading, 'The first preview body did not start.');
+   close.click();
+   launch.click();
+   await until(() => !shot.hidden && uploads.length === 2, 'Reopen did not show the replacement preview.');
+   const replacement = shot.href;
+   lateImage.resolve(png());
+   await new Promise(resolve => setTimeout(resolve, 50));
+   check(reads[0].signal.aborted && shot.href === replacement &&
+         uploads[1].payload.capture_key !== key, 'A late preview cannot replace the new draft preview.');
+   close.click();
+   check(revoked.includes(replacement), 'Cancel revokes the replacement preview URL.');
+   checkReleased();
+   return;
+  }
+  check(dialog.captureStateForTest().owners === 1, 'The open draft has one snapshot owner.');
+  type('First draft words.');
+  if (outcome.startsWith('undo-')) {
+   send.click();
+   const undo = () => window.top.document.querySelector('[data-send-undo] button');
+   await until(undo, 'The Undo action did not appear.');
+   check(sends[0].signal && sends[0].signal !== upload.signal && !upload.signal?.aborted,
+         'The held Send uses a separate request lifetime.');
+   undo().click();
+   await until(() => dialog.open && notice.textContent.startsWith('Undone.') && !send.disabled,
+               'Undo did not restore the draft.');
+   if (outcome === 'undo-cancel') {
+    close.click();
+    check(upload.aborted && discarded.includes(key), 'Cancel after Undo aborts and discards the capture.');
+   } else {
+    type('Edited after Undo.');
+    await sendWords();
+    const [first, second] = sends.map(request => request.payload);
+    check(second.words === 'Edited after Undo.' && second.capture_key === first.capture_key &&
+          second.defer_capture?.document_gzip === first.defer_capture?.document_gzip &&
+          second.page_state?.title === first.page_state?.title, 'Send after Undo keeps the capture and sends the edit.');
+   }
+   checkReleased();
+   return;
+  }
+  if (outcome === 'list-row') await until(() => !shot.hidden, 'The List preview did not load.');
+  const oldPreview = shot.hasAttribute('href') && shot.href;
+  await sendWords();
+  const first = sends[0].payload;
+  if (outcome !== 'list-row') {
+   check(first.defer_capture?.document_gzip === upload.payload.page_capture.document_gzip,
+         'A pending capture is sent with the held request.');
+  }
+  if (['lost','retained','error-close'].includes(outcome)) {
+   check(dialog.open && !notice.hidden && words.readOnly && !upload.signal?.aborted,
+         'A lost response locks Retry and keeps the capture.');
+   if (outcome === 'error-close') {
+    close.click();
+    check(upload.aborted && !discarded.includes(key), 'Closing a failed Send keeps the capture eligible for recovery.');
+    checkReleased();
+    launch.click();
+    await until(() => !send.disabled, 'Reopen did not restore the failed Send.');
+    await sendWords();
+    const retry = sends[1].payload;
+    check(retry.token === serverToken, 'Retry uses the current token.');
+    check(!retry.defer_capture?.document_gzip && retry.defer_capture?.place === first.defer_capture.place &&
+          retry.capture_key === key && retry.request_id === first.request_id,
+          'Retry after close keeps the draft and viewport without retaining the bytes.');
+    check(sends[0].holdId && sends[1].holdId === sends[0].holdId,
+          'Retry after close uses the original Undo request ID.');
+    return;
+   }
+   if (outcome === 'retained') {
+    const later = dialog.querySelector('[data-later-draft]');
+    later.click();
+    check(!words.readOnly && send.disabled, 'A separate draft allows editing before Retry.');
+    type('Keep this edit for a new Send.');
+    heading.textContent = 'Fresh page evidence';
+    later.click();
+   }
+   await sendWords();
+   check(JSON.stringify(sends[1].payload) === JSON.stringify(first), 'Retry sends the original request.');
+  }
+  if (outcome === 'continuation-compression') {
+   await until(() => preparationReady && !send.disabled, 'Send did not become available during compression.');
+   check(uploads.length === 1 && !dialog.querySelector('[data-taking]').hidden,
+         'Continuation is still preparing the screenshot.');
+   send.click();
+   check(!dialog.open, 'Send closes the continuation during compression.');
+   releasePreparation.resolve();
+   await until(() => sends.length === 2 && send.form.getAttribute('aria-busy') === 'false',
+               'Send did not settle after compression.');
+   check(sends[1].payload.capture_key && sends[1].payload.defer_capture?.document_gzip,
+         'Send during continuation compression submits the pending capture.');
+   await checkContinuation(first, sends[1].payload, uploads[1]);
+   check(!reads.length, 'Send finishes while the preview upload waits.');
+  } else if (outcome === 'continuation-token') {
+   await until(() => uploads.length === 2, 'Continuation did not start a fresh preview.');
+   check(tokenReads.includes(serverToken) && uploads[1].payload.token === serverToken,
+         'Continuation fetches a fresh token before uploading.');
+   await until(() => !shot.hidden, 'The replacement preview did not load after restart.');
+   await sendWords();
+   const second = sends[1].payload;
+   check(second.token === serverToken && second.capture_key === uploads[1].payload.capture_key &&
+         second.capture_key.startsWith(second.request_id) && second.request_id !== first.request_id &&
+         second.evidence.kind === 'page-data' && second.page_state?.title === 'Fresh page evidence',
+         'The next Send uses the replacement preview and token.');
+  } else if (outcome === 'already-filed' || outcome === 'retained') {
+   check(dialog.open &&
+         words.value === (outcome === 'already-filed' ? first.words : 'Keep this edit for a new Send.'),
+         'Continuation keeps the edited dialog.');
+   const option = dialog.querySelector('[name="include_page"]').closest('label');
+   await until(() => uploads.length === 2 || option.hidden, 'Continuation did not start a fresh preview.');
+   await sendWords();
+   await checkContinuation(first, sends.at(-1).payload, uploads[1]);
+   check(upload.aborted, 'Continuation aborts the original upload.');
+  }
+  if (oldPreview) check(revoked.includes(oldPreview), 'Filing revokes the preview URL.');
+  if (outcome === 'list-no-row') check(dialog.open && !words.value, 'The Review-only result stays open without the draft.');
+  checkReleased();
+ } catch (error) {
+  failures.push(String(error));
+ } finally {
+  await fetchHTTP('/results', {method:'POST',body:JSON.stringify(failures)});
+ }
+})();
+"""
+        inspect_owners = b"""
+ dialog.captureStateForTest = () => ({
+  owners: [pageContext, pageCapture, captureSession, submittedDraft]
+   .filter(value => JSON.stringify(value)?.includes('"document_gzip"')).length,
+  activePreview: Boolean(captureSession),
+  pendingBytes: JSON.stringify(submittedDraft)?.includes('"document_gzip"')
+ });
+ return draft;
+"""
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                page = bug_fixture_page(script=probe.replace("__OUTCOME__", json.dumps(outcome)))
+                self.assertEqual(firefox_probe_results(page.replace(b" return draft;", inspect_owners, 1)), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for live page capture.")
+    def test_cancel_releases_the_live_page_capture(self) -> None:
+        probe = r"""
+const failures = [];
+const dialog = document.querySelector('#review-new-item');
+const fetchHTTP = window.fetch;
+let acceptCapture, requestKey, previewReads = 0;
+const posted = Promise.withResolvers(), discarded = Promise.withResolvers();
+window.fetch = (path, options = {}) => {
+ if (options.method !== 'POST') {
+  if (String(path).includes('capture_key=')) previewReads++;
+  return Promise.resolve(Response.json({
+   token:'fixture',page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:true}]
+  }));
+ }
+ const payload = JSON.parse(options.body);
+ if (payload.page_capture?.document_gzip) {
+  requestKey = payload.capture_key;
+  return new Promise(accept => { acceptCapture = accept; posted.resolve(); });
+ }
+ if (payload.discard_capture === requestKey) discarded.resolve();
+ return Promise.resolve(Response.json({}));
+};
+(async () => {
+ try {
+  document.querySelector('[data-owner-new]').click();
+  await posted.promise;
+  const session = dialog.previewSessionForTest();
+  if (!dialog.hasLiveCapture()) failures.push('New item has the live snapshot.');
+  if (JSON.stringify(session).includes('"document_gzip"')) failures.push('The preview session keeps the posted snapshot.');
+  dialog.querySelector('[data-cancel]').click();
+  if (dialog.open || dialog.hasLiveCapture()) failures.push('Cancel releases the live snapshot.');
+  acceptCapture(Response.json({capture_key:requestKey}, {status:202}));
+  await discarded.promise;
+  if (previewReads) failures.push('Cancel prevents a preview request after the POST returns.');
+ } catch (error) { failures.push(String(error)); }
+ await fetchHTTP('/results', {method:'POST',body:JSON.stringify(failures)});
+})();
+"""
+        page = bug_fixture_page(script=probe).replace(
+            b" return draft;",
+            b" dialog.hasLiveCapture = () => pageCapture.status === 'prepared';\n" +
+            b" dialog.previewSessionForTest = () => captureSession;\n return draft;", 1)
+        self.assertEqual(firefox_probe_results(page), [[]])
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_bug_dialog_reports_the_open_page_even_without_a_screenshot(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -2418,6 +3315,12 @@ window.fetch = (path, options) => {
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_failed_held_send_reopens_the_new_item_with_the_error(self) -> None:
         self.assert_held_send("failure")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_new_item_send_times_out_and_reuses_the_hold_id(self) -> None:
+        probe = UNDO_PROBE.replace("__OUTCOME__", json.dumps("post-timeout"))
+        page = re.sub(rb'"requestTimeoutSeconds": \d+', b'"requestTimeoutSeconds": 1', bug_fixture_page(script=probe))
+        self.assertEqual(firefox_probe_results(page), [[]])
 
     def assert_held_send(self, outcome: str) -> None:
         probe = UNDO_PROBE.replace("__OUTCOME__", json.dumps(outcome)).replace("__PNG__", PNG)
