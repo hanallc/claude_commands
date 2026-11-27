@@ -611,7 +611,8 @@ The `start` and `fixed` commands send no follow-up push.
     A stored text that fails the check prints `questions: reword — <text>: …` but permits the write.
     Read-time checks were removed on 2026-10-18 because one stored word blocked every update to hana's list.
   - Each new question is reviewed once with `review.review_question(QuestionKey(name, text), question, revision=False) -> QuestionOutcome`. This uses guide tags `question,all`, no push header parsing, no length limits and no `withhold`.
-  - The Console question review reuses approval when the key, draft, rules, date, and time zone match. A changed line can get new model questions.
+  - The Console question review reuses approval when the key, title, body, Console kind, rules, caption layout, date, and time zone match.
+    The review reads saved approval before it resolves the reviewer binary.
   - Outcomes:
     - `QuestionAccepted(question)`: the original, or the rewrite if it passed a second check.
     - `QuestionAwaitingFacts(question, questions)`

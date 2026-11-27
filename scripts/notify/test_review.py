@@ -525,6 +525,57 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"), held)
         self.assertEqual(call.call_count, 3)
 
+    def test_console_question_rechecks_a_new_title_already_in_the_body(self) -> None:
+        from scripts.console_text import check as console_text
+
+        title = "Retry the download?"
+        revised_title = "Keep the partial file?"
+        draft = f"{title}\n\n{revised_title}\n\nRecommended: Yes."
+        key = review.QuestionKey("demo", "download", request_key="download")
+        runner = FakeReviewer(verdict(self.draft))
+        real_review = review.review_question
+        questions = ("Which choice do you recommend?",)
+        requests: list[QuestionReviewRequest] = []
+
+        def run(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
+            return real_review(key, text, runner=runner, console_kind=console_kind)
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            request = question_request(prompt)
+            requests.append(request)
+            return question_batch(request, questions=questions if len(requests) > 1 else ())
+
+        with (mock.patch.object(review, "review_question", side_effect=run),
+              mock.patch.object(review, "structured_call", side_effect=judge)):
+            self.assertEqual(console_text.check(draft, "question", key=key, title=title),
+                             review.QuestionAccepted(draft))
+            self.assertEqual(console_text.check(draft, "question", key=key, title=revised_title),
+                             review.QuestionAwaitingFacts(draft, questions))
+        self.assertEqual([request["draft"] for request in requests], [draft, draft])
+
+    def test_console_question_uses_saved_approval_without_a_reviewer_binary(self) -> None:
+        title = "Retry the download?"
+        draft = f"{title}\n\n1. The download stopped.\n\nRecommended: Yes."
+        key = review.QuestionKey("demo", title)
+        runner = FakeReviewer(verdict(self.draft))
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            return question_batch(question_request(prompt))
+
+        with mock.patch.object(review, "structured_call", side_effect=judge) as call:
+            self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                             review.QuestionAccepted(draft))
+            call.reset_mock()
+            missing = review.MissingReviewerBinary(("PATH: claude",))
+            with mock.patch.object(review, "reviewer_binary", return_value=missing) as resolve_binary:
+                self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                                 review.QuestionAccepted(draft))
+                resolve_binary.assert_not_called()
+                revised = draft.replace("stopped", "paused")
+                self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"),
+                                 review.QuestionReviewUnavailable(revised, "no claude binary: PATH: claude"))
+            call.assert_not_called()
+
     def test_console_question_keeps_the_passed_title_after_two_other_lines_change(self) -> None:
         title = "## The change for your 07:15 PST Yes is ready: may it go in?"
         question = (

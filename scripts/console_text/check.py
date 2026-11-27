@@ -143,6 +143,8 @@ def check(text: str, kind: Kind, *, key: review.QuestionKey | None = None,
         return review.QuestionAccepted(text)
     draft = f"{heading}\n\n{text}" if separate_title else text
     model_key = key or review.QuestionKey(kind, draft)
+    if title:
+        model_key = replace(model_key, console_draft_digest=review.question_part_digest((title, text)))
     if caption_layout is None:
         result = review.review_question(model_key, draft, console_kind=kind)
     else:
