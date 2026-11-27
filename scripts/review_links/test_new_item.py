@@ -41,7 +41,9 @@ CARGO_STYLE = member("10000000-0000-4000-8000-000000000008", "unit", "style", CA
 SPACETIME_STYLE = member("10000000-0000-4000-8000-000000000009", "unit", "style", SPACETIME)
 MORTY = member("01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a", "producer", "morty")
 ROWS = (DWIGHT, BOB, SPACETIME, MODELS, NATEDEV, POSTMASTER, CARGO, TILE, HIDDEN, CARGO_STYLE, SPACETIME_STYLE)
-MEMBERS = staff.StaffSnapshot(ROWS)
+MEMBERS = staff.StaffSnapshot((*ROWS, staff.StaffRow.from_json({
+    **MORTY.to_json(), staff.LEGACY_PRODUCER_MARK: MORTY.name,
+})))
 ADDRESS = for_you.ConsoleAddress("192.0.2.1", 8765)
 EXCHANGE = new_item.exchange
 
@@ -116,7 +118,7 @@ class ServerFixture(unittest.TestCase):
         document = self.config.parent / "natedev.md"
         _ = document.write_text("> **Status: PRODUCTION — running.**\n", encoding="utf-8")
         natedev = replace(NATEDEV, doc=staff.LiveDoc(local_machine(), document))
-        return staff.StaffSnapshot(tuple(natedev if row == NATEDEV else row for row in MEMBERS.rows) + (MORTY,))
+        return staff.StaffSnapshot(tuple(natedev if row == NATEDEV else row for row in ROWS) + (MORTY,))
 
     def run_main(self, *arguments: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
@@ -130,6 +132,13 @@ class NewItemTests(ServerFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=MEMBERS))
+
+    def test_fixture_keeps_the_name_of_an_inactive_producer(self) -> None:
+        row = staff.snapshot().by_id(MORTY.id)
+        assert row is not None
+        self.assertEqual(row.name, "morty")
+        self.assertTrue(row.awaits_legacy_removal)
+        self.assertNotIn(row, staff.active(staff.snapshot(), "producer"))
 
     def test_no_arguments_print_the_usage(self) -> None:
         code, output, _ = self.run_main()

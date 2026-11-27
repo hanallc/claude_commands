@@ -2562,7 +2562,10 @@ def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc, *,
 
 def require_stopped(identity: StaffId) -> None:
     """Removal cannot erase a live native session or uncertain process evidence."""
-    record = snapshot()
+    _require_stopped(snapshot(), identity)
+
+
+def _require_stopped(record: StaffSnapshot, identity: StaffId) -> None:
     target = record.by_id(identity)
     if target is None:
         return
@@ -2608,30 +2611,44 @@ def retire(staff_id: StaffId) -> StaffRow | None:
     return removed
 
 
-def retire_unit(expected: StaffRow) -> None:
+def retire_unit(expected: StaffRow, *, expected_workers: Sequence[StaffRow] | None = None) -> None:
     """Remove a unit and its stopped workers after checkout and pane cleanup."""
-    if not is_owner():
-        _ = _remote(["remove-unit-record", expected.id, "--expected-row", json.dumps(expected.to_json())])
-        return
-    record = snapshot()
-    row = record.by_id(expected.id)
-    if row is None:
-        return
-    if row.kind != "unit" or row.current_session != expected.current_session or row.worktree != expected.worktree:
-        raise StaffRefused(f"{expected.name}: the unit changed before retirement")
-    members = {member.id: member for member in (row, *record.find(kind="worker", parent=row.id))}
-    for identity in members:
-        require_stopped(identity)
-
-    def edit(rows: list[StaffRow], pending: set[StaffId]) -> None:
-        if (any(_row_by_id(rows, identity) != member for identity, member in members.items())
-                or any(member.parent == ReportsTo(row.id) and member.id not in members for member in rows)):
-            raise StaffRefused(f"{row.name}: the unit or its workers changed before retirement")
-        rows[:] = [member for member in rows if member.id not in members]
-        pending.difference_update(members)
-
-    _record_transaction(edit)
+    with slot_operation(expected.id, expected.name), ExitStack() as locks:
+        record = authority_snapshot()
+        row = record.by_id(expected.id)
+        if row is None:
+            return
+        if row.kind != "unit" or row.to_json() != expected.to_json():
+            raise StaffRefused(f"{expected.name}: the unit changed before retirement")
+        workers = record.find(kind="worker", parent=row.id)
+        if expected_workers is not None and {worker.id: worker.to_json() for worker in workers} != {
+                worker.id: worker.to_json() for worker in expected_workers}:
+            raise StaffRefused(f"{row.name}: the unit's workers changed before retirement")
+        for worker in workers:
+            _ = locks.enter_context(slot_operation(worker.id, worker.name))
+        if not is_owner():
+            for member in (row, *workers):
+                _require_stopped(record, member.id)
+            _ = _remote(["remove-unit-record", expected.id, "--expected-row", json.dumps(expected.to_json()),
+                         "--expected-workers", json.dumps([worker.to_json() for worker in workers])])
+            _forget_restart([member.id for member in (row, *workers)])
+            return
+        members = {member.id: member for member in (row, *workers)}
+        _record_transaction(lambda rows, pending: _remove_unit_members(rows, pending, row, members))
     _forget_restart(list(members))
+
+
+def _remove_unit_members(rows: list[StaffRow], pending: set[StaffId], unit: StaffRow,
+                         members: dict[StaffId, StaffRow]) -> None:
+    if (any((current := _row_by_id(rows, identity)) is None or current.to_json() != member.to_json()
+            for identity, member in members.items())
+            or any(member.reports_to(unit.id) and member.id not in members for member in rows)):
+        raise StaffRefused(f"{unit.name}: the unit or its workers changed before retirement")
+    record = authority_snapshot()
+    for identity in members:
+        _require_stopped(record, identity)
+    rows[:] = [member for member in rows if member.id not in members]
+    pending.difference_update(members)
 
 
 def _forget_restart(staff_ids: list[StaffId]) -> None:
@@ -2704,30 +2721,43 @@ def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
     return row
 
 
-def _retain_retired(rows: list[StaffRow], row: StaffRow) -> bool:
-    """Finish one unheld retirement without deleting a row or changing an edge."""
-    if any(child.kind == "worker" and child.parent == ReportsTo(row.id) for child in rows):
+def _retire_absent_unit(rows: list[StaffRow], pending: set[StaffId], row: StaffRow, locks: ExitStack) -> bool:
+    """Remove a stopped unit after its local worktree and worker rows are gone."""
+    from scripts.agents import remote
+
+    if any(child.reports_to(row.id) for child in rows):
         return False
-    if row.kind == "unit":
-        if isinstance(row.worktree, WorktreeUnfilled):
-            print(f"staff: keeping {row.id}: worktree is unfilled", file=sys.stderr)
-            return False
-        changed = replace(row, worktree=_keep_location_fields(
-            row.worktree if isinstance(row.worktree, RemovedWorktree) else
-            RemovedWorktree(row.worktree.machine, row.worktree.path), row.worktree))
-    elif row.kind == "showrunner":
-        if any(child.kind == "unit" and child.parent == ReportsTo(row.id)
-               and not isinstance(child.worktree, RemovedWorktree) for child in rows):
-            return False
-        if isinstance(row.doc, DocUnfilled):
-            print(f"staff: keeping {row.id}: doc is unfilled", file=sys.stderr)
-            return False
-        destination = WrappedDoc(row.doc.machine, row.doc.path)
-        _require_document_change(row, destination)
-        changed = replace(row, doc=_keep_location_fields(destination, row.doc))
-    else:
+    location = row.worktree
+    if isinstance(location, WorktreeUnfilled):
+        print(f"staff: keeping {row.id}: worktree is unfilled", file=sys.stderr)
+        return False
+    if location.machine != remote.local_machine():
+        return False
+    try:
+        _ = locks.enter_context(slot_operation(row.id, row.name))
+        try:
+            _ = location.path.lstat()
+        except FileNotFoundError:
+            _remove_unit_members(rows, pending, row, {row.id: row})
+            return True
+    except (OSError, StaffRefused) as error:
+        print(f"staff: keeping {row.id}: {error}", file=sys.stderr)
+    return False
+
+
+def _wrap_pending_showrunner(rows: list[StaffRow], row: StaffRow) -> bool:
+    """Wrap the document when no current unit or worker depends on the row."""
+    if row.kind != "showrunner":
         raise StaffRefused("pending retirement is for units and showrunners")
-    rows[rows.index(row)] = changed
+    if any(child.reports_to(row.id) and (child.kind == "worker"
+           or child.kind == "unit" and not isinstance(child.worktree, RemovedWorktree)) for child in rows):
+        return False
+    if isinstance(row.doc, DocUnfilled):
+        print(f"staff: keeping {row.id}: doc is unfilled", file=sys.stderr)
+        return False
+    destination = WrappedDoc(row.doc.machine, row.doc.path)
+    _require_document_change(row, destination)
+    rows[rows.index(row)] = replace(row, doc=_keep_location_fields(destination, row.doc))
     return True
 
 
@@ -2757,18 +2787,27 @@ def retire_pending() -> tuple[StaffId, ...]:
             raise StaffUnreadable("invalid pending retirement ids")
         return tuple(StaffId(item) for item in cast(list[str], value))
 
+    removed: list[StaffId] = []
+
     def edit(rows: list[StaffRow], pending: set[StaffId]) -> tuple[StaffId, ...]:
         ordered = sorted(pending, key=lambda key: (0 if (row := _row_by_id(rows, key)) is None
                                                      or row.kind == "unit" else 1, key))
         for staff_id in ordered:
             row = _row_by_id(rows, staff_id)
-            if row is not None:
-                if not _retain_retired(rows, row):
-                    continue
-            pending.remove(staff_id)
+            if row is None:
+                pending.remove(staff_id)
+            elif row.kind == "unit":
+                if _retire_absent_unit(rows, pending, row, locks):
+                    removed.append(staff_id)
+            elif _wrap_pending_showrunner(rows, row):
+                pending.remove(staff_id)
         return tuple(sorted(pending))
 
-    return _record_transaction(edit)
+    with ExitStack() as locks:
+        remaining = _record_transaction(edit)
+    if removed:
+        _forget_restart(removed)
+    return remaining
 
 
 def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
@@ -2778,6 +2817,8 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
         if not isinstance(value, dict):
             raise StaffUnreadable("staff snapshot must be an object")
         return _snapshot_value(cast(dict[str, object], value))
+
+    removed: list[StaffId] = []
 
     def edit(rows: list[StaffRow], pending: set[StaffId]) -> StaffSnapshot:
         entries = {member.key: member for member in seed_input.members}
@@ -2835,15 +2876,18 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
                 raise StaffRefused(f"seed can retire only an absent unit: {staff_id}")
             if row.parent != ReportsTo(retirement.parent):
                 print(f"seed: keeping unit {row.name}: parent changed", file=sys.stderr)
-            elif any(child.kind == "worker" and child.parent == ReportsTo(staff_id) for child in rows):
-                print(f"seed: keeping unit {row.name}: worker rows remain", file=sys.stderr)
-                pending.add(staff_id)
-            elif not _retain_retired(rows, row):
+            elif _retire_absent_unit(rows, pending, row, locks):
+                removed.append(staff_id)
+            else:
                 pending.add(staff_id)
         return StaffSnapshot(tuple(sorted(rows, key=lambda row: row.id)),
                              tuple(sorted(pending)))
 
-    return _record_transaction(edit)
+    with ExitStack() as locks:
+        result = _record_transaction(edit)
+    if removed:
+        _forget_restart(removed)
+    return result
 
 
 def _paths(rows: list[StaffRow]) -> dict[StaffId, str]:
@@ -2866,6 +2910,7 @@ class _MoveCommand(Protocol):
 
 class _Arguments:
     expected_row: str = ""
+    expected_workers: str = ""
     creation_action: str = ""
     marker: str = ""
     profile: str = ""
@@ -3011,6 +3056,7 @@ def _parser() -> argparse.ArgumentParser:
     remove_unit = verbs.add_parser("remove-unit-record", help=argparse.SUPPRESS)
     _ = remove_unit.add_argument("target")
     _ = remove_unit.add_argument("--expected-row", required=True)
+    _ = remove_unit.add_argument("--expected-workers", default="")
     _ = remove_unit.add_argument("--json", action="store_true")
     apply_parser = verbs.add_parser("apply-seed", help=argparse.SUPPRESS)
     defer_parser = verbs.add_parser("defer-retire", help=argparse.SUPPRESS)
@@ -3143,7 +3189,13 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         expected = StaffRow.from_json(_decode(arguments.expected_row))
         if expected.id != arguments.target:
             raise StaffRefused("the expected unit does not match the target")
-        retire_unit(expected)
+        expected_workers = None
+        if arguments.expected_workers:
+            decoded = _decode(arguments.expected_workers)
+            if not isinstance(decoded, list):
+                raise StaffRefused("expected workers must be a list")
+            expected_workers = [StaffRow.from_json(item) for item in cast(list[object], decoded)]
+        retire_unit(expected, expected_workers=expected_workers)
         return None
     if arguments.verb == "apply-seed":
         return apply_seed(SeedInput.from_json(_decode(seed_text)))
