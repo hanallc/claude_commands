@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 import fcntl
 import io
@@ -584,6 +584,128 @@ class RemoteCopiesTests(unittest.TestCase):
         finally:
             os.kill(pid, signal.SIGKILL)
 
+    def mirror_receiver(self, session: str, *command: str) -> list[str]:
+        script = Path(copies.__file__).resolve()
+        return [sys.executable, str(script), "mirror-receive", "--path", str(self.mirror), "--owner", "alpha",
+                "--repository", "repository", "--session", session, "--", *command]
+
+    def test_cut_receiver_ends_its_children_and_releases_the_lease(self) -> None:
+        program = """\
+import os, signal
+assert not os.isatty(0)
+child = os.fork()
+if child:
+    print(os.getpid(), child, flush=True)
+signal.pause()
+"""
+        unrelated = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
+        receiver: subprocess.Popen[str] = subprocess.Popen(self.mirror_receiver("cut-session", sys.executable, "-c", program),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        children: tuple[int, ...] = ()
+        try:
+            assert receiver.stdin is not None and receiver.stdout is not None
+            self.assertTrue(select.select([receiver.stdout], [], [], 10)[0], "The receiver did not start")
+            children = tuple(map(int, cast(str, receiver.stdout.readline()).split()))
+            self.assertEqual(len(children), 2)
+            self.assertEqual(os.getsid(unrelated.pid), os.getsid(receiver.pid))
+            with self.assertRaisesRegex(copies.CopyError, "cut-session"):
+                with copies.local_mirror_lease(self.mirror, "busy-check"):
+                    self.fail("The active receiver lost its lease")
+
+            receiver.stdin.close()
+            try:
+                status = receiver.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.fail("The receiver stayed alive after the channel closed")
+            self.assertNotEqual(status, 0)
+            self.assertTrue(select.select([receiver.stdout], [], [], 5)[0], "A child kept the channel open")
+            self.assertEqual(receiver.stdout.read(1), "")
+            children = ()
+            self.assertIsNone(unrelated.poll())
+
+            with subprocess.Popen(self.mirror_receiver("next-session", sys.executable, "-c", "pass"), stdin=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) as next_receiver:
+                try:
+                    self.assertEqual(next_receiver.wait(timeout=5), 0)
+                finally:
+                    if next_receiver.poll() is None:
+                        next_receiver.kill()
+        finally:
+            if receiver.poll() is None:
+                receiver.kill()
+            _ = receiver.wait(timeout=5)
+            for pid in reversed(children):
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+            for stream in (receiver.stdin, receiver.stdout, receiver.stderr):
+                if stream is not None:
+                    stream.close()
+            if unrelated.poll() is None:
+                unrelated.kill()
+            _ = unrelated.wait(timeout=5)
+
+    @unittest.skipUnless(sys.platform == "linux", "The test uses pidfds to confirm process exit")
+    def test_cut_receiver_ends_its_child_after_the_leader_exits(self) -> None:
+        program = """\
+import os, signal
+child = os.fork()
+if child:
+    print(os.getpid(), child, flush=True)
+    assert os.read(0, 1) == b"x"
+    os._exit(23)
+signal.pause()
+"""
+
+        def stop_child(descriptor: int) -> None:
+            with suppress(ProcessLookupError):
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+
+        command = self.mirror_receiver("cut-session", sys.executable, "-c", program)
+        with (subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as receiver,
+              ExitStack() as descriptors):
+            try:
+                assert receiver.stdin is not None and receiver.stdout is not None
+                self.assertTrue(select.select([receiver.stdout], [], [], 10)[0], "The receiver did not start")
+                leader, child = map(int, cast(str, receiver.stdout.readline()).split())
+                child_exit = os.pidfd_open(child)
+                _ = descriptors.callback(os.close, child_exit)
+                _ = descriptors.callback(stop_child, child_exit)
+                leader_exit = os.pidfd_open(leader)
+                _ = descriptors.callback(os.close, leader_exit)
+                _ = receiver.stdin.write("x")
+                receiver.stdin.flush()
+                self.assertTrue(select.select([leader_exit], [], [], 5)[0], "The leader did not exit")
+                with self.assertRaisesRegex(copies.CopyError, "cut-session"):
+                    with copies.local_mirror_lease(self.mirror, "busy-check"):
+                        self.fail("The active child lost its lease")
+                self.assertEqual(os.getpgid(leader), leader, "The receiver reaped the leader")
+
+                receiver.stdin.close()
+                self.assertEqual(receiver.wait(timeout=5), 23)
+                self.assertTrue(select.select([child_exit], [], [], 5)[0], "The child survived the channel cut")
+                with copies.local_mirror_lease(self.mirror, "after-cut"):
+                    pass
+            finally:
+                if receiver.poll() is None:
+                    receiver.kill()
+
+    def test_normal_remote_rsync_releases_the_receiver_lease(self) -> None:
+        mirror = self.remote(path=str(self.mirror))
+        exclude = self.root / "excludes"
+        exclude.touch()
+        ssh = self.root / "ssh"
+        _ = ssh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$*"\n')
+        ssh.chmod(0o700)
+        command = copies.remote_rsync(self.source, mirror, exclude, [])
+        command[command.index("-e") + 1] = shlex.quote(str(ssh))
+        receiver = shlex.join(self.mirror_receiver(mirror.session, "rsync"))
+        command = [f"--rsync-path={receiver}" if word.startswith("--rsync-path=") else word for word in command]
+        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.mirror / "source.txt").read_text(), "committed\n")
+        with copies.local_mirror_lease(self.mirror, "after-transfer"):
+            self.assertTrue((self.mirror / ".copy-record.json").exists())
+
     def test_surviving_process_without_an_inherited_descriptor_keeps_metadata(self) -> None:
         copies.probe_remote_folder(str(self.mirror))
         child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"], cwd=self.mirror)
@@ -644,9 +766,13 @@ class RemoteCopiesTests(unittest.TestCase):
                     self.assertIs(state, file_lock.LockResult.BUSY)
             real_write(path, content)
 
-        with mock.patch.object(floor_claims, "read_claims", side_effect=claims), \
-                mock.patch.object(copies, "write_text_atomic", side_effect=record):
+        with (mock.patch.object(floor_claims, "read_claims", side_effect=claims),
+              mock.patch.object(copies, "write_text_atomic", side_effect=record),
+              mock.patch.object(copies, "local_mirror_lease", wraps=copies.local_mirror_lease) as lease):
             self.assertEqual(copies.mirror_run(args), 0)
+        lease.assert_called_once_with(self.mirror, "receiver-session", create_tree=False)
+        with copies.local_mirror_lease(self.mirror, "after-transfer"):
+            pass
         metadata = self.mirror / ".copy-record.json"
         self.assertIn('"owner": "alpha"', metadata.read_text())
         self.assertTrue((self.mirror / ".mac-test-mirror").exists())
