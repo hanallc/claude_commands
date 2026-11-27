@@ -17,6 +17,7 @@ from scripts.direct import pass_record, progress_history
 from scripts.lib import process_start, unit_runs
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from scripts.lib.transcript_test_support import compressed_copy
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import review
 from scripts.production import (
     behavior_check, behavior_review, record_store, session_staff, staff, the_list, update_registration, worker,
@@ -118,8 +119,13 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         return finding
 
     def new_list_record(self) -> tuple[record_store.NumberedRecords, str]:
-        keeper = replace(self.producer, name="morty")
-        with staff.supplied_snapshot(staff.StaffSnapshot((keeper,))):
+        keeper = self.producer
+        members = staff.StaffSnapshot((keeper,))
+        configuration = self.root / "config"
+        _ = write_config_fixture(configuration / "console.conf", f"page.list.owner={keeper.id}\n")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              mock.patch.object(staff, "authority_snapshot", return_value=members),
+              staff.supplied_snapshot(members)):
             item = the_list.add(keeper.id, "Set the move timing", owner=keeper.id, source="nate", changes={})
         return list_draft.list_records(keeper.id), item.id
 
