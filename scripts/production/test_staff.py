@@ -1443,6 +1443,24 @@ class StaffTests(StaffCommandTestCase):
             staff.retire_unit(unit)
         self.assertEqual(self.staff_file.read_bytes(), before)
 
+    def test_remote_retirement_removes_members_and_records_cleanup_in_one_write(self) -> None:
+        parent, unit, worker = self.tree()
+        token = "a" * 32
+        before = self.staff_file.read_bytes()
+        with self.machine("mac"):
+            with self.assertRaisesRegex(staff.StaffRefused, "workers changed"):
+                staff.remove_unit_for_retirement(unit, parent, [], token)
+            self.assertEqual(self.staff_file.read_bytes(), before)
+            staff.remove_unit_for_retirement(unit, parent, [worker], token)
+            current = staff.authority_snapshot()
+            self.assertIsNone(current.by_id(unit.id))
+            self.assertIsNone(current.by_id(worker.id))
+            self.assertEqual(current.by_id(parent.id), parent)
+            self.assertEqual(current.retirement_cleanup, {unit.id: token})
+            staff.finish_unit_retirement(unit.id, token)
+            self.assertEqual(staff.authority_snapshot().retirement_cleanup, {})
+        self.assertFalse(self.mac_file.exists())
+
     def test_pending_retirement_keeps_ids_and_edges_and_waits_for_workers_and_known_locations(self) -> None:
         runner = self.retirement_document(fixture_member("showrunner", name="sdlc"), self.root / "doc.md")
         child = fixture_member("showrunner", name="child", parent=runner.id)

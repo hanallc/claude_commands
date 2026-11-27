@@ -654,11 +654,14 @@ class ProducerCommandsTests(unittest.TestCase):
         fixed_hold = (holds / DIRECTOR).rename(holds / member.id)
         settings = conf.read("production")
         checked = shutdown.retirement_check(unit, settings=settings)
-        with (patch.object(staff, "authority_snapshot", return_value=record),
+        token = "a" * 32
+        authority = staff.StaffSnapshot((parent,), retirement_cleanup={member.id: token})
+        with (patch.object(staff, "authority_snapshot", return_value=authority),
+              patch.object(staff, "require_stopped"),
               patch.object(shutdown, "retirement_remove", return_value=[]) as remove,
               patch.object(copies, "remove_trees") as trees, redirect_stdout(io.StringIO()) as output):
             code = shutdown.retirement_clear_worktree(unit, settings=settings, record=record,
-                pane_workers=[], pane=herdr.NoPane("alpha"), origin=checked.origin, require_cleanup=True)
+                pane_workers=[], pane=herdr.NoPane("alpha"), origin=checked.origin, cleanup_token=token)
         self.assertEqual(code, 0, output.getvalue())
         self.assertIn(["build_hold.py", "release", "--holder", member.id], case.calls)
         self.assertFalse(fixed_hold.exists())

@@ -693,14 +693,18 @@ class StaffSnapshot:
     production: bool = field(default=False, compare=False)
     # The session ids a caller already read. None reads the session registry at use.
     running_sessions: frozenset[str] | None = field(default=None, compare=False)
+    retirement_cleanup: Mapping[StaffId, str] = field(default_factory=lambda: dict[StaffId, str](), kw_only=True)
 
     @property
     def all_rows(self) -> tuple[StaffRow, ...]:
         return self.rows
 
     def encode(self) -> str:
-        return json.dumps({"rows": [row.to_json() for row in self.all_rows], "schema": self.schema,
-                           "pending_retire": list(self.pending_retire), "inputs": list(self.inputs)}, sort_keys=True)
+        fields: dict[str, object] = {"rows": [row.to_json() for row in self.all_rows], "schema": self.schema,
+                                     "pending_retire": list(self.pending_retire), "inputs": list(self.inputs)}
+        if self.retirement_cleanup:
+            fields["retirement_cleanup"] = self.retirement_cleanup
+        return json.dumps(fields, sort_keys=True)
 
     @classmethod
     def decode(cls, text: str) -> StaffSnapshot:
@@ -1581,10 +1585,19 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
                                          for path in cast(list[object], inputs)):
         raise StaffUnreadable("invalid staff input paths")
     rows = _rows(fields.get("rows"))
+    raw_cleanup = fields.get("retirement_cleanup", {})
+    if not isinstance(raw_cleanup, dict):
+        raise StaffUnreadable("invalid retirement cleanup receipts")
+    cleanup: dict[StaffId, str] = {}
+    for identity, token in cast(dict[str, object], raw_cleanup).items():
+        if not _valid_id(identity) or not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+            raise StaffUnreadable("invalid retirement cleanup receipt")
+        cleanup[StaffId(identity)] = token
     return StaffSnapshot(tuple(rows),
                          tuple(sorted({StaffId(item) for item in cast(list[str], pending)})),
                          tuple(cast(list[str], inputs)), cast(int, fields.get("schema", 2)),
-                         all("current_session" in item for item in cast(list[dict[str, object]], fields.get("rows", []))))
+                         all("current_session" in item for item in cast(list[dict[str, object]], fields.get("rows", []))),
+                         retirement_cleanup=cleanup)
 
 
 def _remote(arguments: list[str], *, input_text: str | None = None, machine: str = OWNER_MACHINE) -> object:
@@ -1906,7 +1919,7 @@ def _location_paths(row: StaffRow) -> tuple[Path, ...]:
                  if isinstance(location, (LiveDoc, WrappedDoc, PresentWorktree, RemovedWorktree, SessionLaunchFolder)))
 
 
-def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
+def _store(rows: list[StaffRow], pending: set[StaffId], cleanup: dict[StaffId, str]) -> None:
     from scripts.lib import atomic_file
 
     retained = cast(dict[str, object], _decode(_file().read_text(encoding="utf-8"))) if _file().exists() else {}
@@ -1915,6 +1928,8 @@ def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
     document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows] + unknown}
     if pending:
         document["pending_retire"] = sorted(pending)
+    if cleanup:
+        document["retirement_cleanup"] = cleanup
     atomic_file.write_text_atomic(_file(), json.dumps(document, indent=2, sort_keys=True) + "\n")
     _copy_to_mac()
 
@@ -1961,7 +1976,7 @@ mv -f "$temporary" "$directory/staff.json"
         print(f"staff: Mac copy failed: {' '.join(str(error).split())}", file=sys.stderr)
 
 
-def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
+def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId], dict[StaffId, str]], _Result]) -> _Result:
     from scripts.lib import atomic_file
     from scripts.agents import worker_lifecycle
 
@@ -1975,7 +1990,8 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
             original = _load(initial=True)
             proposed = list(original.all_rows)
             pending = set(original.pending_retire)
-            result = edit(proposed, pending)
+            cleanup = dict(original.retirement_cleanup)
+            result = edit(proposed, pending, cleanup)
             if path.resolve() == _default_file().resolve():
                 previous = {row.id: row for row in original.all_rows}
                 for row in proposed:
@@ -1987,12 +2003,13 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
                         if any(identity[14:15] == "5" for identity in (row.id, row.current_session)):
                             raise StaffRefused("fixture runtime id cannot enter the real staff record")
             proposed.sort(key=lambda row: row.id)
-            if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.all_rows) and pending == set(original.pending_retire):
+            if (original.schema == 2 and original.current_sessions_recorded and proposed == list(original.all_rows)
+                    and pending == set(original.pending_retire) and cleanup == original.retirement_cleanup):
                 # A prior replace may have succeeded before its folder sync failed.
                 atomic_file.sync_folder(path.parent)
                 print("unchanged", file=sys.stderr)
             else:
-                _store(proposed, pending)
+                _store(proposed, pending, cleanup)
             return result
     except worker_lifecycle.OperationDeadlineExpired:
         raise
@@ -2003,7 +2020,7 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
 
 
 def _transaction(edit: Callable[[list[StaffRow]], _Result]) -> _Result:
-    return _record_transaction(lambda rows, pending: edit(rows))
+    return _record_transaction(lambda rows, pending, cleanup: edit(rows))
 
 
 def _required(rows: list[StaffRow], staff_id: StaffId) -> StaffRow:
@@ -2294,7 +2311,7 @@ def promote_unit(identity: StaffId, *, name: str, parent: StaffId, doc: LiveDoc)
 def publish_native_ids(expected: StaffSnapshot, identities: Mapping[StaffId, StaffId],
                        additions: tuple[StaffRow, ...] = ()) -> StaffSnapshot:
     """Finish a migration in the single staff writer after its references are ready."""
-    def edit(rows: list[StaffRow], pending: set[StaffId]) -> StaffSnapshot:
+    def edit(rows: list[StaffRow], pending: set[StaffId], _cleanup: dict[StaffId, str]) -> StaffSnapshot:
         if tuple(rows) != expected.all_rows:
             raise StaffRefused("staff changed during migration; read a fresh snapshot")
         for old, identity in identities.items():
@@ -2634,8 +2651,54 @@ def retire_unit(expected: StaffRow, *, expected_workers: Sequence[StaffRow] | No
             _forget_restart([member.id for member in (row, *workers)])
             return
         members = {member.id: member for member in (row, *workers)}
-        _record_transaction(lambda rows, pending: _remove_unit_members(rows, pending, row, members))
+        _record_transaction(lambda rows, pending, cleanup: _remove_unit_members(rows, pending, row, members))
     _forget_restart(list(members))
+
+
+def remove_unit_for_retirement(unit: StaffRow, parent: StaffRow, workers: Sequence[StaffRow], token: str) -> None:
+    """Publish absence and the cleanup receipt in one staff write."""
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise StaffRefused("invalid retirement cleanup token")
+    if not is_owner():
+        _ = _remote(["retirement-cleanup", unit.id, "remove", token], input_text=json.dumps({
+            "unit": unit.to_json(), "parent": parent.to_json(), "workers": [worker.to_json() for worker in workers],
+        }))
+        _forget_restart([unit.id, *(worker.id for worker in workers)])
+        return
+
+    members = {member.id: member for member in (unit, *workers)}
+
+    def edit(rows: list[StaffRow], pending: set[StaffId], cleanup: dict[StaffId, str]) -> None:
+        current = _required(rows, unit.id)
+        if (unit.kind != "unit" or current.to_json() != unit.to_json() or parent.kind != "showrunner"
+                or current.parent != ReportsTo(parent.id) or (owner := _row_by_id(rows, parent.id)) is None
+                or owner.to_json() != parent.to_json()):
+            raise StaffRefused(f"{unit.name}: the unit or its production changed before retirement")
+        if (any(worker.kind != "worker" or not worker.reports_to(unit.id) for worker in workers)
+                or {row.id: row.to_json() for row in rows if row.reports_to(unit.id)} != {
+                    worker.id: worker.to_json() for worker in workers}):
+            raise StaffRefused(f"{unit.name}: the unit's workers changed before retirement")
+        if unit.id in cleanup:
+            raise StaffRefused(f"{unit.name}: a retirement cleanup receipt already exists")
+        rows[:] = [row for row in rows if row.id not in members]
+        pending.difference_update(members)
+        cleanup[unit.id] = token
+
+    _record_transaction(edit)
+    _forget_restart(list(members))
+
+
+def finish_unit_retirement(identity: StaffId, token: str) -> None:
+    """Remove the receipt for completed cleanup."""
+    if not is_owner():
+        _ = _remote(["retirement-cleanup", identity, "finish", token])
+        return
+
+    def edit(_rows: list[StaffRow], _pending: set[StaffId], cleanup: dict[StaffId, str]) -> None:
+        if cleanup.get(identity) == token:
+            del cleanup[identity]
+
+    _record_transaction(edit)
 
 
 def _remove_unit_members(rows: list[StaffRow], pending: set[StaffId], unit: StaffRow,
@@ -2807,7 +2870,7 @@ def defer_retire(staff_ids: Sequence[StaffId]) -> None:
         _ = _remote(["defer-retire", *staff_ids])
         return
 
-    def edit(rows: list[StaffRow], pending: set[StaffId]) -> None:
+    def edit(rows: list[StaffRow], pending: set[StaffId], _cleanup: dict[StaffId, str]) -> None:
         for staff_id in staff_ids:
             row = _row_by_id(rows, staff_id)
             if row is not None:
@@ -2829,7 +2892,7 @@ def retire_pending() -> tuple[StaffId, ...]:
 
     removed: list[StaffId] = []
 
-    def edit(rows: list[StaffRow], pending: set[StaffId]) -> tuple[StaffId, ...]:
+    def edit(rows: list[StaffRow], pending: set[StaffId], _cleanup: dict[StaffId, str]) -> tuple[StaffId, ...]:
         ordered = sorted(pending, key=lambda key: (0 if (row := _row_by_id(rows, key)) is None
                                                      or row.kind == "unit" else 1, key))
         for staff_id in ordered:
@@ -2861,7 +2924,7 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
 
     removed: list[StaffId] = []
 
-    def edit(rows: list[StaffRow], pending: set[StaffId]) -> StaffSnapshot:
+    def edit(rows: list[StaffRow], pending: set[StaffId], _cleanup: dict[StaffId, str]) -> StaffSnapshot:
         entries = {member.key: member for member in seed_input.members}
         if len(entries) != len(seed_input.members) or any(not key for key in entries):
             raise StaffRefused("seed member keys must be nonempty and unique")
@@ -2952,6 +3015,8 @@ class _MoveCommand(Protocol):
 class _Arguments:
     expected_row: str = ""
     expected_workers: str = ""
+    cleanup_action: str = ""
+    cleanup_token: str = ""
     creation_action: str = ""
     marker: str = ""
     profile: str = ""
@@ -3099,6 +3164,11 @@ def _parser() -> argparse.ArgumentParser:
     _ = remove_unit.add_argument("--expected-row", required=True)
     _ = remove_unit.add_argument("--expected-workers", default="")
     _ = remove_unit.add_argument("--json", action="store_true")
+    cleanup = verbs.add_parser("retirement-cleanup", help=argparse.SUPPRESS)
+    _ = cleanup.add_argument("target")
+    _ = cleanup.add_argument("cleanup_action", choices=("remove", "finish"))
+    _ = cleanup.add_argument("cleanup_token")
+    _ = cleanup.add_argument("--json", action="store_true")
     apply_parser = verbs.add_parser("apply-seed", help=argparse.SUPPRESS)
     defer_parser = verbs.add_parser("defer-retire", help=argparse.SUPPRESS)
     _ = defer_parser.add_argument("ids", nargs="*")
@@ -3247,6 +3317,24 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb == "retirement-cleanup":
+        if not is_owner():
+            raise StaffRefused("the staff owner must write the retirement cleanup receipt")
+        if arguments.cleanup_action == "remove":
+            raw = _decode(sys.stdin.read())
+            if not isinstance(raw, dict):
+                raise StaffRefused("invalid retirement cleanup request")
+            fields = cast(dict[str, object], raw)
+            unit = StaffRow.from_json(fields.get("unit"))
+            workers = fields.get("workers")
+            if unit.id != arguments.target or not isinstance(workers, list):
+                raise StaffRefused("the retirement cleanup request does not match the unit")
+            remove_unit_for_retirement(unit, StaffRow.from_json(fields.get("parent")),
+                [StaffRow.from_json(worker) for worker in cast(list[object], workers)], arguments.cleanup_token)
+        else:
+            finish_unit_retirement(StaffId(arguments.target), arguments.cleanup_token)
+        print("null")
+        return 0
     if arguments.verb == "worktree-write-lock-status":
         if not is_owner():
             raise StaffRefused("the staff owner must check the worktree write lock")
