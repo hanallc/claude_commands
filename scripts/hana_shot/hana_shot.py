@@ -847,6 +847,7 @@ def camera_state(components: dict[str, object]) -> CameraState:
 class MacConsole(StrEnum):
     UNLOCKED = "unlocked"
     LOCKED = "locked"
+    LOGIN_REQUIRED = "login required"
     UNAVAILABLE = "unavailable"
 
 
@@ -862,7 +863,7 @@ SSH_PROBE = ("ssh", "-T", "-o", "BatchMode=yes", "--")
 
 
 def mac_console_state(output: bytes) -> MacConsole:
-    """Read the lock state of the logged-in console session."""
+    """Read the Mac console login and lock state."""
     try:
         root = cast(object, plistlib.loads(output))
     except (ValueError, ExpatError, OverflowError, AttributeError, LookupError) as exc:
@@ -870,10 +871,8 @@ def mac_console_state(output: bytes) -> MacConsole:
     if not isinstance(root, dict):
         raise MacConsoleReadFailure("the ioreg property list must have a top-level dictionary")
     properties = cast(dict[str, object], root)
-    if "IOConsoleLocked" not in properties:
-        raise MacConsoleReadFailure("IOConsoleLocked is missing")
-    locked = properties["IOConsoleLocked"]
-    if not isinstance(locked, bool):
+    locked = properties.get("IOConsoleLocked")
+    if "IOConsoleLocked" in properties and not isinstance(locked, bool):
         raise MacConsoleReadFailure("IOConsoleLocked must be a boolean")
     users = properties.get("IOConsoleUsers")
     if not isinstance(users, list):
@@ -883,10 +882,20 @@ def mac_console_state(output: bytes) -> MacConsole:
         if not isinstance(user, dict):
             raise MacConsoleReadFailure("IOConsoleUsers must contain dictionaries")
         session = cast(dict[str, object], user)
-        if session.get("kCGSSessionOnConsoleKey") is True and session.get("kCGSessionLoginDoneKey") is True:
+        on_console = session.get("kCGSSessionOnConsoleKey", False)
+        login_done = session.get("kCGSessionLoginDoneKey", False)
+        if not isinstance(on_console, bool):
+            raise MacConsoleReadFailure("kCGSSessionOnConsoleKey must be a boolean")
+        if not isinstance(login_done, bool):
+            raise MacConsoleReadFailure("kCGSessionLoginDoneKey must be a boolean")
+        if on_console and login_done:
             console_users += 1
-    if console_users != 1:
+    if console_users == 0:
+        return MacConsole.LOGIN_REQUIRED
+    if console_users > 1:
         raise MacConsoleReadFailure(f"expected one logged-in console user in IOConsoleUsers, found {console_users}")
+    if "IOConsoleLocked" not in properties:
+        raise MacConsoleReadFailure("IOConsoleLocked is missing")
     return MacConsole.LOCKED if locked else MacConsole.UNLOCKED
 
 
@@ -905,7 +914,7 @@ def probe_mac_console(remote: str | None, timeout: float) -> MacConsole:
 
 
 def mac_lock_cleared(pid: int, start: str, remote: str | None) -> bool:
-    """Check whether the capture process ended or the Mac unlocked."""
+    """Check whether the capture process ended or the Mac console is ready."""
     identity = process_start.process_start(pid)
     if isinstance(identity, (process_start.Gone, process_start.Zombie)):
         return True
@@ -972,7 +981,7 @@ class Session:
             time.sleep(self.settings.number("resend_seconds"))
 
     def wait_for_mac(self) -> None:
-        """Wait for the Mac to unlock before using the camera."""
+        """Wait for an unlocked Mac console with a logged-in user."""
         if not self.macos:
             return
         timeout = self.settings.number("call_timeout_seconds")
@@ -980,14 +989,14 @@ class Session:
         if state is not MacConsole.UNLOCKED:
             print(f"hana_shot: waiting for {self.remote or 'the Mac'} ({state})", file=sys.stderr)
         while state is not MacConsole.UNLOCKED:
-            if state is MacConsole.LOCKED and not self.mac_lock_alert_sent:
+            if state in (MacConsole.LOCKED, MacConsole.LOGIN_REQUIRED) and not self.mac_lock_alert_sent:
                 self.send_mac_lock_alert()
             time.sleep(self.settings.number("resend_seconds"))
             state = probe_mac_console(self.remote, timeout)
         self.retire_mac_lock_alert()
 
     def send_mac_lock_alert(self) -> None:
-        """Send the first confirmed lock alert for this run."""
+        """Send the alert when the Mac is locked or needs a login."""
         from scripts.notify import review
 
         pid = os.getpid()
@@ -1007,7 +1016,7 @@ class Session:
                                       send_timeout_s=timeout)
 
     def retire_mac_lock_alert(self) -> None:
-        """Retire the alert when the Mac unlocks or the run ends."""
+        """Retire the alert when the Mac console is ready or the run ends."""
         if self.mac_lock_alert_key is None:
             return
         sender = push_texts.render(MAC_LOCK_TEXT).sender

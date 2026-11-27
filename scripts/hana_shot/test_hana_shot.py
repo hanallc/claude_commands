@@ -47,6 +47,7 @@ LAUNCH_RECORDING_PURPOSE = "launch recovery"
 
 SCRIPT = Path(__file__).with_name("hana_shot.py")
 MAC_IOREG_UNLOCKED = SCRIPT.parent / "testdata" / "mac_ioreg_unlocked.plist"
+MAC_IOREG_NO_LOGIN = MAC_IOREG_UNLOCKED.with_name("mac_ioreg_no_login.plist")
 CAMERA_ENTITY = 5
 WINDOW_ENTITY = 3
 NAME = "bevy_ecs::name::Name"
@@ -2864,6 +2865,12 @@ class MacConsoleTests(BuildLogIsolatedTest):
         output = plistlib.dumps(properties | {"IOConsoleUsers": [extra_fields]})
         self.assertIs(hana_shot.mac_console_state(output), hana_shot.MacConsole.UNLOCKED)
 
+    def test_mac_console_without_login_allows_a_missing_lock_property(self) -> None:
+        properties = cast(dict[str, object], plistlib.loads(MAC_IOREG_NO_LOGIN.read_bytes()))
+        del properties["IOConsoleLocked"]
+
+        self.assertIs(hana_shot.mac_console_state(plistlib.dumps(properties)), hana_shot.MacConsole.LOGIN_REQUIRED)
+
     def test_mac_console_waits_after_a_failed_ssh_probe(self) -> None:
         output = MAC_IOREG_UNLOCKED.read_bytes()
         session = hana_shot.Session(hana_shot.Brp(15703), REMOTE_HOST)
@@ -3021,7 +3028,6 @@ class RemoteTests(HanaShotTest):
         console = self.scratch / "mac-console.plist"
         properties = cast(dict[str, object], plistlib.loads(console.read_bytes()))
         user, = cast(list[dict[str, object]], properties["IOConsoleUsers"])
-        no_console_user = "expected one logged-in console user in IOConsoleUsers, found 0"
         for output, cause in (
             (b"<?xml broken", "invalid ioreg property list"),
             (b'<?xml version="1.0"?><plist><date>invalid</date></plist>', "invalid ioreg property list"),
@@ -3032,9 +3038,12 @@ class RemoteTests(HanaShotTest):
             (plistlib.dumps({"IOConsoleLocked": False}), "IOConsoleUsers must be an array"),
             (plistlib.dumps(properties | {"IOConsoleUsers": {}}), "IOConsoleUsers must be an array"),
             (plistlib.dumps(properties | {"IOConsoleUsers": ["user"]}), "IOConsoleUsers must contain dictionaries"),
-            (plistlib.dumps(properties | {"IOConsoleUsers": []}), no_console_user),
-            (plistlib.dumps(properties | {"IOConsoleUsers": [user | {"kCGSSessionOnConsoleKey": False}]}), no_console_user),
-            (plistlib.dumps(properties | {"IOConsoleUsers": [user | {"kCGSessionLoginDoneKey": False}]}), no_console_user),
+            (plistlib.dumps(properties | {"IOConsoleLocked": "false", "IOConsoleUsers": []}),
+             "IOConsoleLocked must be a boolean"),
+            (plistlib.dumps(properties | {"IOConsoleUsers": [user | {"kCGSSessionOnConsoleKey": 1}]}),
+             "kCGSSessionOnConsoleKey must be a boolean"),
+            (plistlib.dumps(properties | {"IOConsoleUsers": [user | {"kCGSessionLoginDoneKey": "true"}]}),
+             "kCGSessionLoginDoneKey must be a boolean"),
             (plistlib.dumps(properties | {"IOConsoleUsers": [user, user]}),
              "expected one logged-in console user in IOConsoleUsers, found 2"),
         ):
@@ -3050,6 +3059,43 @@ class RemoteTests(HanaShotTest):
                 self.assertEqual(self.fake.calls, [])
                 self.assertFalse((self.scratch / "shot.png").exists())
                 sleep.assert_not_called()
+
+    def test_shot_alerts_once_and_waits_for_console_login(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        console = self.scratch / "mac-console.plist"
+        unlocked = MAC_IOREG_UNLOCKED.read_bytes()
+        properties = cast(dict[str, object], plistlib.loads(unlocked))
+        user, = cast(list[dict[str, object]], properties["IOConsoleUsers"])
+        for case, output in (
+            ("empty user list", plistlib.dumps(properties | {"IOConsoleUsers": []})),
+            ("user off console", plistlib.dumps(properties | {"IOConsoleUsers": [user | {"kCGSSessionOnConsoleKey": False}]})),
+            ("login not done", MAC_IOREG_NO_LOGIN.read_bytes()),
+        ):
+            self.fake.calls.clear()
+            _ = console.write_bytes(output)
+            after_wait = iter((output, unlocked))
+
+            def advance_console(_seconds: float) -> None:
+                self.assertEqual(self.fake.calls, [])
+                _ = console.write_bytes(next(after_wait))
+
+            sleep = mock.Mock(side_effect=advance_console)
+            with (
+                self.subTest(case=case),
+                mock.patch.object(hana_shot, "time", mock.Mock(wraps=time, sleep=sleep)),
+                mock.patch.object(push_texts, "send_user_push", return_value=True) as send,
+                mock.patch.object(push_texts, "user_retire_argv", return_value=[sys.executable, "-c", ""]) as retire,
+            ):
+                result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                delay = conf.read("hana_shot").number("resend_seconds")
+                self.assertEqual(sleep.call_args_list, [mock.call(delay)] * 2)
+                send.assert_called_once()
+                alert = send.call_args
+                self.assertEqual(cast(push_texts.RenderedPush, alert.args[0]).id, "hana_shot.mac_locked")
+                retire.assert_called_once_with(alert.kwargs["sender"], alert.kwargs["key"])
+                self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 1)
 
     def test_views_check_saves_passing_views_before_stopping_on_invalid_mac_console_output(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
