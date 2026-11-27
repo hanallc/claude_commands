@@ -931,14 +931,6 @@ The dialog shows Error lines and Script errors when the page has errors.
 Review and Accounts reuse gzip bytes for an unchanged page with its current owner control.
 A Bug with a screenshot also includes the viewport.
 A new draft selects the page's default assignee when one is available.
-Under **Where it goes**, **Change** opens the assignee menu at the end of the route.
-**None** is the first choice. The available assignees follow it.
-The menu closes when focus leaves it.
-Press **Escape** or select **Change** again to close the menu and return focus to **Change**.
-The open menu follows **Change** when the dialog moves.
-The menu checks the available space again when the assignment row changes size.
-The menu opens above **Change** if there is more room above and it cannot fit below.
-If the choices still do not fit, the menu scrolls.
 Select **None** to send the item to the producer without an assignee.
 The route ends with **bob assigns it** when bob is the producer.
 For a Bug, the route says **bob tracks this bug and assigns it.**
@@ -946,7 +938,6 @@ Before you choose a producer, the route ends with **The producer assigns it**.
 The producer notice says **You assign it.**
 Changing the producer keeps **None** selected.
 The browser keeps the assignee choice in the submitted draft for recovery and Retry.
-**Undo** restores the assignee choice.
 **Send** closes the New item dialog at once.
 The user can work on the page while the fading **Undo** toast shows.
 **Undo** reopens the dialog with the same type, recipient, words, images and page capture.

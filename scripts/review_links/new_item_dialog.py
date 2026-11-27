@@ -1035,12 +1035,14 @@ def render() -> str:
       <div>
        <div class="route-assignment"><strong data-route-assignee></strong>
         <button type="button" data-route-change aria-expanded="false" hidden>Change {page_frame.icon_svg("chevron-down")}</button>
-        <fieldset class="route-assignees" id="new-item-assignees" data-assignees aria-label="Assignee" hidden></fieldset>
        </div>
        <small data-route-assigned hidden>assigned</small>
       </div>
      </div>
      <p data-route-copy aria-live="polite"></p>
+     <fieldset class="route-assignees" id="new-item-assignees" aria-label="Assignee" hidden>
+      <div class="new-item-chips" data-assignees></div>
+     </fieldset>
     </div>
    </section>
    <textarea name="words" rows="4" maxlength="{MAX_WORDS_LENGTH}" aria-label="Your words"
@@ -1174,7 +1176,7 @@ STYLE = '''
 .new-item-route .route-steps strong { font-weight: 650; }
 .new-item-route .route-steps small:not([hidden]) { display: block; color: var(--ink-3); font-size: 12px; }
 .new-item-route .route-steps > svg { justify-self: center; width: 16px; height: 16px; margin-top: 3px; color: var(--ink-3); }
-.new-item-route .route-assignment { position: relative; display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 9px; }
+.new-item-route .route-assignment { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 9px; }
 :is(#review-new-item,[data-new-item-draft]) [data-route-change]:not([hidden]) {
  display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: none;
  color: var(--accent); font-size: 13px; text-decoration: underline; text-underline-offset: 2px;
@@ -1182,29 +1184,7 @@ STYLE = '''
 .new-item-route [data-route-change] svg { width: 14px; height: 14px; transform: rotate(-90deg); }
 .new-item-route [data-route-change][aria-expanded="true"] svg { transform: none; }
 .new-item-route [data-route-copy] { margin: 10px 0 0; font-size: 14px; color: var(--ink-2); }
-:is(#review-new-item,[data-new-item-draft]) .route-assignees {
- position: absolute; z-index: 1; inset-inline-end: 0; inset-block-start: calc(100% + var(--assignee-gap, 6px));
- inline-size: min(14rem, 65vw); max-block-size: min(12rem, 35dvh);
- overflow: auto; overscroll-behavior: contain;
- padding: 4px; border: 1px solid var(--line); border-radius: 8px;
- background: var(--card); box-shadow: 0 8px 24px #0005;
-}
-:is(#review-new-item,[data-new-item-draft]) .route-assignees[data-above] {
- inset-block-start: auto; inset-block-end: calc(100% + var(--assignee-gap, 6px));
-}
-.new-item-route .route-assignee-option {
- display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 6px 8px;
- border-radius: 4px; cursor: pointer; font-size: 14px; overflow-wrap: anywhere;
-}
-.new-item-route .route-assignee-option:is(:hover, :focus-within) { background: var(--bg); }
-.new-item-route .route-assignee-option:has(input:focus-visible) {
- outline: 2px solid var(--accent); outline-offset: -2px;
-}
-:is(#review-new-item,[data-new-item-draft]) .route-assignee-option :is(input:focus-visible, input:focus-visible + span) {
- outline: none;
-}
-.new-item-route .route-assignee-option input { flex: none; margin: 0; accent-color: var(--accent); }
-.new-item-route .route-assignee-option span { min-width: 0; }
+:is(#review-new-item,[data-new-item-draft]) .route-assignees { margin-top: 12px; max-height: 12rem; overflow: auto; }
 :is(#review-new-item,[data-new-item-draft]) [data-producer-hint] {
  align-self: center; margin-right: 4px; color: var(--ink-2); font-size: 13px;
 }
@@ -1390,9 +1370,7 @@ function bindDraft(dialog, fresh = false) {
  const route = dialog.querySelector('[data-route]'), changeAssignee = dialog.querySelector('[data-route-change]');
  const routeProducer = route.querySelector('[data-route-producer]'), routeAssignee = route.querySelector('[data-route-assignee]');
  const routeAssigned = route.querySelector('[data-route-assigned]'), routeCopy = route.querySelector('[data-route-copy]');
- const assigneeGroup = route.querySelector('[data-assignees]');
- const assignment = changeAssignee.parentElement;
- const assigneeMenuResize = new ResizeObserver(placeAssigneeChoices);
+ const assigneeChips = route.querySelector('[data-assignees]'), assigneeGroup = assigneeChips.closest('fieldset');
  changeAssignee.setAttribute('aria-controls', assigneeGroup.id);
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
  const wordsPlaceholder = words.placeholder;
@@ -1528,7 +1506,6 @@ function bindDraft(dialog, fresh = false) {
   words.readOnly = locked;
   includePage.disabled = sending || locked;
   changeAssignee.disabled = sending || locked;
-  if (changeAssignee.disabled) showAssigneeChoices(false);
   for (const button of previews.querySelectorAll('button')) button.disabled = sending || locked;
   for (const fieldset of form.querySelectorAll('fieldset')) fieldset.disabled = sending || locked;
   send.textContent = sending ? 'Sending…' : recovering ? 'Retry' : 'Send';
@@ -1552,54 +1529,27 @@ function bindDraft(dialog, fresh = false) {
   else send.setAttribute('aria-describedby', producerHint.id);
  }
 
- function radioChoice(name, choice, selected, className) {
-  const label = node('label', '', className), input = node('input');
+ function choiceChip(name, choice, selected) {
+  const chip = node('label', '', 'new-item-chip'), input = node('input');
   input.type = 'radio';
   input.name = name;
   input.value = choice.id;
   input.checked = choice.id === selected;
   const face = node('span', choice.name);
   face.setAttribute('data-button-face', '');
-  label.append(input, face);
-  return label;
- }
-
- function placeAssigneeChoices() {
-  if (assigneeGroup.hidden) return;
-  const anchor = assignment.getBoundingClientRect(), bounds = body.getBoundingClientRect(), gap = 6;
-  const top = bounds.top + gap, bottom = bounds.bottom - gap;
-  const aboveEdge = Math.min(anchor.top - gap, bottom), belowEdge = Math.max(anchor.bottom + gap, top);
-  const above = Math.max(0, aboveEdge - top), below = Math.max(0, bottom - belowEdge);
-  assigneeGroup.style.maxBlockSize = '';
-  const preferred = assigneeGroup.getBoundingClientRect().height;
-  const opensAbove = below < preferred && above > below;
-  assigneeGroup.toggleAttribute('data-above', opensAbove);
-  assigneeGroup.style.setProperty('--assignee-gap', `${opensAbove ? anchor.top - aboveEdge : belowEdge - anchor.bottom}px`);
-  assigneeGroup.style.maxBlockSize = `min(12rem, 35dvh, ${opensAbove ? above : below}px)`;
+  chip.append(input, face);
+  return chip;
  }
 
  function showAssigneeChoices(open) {
-  if (open === !assigneeGroup.hidden) return;
   changeAssignee.setAttribute('aria-expanded', String(open));
   assigneeGroup.hidden = !open;
-  if (open) {
-   placeAssigneeChoices();
-   assigneeMenuResize.observe(body);
-   assigneeMenuResize.observe(assignment);
-  } else {
-   assigneeMenuResize.disconnect();
-  }
- }
-
- function closeAssigneeChoices() {
-  showAssigneeChoices(false);
-  changeAssignee.focus({preventScroll: true});
  }
 
  function showRoute() {
   route.hidden = !assignees;
   if (route.hidden) return;
-  for (const input of assigneeGroup.querySelectorAll('input'))
+  for (const input of assigneeChips.querySelectorAll('input'))
    input.checked = input.value === (selectedAssignee ?? '');
   const producer = recipients.find(choice => choice.id === selectedRecipient);
   const assignee = assignees.find(choice => choice.id === selectedAssignee);
@@ -1629,7 +1579,7 @@ function bindDraft(dialog, fresh = false) {
   }
   recipientChips.replaceChildren();
   for (const recipient of available)
-   recipientChips.append(radioChoice('recipient_id', recipient, selectedRecipient, 'new-item-chip'));
+   recipientChips.append(choiceChip('recipient_id', recipient, selectedRecipient));
   showActionFailure(recipientStatus, selectedRecipient === null
    ? (assignees ? 'The producer you chose is unavailable.' : 'The recipient you chose is not available. Choose a recipient.')
    : available.length ? '' : (assignees ? 'No producers are available.' : 'No recipients are available.'));
@@ -1786,8 +1736,7 @@ function bindDraft(dialog, fresh = false) {
   if (assignees && selectedAssignee !== null && !assignees.some(choice => choice.id === selectedAssignee))
    selectedAssignee = null;
   const choices = assignees ? [{id:'', name:'None'}, ...assignees] : [];
-  assigneeGroup.replaceChildren(...choices.map(choice =>
-   radioChoice('assignee_id', choice, selectedAssignee ?? '', 'route-assignee-option')));
+  assigneeChips.replaceChildren(...choices.map(choice => choiceChip('assignee_id', choice, selectedAssignee ?? '')));
   showRecipients();
   showRoute();
   updateSend();
@@ -2516,7 +2465,6 @@ function bindDraft(dialog, fresh = false) {
  }
 
  function hideDialog() {
-  showAssigneeChoices(false);
   dialog.close();
   if (launcher?.isConnected) launcher.focus({preventScroll: true});
  }
@@ -2585,7 +2533,6 @@ function bindDraft(dialog, fresh = false) {
   sendNotice.textContent = '';
   recipients = null;
   assignees = null;
-  showAssigneeChoices(false);
   route.hidden = true;
   recipientChips.replaceChildren();
   pageOwner = '';
@@ -2626,44 +2573,7 @@ function bindDraft(dialog, fresh = false) {
  }
 
  form.addEventListener('input', editDraft);
- body.addEventListener('scroll', placeAssigneeChoices);
- assignment.addEventListener('mousedown', event => {
-  if (!assigneeGroup.hidden && event.button === 0 && !event.target.matches('input'))
-   event.preventDefault();
- });
- changeAssignee.addEventListener('click', () => {
-  if (!assigneeGroup.hidden) {
-   closeAssigneeChoices();
-   return;
-  }
-  showAssigneeChoices(true);
-  const selected = assigneeGroup.querySelector('input:checked');
-  selected.focus({preventScroll: true});
-  const option = selected.labels[0];
-  const distance = option.getBoundingClientRect().bottom - assigneeGroup.getBoundingClientRect().bottom;
-  if (distance > 0) assigneeGroup.scrollTop += distance;
-  if (option.offsetTop < assigneeGroup.scrollTop) assigneeGroup.scrollTop = option.offsetTop;
- });
- assigneeGroup.addEventListener('focusout', event => {
-  if (!assigneeGroup.contains(event.relatedTarget)) showAssigneeChoices(false);
- });
- assigneeGroup.addEventListener('click', event => {
-  if (event.target.matches('input')) closeAssigneeChoices();
- });
- assigneeGroup.addEventListener('keydown', event => {
-  if (event.key !== 'Enter') return;
-  event.preventDefault();
-  closeAssigneeChoices();
- });
- dialog.addEventListener('keydown', event => {
-  if (event.key !== 'Escape' || assigneeGroup.hidden) return;
-  event.preventDefault();
-  closeAssigneeChoices();
- });
- dialog.addEventListener('click', event => {
-  if (!assigneeGroup.hidden && !changeAssignee.contains(event.target) && !assigneeGroup.contains(event.target))
-   showAssigneeChoices(false);
- });
+ changeAssignee.addEventListener('click', () => showAssigneeChoices(assigneeGroup.hidden));
  bindConsoleDialog(dialog, close);
  dialog.querySelector('[data-cancel]').addEventListener('click', () => close());
  done.addEventListener('click', () => close({acknowledged: true}));

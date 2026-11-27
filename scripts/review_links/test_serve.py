@@ -704,9 +704,7 @@ addEventListener('DOMContentLoaded', async () => {
   dialog.querySelector('[name="kind"][value="bug"]').click();
   dialog.querySelector('[name="recipient_id"][value=__MORTY__]').click();
   route.querySelector('[data-route-change]').click();
-  const menu = route.querySelector('[data-assignees]');
-  if (menu.hidden) throw new Error('Change did not open the assignee menu.');
-  menu.querySelector('[name="assignee_id"][value=""]').click();
+  route.querySelector('[name="assignee_id"][value=""]').click();
   const include = dialog.querySelector('[name="include_page"]');
   if (include.checked) include.click();
   const words = dialog.querySelector('textarea');
