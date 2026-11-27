@@ -7296,6 +7296,42 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(saved["delivery"], "sent: director received the result")
         self.assertIs(saved["completion_pending"], False)
 
+    def test_reap_alerts_when_a_stopped_runs_worker_retires_before_delivery(self) -> None:
+        row = self.fixture.worker()
+        record = self.record(row, "orphan-stop-retired-before-delivery")
+        record.update(pid=DEAD_PID, exit_code=143, stop_pass_requested=True, stop_reason="fixture stop")
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+
+        def receive_alert(options: send.Options) -> send.Result:
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved["push_alert_delivery"], saved["delivery"])
+            self.assertEqual(options.to, self.fixture.parent.id)
+            self.assertIn("Result delivery failed.", options.text or "")
+            self.assertIn("exit 143", options.text or "")
+            return send.Result("sent", "director received the alert")
+
+        with (patch.object(staff, "snapshot", side_effect=staff.StaffUnreadable("fixture staff lookup failed")),
+              patch.object(subprocess, "Popen") as spawn, contextlib.redirect_stderr(io.StringIO())):
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [path.stem])
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["status"], "finished")
+        self.assertIs(saved["completion_pending"], True)
+        self.assertNotIn("delivery", saved)
+        spawn.assert_called_once()
+        argv = cast(list[str], spawn.call_args.args[0])
+        self.assertIsNotNone(staff.retire(row.id))
+
+        with (patch.object(time, "sleep") as delay,
+              patch.object(send, "send", side_effect=receive_alert) as alert):
+            self.assertEqual(detached_runs.main(argv[2:]), 0)
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        alert.assert_called_once()
+        delay.assert_called_once_with(5)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertIs(saved["push_alert_attempted"], True)
+        self.assertNotIn("push_alert_delivery", saved)
+
     def test_reap_alerts_once_when_a_director_result_push_fails(self) -> None:
         for retired in (False, True):
             with self.subTest(retired=retired):

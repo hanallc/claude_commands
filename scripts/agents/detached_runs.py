@@ -2747,7 +2747,7 @@ def _prepare_result_delivery(record: RunRecord, result: CommandResult, *,
             if _result_push_failed(saved) and not _pane_submission_not_started(saved):
                 return saved
             if (not self_stop and current_record["status"] == "finished"
-                    and _worker_result_pending(saved)
+                    and (not saved or _worker_result_pending(saved))
                     and (saved != ORPHAN_RESULT_PENDING or "exit_code" in current_record)):
                 return _save_delivery(path, FAILED_RESULT_PUSH + member.reason, if_current=saved, stage_push_alert=True)
             print(f"anomaly: {member.reason}", file=sys.stderr)
