@@ -26,6 +26,7 @@ from scripts.notify.push_reference import PushIdentity
 class Binding:
     identity: PushIdentity
     emergency: bool
+    admitted_without_read: bool = False
 
     @property
     def reference(self) -> push_reference.QuestionReference:
@@ -60,9 +61,11 @@ def read_binding(path: Path) -> Binding | None:
         fields = cast(dict[str, object], value)
         reference = push_reference.read_reference(fields.get("reference"))
         source, key, emergency = fields.get("source"), fields.get("key"), fields.get("emergency")
+        admitted_without_read = fields.get("admitted_without_read", False)
         if (reference["kind"] == "question" and isinstance(source, str) and source and isinstance(key, str)
-                and key and isinstance(emergency, bool) and path == binding_path(source, key)):
-            return Binding(PushIdentity(source, key, reference), emergency)
+                and key and isinstance(emergency, bool) and isinstance(admitted_without_read, bool)
+                and path == binding_path(source, key)):
+            return Binding(PushIdentity(source, key, reference), emergency, admitted_without_read)
     raise ValueError(f"invalid Question push binding {path}")
 
 
@@ -105,24 +108,35 @@ def retire_copies(identity: PushIdentity, *, emergency: bool) -> str:
     return transport.retire_question_copies(identity, emergency=emergency)
 
 
-def bind_locked(identity: PushIdentity, *, emergency: bool) -> Binding:
+def _opening_unreadable(reference: push_reference.QuestionReference, *, allow_unreadable: bool) -> bool:
+    try:
+        reason = settled(reference)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        if not allow_unreadable:
+            raise
+        return True
+    if reason:
+        raise SettledQuestion(reason)
+    return False
+
+
+def bind_locked(identity: PushIdentity, *, emergency: bool, allow_unreadable: bool = False) -> Binding:
     """Record the active binding before the caller keeps or posts the push."""
     question = identity.question
     assert question is not None
     reference = question.reference
     path = binding_path(identity.sender, identity.key)
     previous = read_binding(path)
-    if reason := settled(reference):
-        raise SettledQuestion(reason)
+    unreadable = _opening_unreadable(reference, allow_unreadable=allow_unreadable)
     if previous is not None and previous.identity != identity:
         _ = retire_locked(previous.identity, emergency=previous.emergency)
         previous = None
-        if reason := settled(reference):
-            raise SettledQuestion(reason)
-    bound = Binding(identity, emergency or (previous is not None and previous.emergency))
+        unreadable = _opening_unreadable(reference, allow_unreadable=allow_unreadable)
+    bound = Binding(identity, emergency or (previous is not None and previous.emergency), unreadable)
     if bound != previous:
-        write_text_atomic(path, json.dumps({"source": identity.sender, "key": identity.key, "reference": reference,
-                                           "emergency": bound.emergency}) + "\n")
+        fields = {"source": identity.sender, "key": identity.key, "reference": reference,
+                  "emergency": bound.emergency, "admitted_without_read": bound.admitted_without_read}
+        write_text_atomic(path, json.dumps(fields) + "\n")
     return bound
 
 

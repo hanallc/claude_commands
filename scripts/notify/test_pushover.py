@@ -783,35 +783,51 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual((record["key"], record["template"], record["reference"], record["outcome"]),
                          ("question-key", "decision.choices", reference, "dropped: question closed"))
 
-    def test_direct_forwarded_reference_requires_a_local_open_question(self) -> None:
+    def test_unreadable_forwarded_question_posts_and_reports_once(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
+        path = self.keys.parent / "question-unreadable.md"
+        _ = path.write_bytes(b"\xff")
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        argv = ["--source", PARENT, "--text-id", entry.id, "--push-reference", json.dumps(reference),
+                *(item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}"))]
+        with redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
+            code, form = self.run_send(argv)
+        self.assertEqual(code, 0)
+        self.assertIn("message", form)
+        self.assertEqual(errors.getvalue(), f"pushover: Cannot read Question {str(path)!r}.\n")
+        identity = push_reference.PushIdentity(PARENT, "question:" + str(path), reference)
+        binding = question_pushes.read_binding(question_pushes.binding_path(identity.sender, identity.key))
+        assert binding is not None
+        self.assertEqual(binding.identity, identity)
+        _ = path.write_text('---\nrecord_type: question\nstatus: closed\nregistration: {"since":"opening"}\n---\n')
+        self.assertEqual(question_pushes.drain(path), 0)
+        self.assertIsNone(question_pushes.read_binding(question_pushes.binding_path(identity.sender, identity.key)))
+
+    def test_direct_forwarded_reference_refuses_a_closed_question(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
         path = self.keys.parent / "question-local.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: closed\nregistration: {"since":"opening"}\n---\n')
         values = [item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}")]
-        reference = {"kind": "question", "path": str(path), "since": "forged"}
-        for status in ("closed", "absent"):
-            with self.subTest(status=status):
-                if status == "closed":
-                    _ = path.write_text('---\nrecord_type: question\nstatus: closed\nregistration: {"since":"opening"}\n---\n')
-                elif path.exists():
-                    path.unlink()
-                with (mock.patch.object(review, "review") as read, mock.patch.object(pushover, "read_keys") as keys,
-                      redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO())):
-                    code = pushover.send(["--text-id", entry.id, "--push-reference", json.dumps(reference), *values],
-                        self.keys, mock.Mock(side_effect=AssertionError("unvalidated push posted")))
-                self.assertEqual(code, 2)
-                read.assert_not_called()
-                keys.assert_not_called()
+        reference = {"kind": "question", "path": str(path), "since": "opening"}
+        with (mock.patch.object(review, "review") as read, mock.patch.object(pushover, "read_keys") as keys,
+              redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO())):
+            code = pushover.send(["--text-id", entry.id, "--push-reference", json.dumps(reference), *values],
+                self.keys, mock.Mock(side_effect=AssertionError("closed Question posted")))
+        self.assertEqual(code, 2)
+        self.assertIn(f"question closed: {path}", errors.getvalue())
+        read.assert_not_called()
+        keys.assert_not_called()
 
-    def test_reference_survives_review_and_checks_the_authoritative_opening(self) -> None:
+    def test_reference_survives_admission_review_and_silence_without_an_immediate_release_check(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
         path = self.keys.parent / "question-admission.md"
         _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"2026-11-03T12:00"}\n---\n')
         argv = ["--text-id", entry.id, "--question", str(path),
                 *(item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}"))]
         self.silence_on()
-        with redirect_stdout(io.StringIO()) as output:
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code, form = self.run_send(argv)
-        self.assertEqual((code, form), (0, {}))
+        self.assertEqual((code, form, errors.getvalue()), (0, {}, ""))
         expected = {"kind": "question", "path": str(path), "since": "2026-11-03T12:00"}
         kept = silence.read_kept()[0]
         self.assertEqual(kept.get("reference"), expected)
@@ -819,18 +835,25 @@ class PushoverTests(unittest.TestCase):
         record_line = next(line for line in output.getvalue().splitlines() if line.startswith("pushover: reviewed JSON: "))
         record = cast(dict[str, object], json.loads(record_line.removeprefix("pushover: reviewed JSON: ")))
         self.assertEqual(record["reference"], expected)
-        # Read the opening on the machine that owns the Question.
+
         path.unlink()
         remote = {**expected, "machine": "mac"}
         forwarded = ["--ssh-forwarded-reference", "--text-id", entry.id, "--push-reference", json.dumps(remote), *argv[4:]]
+        posted = mock.Mock(return_value=(200, b'{"status":1}'))
         with (mock.patch.dict(os.environ, {"SSH_CONNECTION": "origin 1 receiver 2"}),
-              mock.patch.object(push_reference, "read_question", side_effect=AssertionError("remote record read during admission")),
-              mock.patch.object(question_pushes, "opening", return_value=push_reference.QuestionOpening("open", expected["since"])) as opening,
-              redirect_stdout(io.StringIO())):
+              mock.patch.object(push_reference, "read_question", side_effect=AssertionError("read on the wrong machine")),
+              mock.patch.object(question_pushes, "opening", side_effect=OSError("Question owner unavailable")) as opening,
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
             code, form = self.run_send(forwarded)
-        self.assertEqual((code, form), (0, {}))
-        opening.assert_called_with(remote)
-        self.assertEqual(silence.read_kept()[0].get("reference"), remote)
+            self.assertEqual((code, form), (0, {}))
+            self.assertEqual(errors.getvalue(), f"pushover: Cannot read Question {str(path)!r}.\n")
+            opening.assert_called_with(remote)
+            saved, = silence.read_kept()
+            self.assertEqual(saved.get("reference"), remote)
+            self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, posted)), 0)
+        posted.assert_called_once()
+        self.assertEqual(silence.read_kept(), [])
+        self.assertEqual(errors.getvalue(), f"pushover: Cannot read Question {str(path)!r}.\n")
 
     def test_legacy_kept_free_text_still_releases_without_new_admission(self) -> None:
         posted: list[str] = []

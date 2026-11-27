@@ -30,6 +30,7 @@ class NoReference(TypedDict):
 
 PushReference = QuestionReference | NoReference
 NO_REFERENCE: NoReference = {"kind": "none"}
+UNREADABLE_QUESTION_REPORT = "pushover: Cannot read Question "
 
 
 def read_reference(value: object) -> PushReference:
@@ -125,7 +126,7 @@ def read_question(path: Path) -> QuestionOpening:
 
 def admission_reference(text_id: str, question: str = "", forwarded: str = "", *,
                         remote_forward: bool = False) -> PushReference:
-    """Read local questions before admission. Preserve missing remote references."""
+    """Read new Question references and check readable forwarded references."""
     reference: PushReference
     if forwarded:
         reference = read_reference(cast(object, json.loads(forwarded)))
@@ -142,12 +143,17 @@ def admission_reference(text_id: str, question: str = "", forwarded: str = "", *
     elif reference["kind"] == "question":
         path = Path(reference["path"])
         foreign = reference.get("machine") == "mac" and sys.platform != "darwin"
-        if not (remote_forward and (foreign or not path.exists())):
+        try:
+            if remote_forward and (foreign or not path.exists()):
+                return reference
             opening = read_question(path)
-            if opening.status != "open":
-                raise ValueError(f"question closed: {path}")
-            if opening.since != reference["since"]:
-                raise ValueError(f"question reopened since the push was made: {path}")
+        except (OSError, ValueError):
+            # The delivery owner reports a failed read when it binds the push.
+            return reference
+        if opening.status != "open":
+            raise ValueError(f"question closed: {path}")
+        if opening.since != reference["since"]:
+            raise ValueError(f"question reopened since the push was made: {path}")
     if text_id == "decision.choices" and reference["kind"] != "question":
         raise ValueError("decision.choices requires --question with an open question record")
     return reference
