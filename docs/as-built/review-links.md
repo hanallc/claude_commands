@@ -930,6 +930,14 @@ A Bug also includes the page title, address, filters, and render time.
 The dialog shows Error lines and Script errors when the page has errors.
 Review and Accounts reuse gzip bytes for an unchanged page with its current owner control.
 A Bug with a screenshot also includes the viewport.
+A new draft selects the page's default assignee when one is available.
+Select **None** to send the item to the producer without an assignee.
+The route ends with **bob assigns it** when bob is the producer.
+For a Bug, the route says **bob tracks this bug and assigns it.**
+Before you choose a producer, the route ends with **The producer assigns it**.
+The producer notice says **You assign it.**
+Changing the producer keeps **None** selected.
+The browser keeps the assignee choice in the submitted draft for recovery and Retry.
 **Send** closes the New item dialog at once.
 The user can work on the page while the fading **Undo** toast shows.
 **Undo** reopens the dialog with the same type, recipient, words, images and page capture.

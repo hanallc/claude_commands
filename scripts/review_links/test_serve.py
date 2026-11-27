@@ -653,6 +653,115 @@ class ReviewLinksServerTests(unittest.TestCase):
                         self.assertTrue(message.endswith("\n\nNate's words:\n" + request.words))
                         self.assertNotIn("Answer with", message)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_builds_bug_with_none_goes_to_morty_to_assign(self) -> None:
+        case = self.review_fixture()
+        builds_doc = self.root.parent / "builds.md"
+        _ = builds_doc.write_text("# Builds\n> **Status: PRODUCTION — running.**\n")
+        builds = fixture_member("showrunner", name="builds", doc=staff.LiveDoc(local_machine(), builds_doc))
+        bob = fixture_member("producer", name="bob")
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.builds.owner={builds.id}\npage.list.owner={morty.id}\n")
+        _ = conf.path("producer_map").write_text(f"{builds.id} = {bob.id}\n")
+        _ = write_config_fixture(conf.path("machines"), f"aliases=fixture\nfixture.platform=linux\nfixture.hosts={local_machine()}\n")
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        folder = self.root / "memory_feed"
+        folder.mkdir()
+        _ = write_config_fixture(conf.path("memory_feed"), f"output_folder={folder}\n")
+        probe = r'''<img src="/probe-complete" alt="" hidden><script>
+addEventListener('DOMContentLoaded', async () => {
+ const failures = [], nativeFetch = window.fetch;
+ window.fetch = (path, options) => {
+  if (String(path).startsWith('/console/review/new-item') && options?.body) {
+   const payload = JSON.parse(options.body);
+   if (payload.page_capture) return Promise.resolve(Response.json({}, {status:503}));
+   if (payload.discard_capture) return Promise.resolve(Response.json({}));
+   if (payload.assignee_id !== null) failures.push('Send must send a null assignee ID.');
+  }
+  return nativeFetch(path, options);
+ };
+ const dialog = document.querySelector('#review-new-item');
+ const route = dialog.querySelector('[data-route]');
+ try {
+  const optionsReady = new Promise(resolve => {
+   const observer = new MutationObserver(() => {
+    if (!route.hidden) { observer.disconnect(); resolve(); }
+   });
+   observer.observe(route, {attributes:true});
+  });
+  document.querySelector('[data-owner-new]').click();
+  await optionsReady;
+  dialog.querySelector('[name="kind"][value="bug"]').click();
+  dialog.querySelector('[name="recipient_id"][value=__MORTY__]').click();
+  route.querySelector('[data-route-change]').click();
+  route.querySelector('[name="assignee_id"][value=""]').click();
+  const include = dialog.querySelector('[name="include_page"]');
+  if (include.checked) include.click();
+  const words = dialog.querySelector('textarea');
+  words.value = 'Check the Builds queue.';
+  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+  const filed = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+  const send = dialog.querySelector('[type="submit"]');
+  if (send.disabled) throw new Error('Send is unavailable.');
+  send.click();
+  await filed;
+ } catch (error) {
+  failures.push(String(error));
+ }
+ await nativeFetch('/probe-result', {method:'POST', body:JSON.stringify(failures)});
+});
+</script>'''.replace("__MORTY__", json.dumps(morty.id))
+        _ = (folder / memory_files.PAGE_NAME).write_text(memory_feed.page_document(60).replace("</body>", probe + "</body>"))
+        complete = threading.Event()
+        failures: list[str] = []
+
+        class BuildsSendHandler(serve.ReviewLinksHandler):
+            @override
+            def do_GET(self) -> None:
+                if self.path == "/probe-complete":
+                    _ = complete.wait(10)
+                    self.json_response(200, {})
+                else:
+                    super().do_GET()
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == "/probe-result":
+                    failures.extend(cast(list[str], json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                    self.json_response(200, {})
+                    complete.set()
+                else:
+                    super().do_POST()
+
+        server = self.server
+        server.RequestHandlerClass = BuildsSendHandler
+        server.verified_tailscale_address = server.bound_address
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        self.addCleanup(server.send_holds.stop_if_idle)
+        profile = self.root.parent / "profile"
+        profile.mkdir()
+        with (patch.object(server, "review_cache", cache), patch.object(server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            result = run_process_group(
+                ["firefox", "--headless", "--no-remote", "--profile", str(profile), "--screenshot",
+                 str(self.root.parent / "builds.png"), f"http://127.0.0.1:{self.port}/memory_feed/{memory_files.PAGE_NAME}"],
+                timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(complete.is_set(), "Firefox did not report the Send result.")
+        self.assertEqual(failures, [])
+        send.assert_called_once_with(f"session:{morty.current_session}", change_page.SENDER, ANY)
+        self.assertIn("\nYou assign it.\n", cast(str, send.call_args.args[2]))
+        bug, = investigation.records(morty.id)
+        item = next(item for item in cache.get().records.values() if item.title == bug.title and item.owner == morty.id)
+        details = review_items.submission_origin(item)
+        assert isinstance(details, new_item_dialog.ReviewSubmission)
+        self.assertEqual((details.page, details.assignment), ("builds", new_item_dialog.ProducerAssigns()))
+        row, = the_list.records(morty.id)
+        self.assertEqual((row.owner, row.producer, row.unit), (morty.id, morty.id, ""))
+        self.assertEqual(investigation.records(bob.id), [])
+        self.assertEqual(investigation.records(builds.id), [])
+
     def test_new_item_refuses_fresh_legacy_sends_to_a_showrunner(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
@@ -4763,6 +4872,28 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(retry.call_args.args[0], producer)
                 self.assertEqual(cast(dict[str, object], json.loads(receipt.read_text()))["confirmed"],
                                  [showrunner, producer])
+
+    def test_scheduled_new_item_with_none_tells_the_producer_to_assign_it(self) -> None:
+        producer = fixture_member("producer", name="bob")
+        keeper = self.configure_list_keeper()
+        self.server.verified_tailscale_address = self.server.bound_address
+        _ = write_config_fixture(conf.path("the_list"), "series_run_limit=730\n")
+        body = json.dumps({"token": self.server.new_item_token, "kind": "scheduled", "page": "builds",
+                           "page_recipient": "producer", "request_id": "s1-" + uuid4().hex,
+                           "recipient_id": producer.id, "assignee_id": None,
+                           "words": "Check the queue. Start 2099-11-30T09:00Z."}).encode()
+        sent = send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("sent", "", ""))
+        with (patch.object(unrouted_alert, "message_outcome", return_value=(sent, "")) as notify,
+              capture_sender("send_message") as send):
+            response = self.new_item_http(body, finished=True)
+        self.assertEqual(response.status, 200, response.body)
+        self.assertEqual(json.loads(response.body)["notice_warning"], "")
+        item, = the_list.records(keeper.id)
+        self.assertEqual((item.producer, item.owner, item.unit), (producer.id, producer.id, ""))
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.args[0], producer.id)
+        self.assertIn("You assign it.", cast(str, notify.call_args.args[2]))
+        send.assert_not_called()
 
     def test_scheduled_new_item_recovers_assignee_copy_after_assignment_failure(self) -> None:
         case = self.review_fixture()

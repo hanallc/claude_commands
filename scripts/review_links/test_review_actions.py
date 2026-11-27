@@ -12,6 +12,7 @@ from uuid import uuid4
 from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents.remote import local_machine
 from scripts.production import investigation, staff, update_registration
+from scripts.production.staff_test_support import fixture_member
 from scripts.production import test_waiting_why as fixtures
 from scripts.review_links import change_browser, change_page, new_item_dialog, reply_tokens, review_actions, review_items, review_page, review_submissions
 
@@ -22,6 +23,21 @@ class WaitingActionTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.fixture = set_up_fixture(self.addCleanup, fixtures.WaitingWhyTests('runTest'))
+
+    def test_producer_notice_says_to_assign_a_bug_with_no_assignee(self) -> None:
+        producer = fixture_member('producer', name='bob')
+        request = new_item_dialog.NewItemRequest(
+            f'r6-{uuid4().hex}', new_item_dialog.SubmissionKind.BUG, producer.id,
+            'Check the Builds queue.', new_item_dialog.NoEvidence(), page='builds',
+            page_recipient=new_item_dialog.PageRecipient.PRODUCER, assignment=new_item_dialog.ProducerAssigns())
+        saved = review_submissions.submit(request)
+        deliveries = review_actions.prepare_submission_deliveries(
+            saved, request.words, change_page.DeliveryStatus(self.fixture.root),
+            evidence_page='', members=staff.snapshot())
+        assert isinstance(deliveries.primary, change_page.MessageDelivery)
+        self.assertEqual(deliveries.primary.recipients, (producer.id,))
+        self.assertIn('\nYou assign it.\n', deliveries.primary.message)
+        self.assertIsInstance(deliveries.assignee, change_page.NoMessageDelivery)
 
     def test_user_question_automatically_stores_its_text_for_each_type(self) -> None:
         doc = self.fixture.fixture.production
