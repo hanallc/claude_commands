@@ -53,7 +53,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
   - `scripts/lib/config_form_exceptions_test_support.py` — the typed allow lists of the form test.
 - **Test lanes:** `scripts/lib/test_conf.py`, `scripts/lib/test_conf_sh.py`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_tune.py`, and the `test_*.py` beside each changed module. The new form test is `scripts/lib/test_config_form.py`.
 - **Build:** none.
-- **Test:** a queued run: `~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo <worktree> --commit HEAD --apply-uncommitted <worktree> -- ./scripts/lib/py scripts/production/gate.py --affected`, with no `--targets` (the default is natedev and mac-linux). While iterating, add `--module <suite>/<test_module>.py` and name `--targets natedev`: the queue runs `--module` only on natedev. A direct run names single test functions only: `./scripts/lib/py -m unittest scripts.<suite>.<test_module>.<Class>.<test>`. The run target rule is from builds, 00:07 PST Nov 24. Never start `targeted_test.py` by hand (builds, 11-23).
+- **Test:** a queued run: `~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo <worktree> --commit HEAD --apply-uncommitted <worktree> -- ./scripts/lib/py scripts/production/gate.py --affected`, with no `--targets` (the default is natedev and mac-linux). While iterating, add `--module <suite>/<test_module>.py` and name `--targets natedev`: the queue runs `--module` only on natedev. A direct run names single test functions only: `./scripts/lib/py -m unittest scripts.<suite>.<test_module>.<Class>.<test>`. The run target rule is from builds, 00:07 PST Nov 24.
 - **Status line check:** a phase that changes fixture or config path selection names `scripts.production.test_unit_phases` `test_unit_count_cache_filters_sources_and_retries_failed_reads` among its direct checks. It proves that the status line question count watches the configured zone file.
 - **Lint:** `basedpyright` on each changed Python file: zero errors, zero warnings. `bash -n` on each changed shell file.
 - **Invariants:**
@@ -566,68 +566,34 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - Wait limits (screen recording duration, Review capture expiry, preview wait, attachment retry) stay in code for item 277.
 
 ### Phase 13 — Production and direct literals to config  · status: done
-**Depends on:** Phase 3
 
-#### Work Order
+#### As-built
 
-**Goal:** Each `tunable` literal of the production and direct batch is a commented, limit-checked key in `config/`, read at use, with the same value, and `config/the_list.conf` has the blank-line form.
-
-**Spec:**
-
-0. **Wait.** Start only after item 229 is on main (`scripts/production/the_list.py`, `config/the_list.conf`) and devtools phases busywrite and rundone are on main (`scripts/production/worker.py`, `scripts/direct/assign.py`, `scripts/agents/detached_runs.py`). Merge main first. The `TunableLiteral` rows hold bob's working names (11-23 19:17 PST); the batch merges with them.
-1. Batch folders: `scripts/production`, `scripts/direct`, `scripts/herdr`, `scripts/agents`, `scripts/accounts`, `scripts/worktree`, `scripts/bevy_upgrade`, `scripts/history`, `scripts/orphans`, `scripts/prioritize`, `scripts/lib`. Examples from P807: `scripts/direct/phase_reservation.py:114` `CHECK_TIMEOUT_SECONDS = 90`, `scripts/production/worker_capacity.py:37` `LOCK_WAIT_SECONDS = 60`.
-2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions_test_support.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the stem and key of the row. The config text is the numeric result of `TunableLiteral.value` (`1 << 20` is `1048576`); check that the typed reader returns the original number. A literal of the batch that is a wait limit stays in the code for item 277; name it in the reply. A List key uses the key form that item 229 put on main for `config/the_list.conf`.
-3. The code reads the key with `conf.read(stem)` at use. Delete the constant.
-4. Values stay the same.
-5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
-6. **the_list.conf.** Main has the blank-line form (item 229), and the join with main at c8acb1f932 removed its blank-line allow-list row. Run the item 229 writer (`listadd`, `scripts/production/the_list.py`) on a fixture copy and run `check_blank_lines` on its output. If the writer breaks the form, fix the writer and add a test row that runs it and then `check_blank_lines`. Remove the absent-file case for `config/the_list.conf` from the stale-row loop of `test_repository_form` in `scripts/lib/test_config_form.py`.
-7. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config. Before edits, list each `CONF_DIR` fixture that reaches a moved reader: the gate suite helper (`gate_suites_test_support.py`), the worker and shutdown CLI fixtures (`test_worker.py`), the direct progress fixtures (`test_progress_history.py`), and both guest route fixtures.
-8. **Unused reader.** Before the literal moves, after the main merge of item 0: confirm that `scripts/agents/inventory.py` `last_tool_call()` still has no caller. Then remove it, its `_LAST_STEP_BYTES` constant and its inventory row. Do not add `production.inventory.last_step_scan_bytes`.
-9. **Bounds.** Give the `scripts/production/gate.py` `RERUN_LIMIT` key the lower bound 0, and keep the shipped value 8: `test_gate_holds.py` sets it to zero to prove hold recovery with ordinary reruns off; keep that fixture. Bound `worker.history_bytes` (`scripts/production/worker.py` `WORKER_HISTORY_BYTES`) so that `read(limit + 1)` stays in range. Give the nightly diagnostic and board note slices explicit upper bounds.
-   - **Unusable limits.** `gate.py` uses the rerun limit after modules report results, and the nightly text is cut after the red result is saved. Read the rerun limit once when the gate starts, before any module runs. Only ordinary reruns use the rerun limit. Memory retries keep their own `gate.conf` count, and hold recovery stays independent of both. Test each with the rerun limit set to 0. An unusable rerun limit stops the gate start with the diagnostic, and no module runs. An unusable nightly display limit never changes the saved red result or its assignment path; the note then shows the diagnostic in place of the cut text. Tests: an unusable rerun limit runs no module; an unusable nightly display limit keeps the red result and its assignment.
-10. **Guests.** Selected suites reach the rerun policy in the Mac Linux and AWS guest gates. Give the controller and candidate different rerun limits. Prove through each guest route that the candidate limit controls ordinary reruns. For AWS, supply the installed account policy through fixture `HOME` or the explicit settings path. The tests go in `scripts/build_targets/test_mac_linux.py` and `scripts/aws_target/test_cloud_gate.py`.
-11. **References.** Search `docs/` and `scripts/` for each moved name and each changed function. Update current docs, fixtures and test spies. Run every test module with a changed reference.
+- Eight limits are config keys, read at use with `conf.read(stem)`, with their old values:
+  - `config/gate.conf`: `rerun.max_failed_modules=8` (`# whole: 0..`) and `nightly.type_line_bytes=512` (`# whole: 3..4096`).
+  - `config/production.conf`: `record_store.history_cache_entries=128` (`# whole: 1..`) and `worker.history_bytes=65536` (`# whole: 1..1048576`).
+  - `config/shutdown.conf`: `worker.stop_attempts=2` (`# whole: 1..`).
+  - `config/direct.conf`: `plan_history.max_rate_factor=2.0` (`# range: 1..`) and `board.max_note_chars=72` (`# whole: 1..900`).
+  - `config/orphans.conf` (new, with a `config/README.md` section): `corpus.max_file_bytes=2000000` (`# whole: 1..`).
+- `gate.py` `_run_suites` reads `rerun.max_failed_modules` and `memory_stop_reruns` at every gate start, before hold recovery and before any module. An unusable value raises `GateRefused` with the diagnostic. Only ordinary reruns use the rerun limit; memory retries keep their own count, and hold recovery runs with the limit at 0.
+- An unusable nightly display limit keeps the saved red result and its assignment; the note shows the diagnostic in place of the cut text.
+- Fallbacks for an unusable value: the ETA low and high cells are blank (`EtaProjectionUnavailable`); the board note shows the activity kind; `/orphans` prints the error and exits 2 before the scan; `record_store.historical_issue_folders` skips only the cache and still collects the Git input stamps into `sources`; `worker.py` history prints one `anomaly:` line; `worker_capacity.stop_worker` returns `WorkerNotStopped` with the diagnostic.
+- `inventory.last_tool_call()` and `_LAST_STEP_BYTES` are removed. The nine batch `TunableLiteral` rows and `_PRODUCTION_BATCH` are gone. `test_repository_form` has no `config/the_list.conf` absent-file case.
+- The Mac Linux and AWS guest tests give the controller and the candidate different rerun limits and prove the candidate limit applies. The AWS test runs the real `gate_box.GUEST` bootstrap.
 
 **Files:**
-- `scripts/lib/config_form_exceptions_test_support.py` — the batch rows name each source file; the rows leave the list
-- `scripts/**/*.py` — the source files of the batch rows, and their tests
-- `config/*.conf` — the stems that get keys
-- `config/the_list.conf` — blank lines
-- `scripts/lib/test_config_form.py` — the `config/the_list.conf` absent-file case removed
-- `scripts/production/the_list.py`, `scripts/production/test_the_list.py` — only if the writer breaks the blank-line form
-- `scripts/agents/inventory.py` — `last_tool_call()` removed
-- `scripts/production/test_gate_holds.py`, `scripts/production/test_gate_suites_reruns.py`, `scripts/production/test_gate_suites_types.py`, `scripts/production/test_worker.py`
-- `scripts/build_targets/test_mac_linux.py`, `scripts/aws_target/test_cloud_gate.py` — the guest gate route tests of Spec item 10
-- `docs/as-built/merge-gate-and-test-speed.md`, `docs/plans/builds-natest.md` — name moved constants
+- `scripts/production/gate.py` — rerun and nightly limits read at gate start
+- `scripts/production/record_store.py`, `scripts/production/worker.py`, `scripts/production/worker_capacity.py` — history cache, history bytes, stop attempts
+- `scripts/direct/plan_history.py`, `scripts/direct/progress_history.py` — rate factor and board note length
+- `scripts/orphans/orphans.py`, `config/orphans.conf` — corpus file size limit
+- `scripts/build_targets/test_mac_linux.py`, `scripts/aws_target/test_cloud_gate.py` — guest route proofs
 
-**Workers:** 2 writers — split by folder. Before edits start, the director assigns each destination stem to one slot in the prompts.
-- `impl` — `scripts/production`, `scripts/herdr`, `config/the_list.conf`, `scripts/lib/test_config_form.py`, every edit to `scripts/lib/config_form_exceptions_test_support.py`, both guest gate tests (`scripts/build_targets/test_mac_linux.py`, `scripts/aws_target/test_cloud_gate.py`), and the stems assigned to this slot; hub: `scripts/lib/config_form_exceptions_test_support.py` (`test` sends its row removals to `impl`)
-- `test` opens as impl — `scripts/direct`, `scripts/agents`, `scripts/accounts`, `scripts/worktree`, `scripts/bevy_upgrade`, `scripts/history`, `scripts/orphans`, `scripts/prioritize`, `scripts/lib` except `scripts/lib/test_config_form.py` and `scripts/lib/config_form_exceptions_test_support.py`, their tests, and the stems assigned to this slot
+**Gotchas:**
+- `LOCK_WAIT_SECONDS` (`worker_capacity.py`) and `CHECK_TIMEOUT_SECONDS` (`phase_reservation.py`) stay in code; item 277 owns wait limits.
 
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 3 wrote the literal inventory; each `tunable` row of batch "Production and direct literals to config" holds the proposed stem, key, limit line.
-- Phase 1 put `config/the_list.conf` on the blank-line allow list. `test_repository_form` does not report that row as stale while the file is absent; that case is code in the test, near the stale-row check of the file exceptions.
-- Phase 5 changed `scripts/direct/assign.py`, `scripts/direct/claude_worker.py` and `scripts/production/staff.py` for `CONF_DIR`.
-- The `TAIL_BYTES` row of `scripts/production/hand_made_limit.py` belongs to the `config/cli.conf` phase (Phase 6), not to this batch.
-- Phase 10: a test spy on a changed function and current docs that named moved constants broke after the move. A size key gets an upper bound when the code passes it to a read or a slice.
-- Phase 11: a key added to an existing stem must be in every literal test fixture of that stem. `scripts/production/fixture_conf_keys.py` finds the fixtures that lack it; a test outside the batch folders can need the key.
-- Phase 11: a read in a hook, alert, notice, `finally` block or batch loop handles `conf.Unusable` at use. It falls back to a step that needs no value, or it refuses with a logged reason. A raise must not hide other results. Forms: `context_usage.latest_reading`, `pushover.post_message`.
-- Phase 11: the controller's `GuestSettings` (`scripts/build_targets/mac_linux.py` `read_settings`) owns `ssh.connect_attempts`; the candidate commit owns `gate.conf`. `runner_commit` (`mac_linux.py:345`) refuses an uncommitted change under `scripts/`, so the hand-made Mac Linux guest tests run only on a committed tree.
-- Phase 12: a limit that guards saved or accepted work reads `conf.read(stem).whole_upper_bound(key)`, the upper bound of the key's `# whole:` limit line, so a lower value never makes saved work fail. A new request reads the live value. Form: `scripts/review_links/new_item_dialog.py` `read_new_item_limits`.
-- Phase 19: `conf.read` of a `.conf` path in the live config folder recovers like a read of its stem: a new key read by that path comes from the repository before it is on main. The read keeps the caller's path as `ConfigRead.source`. A path outside the live folder does not use the repository.
-
-**Acceptance gate:**
-- Each changed module's tests pass, and each test module with a changed reference passes.
-- `test_config_form.py` passes. The allow list has no `tunable` row of this batch and no blank-line row.
-- `scripts/production/fixture_conf_keys.py --repo <worktree> --base <phase start> --tip <candidate commit>` exits 0. Each stem owner reads the fixtures it reports as not checked.
-- `test_gate_holds.py` passes with its zero rerun fixture. A test proves that the Mac Linux and AWS guest gate routes read the candidate's `gate.conf`.
-- An unusable rerun limit runs no module. An unusable nightly display limit keeps the saved red result and its assignment.
-- `last_tool_call()` and its inventory row are gone, and no `last_step_scan_bytes` key exists.
-- A search of `docs/` and `scripts/` finds no moved constant name outside this plan.
-- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
-- basedpyright reports zero errors and zero warnings on each changed Python file.
+**Ruled out:**
+- One rate factor read per ETA report: two reads differ only during a live tune, and the next render is consistent.
+- A `worker.py` guard for an oversize `<key>.<host>` row: the cause is conf host-row limits, held as an add-on.
 
 ### Phase 14 — Runtime state out of config  · status: todo
 **Depends on:** Phase 13
@@ -671,6 +637,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Constraints from prior phases:**
 - Phase 7 moves `config/accounts.toml` `[trust] folders` to `config/accounts.conf` `trust.folders`. Phase 7 has nate's go (11-24) and waits for Phases 1 and 2 and item 229 on main; this phase does not depend on it. If Phase 7 is not done when this phase starts, `trust.folders` is still in `config/accounts.toml`. If both phases run at the same time, they share `scripts/accounts/accounts.py`: the director gives that file to one phase at a time.
 - Phase 1 format check reads tracked files only; Spec item 5 adds the untracked runtime file case. `check_format(root, files)` judges only the paths it gets, and `test_repository_form` passes `git ls-files -z config/`. The untracked case needs its own file list from the `config/` folder on disk, and its own planted row in `test_planted_violations`.
+- Phase 13 removed the `config/the_list.conf` absent-file case from the stale-row loop of `test_repository_form`. That loop now reports every file exception that matches no violation. Phase 13 also removed `_PRODUCTION_BATCH` from `scripts/lib/config_form_exceptions_test_support.py`.
 
 **Acceptance gate:**
 - The account tests pass, including the switch tests of Spec item 3.
