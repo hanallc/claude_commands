@@ -2984,6 +2984,14 @@ def run_limited(tmp: Path, argv: Sequence[str], copy: Path, environment: dict[st
         os.close(status_read)
 
 
+def _copy_guest_fact_cache(source: Path, target: Path) -> None:
+    """Replace the target with a complete copy of the cache."""
+    with TemporaryDirectory(dir=target.parent) as folder:
+        temporary = Path(folder) / target.name
+        _ = shutil.copyfile(source, temporary)
+        os.replace(temporary, target)
+
+
 def _publish_guest_fact_cache(source: Path, kept: Path, original: os.stat_result | None) -> None:
     """Publish a changed run cache while holding the kept cache lock."""
     try:
@@ -3005,40 +3013,39 @@ def _publish_guest_fact_cache(source: Path, kept: Path, original: os.stat_result
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return
-            with TemporaryDirectory(dir=kept.parent) as folder:
-                temporary = Path(folder) / kept.name
-                _ = shutil.copyfile(source, temporary)
-                os.replace(temporary, kept)
+            _copy_guest_fact_cache(source, kept)
     except OSError as error:
         print(f'Guest fact cache copy out failed: {error}', file=sys.stderr)
 
 
 @contextmanager
-def _guest_fact_cache(repository: str, home: Path) -> Generator[None]:
+def _guest_fact_cache(repository: str, copy: Path, tmp: Path, environment: Mapping[str, str]) -> Generator[None]:
     """Copy the kept facts into the run and publish its new snapshot when the run ends."""
     from scripts.production import affected_modules, land_runs
 
-    state = Path(land_runs.DEFAULT_STATE_DIR)
     with ExitStack() as lease:
         try:
+            state = copy / land_runs.state_dir(environment)
+            root = copy
+            if not state.is_relative_to(copy):
+                # The limited command sees the run temp folder as /tmp.
+                state = tmp / state.relative_to(TEMP)
+                root = tmp
+            requested = state / affected_modules.FACT_CACHE_NAME
+            source = Path(os.path.normpath(requested))
+            if not source.is_relative_to(root) or requested.resolve() != source:
+                raise ValueError('The run cache path leaves its private folder or contains a link.')
             main = lease.enter_context(build_folders.leased_build_folder(build_folders.MainOutput(repository)))
             build_folders.mark_folder_use(main)
-            kept = main / state.name / affected_modules.FACT_CACHE_NAME
-            source = home.resolve(strict=True).joinpath(*state.parts[1:], kept.name)
+            kept = main / Path(land_runs.DEFAULT_STATE_DIR).name / source.name
             source.parent.mkdir(parents=True, exist_ok=True)
+            if kept.exists():
+                _copy_guest_fact_cache(kept, source)
             original = None
-            try:
-                _ = shutil.copyfile(kept, source)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                with suppress(OSError):
-                    source.unlink(missing_ok=True)
-                raise
-            else:
+            with suppress(FileNotFoundError):
                 original = source.stat()
             _ = lease.callback(_publish_guest_fact_cache, source, kept, original)
-        except (OSError, ValueError) as error:
+        except (OSError, RuntimeError, ValueError, land_runs.GateStateMoveRequired) as error:
             print(f'Guest fact cache copy in failed: {error}', file=sys.stderr)
         yield
 
@@ -3076,7 +3083,7 @@ def run_guest(request_path: Path) -> int:
                 refusal = command_refusal(copy.path, command, request['checked'], environment['PATH'])
                 if refusal:
                     return refuse_run(refusal, request['attempt'])
-                with _guest_fact_cache(copy.repository, home):
+                with _guest_fact_cache(copy.repository, copy.path, tmp, environment):
                     return run_limited(tmp, command, copy.path, environment, request['attempt'])
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')

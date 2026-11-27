@@ -624,8 +624,12 @@ class GuestFactCacheTests(unittest.TestCase):
         _ = self.enterContext(patch.object(build_folders, 'leased_build_folder', return_value=nullcontext(main)))
         _ = self.enterContext(patch.object(build_folders, 'mark_folder_use'))
 
-    def cache(self) -> AbstractContextManager[None]:
-        return mac_linux._guest_fact_cache('claude', self.home)  # pyright: ignore[reportPrivateUsage]
+    def cache(self, state: str | None = None) -> AbstractContextManager[None]:
+        environment = {'HOME': str(self.home)}
+        if state is not None:
+            environment['GATE_STATE_DIR'] = state
+        return mac_linux._guest_fact_cache(  # pyright: ignore[reportPrivateUsage]
+            'claude', self.root, self.root / 'tmp', environment)
 
     def seed(self) -> None:
         self.kept.parent.mkdir(parents=True)
@@ -635,6 +639,19 @@ class GuestFactCacheTests(unittest.TestCase):
         self.seed()
         with self.cache():
             self.assertEqual(self.run_cache.read_bytes(), self.kept.read_bytes())
+
+    def test_guest_cache_uses_the_selected_gate_state_folder(self) -> None:
+        self.seed()
+        for setting, folder in ((str(self.root / 'absolute'), self.root / 'absolute'),
+                                ('relative', self.root / 'relative'), ('~/selected', self.home / 'selected'),
+                                ('/tmp/selected', self.root / 'tmp/selected')):
+            with self.subTest(setting=setting):
+                selected = folder / self.kept.name
+                with self.cache(setting):
+                    self.assertFalse(self.run_cache.exists())
+                    self.assertEqual(selected.read_bytes(), self.kept.read_bytes())
+                    _ = selected.write_bytes(setting.encode())
+                self.assertEqual(self.kept.read_bytes(), setting.encode())
 
     def test_replaced_run_cache_updates_the_kept_file(self) -> None:
         self.seed()
@@ -677,9 +694,10 @@ class GuestFactCacheTests(unittest.TestCase):
 
     def test_copy_out_failure_preserves_the_kept_file(self) -> None:
         self.seed()
-        with (patch.object(os, 'replace', side_effect=OSError('copy failed')),
+        with (patch.object(os, 'replace', wraps=os.replace) as replace_cache,
               redirect_stderr(io.StringIO()) as errors, self.cache()):
             _ = self.run_cache.write_bytes(b'new facts')
+            replace_cache.side_effect = OSError('copy failed')
         self.assertEqual(errors.getvalue(), 'Guest fact cache copy out failed: copy failed\n')
         self.assertEqual(self.kept.read_bytes(), b'kept facts')
 
@@ -4631,11 +4649,11 @@ with (patch.object(conf, 'read', read_config),
     def test_command_request_runs_the_argv_in_the_numbered_copy_and_proves_the_end(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
         state = Path(land_runs.DEFAULT_STATE_DIR)
-        cache = Path(*state.parts[1:], affected_modules.FACT_CACHE_NAME)
-        kept = self.guest_home / 'build/claude/main' / state.name / cache.name
+        cache_name = affected_modules.FACT_CACHE_NAME
+        kept = self.guest_home / 'build/claude/main' / state.name / cache_name
         for status in (0, 4):
             program = ('import os, sys\nfrom pathlib import Path\n'
-                       + f'cache = Path.home() / {str(cache)!r}\n'
+                       + f'cache = Path(os.environ["GATE_STATE_DIR"]).expanduser() / {cache_name!r}\n'
                        + ('assert cache.read_bytes() == b"0"\n' if status else 'assert not cache.exists()\n')
                        + f'cache.write_bytes({str(status).encode()!r})\n'
                        + f'print("guest ran in", os.getcwd(), flush=True)\nsys.exit({status})\n')
@@ -4643,9 +4661,10 @@ with (patch.object(conf, 'read', read_config),
             _ = script.write_text(program, encoding='utf-8')
             command = mac_linux.GuestCommand(settings)
             try:
-                process = command.start(self.repo, ['python3', 'scripts/fixture/hand.py'], work='hand-made',
-                                        unit='caller', bootstrap=self.root / 'bootstrap.tar',
-                                        checked={script: program.encode()})
+                with patch.dict(os.environ, {'GATE_STATE_DIR': '~/selected-state'}):
+                    process = command.start(self.repo, ['python3', 'scripts/fixture/hand.py'], work='hand-made',
+                                            unit='caller', bootstrap=self.root / 'bootstrap.tar',
+                                            checked={script: program.encode()})
                 with process:
                     output, _ = process.communicate(timeout=60)
             finally:

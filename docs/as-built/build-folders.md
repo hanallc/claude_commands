@@ -27,6 +27,7 @@ The main checkouts stay at `~/rust/<repo>` and `~/.claude`. The repo word is the
 
 The Hana guest stores its shell cache under `<build root>/hana/main/shells`.
 The Mac Linux guest stores its affected-module fact cache under `<build root>/claude/main/gate/affected-module-facts.sqlite` and holds the main output lease during use.
+The guest copies the cache through the gate state folder in the run, including a private folder selected by `GATE_STATE_DIR`.
 Each numbered copy uses its own real `target` directory.
 
 The unit word names the unit. Use a unit word for only one active unit. A new unit can reuse a retired unit's word. The folder rules reserve `main` and `ci`.
