@@ -5782,7 +5782,8 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                                 f"worker message delivery unconfirmed: {reason}. "
                                 + "The message may already have arrived. Do not resend it.")
                     elif isinstance(error, (herdr_types.HerdrFailure, OSError)):
-                        if not attempting_input or isinstance(error, (herdr.HerdrCommandNotStarted, herdr.AgentBlocked)):
+                        if (not attempting_input or isinstance(error, (herdr.HerdrCommandNotStarted, herdr.AgentBlocked))
+                                or (isinstance(error, herdr_types.HerdrFailure) and error.code == "pane_not_found")):
                             result_submission.may_have_submitted = False
                             return WorkerResultNotSubmitted("retry", reason)
                     else:

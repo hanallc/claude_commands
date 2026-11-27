@@ -4925,6 +4925,23 @@ class WorkerCommandTests(unittest.TestCase):
         self.append_stop_recovery_turn_end(row, time.time() + 1)
         self.assertIsInstance(self.receipt(), worker.DispatchSubmitted)
 
+    def test_stop_recovery_releases_the_pass_when_the_prompt_pane_is_missing(self) -> None:
+        row, _, _ = self.save_stop_canceled_worker_runs()
+        parked, _ = self.detached_record(row, "parked-stop")
+        parked.unlink()
+        path, _ = self.detached_record(row, "unreceived-stop")
+        record = cast(detached_runs.RunRecord, cast(object, worker_lifecycle.read_json_object(path)))
+        record["delivery"] = detached_runs.PARKED_WORKER_RESULT
+        atomic_file.write_text_atomic(path, json.dumps(record))
+
+        missing = herdr_types.HerdrFailure("The pane closed.", code="pane_not_found")
+        with patch.object(self.fixture.world, "_prompt", side_effect=missing) as prompt:
+            result = detached_runs.deliver(record, detached_runs.command_result(record))
+        prompt.assert_called_once()
+        self.assertTrue(result.startswith(detached_runs.FAILED_WORKER_SUBMISSION), result)
+        self.assertNotIn("worker_result_attempt", worker_lifecycle.read_json_object(path))
+        self.assertIsInstance(self.receipt(), worker.DispatchSubmitted)
+
     def test_done_stages_the_stop_result_before_saving_finished(self) -> None:
         row, pane, instance = self.save_stop_canceled_worker_runs()
         other, _ = self.detached_record(row, "unreceived-stop")
