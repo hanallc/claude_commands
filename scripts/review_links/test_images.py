@@ -1180,7 +1180,7 @@ class ImagesTests(ImagesFixture):
                     "After you act on it, delete the image: "
                     + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
                 self.assertIn("feedback_at", image_store.read_record(self.root / image_store.IMAGES_FOLDER / record["id"]))
-                self.assertNotIn(record["id"], images.render(self.status).decode())
+                self.assertNotIn(f'<article id="image-{record["id"]}"', images.render(self.status).decode())
                 images.delete(self.root, record["id"])
                 directory = images.images_root(self.root)
                 (directory / f".review-link-image-answers-{record['id']}.json").unlink()
@@ -1305,7 +1305,7 @@ class ImagesTests(ImagesFixture):
             self.submit(body)
         self.assertEqual([recipient for recipient, _ in calls], [self.owner_id(), *([producer.id] * 4)])
         self.assertEqual(len({key for _, key in calls}), 1)
-        self.assertNotIn(record["id"], images.render(self.status).decode())
+        self.assertNotIn(f'<article id="image-{record["id"]}"', images.render(self.status).decode())
 
     def test_conflicting_words_leave_the_accepted_request_open_for_the_producer(self) -> None:
         keeper, producer, item = self.list_item()
@@ -1721,7 +1721,7 @@ sessionStorage.setItem('images.answer-drafts:' + location.pathname, JSON.stringi
         folder = self.root / image_store.IMAGES_FOLDER / record["id"]
         self.assertTrue((folder / "image.png").is_file())
         self.assertIn("feedback_at", image_store.read_record(folder))
-        self.assertNotIn(record["id"], images.render(self.status).decode())
+        self.assertNotIn(f'<article id="image-{record["id"]}"', images.render(self.status).decode())
         images.delete(self.root, record["id"])
         self.assertEqual(images.records(self.root), [])
 

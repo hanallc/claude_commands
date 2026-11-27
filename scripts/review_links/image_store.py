@@ -10,6 +10,7 @@ import tempfile
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
@@ -202,6 +203,20 @@ def read_answers(directory: Path, identity: str) -> ImageAnswers:
             saved["form_request_keys"] = _texts(fields["form_request_keys"])
         answers["attempts"][key] = saved
     return answers
+
+
+class ImageAnswersUnavailable(Enum):
+    UNAVAILABLE = "the answer record is absent or unreadable"
+
+
+def find_answers(directory: Path, identity: str) -> ImageAnswers | ImageAnswersUnavailable:
+    """Read the server answer for one image without following a symlink."""
+    try:
+        if not directory.is_symlink() and not _answers_path(directory, identity).is_symlink():
+            return read_answers(directory, identity)
+    except (OSError, ValueError):
+        pass
+    return ImageAnswersUnavailable.UNAVAILABLE
 
 
 def write_answers(directory: Path, answers: ImageAnswers) -> None:

@@ -13,8 +13,8 @@ from typing import cast
 from scripts.agents import catch_up
 from scripts.lib import transcripts
 from scripts.lib.showrunner_state import state_root
-from scripts.production import record_store, staff, the_list, update_registration
-from scripts.review_links import images, review_events, review_link
+from scripts.production import delivery_state, record_store, staff, the_list, update_registration
+from scripts.review_links import change_page, image_store, images, review_events, review_link
 
 
 @dataclass(frozen=True)
@@ -109,6 +109,51 @@ def transcript_words(path: Path) -> Iterator[NateWords]:
             yield from typed_turn(row)
 
 
+def list_question_words(item: the_list.ListItem, keeper: staff.StaffId) -> Iterator[NateWords]:
+    questions = {question.question_id: question for question in item.questions}
+    questions.update((event.what.question.question_id, event.what.question)
+                     for event in item.log if isinstance(event.what, the_list.QuestionClosed))
+    for event in item.log:
+        receipt = event.what
+        if event.source != the_list.PAGE_SOURCE or not isinstance(receipt, the_list.QuestionRequestReceipt):
+            continue
+        question = questions.get(receipt.question_id)
+        if question is None or question.words != receipt.request.words:
+            continue
+        target = the_list.list_question_target(keeper, item, question.recipient_id(keeper))
+        status = change_page.DeliveryStatus(review_link.review_root())
+        delivery = change_page.published_question_delivery_view(status, target.saved(question))
+        if delivery.state is delivery_state.QuestionSendState.SENT:
+            yield NateWords(question.words, event.time)
+
+
+def legacy_image_approval_matches(event: the_list.ImageAnswerChange, item: str,
+                                  keeper: staff.StaffId, identity: str) -> bool:
+    directory = images.images_root(review_link.review_root())
+    answers = image_store.find_answers(directory, identity)
+    if (isinstance(answers, image_store.ImageAnswersUnavailable)
+            or answers.get("list_item") != item or answers.get("list_keeper") != keeper):
+        return False
+    attempt = answers["attempts"].get(event.key)
+    approval_message = images.ANSWER_PREFIX + images.ANSWERS["approved"]
+    return (attempt is not None and attempt.get("words") == event.what
+            and attempt["message"].partition("\n")[0] == approval_message)
+
+
+def list_image_words(event: the_list.ImageAnswerChange, item: str, keeper: staff.StaffId) -> Iterator[NateWords]:
+    if event.source != the_list.IMAGE_ANSWER_SOURCE:
+        return
+    line, _, feedback = event.what.partition("\n")
+    label, _, answer = line.partition(": ")
+    identity = label.removeprefix("Image ")
+    if not label.startswith("Image ") or not image_store.IDENTITY.fullmatch(identity):
+        return
+    if answer == images.ANSWERS["approved"] and (event.signed or legacy_image_approval_matches(event, item, keeper, identity)):
+        yield NateWords(line, event.time)
+    if event.signed and feedback and answer in images.ANSWERS.values():
+        yield NateWords(feedback, event.time)
+
+
 def list_words(path: Path, keeper: staff.StaffId) -> Iterator[NateWords]:
     item = the_list.load(keeper, path.stem)
     for event in item.log:
@@ -116,9 +161,9 @@ def list_words(path: Path, keeper: staff.StaffId) -> Iterator[NateWords]:
         if (event.source == the_list.PAGE_SOURCE and isinstance(feedback, the_list.PageFeedback)
                 and feedback.action == "tell" and feedback.state == "sent"):
             yield NateWords(feedback.words, event.time)
-        elif (isinstance(event, the_list.ImageAnswerChange) and event.source == the_list.IMAGE_ANSWER_SOURCE
-              and event.signed):
-            yield NateWords(event.what, event.time)
+        elif isinstance(event, the_list.ImageAnswerChange):
+            yield from list_image_words(event, item.id, keeper)
+    yield from list_question_words(item, keeper)
     for question in item.questions:
         answer = question.answer
         if answer is None:

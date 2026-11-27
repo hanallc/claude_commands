@@ -1,6 +1,7 @@
-"""Verify Images answers from the List and the Images answer store."""
+"""Verify Nate's List questions and Images answers."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime
 import json
 import os
@@ -10,9 +11,15 @@ from typing import cast, override
 from unittest import TestCase
 from unittest.mock import patch
 
-from scripts.production import behavior_request, the_list
+from scripts.production import behavior_request, delivery_state, staff, the_list
 from scripts.production.staff_test_support import fixture_member
-from scripts.review_links import images
+from scripts.review_links import change_page, image_store, images
+
+
+IMAGE = "5c6c129422b8"
+KEY = "review:" + "a" * 64
+APPROVAL = f"Image {IMAGE}: {images.ANSWERS['approved']}"
+MOMENT = datetime(2026, 11, 27, 17, 18, tzinfo=UTC)
 
 
 class BehaviorRequestImagesTests(TestCase):
@@ -25,6 +32,103 @@ class BehaviorRequestImagesTests(TestCase):
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "STAFF_FILE": str(self.root / "staff.json"),
             "REVIEW_LINKS_ROOT": str(self.root),
         })))
+
+    def new_list_item(self) -> tuple[staff.StaffId, the_list.ListItem, Path]:
+        keeper = fixture_member("producer", name="morty").id
+        item = the_list.add(keeper, "Check the picture", owner=keeper, source="nate", changes={})
+        return keeper, item, the_list.folder(keeper) / f"{item.id}.md"
+
+    def legacy_approval(self, words: str = APPROVAL) -> tuple[Path, image_store.ImageAnswers]:
+        keeper, item, source = self.new_list_item()
+        event = {"time": MOMENT.isoformat(), "source": the_list.IMAGE_ANSWER_SOURCE, "note": words,
+                 "image_answer": {"key": KEY, "producer": item.producer}}
+        with source.open("a", encoding="utf-8") as stream:
+            _ = stream.write("\n- " + json.dumps(event) + "\n")
+        directory = images.images_root(self.root)
+        directory.mkdir()
+        answers: image_store.ImageAnswers = {"id": IMAGE, "owner": keeper, "registered_at": MOMENT.isoformat(),
+            "list_item": item.id, "list_keeper": keeper, "attempts": {KEY: {
+                "message": images.ANSWER_PREFIX + images.ANSWERS["approved"], "words": words,
+                "answered": [], "recipients": [keeper], "confirmed": [keeper],
+            }}}
+        return source, answers
+
+    def test_list_question_requires_a_matching_sent_delivery(self) -> None:
+        keeper, item, source = self.new_list_item()
+        words = "Can you keep the second row?"
+        status = change_page.DeliveryStatus(self.root)
+        with patch.object(the_list, "now", return_value=MOMENT):
+            delivery = the_list.ask_question(keeper, item.id, the_list.PageRequest("ask-test", "question", words), status)
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        self.addCleanup(delivery.job.release)
+        self.assertEqual(behavior_request.verified_dates(source, {words}), {})
+        attempt = delivery.job.record
+        path = status.path(delivery.page, delivery.row)
+        sent = replace(attempt, state=delivery_state.QuestionSendState.SENT,
+                       owner=delivery_state.NoQuestionSendOwner(), receipt=delivery_state.QuestionSendReceipt("sent", ""))
+        change_page.publish_question_attempt(path, replace(sent, state=delivery_state.QuestionSendState.QUEUED,
+                                                          receipt=delivery_state.QuestionSendReceipt("queued", "")))
+        self.assertEqual(behavior_request.verified_dates(source, {words}), {})
+        change_page.publish_question_attempt(path, replace(sent, message=sent.message.replace(words, "A different question?")))
+        self.assertEqual(behavior_request.verified_dates(source, {words}), {})
+        change_page.publish_question_attempt(path, sent)
+        self.assertEqual(behavior_request.verified_dates(source, {words}), {words: MOMENT.date()})
+
+    def test_unsigned_images_approval_verifies_with_its_server_record(self) -> None:
+        source, answers = self.legacy_approval()
+        self.assertEqual(behavior_request.verified_dates(source, {APPROVAL}), {})
+        image_store.write_answers(images.images_root(self.root), answers)
+        self.assertEqual(behavior_request.verified_dates(source, {APPROVAL}), {APPROVAL: MOMENT.date()})
+
+    def test_unsigned_approval_requires_the_same_list_item_and_keeper(self) -> None:
+        source, answers = self.legacy_approval()
+        directory = images.images_root(self.root)
+        wrong_references: tuple[image_store.ImageAnswers, ...] = (
+            {**answers, "list_item": "L99"}, {**answers, "list_keeper": "another-keeper"},
+        )
+        for wrong in wrong_references:
+            with self.subTest(wrong=wrong):
+                image_store.write_answers(directory, wrong)
+                self.assertEqual(behavior_request.verified_dates(source, {APPROVAL}), {})
+        image_store.write_answers(directory, answers)
+        self.assertEqual(behavior_request.verified_dates(source, {APPROVAL}), {APPROVAL: MOMENT.date()})
+
+    def test_unsigned_approval_requires_the_same_attempt_key_and_full_words(self) -> None:
+        words = APPROVAL + "\nKeep the second row."
+        source, answers = self.legacy_approval(words)
+        directory = images.images_root(self.root)
+        attempt = answers["attempts"][KEY]
+        wrong_attempts: tuple[dict[str, image_store.ImageAnswer], ...] = (
+            {"review:" + "b" * 64: attempt}, {KEY: {**attempt, "words": APPROVAL}},
+        )
+        for attempts in wrong_attempts:
+            with self.subTest(attempts=attempts):
+                image_store.write_answers(directory, {**answers, "attempts": attempts})
+                self.assertEqual(behavior_request.verified_dates(source, {APPROVAL}), {})
+        image_store.write_answers(directory, answers)
+        self.assertEqual(behavior_request.verified_dates(source, {APPROVAL}), {APPROVAL: MOMENT.date()})
+
+    def test_images_approval_and_feedback_have_distinct_words(self) -> None:
+        feedback = "Keep the second row."
+        approval_note = APPROVAL + "\n" + feedback
+        source, answers = self.legacy_approval(approval_note)
+        directory = images.images_root(self.root)
+        attempt = answers["attempts"][KEY]
+        feedback_message = images.ANSWER_PREFIX + images.ANSWERS["feedback"]
+        image_store.write_answers(directory, {**answers, "attempts": {KEY: {**attempt, "message": feedback_message}}})
+        self.assertEqual(behavior_request.verified_dates(source, {APPROVAL}), {})
+        image_store.write_answers(directory, answers)
+        self.assertEqual(behavior_request.verified_dates(source, {APPROVAL, feedback, approval_note}),
+                         {APPROVAL: MOMENT.date()})
+
+        keeper, item, source = self.new_list_item()
+        feedback_line = f"Image {IMAGE}: {images.ANSWERS['feedback']}"
+        feedback_note = feedback_line + "\n" + feedback
+        _ = the_list.save_image_answer(keeper, item.id, KEY, feedback_note,
+                                       image_id=IMAGE, approved=False, signed_at=MOMENT)
+        self.assertEqual(behavior_request.verified_dates(source, {APPROVAL, feedback_line, feedback_note, feedback}),
+                         {feedback: MOMENT.date()})
 
     def test_an_images_answer_on_the_list_verifies_as_nates_words(self) -> None:
         keeper = fixture_member("producer", name="morty")
