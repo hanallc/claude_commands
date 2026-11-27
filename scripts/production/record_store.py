@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from itertools import chain
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local
 from typing import NamedTuple, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
@@ -37,6 +37,46 @@ from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY
 class RecordText(NamedTuple):
     fields: dict[str, str]
     body: str
+
+
+class _ListDestinationLocks(local):
+    def __init__(self) -> None:
+        self.held: set[Path] = set()
+
+
+_list_destination_locks = _ListDestinationLocks()
+
+
+@contextmanager
+def list_destination_lock() -> Generator[None]:
+    """Hold the List lock across destination discovery and publication."""
+    root = state_root()
+    lock = root / ".list-allocation.lock"
+    held = _list_destination_locks.held
+    if lock in held:
+        yield
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    with exclusive(lock):
+        held.add(lock)
+        try:
+            yield
+        finally:
+            held.remove(lock)
+
+
+def saved_path_exists(path: Path) -> bool:
+    """Distinguish an absent path from an unreadable saved entry."""
+    try:
+        _ = path.lstat()
+    except FileNotFoundError:
+        # A missing parent link target also makes lstat report ENOENT.
+        for parent in path.parents:
+            if parent.is_symlink():
+                _ = parent.stat()
+        return False
+    _ = path.stat()
+    return True
 
 
 class RecordKind(StrEnum):
@@ -827,9 +867,7 @@ class NumberedRecords:
         """Check the keeper before creating or locking its folder."""
         with staff.supplied_snapshot(staff.snapshot()):
             self.require_list_keeper()
-            root = state_root()
-            root.mkdir(parents=True, exist_ok=True)
-            with exclusive(root / ".list-allocation.lock"), self.locked(check=self.require_list_keeper):
+            with list_destination_lock(), self.locked(check=self.require_list_keeper):
                 yield
 
     def _list_folders(self) -> Iterator[Path]:
@@ -891,6 +929,14 @@ class NumberedRecords:
         if number < self.next_number():
             raise self.error_type("the number is below the saved sequence")
         write_text_atomic(self.counter_path(), f"{number + 1}\n", new_file_mode=0o600)
+
+    def finish_reserved_number(self, number: int) -> None:
+        """Advance the saved keeper's counter for a durable reservation."""
+        counter = self.counter_path()
+        if self._saved_next_number(counter) <= number:
+            write_text_atomic(counter, f"{number + 1}\n", new_file_mode=0o600)
+        else:
+            sync_folder(self.folder())
 
     def invalid(self, identity: str, error: object) -> ValueError:
         return self.error_type(f"{identity}: invalid {self.noun}: {error}")

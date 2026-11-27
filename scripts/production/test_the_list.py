@@ -3963,6 +3963,32 @@ the_list.fire_scheduled(timedelta(minutes=2))
                 self.assertEqual(path.read_bytes(), data)
                 (path.parent / f"L{next_number}.md").unlink()
 
+    def test_report_reservation_and_filing_require_a_complete_list_scan(self) -> None:
+        report = the_list.ListReport(the_list.ReportKind.CHANGE, "sdlc/C1", "Check the change.")
+        path = self.root / "report-number"
+        destination = the_list.file_report(MORTY.id, report, "Check the change", owner=RUNNER.id, producer=MORTY.id,
+                                           unit="", source="nate")
+        folder = the_list.folder(destination.keeper)
+        row = folder / f"L{destination.number}.md"
+        before = row.read_bytes()
+        counter = (folder / ".next-number").read_bytes()
+        with patch.object(the_list, "load", side_effect=PermissionError("The row read failed.")):
+            with self.assertRaisesRegex(the_list.IncompleteListScan, "The row read failed"):
+                _ = the_list.moved_report_candidate(MORTY.id, report.evidence_key)
+            with self.assertRaisesRegex(the_list.IncompleteListScan, "The row read failed"):
+                _ = the_list.file_report(MORTY.id, report, "Check the change", owner=RUNNER.id, producer=MORTY.id,
+                                         unit="", source="nate", reservation=path)
+        self.assertEqual(row.read_bytes(), before)
+        self.assertEqual((folder / ".next-number").read_bytes(), counter)
+        self.assertEqual(list(folder.glob("L*.md")), [row])
+        self.assertFalse(path.exists())
+        self.assertEqual(self.notices, [])
+        self.assertEqual(the_list.moved_report_candidate(MORTY.id, report.evidence_key), destination)
+        self.assertEqual(the_list.file_report(MORTY.id, report, "Check the change", owner=RUNNER.id, producer=MORTY.id,
+                                              unit="", source="nate", reservation=path), destination)
+        self.assertEqual(the_list.reserved_review_number(path), destination.number)
+        self.assertEqual((folder / ".next-number").read_bytes(), counter)
+
     def test_invalid_fields_and_inputs_refuse_without_writing(self) -> None:
         item = self.add()
         path = the_list.folder(MORTY.id) / "L1.md"

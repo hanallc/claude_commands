@@ -1425,9 +1425,10 @@ For a List window Send, the server uses the recipient's producer.
 Send reads the producer map from disk without Git recovery.
 For legacy submissions other than questions, the server can send the notice after it saves a reason to skip the List row.
 An unavailable map or a retired producer can cause that fallback.
-Without an active keeper, Send and recovery check the List destination before claiming a question notice.
-The check reports **found**, **absent**, or **incomplete**.
-They verify the native source on **found**, save the fallback on **absent**, and keep the notice pending on **incomplete**.
+Send and recovery use `scan_list_records` before they select a List destination for a saved source.
+The scan requires readable rows and folders, including the targets of saved links.
+The destination check and reservation use the List lock.
+Only a complete absence check permits the Review-only fallback.
 A retired producer leaves a question filing pending when it still requires a List row.
 The command saves its draft ID and recipient before the POST.
 While the result is uncertain, a retry sends the saved ID and recipient before any routing checks for a new filing.
@@ -2319,12 +2320,17 @@ Send and restart recovery file the question with the stable request key from the
 They keep the original keeper and number for a reserved row.
 They check the current keeper under the question filing locks for an unreserved route.
 If a keeper is active, they file the question and verify the native source in the saved row before claiming the notice.
-If no keeper is active, they check the destination under the filing locks.
+Both paths use the locked resolver and `scan_list_records`.
+The scan reads closed rows and supported legacy rows that lack a source key.
 
-- **Found**. They verify the saved native source before claiming the notice.
-- **Absent**. They save the Review-only fallback before claiming the notice.
-- **Incomplete**. An unreadable row or unresolved destination leaves the notice pending. Recovery logs one line for the failed check.
+- **Found**. Send and recovery verify the saved native source before claiming the notice.
+- **Reserved**. Filing resumes at the saved keeper and number.
+- **Absent**. A complete scan without a destination permits allocation or the allowed fallback.
+- **Studio pending**. Other writers wait for Studio to finish its filing.
+- **Incomplete or unresolved**. Filing and the notice stay pending. Recovery logs the failure.
 
+Review moves, report filing, exchange filing, migration apply, and exchange reservation recovery also use `scan_list_records`.
+Exchange filing reads the current links under the source lock before it selects a destination.
 The fallback preserves the route for recovery if the keeper returns before the claim.
 The pending delivery marker remains if row verification or fallback saving fails.
 A reply to the native question or a Studio follow-up changes the item from **Working** to **Answered**.

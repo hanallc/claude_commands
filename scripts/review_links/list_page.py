@@ -287,11 +287,10 @@ def list_keepers(sources: list[Path] | None = None) -> list[staff.StaffId]:
     return [staff.StaffId(owner.name) for owner in owners if owner.is_dir() and not owner.is_symlink()]
 
 
-def records(*, include_closed: bool = False, sources: list[Path] | None = None,
-            read: the_list.ListRead = the_list.ListRead.SKIP_INVALID) -> list[ListRecord]:
+def records(*, include_closed: bool = False, sources: list[Path] | None = None) -> list[ListRecord]:
     """Read the list folders even when a producer has no current staff row."""
     found = [ListRecord(keeper, item) for keeper in list_keepers(sources)
-             for item in the_list.records(keeper, include_closed=include_closed, sources=sources, read=read)]
+             for item in the_list.records(keeper, include_closed=include_closed, sources=sources)]
     return sorted(found, key=lambda entry: the_list.order(entry.item))
 
 

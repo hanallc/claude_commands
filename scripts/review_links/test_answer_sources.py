@@ -228,6 +228,59 @@ class AnswerSourceTests(unittest.TestCase):
             result = answer_sources.main()
         return result, out.getvalue()
 
+    def test_migration_apply_refuses_an_invalid_row_after_planning(self) -> None:
+        key = self.native("unreadable-list", {"since": FILED, "text": "Choose a plan", "question": "Which plan?"})
+        item = the_list.add(KEEPER.id, "Existing item", owner=OWNER.id, source="nate", changes={})
+        item = the_list.link(KEEPER.id, item.id, (key,), source="nate")
+        inventory = answer_sources.read_exchanges(self.review, members=MEMBERS)
+        folder = the_list.folder(KEEPER.id)
+        row = folder / f"{item.id}.md"
+        before = row.read_bytes()
+        counter = (folder / ".next-number").read_bytes()
+        _ = row.write_bytes(b"Invalid List row.\n")
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(answer_sources.migrate(inventory, MEMBERS, apply=True), 1)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(item.id, errors.getvalue())
+        self.assertEqual(row.read_bytes(), b"Invalid List row.\n")
+        self.assertEqual((folder / ".next-number").read_bytes(), counter)
+        self.assertEqual(list(folder.glob("L*.md")), [row])
+        self.assertIs(the_list.exchange_reservation(key), the_list.NextNumber.AVAILABLE)
+        self.assertFalse(the_list.exchange_filing_started(key))
+        _ = row.write_bytes(before)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(answer_sources.migrate(inventory, MEMBERS, apply=True), 0)
+        saved, = the_list.records(KEEPER.id)
+        filed, = saved.filed_exchanges
+        self.assertEqual((saved.id, filed.source_key), (item.id, key))
+        self.assertEqual((folder / ".next-number").read_bytes(), counter)
+
+    def test_migration_refreshes_changed_review_links_under_the_filing_lock(self) -> None:
+        with (patch.object(console_text, "require"),
+              patch.object(the_list, "file_exchanges", side_effect=OSError("The List save stopped."))):
+            report = investigation.file(OWNER.id, "Choose a route", "Which route?", waiting_why="Check the route.")
+            report = investigation.answer(OWNER.id, report.id, "Use the north route.")
+        key = review_items.investigation_record_key(report)
+        first = the_list.add(KEEPER.id, "First destination", owner=OWNER.id, source="nate", changes={})
+        second = the_list.add(KEEPER.id, "Second destination", owner=OWNER.id, source="nate", changes={})
+        first = the_list.link(KEEPER.id, first.id, (key,), source="nate")
+        inventory = answer_sources.read_exchanges(self.review, members=MEMBERS)
+        planned, = inventory.exchanges
+        self.assertEqual(planned.list_links, (investigation.ListDestination(KEEPER.id, first.number),))
+        first = the_list.unlink(KEEPER.id, first.id, (key,), source="nate")
+        second = the_list.link(KEEPER.id, second.id, (key,), source="nate")
+        counter = the_list.folder(KEEPER.id) / ".next-number"
+        before = counter.read_bytes()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(answer_sources.migrate(inventory, MEMBERS, apply=True), 0)
+        self.assertEqual(the_list.load(KEEPER.id, first.id), first)
+        saved = the_list.load(KEEPER.id, second.id)
+        filed, = saved.filed_exchanges
+        self.assertEqual(filed.source_key, key)
+        self.assertEqual(the_list.exchange_reservation(key), the_list.ExchangeDestination(
+            investigation.ListDestination(KEEPER.id, second.number), False))
+        self.assertEqual(counter.read_bytes(), before)
+
     def test_migrate_creates_one_row_and_keeps_every_followup(self) -> None:
         key = self.native("open", {"since": FILED, "text": "Pick a route", "question": "Which route?",
             "followups": [{"followup": "How long?", "reply": "Ten minutes."},

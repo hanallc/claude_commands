@@ -5506,9 +5506,9 @@ window.fetch=(url,options)=>{
                 native = investigation.file(OWNER.id, "Check the menu", "The menu hides half the choices.",
                                             waiting_why="sdlc checks the menu.")
                 report = the_list.ListReport(kind, review_items.investigation_record_key(native), native.question)
-                number = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
-                                              unit="", source="nate")
-                item = the_list.load(MORTY.id, f"L{number}")
+                destination = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                                   unit="", source="nate")
+                item = the_list.load(destination.keeper, f"L{destination.number}")
                 self.assertEqual((item.state, item.state_entered), (the_list.ItemState.NEW, item.opened))
                 with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=1)):
                     working = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.WORKING}, source="dwight")
@@ -5531,7 +5531,7 @@ window.fetch=(url,options)=>{
                 with self.assertRaisesRegex(question_record.AnswerRefused, "List token"):
                     _ = list_page.submit(root, urlencode({**stale, "token": "wrong"}))
                 revision = repaired.repair_revision
-                _ = the_list.save_image_answer(MORTY.id, item.id, f"review:picture-{number}",
+                _ = the_list.save_image_answer(MORTY.id, item.id, f"review:picture-{destination.number}",
                                                "The image shows the chooser.", image_id="000000000001", approved=True)
                 after_image = the_list.load(MORTY.id, item.id)
                 self.assertEqual((after_image.state, after_image.next_step, after_image.repair_revision),
@@ -5573,7 +5573,7 @@ window.fetch=(url,options)=>{
                 self.assertEqual(panel.get("next_step_html"), "")
                 self.assertNotIn('<h3>Next step</h3>', panel.get("detail_html", ""))
                 done_page = list_page.render(root, include_counts=False, query="show=needs-me").decode()
-                row = re.search(r'<tbody data-list-item [^>]+data-number="'+str(number)+r'"[^>]*>', done_page)
+                row = re.search(r'<tbody data-list-item [^>]+data-number="'+str(destination.number)+r'"[^>]*>', done_page)
                 self.assertIsNotNone(row)
                 assert row is not None
                 self.assertIn(" hidden", row[0])
@@ -5587,9 +5587,9 @@ window.fetch=(url,options)=>{
             with self.subTest(scenario=scenario):
                 native = investigation.file(OWNER.id, "Check the menu", words, waiting_why="sdlc checks the menu.")
                 report = the_list.ListReport(the_list.ReportKind.BUG, review_items.investigation_record_key(native), words)
-                number = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
-                                              unit="", source="nate")
-                identity = f"L{number}"
+                destination = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                                   unit="", source="nate")
+                identity = f"L{destination.number}"
                 _ = the_list.update(MORTY.id, identity, {"state": the_list.ItemState.WORKING}, source="dwight")
                 repaired = the_list.update(MORTY.id, identity, {"state": the_list.ItemState.REPAIRED,
                             "next_step": "Open the menu."}, source="dwight")
@@ -10180,9 +10180,9 @@ window.fetch=async(_url,options)=>{
     def file_repaired_report(self, title: str, instructions: str = "Open the menu.") -> the_list.ListItem:
         native = investigation.file(OWNER.id, title, "The menu hides choices.", waiting_why="sdlc checks the menu.")
         report = the_list.ListReport(the_list.ReportKind.BUG, review_items.investigation_record_key(native), native.question)
-        number = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
-                                      unit="", source="nate")
-        identity = f"L{number}"
+        destination = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                           unit="", source="nate")
+        identity = f"L{destination.number}"
         _ = the_list.update(MORTY.id, identity, {"state": the_list.ItemState.WORKING}, source="dwight")
         return the_list.update(MORTY.id, identity, {"state": the_list.ItemState.REPAIRED, "next_step": instructions},
                                source="dwight")

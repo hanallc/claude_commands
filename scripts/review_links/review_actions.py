@@ -10,7 +10,6 @@ from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, tzinfo
-from functools import partial
 from importlib import import_module
 from pathlib import Path
 from typing import cast
@@ -77,7 +76,7 @@ class ReviewWaitEnded(Exception):
 
 @dataclass(frozen=True)
 class MovedReportNumberChanged(Exception):
-    number: the_list.ReservedReportNumber
+    destination: investigation.ListDestination
 
 
 def migrate_report_words(item: review_items.ReviewItem) -> str:
@@ -131,7 +130,7 @@ def move_wait_to_list(root: Path, item: review_items.ReviewItem, members: staff.
         return move(root, item, members, original.record.owner)
 
     route = the_list.report_route(item.owner, members)
-    reservation = the_list.reserve_moved_report(route.keeper, item.key)
+    expected = the_list.moved_report_candidate(route.keeper, item.key)
 
     def file_current_wait() -> None:
         try:
@@ -150,24 +149,24 @@ def move_wait_to_list(root: Path, item: review_items.ReviewItem, members: staff.
                           if kind is the_list.ReportKind.VALIDATION
                           and isinstance(current.source, review_items.ChangeSource)
                           else review_items.LegacyValidationLog.MOVE_MARKER)
-        number = the_list.file_report(
-            route.keeper, the_list.ListReport(kind, current.key, migrate_report_words(current),
+        destination = the_list.file_report(
+            current_route.keeper, the_list.ListReport(kind, current.key, migrate_report_words(current),
                                               validation_log=validation_log),
             ' '.join(current.title.split()), owner=current.owner or the_list.UnassignedOwner.NOT_RECORDED,
             producer=current_route.producer, unit=current_route.unit, source='moved from Review',
-            state=the_list.ItemState.WORKING, reservation=reservation)
-        if number != reservation.number:
-            raise MovedReportNumberChanged(the_list.ReservedReportNumber(number))
+            state=the_list.ItemState.WORKING)
+        if destination != expected:
+            raise MovedReportNumberChanged(destination)
 
     while True:
         try:
-            record_action(item, f'moved to List item {reservation.number}', root=root, check=file_current_wait)
+            record_action(item, f'moved to List item {expected.number}', root=root, check=file_current_wait)
         except ReviewWaitEnded:
             return investigation.NoListDestination.ABSENT
         except MovedReportNumberChanged as changed:
-            reservation = changed.number
+            expected = changed.destination
         else:
-            return investigation.ListDestination(route.keeper, reservation.number)
+            return expected
 
 
 def file_change_work(page: change_page.ReviewPage, row: dict[str, str],
@@ -193,11 +192,10 @@ def file_change_work(page: change_page.ReviewPage, row: dict[str, str],
         route = the_list.report_route(staff.StaffId(owner), members)
         retry = (the_list.ReportRetry.UPDATE if outcome in ('not works', 'validate')
                  else the_list.ReportRetry.KEEP)
-        number = the_list.file_report(route.keeper, report, title, owner=owner, producer=route.producer, unit=route.unit,
-                                      source='nate via Review', retry=retry)
+        return the_list.file_report(route.keeper, report, title, owner=owner, producer=route.producer, unit=route.unit,
+                                    source='nate via Review', retry=retry)
     except (the_list.ListError, staff.StaffRefused) as error:
         raise OSError(f'Cannot file {key} on the List: {error}') from error
-    return investigation.ListDestination(route.keeper, number)
 
 
 def record_superseded(item: review_items.ReviewItem, action: str, *,
@@ -491,32 +489,18 @@ def _question_filing_retry(saved: review_submissions.SavedSubmission, fields: di
     return review_submissions.ListFilingUnavailable(reason)
 
 
-def _refresh_studio_question_route(saved: review_submissions.SavedSubmission,
-                                   record: update_registration.QuestionRecord, reservation: Path,
+def _refresh_studio_question_route(saved: review_submissions.SavedSubmission, reservation: Path,
                                    route: review_submissions.ListFilingRoute | review_submissions.ListFilingUnavailable
                                    | review_submissions.NoListFiling, members: staff.StaffSnapshot
-                                   ) -> review_submissions.ListFilingRoute | review_submissions.NoListFiling:
-    """Resolve the current keeper or save the Review-only fallback."""
+                                   ) -> review_submissions.ListFilingRoute:
+    """Resolve the keeper before publishing a new or reserved row."""
     path = reservation.with_name("list-filing.json")
     if isinstance(the_list.reserved_review_number(reservation), int):
         if isinstance(route, dict):
             return route
         raise OSError(f"Cannot read the reserved List route for {saved.id}.")
     keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
-    if keeper is None:
-        def save_fallback() -> None:
-            if isinstance(route, review_submissions.NoListFiling):
-                return
-            reason = "The List has no active producer."
-            fields = _read_question_filing_fields(path)
-            atomic_file.write_text_atomic(path, json.dumps({**fields, "skipped": reason}) + "\n", new_file_mode=0o600)
-            print(f"Review List filing {saved.id}: {reason}", file=sys.stderr)
-
-        finish_without_keeper = cast(Callable[[update_registration.QuestionRecord, Callable[[], None]], None],
-                                     import_module("scripts.review_links.answer_sources").finish_studio_question_without_keeper)
-        finish_without_keeper(record, save_fallback)
-        return review_submissions.NoListFiling()
-    if isinstance(route, dict) and route["keeper"] == keeper.id:
+    if isinstance(route, dict) and keeper is not None and route["keeper"] == keeper.id:
         return route
     if not isinstance(route, review_submissions.ListFilingUnavailable):
         route = _question_filing_retry(saved, _read_question_filing_fields(path), members)
@@ -529,30 +513,49 @@ def _add_submission_list_row(saved: review_submissions.SavedSubmission, route: r
     evidence = REVIEW_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
     words = saved.words
     keeper = route["keeper"]
-    number = the_list.add_review_item(keeper, review_submissions.submission_title(words),
-                                      owner=route["owner"], producer=route["producer"], unit=route["unit"],
-                                      words=words, evidence=evidence, review_key=key, source=route["source"],
-                                      reservation=reservation)
-    return investigation.ListDestination(keeper, number)
+    return the_list.file_review_item(keeper, review_submissions.submission_title(words),
+                                     owner=route["owner"], producer=route["producer"], unit=route["unit"],
+                                     words=words, evidence=evidence, review_key=key, source=route["source"],
+                                     reservation=reservation)
 
 
 def _ensure_studio_question_filing(saved: review_submissions.SavedSubmission,
                                    record: update_registration.QuestionRecord) -> None:
     with update_registration.wrap_question_locks(record.owner):
         reservation = review_submissions.list_filing_reservation(saved)
+        if not record_store.saved_path_exists(reservation.with_name("list-filing.json")):
+            if isinstance(the_list.reserved_review_number(reservation), int):
+                raise OSError(f"Cannot find the reserved List route for {saved.id}.")
+            return
         saved_route = review_submissions.list_filing_route(saved)
-        if isinstance(saved_route, review_submissions.NoListFiling) and not (
-                reservation.with_name("list-filing.json").is_file()
-                and reservation.with_name("first-message.json").is_file()):
+        if isinstance(saved_route, review_submissions.NoListFiling) and not record_store.saved_path_exists(
+                reservation.with_name("first-message.json")):
             return
         members = staff.snapshot()
-        route = _refresh_studio_question_route(saved, record, reservation, saved_route, members)
-        if isinstance(route, review_submissions.NoListFiling):
+        if (isinstance(the_list.reserved_review_number(reservation), the_list.NextNumber)
+                and record_store.list_keeper(conf.read_or_repository("console"), members) is None):
+            def save_fallback() -> None:
+                if isinstance(saved_route, review_submissions.NoListFiling):
+                    return
+                path = reservation.with_name("list-filing.json")
+                reason = "The List has no active producer."
+                fields = _read_question_filing_fields(path)
+                atomic_file.write_text_atomic(path, json.dumps({**fields, "skipped": reason}) + "\n", new_file_mode=0o600)
+                print(f"Review List filing {saved.id}: {reason}", file=sys.stderr)
+
+            finish = cast(Callable[[update_registration.QuestionRecord, Callable[[], None]], None],
+                          import_module("scripts.review_links.answer_sources").finish_studio_question_without_keeper)
+            finish(record, save_fallback)
             return
+
+        def file_row() -> investigation.ListDestination:
+            route = _refresh_studio_question_route(saved, reservation, saved_route, members)
+            return _add_submission_list_row(saved, route, reservation)
+
         file_question = cast(Callable[[update_registration.QuestionRecord, Path,
                                        Callable[[], investigation.ListDestination], staff.StaffSnapshot], None],
                              import_module("scripts.review_links.answer_sources").file_list_submission_question)
-        file_question(record, reservation, partial(_add_submission_list_row, saved, route, reservation), members)
+        file_question(record, reservation, file_row, members)
 
 
 def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
@@ -561,17 +564,22 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
     if isinstance(record, update_registration.QuestionRecord):
         _ensure_studio_question_filing(saved, record)
         return
+    reservation = review_submissions.list_filing_reservation(saved)
+    route_saved = record_store.saved_path_exists(reservation.with_name("list-filing.json"))
     route = review_submissions.list_filing_route(saved)
     if isinstance(record, investigation.Investigation) and record.belongs_on_list:
-        if not isinstance(record.list_destination, investigation.ListDestination):
-            kind = the_list.investigation_report_kind(record)
-            if isinstance(kind, the_list.ReportKind):
+        kind = the_list.investigation_report_kind(record)
+        if isinstance(kind, the_list.ReportKind):
+            if isinstance(record.list_destination, investigation.ListDestination):
+                report = the_list.report_from_investigation(record, kind, review_items.investigation_record_key(record))
+                the_list.verify_report_destination(record.list_destination, report)
+            else:
                 members = staff.snapshot()
                 if isinstance(route, review_submissions.ListFilingUnavailable):
                     route = review_submissions.retry_list_filing_route(saved, route, members)
                 try:
                     _ = investigation.file_on_list(saved.path, lambda current: the_list.file_investigation_report(
-                        current, kind, members, route=route, reservation=review_submissions.list_filing_reservation(saved),
+                        current, kind, members, route=route, reservation=reservation,
                         source="nate via New item"),
                         mode=(investigation.ListFilingMode.MOVE_BUG
                               if record.purpose is investigation.InvestigationPurpose.MOVING_LEGACY_BUG
@@ -580,15 +588,34 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
                     raise OSError(f"Cannot file {saved.id} on the List: {error}") from error
         return
     if isinstance(route, review_submissions.NoListFiling):
+        if isinstance(the_list.reserved_review_number(reservation), int):
+            raise OSError(f"Cannot find the reserved List route for {saved.id}.")
+        if route_saved:
+            with record_store.list_destination_lock():
+                _ = the_list.review_fallback_destination(review_items.submission_review_key(saved))
         return
     if isinstance(route, review_submissions.ListFilingUnavailable):
-        review_submissions.skip_list_filing(saved, route.reason)
+        _skip_submission_list_filing(saved, reservation, route.reason, route)
         return
-    reservation = review_submissions.list_filing_reservation(saved)
     try:
         _ = _add_submission_list_row(saved, route, reservation)
     except the_list.RetiredListProducer as error:
-        review_submissions.skip_list_filing(saved, str(error))
+        _skip_submission_list_filing(saved, reservation, str(error), route)
+
+
+def _skip_submission_list_filing(
+    saved: review_submissions.SavedSubmission, reservation: Path, reason: str,
+    route: review_submissions.ListFilingRoute | review_submissions.ListFilingUnavailable,
+) -> None:
+    with record_store.list_destination_lock():
+        destination = the_list.review_fallback_destination(review_items.submission_review_key(saved))
+        if destination is investigation.NoListDestination.ABSENT:
+            number = the_list.reserved_review_number(reservation)
+            if isinstance(number, int):
+                if isinstance(route, review_submissions.ListFilingUnavailable) or record_store.saved_path_exists(
+                        the_list.folder(route["keeper"]) / f"L{number}.md"):
+                    raise the_list.ListError("The Review source still has a List reservation.")
+            review_submissions.skip_list_filing(saved, reason)
 
 
 def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus,
