@@ -80,7 +80,7 @@ from scripts.herdr.herdr_types import HerdrFailure
 from scripts.lint import memory_admit as gate
 from scripts.message import sessions, unit_labels
 from scripts.production import staff, staff_sources
-from scripts.lib import conf, process_start
+from scripts.lib import conf, process_start, waits
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.user_zone import user_zone
@@ -1899,15 +1899,17 @@ class TokenPoolUnavailable(TypedDict):
 
 # stevie prints one line for each option, in argument order: the memory floor in MiB, free tokens, total tokens.
 STEVIE_POOL_OPTIONS = ("-a", "-t", "-j")
-STEVIE_TIMEOUT_SECONDS = 0.5
 
 
 def stevie_output(program: Path) -> str:
     """Read the natedev jobserver pool; an error returns its reason."""
+    limit = waits.read(waits.OwnWait.STEVIE_POOL)
     try:
         result = subprocess.run((str(program), *STEVIE_POOL_OPTIONS), capture_output=True, text=True,
-                                timeout=STEVIE_TIMEOUT_SECONDS, check=False)
-    except (OSError, subprocess.TimeoutExpired) as error:
+                                timeout=limit.seconds, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(limit.limit_message("the Stevie token pool")) from error
+    except OSError as error:
         raise ValueError(f"stevie did not answer: {error}") from error
     if result.returncode != 0:
         raise ValueError(f"stevie exited {result.returncode}: {result.stderr.strip()}")
@@ -1943,7 +1945,6 @@ NO_TOKEN_DUMP_YET = TokenHoldersUnknown("waiting for a steve token dump")
 STEVE_UNIT = "steve.service"
 # systemctl must never ask for a password: the polkit rule allows this reload alone.
 STEVE_DUMP_COMMAND = ("systemctl", "--no-ask-password", "reload", STEVE_UNIT)
-STEVE_DUMP_TIMEOUT_SECONDS = 5
 STEVE_DUMP_DENIED = "Access denied"
 STEVE_DUMP_DENIED_REASON = "no permission to request a steve token dump"
 STEVE_DUMP_HEADER = re.compile(r"steve: currently (\d+) tokens available out of (\d+)")
@@ -1953,9 +1954,10 @@ STEVE_DUMP_DETAIL = re.compile(r"\s+(job 0x[0-9a-f]+ running for .*|\d+ processe
 
 def request_token_dump() -> str:
     """Ask steve to write its state to the journal; return the reason when it cannot."""
+    limit = waits.read(waits.WaitSize.FAST)
     try:
         result = subprocess.run(STEVE_DUMP_COMMAND, capture_output=True, text=True,
-                                timeout=STEVE_DUMP_TIMEOUT_SECONDS, check=False)
+                                timeout=limit.seconds, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         return f"systemctl reload steve did not finish: {error}"
     if result.returncode == 0:
@@ -1968,9 +1970,10 @@ def request_token_dump() -> str:
 
 def steve_journal(since_seconds: int) -> str:
     """Read steve's journal lines of the last since_seconds, each with its time."""
+    limit = waits.read(waits.WaitSize.FAST)
     result = subprocess.run(("journalctl", "--unit", STEVE_UNIT, "--output", "short-unix", "--no-pager", "--quiet",
                              "--since", f"-{since_seconds}s"), capture_output=True, text=True,
-                            timeout=STEVE_DUMP_TIMEOUT_SECONDS, check=False)
+                            timeout=limit.seconds, check=False)
     if result.returncode != 0:
         raise OSError(f"journalctl exited {result.returncode}: {result.stderr.strip()}")
     return result.stdout

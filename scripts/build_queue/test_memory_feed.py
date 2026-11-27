@@ -71,6 +71,7 @@ from scripts.mac_test.claim_state import RepositoryScope
 
 REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
 STEVIE_OUTPUT = memory_feed.stevie_output
+STEVE_JOURNAL = memory_feed.steve_journal
 FIXTURE_GUEST_REPORT_SECONDS = 2
 FIXTURE_GUEST_START_LIMIT = mac_linux.TRANSFER_ALLOWANCE_SECONDS + FIXTURE_GUEST_REPORT_SECONDS
 UNIT_LABELS_FOR = unit_labels.unit_labels_for
@@ -954,6 +955,34 @@ class MemoryFeedTests(unittest.TestCase):
             self.assertEqual(STEVIE_OUTPUT(program).split(), ["-a", "-t", "-j"])
             with self.assertRaisesRegex(ValueError, "stevie did not answer"):
                 _ = STEVIE_OUTPUT(self.root / "missing" / "stevie")
+
+    def test_token_commands_use_configured_waits(self) -> None:
+        _ = (self.root / "waits.conf").write_text(
+            "# range: 5e-324..\nstevie_pool.seconds=0.75\n# whole: 1..\nsize.fast.seconds=7\n")
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, "", "")) as run:
+            _ = STEVIE_OUTPUT(STEVIE)
+            _ = REQUEST_TOKEN_DUMP()
+            _ = STEVE_JOURNAL(20)
+        self.assertEqual([cast(float, call.kwargs["timeout"]) for call in run.call_args_list], [0.75, 7, 7])
+
+    def test_token_command_timeouts_keep_the_feed_reasons(self) -> None:
+        reload_timeout = subprocess.TimeoutExpired(memory_feed.STEVE_DUMP_COMMAND, 8)
+        with mock.patch.object(subprocess, "run", side_effect=reload_timeout):
+            self.assertEqual(REQUEST_TOKEN_DUMP(), f"systemctl reload steve did not finish: {reload_timeout}")
+
+        journal_timeout = subprocess.TimeoutExpired("journalctl", 8)
+        with (mock.patch.object(subprocess, "run", side_effect=journal_timeout),
+              mock.patch.object(memory_feed, "steve_journal", STEVE_JOURNAL)):
+            self.assertEqual(memory_feed.newest_token_holders(10),
+                             memory_feed.TokenHoldersUnknown(f"unreadable steve journal · {journal_timeout}"))
+
+        pool_timeout = subprocess.TimeoutExpired(str(STEVIE), 0.5)
+        with (mock.patch.object(subprocess, "run", side_effect=pool_timeout),
+              mock.patch.object(memory_feed, "stevie_output", STEVIE_OUTPUT)):
+            self.assertEqual(memory_feed.token_pool(0, STEVIE), {
+                "kind": "TokenPoolUnavailable",
+                "reason": "Waited 0.5 seconds for the Stevie token pool (waits.conf stevie_pool.seconds).",
+            })
 
     def test_the_newest_steve_dump_gives_the_tokens_of_each_process(self) -> None:
         journal = textwrap.dedent("""\

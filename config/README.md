@@ -27,6 +27,12 @@ machines at once, then commits it on main and pulls the Mac, without a test or
 release cycle. Moving an unchanged value from code
 to config needs no approval and does not use `/tune`.
 
+## waits.conf
+
+Use `scripts/lib/waits.py` to read wait limits from `waits.conf`.
+Choose a kind or a size from the file.
+Use an `[own]` key only when its comment explains the separate limit.
+
 ## machines.conf
 
 `aliases` lists the workstation SSH aliases.

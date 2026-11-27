@@ -27,6 +27,8 @@ It refuses a nested verify step while the same reservation and holder (pid and s
 The memory and cargo-token entry points use the same check before waiting.
 Markers for other queues, dead holders, reused pids, and released reservations do not block a step.
 
+The Builds page feed reads the Stevie pool, Steve reload, and Steve journal limits from `config/waits.conf`.
+
 ### Installed writers and private test state
 
 Only the installed scripts under `~/.claude/scripts` may change shared build state.
