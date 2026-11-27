@@ -71,11 +71,15 @@ def _value_line(key: str, value: str) -> str:
     return f"{key}: {value if key in BARE else _quoted(value)}\n"
 
 
-def _closing_fence(lines: list[str], path: Path) -> int:
-    if not lines or lines[0].strip() != FENCE:
+def _closing_fence(lines: list[str], path: Path, *, strict: bool = False) -> int:
+    opening = lines[0] if lines else ""
+    if (opening.rstrip("\r\n") if strict else opening.strip()) != FENCE:
         raise Refusal(f"{path} has no frontmatter")
     for index in range(1, len(lines)):
-        if lines[index].strip() == FENCE:
+        line = lines[index]
+        if line.strip() == FENCE:
+            if strict and line.rstrip("\r\n") != FENCE:
+                break
             return index
     raise Refusal(f"{path} has no closing --- for its frontmatter")
 
@@ -992,10 +996,11 @@ def _move_one(path: Path, today: date, *, dry_run: bool) -> MoveOutcome:
         if not _approved_at_backlog(Issue(path, frontmatter(path))):
             return LeftAlone(path)
         try:
-            text, _ = _clear_waiting_mark(read_issue(path), path)
+            original = read_issue(path)
+            _ = _closing_fence(record_store.lines_with_endings(original), path, strict=True)
+            text, _ = _clear_waiting_mark(original, path)
             text, _ = set_fields(text, {"stage": IN_PROGRESS_STAGE, "date_modified": _vault_date(today)}, path)
-            if not dry_run:
-                write_issue(path, text)
+            write_issue(path, text, preview=dry_run)
         except (ValueError, OSError, UnicodeError) as error:
             return MoveRefused(path, str(error))
         return Moved(path)

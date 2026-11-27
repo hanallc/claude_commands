@@ -720,9 +720,20 @@ class NewItemServerTests(unittest.TestCase):
         self.addCleanup(cache.close)
         address = for_you.ConsoleAddress("127.0.0.1", server.port)
         received: list[tuple[str, str]] = []
+        copies: list[tuple[str, str]] = []
 
         def capture(recipient: str, _sender: str, message: str, **_options: str) -> None:
-            received.append((recipient, message.splitlines()[-1]))
+            command = message.splitlines()[-1]
+            if " answer-question --item " in command:
+                received.append((recipient, command))
+            else:
+                copies.append((recipient, message))
+
+        def assert_assignee_copy(words: str) -> None:
+            copy, = copies
+            self.assertEqual(copy[0], f"session:{assignee.current_session}")
+            self.assertIn(words, copy[1])
+            copies.clear()
 
         with (mock.patch.object(server.server, "review_cache", cache),
               mock.patch.object(server.server, "delivery_status", case.status),
@@ -739,6 +750,7 @@ class NewItemServerTests(unittest.TestCase):
                         server.finish_new_item_posts()
                     self.assertEqual((outcome, errors.getvalue()), (new_item.Outcome.FILED, ""))
                     command_owner, command = received.pop()
+                    assert_assignee_copy("Check the command filing.")
                     self.assertEqual(command_owner, f"session:{owner.current_session}")
                     self.assertIn("this session.", output.getvalue())
                     self.assertIn("List item ", output.getvalue())
@@ -754,6 +766,7 @@ class NewItemServerTests(unittest.TestCase):
                     reply = server.new_item_http(server.new_item_body(request), finished=True)
                     self.assertEqual(reply.status, 200, reply.body)
                     window_owner, command = received.pop()
+                    assert_assignee_copy(request.words)
                     self.assertEqual(window_owner, f"session:{owner.current_session}")
                     token = self.run_reply_command(command, "The window reply works.")
                     self.assertNotIn(token.encode(), reply.body)
@@ -767,6 +780,7 @@ class NewItemServerTests(unittest.TestCase):
             self.assertEqual((outcome, errors.getvalue()), (new_item.Outcome.FILED, ""))
             self.assertNotIn("this session", output.getvalue())
             command_owner, command = received.pop()
+            assert_assignee_copy("Check the caller identity.")
             self.assertEqual(command_owner, f"session:{owner.current_session}")
             token = self.run_reply_command(command, "Only the owner received the command.")
             self.assertNotIn(token, output.getvalue())
@@ -788,6 +802,7 @@ class NewItemServerTests(unittest.TestCase):
             for kind, report_kind in ((new_item_dialog.SubmissionKind.BUG, the_list.ReportKind.BUG),
                                       ("enhancement", the_list.ReportKind.ENHANCEMENT)):
                 with self.subTest(kind=kind):
+                    send.reset_mock()
                     words = f"The {report_kind} report keeps my words."
                     report = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, keeper.id),
                                      kind=kind, page="list", request_id=f"r6-{uuid4().hex}", words=words,
@@ -817,7 +832,10 @@ class NewItemServerTests(unittest.TestCase):
                     image_reply = connection.getresponse()
                     self.assertEqual(image_reply.status, 200)
                     self.assertEqual(image_reply.read(), b64decode(test_review_submissions.PNG))
-                    self.assertIn("Evidence on the List", cast(str, send.call_args.args[2]))
+                    primary, copy = send.call_args_list
+                    self.assertEqual((primary.args[0], copy.args[0]), (keeper.id, owner.id))
+                    self.assertIn("Evidence on the List", cast(str, primary.args[2]))
+                    self.assertIn(words, cast(str, copy.args[2]))
                     source = snapshot.records[key].source
                     assert isinstance(source, review_items.InvestigationSource)
                     scoped = new_item_dialog.read_submission_key(source.record.submission_scope)

@@ -2835,6 +2835,11 @@ overflow:auto;padding:4px;border:1px solid var(--line);border-radius:8px;backgro
 .list-tag-editor .list-tag-controls{margin-bottom:4px}
 [data-tag-pending],[data-tag-error]{margin:4px 0 0;font-size:13px}
 [data-tag-pending]{color:var(--ink-2)}[data-tag-error]{color:var(--error)}
+@media(min-width:961px) and (max-height:650px){
+ .list-tag-editor{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px}
+ .list-tag-editor h3,.list-tag-editor .list-tag-controls{margin:0}
+ .list-tag-editor :is([data-tag-pending],[data-tag-error]){flex-basis:100%}
+}
 [data-tag-empty]:not([aria-pressed=true]){color:var(--ink-3)}
 #list-tag-notices{position:fixed;z-index:3;inset:auto 16px 24px;display:grid;justify-items:center;pointer-events:none}
 .list-tag-notice{display:inline-flex;align-items:center;flex-wrap:wrap;gap:6px;padding:2px 8px;max-width:100%;
@@ -2898,6 +2903,10 @@ background:var(--ink-2);border-radius:50%}
 .list-item-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:16px}
 .list-item-fields section{grid-column:span 2}
 .list-item-fields :is(.list-field-state,.list-field-eta){grid-column:auto}
+@media(min-width:961px) and (max-height:650px){
+ .list-item-fields :is(.list-field-next_step,.list-field-done_when){grid-column:auto}
+ .list-item-fields h3{margin-top:8px}
+}
 .list-table .item-url{color:var(--accent);overflow-wrap:anywhere}
 .item-links ul{list-style:none;padding:0;margin:0 0 16px}
 .item-links li{padding:6px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}
@@ -3945,6 +3954,22 @@ function chooseScheduleScope(parent,{number,canEditFollowing,removing,parking,ch
   dialog.showModal();
  });
 }
+function fitSchedulePicker(menu){
+ const {top,right}=menu.parentElement.getBoundingClientRect();
+ const width=document.documentElement.clientWidth;
+ const {offsetWidth:pickerWidth,offsetHeight:pickerHeight}=menu;
+ const baseLeft=right-pickerWidth,baseTop=top-pickerHeight-6;
+ const left=Math.max(16,Math.min(baseLeft,width-pickerWidth-16));
+ const pickerTop=Math.max(16,Math.min(baseTop,innerHeight-pickerHeight-16));
+ menu.style.setProperty('--list-picker-x',left-baseLeft+'px');
+ menu.style.setProperty('--list-picker-y',pickerTop-baseTop+'px');
+}
+function fitOpenSchedulePicker(){
+ const menu=recordDetails(tableView.openItem)?.querySelector('[data-later-menu]:not([hidden])');
+ if(menu?.offsetWidth) fitSchedulePicker(menu);
+}
+addEventListener('scroll',fitOpenSchedulePicker,{passive:true});
+addEventListener('resize',fitOpenSchedulePicker);
 function bindScheduleFields(form,until,zone,draft,edit){
  const panel=form.querySelector('[data-schedule-template]').content.firstElementChild.cloneNode(true);
  const words=panel.querySelector('[data-schedule-words]'),select=panel.querySelector('[data-repeat]');
@@ -3953,23 +3978,17 @@ function bindScheduleFields(form,until,zone,draft,edit){
  const calendar=document.createElement('div');
  calendar.append(...[...picker.children].filter(child=>child!==save));
  picker.prepend(calendar);
- const anchor=menu.closest('.list-actions');
  const fitPicker=()=>{
   if(!menu.offsetWidth){pickerSize.disconnect();return;}
-  const width=document.documentElement.clientWidth;
-  const {top,right}=anchor.getBoundingClientRect();
-  const baseLeft=right-menu.offsetWidth,baseTop=top-menu.offsetHeight-6;
-  const left=Math.max(16,Math.min(baseLeft,width-menu.offsetWidth-16));
-  const pickerTop=Math.max(16,Math.min(baseTop,innerHeight-menu.offsetHeight-16));
-  menu.style.setProperty('--list-picker-x',left-baseLeft+'px');
-  menu.style.setProperty('--list-picker-y',pickerTop-baseTop+'px');
+  fitSchedulePicker(menu);
  };
  const pickerSize=new ResizeObserver(fitPicker);
  const observer=new MutationObserver(()=>{
   if(menu.hidden){panel.remove();pickerSize.disconnect();}
   else{
    fitPicker();
-   pickerSize.observe(anchor);
+   pickerSize.observe(menu.closest('.list-actions'));
+   pickerSize.observe(menu.parentElement);
    pickerSize.observe(menu);
   }
  });

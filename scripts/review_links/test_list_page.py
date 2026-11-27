@@ -52,7 +52,7 @@ from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert
 from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_record_table import save_notice_failures
-from scripts.review_links.test_serve import new_item_notice_log, read_new_item_notices
+from scripts.review_links.test_serve import HandlerCalls, new_item_notice_log, read_new_item_notices
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
 
@@ -678,6 +678,8 @@ document.body.append(result);
         _ = write_config_fixture(conf.path("producer_map"))
         words = "Keep the wait time next to the queue name."
         saved: list[tuple[int, Mapping[str, object]]] = []
+        new_item_posts = HandlerCalls()
+        delivery_workers: list[threading.Thread] = []
         probe = r"""<script>
 (async()=>{
  const result=document.createElement('p');
@@ -743,7 +745,22 @@ document.body.append(result);
         probe = probe.replace("__SAVED_PRODUCER__", json.dumps(MORTY.id))
 
         @final
+        class TrackedDeliveryServer(serve.ReviewLinksServer):
+            @override
+            def start_new_item_delivery(self, deliver: Callable[[], object], *,
+                                        claim: change_page.MessageDelivery | None) -> threading.Thread | None:
+                worker = super().start_new_item_delivery(deliver, claim=claim)
+                if worker is not None:
+                    delivery_workers.append(worker)
+                return worker
+
+        @final
         class Probe(serve.ReviewLinksHandler):
+            @override
+            def new_item_post(self) -> None:
+                with new_item_posts.running():
+                    super().new_item_post()
+
             @override
             def html_response(self, status: int, content: bytes, *, delivery_pending: bool | None = None,
                               builds_version: str = "", content_security_policy: str = "",
@@ -769,7 +786,7 @@ document.body.append(result);
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(serve, "loaded_module_stamps", return_value={}),
               new_item_notice_log(self.root, MORTY.id) as log,
-              serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+              TrackedDeliveryServer(("127.0.0.1", 0), root) as server):
             server.RequestHandlerClass = Probe
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
@@ -782,6 +799,10 @@ document.body.append(result);
             finally:
                 server.shutdown()
                 thread.join()
+                self.assertTrue(new_item_posts.wait_until_none_run(), "The New item request did not finish.")
+                for worker in delivery_workers:
+                    worker.join(TEST_HANG_GUARD_SECS)
+                    self.assertFalse(worker.is_alive(), "The New item delivery did not finish.")
             marker = '<p id="probe-results">'
             for page in (first_page, result):
                 self.assertIn(marker, page.stdout, page.stderr)
@@ -3598,7 +3619,8 @@ if(logStyle.scrollbarColor!==ink+' rgba(0, 0, 0, 0)')
  failures.push('The log uses the theme for the thumb and shows the panel color through the track.');
 if(desktop && !(box.left>left.getBoundingClientRect().right && box.bottom<=panel.getBoundingClientRect().bottom &&
  panel.getBoundingClientRect().height<innerHeight))
- failures.push('On a desktop the log sits beside the details and ends with the panel.');
+ failures.push('On a desktop the log sits beside the details and ends with the panel. Panel height: '+
+  panel.getBoundingClientRect().height+' px. Viewport height: '+innerHeight+' px.');
 if(!desktop && Math.abs(log.clientHeight-9*rem)>1)
  failures.push('On a narrow page the log is 9rem tall from the config. Found '+log.clientHeight+' px.');
 const result=document.createElement('p');result.id='probe-results';
@@ -3719,6 +3741,11 @@ document.body.append(result);
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
         _ = self.enterContext(patch.object(rebuild_row, "read", return_value=rebuild_row.RebuildAnswer((), False)))
         _ = change_page.console_folder(self.root / "reviews")
+
+    def assign_legacy_producer(self, item: the_list.ListItem, identity: staff.StaffId) -> the_list.ListItem:
+        producer = replace(MORTY, id=identity)
+        with patch.object(staff, "authority_snapshot", return_value=staff.StaffSnapshot((producer,))):
+            return the_list.update(MORTY.id, item.id, {"producer": identity}, source="morty")
 
     def add(self, title: str, state: the_list.ItemState = the_list.ItemState.WORKING, *,
             owner: the_list.ItemOwner = OWNER.id, number: int | the_list.NextNumber = the_list.NextNumber.AVAILABLE,
@@ -3856,7 +3883,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
             (1, owner, producer), (2, owner, staff.StaffId("p%0Db")), (3, staff.StaffId("o%0Da"), producer),
         ):
             item = self.add(f"Check item {number}", owner=owner_id, number=number)
-            _ = the_list.update(MORTY.id, item.id, {"producer": producer_id}, source="morty")
+            _ = self.assign_legacy_producer(item, producer_id)
         before = r'''<script>
 history.replaceState(null,'',ADDRESS);
 const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')]
@@ -5664,6 +5691,73 @@ window.fetch=async(_path,options={})=>{
                 self.assertTrue(state.get("scheduled_note", "").endswith(note))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_schedule_picker_stays_in_view_on_scroll(self) -> None:
+        self.browser_action_sequence(r"""
+ document.body.style.paddingTop='600px';
+ document.body.style.paddingBottom='1200px';
+ const toggle=form.querySelector('[data-later-toggle]');
+ toggle.focus({preventScroll:true});
+ toggle.click();
+ const picker=form.querySelector('[data-later-menu]');
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ await paint();
+ const initial=picker.getBoundingClientRect();
+ check(!picker.hidden && initial.top>=0 && initial.bottom<=innerHeight,'The open picker fits before scrolling.');
+ const focus=document.activeElement,scrollBefore=scrollY;
+ scrollBy({top:initial.top+80,behavior:'instant'});
+ await paint();
+ const box=picker.getBoundingClientRect();
+ check(scrollY>scrollBefore && document.activeElement===focus,'The page scrolls with the same focus.');
+ check(!picker.hidden && box.top>=0 && box.bottom<=innerHeight,'The open picker fits after scrolling.');
+""", reduced_motion=True, window_size=(1024, 1024))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_schedule_picker_stays_in_view_on_resize(self) -> None:
+        _ = self.add("Check the schedule picker")
+        page = self.root / "studio.html"
+        _ = page.write_bytes(list_page.render(self.root / "reviews", include_counts=False))
+        browser = self.chrome()
+        session = browser.session
+
+        def set_height(height: int) -> None:
+            _ = browser.command("Emulation.setDeviceMetricsOverride",
+                {"width": 1024, "height": height, "deviceScaleFactor": 1, "mobile": False}, session)
+
+        def evaluate(expression: str) -> dict[str, float]:
+            response = browser.command("Runtime.evaluate",
+                {"expression": expression, "awaitPromise": True, "returnByValue": True}, session)
+            self.assertNotIn("exceptionDetails", response, response)
+            return cast(dict[str, dict[str, float]], response["result"])["value"]
+
+        set_height(1024)
+        _ = browser.command("Emulation.setEmulatedMedia",
+            {"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]}, session)
+        browser.navigate(page.as_uri())
+        before = evaluate(r"""
+(() => {
+ document.querySelector('.list-toggle').click();
+ const detail=document.querySelector('[data-record-inline-detail]');
+ const picker=detail.querySelector('[data-later-menu]');
+ document.body.style.paddingBottom='1200px';
+ document.body.style.paddingTop=(950-picker.parentElement.getBoundingClientRect().top)+'px';
+ detail.querySelector('[data-later-toggle]').click();
+ window.pickerLayout=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>{
+  const {top,bottom,height}=picker.getBoundingClientRect();
+  resolve({top,bottom,height,scrollY,innerHeight});
+ })));
+ return pickerLayout();
+})()
+""")
+        self.assertGreater(before["bottom"], 800)
+        self.assertLessEqual(before["bottom"], before["innerHeight"])
+        set_height(800)
+        after = evaluate("pickerLayout()")
+        self.assertEqual(after["innerHeight"], 800)
+        self.assertEqual((after["scrollY"], after["height"]), (before["scrollY"], before["height"]))
+        self.assertGreaterEqual(after["top"], 0)
+        self.assertLessEqual(after["bottom"], 800)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_schedule_filters_repeat_menu_and_scopes(self) -> None:
         root = self.root / "reviews"
         start = the_list.ScheduledRun(datetime(2026, 11, 30, 14, tzinfo=UTC), "Compare the account predictions.")
@@ -7314,7 +7408,7 @@ window.fetch=async(_path,options={})=>{
         for key, markup in (("BEFORE_PAGE", before), ("AFTER_PAGE", after)):
             steps = steps.replace(key, json.dumps(markup).replace("</", r"<\/"))
         self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=before,
-                                     open_number=2, window_size=(1280, 1300))
+                                     open_number=2, window_size=(1280, 1400))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_list_save_keeps_the_open_row_in_place_during_the_animation(self) -> None:
@@ -7429,7 +7523,8 @@ window.fetch=async(_path,options={})=>{
             "AFTER_PAGE", json.dumps(after).replace("</", r"<\/"))
         for case, checks in enumerate(cases):
             with self.subTest(case=case):
-                self.browser_action_sequence(steps + checks, add_item=False, markup=before, window_size=(1280, 800))
+                height = 900 if scroll_start == "bottom" else 800
+                self.browser_action_sequence(steps + checks, add_item=False, markup=before, window_size=(1280, height))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_lost_park_reply_keeps_the_other_open_row_at_the_same_pixel(self) -> None:
@@ -12098,7 +12193,7 @@ async function until(condition,message){
             self.assertIsInstance(list_page.deliver_with_outcome(submission), change_page.DeliveryUnconfirmed)
             self.assertIsInstance(list_page.words_delivery_status(delivery), change_page.DeliveryUnconfirmed)
             list_page.recover_pending(root)
-        pending.assert_called_once()
+        self.assertEqual(pending.call_args_list, [pending.call_args, pending.call_args])
         alert.assert_not_called()
         self.assertEqual(pending.call_args.args[0], MORTY.id)
         self.assertIn("Nate's words:\nCheck the notes.", cast(str, pending.call_args.args[2]))
@@ -12115,7 +12210,7 @@ async function until(condition,message){
             for _ in range(2):
                 self.assertIsInstance(list_page.deliver_with_outcome(delivery, retry_words=True),
                                       change_page.DeliveryConfirmed)
-        self.assertEqual(send.call_args_list, pending.call_args_list)
+        self.assertEqual(send.call_args_list, [pending.call_args])
         self.assertIsInstance(list_page.words_delivery_status(delivery), change_page.DeliveryConfirmed)
         self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
 
@@ -12395,7 +12490,7 @@ async function until(condition,message){
         root = self.root / "reviews"
         producer = staff.StaffId("producer." + "a" * 32)
         item = self.add("The assigned item")
-        _ = the_list.update(MORTY.id, item.id, {"producer": producer}, source="morty")
+        _ = self.assign_legacy_producer(item, producer)
         stored = the_list.load(MORTY.id, item.id)
         self.assertEqual(stored.producer, producer)
         fields = self.fields(stored, "tell", words="Keep these words.")
@@ -12411,7 +12506,7 @@ async function until(condition,message){
         root = self.root / "reviews"
         producer = staff.StaffId("old producer")
         item = self.add("The assigned item")
-        item = the_list.update(MORTY.id, item.id, {"producer": producer}, source="morty")
+        item = self.assign_legacy_producer(item, producer)
         fields = self.fields(item, "tell", words="Keep these words.")
         delivery = list_page.submit(root, urlencode(fields))
         request = fields["request"]
@@ -12429,7 +12524,7 @@ async function until(condition,message){
         root = self.root / "reviews"
         producer = staff.StaffId("old.producer")
         item = self.add("The assigned item")
-        item = the_list.update(MORTY.id, item.id, {"producer": producer}, source="morty")
+        item = self.assign_legacy_producer(item, producer)
         fields = self.fields(item, "tell", words="Keep these words.")
         request = fields["request"] + "." + "b" * 32
         alternate = request.replace("%2E", "%2e")
@@ -12944,7 +13039,7 @@ window.fetch=async(_path,options={})=>{
             _ = self.add(f"Item {number}", owner=staff.StaffId(f"delivery-team-{number:02d}"), number=number)
         all_staff = staff.StaffId("all")
         item = self.add("Item for all", owner=all_staff, number=13)
-        _ = the_list.update(MORTY.id, item.id, {"producer": all_staff}, source="morty")
+        _ = self.assign_legacy_producer(item, all_staff)
         _ = self.add("Item for builds", owner=OTHER.id, number=14)
         _ = self.add("Item for builds support", owner=staff.StaffId("builds-support"), number=15)
         spacetime = staff.StaffId("10e35465-1777-435a-8bbf-5709e6ab0491")
@@ -13061,7 +13156,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
     def test_browser_staff_chips_strip_repeated_suffixes_and_keep_empty_name_ids(self) -> None:
         for number, identity in enumerate((OTHER.id, staff.StaffId("-unit")), start=1):
             item = self.add(f"Item {number}", owner=identity, number=number)
-            _ = the_list.update(MORTY.id, item.id, {"producer": identity}, source="morty")
+            _ = self.assign_legacy_producer(item, identity)
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
             member.to_json() for member in (MORTY, OWNER, replace(OTHER, name="builds-unit-unit"))]}))
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
@@ -13435,7 +13530,8 @@ try{
   await until(()=>!form.dataset.sending,'the '+action+' response');
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
-  check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
+  if(action==='remove') check(form.elements.words.value==='','a confirmed Remove clears its words');
+  else check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
   const motions=[...document.querySelectorAll('[data-record-motion]')].flatMap(node=>node.getAnimations({subtree:true}));
   await Promise.allSettled(motions.map(animation=>animation.finished));
   if(action==='tell'){

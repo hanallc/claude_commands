@@ -846,7 +846,8 @@ class ProposalIssueTests(unittest.TestCase):
             with self.subTest(verb=name):
                 setup()
                 blocked: list[bool] = []
-                def write(path: Path, text: str) -> None:
+                def write(path: Path, text: str, *, preview: bool = False) -> None:
+                    _ = preview
                     lock, = self.runtime.glob("proposal-issue-*.lock")
                     with lock.open("a") as other:
                         try:
@@ -1165,6 +1166,35 @@ class ProposalIssueTests(unittest.TestCase):
         code, out, error = self.run_cli("move-approved", str(self.root / "absent"))
         self.assertEqual((code, out), (2, ""))
         self.assertIn("absent is not a folder", error)
+
+    def test_move_approved_dry_run_refuses_legacy_reply_proof(self) -> None:
+        folder = self.approved_folder()
+        path = folder / "approved.md"
+        proof: dict[str, object] = {"request_id": "request-1", "request_digest": "a" * 64,
+                                    "evidence": {"kind": "none"}, "images": [], "reply_token": "b" * 43}
+        original, _ = proposal_issue.set_fields(path.read_text(), {
+            "proposal_id": "P1", "review_submission": json.dumps(proof)}, path)
+        _ = path.write_text(original)
+        lines = ("move-approved approved.md: refused Move the reply proof before editing this note.\n"
+                 "move-approved: 0 moved\n")
+        for options in (("--dry-run",), ()):
+            with self.subTest(options=options):
+                self.assertEqual(self.run_cli("move-approved", str(folder), *options)[:2], (2, lines))
+                self.assertEqual(path.read_text(), original)
+
+    def test_move_approved_rejects_a_padded_close_before_a_body_fence(self) -> None:
+        folder = self.approved_folder()
+        path = folder / "approved.md"
+        header, closing, body = path.read_text()[4:].partition("\n---\n")
+        self.assertEqual(closing, "\n---\n")
+        original = f"---\n{header}\n--- \n{body}\n---\n"
+        lines = (f"move-approved approved.md: refused {path} has no closing --- for its frontmatter\n"
+                 "move-approved: 0 moved\n")
+        for options in (("--dry-run",), ()):
+            with self.subTest(options=options):
+                _ = path.write_text(original)
+                self.assertEqual(self.run_cli("move-approved", str(folder), *options)[:2], (2, lines))
+                self.assertEqual(path.read_text(), original)
 
     def test_insert_goes_before_the_closing_fence_and_replace_stays_in_place(self) -> None:
         _ = self.run_cli(

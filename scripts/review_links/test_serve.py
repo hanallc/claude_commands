@@ -3232,7 +3232,7 @@ addEventListener('DOMContentLoaded', async () => {
                     self.assertEqual((expired.status, json.loads(expired.body)["code"]), (409, "screenshot_expired"))
                     if choice == "renew":
                         key = attempt.request_id + uuid4().hex
-                        fields.update(capture_key=key, defer_capture=asdict(capture))
+                        fields.update(capture_key=key, defer_capture=capture_fields(capture))
                     reply = self.new_item_http(json.dumps(fields).encode(), finished=True)
                     self.assertEqual(reply.status, 200, reply.body)
                     result = cast(dict[str, str], json.loads(reply.body))
@@ -3243,7 +3243,7 @@ addEventListener('DOMContentLoaded', async () => {
                     if choice == "renew":
                         self.assertEqual(details.capture_intent, new_item_dialog.DeferredCaptureIntent(
                             key, attempt.request_id, capture))
-                        launch.assert_called_once_with(key, "/test/firefox", capture, queued=False)
+                        launch.assert_called_once_with(key, "/test/firefox", live_capture(capture), queued=True)
                     else:
                         self.assertIs(details.capture_intent, new_item_dialog.NoDeferredCapture.ABSENT)
                         self.assertEqual(launch.call_count, 1)
@@ -3459,7 +3459,7 @@ addEventListener('DOMContentLoaded', async () => {
             self.assertEqual(deliver.call_count, 12)
             self.assertEqual(the_list.records(request.recipient_id), [])
             rows = the_list.records(keeper.id)
-            self.assertEqual(len(rows), 10)
+            self.assertEqual(len(rows), 12)
             self.assertEqual({row.owner for row in rows}, {request.recipient_id})
             self.assertEqual({row.report.evidence_key for row in rows
                               if isinstance(row.report, the_list.ListReport)}, keys)
@@ -8312,17 +8312,19 @@ addEventListener('DOMContentLoaded', async () => {
             counts.assert_called_once()
 
     def add_list_filter_items(self) -> staff.StaffId:
-        keeper = self.configure_list_keeper().id
-        for number, producer, parked, unread in (
-                (1, "pa", True, True), (2, "pb", True, True), (3, "pa", True, False),
-                (4, "pa", False, True), (5, "pb", False, True)):
-            item = the_list.add(keeper, f"Task {number}", owner=the_list.UnassignedOwner.NATE,
-                                source="nate", changes={"producer": staff.StaffId(producer)}, number=number)
-            if parked:
-                _ = the_list.park(keeper, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
-            if not unread:
-                _ = the_list.mark_read(keeper, item.id, source="nate")
-        return keeper
+        keeper = self.configure_list_keeper()
+        producers = tuple(replace(keeper, id=staff.StaffId(name), name=name) for name in ("pa", "pb"))
+        with patch.object(staff, "authority_snapshot", return_value=staff.StaffSnapshot((keeper, *producers))):
+            for number, producer, parked, unread in (
+                    (1, "pa", True, True), (2, "pb", True, True), (3, "pa", True, False),
+                    (4, "pa", False, True), (5, "pb", False, True)):
+                item = the_list.add(keeper.id, f"Task {number}", owner=the_list.UnassignedOwner.NATE,
+                                    source="nate", changes={"producer": staff.StaffId(producer)}, number=number)
+                if parked:
+                    _ = the_list.park(keeper.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+                if not unread:
+                    _ = the_list.mark_read(keeper.id, item.id, source="nate")
+        return keeper.id
 
     def list_filter_markup(self, query: str = "", *,
                            path: str = studio_page.PAGE_PATH) -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
@@ -8705,7 +8707,8 @@ addEventListener('DOMContentLoaded', async () => {
         if waiting:
             _ = the_list.update(morty.id, item.id, {"state": the_list.ItemState.WAITING_FOR_NATE}, source="morty")
         if producer is not None:
-            _ = the_list.move_open_producer(morty.id, item.id, morty.id, producer.id, source="morty")
+            with patch.object(staff, "authority_snapshot", return_value=staff.StaffSnapshot(rows)):
+                _ = the_list.move_open_producer(morty.id, item.id, morty.id, producer.id, source="morty")
         item = the_list.mark_read(morty.id, item.id, source="morty")
         ask = the_list.add_ask(morty.id, item.id, kind=the_list.AskKind.GO, target=unit.id, what="Merge needsme to main.",
                                why="The merge needs nate's go.", config=False, requester=morty.id, source="morty")
@@ -9642,6 +9645,7 @@ addEventListener('DOMContentLoaded', async () => {
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
                   "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
         with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
+              patch.object(staff, "authority_snapshot", return_value=staff.StaffSnapshot((morty,))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(change_page, "send_question", side_effect=send),
               patch.object(list_page, "deliver", side_effect=deliver)):

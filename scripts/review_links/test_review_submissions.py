@@ -436,7 +436,7 @@ class ReviewSubmissionTests(unittest.TestCase):
                 match kind:
                     case submissions.SubmissionKind.QUESTION:
                         question, = self.questions()
-                        saved = new_item_dialog.read_submission(question.item.get("review_submission"))
+                        saved = update_registration.review_submission(question)
                     case submissions.SubmissionKind.PROPOSAL:
                         proposal, = self.proposals()
                         saved = proposal_issue.review_submission(proposal)
@@ -1809,11 +1809,11 @@ class ReviewSubmissionTests(unittest.TestCase):
         original_lock = update_registration.outstanding_lock
 
         @contextmanager
-        def replace_before_lock(path: Path) -> Generator[None]:
+        def replace_before_lock(path: Path, *, existing_only: bool = False) -> Generator[None]:
             if path == update_registration.outstanding_path(scope):
                 update_registration.write_question_record(replace(ordinary, status='closed'))
                 update_registration.write_question_record(replacement)
-            with original_lock(path):
+            with original_lock(path, existing_only=existing_only):
                 yield
 
         with (patch.object(update_registration, 'outstanding_lock', side_effect=replace_before_lock),
@@ -1867,7 +1867,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         replacement: list[update_registration.QuestionRecord] = []
 
         @contextmanager
-        def refile_before_lock(path: Path) -> Generator[None]:
+        def refile_before_lock(path: Path, *, existing_only: bool = False) -> Generator[None]:
             if path == update_registration.outstanding_path(scope) and not replacement:
                 update_registration.write_question_record(replace(ordinary, status='closed'))
                 new = ordinary.item.copy()
@@ -1876,7 +1876,7 @@ class ReviewSubmissionTests(unittest.TestCase):
                 update_registration.store_questions(scope, [new], self.identities)
                 replacement.extend(record for record in self.questions() if record.status == 'open'
                                    and 'review_submission' not in record.item)
-            with lock(path):
+            with lock(path, existing_only=existing_only):
                 yield
 
         with (patch.object(update_registration, 'outstanding_lock', side_effect=refile_before_lock),
@@ -2039,7 +2039,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         roll_back = Event()
         retry_state: Queue[str] = Queue()
         sync_folder = atomic_file.sync_folder
-        locks = investigation.recipient_locks
+        proof_lock = file_lock.exclusive
 
         def fail_first_sync(path: Path) -> None:
             if path == self.issues and self.proposals() and not published.is_set():
@@ -2049,10 +2049,10 @@ class ReviewSubmissionTests(unittest.TestCase):
                 raise OSError("Native publication failed.")
             sync_folder(path)
 
-        def lock_retry(*owners: staff.StaffId) -> AbstractContextManager[None]:
+        def lock_retry(path: Path, *, wait: bool = True) -> AbstractContextManager[file_lock.LockResult]:
             if published.is_set() and not roll_back.is_set():
-                retry_state.put("request lock")
-            return locks(*owners)
+                retry_state.put("proof lock")
+            return proof_lock(path, wait=wait)
 
         def retry() -> submissions.SavedSubmission:
             saved = submissions.submit(payload)
@@ -2061,13 +2061,13 @@ class ReviewSubmissionTests(unittest.TestCase):
 
         with (patch.object(atomic_file, "sync_folder", side_effect=fail_first_sync),
               patch.object(record_store, "sync_folder", side_effect=fail_first_sync),
-              patch.object(investigation, "recipient_locks", side_effect=lock_retry),
+              patch.object(reply_proofs, "exclusive", side_effect=lock_retry),
               ThreadPoolExecutor(max_workers=2) as executor):
             first = executor.submit(submissions.submit, payload)
             try:
                 self.assertTrue(published.wait(5))
                 second = executor.submit(retry)
-                self.assertEqual(retry_state.get(timeout=5), "request lock")
+                self.assertEqual(retry_state.get(timeout=5), "proof lock")
                 self.assertFalse((folder / "receipt.json").exists())
             finally:
                 roll_back.set()

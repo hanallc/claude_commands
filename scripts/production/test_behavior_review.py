@@ -40,8 +40,9 @@ MOVE_QUESTION = update_registration.QuestionParts(
 
 
 class BehaviorReviewTests(ScriptRepositoryTestCase):
-    producer: staff.StaffRow = staff.StaffRow(staff.StaffId("e31b40f3-fd25-4c3c-97e3-f80783736401"), "producer",
-                                             "fixture", staff.STAFF_ROOT, current_session=staff.StaffId("claude-fixture"))
+    producer_id: staff.StaffId = staff.StaffId("e31b40f3-fd25-4c3c-97e3-f80783736401")
+    producer: staff.StaffRow = staff.StaffRow(producer_id, "producer", "fixture", staff.STAFF_ROOT,
+                                             current_session=producer_id)
     identities: update_registration.QuestionStaff = update_registration.QuestionStaff(
         staff.StaffSnapshot((producer,)), session_staff.MemberSources(()))
     folder: Path = Path()
@@ -120,8 +121,11 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         return finding
 
     def new_list_record(self) -> tuple[record_store.NumberedRecords, str]:
-        keeper = replace(self.producer, name="morty")
-        with staff.supplied_snapshot(staff.StaffSnapshot((keeper,))):
+        keeper = self.producer
+        _ = self.write(self.home / ".claude/config/console.conf", f"page.list.owner={keeper.id}\n")
+        staff_file = self.write(self.root / "staff.json", json.dumps({"schema": 2, "rows": [keeper.to_json()]}))
+        with (mock.patch.dict(os.environ, {"STAFF_FILE": str(staff_file)}),
+              staff.supplied_snapshot(staff.StaffSnapshot((keeper,)))):
             item = the_list.add(keeper.id, "Set the move timing", owner=keeper.id, source="nate", changes={})
         return list_draft.list_records(keeper.id), item.id
 
