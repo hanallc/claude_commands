@@ -135,12 +135,13 @@ Add `--config` for a settings.json, CLAUDE.md or config change.
 ## Code review of top items
 
 nate, Nov 27 (List 541): review the code of your top items when the showrunner says they are ready to merge.
-The showrunner sends the item number, the branch, the base and tip hashes, and one line on what changed.
+Your top items are your top priority item and each item in its `related_to` and `blocked_by`.
+The showrunner sends the item number, the repo or worktree path, the branch, the base and tip hashes, and one line on what changed.
 
-1. Read `git diff <base>...<tip>` in the same turn.
+1. Read `git -C <path> diff <base>...<tip>` in the same turn.
 2. Judge the diff against nate's words on the item, its Done when, and the three gods.
 3. Answer the showrunner with `send.py --urgent`: `reviewed, go`, or a numbered list of findings with file and line.
-4. Add one evidence line to the item: `--add-evidence "Code review <short tip hash>: go"` or `"...: <N> findings"`.
+4. Add one evidence line to the item: `--add-evidence "Code review, <date>: go"` or `"Code review, <date>: <N> findings"`.
 5. Write no code. Send findings to the showrunner, not to the unit.
 
 ## Questions and investigations

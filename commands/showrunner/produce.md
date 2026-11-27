@@ -702,11 +702,14 @@ each item in its `related_to` and `blocked_by`.
 
 1. **Send.** When a change that carries a top item goes into the merge line,
    send its producer one message in the same turn. Give the item number, the
-   branch, the base hash, the tip hash, and one line on what changed.
+   repo or worktree path, the branch, the base hash, the tip hash, and one line
+   on what changed.
 2. **Wait in the line.** The review runs while the change waits in the merge
    line. Do not hold its test run for the review.
 3. **Merge on the answer.** Merge the change only after the producer answers
    `reviewed, go`. Only the producer answers; a peer word for it is not the answer.
+   If the producer's session is not live, send the change to morty. morty
+   reviews in its place.
 4. **Findings.** Findings come to you. Decide the repair and send it to the unit.
    Send the repaired change to the producer again, with the new tip hash and
    the changed files only.
