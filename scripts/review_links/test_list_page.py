@@ -47,7 +47,7 @@ from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import (browser_test_support, console, go_ledger, list_page, page_frame, serve, staff_names,
                                   studio_page)
 from scripts.review_links import answer_sources, change_browser, change_page, images, new_item_dialog, page_question, question_record
-from scripts.review_links import review_items, review_link, review_page, review_submissions, search_fold, send_hold
+from scripts.review_links import review_actions, review_items, review_link, review_page, review_submissions, search_fold, send_hold
 from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
@@ -3282,6 +3282,44 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         self.assertEqual((notice.state, notice.form_words), ("sent", "Wait for the desktop check."))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_studio_later_uses_a_new_request_after_an_expired_deadline_refusal(self) -> None:
+        item = self.studio_team_question()
+        with (patch.object(change_page, "send_to_staff", return_value=None) as send,
+              self.studio_review_server() as origin):
+            self.open_studio_review_fixture(origin, "#show=questions")
+            self.studio_review_check(r"""
+ const item=row(1);
+ item.querySelector('.list-toggle').click();
+ const readForm=()=>recordDetails(item).querySelector('[data-studio-question-card] [data-review-form]');
+ await until(readForm);
+ const form=readForm(),notice=form.querySelector('[data-send-status]');
+ const toggle=form.querySelector('[data-later-toggle]'),soon=form.querySelector('[data-later-preset="soon"]');
+ const post=window.fetch.bind(window),requests=[];
+ const present=Date.parse(FIXTURE_NOW);let now=present-604800000;Date.now=()=>now;
+ window.fetch=async (url,init)=>{
+  if(init?.method==='POST' && new URL(url,location.href).pathname.endsWith('/review.html')){
+   requests.push(new URLSearchParams(init.body));
+  }
+  return post(url,init);
+ };
+ form.elements.feedback.value='Wait for the desktop check.';
+ toggle.click();soon.click();
+ await until(()=>!form.dataset.sending && !notice.hidden);
+ check(notice.textContent.includes('Choose a future parking date.'),'The server refuses the expired deadline.');
+ check(requests.length===1,'The confirmed refusal ends the request.');
+ now=present;
+ toggle.click();soon.click();
+ await until(()=>!recordIsOpen(item) || !form.dataset.sending && !notice.hidden);
+ check(requests.length===2,'Later sends a second request.');
+ check(requests[0].get('request')!==requests[1].get('request'),'The second request has a new ID.');
+ check(Date.parse(requests[1].get('later'))>present,'The second request has a future deadline.');
+ check(!recordIsOpen(item),'The second request saves the item.');
+""".replace("FIXTURE_NOW", json.dumps(NOW.isoformat())))
+        send.assert_called_once()
+        notice, = the_list.feedback_requests(the_list.load(MORTY.id, item.id)).values()
+        self.assertEqual((notice.state, notice.form_words), ("sent", "Wait for the desktop check."))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_overlay_hides_delivery_failure_after_form_reload(self) -> None:
         item = self.studio_team_question()
         source = self.add("Read the linked question", number=2)
@@ -6260,10 +6298,11 @@ window.fetch=(url,options)=>{
         delivery = list_page.submit(self.root / "reviews", urlencode(fields))
         with (patch.object(change_page, "send_with_retries",
                            return_value=[change_page.DeliveryFailure(DWIGHT.id, "offline")]),
-              patch.object(list_page, "alert_showrunners", return_value=(DWIGHT, MORTY)),
-              patch.object(change_page, "alert_delivery_failures", return_value=True) as alert):
+              patch.object(change_page, "staff_showrunner", return_value=(DWIGHT, MORTY)),
+              patch.object(change_page, "send_to_staff", return_value=None) as alert):
             list_page.deliver(delivery)
-        self.assertEqual(cast(tuple[str, ...], alert.call_args.kwargs["recipients"]), (MORTY.id,))
+        alert.assert_called_once()
+        self.assertEqual(alert.call_args.args[0], MORTY.id)
         feedback = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]]
         self.assertEqual((feedback.state, feedback.alerted_to), ("alerted", "morty"))
         markup = without_role_colors(list_page.render(self.root / "reviews", include_counts=False).decode())
@@ -6276,6 +6315,25 @@ window.fetch=(url,options)=>{
             the_list.folder(MORTY.id) / (item.id + ".md"), item.id, fields["request"]))
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].state, "sent")
+
+    def test_unassigned_studio_notice_alerts_the_saved_recipients_team(self) -> None:
+        item = self.add("Read the unassigned item", owner=the_list.UnassignedOwner.NATE)
+        request = uuid4().hex
+        _ = the_list.save_feedback(MORTY.id, item.id, the_list.PageFeedback(
+            request, "Keep this result.", action="read", recipient=DWIGHT.id))
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        notice = review_actions.StudioNoticeDelivery(MORTY.id, item.id, request, status)
+        members = staff.StaffSnapshot((MORTY, OWNER, replace(DWIGHT, parent=staff.ReportsTo(OWNER.id))))
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        with (patch.object(staff, "snapshot", return_value=members),
+              patch.object(change_page, "send_to_staff", side_effect=[RuntimeError("Offline"), None]) as send):
+            list_page.deliver(notice)
+        failed, alert = send.call_args_list
+        self.assertEqual(failed.args[0], DWIGHT.id)
+        self.assertEqual(alert.args[0], OWNER.id)
+        self.assertIn("Keep this result.", cast(str, alert.args[2]))
+        saved = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[request]
+        self.assertEqual((saved.state, saved.alerted_to), ("alerted", OWNER.name))
 
     def test_mark_read_on_a_waiting_item_with_an_open_question_sends_no_message(self) -> None:
         root = self.root / "reviews"

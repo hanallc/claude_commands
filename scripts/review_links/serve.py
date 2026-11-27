@@ -2239,6 +2239,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 change_page.recover_pending(server.delivery_status, only=error.cleanup)
                 server.review_cache.invalidate()
             return
+        except the_list.ParkingDeadlinePassed as error:
+            self.json_response(400, {"reason": str(error), "refusal": "parking-deadline-passed"})
+            return
         except ValueError as error:
             self.review_answer_refused(error, str(error))
             return
@@ -2269,8 +2272,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             delivery = change_page.finish_verdict_cleanup(action_delivery, server.delivery_status)
             return self.deliver_review(server, delivery, report_outcome=report_outcome)
 
-        if (self.headers.get(send_hold.REPLAY_HEADER) == "1"
-                or self.headers.get(review_page.DELIVERY_RESULT_HEADER) == "1"):
+        replay = self.headers.get(send_hold.REPLAY_HEADER) == "1"
+        if (not studio_delivery and replay) or (not replay and self.headers.get(review_page.DELIVERY_RESULT_HEADER) == "1"):
             outcome = deliver_saved(report_outcome=True)
             if not studio_delivery:
                 result.update(held_delivery_result(outcome, not pending))
@@ -2316,6 +2319,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if isinstance(delivery, change_page.MessageDelivery):
                 status.release_owned_claims((delivery.attempt,))
                 server.review_cache.invalidate()
+        if isinstance(delivery, change_page.MessageDelivery) and change_page.studio_review_delivery(delivery.page):
+            status.defer_question(status.path(delivery.page, delivery.row), delivery)
         return change_page.DeliveryUnconfirmed()
 
     def queue_move_allowed(self, *, origin_required: bool) -> bool:
@@ -2565,7 +2570,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 return server.deliver_list_notice(submission)
             return list_page.deliver_with_outcome(submission)
 
-        if self.headers.get(send_hold.REPLAY_HEADER) == "1" or repair_feedback:
+        if (self.headers.get(send_hold.REPLAY_HEADER) == "1" and action not in ("read", "question")) or repair_feedback:
             try:
                 outcome = deliver_saved()
             except OSError as error:
@@ -3091,6 +3096,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
             return check in self._item_deliveries
 
     def deliver_list_notice(self, delivery: review_actions.ListFeedbackDelivery) -> change_page.DeliveryOutcome:
+        if isinstance(delivery, review_actions.StudioNoticeDelivery) and delivery.alert_status is not self.delivery_status:
+            delivery = replace(delivery, alert_status=self.delivery_status)
         try:
             result = list_page.deliver_with_outcome(delivery)
         except FileNotFoundError:

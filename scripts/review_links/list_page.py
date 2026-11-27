@@ -1861,7 +1861,7 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
     if action == "read":
         read_edit = the_list.mark_read_edit(keeper, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
                                            page_request=the_list.PageRequest(request, "read", words))
-        delivery = _notice_delivery(keeper, read_edit.item, request)
+        delivery = _notice_delivery(keeper, read_edit.item, request, status or change_page.DeliveryStatus(root))
     else:
         delivery = _submit_action(root, keeper, identity, request, prefix, action, words, until, status, submitted)
     if not include_detail:
@@ -1950,7 +1950,7 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
     else:
         recipient = keeper if prefix.recipient is the_list.LegacyFeedbackRecipient.KEEPER else prefix.recipient
         raise question_record.AnswerRefused(f"Enter words for {owner_name(staff.snapshot(), recipient)}.")
-    delivery = _notice_delivery(keeper, changed, request)
+    delivery = _notice_delivery(keeper, changed, request, status or change_page.DeliveryStatus(root))
     if action == "unpark":
         outcome = (UnparkOutcome(the_list.unpark_no_change_reason(changed, request).value)
                    if request not in the_list.feedback_requests(changed) else UnparkOutcome.CLEARED)
@@ -1958,14 +1958,14 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
     return delivery
 
 
-def _notice_delivery(keeper: staff.StaffId, item: the_list.ListItem,
-                     request: str) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
+def _notice_delivery(keeper: staff.StaffId, item: the_list.ListItem, request: str,
+                     status: change_page.DeliveryStatus) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
     """Send the notice that an item action saved, if it is still pending."""
     notice = the_list.feedback_requests(item).get(request)
     if notice is None or notice.state == "sent":
         return change_page.NoMessageDelivery()
     if notice.studio_save_notice:
-        return review_actions.StudioNoticeDelivery(keeper, item.id, request)
+        return review_actions.StudioNoticeDelivery(keeper, item.id, request, status)
     return ListFeedbackDelivery(keeper, item.id, request) if notice.state == "pending" else change_page.NoMessageDelivery()
 
 
@@ -2007,16 +2007,33 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
                                                  confirm=confirm)
         if repair and any(isinstance(failure, change_page.UnconfirmedDelivery) for failure in failures):
             return feedback
+        if isinstance(delivery, review_actions.StudioNoticeDelivery):
+            row = f"{item.id}/Studio/{feedback.request}"
+            page = change_page.ReviewPage(source, source.parent, (row,), "")
+            saved = change_page.MessageDelivery(page, row, recipients, message, feedback.request)
+            status = delivery.alert_status
+            if failures:
+                outcome = change_page.FailedDelivery(feedback.request, source, item.id, failures[-1].error)
+                if feedback.state == "alerted":
+                    return feedback
+                owner = None if isinstance(item.owner, the_list.UnassignedOwner) else item.owner
+                alerted = status.alert_studio_failure(saved, failures, tries, item_owner=owner,
+                                                      title="List feedback needs attention")
+                if alerted:
+                    members = staff.snapshot()
+                    names = [member.name if (member := members.by_id(target)) else target for target in alerted]
+                    return replace(feedback, state="alerted", alerted_to=", ".join(names))
+                return feedback
+            if status.closeout_path(page, row).exists():
+                with status.locked():
+                    status.record_result_locked(saved, change_page.NO_FAILED_DELIVERY)
         if not failures:
             outcome = change_page.DeliveryConfirmed()
             return replace(feedback, state="sent", alerted_to="")
         outcome = change_page.FailedDelivery(feedback.request, source, item.id, failures[-1].error)
-        if feedback.studio_save_notice and feedback.state == "alerted":
-            return feedback
         owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id not in recipients)
         reached = change_page.alert_delivery_failures(failures, tries, source=source, row=item.id, message=message,
-            recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention",
-            confirm=feedback.studio_save_notice)
+            recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
         return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
     the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
     if not attempted:
@@ -2192,12 +2209,13 @@ def _go_sends_notice(ledger: Path, keeper: staff.StaffId, feedback: the_list.Pag
 
 def recover_pending(ledger: Path, *, send_notice: Callable[[ListFeedbackDelivery], object] = deliver) -> None:
     """Retry each pending request once at server start; leave a Go's next-step notice to the Go path."""
+    status = change_page.DeliveryStatus(ledger)
     for entry in records(include_closed=True):
         for feedback in the_list.feedback_requests(entry.item).values():
             if (feedback.state == "pending" or (feedback.state == "alerted" and feedback.studio_save_notice)
                     ) and not _go_sends_notice(ledger, entry.keeper, feedback):
                 try:
-                    delivery = _notice_delivery(entry.keeper, entry.item, feedback.request)
+                    delivery = _notice_delivery(entry.keeper, entry.item, feedback.request, status)
                     if isinstance(delivery, ListFeedbackDelivery):
                         _ = send_notice(delivery)
                 except (OSError, ValueError) as error:
@@ -3193,6 +3211,7 @@ function bindStudioQuestion(item,card,form,view){
     if(reviewDrafts.get(draftKey)===submittedDraft) reviewDrafts.delete(draftKey);
    },
    saved:()=>{},
+   refused:code=>{if(action==='later' && code==='parking-deadline-passed') clearLaterRequest();},
    failed:reason=>showNotice('Not saved: '+reason),
    undone:message=>{
     if(action==='later') clearLaterRequest();

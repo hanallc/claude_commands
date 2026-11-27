@@ -1686,7 +1686,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         until = fields.get('later', [''])[0]
         if isinstance(studio_target, review_actions.StudioQuestionTarget):
             request = fields.get('request', [''])[0]
-            return ReviewActionResult(*review_actions.studio_later(studio_target, until, words, request, verify_revision=validate))
+            return ReviewActionResult(*review_actions.studio_later(
+                studio_target, until, words, request, status, verify_revision=validate))
         return ReviewActionResult(change_page.NoMessageDelivery(), review_actions.later(
             item, until, words, verify_revision=validate, root=root))
     if outcome not in item.actions:
@@ -2111,7 +2112,7 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
   refreshError(error);
  }
 }
-async function saveReviewAction(data,{url=location.pathname,hold,button,saveOnly=false,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
+async function saveReviewAction(data,{url=location.pathname,hold,button,saveOnly=false,sending,confirmedSave,saved,refused,failed,undone=failed,displayFailed,recover,finished}){
  let conflict=false,confirmed=false;
  try{
   const outcome=data.get('outcome'),later=outcome==='later';
@@ -2124,7 +2125,10 @@ async function saveReviewAction(data,{url=location.pathname,hold,button,saveOnly
   confirmed=response.ok;
   if(confirmed) confirmedSave?.();
   const result=await response.json();
-  if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+  if(!response.ok){
+   if(response.status===400) refused?.(result.refusal);
+   throw new Error(result.reason || 'HTTP '+response.status);
+  }
   await saved(result);
  }catch(error){
   const wasHeld=hold.restore();

@@ -342,6 +342,8 @@ class ListFeedbackDelivery:
 class StudioNoticeDelivery(ListFeedbackDelivery):
     """Deliver words from a Studio Later or Mark read save."""
 
+    alert_status: change_page.DeliveryStatus = field(compare=False, repr=False)
+
 
 def sent_question_action(item: review_items.ReviewItem, record: update_registration.QuestionRecord,
                          scope: update_registration.QuestionScope, action: change_page.QuestionOutcome, words: str,
@@ -441,7 +443,8 @@ def _save_review_park(item: review_items.ReviewItem, until: datetime, words: str
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
 
 
-def studio_later(target: StudioQuestionTarget, value: str, words: str, request: str, *,
+def studio_later(target: StudioQuestionTarget, value: str, words: str, request: str,
+                 status: change_page.DeliveryStatus, *,
                  verify_revision: Callable[[], object]
                  ) -> tuple[ListFeedbackDelivery | change_page.NoMessageDelivery, str]:
     identity = f'L{target.number}'
@@ -463,7 +466,7 @@ def studio_later(target: StudioQuestionTarget, value: str, words: str, request: 
 
         _ = the_list.park(target.keeper, identity, until, source=the_list.PAGE_SOURCE, notice=notice,
                           note='Later: '+words if words.strip() else '', check_deadline=check_current)
-        delivery = (StudioNoticeDelivery(target.keeper, identity, request)
+        delivery = (StudioNoticeDelivery(target.keeper, identity, request, status)
                     if isinstance(notice, the_list.PageItemNotice) else change_page.NoMessageDelivery())
         return delivery, label
 
@@ -840,18 +843,29 @@ def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestion
                   question: change_page.NoQuestion | change_page.OpenQuestion) -> change_page.MessageDelivery:
     row = page.rows[0]
     with status.locked():
-        previous_page = status.metadata_page(change_page.ReviewPage(page.review_list, page.production, page.rows, page.token))
+        source = change_page.ReviewPage(page.review_list, page.production, page.rows, page.token)
+        previous_page = status.metadata_page(source)
         previous_slots = status.slots(page, row)
         attempt = secrets.token_hex()
         intent = change_page.DeliveryIntent(attempt,'verdict',recipients=(owner,))
         slots = change_page.DeliverySlots(change_page.NoDelivery(),intent,question)
+        studio = isinstance(page, change_page.UserQuestionPage) and change_page.studio_review_delivery(page)
+        if studio:
+            row = f"{row}/Studio/{attempt}"
+            page = replace(page, rows=(row,), saved={**page.saved, "studio_delivery_row": row})
         status.write_slots(page,row,slots)
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page,row),'claimed')
         try:
+            if studio:
+                # The reply uses the source row. Each saved message uses its own row.
+                reply_page = previous_page if previous_slots.intents() else source
+                status.write_slots(reply_page, source.rows[0], replace(previous_slots, question=question))
             _ = save()
         except BaseException:
             _ = status.request_attempts.pop(attempt, None)
-            status.write_slots(previous_page, row, previous_slots)
+            if studio:
+                status.path(page, row).unlink(missing_ok=True)
+            status.write_slots(previous_page, source.rows[0], previous_slots)
             raise
         page = replace(page,saved={**page.saved,'saved':True})
         status.mark_review_saved(page, row, slots, intent)

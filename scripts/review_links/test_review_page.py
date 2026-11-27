@@ -979,7 +979,8 @@ window.fetch=(url,options)=>{
     def test_save_projection_matches_the_current_snapshot_for_every_source(self) -> None:
         issue, efficiency = self.decisions()
         question = self.question()
-        report = self.investigation()
+        with patch("scripts.review_links.answer_sources.file_saved_investigation"):
+            report = self.investigation()
         investigation_key = f'investigation/{report.owner}/{report.id}'
         ledger = self.fixture.temporary/'backlog.md'
         linked = ledger.with_name('check-notes.md')
@@ -6168,7 +6169,8 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
     def test_waiting_cards_keep_the_for_you_action_groups(self) -> None:
         decisions = self.decisions()
         question = self.question()
-        report = self.investigation()
+        with patch("scripts.review_links.answer_sources.file_saved_investigation"):
+            report = self.investigation()
         keys = (question, f'investigation/{report.owner}/{report.id}', *decisions)
         token, initial = change_browser.browser_manifest(change_page.console_folder(self.root))
         browser = change_page.ReviewBrowser(token, initial)

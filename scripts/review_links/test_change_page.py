@@ -2575,6 +2575,42 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(current.get("pending_alerts"), [])
         self.assertEqual(current["messages"], ["Another request updated this record."])
 
+    def test_studio_alert_uses_a_separate_fallback_when_the_showrunner_is_the_owner(self) -> None:
+        failed = fixture_member("showrunner", name="offline-owner")
+        fallback = showrunners.owner_for("page-owner")
+        _ = write_config_fixture(conf.path("review_links"), f"unrouted_alert_recipient={fallback.name}\n")
+        status = change_page.DeliveryStatus(self.root)
+        delivery = change_page.MessageDelivery(self.page, "C1", (failed.id,), "Use the tool clock.", "studio-attempt")
+        with patch.object(change_page, "send_to_staff", return_value=None) as send:
+            reached = status.alert_studio_failure(delivery, [change_page.DeliveryFailure(failed.id, "Offline")], 3)
+        self.assertEqual(reached, (fallback.id,))
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[:2], (fallback.id, change_page.SENDER))
+        self.assertIn(delivery.message, cast(str, send.call_args.args[2]))
+
+    def test_studio_terminal_alert_failure_keeps_the_team_record_until_confirmation(self) -> None:
+        team = showrunners.owner_for("page-owner")
+        producer = fixture_member("producer", name="offline-producer")
+        _ = write_config_fixture(conf.path("review_links"), f"unrouted_alert_recipient={team.name}\n")
+        status = change_page.DeliveryStatus(self.root)
+        delivery = change_page.MessageDelivery(self.page, "C1", (producer.id,), "Use the tool clock.", "studio-attempt")
+        failures = [change_page.DeliveryFailure(producer.id, "Offline")]
+        with patch.object(change_page, "send_to_staff", side_effect=change_page.FinalSendFailure("Team is offline.")) as first:
+            self.assertEqual(status.alert_studio_failure(delivery, failures, 3), ())
+        self.assertTrue(status.has_deferred_alerts())
+        alert, = status.closeout_fields(self.page, "C1").get("pending_alerts", [])
+        self.assertIn(delivery.message, alert["message"])
+        with status.locked():
+            status.record_result_locked(delivery, change_page.NO_FAILED_DELIVERY)
+        restarted = change_page.DeliveryStatus(self.root)
+        self.assertEqual(restarted.closeout_fields(self.page, "C1").get("pending_alerts"), [alert])
+        with patch.object(change_page, "send_to_staff", return_value=None) as confirmed:
+            restarted.send_pending_alerts(restarted.closeout_path(self.page, "C1"))
+        confirmed.assert_called_once()
+        self.assertEqual(confirmed.call_args, first.call_args)
+        self.assertEqual(restarted.closeout_fields(self.page, "C1").get("pending_alerts"), [])
+        self.assertEqual(restarted.closeout_fields(self.page, "C1").get("studio_alert_recipients"), [team.id])
+
     def test_open_question_answer_recovers_for_the_asker_when_the_saved_mark_fails(self) -> None:
         key = self.file_user_question("Keep the saved answer")
         status = change_page.DeliveryStatus(self.root)

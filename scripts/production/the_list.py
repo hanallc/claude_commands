@@ -58,6 +58,10 @@ class ListError(ValueError):
     """The item cannot accept the requested operation."""
 
 
+class ParkingDeadlinePassed(ListError):
+    """The request has a parking deadline that has passed."""
+
+
 class ScheduleSelectionChanged(ListError):
     """The saved schedule or selected run changed before the write."""
 
@@ -1129,7 +1133,7 @@ def parking_active(value: Parking, moment: datetime) -> bool:
 def require_active_parking(value: Parking, moment: datetime) -> None:
     """Refuse a parking deadline that has passed."""
     if not parking_active(value, moment):
-        raise ListError("Choose a future parking date.")
+        raise ParkingDeadlinePassed("Choose a future parking date.")
 
 
 def _request_parking(value: Parking) -> Parking:

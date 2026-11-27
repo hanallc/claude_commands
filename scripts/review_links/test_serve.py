@@ -43,7 +43,7 @@ from functools import partial
 from http.client import HTTPConnection, RemoteDisconnected, parse_headers
 from io import BytesIO, StringIO
 from pathlib import Path
-from unittest.mock import ANY, Mock, call, patch
+from unittest.mock import ANY, Mock, ThreadingMock, call, patch
 
 
 from typing import IO, Literal, TextIO, TypedDict, cast, override
@@ -159,9 +159,9 @@ class ServerConfigFolderTests(unittest.TestCase):
 
 
 @contextmanager
-def capture_sender(name: str) -> Generator[Mock]:
+def capture_sender(name: str) -> Generator[ThreadingMock]:
     """Capture the recipient, sender, and message of a keyed send."""
-    send = Mock()
+    send = ThreadingMock()
 
     def capture(recipient: str, sender: str, message: str, **_options: str) -> None:
         _ = cast(object, send(recipient, sender, message))
@@ -6891,6 +6891,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         body = case.body(key, "answer", "Use the wide layout.") + "&" + urlencode({"revision": revision[1].decode()})
         with capture_sender("send_to_staff") as send:
             status, answer = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+            send.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(status, 200, answer)
         self.assert_studio_question_message(send, row, "Use the wide layout.")
         self.assertEqual(self.list_filter_markup("?show=questions")[0], [])
@@ -6921,6 +6922,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             status, reply = self.post(review_page.PAGE_PATH, body + "&" + urlencode({"later": later.isoformat()}),
                                       headers={send_hold.REPLAY_HEADER: "1"})
             self.assertEqual(status, 200, reply)
+            send.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
             self.assert_studio_question_message(send, row, "Wait for the desktop check.")
             self.assertEqual(self.list_filter_markup("?show=questions")[0], [])
             item = the_list.load(row.keeper, row.item.id)
@@ -6936,6 +6938,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         body = case.body(key, "question", ask) + "&" + urlencode({"revision": shown[1].decode()})
         with capture_sender("send_to_staff") as send:
             status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+            send.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(status, 200, reply)
         self.assert_studio_question_message(send, row, ask)
         current = self.server.review_cache.get().records[key].source
@@ -6993,8 +6996,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         shown = re.search(rb'name="revision" value="([^"]+)"', data)
         assert shown is not None
         body = case.body(key, "question", "Does the wide layout fit on a laptop?") + "&" + urlencode({"revision": shown[1].decode()})
-        with capture_sender("send_to_staff"):
+        with capture_sender("send_to_staff") as send:
             status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+            send.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(status, 200, reply)
         current = self.server.review_cache.get()
         self.assertIs(current.records[key].state, review_items.ReviewState.WAITING)
@@ -7031,7 +7035,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             "revision": shown[1].decode(), "later": until.isoformat()})
         tries = conf.read("review_links").whole("delivery_tries")
         with (patch.object(change_page, "send_to_staff", side_effect=[*(["pending"] * tries), "skipped"]) as send,
-              patch.object(change_page, "alert_delivery_failures", return_value=False) as alert):
+              patch.object(change_page, "studio_alert_targets", return_value=()) as route):
             status, reply = self.post(review_page.PAGE_PATH, body, headers={review_page.DELIVERY_RESULT_HEADER: "1"})
             self.assertEqual(status, 200, reply)
             self.assertNotIn(b"send_failure", reply)
@@ -7039,11 +7043,12 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(saved.parked_until, until)
             notice, = the_list.feedback_requests(saved).values()
             self.assertEqual(notice.state, "pending")
+            self.assertTrue(case.status.has_deferred_alerts())
             self.server.retry_studio_notices()
             self.server.retry_studio_notices()
         self.assertEqual(send.call_count, tries + 1)
         self.assertEqual(len({cast(str, call.kwargs["key"]) for call in send.call_args_list}), 1)
-        alert.assert_called_once()
+        route.assert_called_once()
         self.assertEqual(the_list.feedback_requests(the_list.load(row.keeper, row.item.id))[notice.request].state, "sent")
 
     def test_submit_snapshot_returns_the_studio_later_delivery(self) -> None:
@@ -7108,8 +7113,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         headers = {review_page.DELIVERY_RESULT_HEADER: "1"}
         _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
         failure = RuntimeError("The owner is offline.")
-        with (patch.object(change_page, "send_to_staff", side_effect=[failure, failure, "skipped"]) as send,
-              patch.object(change_page, "alert_delivery_failures", return_value=True) as alert):
+        team = fixture_member("showrunner", name="alert-team")
+        with (patch.object(change_page, "send_to_staff", side_effect=[failure, None, failure, "skipped"]) as send,
+              patch.object(change_page, "studio_alert_targets", return_value=(team.id,)) as route):
             status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
             self.assertEqual(status, 200, reply)
             self.assertNotIn(b"send_failure", reply)
@@ -7119,9 +7125,13 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(status, 200, reply)
             self.assertNotIn(b"send_failure", reply)
             self.server.retry_studio_notices()
-        self.assertEqual(send.call_count, 3)
-        self.assertEqual(len({cast(str, call.kwargs["key"]) for call in send.call_args_list}), 1)
-        alert.assert_called_once()
+        self.assertEqual(send.call_count, 4)
+        owner_sends = [entry for entry in send.call_args_list if entry.args[0] == row.item.owner]
+        self.assertEqual(len(owner_sends), 3)
+        self.assertEqual(len({cast(str, entry.kwargs["key"]) for entry in owner_sends}), 1)
+        self.assertEqual(send.call_args_list[1].args[0], team.id)
+        self.assertIn("Wait for the desktop check.", cast(str, send.call_args_list[1].args[2]))
+        route.assert_called_once()
         self.assertEqual(the_list.feedback_requests(the_list.load(row.keeper, row.item.id))[request].state, "sent")
 
     def test_studio_later_returns_the_same_delivery_from_submit_and_cache(self) -> None:
@@ -7136,10 +7146,96 @@ class ReviewLinksServerTests(unittest.TestCase):
         body = case.body(key, "later", "Wait for the desktop check.") + "&" + urlencode({
             "revision": shown[1].decode(), "later": until.isoformat(), "request": request})
         result = review_page.submit(case.root, body, case.status, snapshot=snapshot)
-        self.assertEqual(result.delivery, review_actions.StudioNoticeDelivery(row.keeper, row.item.id, request))
+        self.assertEqual(result.delivery, review_actions.StudioNoticeDelivery(row.keeper, row.item.id, request, case.status))
         saved = cache.save(body, case.status)
         self.assertEqual(saved.delivery, result.delivery)
         self.assertEqual(saved.answer, result.answer)
+
+    def test_studio_answer_retries_when_the_team_record_write_fails(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        words = "Use the wide layout."
+        body = case.body(key, "answer", words) + "&" + urlencode({"revision": shown[1].decode()})
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        with patch.object(change_page, "send_to_staff", side_effect=["pending", None]) as send:
+            with patch.object(case.status, "record_studio_failure_locked", side_effect=OSError("The team record failed.")):
+                status, reply = self.post(review_page.PAGE_PATH, body, headers={review_page.DELIVERY_RESULT_HEADER: "1"})
+            self.assertEqual(status, 200, reply)
+            self.assertNotIn(b"send_failure", reply)
+            self.assertEqual(case.status.request_attempts, {})
+            self.assertTrue(case.status.has_deferred_questions())
+            change_page.recover_deferred_questions(case.status)
+            change_page.recover_deferred_questions(case.status)
+        first, retry = send.call_args_list
+        self.assertEqual(first, retry)
+        self.assertEqual(retry.args[0], row.item.owner)
+        self.assertIn(words, cast(str, retry.args[2]))
+        self.assertFalse(case.status.has_deferred_questions())
+
+    def test_studio_ask_and_answer_keep_their_own_pending_delivery_records(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        words = ("Does the wide layout fit on a laptop?", "Use the wide layout.")
+        with (patch.object(change_page, "send_to_staff", return_value="pending") as pending,
+              patch.object(change_page, "studio_alert_targets", return_value=())):
+            for action, text in zip(("question", "answer"), words, strict=True):
+                data = self.server.review_cache.get().body(
+                    key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+                shown = re.search(rb'name="revision" value="([^"]+)"', data)
+                assert shown is not None
+                body = case.body(key, action, text) + "&" + urlencode({"revision": shown[1].decode()})
+                status, reply = self.post(review_page.PAGE_PATH, body, headers={review_page.DELIVERY_RESULT_HEADER: "1"})
+                self.assertEqual(status, 200, reply)
+            self.assertEqual(pending.call_count, 2)
+        restarted = change_page.DeliveryStatus(case.status.root)
+        with patch.object(change_page, "send_to_staff", return_value=None) as delivered:
+            change_page.recover_question_answers(restarted)
+            change_page.recover_question_answers(restarted)
+        self.assertCountEqual(delivered.call_args_list, pending.call_args_list)
+        self.assertEqual(len({cast(str, entry.kwargs["key"]) for entry in delivered.call_args_list}), 2)
+        for entry, text in zip(pending.call_args_list, words, strict=True):
+            self.assertEqual(entry.args[0], row.item.owner)
+            self.assertIn(text, cast(str, entry.args[2]))
+
+    def test_studio_undo_replay_confirms_the_save_while_delivery_is_blocked(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        words = "Use the wide layout."
+        body = case.body(key, "answer", words) + "&" + urlencode({"revision": shown[1].decode()})
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_send(_recipient: staff.StaffId, _sender: str, _words: str, *, key: str) -> None:
+            self.assertTrue(key.startswith("review:"))
+            entered.set()
+            self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
+
+        marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(change_page, "send_to_staff", side_effect=slow_send) as send):
+            status, hold, fields = self.held_http("POST", review_page.PAGE_PATH, body.encode(), headers=marked)
+            self.assertEqual((status, hold), (202, "held"), fields)
+            send.assert_not_called()
+            endpoint = f"{send_hold.HOLD_PATH}/{fields['hold']}"
+            try:
+                self.assertEqual(self.held_http("POST", endpoint + "/send")[0], 200)
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    result = executor.submit(self.held_http, "GET", endpoint)
+                    try:
+                        status, _, saved = result.result(timeout=5)
+                        self.assertEqual((status, saved.get("answer")), (200, words), saved)
+                        self.assertNotIn("send_failure", saved)
+                    finally:
+                        release.set()
+            finally:
+                release.set()
+            self.assertTrue(self.review_posts.wait_until_none_run())
+        self.assertEqual(send.call_count, 1)
 
     def test_legacy_change_reply_retry_files_the_saved_answer(self) -> None:
         case = self.review_fixture(changes=1)
@@ -7255,6 +7351,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 result = cast(dict[str, object], json.loads(response))
                 self.assertIs(result["words_saved"], True)
                 self.assertEqual(result["item_state"], "Closed")
+                send.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
             send.assert_called_once_with(owner.id, change_page.SENDER, words)
             closed = the_list.load(keeper.id, answered.id)
             self.assertIs(closed.state, the_list.ItemState.CLOSED)
@@ -10570,6 +10667,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_exhausted_list_question_saves_failure_for_the_team(self) -> None:
         morty, item = self.list_keeper_item("The question item")
+        team = fixture_member("showrunner", name="question-team")
+        morty = replace(morty, parent=staff.ReportsTo(team.id))
         request, words = uuid4().hex, "Which check passed?"
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
                   "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
@@ -10586,11 +10685,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             finally:
                 finished.set()
 
-        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
+        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty, team))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(list_page, "counts_strip", return_value=""),
               patch.object(list_page, "deliver", side_effect=deliver),
-              patch.object(change_page, "send_to_staff", return_value=None),
+              patch.object(change_page, "send_to_staff", return_value=None) as alert,
               patch.object(change_page, "send_question", side_effect=[
                   *([question_outcome("refused", "Producer offline")] * tries)]) as send):
             code, response = self.post(list_page.PAGE_PATH, urlencode(fields))
@@ -10616,6 +10715,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertIn(f"\n{words}\n", messages[0])
             self.assertIn(f"answer L1 --keeper {morty.id} --question Q1", messages[0])
             self.assertTrue(self.server.delivery_status.has_deferred_questions())
+            alert.assert_called_once()
+            self.assertEqual(alert.call_args.args[:2], (team.id, change_page.SENDER))
+            self.assertIn(words, cast(str, alert.call_args.args[2]))
+            self.assertIn(f"Recipient: {morty.id}", cast(str, alert.call_args.args[2]))
 
     def test_an_image_question_delivers_when_the_browser_response_fails(self) -> None:
         _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))

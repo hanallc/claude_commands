@@ -205,13 +205,22 @@ class StoredDeliveryCloseout(TypedDict):
     failed_delivery: NotRequired[StoredFailedDelivery]
     review_dispatch: NotRequired[StoredReviewDispatch]
     question_dispatch: NotRequired[StoredQuestionDispatch]
-    pending_alerts: NotRequired[list[PendingDeliveryAlert]]
+    pending_alerts: NotRequired[list[PendingDeliveryAlert | PendingStudioAlert]]
+    studio_alert_attempt: NotRequired[str]
+    studio_alert_recipients: NotRequired[list[staff.StaffId]]
 
 
 class PendingDeliveryAlert(TypedDict):
     recipient: staff.StaffId
     message: str
     key: NotRequired[str]
+
+
+class PendingStudioAlert(TypedDict):
+    failed_recipient: staff.StaffId
+    message: str
+    key: str
+    item_owner: NotRequired[staff.StaffId]
 
 
 class StoredReviewDispatch(TypedDict):
@@ -283,6 +292,7 @@ class StoredUserAnswer(TypedDict):
     scoped_reply: NotRequired[ScopedReplyCommand]
     studio_answer: NotRequired[Literal[True]]
     studio_delivery: NotRequired[Literal[True]]
+    studio_delivery_row: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -1086,12 +1096,8 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
         if result.state is QuestionSendState.UNKNOWN and result.earlier_unconfirmed:
             status.defer_question(path)
         if studio_retry:
-            owner = verified.saved.alert_owner
-            recipients = tuple(runner.id for runner in staff_showrunner(owner, staff.snapshot())) if owner is not None else ()
             failure = DeliveryFailure(recipient, result.error or "The sender has not confirmed delivery.")
-            with status.locked():
-                status.record_studio_failure_locked(delivery, [failure], run.attempts, recipients)
-            status.send_pending_alerts(status.closeout_path(delivery.page, delivery.row))
+            _ = status.alert_studio_failure(delivery, [failure], run.attempts, item_owner=verified.saved.alert_owner)
             return DeliveryUnconfirmed()
         if retry_error is not None and not isinstance(retry_error, (StaleQuestionAttempt, ClosedQuestionSource)):
             print(f"review-links question retry {delivery.row}: " + " ".join(str(retry_error).splitlines()), file=sys.stderr)
@@ -1503,19 +1509,40 @@ class DeliveryStatus:
         self.write_closeout(path, fields)
 
     def record_studio_failure_locked(self, delivery: MessageDelivery, failures: list[DeliveryFailure],
-                                     tries: int, recipients: tuple[staff.StaffId, ...]) -> None:
+                                     tries: int, *, item_owner: staff.StaffId | None = None,
+                                     title: str = "Change review delivery needs attention") -> None:
         """Record one alert per attempt and keep the message ready to retry."""
         page, row = delivery.page, delivery.row
+        alert_row = row.partition("/Studio/")[0]
         fields = self.closeout_fields(page, row)
-        previous = fields.get("failed_delivery")
-        if previous is not None and previous["attempt"] == delivery.attempt:
+        if fields.get("studio_alert_attempt") == delivery.attempt:
             return
+        fields["studio_alert_attempt"] = delivery.attempt
+        fields["studio_alert_recipients"] = []
         fields["failed_delivery"] = {"attempt": delivery.attempt, "review_list": str(page.review_list.resolve()),
                                      "row": row, "last_error": failures[-1].error}
-        alerts = pending_delivery_alerts(delivery, failures, tries, recipients)
-        if alerts:
-            fields["pending_alerts"] = [*fields.get("pending_alerts", []), *alerts]
+        alerts = fields.setdefault("pending_alerts", [])
+        for failure in failures:
+            if isinstance(failure.recipient, MissingRecipient):
+                continue
+            key = review_delivery_key(page.review_list, alert_row, delivery.attempt, purpose=f"alert:{failure.recipient}")
+            alert = PendingStudioAlert(failed_recipient=failure.recipient, key=key,
+                message=delivery_failure_alert(failure, tries, page.review_list, alert_row, delivery.message, title))
+            if item_owner is not None:
+                alert["item_owner"] = item_owner
+            alerts.append(alert)
         self.write_closeout(self.closeout_path(page, row), fields)
+
+    def alert_studio_failure(self, delivery: MessageDelivery, failures: list[DeliveryFailure], tries: int, *,
+                             item_owner: staff.StaffId | None = None,
+                             title: str = "Change review delivery needs attention") -> tuple[staff.StaffId, ...]:
+        with self.locked():
+            self.record_studio_failure_locked(delivery, failures, tries, item_owner=item_owner, title=title)
+        self.send_pending_alerts(self.closeout_path(delivery.page, delivery.row))
+        fields = self.closeout_fields(delivery.page, delivery.row)
+        if fields.get("pending_alerts"):
+            return ()
+        return tuple(fields.get("studio_alert_recipients", []))
 
     def send_pending_alerts(self, path: Path) -> None:
         """Keep each alert until the sender confirms its result."""
@@ -1529,21 +1556,41 @@ class DeliveryStatus:
         try:
             saved = cast(StoredDeliveryCloseout, json.loads(path.read_text(encoding="utf-8")))
             for alert in saved.get("pending_alerts", []):
-                try:
-                    outcome = send_to_staff(alert["recipient"], SENDER, alert["message"], key=alert.get("key", ""))
-                    if outcome == "pending":
+                if "failed_recipient" in alert:
+                    try:
+                        recipients = studio_alert_targets(alert)
+                    except (OSError, ValueError) as error:
+                        print(f"review-links delivery alert {path.name}: {error}", file=sys.stderr)
                         retry = True
                         continue
-                except SEND_ERRORS as error:
-                    print(f"review-links delivery alert {path.name}: {error}", file=sys.stderr)
-                    if not isinstance(error, FinalSendFailure):
-                        retry = True
-                        continue
+                    studio = True
+                else:
+                    recipients = (alert["recipient"],)
+                    studio = False
+                reached: list[staff.StaffId] = []
+                for recipient in recipients:
+                    try:
+                        outcome = send_to_staff(recipient, SENDER, alert["message"], key=alert.get("key", ""))
+                    except SEND_ERRORS as error:
+                        print(f"review-links delivery alert {path.name}: {error}", file=sys.stderr)
+                        if studio and isinstance(error, FinalSendFailure):
+                            continue
+                        if not studio and isinstance(error, FinalSendFailure):
+                            reached.append(recipient)
+                        break
+                    if outcome != "pending":
+                        reached.append(recipient)
+                    break
+                if not reached:
+                    retry = True
+                    continue
                 with self.locked():
                     fields = cast(StoredDeliveryCloseout, json.loads(path.read_text(encoding="utf-8")))
                     alerts = fields.get("pending_alerts", [])
                     if alert in alerts:
                         alerts.remove(alert)
+                        if studio:
+                            fields.setdefault("studio_alert_recipients", []).extend(reached)
                         self.write_closeout(path, fields)
         except FileNotFoundError:
             pass
@@ -1711,6 +1758,10 @@ class DeliveryStatus:
 
     def finish_intent_locked(self, delivery: MessageDelivery, slots: DeliverySlots, intent: DeliveryIntent) -> None:
         page, row = delivery.page, delivery.row
+        if isinstance(page, UserQuestionPage) and page.saved.get("studio_delivery_row") == row:
+            self.path(page, row).unlink(missing_ok=True)
+            self.remove_save_receipt(page, row, intent)
+            return
         if intent.kind == "validation":
             updated = replace(slots, validation=ValidationRequested(intent.attempt, intent.feedback))
         else:
@@ -2813,6 +2864,27 @@ def review_alert_showrunners(owner: staff.StaffId) -> tuple[staff.StaffId, ...]:
         return ()
 
 
+def studio_alert_targets(alert: PendingStudioAlert) -> tuple[staff.StaffId, ...]:
+    """Find a team member other than the recipient of the saved words."""
+    recipient = alert["failed_recipient"]
+    members = staff.snapshot()
+    primary = tuple(runner.id for runner in staff_showrunner(recipient, members))
+    owner = alert.get("item_owner")
+    if owner is not None and not primary:
+        primary = tuple(runner.id for runner in staff_showrunner(owner, members))
+    if not primary:
+        primary = review_alert_showrunners(recipient)
+    member = members.by_id(recipient)
+    parent = members.parent_of(member) if member is not None else None
+    upstream = tuple(runner.id for runner in staff_showrunner(parent.id, members)) if parent is not None else ()
+    try:
+        fallback = conf.read("review_links").text("unrouted_alert_recipient")
+        configured = (showrunners.owner_for(fallback, members).id,)
+    except ValueError:
+        configured = ()
+    return tuple(dict.fromkeys(target for target in (*primary, *upstream, *configured) if target != recipient))
+
+
 def is_change_question(delivery: MessageDelivery, slots: DeliverySlots, intent: DeliveryIntent) -> bool:
     return (intent.kind == "question" and not isinstance(slots.question, OpenFeedback)
             and re.fullmatch(r"C\d+", delivery.row) is not None)
@@ -3019,11 +3091,6 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
         if isinstance(error, reply_tokens.UnavailableReplyToken):
             _defer_question_error(status, status.path(page, row), row, error, delivery=delivery)
             return DeliveryUnconfirmed()
-        if studio_review_delivery(page) and error is None:
-            failures.extend(DeliveryFailure(recipient, "The sender has not confirmed delivery.")
-                            for recipient, result in run.results.items() if result is QuestionSendState.UNKNOWN)
-            if failures:
-                return defer_studio_review(status, delivery, intent, failures, run.attempts)
         if QuestionSendState.UNKNOWN in run.results.values():
             status.defer_question(status.path(page, row), delivery)
             if error is not None:
@@ -3081,18 +3148,19 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
 def defer_studio_review(status: DeliveryStatus, delivery: MessageDelivery, intent: DeliveryIntent,
                         failures: list[DeliveryFailure], tries: int) -> DeliveryUnconfirmed:
     page, row = delivery.page, delivery.row
-    assert isinstance(page, UserQuestionPage)
+    retry = True
     try:
-        recipients = review_alert_showrunners(staff.StaffId(page.saved["owner"]))
+        with status.locked():
+            if intent not in status.slots(page, row).intents():
+                retry = False
+                return DeliveryUnconfirmed()
+            status.record_studio_failure_locked(delivery, failures, tries)
     except (OSError, ValueError) as error:
         print(f"review-links delivery alert {row}: {error}", file=sys.stderr)
-        recipients = ()
-    with status.locked():
-        if intent not in status.slots(page, row).intents():
-            return DeliveryUnconfirmed()
-        status.record_studio_failure_locked(delivery, failures, tries, recipients)
-    status.release_owned_claims((delivery.attempt,))
-    status.defer_question(status.path(page, row), delivery)
+    finally:
+        status.release_owned_claims((delivery.attempt,))
+        if retry:
+            status.defer_question(status.path(page, row), delivery)
     status.send_pending_alerts(status.closeout_path(page, row))
     return DeliveryUnconfirmed()
 
@@ -3117,7 +3185,7 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
         if intent is None:
             _ = status.request_attempts.pop(delivery.attempt, None)
             return DeliveryUnconfirmed()
-        question = review_open_question(page, slots, intent)
+        question = NoQuestion() if studio else review_open_question(page, slots, intent)
         if isinstance(question, NoQuestion):
             settings = conf.read("review_links")
             tries = settings.whole("delivery_tries")
@@ -3441,21 +3509,23 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 intents = slots.intents()
                 if not intents:
                     continue
-                page = UserQuestionPage(Path(saved["source"]), Path(saved["production"]),
-                                        (Path(saved["source"]).stem,), "", saved)
-                try:
-                    questions = update_registration.selected_question_records(
-                        [page.review_list], (), None, owner=saved["owner"], strict=True)
-                except OSError as error:
-                    # The strict reader wraps errors from the source file.
-                    if not isinstance(error.__cause__, FileNotFoundError):
-                        raise
-                    questions = []
-                question = next(iter(questions), None)
-                # An answer closes its question; a follow-up or a skip leaves it open.
-                if question is None or question.status != ("closed" if saved.get("kind", "answer") in ("answer", "feedback") else "open"):
-                    status.clear_locked(page, page.rows[0], slots, "verdict")
-                    continue
+                source = Path(saved["source"])
+                row = saved.get("studio_delivery_row", source.stem)
+                page = UserQuestionPage(source, Path(saved["production"]), (row,), "", saved)
+                if not studio_review_delivery(page):
+                    try:
+                        questions = update_registration.selected_question_records(
+                            [page.review_list], (), None, owner=saved["owner"], strict=True)
+                    except OSError as error:
+                        # The strict reader wraps errors from the source file.
+                        if not isinstance(error.__cause__, FileNotFoundError):
+                            raise
+                        questions = []
+                    question = next(iter(questions), None)
+                    expected = "closed" if saved.get("kind", "answer") in ("answer", "feedback") else "open"
+                    if question is None or question.status != expected:
+                        status.clear_locked(page, row, slots, "verdict")
+                        continue
                 if not saved.get("saved", False):
                     if not status.has_review_save_receipt(page, page.rows[0], slots.verdict):
                         status.clear_locked(page, page.rows[0], slots, "verdict")
@@ -3466,8 +3536,14 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 for attempt in claimed:
                     status.request_attempts[attempt] = AttemptOwnership(path, "claimed")
             for intent in intents:
-                deliver(MessageDelivery(page, page.rows[0], intent.recipients, saved["message"], intent.attempt,
-                                        (staff.StaffId(saved["owner"]),)), status)
+                delivery = MessageDelivery(page, row, intent.recipients, saved["message"], intent.attempt,
+                                           (staff.StaffId(saved["owner"]),))
+                try:
+                    deliver(delivery, status)
+                except (OSError, ValueError) as error:
+                    if not studio_review_delivery(page):
+                        raise
+                    _defer_question_error(status, path, row, error, delivery=delivery)
         except (OSError, ValueError, KeyError, TypeError, update_registration.RegistrationFailure,
                 update_registration.InputError) as error:
             print(f"review-links recovery {path.name}: {error}", file=sys.stderr)
