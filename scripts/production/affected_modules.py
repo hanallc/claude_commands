@@ -6,16 +6,21 @@ from __future__ import annotations
 
 import ast
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
-from contextlib import closing
+from collections.abc import Generator, Iterator, Sequence
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
+import fcntl
+from functools import cache
+from hashlib import sha256
 from importlib.metadata import packages_distributions
 from io import BytesIO
+from itertools import chain
 from pathlib import Path, PurePosixPath
 import json
 import os
 import posixpath
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -68,8 +73,9 @@ def git_output(repo: Path, *arguments: str) -> str:
 
 
 # Bump the extractor version whenever source-fact semantics change.
-CACHE_FORMAT_VERSION = 2
+CACHE_FORMAT_VERSION = 3
 EXTRACTOR_VERSION = 11
+FACT_CACHE_NAME = "affected-module-facts.sqlite"
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_.\-/]+")
 
 
@@ -397,21 +403,21 @@ def scan_strings(value: object) -> tuple[str, ...]:
     return tuple(cast(list[str], value))
 
 
-def scan_rows(value: object, length: int) -> list[list[object]]:
+def scan_rows(value: object, length: int) -> Iterator[list[object]]:
     if not isinstance(value, list):
         raise ValueError("invalid scan rows")
-    result: list[list[object]] = []
     for row in cast(list[object], value):
         if not isinstance(row, list) or len(cast(list[object], row)) != length:
             raise ValueError("invalid scan row")
-        result.append(cast(list[object], row))
-    return result
+        yield cast(list[object], row)
 
 
 def decoded_scan_path(value: object) -> ScanPath | UnrootedPath:
     if value is None:
         return UnrootedPath()
-    root, parts = scan_rows([value], 2)[0]
+    if not isinstance(value, list) or len(cast(list[object], value)) != 2:
+        raise ValueError("invalid scan path")
+    root, parts = cast(list[object], value)
     names = scan_strings(root)
     origin: SourceFileRoot | AbsolutePathRoot | ParameterRoot | ImportedRoot
     if names == ("file",):
@@ -427,20 +433,29 @@ def decoded_scan_path(value: object) -> ScanPath | UnrootedPath:
     return ScanPath(origin, scan_strings(parts))
 
 
-def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
+def decoded_scan_scopes(value: object, encoded_paths: object) -> tuple[ScanScope, ...]:
+    if not isinstance(encoded_paths, list):
+        raise ValueError("invalid scan paths")
+    directories = tuple(decoded_scan_path(path) for path in cast(list[object], encoded_paths))
+
+    def directory_at(index: object) -> ScanPath | UnrootedPath:
+        if not isinstance(index, int) or not 0 <= index < len(directories):
+            raise ValueError("invalid scan path index")
+        return directories[index]
+
     result: list[ScanScope] = []
     for name, parameters, bindings, scans, calls in scan_rows(value, 5):
         if not isinstance(name, str):
             raise ValueError("invalid scan scope name")
         paths: list[tuple[str, ScanPath | UnrootedPath]] = []
         for key, path in scan_rows(bindings, 2):
-            directory = decoded_scan_path(path)
+            directory = directory_at(path)
             if not isinstance(key, str):
                 raise ValueError("invalid scan binding")
             paths.append((key, directory))
         patterns: list[ScanPattern] = []
         for path, pattern, recursive in scan_rows(scans, 3):
-            directory = decoded_scan_path(path)
+            directory = directory_at(path)
             if not isinstance(pattern, str) or not isinstance(recursive, bool):
                 raise ValueError("invalid scan pattern")
             patterns.append(ScanPattern(directory, pattern, recursive))
@@ -452,18 +467,28 @@ def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
             for key, path in scan_rows(keywords, 2):
                 if not isinstance(key, str):
                     raise ValueError("invalid scan keyword")
-                named.append((key, decoded_scan_path(path)))
-            invocations.append(ScanCall(target, tuple(decoded_scan_path(path) for path in cast(list[object], arguments)), tuple(named)))
+                named.append((key, directory_at(path)))
+            invocations.append(ScanCall(target, tuple(directory_at(path) for path in cast(list[object], arguments)), tuple(named)))
         result.append(ScanScope(name, scan_strings(parameters), tuple(paths), tuple(patterns), tuple(invocations)))
     return tuple(result)
 
 
-def encoded_scan_scopes(scopes: tuple[ScanScope, ...]) -> list[object]:
-    return [[scope.name, scope.parameters,
-             [[name, encoded_scan_path(path)] for name, path in scope.bindings],
-             [[encoded_scan_path(scan.directory), scan.pattern, scan.recursive] for scan in scope.scans],
-             [[call.target, [encoded_scan_path(path) for path in call.arguments],
-               [[name, encoded_scan_path(path)] for name, path in call.keywords]] for call in scope.calls]] for scope in scopes]
+def encoded_scans(scopes: tuple[ScanScope, ...]) -> tuple[list[object], list[object]]:
+    # Store each scan path once per blob, including repeated call arguments.
+    paths: dict[ScanPath | UnrootedPath, int] = {}
+
+    def path_index(path: ScanPath | UnrootedPath) -> int:
+        return paths.setdefault(path, len(paths))
+
+    rows: list[object] = [
+        [scope.name, scope.parameters,
+         [[name, path_index(path)] for name, path in scope.bindings],
+         [[path_index(scan.directory), scan.pattern, scan.recursive] for scan in scope.scans],
+         [[call.target, [path_index(path) for path in call.arguments],
+           [[name, path_index(path)] for name, path in call.keywords]] for call in scope.calls]]
+        for scope in scopes
+    ]
+    return rows, [encoded_scan_path(path) for path in paths]
 
 
 def decoded_facts(value: object) -> SourceFacts:
@@ -490,48 +515,105 @@ def decoded_facts(value: object) -> SourceFacts:
         decoded.append((level, module, tuple(cast(list[str], names))))
     syntax = InvalidPython(syntax_error) if isinstance(syntax_error, str) else ValidPython()
     return SourceFacts(tuple(decoded), frozenset(cast(list[str], tokens)), frozenset(cast(list[str], config_reads)),
-                       syntax, decoded_scan_scopes(row.get("scan_scopes")))
+                       syntax, decoded_scan_scopes(row.get("scan_scopes"), row.get("scan_paths")))
 
 
-def read_fact_cache(path: Path) -> dict[str, SourceFacts]:
+def read_fact_cache(path: Path) -> dict[str, SourceFacts] | None:
     try:
-        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        if not isinstance(value, dict):
-            return {}
-        row = cast(dict[str, object], value)
-        if row.get("format") != CACHE_FORMAT_VERSION or row.get("extractor") != EXTRACTOR_VERSION:
-            return {}
-        blobs = row.get("blobs")
-        if not isinstance(blobs, dict):
-            return {}
-        result: dict[str, SourceFacts] = {}
-        for blob, facts in cast(dict[str, object], blobs).items():
-            result[blob] = decoded_facts(facts)
-        return result
-    except (OSError, ValueError):
-        return {}
+        uri = path.absolute().as_uri() + "?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0)) as database:
+            versions = cast(list[tuple[int, int]], database.execute("SELECT format, extractor FROM cache_version").fetchall())
+            if versions != [(CACHE_FORMAT_VERSION, EXTRACTOR_VERSION)]:
+                return None
+            status = cast(tuple[str] | None, database.execute("PRAGMA quick_check(1)").fetchone())
+            if status != ("ok",):
+                return None
+            rows = cast(Iterator[tuple[object, object, object]],
+                        database.execute("SELECT blob, payload, digest FROM facts"))
+            result: dict[str, SourceFacts] = {}
+            for blob, payload, digest in rows:
+                if not isinstance(blob, str) or not isinstance(payload, bytes) or not isinstance(digest, bytes):
+                    return None
+                if fact_digest(blob, payload) != digest:
+                    return None
+                result[blob] = decoded_facts(cast(object, json.loads(payload)))
+            return result
+    except (OSError, ValueError, RecursionError, sqlite3.Error):
+        return None
 
 
-def write_fact_cache(path: Path, facts: dict[str, SourceFacts]) -> None:
-    temporary: Path | None = None
+def fact_digest(blob: str, payload: bytes) -> bytes:
+    digest = sha256(blob.encode("utf-8") + b"\0")
+    digest.update(payload)
+    return digest.digest()
+
+
+def fact_row(blob: str, facts: SourceFacts) -> tuple[str, bytes, bytes]:
+    scopes, paths = encoded_scans(facts.scan_scopes)
+    payload = json.dumps({"imports": facts.imports, "tokens": sorted(facts.tokens),
+                          "config_reads": sorted(facts.config_reads),
+                          "scan_scopes": scopes, "scan_paths": paths,
+                          "syntax_error": facts.syntax.message if isinstance(facts.syntax, InvalidPython) else None},
+                         separators=(",", ":")).encode("utf-8")
+    return blob, payload, fact_digest(blob, payload)
+
+
+def write_fact_cache(path: Path, facts: dict[str, SourceFacts], published: set[str] | None,
+                     retained: set[str]) -> None:
+    original = published if published is not None else set[str]()
+    current = facts.keys() & retained
+    added = current - original
+    removed = original - current
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        value = {"format": CACHE_FORMAT_VERSION, "extractor": EXTRACTOR_VERSION,
-                 "blobs": {blob: {"imports": entry.imports, "tokens": sorted(entry.tokens),
-                                  "config_reads": sorted(entry.config_reads),
-                                  "scan_scopes": encoded_scan_scopes(entry.scan_scopes),
-                                  "syntax_error": entry.syntax.message if isinstance(entry.syntax, InvalidPython) else None}
-                           for blob, entry in facts.items()}}
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as output:
-            temporary = Path(output.name)
-            json.dump(value, output)
-        os.replace(temporary, path)
-    except OSError:
-        # The cache is optional; inability to persist it cannot change selection.
+        with tempfile.TemporaryDirectory(prefix=".affected-facts-", dir=path.parent) as directory:
+            temporary = Path(directory) / path.name
+            if published is not None:
+                _ = shutil.copyfile(path, temporary)
+            with closing(sqlite3.connect(temporary, timeout=0)) as database, database:
+                if published is None:
+                    _ = database.execute("CREATE TABLE cache_version (format INTEGER NOT NULL, extractor INTEGER NOT NULL)")
+                    _ = database.execute("INSERT INTO cache_version VALUES (?, ?)", (CACHE_FORMAT_VERSION, EXTRACTOR_VERSION))
+                    _ = database.execute("CREATE TABLE facts (blob TEXT PRIMARY KEY, payload BLOB NOT NULL, "
+                                         + "digest BLOB NOT NULL) WITHOUT ROWID")
+                _ = database.executemany("DELETE FROM facts WHERE blob = ?", ((blob,) for blob in removed))
+                _ = database.executemany("INSERT INTO facts VALUES (?, ?, ?)", (fact_row(blob, facts[blob]) for blob in added))
+            os.replace(temporary, path)
+    except (OSError, sqlite3.Error):
+        # Selection can proceed if the cache cannot be published.
         pass
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+
+
+@dataclass
+class FactCache:
+    facts: dict[str, SourceFacts]
+    writable_path: Path | None = None
+    published: set[str] | None = None
+
+    def retain(self, blobs: set[str]) -> None:
+        if self.writable_path is not None and (self.facts.keys() & blobs) != self.published:
+            write_fact_cache(self.writable_path, self.facts, self.published, blobs)
+
+
+@contextmanager
+def fact_cache(state_dir: Path | None) -> Generator[FactCache]:
+    if state_dir is None:
+        yield FactCache({})
+        return
+
+    path = state_dir / FACT_CACHE_NAME
+    with ExitStack() as stack:
+        writable_path: Path | None = None
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            lock = stack.enter_context(path.with_suffix(".lock").open("ab"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            writable_path = path
+        except OSError:
+            # Readers can use either published snapshot during an atomic replace.
+            pass
+        snapshot = read_fact_cache(path)
+        published = set(snapshot) if writable_path is not None and snapshot is not None else None
+        yield FactCache(snapshot if snapshot is not None else {}, writable_path, published)
 
 
 def module_dependencies(module: str, tracked: set[str]) -> set[str]:
@@ -580,13 +662,78 @@ class RepositoryDirectory:
     path: str
 
 
+type ScanScopeKey = tuple[str, str]
+type ResolvedDirectory = RepositoryDirectory | UnrootedPath | OutsideRepository
+type ImportedBinding = tuple[ScanScopeKey, ScanPath | UnrootedPath]
+type ScanBindings = frozenset[tuple[str, ResolvedDirectory]]
+type ScanRequest = tuple[ScanScopeKey, ScanBindings, bool, frozenset[ScanScopeKey]]
+type ScanTarget = tuple[str, ScanScope, dict[str, ResolvedDirectory], bool]
+
+
+def unresolved_scan_paths(facts: dict[str, SourceFacts]) -> bool:
+    """Check whether pruning could suppress an error from path resolution."""
+    checked: set[ScanPath] = set()
+    for source in facts.values():
+        for scope in source.scan_scopes:
+            paths = chain((path for _, path in scope.bindings), (scan.directory for scan in scope.scans),
+                          (path for call in scope.calls for path in call.arguments),
+                          (path for call in scope.calls for _, path in call.keywords))
+            for value in paths:
+                if isinstance(value, ScanPath) and isinstance(value.root, AbsolutePathRoot) and value not in checked:
+                    try:
+                        _ = Path(value.root.path).joinpath(*value.parts).resolve()
+                    except (OSError, ValueError):
+                        return True
+                    checked.add(value)
+    return False
+
+
+def scan_components(predecessors: dict[ScanScopeKey, set[ScanScopeKey]],
+                    successors: dict[ScanScopeKey, set[ScanScopeKey]],
+                    roots: set[ScanScopeKey]) -> dict[ScanScopeKey, frozenset[ScanScopeKey]]:
+    """Find components of scopes that can reach a scan."""
+    finished: list[ScanScopeKey] = []
+    visited: set[ScanScopeKey] = set()
+    for root in roots:
+        if root in visited:
+            continue
+        visited.add(root)
+        stack = [(root, iter(predecessors[root]))]
+        while stack:
+            key, edges = stack[-1]
+            parent = next(edges, None)
+            if parent is None:
+                finished.append(key)
+                _ = stack.pop()
+            elif parent not in visited:
+                visited.add(parent)
+                stack.append((parent, iter(predecessors[parent])))
+
+    components: dict[ScanScopeKey, frozenset[ScanScopeKey]] = {}
+    for root in reversed(finished):
+        if root not in visited:
+            continue
+        pending = [root]
+        members = {root}
+        visited.remove(root)
+        while pending:
+            key = pending.pop()
+            new = successors[key] & visited
+            visited.difference_update(new)
+            members.update(new)
+            pending.extend(new)
+        component = frozenset(members)
+        components.update((key, component) for key in component)
+    return components
+
+
 def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_modules: dict[str, set[str]]
                           ) -> dict[str, frozenset[RepositoryScan]]:
     """Resolve scoped scans without following imports beyond a called helper."""
     repository_root = repo.resolve()
     scopes = {path: {scope.name: scope for scope in source.scan_scopes} for path, source in facts.items()}
 
-    def symbols(source: str, target: str) -> Iterator[tuple[str, str]]:
+    def find_symbols(source: str, target: str) -> Iterator[ScanScopeKey]:
         level = len(target) - len(target.lstrip("."))
         parts = target.lstrip(".").split(".")
         if level:
@@ -603,73 +750,199 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
                     yield path, ".".join(parts[size:])
                 return
 
-    def directory(source: str, value: ScanPath | UnrootedPath | OutsideRepository,
-                  parameters: dict[str, RepositoryDirectory | UnrootedPath | OutsideRepository], seen: frozenset[tuple[str, str]]
-                  ) -> RepositoryDirectory | UnrootedPath | OutsideRepository:
-        if isinstance(value, (UnrootedPath, OutsideRepository)):
+    @cache
+    def symbols(source: str, target: str) -> tuple[ScanScopeKey, ...]:
+        return tuple(find_symbols(source, target))
+
+    def imported_bindings(source: str, target: str, seen: set[ScanScopeKey]) -> Iterator[ImportedBinding]:
+        for key in symbols(source, target):
+            if key in seen:
+                continue
+            path, name = key
+            parent, _, member = name.rpartition(".")
+            scope = scopes[path].get(parent)
+            if scope is not None and (binding := dict(scope.bindings).get(member)) is not None:
+                yield key, binding
+
+    def directory(source: str, value: ScanPath | UnrootedPath,
+                  parameters: dict[str, ResolvedDirectory]) -> ResolvedDirectory:
+        if isinstance(value, UnrootedPath):
             return value
-        origin: RepositoryDirectory | UnrootedPath | OutsideRepository = UnrootedPath()
-        match value.root:
-            case SourceFileRoot():
-                origin = RepositoryDirectory(source)
-            case AbsolutePathRoot(path):
-                absolute = Path(path).joinpath(*value.parts).resolve()
-                try:
-                    return RepositoryDirectory(absolute.relative_to(repository_root).as_posix())
-                except ValueError:
-                    return OutsideRepository()
-            case ParameterRoot(name):
-                origin = parameters.get(name, OutsideRepository())
-            case ImportedRoot(target):
-                for path, name in symbols(source, target):
-                    key = path, name
-                    if key in seen:
-                        continue
-                    parent, separator, member = name.rpartition(".")
-                    scope = scopes[path].get(parent if separator else "")
-                    if scope is not None:
-                        binding = dict(scope.bindings).get(member)
-                        if binding is not None:
-                            origin = directory(path, binding, {}, seen | {key})
-                            if isinstance(origin, RepositoryDirectory):
-                                break
-        if isinstance(origin, RepositoryDirectory):
-            path = posixpath.normpath(posixpath.join(origin.path, *value.parts))
-            if path != ".." and not path.startswith("../") and not path.startswith("/"):
-                return RepositoryDirectory(path)
-            return OutsideRepository()
-        return origin
+        seen: set[ScanScopeKey] = set()
+        stack: list[tuple[ScanScopeKey, tuple[str, ...], Iterator[ImportedBinding]]] = []
+        while True:
+            parts: tuple[str, ...] | None = None
+            candidates: Iterator[ImportedBinding] | None = None
+            origin: ResolvedDirectory = UnrootedPath()
+            if isinstance(value, ScanPath):
+                parts = value.parts
+                match value.root:
+                    case SourceFileRoot():
+                        origin = RepositoryDirectory(source)
+                    case AbsolutePathRoot(path):
+                        absolute = Path(path).joinpath(*parts).resolve()
+                        try:
+                            origin = RepositoryDirectory(absolute.relative_to(repository_root).as_posix())
+                        except ValueError:
+                            origin = OutsideRepository()
+                        parts = None
+                    case ParameterRoot(name):
+                        origin = parameters.get(name, OutsideRepository())
+                    case ImportedRoot(target):
+                        candidates = imported_bindings(source, target, seen)
 
-    def called_scans(source: str, scope: ScanScope, parameters: dict[str, RepositoryDirectory | UnrootedPath | OutsideRepository],
-                     follow_imports: bool, seen: frozenset[tuple[str, str]]) -> set[RepositoryScan]:
-        key = source, scope.name
-        if key in seen:
-            return set()
-        seen = seen | {key}
-        result: set[RepositoryScan] = set()
+            while True:
+                if candidates is not None and not isinstance(origin, RepositoryDirectory):
+                    candidate = next(candidates, None)
+                    if candidate is not None:
+                        key, value = candidate
+                        assert parts is not None
+                        stack.append((key, parts, candidates))
+                        seen.add(key)
+                        source = key[0]
+                        parameters = {}
+                        break
+                if isinstance(origin, RepositoryDirectory) and parts is not None:
+                    # Check each suffix before the parent uses this directory.
+                    path = posixpath.normpath(posixpath.join(origin.path, *parts))
+                    if path == ".." or path.startswith(("../", "/")):
+                        origin = OutsideRepository()
+                    else:
+                        origin = RepositoryDirectory(path)
+                if not stack:
+                    return origin
+                key, parts, candidates = stack.pop()
+                seen.remove(key)
+
+    def direct_scans(source: str, scope: ScanScope, parameters: dict[str, ResolvedDirectory]) -> Iterator[RepositoryScan]:
         for scan in scope.scans:
-            root = directory(source, scan.directory, parameters, frozenset())
+            root = directory(source, scan.directory, parameters)
             if isinstance(root, UnrootedPath):
-                result.add(RepositoryScan(".", scan.pattern, True))
+                yield RepositoryScan(".", scan.pattern, True)
             elif isinstance(root, RepositoryDirectory):
-                result.add(RepositoryScan(root.path, scan.pattern, scan.recursive))
-        for call in scope.calls:
-            arguments = [directory(source, value, parameters, frozenset()) for value in call.arguments]
-            keywords = {name: directory(source, value, parameters, frozenset()) for name, value in call.keywords}
-            targets = [(source, call.target)] if call.target in scopes[source] else []
-            local = bool(targets)
-            if not local and follow_imports and any(isinstance(value, RepositoryDirectory) for value in (*arguments, *keywords.values())):
-                targets = list(symbols(source, call.target))
-            for path, name in targets:
-                callee = scopes[path].get(name)
-                if callee is not None:
-                    bound = {**dict(zip(callee.parameters, arguments)), **keywords}
-                    result.update(called_scans(path, callee, bound, follow_imports and local, seen))
-        return result
+                yield RepositoryScan(root.path, scan.pattern, scan.recursive)
 
-    return {path: frozenset(scan for scope in source.scan_scopes
-                            for scan in called_scans(path, scope, {}, True, frozenset()))
-            for path, source in facts.items()}
+    def scan_arguments(source: str, call: ScanCall, parameters: dict[str, ResolvedDirectory]
+                       ) -> tuple[list[ResolvedDirectory], dict[str, ResolvedDirectory]]:
+        arguments = [directory(source, value, parameters) for value in call.arguments]
+        keywords = {name: directory(source, value, parameters) for name, value in call.keywords}
+        return arguments, keywords
+
+    if (unresolved_scan_paths(facts)
+            or any(len(source.scan_scopes) != len(scopes[path]) for path, source in facts.items())):
+        def all_scan_targets(source: str, scope: ScanScope, parameters: dict[str, ResolvedDirectory],
+                             follow_imports: bool) -> Iterator[ScanTarget]:
+            for call in scope.calls:
+                arguments, keywords = scan_arguments(source, call, parameters)
+                local = call.target in scopes[source]
+                targets: tuple[ScanScopeKey, ...] = ((source, call.target),) if local else ()
+                if not local and follow_imports and any(isinstance(value, RepositoryDirectory)
+                                                        for value in (*arguments, *keywords.values())):
+                    targets = symbols(source, call.target)
+                for path, name in targets:
+                    callee = scopes[path].get(name)
+                    if callee is not None:
+                        bound = {**dict(zip(callee.parameters, arguments)), **keywords}
+                        yield path, callee, bound, follow_imports and local
+
+        def all_called_scans(source: str, scope: ScanScope) -> set[RepositoryScan]:
+            result: set[RepositoryScan] = set()
+            visited: set[ScanScopeKey] = set()
+            stack: list[tuple[ScanScopeKey, Iterator[ScanTarget]]] = []
+
+            def visit(path: str, scope: ScanScope, parameters: dict[str, ResolvedDirectory], follow_imports: bool) -> None:
+                key = path, scope.name
+                if key not in visited:
+                    visited.add(key)
+                    result.update(direct_scans(path, scope, parameters))
+                    stack.append((key, all_scan_targets(path, scope, parameters, follow_imports)))
+
+            visit(source, scope, {}, True)
+            while stack:
+                key, targets = stack[-1]
+                target = next(targets, None)
+                if target is None:
+                    _ = stack.pop()
+                    visited.remove(key)
+                else:
+                    visit(*target)
+            return result
+
+        return {path: frozenset(scan for scope in source.scan_scopes for scan in all_called_scans(path, scope))
+                for path, source in facts.items()}
+
+    all_scopes = {(path, scope.name): scope for path, names in scopes.items() for scope in names.values()}
+    predecessors: dict[ScanScopeKey, set[ScanScopeKey]] = {key: set() for key in all_scopes}
+    successors: dict[ScanScopeKey, set[ScanScopeKey]] = {key: set() for key in all_scopes}
+    calls: dict[ScanScopeKey, list[tuple[ScanCall, bool, tuple[ScanScopeKey, ...]]]] = {}
+    for key, scope in all_scopes.items():
+        source = key[0]
+        resolved: list[tuple[ScanCall, bool, tuple[ScanScopeKey, ...]]] = []
+        for call in scope.calls:
+            local = call.target in scopes[source]
+            targets = (((source, call.target),) if local else
+                       tuple(target for target in symbols(source, call.target) if target in all_scopes))
+            if targets:
+                resolved.append((call, local, targets))
+                successors[key].update(targets)
+                for target in targets:
+                    predecessors[target].add(key)
+        if resolved:
+            calls[key] = resolved
+    components = scan_components(predecessors, successors, {key for key, scope in all_scopes.items() if scope.scans})
+    calls = {key: [(call, local, reachable) for call, local, targets in invocations
+                   if (reachable := tuple(target for target in targets if target in components))]
+             for key, invocations in calls.items() if key in components}
+
+    def scan_requests(key: ScanScopeKey, parameters: dict[str, ResolvedDirectory],
+                      follow_imports: bool, seen: frozenset[ScanScopeKey]) -> Iterator[ScanRequest]:
+        source = key[0]
+        seen = seen | {key}
+        for call, local, targets in calls.get(key, ()):
+            if not local and not follow_imports:
+                continue
+            arguments, keywords = scan_arguments(source, call, parameters)
+            if not local and not any(isinstance(value, RepositoryDirectory) for value in (*arguments, *keywords.values())):
+                continue
+            for target in targets:
+                if target not in seen:
+                    bound = {**dict(zip(all_scopes[target].parameters, arguments)), **keywords}
+                    # A path can return to a visited scope only within the same component.
+                    yield target, frozenset(bound.items()), follow_imports and local, seen & components[target]
+
+    results: dict[ScanRequest, frozenset[RepositoryScan]] = {}
+
+    def scan_frame(request: ScanRequest) -> tuple[ScanRequest, set[RepositoryScan], Iterator[ScanRequest]]:
+        key, bindings, follow_imports, seen = request
+        parameters = dict(bindings)
+        return (request, set(direct_scans(key[0], all_scopes[key], parameters)),
+                scan_requests(key, parameters, follow_imports, seen))
+
+    def called_scans(request: ScanRequest) -> frozenset[RepositoryScan]:
+        if request in results:
+            return results[request]
+        stack = [scan_frame(request)]
+        while stack:
+            current, scans, children = stack[-1]
+            child = next(children, None)
+            if child is None:
+                results[current] = frozenset(scans)
+                _ = stack.pop()
+                if stack:
+                    stack[-1][1].update(scans)
+            elif child in results:
+                scans.update(results[child])
+            else:
+                stack.append(scan_frame(child))
+        return results[request]
+
+    no_bindings: ScanBindings = frozenset()
+    no_visited: frozenset[ScanScopeKey] = frozenset()
+    graph = {path: frozenset(scan for scope in source.scan_scopes
+                             if (key := (path, scope.name)) in components
+                             for scan in called_scans((key, no_bindings, True, no_visited)))
+             for path, source in facts.items()}
+    return graph
 
 
 def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
@@ -697,8 +970,9 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
                 cached[blob] = facts
         if isinstance(facts.syntax, InvalidPython) and is_test_module(path):
             raise SyntaxError(f"{facts.syntax.message} ({path})")
-        tokens[path] = facts.tokens
-        config_reads[path] = facts.config_reads
+        if worktree:
+            tokens[path] = facts.tokens
+            config_reads[path] = facts.config_reads
         scan_facts[path] = facts
         dependencies: set[str] = set()
         for level, module, names in facts.imports:
@@ -715,7 +989,26 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
 
         dependencies.discard(path)
         graph[path] = dependencies
-    return SourceGraph(graph, tokens, config_reads, repository_scan_graph(repo, scan_facts, bare_modules))
+    scans = repository_scan_graph(repo, scan_facts, bare_modules) if worktree or unresolved_scan_paths(scan_facts) else {}
+    return SourceGraph(graph, tokens, config_reads, scans)
+
+
+MODULE_HISTORY_SQL = (
+    "WITH latest AS (SELECT "
+    + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+    + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+    + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
+    + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+    + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+    + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
+    + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+    + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+    + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
+    + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
+    + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
+    + "CASE WHEN run_id = content_gate THEN content_reads END FROM latest CROSS JOIN gate_modules "
+    + "WHERE run_id IN (config_gate, folder_gate, content_gate) ORDER BY suite, module, attempt"
+)
 
 
 def latest_module_reads() -> dict[str, ModuleReadRecord]:
@@ -724,22 +1017,8 @@ def latest_module_reads() -> dict[str, ModuleReadRecord]:
 
     _ = index.update()
     with closing(index.read_only()) as connection:
-        rows = cast(list[tuple[str, str, str | None, str | None, str | None]], connection.execute(
-            "WITH latest AS (SELECT "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
-            + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
-            + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
-            + "CASE WHEN run_id = content_gate THEN content_reads END FROM gate_modules CROSS JOIN latest "
-            + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate ORDER BY suite, module, attempt"
-        ).fetchall())
+        rows = cast(list[tuple[str, str, str | None, str | None, str | None]],
+                    connection.execute(MODULE_HISTORY_SQL).fetchall())
     recorded: dict[str, ModuleReadRecord] = {}
     for suite, module, config_json, folder_json, content_json in rows:
         path = f"scripts/{suite}/{module}"
@@ -803,13 +1082,6 @@ def scans_changed_paths(scans: RecordedFolderScans, changed: set[str], parents: 
     return False
 
 
-def retain_facts(cache_path: Path | None, cached: dict[str, SourceFacts],
-                 before: set[str], blobs: set[str]) -> None:
-    current = {blob: facts for blob, facts in cached.items() if blob in blobs}
-    if cache_path is not None and current.keys() != before:
-        write_fact_cache(cache_path, current)
-
-
 def source_blobs(paths: set[str], blobs: dict[str, str]) -> set[str]:
     return {blob for path, blob in blobs.items() if path in paths}
 
@@ -818,11 +1090,9 @@ def dependency_graph(repo: Path, *, state_dir: Path | None = None
                      ) -> tuple[dict[str, set[str]], dict[str, frozenset[str]]]:
     dirty = dirty_paths(repo)
     paths, blobs = worktree_files(repo, dirty)
-    cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
-    cached = read_fact_cache(cache_path) if cache_path is not None else {}
-    before = set(cached)
-    result = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
-    retain_facts(cache_path, cached, before, source_blobs(paths | dirty, blobs))
+    with fact_cache(state_dir) as cached:
+        result = graph_for_files(repo, paths, blobs, dirty, cached.facts, worktree=True)
+        cached.retain(source_blobs(paths | dirty, blobs))
     return result.imports, result.tokens
 
 
@@ -972,28 +1242,26 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         base, committed_changes = min(differences, key=lambda item: len(item[1]))
         changed = committed_changes | dirty
         paths, blobs = worktree_files(repo, dirty)
-        cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
-        cached = read_fact_cache(cache_path) if cache_path is not None else {}
-        before = set(cached)
-        graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
-        config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
-        configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
-        recorded = latest_module_reads() if changed else {}
-        has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
-        has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
-        content_changes = {path for path in changed if not path.startswith("config/")}
-        base_blobs = revision_files(repo, base.commit) if has_folder_records else {}
-        scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set()
-        retained = source_blobs(paths | dirty, blobs)
-        python = {path for path in changed if path.endswith(".py")}
-        removed = {path for path in python if not (repo / path).is_file()}
-        old_graph: dict[str, set[str]] = {}
-        if removed:
-            old_blobs = base_blobs if has_folder_records else revision_files(repo, base.commit)
-            old_paths = {path for path in old_blobs if path.endswith(".py")}
-            old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False).imports
-            retained.update(source_blobs(old_paths, old_blobs))
-        retain_facts(cache_path, cached, before, retained)
+        with fact_cache(state_dir) as cached:
+            graph = graph_for_files(repo, paths, blobs, dirty, cached.facts, worktree=True)
+            config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
+            configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
+            recorded = latest_module_reads() if changed else {}
+            has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
+            has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
+            content_changes = {path for path in changed if not path.startswith("config/")}
+            base_blobs = revision_files(repo, base.commit) if has_folder_records else {}
+            scanned_parents = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set[str]()
+            retained = source_blobs(paths | dirty, blobs)
+            python = {path for path in changed if path.endswith(".py")}
+            removed = {path for path in python if not (repo / path).is_file()}
+            old_graph: dict[str, set[str]] = {}
+            if removed:
+                old_blobs = base_blobs if has_folder_records else revision_files(repo, base.commit)
+                old_paths = {path for path in old_blobs if path.endswith(".py")}
+                old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached.facts, worktree=False).imports
+                retained.update(source_blobs(old_paths, old_blobs))
+            cached.retain(retained)
         folder_stems: dict[str, set[str]] = defaultdict(set)
         for source in python:
             if not is_test_module(source):
