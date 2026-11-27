@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
 from scripts.production import change_routing, staff, unrouted_alert
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 from scripts.production.staff_test_support import fixture_member, production_staff_record
 
@@ -108,18 +109,18 @@ assert 'send' not in sys.modules
         def send(recipient: str, sender: str, message: str) -> None:
             del recipient, sender, message
             entered.set()
-            if not release.wait(5):
+            if not release.wait(TEST_HANG_GUARD_SECS):
                 raise RuntimeError("test did not release the alert")
         with patch.object(unrouted_alert, "send_message", side_effect=send) as sent, ThreadPoolExecutor(max_workers=2) as executor:
             first = executor.submit(self.notify)
             try:
-                self.assertTrue(entered.wait(5))
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS), "the first alert did not reach the send")
                 second = executor.submit(self.notify)
-                second.result(5)
+                LauncherHangGuard("second render while the first alert is pending").result(second)
                 self.assertEqual(sent.call_count, 1)
             finally:
                 release.set()
-            first.result(5)
+            LauncherHangGuard("first render after the alert send").result(first)
         self.notify_after_acceptance()
 
     def notify_after_acceptance(self) -> None:
