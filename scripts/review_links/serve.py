@@ -2024,7 +2024,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         respond_first = on_list or main_request is not None
         claim = delivery if isinstance(delivery, change_page.MessageDelivery) else None
-        send = partial(self.deliver_review, server, delivery, report_outcome=True) if claim is not None else None
+        def send_submission() -> change_page.DeliveryOutcome:
+            outcome = self.deliver_review(server, delivery, report_outcome=True)
+            if on_list and saved.kind == new_item_dialog.SubmissionKind.QUESTION:
+                from scripts.review_links import answer_sources
+
+                answer_sources.file_saved_submission(new_item_dialog.read_submission_key(saved.key), created.members)
+                self.publish_review_delivery(server, created.key)
+            return outcome
+
+        send = send_submission if claim is not None else None
         try:
             try:
                 if respond_first:
@@ -2526,6 +2535,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         repair_feedback = action == the_list.ReportVerdict.NOT_FIXED
         state = "saved" if repair_feedback else {"read": "read", "question": "saved", "top": "saved"}.get(action, "sent")
         reply = {"state": state, "delivery_pending": pending, **saved_fields}
+        if action == "read":
+            reply["words_saved"] = True
         if current is not None and isinstance(submission, list_page.ListUnparkSubmission):
             reply["unpark_outcome"] = submission.response_outcome(current).value
         if self.headers.get(send_hold.REPLAY_HEADER) == "1" or repair_feedback:

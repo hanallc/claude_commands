@@ -6241,6 +6241,61 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertIn(b"Use the wide layout.", card.body)
             self.assertNotIn(b"<dialog data-list-review-dialog ", card.body)
 
+    def test_studio_question_returns_as_answered_and_mark_read_sends_words_once(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="layout-owner")
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = replace(case.submission_request(kind, owner.id), page="studio",
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff") as send):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+            sent = cast(dict[str, str], json.loads(created.body))
+            key = sent["key"]
+            working, = the_list.records(keeper.id)
+            self.assertIs(working.state, the_list.ItemState.WORKING)
+            self.assertEqual(working.log[-1].what, the_list.FieldChange("Updated", {"state": working.state}))
+            self.assertNotIn(key, {entry["key"] for entry in review_page.build_snapshot(case.root).entries})
+            origin = review_items.submission_origin(cache.get().records[key])
+            assert isinstance(origin, new_item_dialog.ReviewSubmission)
+            reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], request.request_id)
+            self.assertTrue(change_page.answer_item(reply, "Use the wide layout.", origin.reply_token, case.status))
+            answered, = the_list.records(keeper.id)
+            self.assertEqual(answered.id, working.id)
+            self.assertIs(answered.state, the_list.ItemState.ANSWERED)
+            self.assertIsInstance(answered.unread_since, datetime)
+            self.assertEqual(answered.log[-1].what, the_list.FieldChange("Updated", {"state": answered.state}))
+            self.assertEqual(sum(isinstance(entry.what, the_list.ReturnedAnswer) for entry in answered.log), 1)
+            prefix, token = list_page.signed_item_request(list_page.ListRecord(keeper.id, answered),
+                                                         list_page.form_secret(self.server.root))
+            words = "I will use that layout."
+            body = urlencode({"keeper": keeper.id, "id": answered.id, "request": prefix, "token": token,
+                              "action": "read", "words": words, "until": ""})
+            send.reset_mock()
+            old_request, old_token = list_page.signed_item_request(list_page.ListRecord(keeper.id, working),
+                                                                  list_page.form_secret(self.server.root))
+            stale_body = urlencode({"keeper": keeper.id, "id": working.id, "request": old_request,
+                                    "token": old_token, "action": "read", "words": words, "until": ""})
+            self.assertEqual(self.post(studio_page.PAGE_PATH, stale_body)[0], 400)
+            send.assert_not_called()
+            for _ in range(2):
+                status, response = self.post(studio_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+                self.assertEqual(status, 200, response)
+                result = cast(dict[str, object], json.loads(response))
+                self.assertIs(result["words_saved"], True)
+                self.assertEqual(result["item_state"], "Closed")
+            send.assert_called_once_with(owner.id, change_page.SENDER, words)
+            closed = the_list.load(keeper.id, answered.id)
+            self.assertIs(closed.state, the_list.ItemState.CLOSED)
+            self.assertEqual(the_list.unread_answer_ids(closed), frozenset())
+            self.assertEqual(sum(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Closed"
+                                 for entry in closed.log), 1)
+
     def test_review_card_shows_only_the_unfiled_answer(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="layout-owner")
@@ -6270,6 +6325,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertTrue(change_page.answer_item(reply, words, origin.reply_token, case.status))
         snapshot = review_page.build_snapshot(case.root)
         self.assertIn(key, {row["key"] for row in snapshot.entries})
+        self.assertIn(b'<button type="button" hidden id="filter-type-question"', snapshot.page)
+        self.assertIn(b'<button type="button" hidden id="filter-type-response"', snapshot.page)
         handoff = snapshot.records[key].exchange_handoff
         assert isinstance(handoff, review_items.FiledReviewExchange)
         self.assertEqual(handoff.exchange_ids, {"followup:1"})
