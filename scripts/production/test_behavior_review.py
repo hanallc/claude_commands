@@ -169,7 +169,9 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         temp.chmod(0o555)
         self.addCleanup(temp.chmod, 0o755)
         command = prompt.split("```sh\n", 1)[1].split("\n```", 1)[0]
-        result = self.run_in_repo("env", f"TMPDIR={temp}", f"PYTHONPATH={self.repo}", "zsh", "-fc", command)
+        result = self.run_in_repo(
+            "env", f"TMPDIR={temp}", f"TMPPREFIX={temp / 'zsh'}", f"PYTHONPATH={self.repo}", "zsh", "-fc", command,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [str(checker_root / "scripts/lib/transcripts.py"),
                                                       str(checker_root / "scripts/production/update_registration.py")])
