@@ -2685,6 +2685,18 @@ class RebuildRowTests(unittest.TestCase):
         paths = rebuild_row.ExpectedSystems("a" * 40, (), expected, expected)
         return rebuild_row.row(self.settings(), paths, run)
 
+    def nix_machine(self, command: list[str], commit: str) -> str:
+        expression = command[-1]
+        self.assertEqual(command[:-1], ["nix", "eval", "--json", "--no-write-lock-file", "--expr"])
+        self.assertIn(f"?rev={commit}", expression)
+        targets = {
+            "natedev": 'nixosConfigurations."natedev"',
+            "mac": 'darwinConfigurations."MacBook-Pro"',
+        }
+        matches = [machine for machine, attribute in targets.items() if attribute in expression]
+        self.assertEqual(len(matches), 1)
+        return matches[0]
+
     def test_8ab801c_differs_from_613d31d_then_the_1628_rebuild_clears_the_item(self) -> None:
         self.assertEqual(self.answer("/nix/store/8ab801c-system", "/nix/store/main-system"), "rebuild natedev")
         self.assertEqual(self.answer("/nix/store/main-system", "/nix/store/main-system"), "")
@@ -2732,7 +2744,9 @@ class RebuildRowTests(unittest.TestCase):
             _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
                                   + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
             commands: list[list[str]] = []
-            running = "/nix/store/old"
+            evaluated: list[str] = []
+            expected = {"natedev": "/nix/store/main-linux", "mac": "/nix/store/main-mac"}
+            running = {"natedev": "/nix/store/old-linux", "mac": "/nix/store/old-mac"}
 
             def run(command: list[str], *, timeout: int = 30) -> str:
                 commands.append(command)
@@ -2740,23 +2754,28 @@ class RebuildRowTests(unittest.TestCase):
                 if command[0] == "git":
                     return "a" * 40
                 if command[0] == "nix":
-                    return json.dumps({"natedev": "/nix/store/main", "mac": "/nix/store/main"})
-                return running
+                    machine = self.nix_machine(command, "a" * 40)
+                    evaluated.append(machine)
+                    return json.dumps(expected[machine])
+                self.assertIn(command[0], ("realpath", "ssh"))
+                return running["natedev" if command[0] == "realpath" else "mac"]
 
             rebuild_row.write(config, run)
+            self.assertEqual(evaluated, ["natedev", "mac"])
             line, due, source, details = cache.read_text(encoding="utf-8").splitlines()
             self.assertEqual(line, "rebuild natedev, rebuild mac")
             self.assertGreater(int(due), time.time())
             self.assertEqual(source, str(config))
             self.assertEqual(rebuild_row.read(config).expected, rebuild_row.ExpectedSystems(
-                "a" * 40, ("/test/nixos", "main", "natedev", "MacBook-Pro"), "/nix/store/main", "/nix/store/main"))
+                "a" * 40, ("/test/nixos", "main", "natedev", "MacBook-Pro"), expected["natedev"], expected["mac"]))
             commands.clear()
             rebuild_row.write(config, run)
             self.assertEqual(commands, [])
-            running = "/nix/store/main"
+            running.update(expected)
             _ = cache.write_text("\n0\n" + str(config) + "\n" + details + "\n", encoding="utf-8")
             rebuild_row.write(config, run)
             self.assertEqual(cache.read_text(encoding="utf-8").splitlines()[0], "")
+            self.assertEqual(evaluated, ["natedev", "mac"])
 
     def test_running_system_probe_availability_survives_cache_round_trip(self) -> None:
         for failed in ("natedev", "mac", ""):
@@ -2766,25 +2785,35 @@ class RebuildRowTests(unittest.TestCase):
                 _ = config.write_text("rebuild.repo=/fixture/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
                     + "rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=120\n"
                     + f"rebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
+                commit = "a" * 40
+                expected = {"natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac"}
+                evaluated: list[str] = []
 
                 def run(command: list[str], *, timeout: int = 30) -> str:
-                    _ = timeout
                     if command[0] == "git":
-                        return "a" * 40
+                        return commit
                     if command[0] == "nix":
-                        return json.dumps({"natedev": "/nix/store/expected", "mac": "/nix/store/expected"})
+                        self.assertEqual(timeout, 120)
+                        machine = self.nix_machine(command, commit)
+                        evaluated.append(machine)
+                        return json.dumps(expected[machine])
+                    self.assertIn(command[0], ("realpath", "ssh"))
                     machine = "mac" if command[0] == "ssh" else "natedev"
                     if machine == failed:
                         failure = subprocess.CompletedProcess(command, 255, "", "Fixture probe failure.")
                         with patch.object(subprocess, "run", return_value=failure):
                             return rebuild_row.command_output(command)
-                    return "/nix/store/expected"
+                    return expected[machine]
 
                 rebuild_row.write(config, run)
+                self.assertEqual(evaluated, ["natedev", "mac"])
                 details = cast(dict[str, object], json.loads(cache.read_text().splitlines()[3]))
                 self.assertEqual(details.get("running_system_probes"),
                                  {"natedev": failed != "natedev", "mac": failed != "mac"})
                 answer = rebuild_row.read(config)
+                self.assertEqual(answer.expected, rebuild_row.ExpectedSystems(
+                    commit, ("/fixture/nixos", "main", "natedev", "MacBook-Pro"), expected["natedev"], expected["mac"]))
+                self.assertEqual(answer.failure, rebuild_row.NoEvaluationFailure())
                 self.assertEqual(answer.probes.natedev, failed != "natedev")
                 self.assertEqual(answer.probes.mac, failed != "mac")
                 self.assertEqual(answer.row(), "")
@@ -2902,6 +2931,7 @@ class RebuildRowTests(unittest.TestCase):
             _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
                                   + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=47\nrebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
             commands: list[list[str]] = []
+            evaluated: list[str] = []
             commit = "a" * 40
             running = "/nix/store/old"
 
@@ -2913,26 +2943,27 @@ class RebuildRowTests(unittest.TestCase):
                                                "--end-of-options", "main^{commit}"])
                     return commit + "\0Update the settings"
                 if command[0] == "nix":
-                    self.assertIn(f"?rev={commit}", command[-1])
-                    self.assertIn('nixosConfigurations."natedev"', command[-1])
-                    self.assertIn('darwinConfigurations."MacBook-Pro"', command[-1])
-                    return json.dumps({"natedev": "/nix/store/main", "mac": "/nix/store/main"})
+                    evaluated.append(self.nix_machine(command, commit))
+                    return json.dumps("/nix/store/main")
                 return running
 
             rebuild_row.write(config, run)
-            self.assertEqual([command[0] for command in commands], ["git", "nix", "realpath", "ssh"])
+            self.assertEqual([command[0] for command in commands], ["git", "nix", "nix", "realpath", "ssh"])
+            self.assertEqual(evaluated, ["natedev", "mac"])
             for changed in (False, True):
                 with self.subTest(changed=changed):
                     lines = cache.read_text(encoding="utf-8").splitlines()
                     lines[1] = "0"
                     _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
                     commands.clear()
+                    evaluated.clear()
                     running = "/nix/store/main"
                     if changed:
                         commit = "b" * 40
                     rebuild_row.write(config, run)
                     self.assertEqual([command[0] for command in commands],
-                                     ["git", "nix", "realpath", "ssh"] if changed else ["git", "realpath", "ssh"])
+                                     ["git", "nix", "nix", "realpath", "ssh"] if changed else ["git", "realpath", "ssh"])
+                    self.assertEqual(evaluated, ["natedev", "mac"] if changed else [])
                     self.assertEqual(rebuild_row.read(config).row(), "")
 
     def test_failed_eval_waits_for_a_retry_and_a_new_commit_bypasses_the_wait(self) -> None:
@@ -2944,7 +2975,11 @@ class RebuildRowTests(unittest.TestCase):
                     _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
                         + "rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=59\n"
                         + f"rebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
-                    evaluated = 0
+                    machines = ("natedev", "mac")
+                    failed = (failure.removeprefix("empty "),) if failure.startswith("empty ") else machines
+                    confirmed = tuple(machine for machine in machines if machine not in failed)
+                    evaluated: list[str] = []
+                    evaluation_fails = True
                     commit = "a" * 40
                     now = 1000.0
 
@@ -2952,57 +2987,60 @@ class RebuildRowTests(unittest.TestCase):
                         return now
 
                     def run(command: list[str], *, timeout: int = 30) -> str:
-                        nonlocal evaluated, now
+                        nonlocal now
                         if command[0] == "git":
                             return commit
                         if command[0] != "nix":
                             return "/nix/store/old"
-                        evaluated += 1
+                        machine = self.nix_machine(command, commit)
+                        evaluated.append(machine)
                         self.assertEqual(timeout, 59)
-                        self.assertIn(f"?rev={commit}", command[-1])
-                        paths = {"natedev": "/nix/store/main", "mac": "/nix/store/main"}
-                        if evaluated == 1:
-                            now += 59
-                            if failure.startswith("empty"):
-                                paths[failure.removeprefix("empty ")] = ""
-                            else:
-                                effect = (subprocess.TimeoutExpired(command, timeout) if failure == "timeout"
-                                          else subprocess.CompletedProcess(command, 1, "", "eval failed"))
-                                with patch.object(subprocess, "run", side_effect=[effect]) as process:
-                                    output = rebuild_row.command_output(command, timeout=timeout)
-                                self.assertEqual(process.call_args.kwargs["timeout"], 59)
-                                return output
-                        return json.dumps(paths)
+                        if not evaluation_fails or machine not in failed:
+                            return json.dumps("/nix/store/main")
+                        now += timeout
+                        if failure.startswith("empty "):
+                            return json.dumps("")
+                        effect = (subprocess.TimeoutExpired(command, timeout) if failure == "timeout"
+                                  else subprocess.CompletedProcess(command, 1, "", "eval failed"))
+                        with patch.object(subprocess, "run", side_effect=[effect]) as process:
+                            output = rebuild_row.command_output(command, timeout=timeout)
+                        self.assertEqual(process.call_args.kwargs["timeout"], 59)
+                        return output
 
                     stale = rebuild_row.ExpectedSystems(
                         commit, ("/test/nixos", "main", "natedev", "MacBook-Pro"), "", "")
                     _ = cache.write_text("\n0\n" + str(config) + "\n" + stale.details() + "\n", encoding="utf-8")
                     rebuild_row.write(config, run, clock=clock)
-                    self.assertEqual(evaluated, 1)
+                    self.assertEqual(evaluated, list(machines))
                     answer = rebuild_row.read(config, clock=clock)
                     self.assertIsInstance(answer.expected, rebuild_row.NoExpectedSystems)
-                    self.assertEqual(answer.failure, rebuild_row.EvaluationFailure(commit, stale.source, 1059))
+                    failed_at = 1000 + 59 * len(failed)
+                    self.assertEqual(answer.failure,
+                                     rebuild_row.EvaluationFailure(commit, stale.source, failed_at, confirmed))
                     self.assertEqual(answer.row(), {
                         "empty natedev": "rebuild mac", "empty mac": "rebuild natedev"}.get(failure, ""))
-                    # The cache retains the row, but never stores partial paths for reuse.
+                    # The cache records only the successful paths for this commit.
                     details = cast(dict[str, object], json.loads(cache.read_text().splitlines()[3]))
                     self.assertNotIn("natedev", details)
                     self.assertNotIn("mac", details)
+                    self.assertEqual(tuple(answer.evaluated_system_paths), confirmed)
                     for elapsed in (60, 120, 539):
-                        now = 1059 + elapsed
+                        now = failed_at + elapsed
                         commit = "" if elapsed == 120 else "a" * 40
                         rebuild_row.write(config, run, clock=clock)
                         delayed = rebuild_row.read(config, clock=clock)
-                        self.assertEqual(evaluated, 1)
+                        self.assertEqual(evaluated, list(machines))
                         self.assertEqual(delayed.row(), answer.row())
                         self.assertEqual(delayed.failure, answer.failure)
                     if changed:
                         commit = "b" * 40
-                        now = 1059 + 599
+                        now = failed_at + 599
                     else:
-                        now = 1059 + 600
+                        now = failed_at + 600
+                    evaluation_fails = False
                     rebuild_row.write(config, run, clock=clock)
-                    self.assertEqual(evaluated, 2)
+                    expected_evaluations = [*machines, *(machines if changed else failed)]
+                    self.assertEqual(evaluated, expected_evaluations)
                     success = rebuild_row.read(config, clock=clock)
                     self.assertEqual(success.expected, rebuild_row.ExpectedSystems(
                         commit, stale.source, "/nix/store/main", "/nix/store/main"))
@@ -3011,7 +3049,7 @@ class RebuildRowTests(unittest.TestCase):
                     self.assertEqual(success.row(), "rebuild natedev, rebuild mac")
                     now += 60
                     rebuild_row.write(config, run, clock=clock)
-                    self.assertEqual(evaluated, 2)
+                    self.assertEqual(evaluated, expected_evaluations)
 
     def test_open_needs_show_without_an_evaluation_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

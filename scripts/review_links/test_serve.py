@@ -7046,6 +7046,73 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"available": False, "partial": True, "other_count": 1,
                                            "rebuild_machines": ["mac"], "rebuild_reasons": reasons})
 
+    def test_for_you_route_reports_the_last_observed_mac_system(self) -> None:
+        config = conf.path("statusline")
+        cache = self.root.parent / "rebuild-cache"
+        _ = write_config_fixture(config, f"rebuild.cache={cache}\n")
+        details = {"commit": "a" * 40, "source": ["/etc/nixos", "main", "natedev", "MacBook-Pro"],
+                   "natedev": "/nix/store/current-natedev", "mac": "/nix/store/expected-mac",
+                   "running_system_probes": {"natedev": True, "mac": False}}
+        _ = cache.write_text(f"\n9999999999\n{config}\n{json.dumps(details)}\n", encoding="utf-8")
+        mac = rebuild_row.ComparedChanges("/nix/store/older-mac", "b" * 40, "a" * 40, ())
+        _ = rebuild_row.changes_path(cache).write_text(json.dumps({"mac": asdict(mac)}), encoding="utf-8")
+        with patch.object(subprocess, "run", side_effect=AssertionError("The count route ran a command.")):
+            reply = self.request("/console/for-you.json")
+        self.assertEqual(reply.status, 200)
+        payload = cast(dict[str, object], json.loads(reply.body))
+        self.assertEqual((payload.get("available"), payload.get("count"), payload.get("stale")), (True, 1, True))
+        entries = cast(list[dict[str, object]], payload["entries"])
+        self.assertEqual([entry["key"] for entry in entries], ["rebuild/mac"])
+
+    def test_review_has_the_rebuild_card_named_by_the_stale_for_you_route(self) -> None:
+        case = self.review_fixture()
+        config = conf.path("statusline")
+        cache = case.root.parent / "rebuild-comparison"
+        _ = write_config_fixture(config, f"rebuild.cache={cache}\n")
+        details = {"commit": "a" * 40, "source": ["/etc/nixos", "main", "natedev", "MacBook-Pro"],
+                   "natedev": "/nix/store/current-natedev", "mac": "/nix/store/expected-mac",
+                   "running_system_probes": {"natedev": True, "mac": False}}
+        _ = cache.write_text(f"\n9999999999\n{config}\n{json.dumps(details)}\n", encoding="utf-8")
+        mac = rebuild_row.ComparedChanges("/nix/store/older-mac", "b" * 40, "a" * 40, ())
+        _ = rebuild_row.changes_path(cache).write_text(json.dumps({"mac": asdict(mac)}), encoding="utf-8")
+        with patch.object(subprocess, "run", side_effect=AssertionError("The reader ran a command.")):
+            reply = self.request("/console/for-you.json")
+            snapshot = review_page.build_snapshot(case.root)
+        self.assertEqual(reply.status, 200)
+        payload = cast(dict[str, object], json.loads(reply.body))
+        entries = cast(list[dict[str, str]], payload["entries"])
+        key = entries[0]["key"]
+        self.assertEqual((key, payload["stale"]), ("rebuild/mac", True))
+        self.assertIn(key, snapshot.records)
+        self.assertIn(b"Rebuild mac", snapshot.body(key))
+
+    def test_review_and_notifier_keep_the_same_actions_when_staff_is_unreadable(self) -> None:
+        case = self.review_fixture()
+        config = conf.path("statusline")
+        cache = case.root.parent / "rebuild-comparison"
+        _ = write_config_fixture(config, f"rebuild.cache={cache}\n")
+        details = {"commit": "a" * 40, "source": ["/etc/nixos", "main", "natedev", "MacBook-Pro"],
+                   "natedev": "/nix/store/current-natedev", "mac": "/nix/store/expected-mac",
+                   "running_system_probes": {"natedev": True, "mac": True}}
+        _ = cache.write_text(f"rebuild mac\n9999999999\n{config}\n{json.dumps(details)}\n", encoding="utf-8")
+        action = ActionStore().add(title="Restore access", command="github-warmup", machine="mac",
+                                   cwd="/fixture", requested_by="staff-fixture", reason="Access is required.",
+                                   waits="Release", concerns="console", dedupe_key="restore-access")
+        with (patch.object(staff, "snapshot", side_effect=staff.StaffUnreadable("Fixture staff failure.")),
+              patch.object(subprocess, "run", side_effect=AssertionError("The reader ran a command."))):
+            reply = self.request("/console/for-you.json")
+            snapshot = review_page.build_snapshot(case.root)
+        self.assertEqual(reply.status, 200)
+        payload = cast(dict[str, object], json.loads(reply.body))
+        entries = cast(list[dict[str, str]], payload["entries"])
+        keys = {entry["key"] for entry in entries}
+        self.assertEqual((payload["count"], keys), (2, {action.key, "rebuild/mac"}))
+        self.assertEqual({key for key, item in snapshot.records.items() if item.type == review_items.ReviewType.FOR_YOU},
+                         keys)
+        self.assertIn(b"Rebuild mac", snapshot.body("rebuild/mac"))
+        self.assertIn(b"Restore access", snapshot.body(action.key))
+        self.assertIn("staff: Fixture staff failure.", snapshot.action_notices)
+
     def test_mac_status_line_renders_the_cached_reason_from_the_count_route(self) -> None:
         configuration = conf.path("statusline")
         cache = self.root.parent / "rebuild-cache"

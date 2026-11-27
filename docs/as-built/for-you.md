@@ -88,10 +88,11 @@ The shell accepts that message only from one of its page frames.
 If a read is in progress, the shell reads again when it ends.
 A refresh keeps focused commands and text selections until the user releases them.
 
-Before the first complete read, the badge shows `?` with an unavailable label.
-A transport failure keeps the last complete count and entries and marks them stale.
+Before the first count, the badge shows no number.
+A transport failure keeps the newest complete count and entries and marks them stale.
 The phone badge shows a dotted outline for a stale count in both navigation states.
-An explicit unavailable response clears the previous count, including with HTTP 503.
+A response without a count also keeps the newest complete count, including with HTTP 503.
+A partial count shows only until the next read result.
 At zero, the quiet button shows `For you 0`.
 The panel says `No actions required.`
 

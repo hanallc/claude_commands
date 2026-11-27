@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from scripts.for_you.action import ActionStore
 from scripts.production import staff
 from scripts.rebuild import need
-from scripts.review_links import change_browser, change_page, for_you, review_items, review_page, staff_names
+from scripts.review_links import change_browser, change_page, console, for_you, review_items, review_page, staff_names
 from scripts.statusline import for_you_count, rebuild_row
 
 
@@ -62,6 +62,14 @@ class ForYouTests(unittest.TestCase):
 
     def read(self) -> for_you.ForYouSnapshot:
         return for_you.read(self.config)
+
+    def nix_path(self, command: list[str], natedev: str, mac: str) -> str:
+        expression = command[-1]
+        if "nixosConfigurations." in expression:
+            self.assertNotIn("darwinConfigurations.", expression)
+            return json.dumps(natedev)
+        self.assertIn("darwinConfigurations.", expression)
+        return json.dumps(mac)
 
     def add_action(self, dedupe: str = "access") -> str:
         return self.store.add(title="Restore access", command="github-warmup", machine="mac", cwd="/fixture/repo",
@@ -226,13 +234,45 @@ class ForYouTests(unittest.TestCase):
     def test_damaged_open_record_keeps_valid_requests_and_marks_the_count(self) -> None:
         _ = self.add_action()
         need.add_need("mac", "a" * 40, "Apply settings.", "staff-a")
+        self.assertEqual(self.read().open_count, for_you.KnownOpenCount(2))
         _ = (need.needs_folder() / "bad.json").write_text("{")
         snapshot = self.read()
         issue, = snapshot.unavailable
         self.assertIn("Rebuild request bad.json", issue.reason)
-        self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount(2))
+        self.assertEqual(snapshot.open_count, for_you.PartialOpenCount(2, (for_you.ForYouCountPart.REBUILD_REQUESTS,)))
         self.assertEqual(snapshot.status_line_actions(), for_you.StatusLineActions(("mac",), 1, partial=True))
         self.assertEqual(next(row for row in snapshot.rows if row.kind == "rebuild").requests[0].reason, "Apply settings.")
+
+    def test_damaged_request_counts_the_readable_machine_in_the_same_payload(self) -> None:
+        self.assertEqual(console.for_you_payload(), {"available": True, "count": 0, "entries": []})
+        folder = need.needs_folder()
+        folder.mkdir()
+        _ = (folder / "bad.json").write_text("{")
+        commit = "a" * 40
+        machines: tuple[need.Machine, ...] = ("mac", "natedev")
+        for machine in machines:
+            with self.subTest(machine=machine):
+                need.add_need(machine, commit, "Apply settings.", "staff-a")
+                payload = console.for_you_payload()
+                self.assertIs(payload["available"], True)
+                assert payload["available"] is True
+                self.assertEqual((payload["count"], payload.get("stale")), (1, True))
+                self.assertEqual([row["key"] for row in payload["entries"]], [f"rebuild/{machine}"])
+                (folder / f"{machine}-{commit}.json").unlink()
+        payload = console.for_you_payload()
+        self.assertIs(payload["available"], True)
+        assert payload["available"] is True
+        self.assertEqual((payload["count"], payload.get("stale"), payload["entries"]), (0, True, []))
+
+    def test_unreadable_mac_request_returns_a_partial_zero(self) -> None:
+        commit = "a" * 40
+        need.add_need("mac", commit, "Apply settings.", "staff-a")
+        self.assertEqual(console.for_you_payload().get("count"), 1)
+        _ = (need.needs_folder() / f"mac-{commit}.json").write_text("{")
+        self.assertEqual(console.for_you_payload(), {
+            "available": True, "count": 0, "entries": [], "stale": True, "partial": True,
+            "kept_parts": (for_you.ForYouCountPart.REBUILD_REQUESTS,),
+        })
 
     def test_mac_status_line_reads_the_partial_count(self) -> None:
         fields = {"available": False, "partial": True, "other_count": 1, "rebuild_machines": ["mac"]}
@@ -256,7 +296,7 @@ class ForYouTests(unittest.TestCase):
                 with patch("subprocess.run", return_value=result):
                     return rebuild_row.command_output(command)
             if command[0] == "nix":
-                return json.dumps({"natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac"})
+                return self.nix_path(command, "/nix/store/expected-linux", "/nix/store/expected-mac")
             if command[0] == "sh":
                 revision = switched + "-dirty" if dirty else switched
                 return self.switch_probe(running, 1, revision)
@@ -315,7 +355,7 @@ class ForYouTests(unittest.TestCase):
                 case "git", _:
                     self.fail(f"Unexpected Git command: {command}")
                 case "nix", _:
-                    return json.dumps({"natedev": local, "mac": "/nix/store/expected-mac"})
+                    return self.nix_path(command, local, "/nix/store/expected-mac")
                 case "realpath", _:
                     return local
                 case "sh", _:
@@ -355,7 +395,7 @@ class ForYouTests(unittest.TestCase):
                 self.assertEqual(command[3], "show")
                 return commit
             if command[0] == "nix":
-                return json.dumps({"natedev": running, "mac": mac})
+                return self.nix_path(command, running, mac)
             if command[0] == "realpath":
                 return running
             if command[0] == "sh":
@@ -383,7 +423,7 @@ class ForYouTests(unittest.TestCase):
         answer = rebuild_row.read(self.config, clock=lambda: 10_000_000_000)
         snapshot = for_you.read(self.config, rebuild=answer)
         row, = snapshot.rows
-        self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount(1))
+        self.assertEqual(snapshot.open_count, for_you.StaleOpenCount(1, (for_you.ForYouCountPart.REBUILD_COMPARISON,)))
         self.assertEqual(row.running_revision, "")
 
     def test_dirty_running_revision_keeps_its_dirty_suffix(self) -> None:
@@ -443,33 +483,34 @@ class ForYouTests(unittest.TestCase):
         self.write_comparison(due="0")
         snapshot = self.read()
         self.assertEqual(snapshot.rows[0].status, "open")
-        self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount(1))
+        self.assertEqual(snapshot.open_count, for_you.StaleOpenCount(1, (for_you.ForYouCountPart.REBUILD_COMPARISON,)))
         self.assertEqual(snapshot.unavailable[0].source, "rebuild comparison")
 
     def test_stale_positive_comparison_preserves_open_signal(self) -> None:
         self.write_comparison("rebuild mac", "0")
         snapshot = self.read()
         self.assertEqual(snapshot.rows[0].status, "open")
-        self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount(1))
+        self.assertEqual(snapshot.open_count, for_you.StaleOpenCount(1, (for_you.ForYouCountPart.REBUILD_COMPARISON,)))
 
-    def test_missing_or_damaged_comparison_is_unavailable(self) -> None:
+    def test_missing_or_damaged_comparison_keeps_open_needs_and_marks_the_count(self) -> None:
         need.add_need("natedev", "c" * 40, "Show the build result.", "console", "staff-a")
         self.cache.unlink()
         snapshot = self.read()
         self.assertEqual(snapshot.rows[0].status, "open")
         self.assertTrue(snapshot.unavailable)
         _ = self.cache.write_text("damaged")
-        self.assertIsInstance(self.read().open_count, for_you.UnavailableOpenCount)
+        self.assertEqual(self.read().open_count, for_you.UnavailableOpenCount())
 
     def test_failed_needs_read_preserves_actions_and_prevents_false_completion(self) -> None:
         key = self.add_action()
         _ = self.complete_need()
+        self.assertEqual(self.read().open_count, for_you.KnownOpenCount(1))
         with patch.object(need, "read_needs", side_effect=OSError("Fixture source failure.")):
             snapshot = self.read()
         rows = {row.key: row for row in snapshot.rows}
         self.assertEqual(rows[key].status, "open")
         self.assertNotIn("rebuild/natedev", rows)
-        self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount(1))
+        self.assertEqual(snapshot.open_count, for_you.StaleOpenCount(1, (for_you.ForYouCountPart.REBUILD_REQUESTS,)))
         self.assertIn("rebuild needs", [source.source for source in snapshot.unavailable])
 
     def test_damaged_history_does_not_hide_open_requests(self) -> None:
@@ -482,7 +523,7 @@ class ForYouTests(unittest.TestCase):
         snapshot = self.read()
         self.assertEqual({source.source for source in snapshot.unavailable}, {"actions"})
         self.assertEqual([row.key for row in snapshot.rows], ["rebuild/mac"])
-        self.assertIsInstance(snapshot.open_count, for_you.UnavailableOpenCount)
+        self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount())
 
     def test_failed_staff_read_preserves_raw_requester_and_marker(self) -> None:
         _ = self.add_action()
@@ -497,7 +538,7 @@ class ForYouTests(unittest.TestCase):
         snapshot = self.read()
         self.assertEqual(snapshot.rows[0].status, "open")
         self.assertEqual(snapshot.rows[0].cwd, "")
-        self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount(1))
+        self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount())
 
     def test_open_count_counts_each_machine_and_each_action_once(self) -> None:
         _ = self.add_action()
@@ -525,7 +566,7 @@ class ForYouTests(unittest.TestCase):
             if command[0] == "git":
                 return "a" * 40
             if command[0] == "nix":
-                return json.dumps({"natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac"})
+                return self.nix_path(command, "/nix/store/expected-linux", "/nix/store/expected-mac")
             return "/nix/store/expected-linux" if command[0] == "realpath" else ""
 
         rebuild_row.write(self.config, run, clock=lambda: 9_999_999_900)
@@ -533,8 +574,280 @@ class ForYouTests(unittest.TestCase):
         rows = {row.key: row for row in snapshot.rows}
         self.assertEqual(rows["rebuild/mac"].status, "open")
         self.assertNotIn("rebuild/natedev", rows)
-        self.assertIsInstance(snapshot.open_count, for_you.UnavailableOpenCount)
+        self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount())
         self.assertTrue(any("mac" in source.reason for source in snapshot.unavailable))
+
+    def test_notifier_counts_last_observed_system_only_for_a_failed_probe(self) -> None:
+        _ = self.add_action()
+        answer = rebuild_row.read(self.config)
+        without_mac = replace(answer, probes=rebuild_row.RunningSystemProbes(natedev=True))
+        cache = rebuild_row.changes_path(self.cache)
+        for changes in ("{}", '{"mac": []}'):
+            with self.subTest(changes=changes):
+                _ = cache.write_text(changes, encoding="utf-8")
+                with patch.object(rebuild_row, "read", return_value=without_mac):
+                    snapshot = self.read()
+                    payload = console.for_you_payload()
+                issue, = snapshot.unavailable
+                self.assertFalse(issue.count_retained)
+                self.assertEqual(payload, {"available": False})
+        for running_path, compared, expected in (
+            ("/nix/store/expected-mac", without_mac, (1, True)),
+            ("/nix/store/older-mac", without_mac, (2, True)),
+            ("/nix/store/older-mac", answer, (1, False)),
+        ):
+            with self.subTest(running_path=running_path, probes=compared.probes):
+                change = rebuild_row.ComparedChanges(running_path, "b" * 40, "a" * 40, ())
+                _ = cache.write_text(json.dumps({"mac": asdict(change)}), encoding="utf-8")
+                with patch.object(rebuild_row, "read", return_value=compared):
+                    payload = console.for_you_payload()
+                self.assertIs(payload["available"], True)
+                assert payload["available"] is True
+                self.assertEqual((payload["count"], payload.get("stale", False)), expected)
+
+    def test_failed_probes_keep_the_confirmed_rebuild_until_a_good_probe_clears_it(self) -> None:
+        previous = rebuild_row.ComparedChanges("/nix/store/expected-mac", "b" * 40, "a" * 40, ())
+        _ = rebuild_row.changes_path(self.cache).write_text(json.dumps({"mac": asdict(previous)}), encoding="utf-8")
+
+        def refresh(at: int, mac_path: str) -> None:
+            def run(command: list[str], *, timeout: int = 30) -> str:
+                _ = timeout
+                if command[0] == "git":
+                    return "a" * 40
+                if command[0] == "realpath":
+                    return "/nix/store/expected-linux"
+                return mac_path if command[0] == "ssh" and command[-1] == "realpath /run/current-system" else ""
+
+            rebuild_row.write(self.config, run, clock=lambda: at)
+            rebuild_row.write_changes(self.config, run)
+
+        refresh(10_000_000_000, "/nix/store/rollback-mac")
+        self.assertEqual(console.for_you_payload().get("count"), 1)
+        refresh(10_000_000_100, "")
+        payload = console.for_you_payload()
+        self.assertEqual((payload.get("count"), payload.get("stale")), (1, True))
+        self.assertEqual([row.key for row in self.read().rows], ["rebuild/mac"])
+        refresh(10_000_000_200, "/nix/store/expected-mac")
+        self.assertEqual(console.for_you_payload(), {"available": True, "count": 0, "entries": []})
+        earlier_rollback = replace(previous, running_path="/nix/store/rollback-mac")
+        _ = rebuild_row.changes_path(self.cache).write_text(
+            json.dumps({"mac": asdict(earlier_rollback)}), encoding="utf-8")
+        refresh(10_000_000_300, "")
+        self.assertEqual(console.for_you_payload(), {"available": True, "count": 0, "entries": [], "stale": True,
+                                                     "kept_parts": (for_you.ForYouCountPart.REBUILD_COMPARISON,)})
+
+    def test_rebuild_comparison_survives_reader_restart(self) -> None:
+        previous = rebuild_row.ComparedChanges("/nix/store/expected-mac", "b" * 40, "a" * 40, ())
+        _ = rebuild_row.changes_path(self.cache).write_text(json.dumps({"mac": asdict(previous)}), encoding="utf-8")
+        at = 10_000_000_000
+        mac_path = "/nix/store/rollback-mac"
+        commit = "a" * 40
+
+        def run(command: list[str], *, timeout: int = 30) -> str:
+            _ = timeout
+            if command[0] == "git":
+                return commit
+            if command[0] == "realpath":
+                return "/nix/store/expected-linux"
+            if command[0] == "nix":
+                return ""
+            self.assertEqual(command[0], "ssh")
+            return mac_path
+
+        rebuild_row.write(self.config, run, clock=lambda: at)
+        self.assertEqual(console.for_you_payload().get("count"), 1)
+        mac_path = ""
+        rebuild_row.write(self.config, run, clock=lambda: at + 100)
+        before = console.for_you_payload()
+        self.assertEqual((before.get("count"), before.get("stale")), (1, True))
+        for refreshed_at, commit in ((at + 100, "a" * 40), (at + 200, "b" * 40)):
+            with self.subTest(refreshed_at=refreshed_at):
+                rebuild_row.write(self.config, run, clock=lambda: refreshed_at)
+                memory: dict[Path, dict[str, for_you.ConfirmedSystemComparison]] = {}
+                with patch.object(for_you, "_confirmed_rebuilds", memory):
+                    self.assertEqual(console.for_you_payload(), before)
+                answer = rebuild_row.read(self.config)
+                self.assertFalse(answer.probes.mac)
+                self.assertNotIn("mac", answer.running_paths)
+                self.assertEqual(answer.confirmed_systems["mac"], rebuild_row.ConfirmedRunningSystem(
+                    "/nix/store/rollback-mac", at))
+                self.assertEqual(answer.evaluated_system_paths["mac"].path, "/nix/store/expected-mac")
+                self.assertEqual(answer.confirmed_systems["natedev"].observed_at, refreshed_at)
+
+    def test_natedev_comparison_updates_during_a_failed_mac_evaluation(self) -> None:
+        self.cache.unlink()
+        at = 10_000_000_000
+        commit = "a" * 40
+        expected_natedev = running_natedev = "/nix/store/expected-linux"
+        expected_mac = running_mac = "/nix/store/expected-mac"
+        evaluations = 0
+
+        def run(command: list[str], *, timeout: int = 30) -> str:
+            nonlocal evaluations
+            _ = timeout
+            match command[0]:
+                case "git":
+                    return commit
+                case "nix":
+                    evaluations += 1
+                    return self.nix_path(command, expected_natedev, expected_mac)
+                case "realpath":
+                    return running_natedev
+                case _:
+                    self.assertEqual(command[0], "ssh")
+                    return running_mac
+
+        rebuild_row.write(self.config, run, clock=lambda: at)
+        self.assertEqual(console.for_you_payload().get("count"), 0)
+        commit = "b" * 40
+        expected_natedev = "/nix/store/next-linux"
+        expected_mac = running_mac = ""
+        for elapsed, count in ((100, 1), (200, 0)):
+            with self.subTest(elapsed=elapsed):
+                rebuild_row.write(self.config, run, clock=lambda: at + elapsed)
+                payload = console.for_you_payload()
+                self.assertIs(payload["available"], True)
+                assert payload["available"] is True
+                self.assertEqual((payload["count"], payload.get("stale")), (count, True))
+                self.assertEqual([row["key"] for row in payload["entries"]], ["rebuild/natedev"] if count else [])
+                memory: dict[Path, dict[str, for_you.ConfirmedSystemComparison]] = {}
+                with patch.object(for_you, "_confirmed_rebuilds", memory):
+                    self.assertEqual(console.for_you_payload(), payload)
+                answer = rebuild_row.read(self.config)
+                self.assertEqual(answer.evaluated_system_paths, {
+                    "natedev": rebuild_row.EvaluatedSystemPath(expected_natedev, at + 100),
+                    "mac": rebuild_row.EvaluatedSystemPath("/nix/store/expected-mac", at),
+                })
+                self.assertEqual(answer.confirmed_systems, {
+                    "natedev": rebuild_row.ConfirmedRunningSystem(running_natedev, at + elapsed),
+                    "mac": rebuild_row.ConfirmedRunningSystem("/nix/store/expected-mac", at),
+                })
+            running_natedev = expected_natedev
+        self.assertEqual(evaluations, 4)
+
+    def test_mac_nix_abort_does_not_prevent_a_natedev_evaluation(self) -> None:
+        self.cache.unlink()
+        at = 10_000_000_000
+        commit = "a" * 40
+        running_natedev = expected_natedev = "/nix/store/expected-linux"
+        mac = "/nix/store/expected-mac"
+        mac_aborts = False
+        evaluations: list[str] = []
+
+        def run(command: list[str], *, timeout: int = 30) -> str:
+            match command[0]:
+                case "git":
+                    return commit
+                case "realpath":
+                    return running_natedev
+                case "ssh":
+                    return mac
+                case "nix":
+                    self.assertEqual(timeout, 120)
+                    expression = command[-1]
+                    self.assertIn(f"?rev={commit}", expression)
+                    local = "nixosConfigurations." in expression
+                    remote = "darwinConfigurations." in expression
+                    if remote and mac_aborts:
+                        result = subprocess.CompletedProcess(command, 1, "", "error: evaluation aborted")
+                        with patch.object(subprocess, "run", return_value=result):
+                            output = rebuild_row.command_output(command, timeout=timeout)
+                    elif local and remote:
+                        output = json.dumps({"natedev": expected_natedev, "mac": mac})
+                    else:
+                        output = json.dumps(expected_natedev if local else mac)
+                    evaluations.append("both" if local and remote else "natedev" if local else "mac")
+                    return output
+                case _:
+                    self.fail(f"Unexpected command: {command}")
+
+        rebuild_row.write(self.config, run, clock=lambda: at)
+        self.assertEqual(console.for_you_payload().get("count"), 0)
+        evaluations.clear()
+        commit = "b" * 40
+        expected_natedev = "/nix/store/next-linux"
+        mac_aborts = True
+        rebuild_row.write(self.config, run, clock=lambda: at + 100)
+        self.assertEqual(console.for_you_payload().get("count"), 1)
+        self.assertEqual(evaluations, ["natedev", "mac"])
+        paths = rebuild_row.read(self.config).evaluated_system_paths
+        self.assertEqual(paths["natedev"], rebuild_row.EvaluatedSystemPath(expected_natedev, at + 100))
+        self.assertEqual(paths["mac"], rebuild_row.EvaluatedSystemPath(mac, at))
+
+        running_natedev = expected_natedev
+        rebuild_row.write(self.config, run, clock=lambda: at + 200)
+        self.assertEqual(console.for_you_payload().get("count"), 0)
+        self.assertEqual(evaluations, ["natedev", "mac"])
+
+        mac_aborts = False
+        rebuild_row.write(self.config, run, clock=lambda: at + 700)
+        self.assertEqual(evaluations, ["natedev", "mac", "mac"])
+        self.assertEqual(rebuild_row.read(self.config).evaluated_system_paths["natedev"], paths["natedev"])
+        self.assertEqual(console.for_you_payload(), {"available": True, "count": 0, "entries": []})
+
+    def test_notifier_keeps_count_when_staff_is_unreadable_or_the_comparison_expires(self) -> None:
+        _ = self.add_action()
+        self.write_comparison("rebuild mac")
+        self.assertEqual(console.for_you_payload().get("count"), 2)
+        with patch.object(staff, "snapshot", side_effect=staff.StaffUnreadable("Fixture staff failure.")):
+            self.assertEqual(console.for_you_payload().get("count"), 2)
+        self.write_comparison("rebuild mac", "0")
+        payload = console.for_you_payload()
+        self.assertEqual((payload.get("count"), payload.get("stale")), (2, True))
+
+    def test_expired_comparison_has_a_stale_count_type(self) -> None:
+        self.write_comparison(due="0")
+        count = self.read().open_count
+        kept = (for_you.ForYouCountPart.REBUILD_COMPARISON,)
+        self.assertEqual(count, for_you.StaleOpenCount(0, kept))
+        payload = console.for_you_payload()
+        self.assertEqual(payload, {"available": True, "count": 0, "entries": [], "stale": True, "kept_parts": kept})
+
+    def test_failed_probe_compares_the_retained_path_with_the_new_expected_path(self) -> None:
+        self.write_comparison(running_paths={"mac": "/nix/store/expected-mac"})
+        original = rebuild_row.read(self.config)
+        self.assertEqual(console.for_you_payload().get("count"), 0)
+        expected = original.expected
+        assert isinstance(expected, rebuild_row.ExpectedSystems)
+        changed = replace(original, expected=replace(expected, mac="/nix/store/new-mac"),
+                          probes=rebuild_row.RunningSystemProbes(natedev=True), running_paths={})
+        old = rebuild_row.ComparedChanges(expected.mac, "b" * 40, "a" * 40, ())
+        _ = rebuild_row.changes_path(self.cache).write_text(json.dumps({"mac": asdict(old)}), encoding="utf-8")
+        with patch.object(rebuild_row, "read", return_value=changed):
+            payload = console.for_you_payload()
+        self.assertEqual((payload.get("count"), payload.get("stale")), (1, True))
+        _ = self.cache.write_text("damaged", encoding="utf-8")
+        payload = console.for_you_payload()
+        self.assertEqual((payload.get("count"), payload.get("stale")), (1, True))
+
+    def test_failed_action_read_keeps_its_part_of_the_count(self) -> None:
+        _ = self.add_action()
+        _ = self.add_action("release")
+        self.write_comparison("rebuild mac", running_paths={"mac": "/nix/store/older-mac"})
+        self.assertEqual(console.for_you_payload().get("count"), 3)
+        with patch.object(ActionStore, "list", side_effect=OSError("The action store is unreadable.")):
+            payload = console.for_you_payload()
+            self.assertEqual((payload.get("count"), payload.get("stale")), (3, True))
+            self.assertEqual(payload.get("kept_parts"), (for_you.ForYouCountPart.ACTIONS,))
+            self.assertEqual(self.read().open_count, for_you.StaleOpenCount(3, (for_you.ForYouCountPart.ACTIONS,)))
+            self.write_comparison()
+            self.assertEqual(console.for_you_payload().get("count"), 2)
+        self.assertEqual(console.for_you_payload().get("count"), 2)
+
+    def test_kept_rebuild_requests_and_current_comparison_count_each_machine_once(self) -> None:
+        _ = self.add_action()
+        need.add_need("mac", "a" * 40, "Apply settings.", "staff-a")
+        self.assertEqual(self.read().open_count, for_you.KnownOpenCount(2))
+        with patch.object(need, "read_needs", side_effect=OSError("The requests are unreadable.")):
+            self.write_comparison("rebuild mac, rebuild natedev")
+            snapshot = self.read()
+            self.assertEqual(snapshot.open_count,
+                             for_you.StaleOpenCount(3, (for_you.ForYouCountPart.REBUILD_REQUESTS,)))
+            mac = next(row for row in snapshot.rows if row.key == "rebuild/mac")
+            self.assertEqual([request.reason for request in mac.requests], ["Apply settings."])
+            self.write_comparison("rebuild mac, rebuild natedev", due="0")
+            self.assertEqual(self.read().open_count, for_you.StaleOpenCount(
+                3, (for_you.ForYouCountPart.REBUILD_REQUESTS, for_you.ForYouCountPart.REBUILD_COMPARISON)))
 
     def test_rebuild_cwd_uses_the_selected_machine_config(self) -> None:
         self.write_comparison("rebuild mac, rebuild natedev")
@@ -561,7 +874,7 @@ class ForYouTests(unittest.TestCase):
         self.assertIn("Alice: Not recorded", waits)
         self.assertIn("staff-missing: Not recorded", waits)
 
-    def test_legacy_comparison_without_probe_fields_is_unavailable(self) -> None:
+    def test_legacy_comparison_without_probe_fields_cannot_confirm_zero(self) -> None:
         _ = self.complete_need("mac")
         for machines in ("", "rebuild mac"):
             with self.subTest(machines=machines):
@@ -573,7 +886,7 @@ class ForYouTests(unittest.TestCase):
                 _ = self.cache.write_text("\n".join(lines) + "\n")
                 snapshot = self.read()
                 self.assertEqual([row.status for row in snapshot.rows], ["open"] if machines else [])
-                self.assertIsInstance(snapshot.open_count, for_you.UnavailableOpenCount)
+                self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount())
 
 
 if __name__ == "__main__":

@@ -104,6 +104,9 @@ class ExpectedSystems:
     natedev: str
     mac: str
 
+    def path_for(self, machine: str) -> str:
+        return self.mac if machine == "mac" else self.natedev
+
     def details(self) -> str:
         return json.dumps({"commit": self.commit, "source": self.source,
                            "natedev": self.natedev, "mac": self.mac})
@@ -116,41 +119,16 @@ class NoEvaluationFailure:
 
 @dataclass(frozen=True)
 class EvaluationFailure:
-    """The commit, source, and completion time of a failed evaluation."""
+    """The failed evaluation and the machines that succeeded for the same source."""
 
     commit: str
     source: tuple[str, ...]
     failed_at: float
+    evaluated_machines: tuple[str, ...] = ()
 
     def details(self) -> str:
-        return json.dumps({"commit": self.commit, "source": self.source, "failed_at": self.failed_at})
-
-
-def expected_systems(settings: RebuildSettings, previous: ExpectedSystems | NoExpectedSystems,
-                     run: CommandRunner, commit: str) -> ExpectedSystems | NoExpectedSystems:
-    """Reuse a complete evaluation for the resolved commit or evaluate it."""
-    source = (str(settings.repo), settings.ref, settings.natedev, settings.mac)
-    if (isinstance(previous, ExpectedSystems) and previous.commit == commit and previous.source == source
-            and system_path(previous.natedev) and system_path(previous.mac)):
-        return previous
-    flake = f"git+file://{quote(str(settings.repo))}?rev={commit}"
-    expression = (
-        f"let flake = builtins.getFlake {json.dumps(flake)}; "
-        + "pathOrEmpty = value: let result = builtins.tryEval value; "
-        + "in if result.success then result.value else \"\"; in { "
-        + f"natedev = pathOrEmpty flake.nixosConfigurations.{json.dumps(settings.natedev)}.config.system.build.toplevel.outPath; "
-        + f"mac = pathOrEmpty flake.darwinConfigurations.{json.dumps(settings.mac)}.system.outPath; }}"
-    )
-    output = run(["nix", "eval", "--json", "--no-write-lock-file", "--expr", expression], timeout=settings.eval_timeout)
-    try:
-        paths = cast(dict[str, object], json.loads(output))
-        local, mac = paths["natedev"], paths["mac"]
-        return ExpectedSystems(commit, source,
-                               local if isinstance(local, str) and system_path(local) else "",
-                               mac if isinstance(mac, str) and system_path(mac) else "")
-    except (ValueError, KeyError, TypeError):
-        pass
-    return NoExpectedSystems()
+        return json.dumps({"commit": self.commit, "source": self.source, "failed_at": self.failed_at,
+                           "evaluated_machines": self.evaluated_machines})
 
 
 @dataclass(frozen=True)
@@ -172,33 +150,100 @@ class RunningSystemProbes:
 
 
 @dataclass(frozen=True)
+class ExpectedEvaluationTimeNotRecorded:
+    """An older cache supplied an expected path without its evaluation time."""
+
+
+def _timestamp(value: object) -> float | None:
+    if type(value) in (int, float):
+        number = cast(int | float, value)
+        if 0 <= number < float("inf"):
+            return number
+    return None
+
+
+@dataclass(frozen=True)
+class EvaluatedSystemPath:
+    """The last successful evaluation of a machine's expected system path."""
+
+    path: str
+    evaluated_at: float | ExpectedEvaluationTimeNotRecorded
+
+    def details(self) -> dict[str, str | float]:
+        result: dict[str, str | float] = {"path": self.path}
+        if isinstance(self.evaluated_at, (int, float)):
+            result["evaluated_at"] = self.evaluated_at
+        return result
+
+    @classmethod
+    def decode(cls, value: object) -> EvaluatedSystemPath | None:
+        if not isinstance(value, dict):
+            return None
+        fields = cast(dict[str, object], value)
+        path = fields.get("path")
+        if not isinstance(path, str) or not system_path(path):
+            return None
+        if "evaluated_at" not in fields:
+            return cls(path, ExpectedEvaluationTimeNotRecorded())
+        at = _timestamp(fields["evaluated_at"])
+        return cls(path, at) if at is not None else None
+
+
+@dataclass(frozen=True)
+class ConfirmedRunningSystem:
+    """The running system path from the last successful probe."""
+
+    path: str
+    observed_at: float
+
+    @classmethod
+    def decode(cls, value: object) -> ConfirmedRunningSystem | None:
+        if not isinstance(value, dict):
+            return None
+        fields = cast(dict[str, object], value)
+        path, at = fields.get("path"), _timestamp(fields.get("observed_at"))
+        if not isinstance(path, str) or not system_path(path) or at is None:
+            return None
+        return cls(path, at)
+
+
+@dataclass(frozen=True)
 class RebuildComparison:
     """Keep the status text and the running systems that answered."""
 
     row: str
     probes: RunningSystemProbes
-    running_paths: dict[str, str]
+    observations: dict[str, ConfirmedRunningSystem]
+
+    @property
+    def running_paths(self) -> dict[str, str]:
+        return {machine: observed.path for machine, observed in self.observations.items()}
 
 
-def compare(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems,
-            run: Callable[[list[str]], str] = command_output) -> RebuildComparison:
-    """Compare running systems and retain failed probes as unavailable."""
-    items: list[str] = []
-    running_paths: dict[str, str] = {}
-    for machine, path, command in (
-        ("natedev", expected.natedev if isinstance(expected, ExpectedSystems) else "",
-         ["realpath", "/run/current-system"]),
-        ("mac", expected.mac if isinstance(expected, ExpectedSystems) else "",
-         ["ssh", "-o", "BatchMode=yes", settings.ssh, "realpath /run/current-system"]),
+def _probe_running_systems(settings: RebuildSettings, run: Callable[[list[str]], str],
+                           clock: Callable[[], float]) -> dict[str, ConfirmedRunningSystem]:
+    observations: dict[str, ConfirmedRunningSystem] = {}
+    for machine, command in (
+        ("natedev", ["realpath", "/run/current-system"]),
+        ("mac", ["ssh", "-o", "BatchMode=yes", settings.ssh, "realpath /run/current-system"]),
     ):
         running = run(command)
         if system_path(running):
-            running_paths[machine] = running
-            if system_path(path) and running != path:
-                items.append(machine)
+            observations[machine] = ConfirmedRunningSystem(running, clock())
+    return observations
+
+
+def compare(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems,
+            run: Callable[[list[str]], str] = command_output, *,
+            clock: Callable[[], float] = time.time) -> RebuildComparison:
+    """Compare running systems and retain failed probes as unavailable."""
+    observations = _probe_running_systems(settings, run, clock)
+    items = [machine for machine, observed in observations.items()
+             if isinstance(expected, ExpectedSystems) and system_path(expected.path_for(machine))
+             and observed.path != expected.path_for(machine)]
     return RebuildComparison(rebuild_names(items),
-                             RunningSystemProbes("natedev" in running_paths, "mac" in running_paths),
-                             running_paths)
+                             RunningSystemProbes("natedev" in observations, "mac" in observations),
+                             observations)
 
 
 def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems,
@@ -220,13 +265,26 @@ class RebuildNeedsNotRead:
 
 @dataclass(frozen=True)
 class RebuildNeedsUnavailable:
-    """The read failed wholly or returned some valid records."""
+    """The folder read failed before it could return requests."""
 
     reason: str
-    summaries: OpenRebuildNeeds | None = None
 
     def __iter__(self) -> Iterator[need.MachineNeeds]:
-        return iter(self.summaries or ())
+        return iter(())
+
+
+@dataclass(frozen=True)
+class PartialRebuildNeeds:
+    """The readable requests from a folder with one or more damaged records."""
+
+    reason: str
+    summaries: OpenRebuildNeeds
+
+    def __iter__(self) -> Iterator[need.MachineNeeds]:
+        return iter(self.summaries)
+
+
+type RebuildNeedsRead = OpenRebuildNeeds | RebuildNeedsNotRead | RebuildNeedsUnavailable | PartialRebuildNeeds
 
 
 @dataclass(frozen=True)
@@ -235,7 +293,8 @@ class RebuildAnswer:
 
     `compared` holds the machines whose running system differs from main;
     `needs` holds the open rebuild records or the reason they are unavailable.
-    `probes` records whether each machine supplied a running system path.
+    `probes` records which machines answered the latest probe.
+    `confirmed_systems` and `evaluated_system_paths` retain each machine’s last successful reads.
     """
 
     machines: tuple[str, ...]
@@ -243,11 +302,13 @@ class RebuildAnswer:
     expected: ExpectedSystems | NoExpectedSystems = NoExpectedSystems()
     failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
     compared: tuple[str, ...] = ()
-    needs: OpenRebuildNeeds | RebuildNeedsNotRead | RebuildNeedsUnavailable = RebuildNeedsNotRead()
+    needs: RebuildNeedsRead = RebuildNeedsNotRead()
     probes: RunningSystemProbes = RunningSystemProbes()
     running_paths: dict[str, str] = field(default_factory=dict)
     comparison_deadline: int = 0
     configured_subject: str = ""
+    confirmed_systems: dict[str, ConfirmedRunningSystem] = field(default_factory=dict)
+    evaluated_system_paths: dict[str, EvaluatedSystemPath] = field(default_factory=dict)
 
     def row(self) -> str:
         return rebuild_names(self.machines)
@@ -588,7 +649,7 @@ def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.tim
     except (OSError, ValueError, KeyError, TypeError, RecursionError) as error:
         return replace(answer, needs=RebuildNeedsUnavailable(str(error)))
     return replace(answer, machines=tuple(machine for machine in MACHINES if machine in machines),
-                   needs=RebuildNeedsUnavailable("\n".join(errors), needs) if errors else needs)
+                   needs=PartialRebuildNeeds("\n".join(errors), needs) if errors else needs)
 
 
 def _read_cache(config: Path, clock: Callable[[], float], *,
@@ -603,11 +664,13 @@ def _read_cache(config: Path, clock: Callable[[], float], *,
     try:
         if watch is not None:
             watch(cache)
-        lines = cache.read_text(encoding="utf-8").splitlines()
+        with cache.open(encoding="utf-8") as stream:
+            lines = stream.read().splitlines()
+            stamp = os.fstat(stream.fileno())
         if len(lines) < 2 or not lines[1].isascii() or not lines[1].isdecimal():
             return RebuildAnswer((), True)
         deadline = int(lines[1])
-        refresh_due = deadline <= clock() or config.stat().st_mtime_ns > cache.stat().st_mtime_ns
+        refresh_due = deadline <= clock() or config.stat().st_mtime_ns > stamp.st_mtime_ns
         items = lines[0].split(", ") if lines[0] else []
         if any(item not in ("rebuild natedev", "rebuild mac") for item in items):
             return RebuildAnswer((), True)
@@ -616,6 +679,9 @@ def _read_cache(config: Path, clock: Callable[[], float], *,
         probes = RunningSystemProbes()
         running_paths: dict[str, str] = {}
         configured_subject = ""
+        confirmed_systems: dict[str, ConfirmedRunningSystem] = {}
+        evaluated_system_paths: dict[str, EvaluatedSystemPath] = {}
+        legacy_expected: dict[str, str] = {}
         if len(lines) >= 4:
             try:
                 value = cast(object, json.loads(lines[3]))
@@ -627,7 +693,23 @@ def _read_cache(config: Path, clock: Callable[[], float], *,
                 if isinstance(paths, dict):
                     running_paths = {machine: path for machine, path in cast(dict[str, object], paths).items()
                                      if isinstance(path, str) and system_path(path)}
-                commit, source = details["commit"], details["source"]
+                confirmed = details.get("confirmed_running_systems")
+                if isinstance(confirmed, dict):
+                    observations = cast(dict[str, object], confirmed)
+                    for machine in MACHINES:
+                        reading = observations.get(machine)
+                        if (observed := ConfirmedRunningSystem.decode(reading)) is not None:
+                            confirmed_systems[machine] = observed
+                            fields = cast(dict[str, object], reading)
+                            path = fields.get("expected_path")
+                            if isinstance(path, str) and system_path(path):
+                                legacy_expected[machine] = path
+                evaluated = details.get("evaluated_system_paths")
+                if isinstance(evaluated, dict):
+                    paths = cast(dict[str, object], evaluated)
+                    evaluated_system_paths = {machine: path for machine in MACHINES
+                                              if (path := EvaluatedSystemPath.decode(paths.get(machine))) is not None}
+                commit, source = details.get("commit"), details.get("source")
                 if (isinstance(commit, str) and REVISION.fullmatch(commit)
                         and isinstance(source, list) and all(isinstance(value, str) for value in cast(list[object], source))):
                     subject = details.get("configured_subject")
@@ -635,19 +717,32 @@ def _read_cache(config: Path, clock: Callable[[], float], *,
                         configured_subject = subject
                     failed_at = details.get("failed_at")
                     if isinstance(failed_at, (float, int)) and 0 <= failed_at < float("inf"):
-                        failure = EvaluationFailure(commit, tuple(cast(list[str], source)), failed_at)
+                        evaluated_machines = details.get("evaluated_machines")
+                        succeeded = (tuple(machine for machine in MACHINES
+                                           if machine in cast(list[object], evaluated_machines))
+                                     if isinstance(evaluated_machines, list) else ())
+                        failure = EvaluationFailure(commit, tuple(cast(list[str], source)), failed_at, succeeded)
                     else:
                         local, mac = details["natedev"], details["mac"]
                         if isinstance(local, str) and system_path(local) and isinstance(mac, str) and system_path(mac):
                             expected = ExpectedSystems(commit, tuple(cast(list[str], source)), local, mac)
             except (ValueError, KeyError, TypeError):
                 pass
+        for machine in MACHINES:
+            if machine not in confirmed_systems and probes.succeeded(machine) and (running := running_paths.get(machine)):
+                confirmed_systems[machine] = ConfirmedRunningSystem(running, stamp.st_mtime)
+            if machine not in evaluated_system_paths:
+                path = (expected.path_for(machine) if isinstance(expected, ExpectedSystems)
+                        else legacy_expected.get(machine, ""))
+                if path:
+                    evaluated_system_paths[machine] = EvaluatedSystemPath(path, ExpectedEvaluationTimeNotRecorded())
         compared = tuple(item.removeprefix("rebuild ") for item in items)
         if isinstance(expected, NoExpectedSystems) and isinstance(failure, NoEvaluationFailure):
             configured_subject = ""
         return RebuildAnswer(compared, refresh_due, expected, failure, compared,
                              probes=probes, running_paths=running_paths, comparison_deadline=deadline,
-                             configured_subject=configured_subject)
+                             configured_subject=configured_subject, confirmed_systems=confirmed_systems,
+                             evaluated_system_paths=evaluated_system_paths)
     except (OSError, ValueError):
         return RebuildAnswer((), True)
 
@@ -669,6 +764,44 @@ def write_status_cache(cache: Path, line: str, due: str, sources: list[Path], be
     _ = scratch.replace(cache)
 
 
+def _refresh_expected_systems(settings: RebuildSettings, answer: RebuildAnswer, commit: str,
+                              paths: dict[str, EvaluatedSystemPath], run: CommandRunner,
+                              clock: Callable[[], float]) -> ExpectedSystems | EvaluationFailure:
+    """Evaluate each missing path and save the successful paths with their own times."""
+    source = (str(settings.repo), settings.ref, settings.natedev, settings.mac)
+    previous = answer.expected
+    if isinstance(previous, ExpectedSystems) and previous.commit == commit and previous.source == source:
+        return previous
+    current: dict[str, EvaluatedSystemPath] = {}
+    failure = answer.failure
+    if isinstance(failure, EvaluationFailure) and failure.commit == commit and failure.source == source:
+        if clock() < failure.failed_at + settings.eval_retry_seconds:
+            return failure
+        current = {machine: paths[machine] for machine in failure.evaluated_machines if machine in paths}
+
+    flake = f"git+file://{quote(str(settings.repo))}?rev={commit}"
+    attributes = {
+        "natedev": f"nixosConfigurations.{json.dumps(settings.natedev)}.config.system.build.toplevel.outPath",
+        "mac": f"darwinConfigurations.{json.dumps(settings.mac)}.system.outPath",
+    }
+    for machine, attribute in attributes.items():
+        if machine in current:
+            continue
+        expression = f"(builtins.getFlake {json.dumps(flake)}).{attribute}"
+        output = run(["nix", "eval", "--json", "--no-write-lock-file", "--expr", expression],
+                     timeout=settings.eval_timeout)
+        try:
+            path = cast(object, json.loads(output))
+        except ValueError:
+            continue
+        if isinstance(path, str) and system_path(path):
+            current[machine] = EvaluatedSystemPath(path, clock())
+    paths.update(current)
+    if "natedev" in current and "mac" in current:
+        return ExpectedSystems(commit, source, current["natedev"].path, current["mac"].path)
+    return EvaluationFailure(commit, source, clock(), tuple(current))
+
+
 def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[[], float] = time.time) -> None:
     """Refresh the configured cache without concurrent evaluations."""
     try:
@@ -687,8 +820,10 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
         began = time.time_ns()
         line, due, details = "", "", ""
         subject = ""
-        probes = answer.probes
-        running_paths = answer.running_paths
+        probes = RunningSystemProbes()
+        running_paths: dict[str, str] = {}
+        confirmed_systems = answer.confirmed_systems.copy()
+        evaluated_system_paths = answer.evaluated_system_paths.copy()
         if isinstance(answer.failure, EvaluationFailure):
             line, details = answer.row(), answer.failure.details()
             subject = answer.configured_subject
@@ -697,30 +832,36 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
             resolved = run(["git", "-C", str(settings.repo), "show", "-s", "--format=%H%x00%s",
                             "--end-of-options", f"{settings.ref}^{{commit}}"])
             commit, _, resolved_subject = resolved.partition("\0")
-            source = (str(settings.repo), settings.ref, settings.natedev, settings.mac)
-            failure = answer.failure
-            if (isinstance(failure, EvaluationFailure) and failure.commit == commit and failure.source == source
-                    and clock() < failure.failed_at + settings.eval_retry_seconds):
-                line, details = answer.row(), failure.details()
-            elif REVISION.fullmatch(commit):
-                subject = resolved_subject
-                expected = expected_systems(settings, answer.expected, run, commit)
-                evaluated_at = clock()
-                comparison = compare(settings, expected, run)
-                line, probes = comparison.row, comparison.probes
-                running_paths = comparison.running_paths
-                if isinstance(expected, ExpectedSystems) and system_path(expected.natedev) and system_path(expected.mac):
-                    details = expected.details()
-                else:
-                    details = EvaluationFailure(commit, source, evaluated_at).details()
+            if REVISION.fullmatch(commit):
+                evaluation = _refresh_expected_systems(settings, answer, commit, evaluated_system_paths, run, clock)
+                if evaluation is not answer.failure:
+                    subject = resolved_subject
+                    details = evaluation.details()
+                    line = ""
+            observed = _probe_running_systems(settings, run, clock)
+            confirmed_systems.update(observed)
+            probes = RunningSystemProbes("natedev" in observed, "mac" in observed)
+            running_paths = {machine: system.path for machine, system in observed.items()}
+            compared = {item.removeprefix("rebuild ") for item in line.split(", ")}
+            for machine, evaluated in evaluated_system_paths.items():
+                if (running := confirmed_systems.get(machine)) is not None:
+                    if running.path == evaluated.path:
+                        compared.discard(machine)
+                    else:
+                        compared.add(machine)
+            line = rebuild_names(compared)
             due = str(int(clock()) + settings.interval)
         except (OSError, ValueError, KeyError):
             pass
-        if details:
-            fields = cast(dict[str, object], json.loads(details))
+        if confirmed_systems or evaluated_system_paths:
+            due = due or "0"
+        if details or confirmed_systems or evaluated_system_paths:
+            fields = cast(dict[str, object], json.loads(details)) if details else {}
             fields["configured_subject"] = subject
             fields["running_system_probes"] = {"natedev": probes.natedev, "mac": probes.mac}
             fields["running_system_paths"] = running_paths
+            fields["confirmed_running_systems"] = {machine: asdict(system) for machine, system in confirmed_systems.items()}
+            fields["evaluated_system_paths"] = {machine: system.details() for machine, system in evaluated_system_paths.items()}
             details = json.dumps(fields)
         write_status_cache(cache, line, due, [config], began, details)
 

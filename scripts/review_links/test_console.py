@@ -446,6 +446,123 @@ class ForYouNotifierTests(unittest.TestCase):
             with self.subTest(width=width):
                 assert_notifier_browser(self, width)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the action badge.")
+    def test_notifier_waits_for_first_count_and_retains_the_last_count(self) -> None:
+        settings = Path(__file__).resolve().parents[2] / "config"
+        with patch.dict(os.environ, {"CONF_DIR": str(settings)}):
+            source = console.render((), console.UnavailablePage())
+        setup = br"""<script>
+const nativeFetch=window.fetch.bind(window);
+let answer=Response.json({available:false});
+window.fetch=(url,options)=>String(url).includes('for-you.json')
+ ? Promise.resolve(answer.clone()) : nativeFetch(url,options);
+</script>"""
+        probe = br"""<script>
+(async()=>{
+ if(location.search==='?reload') return;
+ const failures=[];
+ const check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const badges=doc=>[...doc.querySelectorAll('[data-for-you-count]')].map(badge=>badge.textContent);
+ const hasCount=(doc,count)=>JSON.stringify(badges(doc))===JSON.stringify([count,count]);
+ try{
+  await flush();
+  check(hasCount(document,'') && [...document.querySelectorAll('[data-for-you-count]')].every(badge=>badge.hidden),
+        'The first failed read leaves both badges hidden.');
+  answer=Response.json({available:true,count:0,entries:[],stale:true});
+  dispatchEvent(new Event('focus'));await flush();
+  check(hasCount(document,'0') && document.querySelector('[data-for-you-toggle]').dataset.state==='stale',
+        'A server count of zero appears with its stale state.');
+  answer=Response.json({available:true,count:3,entries:[]});
+  dispatchEvent(new Event('focus'));await flush();
+  check(hasCount(document,'3'),'A complete read sets both badges.');
+  answer=Response.json({available:true,count:0,entries:[],stale:true,partial:true});
+  dispatchEvent(new Event('focus'));await flush();
+  check(hasCount(document,'0'),'The badges show the partial count from the current read.');
+  const frame=document.createElement('iframe');
+  frame.src=location.pathname+'?reload';
+  await new Promise(resolve=>{frame.onload=resolve;document.body.append(frame);});
+  check(hasCount(frame.contentDocument,'3'),'A new page starts with the last complete count.');
+  answer=Response.json({available:false});
+  dispatchEvent(new Event('focus'));await flush();
+  check(hasCount(document,'3'),'An incomplete read keeps the last complete count.');
+  const button=document.querySelector('.for-you-slot button');
+  button.click();await flush();
+  const panel=document.querySelector('#action-popover');
+  check(panel.querySelector('[data-panel-count]').textContent==='3' &&
+        !panel.textContent.toLowerCase().includes('unavailable'),
+        'The panel keeps the number and omits the unavailable message.');
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        markup = source.replace(b"</head>", setup + b"</head>").replace(b"</body>", probe + b"</body>")
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the action badge.")
+    def test_notifier_keeps_the_newest_complete_count_when_the_server_has_no_count(self) -> None:
+        rebuild: console.ForYouEntry = {
+            "key": "rebuild/natedev", "kind": "rebuild", "title": "Apply the new settings",
+            "command": "rebuild", "machine": "natedev", "requested_by": "watcher",
+            "href": "?page=review&at.review=%2Fconsole%2Freview.html",
+        }
+        self.assert_notifier_count_fallback(0, {
+            "available": True, "count": 1, "entries": [rebuild], "stale": True,
+            "kept_parts": (for_you.ForYouCountPart.REBUILD_COMPARISON,),
+        }, "no count", 1)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the action badge.")
+    def test_notifier_restores_the_complete_count_after_a_partial_count_and_transport_failure(self) -> None:
+        self.assert_notifier_count_fallback(3, {
+            "available": True, "count": 0, "entries": [], "stale": True, "partial": True,
+            "kept_parts": (for_you.ForYouCountPart.REBUILD_REQUESTS,),
+        }, "transport", 3)
+
+    def assert_notifier_count_fallback(
+        self, confirmed: int, interim: console.StaleForYouPayload | console.PartialForYouPayload,
+        failure: Literal["no count", "transport"], expected: int,
+    ) -> None:
+        settings = Path(__file__).resolve().parents[2] / "config"
+        with patch.dict(os.environ, {"CONF_DIR": str(settings)}):
+            source = console.render((), console.UnavailablePage())
+        fixture = json.dumps({"confirmed": confirmed, "interim": interim, "failure": failure, "expected": expected})
+        setup = b"<script>const fixture=" + fixture.encode() + br""";
+const nativeFetch=window.fetch.bind(window);
+let answer={available:true,count:fixture.confirmed,entries:[]};
+window.fetch=(url,options)=>{
+ if(!String(url).includes('for-you.json')) return nativeFetch(url,options);
+ if(answer===null) return Promise.reject(Error('Fixture transport failure.'));
+ return Promise.resolve(Response.json(answer));
+};
+</script>"""
+        probe = br"""<script>
+(async()=>{
+ const failures=[];
+ const check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const refresh=async value=>{answer=value;dispatchEvent(new Event('focus'));await flush();};
+ const badges=[...document.querySelectorAll('[data-for-you-count]')];
+ const hasCount=count=>badges.length===2 && badges.every(badge=>!badge.hidden && badge.textContent===String(count));
+ const panel=document.querySelector('#action-popover');
+ try{
+  await flush();
+  check(hasCount(fixture.confirmed),'The badges show the confirmed count.');
+  document.querySelector('.for-you-slot button').click();await flush();
+  await refresh(fixture.interim);
+  check(hasCount(fixture.interim.count),'The badges show the latest response.');
+  check(panel.querySelectorAll('article').length===fixture.interim.entries.length,'The panel shows the latest entries.');
+  await refresh(fixture.failure==='transport' ? null : {available:false});
+  check(hasCount(fixture.expected),'The badges retain the newest complete count after '+fixture.failure+'.');
+  check(panel.querySelector('[data-panel-count]').textContent===String(fixture.expected),
+        'The panel retains the newest complete count.');
+  check(document.querySelector('[data-for-you-toggle]').dataset.state==='stale','The retained count is stale.');
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        markup = source.replace(b"</head>", setup + b"</head>").replace(b"</body>", probe + b"</body>")
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
 
 def assert_notifier_browser(case: unittest.TestCase, width: int) -> None:
     'Exercise the real shell with controlled reads, timers, and clipboard writes.'
@@ -489,7 +606,8 @@ try{
  const panel=document.querySelector('#action-popover'),shell=document.querySelector('.shell');
  check(Boolean(trigger),'a visible notifier exists');
  if(!trigger) throw Error('Missing notifier.');
- check(trigger.dataset.state==='unavailable' && trigger.textContent.includes('?'),'the first failed read shows unavailable');
+ check(trigger.dataset.state==='pending' && trigger.querySelector('b').hidden,
+  'The first failed read shows no count.');
  mode='good';trigger.click();await flush();
  check(!panel.hidden && trigger.getAttribute('aria-expanded')==='true','the button opens the panel');
  check(trigger.textContent.includes('2') && panel.querySelectorAll('article').length===2,'the count and two entries appear');
@@ -520,14 +638,14 @@ try{
   mode='good';dispatchEvent(new Event('focus'));await flush();
   const start=heading.firstChild,end=panel.querySelector('code').firstChild;
   selection.setBaseAndExtent(start,0,end,end.length);
-  const text=selection.toString(), count=result==='zero'?'0':'?';
+  const text=selection.toString(), count=result==='zero'?'0':'2';
   mode=result;dispatchEvent(new Event('focus'));await flush();
   check(trigger.querySelector('b').textContent===count,result+' updates the badge during selection');
   check(text.startsWith('2') && text.endsWith('rebuild --later') && selection.toString()===text &&
    selection.anchorNode===start && selection.focusNode===end,result+' preserves the panel count and command selection');
   selection.removeAllRanges();await flush();
   check(heading.textContent===count && panel.querySelectorAll('article').length===0 &&
-   panel.querySelector('.panel-note:not([hidden])').textContent===(result==='zero'?'No actions required.':'The action count is unavailable.'),
+   panel.querySelector('.panel-note:not([hidden])').textContent===(result==='zero'?'No actions required.':'The action count is stale.'),
    result+' updates the panel after selection ends');
  }
  mode='good';dispatchEvent(new Event('focus'));await flush();
@@ -545,8 +663,8 @@ try{
   if(shell.classList.contains('collapsed')!==initial) toggle.click();
  }
  mode='unavailable';dispatchEvent(new Event('focus'));await flush();
- check(trigger.dataset.state==='unavailable' && trigger.querySelector('b').textContent==='?' &&
-  panel.querySelectorAll('article').length===0,'an unavailable count clears the previous number and entries');
+ check(trigger.dataset.state==='stale' && trigger.querySelector('b').textContent==='2' &&
+  panel.querySelectorAll('article').length===0,'An incomplete read keeps the last count and clears the entries.');
  visibility='hidden';document.dispatchEvent(new Event('visibilitychange'));const before=reads;
  for(const timer of timers.values()) timer.run();await flush();
  check(reads===before && timers.size===0,'hidden pages stop timed reads');
@@ -589,12 +707,12 @@ try{
  check(trigger.dataset.state==='quiet' && trigger.textContent.includes('0'),'zero uses a quiet visible notifier');
  check(panel.textContent.includes('No actions required.'),'the empty panel names the zero state');
  mode='http-unavailable';dispatchEvent(new Event('focus'));await flush();
- check(trigger.dataset.state==='unavailable' && trigger.querySelector('b').textContent==='?',
-  'an explicit HTTP 503 replaces a known zero');
+ check(trigger.dataset.state==='stale' && trigger.querySelector('b').textContent==='0',
+  'An HTTP 503 keeps the last count of zero.');
  mode='zero';dispatchEvent(new Event('focus'));await flush();
  mode='unavailable';dispatchEvent(new Event('focus'));await flush();
- check(trigger.dataset.state==='unavailable' && trigger.querySelector('b').textContent==='?',
-  'an unavailable count replaces a known zero');
+ check(trigger.dataset.state==='stale' && trigger.querySelector('b').textContent==='0',
+  'An incomplete read keeps the last count of zero.');
  mode='good';dispatchEvent(new Event('focus'));await flush();
  const link=panel.querySelector('[data-for-you-card]');
  check(new URL(link.href).searchParams.get('at.list')==='/page?filter=mine','the card href keeps the saved List location');

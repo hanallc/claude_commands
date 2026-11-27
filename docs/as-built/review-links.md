@@ -499,10 +499,30 @@ It also reads on visibility, focus, panel opening, and a framed `for-you-complet
 A completion message during a read schedules a second read.
 A hidden tab stops the timer.
 A refresh preserves focused commands and text selections.
-A transport failure keeps the last complete count and marks it stale.
+Review and the notifier use the same comparison results for rebuild cards.
+The rebuild cache keeps each machine’s last successful running path and expected path, with a separate time for each.
+A failure preserves the last successful value and time of the affected path.
+The cache evaluates each machine in a separate Nix command.
+A failed evaluation starts a retry delay. Running probes continue during that delay.
+The cache reuses successful evaluations for the same commit and source when it retries.
+If no confirmed probe exists, the reader can use the running path from the rebuild changes cache.
+A partial request read counts the readable requests and shows their cards.
+A folder read failure can use the request records from the last complete read.
+The reader keeps the last complete action count if the action read fails.
+The count includes each machine once, even when it has an open request and a comparison shows a rebuild.
+The server marks the count stale and identifies the affected parts in `kept_parts`.
+The server marks a count from an incomplete source read with `partial: true`.
+If the staff read fails, Review and the notifier still show the action rows.
+Review shows the staff failure in its action notices.
+If a part has no value, the server sends no new count.
+If a read fails or supplies no count, the page shows its newest complete count as stale.
+A complete count can include earlier observations.
+A partial count stays visible only until the next read result.
+The browser saves only confirmed counts for this console origin.
+The button and panel show the first server count when the browser has no saved count.
 The phone badge shows a dotted outline for a stale count in both navigation states.
-An explicit unavailable response shows `?`, including with HTTP 503.
-A known zero uses a quiet button and shows `No actions required.` in the panel.
+An explicit incomplete response clears the panel entries.
+A complete count of zero uses a quiet button and shows `No actions required.` in the panel.
 
 `rebuilds.url` in `config/console.conf` still names `change_page.rebuilds_url`.
 That function returns `/console/rebuilds.html`.
