@@ -89,10 +89,11 @@ async function reviewCardPosition(card){
  const frame=win.frameElement;
  const height=frame?.getBoundingClientRect().height ?? win.innerHeight;
  const requested=frame && Number.parseFloat(frame.style.getPropertyValue('--review-card-height'));
- const fullscreen=frame?.closest('dialog').hasAttribute('data-fullscreen');
- // The cap is the view height under the top of the List box, less 82 px for the box parts around the frame.
- const start=frame ? frame.closest('dialog').getBoundingClientRect().top : 0;
- const cap=win.parent.innerHeight-start-(fullscreen ? 0 : 82);
+ const dialog=frame?.closest('dialog'),fullscreen=dialog?.hasAttribute('data-fullscreen');
+ // The item heading takes space above the frame. The desktop keeps 16 px below the window.
+ const start=frame?.getBoundingClientRect().top ?? 0;
+ const border=dialog ? parseFloat(win.parent.getComputedStyle(dialog).borderBottomWidth) : 0;
+ const cap=win.parent.innerHeight-start-(fullscreen ? 0 : 16+border);
  return {top,left,main,height,requested,cap,
   resized:!frame || Math.abs(height-(fullscreen ? cap : Math.min(requested,cap)))<1,
   row:card.querySelector('[data-review-card-updates]').getBoundingClientRect().height,
@@ -2108,15 +2109,36 @@ async function inspect(){
  const search=doc.querySelector('#list-search');
  search.value='linked reviews';search.dispatchEvent(new win.Event('input',{bubbles:true}));
  await changed(doc.body,()=>link('sdlc/C1') && link('sdlc/C2'),'the List loads the linked cards');
- const waitingLink=doc.querySelector('[data-number="113"] [data-label="State"] a[data-list-review-card]');
+ const waitingRow=doc.querySelector('[data-number="113"]');
+ const waitingLink=waitingRow.querySelector('[data-label="State"] a[data-list-review-card]');
+ const heading=()=>doc.getElementById(dialog.getAttribute('aria-labelledby')).textContent;
+ check(!win.recordIsOpen(waitingRow),'The waiting item starts closed.');
+ waitingLink.scrollIntoView({block:'center',behavior:'instant'});
  const waitingCard=await readCard(waitingLink);
+ const waitingTop=waitingRow.getBoundingClientRect().top;
  check(dialog.open && waitingCard.querySelector('[data-key="'+waitingKey+'"][data-state="Waiting"]'),
   'The summary opens the linked Waiting card.');
+ check(heading()==='L113 · Check the linked reviews that are waiting',
+  'The window heading names the item number and title.');
+ check(win.recordIsOpen(waitingRow),'The summary opens its item behind the window.');
  check(waitingCard.querySelector('.review-box-meta').textContent.includes('The owner checks the error.'),
   'The metadata shows the Waiting reason.');
  check(!waitingCard.querySelector('[data-review-body] section').getClientRects().length,
   'The body hides the section that repeats the title.');
  dialog.querySelector('button').click();
+ check(!dialog.open && win.recordIsOpen(waitingRow) && doc.activeElement===waitingLink &&
+  Math.abs(waitingRow.getBoundingClientRect().top-waitingTop)<1,
+  'Close keeps the item open at its scroll position and focuses its link.');
+ const unlinked=waitingLink.cloneNode();
+ doc.body.append(unlinked);
+ win.addEventListener('click',event=>{
+  check(!event.defaultPrevented && !dialog.open,'A review link outside an item keeps its destination.');
+  event.preventDefault();
+ },{once:true});
+ unlinked.click();
+ unlinked.remove();
+ row().querySelector('.list-toggle').click();
+ const doneScroll=win.scrollY;
  const doneLink=link('sdlc/C2'),done=await readCard(doneLink);
  check(dialog.open && done.querySelector('[data-state="Done"]'),'Done opens in the dialog.');
  check(!done.querySelector('[data-review-form]'),'The Done card has no action form.');
@@ -2124,11 +2146,13 @@ async function inspect(){
  check(shortBody.scrollHeight<=shortBody.clientHeight,'The short card fits without scrolling.');
  check(!done.querySelector('[data-review-body] section').getClientRects().length,'The empty check section is hidden.');
  check(!done.querySelector('[data-review-index]'),'The dialog loads one card.');
+ check(heading()==='L111 · Check the linked reviews','Each review ID opens under the same item heading.');
  check(win.recordIsOpen(row()),'The Review dialog leaves the List row expanded.');
  const close=dialog.querySelector('button');
  done.body.tabIndex=-1;done.body.focus();
  done.body.dispatchEvent(new done.defaultView.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
- check(!dialog.open && doc.activeElement===doneLink,'Escape closes the dialog and focuses the same link.');
+ check(!dialog.open && doc.activeElement===doneLink && win.recordIsOpen(row()) && win.scrollY===doneScroll,
+  'Escape closes the dialog, keeps the item open at its scroll position, and focuses its link.');
  let readyLink=link('sdlc/C1');
  const ready=await readCard(readyLink);
  await animationFrames(win);
@@ -2165,7 +2189,7 @@ async function inspect(){
  const phone=direct || document.querySelector('.mobile-header').getClientRects().length>0;
  check(phone===(direct || new URLSearchParams(location.search).has('phone')),'The List uses the expected layout.');
  // A top window starts at the bottom of the action area, or at the top of the view on a page without one.
- const area=doc.querySelector('[data-page-actions]:not([data-page-window-actions])');
+ const area=dialog.querySelector('[data-page-window-actions]');
  const clear=area ? Math.max(area.getBoundingClientRect().top,
   ...[...area.children].map(control=>control.getBoundingClientRect().bottom)) : 0;
  if(phone){
