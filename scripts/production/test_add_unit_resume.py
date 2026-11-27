@@ -311,7 +311,7 @@ class AddUnitResumeTests(AddUnitTestCase):
                               "--cwd", str(prior))
 
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(result.stderr, "add_unit: unit alpha is retired. Use agents retire alpha to remove the record.\n")
+        self.assertEqual(result.stderr, f"add_unit: unit alpha is retired. Use agents retire {row.id} to remove the record.\n")
         worktree_step.assert_not_called()
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
         self.assertEqual(starts, [])
@@ -332,7 +332,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         result = self.cli("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
 
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(result.stderr, "add_unit: unit alpha is retired. Use agents retire alpha to remove the record.\n")
+        self.assertEqual(result.stderr, f"add_unit: unit alpha is retired. Use agents retire {row.id} to remove the record.\n")
         self.assertFalse(any(call[2:4] == ["agent", "start"] for call in self.herdr_calls()))
         self.assertEqual(staff.by_id(row.id), row)
         self.assertEqual(self.repository_state(), before)

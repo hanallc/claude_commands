@@ -1714,7 +1714,7 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
     if matches:
         member = matches[0]
         if isinstance(member.worktree, staff.RemovedWorktree):
-            return ResumeFailed(session, f"{member.name} is retired. Use agents retire {member.name} to remove the record.")
+            return ResumeFailed(session, f"{member.name} is retired. Use agents retire {member.id} to remove the record.")
         machine = member_machine(member)
         if machine and machine != remote.local_machine():
             route = remote.machine_alias(machine)

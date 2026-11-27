@@ -1352,7 +1352,7 @@ def checked_unit_member(production: Production, unit: str,
             raise Refusal(f"{unit}: native session conflicts with retained staff identity")
     if isinstance(found, staff_sources.MemberFound):
         if isinstance(found.row.worktree, staff.RemovedWorktree):
-            raise Refusal(f"unit {unit} is retired. Use agents retire {found.row.name} to remove the record.")
+            raise Refusal(f"unit {unit} is retired. Use agents retire {found.row.id} to remove the record.")
         if found.row.parent != staff.ReportsTo(production.owner.id):
             owner = record.by_id(found.row.parent.id) if isinstance(found.row.parent, staff.ReportsTo) else None
             if owner is None or owner.kind != "showrunner":

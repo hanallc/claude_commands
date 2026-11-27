@@ -261,8 +261,6 @@ Each move and unit attachment acquires the native session lock first.
 If the session has a staff row, the operation also acquires that row lock.
 The move holds both locks through its stop and resume.
 Attachment refuses while a move holds either lock.
-Retired unit recovery holds both locks in the same order before it starts `add_unit --resume`.
-The child verifies both inherited lock descriptors in native-first order.
 The batch verifies each reference and reads the current conversation while it holds the locks.
 References to the same member share one move and receive the same result.
 Only a user command sets the user-command flag:
@@ -963,7 +961,6 @@ A row leaves the saved list when it starts or already runs.
 `stop_resume.resume` removes a row after a confirmed start while it holds the row lock.
 Upkeep, account moves, watchdog recovery, and named resume share this removal.
 Named resume also removes a row after a successful continuation message.
-Retired recovery removes a row after it proves the resumed native session.
 These removals and restart cleanup occur before the row locks release.
 Native resume, continuation messages, restart, and pruning use `shutdown_record.remove_started`.
 A failed start adds the row to the list.

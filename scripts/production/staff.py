@@ -2641,12 +2641,32 @@ def retire(staff_id: StaffId) -> StaffRow | None:
     return removed
 
 
-def remove_retired_unit(expected: StaffRow) -> None:
+@dataclass(frozen=True)
+class OriginBranchAbsent:
+    """The fetch origin has no ref for the retired branch."""
+
+
+@dataclass(frozen=True)
+class RetiredUnitOrigin:
+    """The origin branch tip used to check the retired unit."""
+
+    machine: str
+    checkout: Path
+    tip: str | OriginBranchAbsent
+
+
+def remove_retired_unit(expected: StaffRow, origin: RetiredUnitOrigin) -> None:
     """Remove a retired unit and its stopped workers in one staff write."""
-    if expected.kind != "unit" or not isinstance(expected.worktree, RemovedWorktree):
-        raise StaffRefused(f"{expected.name}: removal requires a retired unit")
+    location = expected.worktree
+    if (expected.kind != "unit" or not isinstance(location, RemovedWorktree)
+            or not isinstance(location.branch, ParkedBranch)):
+        raise StaffRefused(f"{expected.name}: removal requires a retired unit with a recorded branch")
+    branch = location.branch
     if not is_owner():
-        _ = _remote(["remove-retired-unit"], input_text=json.dumps(expected.to_json()))
+        _ = _remote(["remove-retired-unit"], input_text=json.dumps({
+            "row": expected.to_json(), "machine": origin.machine, "checkout": str(origin.checkout),
+            "tip": origin.tip if isinstance(origin.tip, str) else None,
+        }))
         return
 
     with slot_operation(expected.id, expected.name), ExitStack() as locks:
@@ -2667,6 +2687,9 @@ def remove_retired_unit(expected: StaffRow) -> None:
                 raise StaffRefused(f"{unit.name}: the unit or its workers changed before removal")
             rows[:] = [row for row in rows if row.id not in members]
             pending.difference_update(members)
+            check_origin = cast(Callable[[ParkedBranch, RetiredUnitOrigin], None],
+                import_module("scripts.agents.shutdown").require_retired_origin_unchanged)
+            check_origin(branch, origin)
 
         _record_transaction(edit)
     _forget_restart(list(members))
@@ -3161,7 +3184,16 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
     if arguments.verb == "retire-pending":
         return retire_pending()
     if arguments.verb == "remove-retired-unit":
-        return remove_retired_unit(StaffRow.from_json(_decode(seed_text)))
+        request = _decode(seed_text)
+        if not isinstance(request, dict):
+            raise StaffRefused("invalid retired unit removal request")
+        fields = cast(dict[str, object], request)
+        machine, checkout, tip = fields.get("machine"), fields.get("checkout"), fields.get("tip")
+        if (not isinstance(machine, str) or not isinstance(checkout, str) or "tip" not in fields
+                or (tip is not None and not isinstance(tip, str))):
+            raise StaffRefused("invalid retired unit removal request")
+        return remove_retired_unit(StaffRow.from_json(fields.get("row")), RetiredUnitOrigin(
+            machine, Path(checkout), OriginBranchAbsent() if tip is None else tip))
     if arguments.verb == "ensure":
         assert arguments.kind is not None
         # The record decoder owns the location JSON boundary and wrong-kind checks.
