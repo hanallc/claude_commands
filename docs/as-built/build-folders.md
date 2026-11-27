@@ -26,6 +26,7 @@ Item 191 B3 will keep the Mac claim at the unreachable bound until the guest pro
 The main checkouts stay at `~/rust/<repo>` and `~/.claude`. The repo word is the last part of the Git origin path without the `.git` suffix. The local alias for `claude_commands` is `claude`. The path has no showrunner component.
 
 The Hana guest stores its shell cache under `<build root>/hana/main/shells`.
+The Mac Linux guest stores its affected-module fact cache under `<build root>/claude/main/gate/affected-module-facts.sqlite` and holds the main output lease during use.
 Each numbered copy uses its own real `target` directory.
 
 The unit word names the unit. Use a unit word for only one active unit. A new unit can reuse a retired unit's word. The folder rules reserve `main` and `ci`.
