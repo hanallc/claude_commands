@@ -20,7 +20,7 @@ from uuid import UUID
 
 from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import codex_test_support as codex_fixture
-from scripts.direct import assign, progress_history, recorder_state, remove_run_scratch
+from scripts.direct import assign, phase_reservation, progress_history, recorder_state, remove_run_scratch
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssignmentFixture, InProcessAssignment, assignment_helpers, invoke_assignment, read_object
 from scripts.direct.findings_test_support import invoke_findings
@@ -869,6 +869,20 @@ class AssignLauncherTests(HookAssignmentFixture):
 
         self.assertEqual((self.session_dir / "phases/7/worktree").read_text().strip(), str(other))
         self.assertEqual(directories, [str(other)])
+
+    def test_herdr_assignment_passes_the_directors_berth_session_to_a_new_worker(self) -> None:
+        key = phase_reservation.SESSION_ENVIRONMENT
+        director = self.native.fixture.parent.current_session
+        for name, existing in (("impl", None), ("impl2", "selected-berth-session")):
+            with self.subTest(existing=existing), patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": director}):
+                if existing is None:
+                    _ = os.environ.pop(key, None)
+                else:
+                    os.environ[key] = existing
+                _ = self.successful("implement", "--new-worker", name)
+                kind, _, environment = self.native.fixture.world.requests[-1]
+                self.assertEqual(kind, "codex")
+                self.assertEqual(environment.get(key), director if existing is None else existing)
 
     def test_herdr_assignment_refuses_a_failed_phase_claim_before_the_worker_assignment(self) -> None:
         status = self.session_dir / "phases/3/impl_status"
