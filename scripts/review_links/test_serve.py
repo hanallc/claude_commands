@@ -73,7 +73,7 @@ from scripts.review_links import (
     accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
     placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, studio_page, test_review_page,
 )
-from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
+from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, session_folder, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.statusline import assignment, rebuild_row
@@ -6540,15 +6540,19 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(disks_page, "output_folder", return_value=self.root / "disks"))
         start = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 7)))
         folders: sessions.SessionReport = {"root": "/session", "sessions": []}
+        _ = self.enterContext(patch.object(session_folder, "session_root", return_value=self.root))
         _ = self.enterContext(patch.object(sessions, "session_report", return_value=folders))
-        answer = b'{"state": "started", "target": 7, "sessions": {"root": "/session", "sessions": []}}'
-        self.assertEqual(self.post("/disks/measure", ""), (200, answer))
+        _ = self.enterContext(patch.object(disks_page, "session_name_registry", return_value={}))
+        answer: dict[str, object] = {"state": "started", "target": 7, "sessions": folders, "staff_names": {}}
+        status, body = self.post("/disks/measure", "")
+        self.assertEqual((status, json.loads(body)), (200, answer))
         self.assertEqual(start.call_count, 1)
         start.assert_called_once_with(ANY, force=False)
         self.assertNotEqual(self.post("/other/measure", "")[0], 200)
         self.assertEqual(start.call_count, 1)
         start.reset_mock()
-        self.assertEqual(self.post("/disks/measure", "force=1"), (200, answer))
+        status, body = self.post("/disks/measure", "force=1")
+        self.assertEqual((status, json.loads(body)), (200, answer))
         start.assert_called_once_with(ANY, force=True)
 
     def test_the_disks_measure_returns_its_state_when_sessions_are_unavailable(self) -> None:
@@ -6558,9 +6562,64 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(disks_page, "output_folder", return_value=self.root / "disks"),
               patch.object(disks_page, "start_measure", return_value=disks_page.MeasureRequest(
                   disks_page.MeasureStart.STARTED, 7)),
+              patch.object(disks_page, "session_name_registry", return_value={}),
+              patch.object(session_folder, "session_root", return_value=self.root),
               patch.object(sessions, "session_report", side_effect=OSError("The sessions are unavailable."))):
             status, response = self.post("/disks/measure", "")
-        self.assertEqual((status, response), (200, b'{"state": "started", "target": 7, "sessions": null}'))
+        self.assertEqual((status, json.loads(response)),
+                         (200, {"state": "started", "target": 7, "sessions": None, "staff_names": {}}))
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(disks_page, "output_folder", return_value=self.root / "disks"),
+              patch.object(disks_page, "start_measure", return_value=disks_page.MeasureRequest(
+                  disks_page.MeasureStart.STARTED, 7)),
+              patch.object(disks_page, "session_name_registry", return_value={}),
+              patch.object(session_folder, "session_root", return_value=None)):
+            status, response = self.post("/disks/measure", "")
+        self.assertEqual((status, json.loads(response)),
+                         (200, {"state": "started", "target": 7, "sessions": None, "staff_names": {}}))
+
+    def test_the_disks_refresh_returns_the_role_color_for_a_new_session_folder(self) -> None:
+        from scripts.disks import disks_page, sessions
+
+        root = self.root.parent / "sessions"
+        root.mkdir()
+        folders: sessions.SessionReport = {"root": str(root), "sessions": []}
+        _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        _ = self.enterContext(patch.object(disks_page, "output_folder", return_value=self.root / "disks"))
+        _ = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureRequest(
+            disks_page.MeasureStart.CURRENT, 7)))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {session_folder.ROOT_ENV: str(root)})))
+        report = self.enterContext(patch.object(sessions, "session_report", return_value=folders))
+        scan = self.enterContext(patch.object(session_folder, "session_folders", wraps=session_folder.session_folders))
+        snapshot = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())))
+        status, body = self.post("/disks/measure", "")
+        self.assertEqual((status, json.loads(body)),
+                         (200, {"state": "current", "target": 7, "sessions": folders, "staff_names": {}}))
+
+        name = "report-impl-2"
+        member = staff.StaffRow(staff.StaffId("worker-id"), "worker", "impl", staff.StaffRoot(),
+                                current_session=staff.StaffId("worker-session"))
+        path = root / name
+        path.mkdir()
+        session_folder.write_record(path, {"owner": member.id, "session_id": member.current_session})
+        snapshot.return_value = staff.StaffSnapshot((member,))
+        folders["sessions"].append({"name": name, "size": None, "state": "running", "held": []})
+
+        scan.reset_mock()
+        status, body = self.post("/disks/measure", "")
+        answer = cast(dict[str, object], json.loads(body))
+        self.assertEqual((status, answer["sessions"]), (200, folders))
+        self.assertEqual(scan.call_count, 1)
+        report.assert_called_with(root, [(path, {"owner": member.id, "session_id": member.current_session})])
+        names = cast(dict[str, str], answer["staff_names"])
+        span = ElementTree.fromstring(names[name])
+        self.assertEqual((span.tag, span.text, span.get("data-color-text"), span.get("style")),
+                         ("span", name, "role.worker", "color:#ff0404"))
+
+        with patch.object(disks_page, "session_name_registry", side_effect=OSError("The staff names are unavailable.")):
+            status, body = self.post("/disks/measure", "")
+        self.assertEqual((status, json.loads(body)),
+                         (200, {"state": "current", "target": 7, "sessions": folders, "staff_names": None}))
 
     def test_review_records_signed_for_you_completion_once(self) -> None:
         case = self.review_fixture()
