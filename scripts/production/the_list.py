@@ -2291,9 +2291,24 @@ def _save(store: record_store.NumberedRecords, item: ListItem, *, previous_produ
         store.write(item.id, fields, body)
 
 
-def records(keeper: staff.StaffId, *, include_closed: bool = False,
-            sources: list[Path] | None = None) -> list[ListItem]:
-    items = _store(keeper).records(lambda identity: load(keeper, identity), sources=sources)
+class ListRead(StrEnum):
+    SKIP_INVALID = "omit invalid rows from the List"
+    REQUIRE_COMPLETE = "require every List row to be readable"
+
+
+def records(keeper: staff.StaffId, *, include_closed: bool = False, sources: list[Path] | None = None,
+            read: ListRead = ListRead.SKIP_INVALID) -> list[ListItem]:
+    def require_row(identity: str) -> ListItem:
+        try:
+            return load(keeper, identity)
+        except (ListError, OSError) as error:
+            raise OSError(f"{keeper}/{identity}: {error}") from error
+
+    if read is ListRead.REQUIRE_COMPLETE:
+        # The source collector also reports directory read errors.
+        items = _store(keeper).records(require_row, sources=[] if sources is None else sources)
+    else:
+        items = _store(keeper).records(lambda identity: load(keeper, identity), sources=sources)
     return sorted((item for item in items if include_closed or item.state != ItemState.CLOSED), key=lambda item: item.number)
 
 
