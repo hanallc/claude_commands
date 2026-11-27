@@ -162,8 +162,9 @@ assert result.removed > 0, result
         old_time = time.time() - 3 * 86_400
         for path in (idle_target, *idle_target.rglob("*")):
             os.utime(path, (old_time, old_time), follow_symlinks=False)
+        # Restore the fixture when the private /dev hides a fixture under /dev/shm.
         command = [bwrap, "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev",
-                   "--proc", "/proc", "--bind", str(mirror), str(mirror),
+                   "--proc", "/proc", "--ro-bind", str(base), str(base), "--bind", str(mirror), str(mirror),
                    "--ro-bind", str(source), str(mounted), "--", sys.executable, "-B", "-c", program]
         result = subprocess.run(command, cwd=checkout, env={
             **os.environ, **environment, "HOME": str(home), "PYTHONPATH": str(checkout),

@@ -309,7 +309,8 @@ exit "$CLEANUP_TEST_STATUS"
             '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
             + offload.remote_test_command(config, request, eligibility.KnownRepository("hana's project"))
         )
-        with build_folders.mac_mirror_hold(self.mirror, build_folders.MacMirrorHold.SHARED) as lease:
+        with build_folders.mac_mirror_hold(self.mirror, build_folders.MacMirrorHold.SHARED,
+                                           root=self.mirror.parent) as lease:
             assert isinstance(lease, int), lease
             return subprocess.run(
                 [*shell, "-c", text], cwd=self.home_directory, pass_fds=(lease,),
