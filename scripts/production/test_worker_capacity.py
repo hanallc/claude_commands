@@ -18,7 +18,7 @@ from unittest import mock
 from scripts.agents import detached_runs, remote, restart, shutdown_record
 from scripts.direct import progress_history
 from scripts.herdr import herdr, herdr_types, turn_end, worker_panes
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, unit_runs
 from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.production import broadcast, session_staff, showrunners, staff, worker, worker_capacity
 from scripts.production import test_worker as worker_fixture
@@ -233,6 +233,56 @@ class WorkerCapacityTests(StaffTestCase):
         self.cancel.assert_called_once_with(self.run_dir, self.codex.id)
         self.assertEqual(self.sent, [(str(self.parent.id), worker_capacity.SENDER, "\n".join([
             HEADING, "Passes ended as canceled: implementer. Continue that work yourself from the worktree."]))])
+
+    def test_a_closed_codex_worker_with_an_older_open_pass_gets_its_pass_canceled(self) -> None:
+        older = self.root / "older-run"
+        atomic_file.write_text_atomic(older / unit_runs.STATE_FILE, json.dumps({
+            "owner_staff_id": self.parent.id,
+            "pass": {self.codex.name: {"worker_id": self.codex.id, "instance_id": "older", "status": "active"}},
+        }))
+
+        def active(_identity: staff.StaffId, run: Path) -> progress_history.ActiveDispatch | progress_history.NoActiveDispatch:
+            return (progress_history.ActiveDispatch("older", ("launcher",)) if run == older
+                    else progress_history.NoActiveDispatch())
+
+        def cancel(run: Path, _identity: staff.StaffId) -> int:
+            return int(run == older)
+
+        self.active.side_effect = active
+        self.cancel.side_effect = cancel
+        closed = worker_panes.ClosedWorker(self.codex)
+        with mock.patch.object(worker_panes, "parent_run_index", return_value={self.parent.current_session: [str(older)]}):
+            self.assertEqual(self.stop([closed], closed), 0)
+        self.cancel.assert_any_call(older, self.codex.id)
+        self.stop_row.assert_not_called()
+        self.assertEqual(self.sent, [(str(self.parent.id), worker_capacity.SENDER, "\n".join([
+            HEADING, "Passes ended as canceled: implementer. Continue that work yourself from the worktree."]))])
+
+    def test_the_report_names_live_commands_from_each_run_with_a_canceled_pass(self) -> None:
+        older = self.root / "older-run"
+        untouched = self.root / "untouched-run"
+        primary_commands = self.run_dir / detached_runs.DETACHED_RUNS_DIR
+        older_commands = older / detached_runs.DETACHED_RUNS_DIR
+        self.cancel.side_effect = [1, 1, 0]
+        self.live_runs.side_effect = [
+            [{"run_id": "primary-command", "log": "/logs/primary-command.log"}],
+            [{"run_id": "older-command", "log": "/logs/older-command.log"}],
+        ]
+        opened = self.open_worker()
+        with mock.patch.object(worker_panes, "worker_pass_runs", return_value=(self.run_dir, older, untouched)):
+            self.assertEqual(self.stop([opened], opened, worker_panes.ClosedWorker(self.codex)), 0)
+        self.assertEqual(self.sent, [(str(self.parent.id), worker_capacity.SENDER, "\n".join([
+            HEADING, "Stopped: implementer.",
+            "Passes ended as canceled: implementer. Continue that work yourself from the worktree.",
+            f"Detached run of implementer continues: primary-command: result {primary_commands / 'primary-command.json'}; "
+            + "log /logs/primary-command.log.",
+            f"Detached run of implementer continues: older-command: result {older_commands / 'older-command.json'}; "
+            + "log /logs/older-command.log.",
+        ]))])
+        self.assertEqual(self.live_runs.call_args_list, [
+            mock.call(primary_commands, frozenset({self.codex.id})),
+            mock.call(older_commands, frozenset({self.codex.id})),
+        ])
 
     def test_a_worker_not_proved_stopped_keeps_its_pass_and_faults_go_to_the_fault_reader(self) -> None:
         opened = self.open_worker()
