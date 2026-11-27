@@ -545,6 +545,7 @@ The feed reads it through `mac_idle.view_alert_line()`, which also checks the li
 An empty value hides the alert on the page.
 `scripts/buildlog/machine_watch.py` reads `notices.<machine>` in `build_targets.conf` when it prepares a phone push for a machine that does not answer.
 Set `notices.mac=off` to suppress that push for the Mac.
+Set `notices.mac-linux=off` to suppress that push for the Mac Linux guest.
 The default is `on`.
 `off` stops a new push only. A push that was already sent can repeat until its alert clears.
 The Builds page continues to use the saved alert.

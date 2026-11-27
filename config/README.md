@@ -550,6 +550,7 @@ Natedev reads the SSH host from each active target's settings file before each r
 
 `notices.<machine>` controls the phone push when that machine does not answer.
 Set `notices.mac=off` to disable the Mac push.
+Set `notices.mac-linux=off` to disable the Mac Linux guest push.
 The allowed values are `on` and `off`.
 The default is `on`.
 `off` stops a new push only. A push that was already sent can repeat until its alert clears.
