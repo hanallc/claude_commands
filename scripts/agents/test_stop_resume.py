@@ -245,13 +245,8 @@ class WorkerResumeTests(unittest.TestCase):
         _ = write_registry(case.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
         _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
                                      case.fixture.root / "conf/shutdown.conf")
-        state = case.run_dir / "progress_history_state.json"
-        fields = herdr.json_object(cast(object, json.loads(state.read_text())), "fixture run")
-        fields["open_phases"] = [{"id": "ad hoc", "title": "Workers", "instance_id": "phase-adhoc",
-                                  "status": "active", "started_at": 1}]
-        _ = state.write_text(json.dumps(fields))
         opened = case.opened()
-        _ = progress_history.begin_dispatch(case.run_dir, slot=opened.row.name, phase="ad hoc", role="impl",
+        _ = progress_history.begin_dispatch(case.run_dir, slot=opened.row.name, phase="8", role="impl",
             worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
             prompt=case.prompt, kind="impl", lens="")
         world = case.fixture.world
@@ -5273,9 +5268,7 @@ class StopResumeTests(unittest.TestCase):
         row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "alpha", staff.ReportsTo(parent.id),
                              current_session=staff.StaffId(self.entry["session_id"]), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         record = staff.StaffSnapshot((parent, row))
-        self.entry["environment"][pane_launch.BERTH_SESSION_ENV] = "native-director.phase-phase-b"
-        pane_record.save("agents", {self.entry["pane_id"]: self.entry})
-        for active in (progress_history.ActiveDispatch("own-dispatch", ("assign.sh",), "phase-b"), progress_history.NoActiveDispatch()):
+        for active in (progress_history.ActiveDispatch("own-dispatch", ("assign.sh",)), progress_history.NoActiveDispatch()):
             with (self.subTest(active=active),
                   patch.object(staff, "initial_snapshot", return_value=record),
                   patch.object(worker_panes, "worker_run", return_value=self.root) as run,
@@ -5293,55 +5286,6 @@ class StopResumeTests(unittest.TestCase):
                     self.assertEqual(self.client.prompts, [])
                 run.assert_called_once_with(row, record=record)
                 read.assert_called_once_with(row.id, self.root)
-
-    def test_stopped_resume_refuses_a_worker_with_a_missing_or_stale_phase_key(self) -> None:
-        from scripts.production import worker
-
-        identity = staff.StaffId(self.entry["session_id"])
-        showrunner = staff.StaffRow(staff.StaffId("showrunner"), "showrunner", "showrunner", staff.STAFF_ROOT,
-                                    current_session=staff.StaffId("native-showrunner"))
-        parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.ReportsTo(showrunner.id),
-                                current_session=staff.StaffId("current-director"),
-                                worktree=staff.PresentWorktree(remote.local_machine(), self.root),
-                                unit_type=staff.UnitDetails("direct"))
-        state = self.root / "progress_history_state.json"
-        for family in ("claude", "codex"):
-            home = self.root / (".codex1" if family == "codex" else ".claude3")
-            row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "alpha", staff.ReportsTo(parent.id),
-                                 current_session=identity, home=staff.SessionHome(home))
-            record = staff.StaffSnapshot((showrunner, parent, row))
-            entry = self.entry.copy()
-            entry["kind"] = family
-            entry["config_dir"] = str(home)
-            entry["environment"] = {"CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR": str(home)}
-            _ = state.write_text(json.dumps({
-                "owner_staff_id": parent.id,
-                "open_phases": [{"id": "phase-a"}, {"id": "phase-b"}],
-                "pass": {row.name: {"worker_id": row.id, "instance_id": "dispatch-b", "phase": {"id": "phase-b"},
-                                    "status": "active", "launcher_command": ["assign.sh"]}},
-            }))
-            pass_before = state.read_bytes()
-            for saved in ("no record", "missing", "old-director.phase-phase-b"):
-                with self.subTest(family=family, saved=saved):
-                    if saved == "old-director.phase-phase-b":
-                        entry["environment"][pane_launch.BERTH_SESSION_ENV] = saved
-                    pane_record.save("agents", {} if saved == "no record" else {entry["pane_id"]: entry})
-                    with (patch.object(staff, "initial_snapshot", return_value=record),
-                          patch.object(staff, "snapshot", return_value=record),
-                          patch.object(worker_panes, "worker_run", return_value=self.root),
-                          patch.object(worker, "resume_receipt", return_value=worker.DispatchSubmitted()),
-                          patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
-                          patch.object(herdr, "launch_prepared_agent") as launch,
-                          patch.object(restart, "start_row") as start):
-                        result = stop_resume.resume(row.name)
-                    self.assertEqual(result, stop_resume.ResumeFailed(identity,
-                        "berth key for alpha is not the phase key current-director.phase-phase-b"
-                        + "; end the worker and assign again"))
-                    self.assertEqual(self.launched, set())
-                    self.assertEqual(self.client.prompts, [])
-                    self.assertEqual(state.read_bytes(), pass_before)
-                    launch.assert_not_called()
-                    start.assert_not_called()
 
     def test_named_resume_keeps_the_saved_assignment_when_the_worker_never_received_it(self) -> None:
         from scripts.direct import progress_history

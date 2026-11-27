@@ -1657,7 +1657,7 @@ class WorkerCommandTests(unittest.TestCase):
         resumed = states[busy.row.id]
         assert isinstance(resumed, worker_panes.OpenWorker)
         resume.assert_called_once_with(resumed,
-            worker.WorkerResume(worker.UnsubmittedAssignment(dispatch_id, ("assign.sh", "--to", busy.row.name)), phase="8"))
+            worker.WorkerResume(worker.UnsubmittedAssignment(dispatch_id, ("assign.sh", "--to", busy.row.name))))
         self.assertEqual(resumed.pane, busy.pane)
         self.assertEqual(resumed.terminal, busy.terminal)
         self.assertIsInstance(states[idle.row.id], worker_panes.ClosedWorker)
@@ -1734,7 +1734,7 @@ class WorkerCommandTests(unittest.TestCase):
         resumed = worker_panes.observe_worker(self.fixture.parent.id, opened.row, staff.snapshot())
         self.assertIsInstance(resumed, worker_panes.OpenWorker)
         resume.assert_called_once_with(resumed,
-            worker.WorkerResume(worker.UnsubmittedAssignment(active.instance_id, active.launcher_command), phase="8"))
+            worker.WorkerResume(worker.UnsubmittedAssignment(active.instance_id, active.launcher_command)))
         self.assertEqual(len(self.fixture.world.launches), launches)
         self.assertEqual(self.agent.submitted, [])
         self.assertEqual(progress_history.active_dispatch(opened.row.id, self.run_dir), active)
@@ -5008,54 +5008,6 @@ class WorkerCommandTests(unittest.TestCase):
                 if not hook_ran:
                     self.assertEqual(len(self.fixture.world.launches), launches + (effort == "low"))
                 self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
-
-    def open_phase_worker_for_restore(self, name: str) -> tuple[worker_panes.OpenWorker, str]:
-        opened = self.opened(name)
-        dispatch = progress_history.begin_dispatch(self.run_dir, slot=name, phase="8", role="impl",
-            worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh"],
-            prompt=self.prompt, kind="impl", lens="")
-        line = f"End your final reply with DONE {dispatch}."
-        progress_history.save_dispatch_delivery(self.run_dir, dispatch,
-            pass_recorder.DispatchDelivery(line, dispatch, str(self.reply)))
-        self.agent.append(opened.pane, "user", line)
-        self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
-        return opened, dispatch
-
-    def test_restore_refuses_an_open_worker_with_a_missing_or_stale_phase_key(self) -> None:
-        world = self.fixture.world
-        expected = f"{self.fixture.parent.current_session}.phase-8"
-        for family in ("claude", "codex"):
-            _ = write_registry(self.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
-            opened, _dispatch = self.open_phase_worker_for_restore("impl-" + family)
-            process = world.processes[world.foreground[opened.pane][0]]
-            self.assertEqual(world.foreground[opened.pane][1], family)
-            self.assertEqual(process.environment.pop(pane_launch.BERTH_SESSION_ENV), expected)
-            state = self.run_dir / "progress_history_state.json"
-            pass_before = state.read_bytes()
-            pane_before = (world.foreground.copy(), len(world.launches), list(world.stops), self.fixture.prompts())
-            for saved in ("missing", "old-director.phase-8"):
-                with self.subTest(family=family, saved=saved):
-                    if saved != "missing":
-                        process.environment[pane_launch.BERTH_SESSION_ENV] = saved
-                    report = worker.RestoreReport()
-                    self.assertIs(worker.restore(self.fixture.parent.id, only=frozenset({opened.row.id}), report=report),
-                                  worker.ExitCode.REFUSED)
-                    reason = f"berth key for {opened.row.name} is not the phase key {expected}; end the worker and assign again"
-                    self.assertEqual(report.failures, {opened.row.id: (opened.row.name, reason)})
-                    self.assertEqual(report.restored, set())
-                    self.assertEqual((world.foreground, len(world.launches), world.stops, self.fixture.prompts()), pane_before)
-                    self.assertEqual(state.read_bytes(), pass_before)
-
-    def test_restore_continues_an_open_worker_with_the_matching_phase_key(self) -> None:
-        opened, dispatch = self.open_phase_worker_for_restore("impl")
-        world = self.fixture.world
-        foreground = world.foreground.copy()
-        launches = len(world.launches)
-        self.assertIs(worker.restore(self.fixture.parent.id, only=frozenset({opened.row.id})), worker.ExitCode.OK)
-        self.assertEqual((world.foreground, len(world.launches), world.stops), (foreground, launches, []))
-        prompt = self.fixture.prompts()[-1]
-        self.assertEqual(prompt[2], opened.pane)
-        self.assertIn(f"Continue pass {dispatch} in this conversation.", prompt[3])
 
     def test_restore_keeps_a_working_worker_with_a_submitted_dispatch(self) -> None:
         opened = self.opened()

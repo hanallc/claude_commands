@@ -162,16 +162,14 @@ class ProgressHistoryTests(unittest.TestCase):
         write_text_atomic(path, json.dumps(fields))
         write_text_atomic(run / "impl_worker_impl.json", json.dumps({"staff_id": worker.id, "slot": "impl"}))
         before = path.read_bytes(), path.stat().st_mtime_ns
-        self.assertEqual(progress_history.active_dispatch(worker.id, run),
-                         progress_history.ActiveDispatch("same-pass", tuple(command), "1"))
+        self.assertEqual(progress_history.active_dispatch(worker.id, run), progress_history.ActiveDispatch("same-pass", tuple(command)))
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         command.extend(["--to", worker.name])
         write_text_atomic(path, json.dumps(fields))
-        self.assertEqual(progress_history.active_dispatch(worker.id, run),
-                         progress_history.ActiveDispatch("same-pass", tuple(command), "1"))
+        self.assertEqual(progress_history.active_dispatch(worker.id, run), progress_history.ActiveDispatch("same-pass", tuple(command)))
         renamed = staff.rename(worker.id, "renamed-impl")
         self.assertEqual(progress_history.active_dispatch(worker.id, run),
-                         progress_history.ActiveDispatch("same-pass", (*command[:-1], renamed.name), "1"))
+                         progress_history.ActiveDispatch("same-pass", (*command[:-1], renamed.name)))
         replacement = fixture_worker("impl", parent.id, runtime_id=fixture_runtime_id("replacement-impl"))
         self.assertIsInstance(progress_history.active_dispatch(replacement.id, run), progress_history.NoActiveDispatch)
         other_parent = fixture_member("showrunner", name="foreign-active-owner")

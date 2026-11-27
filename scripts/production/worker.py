@@ -2922,21 +2922,6 @@ NO_LAUNCH_CLEANUP = NoLaunchCleanup()
 class WorkerResume:
     step: BusyPass | UnsubmittedAssignment | NoOwnPass
     detached: str = ""
-    phase: str = ""
-
-
-def _open_berth_refusal(opened: worker_panes.OpenWorker, owner: staff.StaffRow, resume: WorkerResume) -> str:
-    if isinstance(resume.step, UnsubmittedAssignment) or not (expected := worker_panes.phase_berth_session(owner, resume.phase)):
-        return ""
-    backend = staff.backend(opened.row)
-    if isinstance(backend, staff.BackendUnavailable):
-        return "The worker backend is unavailable"
-    process = _client().native_pane_process(opened.pane, backend.family, herdr.PROGRAM_TIMEOUT_SECONDS)
-    if process.current_identity != opened.row.current_session:
-        return "The worker conversation changed during the berth key check"
-    if process.environment.get(pane_launch.BERTH_SESSION_ENV) != expected:
-        return worker_panes.berth_resume_refusal(opened.row, expected)
-    return ""
 
 
 def _resume_launcher(opened: worker_panes.OpenWorker, resume: WorkerResume, *,
@@ -2998,30 +2983,23 @@ def _resume_needed(state: worker_panes.OpenWorker | worker_panes.StoppedWorker |
                 _ = active.setdefault(dispatch.instance_id, (directory, dispatch))
     if len(active) > 1:
         return DispatchEvidenceUnknown("The worker has multiple active dispatches")
-    phase = ""
     if active:
         run, dispatch = next(iter(active.values()))
-        phase = dispatch.phase
         step = resume_step(state.row, dispatch, run=run)
     else:
         step = NO_OWN_PASS
     if isinstance(step, DispatchEvidenceUnknown):
         return step
     if detached or isinstance(step, UnsubmittedAssignment):
-        return WorkerResume(step, detached, phase)
+        return WorkerResume(step, detached)
     already_working = (isinstance(state, worker_panes.OpenWorker)
                        and state.status in (herdr.AgentStatus.WORKING, herdr.AgentStatus.RUNNING))
-    return WorkerResume(step, phase=phase) if isinstance(step, BusyPass) and not already_working else None
+    return WorkerResume(step) if isinstance(step, BusyPass) and not already_working else None
 
 
 def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot, *,
              run: worker_panes.DispatchRun | worker_panes.HolderRun = worker_panes.HolderRun.CURRENT
              ) -> BusyPass | UnsubmittedAssignment | NoOwnPass:
-    return own_resume(row, record, run=run).step
-
-
-def own_resume(row: staff.StaffRow, record: staff.StaffSnapshot, *,
-               run: worker_panes.DispatchRun | worker_panes.HolderRun = worker_panes.HolderRun.CURRENT) -> WorkerResume:
     """Read the worker's active pass from its own run."""
     try:
         parent = record.parent_of(row)
@@ -3034,12 +3012,11 @@ def own_resume(row: staff.StaffRow, record: staff.StaffSnapshot, *,
         elif isinstance(active, progress_history.ActiveDispatch):
             step = resume_step(row, active, run=directory)
             if not isinstance(step, DispatchEvidenceUnknown):
-                return WorkerResume(step, phase=active.phase)
+                return step
             print(f"anomaly: {row.name}: {step.reason}", file=sys.stderr)
-            return WorkerResume(NO_OWN_PASS, phase=active.phase)
     except (OSError, ValueError) as error:
         print(f"anomaly: {row.name}: {error}", file=sys.stderr)
-    return WorkerResume(NO_OWN_PASS)
+    return NO_OWN_PASS
 
 
 def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:
@@ -3510,9 +3487,6 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                             report.skipped[state.row.id] = "No-worker mode keeps this worker stopped"
                         continue
                     resume = _resume_launcher
-                    if isinstance(state, worker_panes.OpenWorker) and (reason := _open_berth_refusal(state, current_holder, plan)):
-                        failed(state.row, reason, ExitCode.REFUSED, notice=reason)
-                        continue
                     if not isinstance(state, worker_panes.OpenWorker):
                         before = rows_before_launch()
                         result = worker_panes.start_or_resume(parent, worker_name, worker_panes.dispatch_role(state.row),

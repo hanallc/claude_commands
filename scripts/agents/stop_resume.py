@@ -1912,25 +1912,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         mode = worker_mode() if row is not None and not keep_workers else NO_WORKERS
         if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
             return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")
-        own = NO_OWN_PASS
-        detached = ""
-        from scripts.production import worker
-
-        if row is not None and row.kind == "worker":
-            from scripts.agents import detached_runs
-            from scripts.herdr import worker_panes
-
-            try:
-                run = worker_panes.worker_run(row, record=names.tab_record)
-                plan = worker.own_resume(row, names.tab_record, run=worker_panes.DispatchRun(run))
-                own = plan.step
-                parent = names.tab_record.parent_of(row)
-                expected = worker_panes.phase_berth_session(parent, plan.phase) if parent is not None else ""
-                if expected and (entry is None or entry["environment"].get(pane_launch.BERTH_SESSION_ENV) != expected):
-                    return ResumeFailed(identity, worker_panes.berth_resume_refusal(row, expected))
-                detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
-            except (OSError, ValueError) as error:
-                print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
         if row is None and entry is None:
             return SessionNotFound(session)
         if row is not None and (entry is None or _enrolled_showrunner_worker(row, names.tab_record)):
@@ -2020,12 +2001,21 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
         workers: ResumeWorkers | WorkersHeld = NO_WORKERS
+        own = NO_OWN_PASS
+        detached = ""
+        from scripts.production import worker
         try:
-            if row is None or row.kind != "worker":
-                if isinstance(mode, WorkersHeld):
-                    workers = mode
-                elif row is not None and not keep_workers:
-                    workers = worker.resume_workers(row.id, names.tab_record)
+            if row is not None and row.kind == "worker":
+                from scripts.agents import detached_runs
+                from scripts.herdr import worker_panes
+
+                run = worker_panes.worker_run(row, record=names.tab_record)
+                own = worker.own_pass(row, names.tab_record, run=worker_panes.DispatchRun(run))
+                detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
+            elif isinstance(mode, WorkersHeld):
+                workers = mode
+            elif row is not None and not keep_workers:
+                workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
         if keep_workers:

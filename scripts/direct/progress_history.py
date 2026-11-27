@@ -796,7 +796,6 @@ def pass_for_finalization(run: Path, instance: str) -> dict[str, object]:
 class ActiveDispatch:
     instance_id: str
     launcher_command: tuple[str, ...]
-    phase: str = ""
 
 
 @dataclass(frozen=True)
@@ -831,8 +830,7 @@ def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoA
         if not instance or not isinstance(command, list) or not command or any(
                 not isinstance(part, str) for part in cast(list[object], command)):
             return ActiveDispatchUnavailable(f"worker {worker_id}: active pass identity or launcher command is unavailable")
-        phase = pass_recorder.string((pass_recorder.object_dict(matches[0].get("phase")) or {}).get("id"))
-        return ActiveDispatch(instance, tuple(pass_recorder.worker_launcher(cast(list[str], command), row.name)), phase)
+        return ActiveDispatch(instance, tuple(pass_recorder.worker_launcher(cast(list[str], command), row.name)))
     except FileNotFoundError:
         return NoActiveDispatch()
     except recorder_state.OldRecorderState as error:

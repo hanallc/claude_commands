@@ -1651,16 +1651,6 @@ def _worker_phase(state: dict[str, object], owner: staff.StaffRow, row: staff.St
     return ""
 
 
-def phase_berth_session(owner: staff.StaffRow, phase: str) -> str:
-    if not phase or phase in ("ad hoc", "adhoc", pass_recorder.AS_BUILT_PHASE):
-        return ""
-    return phase_reservation.phase_session_id(owner.current_session, phase)
-
-
-def berth_resume_refusal(row: staff.StaffRow, expected: str) -> str:
-    return f"berth key for {row.name} is not the phase key {expected}; end the worker and assign again"
-
-
 @herdr.pane_evidence_run()
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
@@ -1718,7 +1708,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             if unit_runs.terminal_run(run_fields):
                 return AdmissionRefused(f"{run}: the run has ended dispatch admission")
             phase = _worker_phase(run_fields, owner, existing, record) if phase is None else phase
-            berth_session = phase_berth_session(owner, phase)
+            berth_session = (phase_reservation.phase_session_id(owner.current_session, phase)
+                             if phase and phase not in ("ad hoc", "adhoc", pass_recorder.AS_BUILT_PHASE) else "")
             allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
                 worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
             target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
