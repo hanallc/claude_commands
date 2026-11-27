@@ -237,23 +237,16 @@ def scan_path(node: ast.AST, bindings: dict[str, ScanPath | UnrootedPath],
     return UnrootedPath()
 
 
-def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
-    """Keep parameters, paths, and scan calls in their lexical scopes."""
-    definitions: dict[str, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = {"": tree}
+type ScanNode = ast.Import | ast.ImportFrom | ast.Assign | ast.AnnAssign | ast.Call
+type ScopeDefinition = ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
 
-    def definitions_in(node: ast.AST, prefix: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                name = f"{prefix}.{child.name}".lstrip(".")
-                definitions[name] = child
-                definitions_in(child, name)
-            else:
-                definitions_in(child, prefix)
 
-    definitions_in(tree, "")
+def source_scan_scopes(definitions: dict[str, tuple[ScopeDefinition, list[ScanNode]]],
+                       ls_files_calls: set[ast.Call]) -> tuple[ScanScope, ...]:
+    """Resolve each scope after the walk records all definitions."""
     scopes: list[ScanScope] = []
     environments: dict[str, tuple[dict[str, ScanPath | UnrootedPath], dict[str, str]]] = {}
-    for name, definition in definitions.items():
+    for name, (definition, nodes) in definitions.items():
         parent = name.rpartition(".")[0]
         inherited, imported = environments.get(parent, ({}, {}))
         bindings = dict(inherited)
@@ -267,49 +260,48 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
             bindings.update((parameter, ScanPath(ParameterRoot(parameter))) for parameter in parameters)
         scans: list[ScanPattern] = []
         calls: list[ScanCall] = []
-        for statement in definition.body:
-            for node in scope_nodes(statement):
-                if isinstance(node, ast.Import):
-                    aliases.update((alias.asname or alias.name, alias.name) for alias in node.names)
-                elif isinstance(node, ast.ImportFrom):
-                    module = "." * node.level + (node.module or "")
-                    aliases.update((alias.asname or alias.name, module + ("." if node.module else "") + alias.name)
-                                   for alias in node.names)
-                elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-                    value = scan_path(node.value, bindings, aliases)
-                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                    bindings.update((ast.unparse(target), value) for target in targets
-                                    if isinstance(target, (ast.Name, ast.Attribute)))
-                elif isinstance(node, ast.Call):
-                    target = ast.unparse(node.func)
-                    if target.startswith(("self.", "cls.")):
-                        target = parent + "." + target.split(".", 1)[1]
-                    for alias, imported_name in aliases.items():
-                        if target == alias or target.startswith(alias + "."):
-                            target = imported_name + target.removeprefix(alias)
-                            break
-                    for prefix in (name, parent):
-                        if f"{prefix}.{target}".lstrip(".") in definitions:
-                            target = f"{prefix}.{target}".lstrip(".")
-                            break
-                    arguments = tuple(scan_path(argument, bindings, aliases) for argument in node.args)
-                    keywords = tuple((keyword.arg, scan_path(keyword.value, bindings, aliases))
-                                     for keyword in node.keywords if keyword.arg is not None)
-                    if target in definitions or any(isinstance(value, ScanPath) for value in (*arguments, *(item[1] for item in keywords))):
-                        calls.append(ScanCall(target, arguments, keywords))
-                    if isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"}:
-                        directory = scan_path(node.func.value, bindings, aliases)
-                        pattern = node.args[0] if node.args else ast.Constant("*")
-                        if isinstance(pattern, ast.Constant) and isinstance(pattern.value, str):
-                            scans.append(ScanPattern(directory, pattern.value, node.func.attr == "rglob"))
-                        else:
-                            scans.append(ScanPattern(directory, "*", True))
-                    elif target.endswith(".walk") and arguments:
-                        scans.append(ScanPattern(arguments[0], "*", True))
-                    elif any(isinstance(part, ast.Constant) and part.value == "ls-files" for part in ast.walk(node)):
-                        directories = [value for key, value in keywords if key == "cwd"] or list(arguments)
-                        if directories:
-                            scans.append(ScanPattern(directories[0], "*", True))
+        for node in nodes:
+            if isinstance(node, ast.Import):
+                aliases.update((alias.asname or alias.name, alias.name) for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                module = "." * node.level + (node.module or "")
+                aliases.update((alias.asname or alias.name, module + ("." if node.module else "") + alias.name)
+                               for alias in node.names)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                value = scan_path(node.value, bindings, aliases)
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                bindings.update((ast.unparse(target), value) for target in targets
+                                if isinstance(target, (ast.Name, ast.Attribute)))
+            elif isinstance(node, ast.Call):
+                target = ast.unparse(node.func)
+                if target.startswith(("self.", "cls.")):
+                    target = parent + "." + target.split(".", 1)[1]
+                for alias, imported_name in aliases.items():
+                    if target == alias or target.startswith(alias + "."):
+                        target = imported_name + target.removeprefix(alias)
+                        break
+                for prefix in (name, parent):
+                    if f"{prefix}.{target}".lstrip(".") in definitions:
+                        target = f"{prefix}.{target}".lstrip(".")
+                        break
+                arguments = tuple(scan_path(argument, bindings, aliases) for argument in node.args)
+                keywords = tuple((keyword.arg, scan_path(keyword.value, bindings, aliases))
+                                 for keyword in node.keywords if keyword.arg is not None)
+                if target in definitions or any(isinstance(value, ScanPath) for value in (*arguments, *(item[1] for item in keywords))):
+                    calls.append(ScanCall(target, arguments, keywords))
+                if isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"}:
+                    directory = scan_path(node.func.value, bindings, aliases)
+                    pattern = node.args[0] if node.args else ast.Constant("*")
+                    if isinstance(pattern, ast.Constant) and isinstance(pattern.value, str):
+                        scans.append(ScanPattern(directory, pattern.value, node.func.attr == "rglob"))
+                    else:
+                        scans.append(ScanPattern(directory, "*", True))
+                elif target.endswith(".walk") and arguments:
+                    scans.append(ScanPattern(arguments[0], "*", True))
+                elif node in ls_files_calls:
+                    directories = [value for key, value in keywords if key == "cwd"] or list(arguments)
+                    if directories:
+                        scans.append(ScanPattern(directories[0], "*", True))
         environments[name] = bindings, aliases
         scopes.append(ScanScope(name, parameters, tuple(bindings.items()), tuple(scans), tuple(calls)))
     return tuple(scopes)
@@ -322,24 +314,79 @@ def extract_facts(text: str, path: str) -> SourceFacts:
         tree = ast.parse(text, filename=path)
     except SyntaxError as error:
         return SourceFacts((), tokens, frozenset(config_reads), InvalidPython(error.msg))
+    definitions: dict[str, tuple[ScopeDefinition, list[ScanNode]]] = {"": (tree, [])}
+    imports_by_depth: dict[int, list[ast.Import | ast.ImportFrom]] = defaultdict(list)
+    config_calls: list[tuple[ast.expr, str]] = []
+    active_calls: list[ast.Call] = []
+    ls_files_calls: set[ast.Call] = set()
+
+    def visit(node: ast.AST, depth: int, name: str, scope: list[ScanNode] | None,
+              in_copy_source: bool = False) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = f"{name}.{node.name}".lstrip(".")
+            body: list[ScanNode] = []
+            definitions[name] = node, body
+            # Scans use only the body. Imports and definitions can also occur in other fields.
+            for field, value in cast(Iterator[tuple[str, object]], ast.iter_fields(node)):
+                children = cast(list[object], value) if isinstance(value, list) else [value]
+                for child in children:
+                    if isinstance(child, ast.AST):
+                        visit(child, depth + 1, name, body if field == "body" else None, in_copy_source)
+            return
+
+        if isinstance(node, ast.Lambda):
+            scope = None
+        copy_source: ast.expr | None = None
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imports_by_depth[depth].append(node)
+            if scope is not None:
+                scope.append(node)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if scope is not None:
+                scope.append(node)
+        elif isinstance(node, ast.Call):
+            if scope is not None:
+                scope.append(node)
+            active_calls.append(node)
+            if node.args:
+                first = node.args[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    config_calls.append((node.func, first.value))
+                if isinstance(node.func, ast.Attribute) and node.func.attr == "copytree":
+                    copy_source = first
+        elif isinstance(node, ast.Constant):
+            if node.value == "ls-files":
+                ls_files_calls.update(active_calls)
+            if in_copy_source and node.value == "config":
+                config_reads.add("*")
+            return
+        elif isinstance(node, ast.JoinedStr) and any(
+                isinstance(part, ast.Constant) and isinstance(part.value, str) and part.value.endswith(".conf")
+                for part in node.values):
+            config_reads.add("*")
+
+        for child in ast.iter_child_nodes(node):
+            visit(child, depth + 1, name, scope, in_copy_source or child is copy_source)
+        if isinstance(node, ast.Call):
+            _ = active_calls.pop()
+
+    visit(tree, 0, "", definitions[""][1])
     imports: list[tuple[int, str, tuple[str, ...]]] = []
     conf_modules: set[str] = set()
     conf_functions: set[str] = set()
-    for node in ast.walk(tree):
+    # Group the imports by depth to preserve breadth-first order.
+    for node in chain.from_iterable(imports_by_depth[depth] for depth in sorted(imports_by_depth)):
         if isinstance(node, ast.Import):
             imports.extend((0, alias.name, ()) for alias in node.names)
             conf_modules.update(alias.asname or alias.name for alias in node.names
                                 if alias.name in {"conf", "scripts.lib.conf"})
-        elif isinstance(node, ast.ImportFrom):
+        else:
             imports.append((node.level, node.module or "", tuple(alias.name for alias in node.names)))
             if not node.level and node.module == "scripts.lib":
                 conf_modules.update(alias.asname or alias.name for alias in node.names if alias.name == "conf")
             elif not node.level and node.module == "scripts.lib.conf":
                 conf_functions.update(alias.asname or alias.name for alias in node.names)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not node.args:
-            continue
-        function = node.func
+    for function, first in config_calls:
         reader = isinstance(function, ast.Name) and function.id in conf_functions
         if isinstance(function, ast.Attribute):
             parts: list[str] = []
@@ -349,20 +396,10 @@ def extract_facts(text: str, path: str) -> SourceFacts:
                 module = module.value
             if isinstance(module, ast.Name):
                 reader = ".".join((module.id, *reversed(parts))) in conf_modules
-        first = node.args[0]
-        if reader and isinstance(first, ast.Constant) and isinstance(first.value, str):
-            config_reads.add(Path(first.value).name.removesuffix(".conf"))
-    # A computed config name or a copied config folder can read any config file.
-    if any(isinstance(node, ast.JoinedStr) and any(
-            isinstance(part, ast.Constant) and isinstance(part.value, str) and part.value.endswith(".conf")
-            for part in node.values) for node in ast.walk(tree)):
-        config_reads.add("*")
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "copytree" and node.args
-                and any(isinstance(part, ast.Constant) and part.value == "config" for part in ast.walk(node.args[0]))):
-            config_reads.add("*")
-    return SourceFacts(tuple(imports), tokens, frozenset(config_reads), scan_scopes=source_scan_scopes(tree))
+        if reader:
+            config_reads.add(Path(first).name.removesuffix(".conf"))
+    return SourceFacts(tuple(imports), tokens, frozenset(config_reads),
+                       scan_scopes=source_scan_scopes(definitions, ls_files_calls))
 
 
 def indexed_files(repo: Path) -> tuple[set[str], dict[str, str]]:

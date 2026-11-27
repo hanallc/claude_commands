@@ -183,6 +183,40 @@ class AffectedModulesTests(unittest.TestCase):
                 _ = self.commit()
                 self.assertEqual(tuple(module.name for module in self.selection().modules), expected)
 
+    def test_extraction_preserves_import_order_and_lexical_scan_scope(self) -> None:
+        facts = affected.extract_facts("""
+if enabled:
+    import deep as renamed
+import shallow
+from scripts.lib import conf
+ROOT = Path(__file__).parent
+
+@capture(ROOT.glob("decorator"))
+def scan(root=ROOT.glob("default")):
+    nested = lambda: ROOT.glob("lambda")
+    outer(root, lambda: check("ls-files"))
+    def child():
+        return ROOT.glob("child")
+
+def scan(root):
+    outer(root, lambda: check("ls-files"))
+    conf.read("nested_setting")
+shutil.copytree(factory() / "config", destination)
+""", "fixture.py")
+        self.assertEqual(facts.imports, ((0, "shallow", ()), (0, "scripts.lib", ("conf",)), (0, "deep", ())))
+        self.assertEqual(facts.config_reads, frozenset({"*", "nested_setting"}))
+        root = affected.ScanPath(affected.SourceFileRoot(), ("..",))
+        parameter = affected.ScanPath(affected.ParameterRoot("root"))
+        self.assertEqual(tuple((scope.name, scope.parameters, scope.scans) for scope in facts.scan_scopes), (
+            ("", (), ()),
+            ("scan", ("root",), (affected.ScanPattern(parameter, "*", True),)),
+            ("scan.child", (), (affected.ScanPattern(root, "child", False),)),
+        ))
+
+    def test_copytree_config_detection_applies_to_the_source(self) -> None:
+        facts = affected.extract_facts('shutil.copytree(source, destination / "config")', "fixture.py")
+        self.assertEqual(facts.config_reads, frozenset())
+
     def test_scan_graph_reuses_shared_acyclic_calls(self) -> None:
         caller = "scripts/checks/test_caller.py"
         helper = "scripts/lib/audit.py"
