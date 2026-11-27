@@ -44,7 +44,7 @@ from scripts.nightly_review import candidates
 from scripts.production.production_doc import read_production
 from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
-from scripts.production import the_list
+from scripts.production import list_exchange, the_list
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
@@ -8758,11 +8758,20 @@ void fetch('/results',{method:'POST',body:JSON.stringify(hidden && review.datase
             ask='Which layout should the page use?',context='Choose a layout.',items=[],
             recommend='',choices=['Compact layout','Wide layout'])
         update_registration.write_question_record(question_item.source.record, assign_id=True)
-        _ = self.investigation()
+        filed = self.investigation()
         _ = self.investigation(False)
         for _ in range(3):
             done = self.investigation()
             _ = investigation.mark_read(done.owner, done.id)
+        filed_key = review_items.investigation_record_key(filed)
+        confirmed_answers = [
+            exchange.answer.text
+            for entry in list_page.records()
+            for exchange in the_list.confirmed_exchanges(
+                filed_key, investigation.ListDestination(entry.keeper, entry.item.number), entry.item.filed_exchanges)
+            if isinstance(exchange.answer, list_exchange.ExchangeAnswer)
+        ]
+        self.assertEqual(confirmed_answers, [filed.answer])
         source = browser_markup(self.root)
         setup = r"""<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, original=MARKUP;
@@ -8812,8 +8821,8 @@ window.fetch=async(_url,options={})=>{
  const showValue=(doc=document)=>doc.querySelector('[data-filter-row="show"] [data-filter-value][aria-pressed="true"]').dataset.filterValue;
  try{
   await flush();
-  check(shown().length===5 && shown().every(row=>row.dataset.state==='Open'),'Open includes only Open records');
-  check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='5',
+  check(shown().length===4 && shown().every(row=>row.dataset.state==='Open'),'Open includes only Open records');
+  check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='4',
     'F007: Open counts only Open records');
   check(!document.querySelector('[data-filter-row="show"] [data-filter-value="Validating"]'),
     'The Show row has no Validating chip.');
@@ -8906,7 +8915,7 @@ window.fetch=async(_url,options={})=>{
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
   check(status.hidden && !status.textContent,'The animation leaves no action status.');
-  check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='4','the count excludes the saved row');
+  check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='3','the count excludes the saved row');
   check(rows().every(row=>!recordIsOpen(row)),'no next card opens');
   choose('list-show','all');
   const allTarget=rows().find(row=>row.dataset.type==='change' && row!==target);allTarget.querySelector('.list-toggle').click();await readyReviewCard(allTarget);
@@ -9084,7 +9093,7 @@ window.fetch=async(_url,options={})=>{
   }
   const beforeShowRequests=window.refreshRequests.length;
   choose('list-show','all');await flush();await flush();
-  check(document.querySelector('[data-filter-row="show"] [data-filter-value="all"] b').textContent==='3' &&
+  check(document.querySelector('[data-filter-row="show"] [data-filter-value="all"] b').textContent==='2' &&
     rows().every(row=>row.dataset.state!=='Done'),
     'All excludes completed records, saved verdicts and the saved answer.');
   check(window.refreshRequests.length===beforeShowRequests,
