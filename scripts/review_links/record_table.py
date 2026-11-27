@@ -1478,6 +1478,8 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  clearTimeout(highlightTimer);
  row.style.scrollMarginTop='16px';
  row.querySelector('.list-toggle').focus({preventScroll:true});
+ // A header resize can precede its observer callback.
+ if(typeof measurePageActions==='function') measurePageActions();
  row.scrollIntoView({block:'start',behavior:'instant'});
  row.dataset.recordHighlight='';
  highlightedRow=row;
