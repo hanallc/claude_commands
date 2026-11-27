@@ -604,6 +604,58 @@ class LocalReviewTests(unittest.TestCase):
                 account.assert_called_once_with("units")
             call.assert_not_called()
 
+    def write_pre_update_question_verdict(self, key: review.QuestionKey, body: str, *,
+                                          failures: Sequence[review.RuleFailureRecord] = ()) -> None:
+        standard = review.CONSOLE_STANDARD.read_text()
+        instructions = review.PROMPT_FILE.read_text().partition(review.CONSOLE_PROMPT_HEADING)[2]
+        prompt = f"Loaded push rules\n{standard}\n{instructions}"
+        rules = review.question_part_digest((prompt, review.SCHEMA, review.CODE_RULES, review.PART_RULES,
+                                             review.zone_line()))
+        part = review.QuestionPart(role="draft", text=body)
+        digest = review.question_part_digest((rules, part, 0))
+        scope = review.question_part_digest((key.name, "request", key.request_key))
+        path = review.state_path() / "question-verdicts" / f"{scope}.json"
+        write_text_atomic(path, json.dumps({digest: {"questions": [], "failed_rules": list(failures)}}))
+
+    def test_console_question_keeps_a_pre_update_hold_during_model_outage(self) -> None:
+        body = "Retry the download?"
+        key = review.QuestionKey("demo", body, request_key="download")
+        failure = review.RuleFailureRecord(rule="console-standard-4", quote=body)
+        held = review.QuestionReviewFailed(body, (), (review.RuleFailure(**failure),))
+        runner = FakeReviewer(verdict(self.draft), failure="timeout")
+        hold = review.state_path() / "questions" / f"{key.digest}.json"
+
+        with mock.patch.object(review, "zone_line", return_value=review.zone_line()):
+            self.write_pre_update_question_verdict(key, body, failures=[failure])
+            review.save_question_review(key, held)
+            before = hold.read_bytes()
+            self.assertEqual(review.review_question(key, body, runner=runner, console_kind="question"), held)
+            self.assertEqual(hold.read_bytes(), before)
+        self.assertEqual([call.argv[0] for call in runner.calls], ["zsh"])
+
+    def test_console_question_rechecks_a_changed_title_after_a_pre_update_approval(self) -> None:
+        from scripts.console_text import check as console_text
+
+        title = "Retry the download?"
+        revised_title = "Keep the partial file?"
+        body = f"{title}\n\n{revised_title}"
+        key = review.QuestionKey("demo", title, request_key="download")
+        draft = replace(self.draft, title="", body=body, action=NoActionRequired())
+        questions = ("Which choice do you recommend?",)
+        runner = FakeReviewer(verdict(draft, "ask", questions=list(questions), failed_rules=[]))
+        real_review = review.review_question
+
+        def run(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
+            return real_review(key, text, runner=runner, console_kind=console_kind)
+
+        with (mock.patch.object(review, "zone_line", return_value=review.zone_line()),
+              mock.patch.object(review, "review_question", side_effect=run)):
+            self.write_pre_update_question_verdict(key, body)
+            revised_key = replace(key, text=revised_title)
+            self.assertEqual(console_text.check(body, "question", key=revised_key, title=revised_title),
+                             review.QuestionAwaitingFacts(body, questions))
+        self.assertEqual(sum(Path(call.argv[0]).name == "claude" for call in runner.calls), 1)
+
     def test_console_question_keeps_the_passed_title_after_two_other_lines_change(self) -> None:
         title = "## The change for your 07:15 PST Yes is ready: may it go in?"
         question = (

@@ -1134,6 +1134,13 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
             if whole and reused:
                 cached, _ = combine_question_verdicts(draft, list(reused.values()), metadata(), line_review)
                 return cached
+            if question and whole:
+                old_digest = question_part_digest((rules, parts[0], 0))
+                if old_digest in saved:
+                    verdict = part_verdict(_object(saved[old_digest]), draft)
+                    if verdict.questions or verdict.failures:
+                        held, _ = combine_question_verdicts(draft, [verdict], metadata(), ConsoleLineReview())
+                        return held
             pending = {number: part for number, part in enumerate(parts, 1) if number not in reused}
             if not whole:
                 fields = json.dumps({"draft": draft.body, "parts": pending}, ensure_ascii=False)
