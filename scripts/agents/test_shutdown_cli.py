@@ -1270,10 +1270,10 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             self.marked = None
         return stop_resume.Stopped(identity, owner["pid"]) if owner else stop_resume.NotRunning(identity)
 
-    def retire(self, *arguments: str) -> tuple[int, str]:
+    def retire(self, *arguments: str, reference: str = "") -> tuple[int, str]:
         output = io.StringIO()
         with redirect_stdout(output), redirect_stderr(output):
-            code = shutdown.main(["retire", str(self.unit_staff_id), *arguments])
+            code = shutdown.main(["retire", reference or str(self.unit_staff_id), *arguments])
         return code, output.getvalue()
 
     def remote_call(self, args: list[str], stdin: str = "", limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT) -> tuple[int, str]:
@@ -1333,6 +1333,50 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertIsNone(staff.by_id(row.id))
         self.assertFalse(shutdown.retirement_journal(row).exists())
 
+    def test_retirement_keeps_a_worker_added_after_the_cleanup_snapshot(self) -> None:
+        row = staff.by_id(self.unit_staff_id)
+        assert row is not None
+        added: list[staff.StaffRow] = []
+
+        def admit_worker(_identity: str) -> None:
+            added.append(fixture_worker("late-worker", row.id))
+
+        with mock.patch.object(copies, "remove_trees", side_effect=admit_worker):
+            code, output = self.retire()
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("workers changed before retirement", output)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(staff.by_id(added[0].id), added[0])
+
+    def test_remote_retirement_keeps_a_unit_resumed_on_the_worktree_host(self) -> None:
+        row = self.move_to_other_machine()
+        read_liveness = session_records.session_liveness
+        resumed = False
+
+        def resume_after_stop(_identity: str) -> None:
+            nonlocal resumed
+            self.assertEqual(remote.local_machine(), "mac")
+            with staff.slot_operation(row.id, row.name, join=False):
+                resumed = True
+
+        def liveness(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+            if resumed and identity == row.current_session and remote.local_machine() == "mac":
+                self.assertNotIn("STAFF_OPERATION_FD", os.environ)
+                with self.assertRaisesRegex(staff.StaffRefused, "another operation holds this row"):
+                    with staff.slot_operation(row.id, row.name, join=False):
+                        self.fail("the resume lock must be held during the liveness check")
+                return sessions.LiveSessionProcess(4101)
+            observed = read_liveness(identity)
+            assert isinstance(observed, (sessions.LiveSessionProcess, sessions.SessionNotLive))
+            return observed
+
+        with (mock.patch.object(copies, "remove_trees", side_effect=resume_after_stop),
+              mock.patch.object(session_records, "session_liveness", side_effect=liveness)):
+            code, output = self.retire()
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("native session is live", output)
+        self.assertEqual(staff.by_id(row.id), row)
+
     def test_retirement_removes_an_old_record_with_a_removed_worktree(self) -> None:
         self.park_without_worktree()
         row = staff.by_id(self.unit_staff_id)
@@ -1372,19 +1416,6 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 finally:
                     case.doCleanups()
 
-    def test_retirement_keeps_content_introduced_by_a_merge_commit(self) -> None:
-        _ = git(self.worktree, "reset", "--hard", "main")
-        write_text_atomic(self.worktree / "merge-only.txt", "work saved by the merge\n")
-        _ = git(self.worktree, "add", "merge-only.txt")
-        tree = git(self.worktree, "write-tree")
-        commit = git(self.worktree, "commit-tree", tree, "-p", "main^1", "-p", "main^2", "-m", "Keep merge work")
-        _ = git(self.worktree, "reset", "--hard", commit)
-        code, output = self.retire()
-        self.assertEqual(code, 1, output)
-        self.assertIn(f"unmerged commits on alpha-branch: {commit}", output)
-        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), commit)
-        self.assertIsNotNone(staff.by_id(self.unit_staff_id))
-
     def test_legacy_retirement_keeps_a_replacement_checkout_at_the_old_path(self) -> None:
         self.park_without_worktree()
         row = staff.by_id(self.unit_staff_id)
@@ -1401,15 +1432,29 @@ class RetireUnitTests(ShutdownRepositoryFixture):
 
     def test_remote_legacy_retirement_uses_the_production_checkout(self) -> None:
         self.park_without_worktree()
+        caller_checkout = self.root / "caller-checkout"
+        _ = git(self.root, "clone", "-q", str(self.root / "origin.git"), str(caller_checkout))
+        production = read_production("alpha")
         row = self.move_to_other_machine()
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("mac", self.worktree,
             staff.ParkedBranch("alpha-branch")), expected=row.worktree)
         self.assertFalse((self.worktree.parent / ".git").exists())
-        code, output = self.retire()
+        _ = git(caller_checkout, "branch", "alpha-branch", "origin/alpha-branch")
+        caller_tip = git(caller_checkout, "rev-parse", "alpha-branch")
+
+        def peer_checkout(word: str) -> Path:
+            self.assertEqual(remote.local_machine(), "mac")
+            self.assertEqual(word, "origin")
+            return self.checkout
+
+        with (mock.patch.object(shutdown, "retirement_production_of", return_value=replace(production, checkout=caller_checkout)),
+              mock.patch.object(worktree_records, "main_checkout_path", side_effect=peer_checkout)):
+            code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertIsNone(staff.by_id(row.id))
         self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
         self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+        self.assertEqual(git(caller_checkout, "rev-parse", "alpha-branch"), caller_tip)
 
     def test_retirement_retry_keeps_the_new_terminal_after_the_old_shell_exits(self) -> None:
         row = staff.by_id(self.unit_staff_id)
@@ -1465,26 +1510,42 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(git(self.worktree, "branch", "--show-current"), "replacement")
         self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch").strip(), "alpha-branch")
 
-    def test_retirement_can_retry_a_journal_unlink_after_staff_removal(self) -> None:
-        row = staff.by_id(self.unit_staff_id)
-        assert row is not None
-        journal = shutdown.retirement_journal(row)
-        unlink = Path.unlink
-
-        def fail_unlink(path: Path, missing_ok: bool = False) -> None:
-            if path == journal:
-                raise PermissionError("fixture journal unlink failed")
-            unlink(path, missing_ok=missing_ok)
-
-        with mock.patch.object(Path, "unlink", fail_unlink):
-            code, output = self.retire()
-        self.assertEqual(code, 1, output)
-        self.assertNotIn("alpha retired", output)
-        self.assertTrue(journal.exists())
-        code, output = self.retire()
+    def test_retirement_ignores_an_unrelated_malformed_producer_receipt(self) -> None:
+        receipt = pane_record.record_directory() / ".producer-retire-unrelated"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(receipt, "{broken")
+        code, output = self.retire(reference="alpha/alpha")
         self.assertEqual(code, 0, output)
-        self.assertIsNone(staff.by_id(row.id))
-        self.assertFalse(journal.exists())
+        self.assertIsNone(staff.by_id(self.unit_staff_id))
+        self.assertEqual(receipt.read_text(encoding="utf-8"), "{broken")
+
+    def test_retirement_can_retry_a_journal_unlink_after_staff_removal(self) -> None:
+        for reference in ("", "alpha/alpha"):
+            with self.subTest(reference=reference):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    row = staff.by_id(case.unit_staff_id)
+                    assert row is not None
+                    journal = shutdown.retirement_journal(row)
+                    unlink = Path.unlink
+
+                    def fail_unlink(path: Path, missing_ok: bool = False) -> None:
+                        if path == journal:
+                            raise PermissionError("fixture journal unlink failed")
+                        unlink(path, missing_ok=missing_ok)
+
+                    with mock.patch.object(Path, "unlink", fail_unlink):
+                        code, output = case.retire(reference=reference)
+                    self.assertEqual(code, 1, output)
+                    self.assertNotIn("alpha retired", output)
+                    self.assertTrue(journal.exists())
+                    code, output = case.retire(reference=reference)
+                    self.assertEqual(code, 0, output)
+                    self.assertIsNone(staff.by_id(row.id))
+                    self.assertFalse(journal.exists())
+                finally:
+                    case.doCleanups()
 
     def test_retirement_checks_detached_head_and_removes_the_merged_checkout(self) -> None:
         _ = git(self.worktree, "switch", "--detach")
@@ -1496,6 +1557,31 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertIn(f"unmerged commits on HEAD: {commit}", output)
         self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), commit)
         _ = git(self.checkout, "merge", "-q", "--no-ff", "-m", "Merge the detached work", commit)
+        write_text_atomic(self.worktree / "work.txt", "late detached work\n")
+        _ = git(self.worktree, "commit", "-qam", "Keep late detached work")
+        late = git(self.worktree, "rev-parse", "HEAD")
+        _ = git(self.worktree, "reset", "--hard", commit)
+        read_dirty = shutdown.retirement_dirty_paths
+        removal_started = False
+
+        def finish_copy_cleanup(_identity: str) -> None:
+            nonlocal removal_started
+            removal_started = True
+
+        def switch_after_status(path: Path, *, settings: conf.ConfigRead) -> tuple[list[str], bool]:
+            result = read_dirty(path, settings=settings)
+            if removal_started:
+                _ = git(path, "reset", "--hard", late)
+            return result
+
+        with (mock.patch.object(copies, "remove_trees", side_effect=finish_copy_cleanup),
+              mock.patch.object(shutdown, "retirement_dirty_paths", side_effect=switch_after_status)):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("the Git worktree identity changed", output)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), late)
+        self.assertIsNotNone(staff.by_id(self.unit_staff_id))
+        _ = git(self.checkout, "merge", "-q", "--no-ff", "-m", "Merge the late detached work", late)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertIsNone(staff.by_id(self.unit_staff_id))
@@ -1694,6 +1780,10 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                             case.assertEqual(staff.by_id(row.id), row)
                             journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
                             case.assertTrue(journal.exists())
+                            legacy = cast(dict[str, object], json.loads(journal.read_text(encoding="utf-8")))
+                            _ = legacy.pop("shell_pid", None)
+                            _ = legacy.pop("shell_start", None)
+                            write_text_atomic(journal, json.dumps(legacy) + "\n")
                         code, output = case.retire()
                     send.assert_not_called()
                     case.assertEqual(code, 1, output)
@@ -1703,6 +1793,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     case.assertEqual(output.count("anomaly:"), 1, output)
                     case.assertIn("alpha:w1:p1: pane close failed", output)
                     case.assertIn("terminal identity changed", output)
+                    if journal_retry:
+                        case.assertIn("The journal has no shell identity.", output)
+                        case.assertIn(f"Run agents retire {row.id} after the replacement pane closes.", output)
                     case.assertFalse(case.worktree.exists())
                     case.assertEqual(staff.by_id(row.id), row)
                 finally:
@@ -1787,11 +1880,25 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             ("missing merge ref after rev-list", True),
             ("stale local, published revert", True),
             ("custom driver", True),
+            ("merge-only content", True),
         ):
             with self.subTest(branch_state=branch_state):
                 case = RetireUnitTests()
                 case.setUp()
                 try:
+                    if branch_state == "merge-only content":
+                        _ = git(case.worktree, "reset", "--hard", "main")
+                        write_text_atomic(case.worktree / "merge-only.txt", "work saved by the merge\n")
+                        _ = git(case.worktree, "add", "merge-only.txt")
+                        tree = git(case.worktree, "write-tree")
+                        commit = git(case.worktree, "commit-tree", tree, "-p", "main^1", "-p", "main^2", "-m", "Keep merge work")
+                        _ = git(case.worktree, "reset", "--hard", commit)
+                        code, output = case.retire()
+                        case.assertEqual(code, 1, output)
+                        case.assertIn(f"unmerged commits on alpha-branch: {commit}", output)
+                        case.assertEqual(git(case.worktree, "rev-parse", "HEAD"), commit)
+                        case.assertIsNotNone(staff.by_id(case.unit_staff_id))
+                        continue
                     if branch_state == "custom driver":
                         _ = git(case.checkout, "config", "merge.keepours.driver", "true")
                         write_text_atomic(case.worktree / ".gitattributes", "work.txt merge=keepours\n")

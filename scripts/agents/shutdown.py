@@ -928,7 +928,7 @@ def main(argv: list[str] | None = None) -> int:
             if (producer_lifecycle.pending_admission(options.session)
                     or producer_lifecycle.lookup(options.session, record) is not None):
                 return producer_lifecycle.retire(options.session, to=options.to)
-            if not any(options.session in (row.name, row.id, row.current_session)
+            if "/" not in options.session and not any(options.session in (row.name, row.id, row.current_session)
                        for row in record.all_rows) and producer_lifecycle.finish_removed(options.session, record):
                 return 0
             if options.to:
@@ -1498,13 +1498,10 @@ def retirement_remove(unit: RetiringUnit, checked: RetirementCheck, *, settings:
             registered = {Path(field.removeprefix("worktree ")).resolve() for field in listed.stdout.split("\0")
                           if field.startswith("worktree ")}
             path = unit.worktree.resolve()
-            if unit.worktree.is_dir():
-                head = retirement_checkout_head(unit)
-                if path not in registered or (isinstance(head, git_files.DetachedHead)
-                                             and head.commit != checked.detached_commit):
-                    return [f"{unit.worktree}: the Git worktree identity changed"]
             force: list[str] = []
             if unit.worktree.is_dir():
+                if path not in registered:
+                    return [f"{unit.worktree}: the Git worktree identity changed"]
                 dirty, recorder_only = retirement_dirty_paths(unit.worktree, settings=settings)
                 if dirty:
                     return [f"uncommitted work in {unit.worktree}: {', '.join(dirty)}"]
@@ -1516,6 +1513,10 @@ def retirement_remove(unit: RetiringUnit, checked: RetirementCheck, *, settings:
             if unit.worktree.is_dir() or path in registered:
                 if isinstance(unit.staff_member.worktree, staff.RemovedWorktree):
                     return [f"{unit.worktree}: the recorded worktree was removed"]
+                if unit.worktree.is_dir():
+                    head = retirement_checkout_head(unit)
+                    if isinstance(head, git_files.DetachedHead) and head.commit != checked.detached_commit:
+                        return [f"{unit.worktree}: the Git worktree identity changed"]
                 result = retirement_git(unit, "worktree", "remove", *force, str(unit.worktree), settings=settings)
                 if result.returncode:
                     return [retirement_failure(result)]
@@ -1583,7 +1584,7 @@ def retirement_journal(row: staff.StaffRow) -> Path:
 
 def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSnapshot,
                         *, merge_branch: str = "", finish_step: bool = False,
-                        why: str | None = None, production_checkout: str = "") -> LocalUnitOutcome:
+                        why: str | None = None, repository_word: str = "") -> LocalUnitOutcome:
     """Run machine-bound work and require an attributed remote answer."""
     location = row.worktree
     assert not isinstance(location, staff.WorktreeUnfilled)
@@ -1593,7 +1594,7 @@ def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSna
         if unit_machine_is_local(location.machine):
             raise ValueError(f"worktree belongs to this machine: {location.machine}")
         payload = {"action": action, "identity": str(row.id), "merge_branch": merge_branch, "finish_step": finish_step,
-                   "production_checkout": production_checkout,
+                   "repository_word": repository_word,
                    "rows": [member.to_json() for member in record.rows]}
         if why is not None:
             payload["why"] = why
@@ -1673,8 +1674,8 @@ def unit_local_command() -> int:
                         checkout = git_files.at(parent.worktree.path).toplevel
                     elif parent is not None and isinstance(parent.doc, (staff.LiveDoc, staff.WrappedDoc)) and unit_machine_is_local(parent.doc.machine):
                         checkout = read_production(parent).checkout
-                    elif fields.get("production_checkout"):
-                        checkout = git_files.at(Path(str(fields["production_checkout"]))).toplevel
+                    elif fields.get("repository_word"):
+                        checkout = worktrees.main_checkout_for_word(str(fields["repository_word"]))
                     else:
                         raise ValueError("the production checkout is unknown on this machine")
                     branch = location.branch.value if isinstance(location.branch, staff.ParkedBranch) else ""
@@ -1687,6 +1688,8 @@ def unit_local_command() -> int:
                                         checkout, Path(), ZoneInfo("UTC"), row)
                 unit = RetiringUnit(production, row.name, location.path, branch, row)
                 result["code"] = retire_local_unit(unit, settings=settings, record=record, saved=saved)
+                if result["code"] == 0:
+                    staff.retire_unit(row, expected_workers=record.find(kind="worker", parent=row.id))
             else:
                 raise ValueError("unknown remote lifecycle action")
         except (OSError, ValueError, Refusal, staff.StaffRefused, staff.StaffNotFound,
@@ -1823,7 +1826,11 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
                                     and reference.id in owners):
                                 pane_launch.retire_launch(pane_record.record_directory() / f"{session}.json", identity, launch)
                             continue
-                    raise herdr_types.HerdrFailure(f"{identity}: terminal identity changed; would close another terminal", "wrong_target")
+                    reason = f"{identity}: terminal identity changed"
+                    if isinstance(shell, UnprovedShell):
+                        reason += (f". Run agents retire {owner.id} after the replacement pane closes."
+                                   " The journal has no shell identity.")
+                    raise herdr_types.HerdrFailure(reason, "wrong_target")
                 if pane is None or pane.get("terminal_id") != terminal:
                     if not client.close_retained_pane(identity, terminal=terminal):
                         print(f"anomaly: {session}:{identity}: pane close is not confirmed")
@@ -1969,20 +1976,30 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
     row = unit.staff_member
     if isinstance(row.worktree, staff.WorktreeUnfilled):
         raise ValueError(f"{row.id}: staff worktree is unfilled")
-    local = unit_machine_is_local(row.worktree.machine)
-    if local:
-        code = retire_local_unit(unit, settings=settings, record=record, saved=saved_retirement(row))
+    if unit_machine_is_local(row.worktree.machine):
+        with staff.operation():
+            code = retire_local_unit(unit, settings=settings, record=record, saved=saved_retirement(row))
+            if code:
+                return code
+            save_retirement_completion(unit, saved_retirement(row))
+            staff.retire_unit(row, expected_workers=record.find(kind="worker", parent=row.id))
     else:
+        word = build_folders.repo_word(unit.production.repository_checkout) if isinstance(row.worktree, staff.RemovedWorktree) else ""
+        save_retirement_completion(unit, {})
         code = unit_remote_command("retire", row, record, merge_branch=unit.production.merge_branch,
-                                   production_checkout=str(unit.production.checkout))["code"]
-    if code:
-        return code
+                                   repository_word=word)["code"]
+        if code:
+            return code
+    return retirement_complete(row)
+
+
+def save_retirement_completion(unit: RetiringUnit, saved: dict[str, object]) -> None:
+    row = unit.staff_member
     journal = retirement_journal(row)
     journal.parent.mkdir(parents=True, exist_ok=True)
-    saved = saved_retirement(row) if local else {}
-    write_text_atomic(journal, json.dumps({**saved, "completed_row": row.to_json()}) + "\n")
-    staff.retire_unit(row)
-    return retirement_complete(row)
+    write_text_atomic(journal, json.dumps({
+        **saved, "completed_row": row.to_json(), "qualified_name": f"{unit.production.name}/{row.name}",
+    }) + "\n")
 
 
 def retirement_complete(row: staff.StaffRow) -> int:
@@ -2000,12 +2017,15 @@ def retirement_complete(row: staff.StaffRow) -> int:
 def retired_unit_receipt(reference: str, record: staff.StaffSnapshot) -> staff.StaffRow | None:
     matches: list[staff.StaffRow] = []
     for journal in retirement_journal_folder().glob("*.json"):
-        raw = retirement_json(journal).get("completed_row")
+        saved = retirement_json(journal)
+        raw = saved.get("completed_row")
         if raw is None:
             continue
         row = staff.StaffRow.from_json(raw)
+        parent = record.parent_of(row)
+        qualified = f"{parent.name}/{row.name}" if parent is not None else saved.get("qualified_name")
         if (row.kind == "unit" and not isinstance(row.worktree, staff.WorktreeUnfilled) and journal == retirement_journal(row)
-                and record.by_id(row.id) is None and reference in (row.id, row.name, row.current_session)):
+                and record.by_id(row.id) is None and reference in (row.id, row.name, row.current_session, qualified)):
             matches.append(row)
     if len(matches) > 1:
         raise ValueError(f"{reference}: several retirement receipts match; use a staff id")
@@ -2047,8 +2067,7 @@ def retire_named_unit(name: str) -> int:
                 unit_config.ConfigRefused, subprocess.SubprocessError) as error:
             print(f"retire: {error}")
             return 1
-    with staff.operation():
-        return staff.cli_result(apply)
+    return staff.cli_result(apply)
 
 
 @dataclass(frozen=True)

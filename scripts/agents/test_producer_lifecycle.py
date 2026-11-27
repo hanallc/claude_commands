@@ -660,9 +660,12 @@ class ProducerLifecycleTests(unittest.TestCase):
         self.assertIsNone(staff.snapshot().by_id(row.id))
         self.assertTrue(handoff.exists())
         self.assertTrue(receipt.exists())
+        unrelated = receipts / ".producer-retire-unrelated"
+        _ = unrelated.write_text("{broken", encoding="utf-8")
         self.assertEqual(command("retire", row.name), (0, "dwight: retired\n", ""))
         self.assertFalse(handoff.exists())
         self.assertFalse(receipt.exists())
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "{broken")
 
 
     def test_producer_retirement_can_skip_handoff_for_a_clone(self) -> None:

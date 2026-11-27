@@ -6,6 +6,7 @@ import os
 import re
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
 from urllib.parse import quote
@@ -318,23 +319,33 @@ def _clear_retirement_state(identity: staff.StaffId) -> None:
         _path(operation, identity).unlink(missing_ok=True)
 
 
+def _retirement_completion_path(row: staff.StaffRow) -> Path:
+    references = "@".join(sha256(value.encode()).hexdigest() for value in (row.name, row.current_session, row.id))
+    return pane_record.record_directory() / f".producer-retired-{references}"
+
+
 def finish_removed(reference: str, record: staff.StaffSnapshot) -> bool:
     """Clear receipts for a producer whose staff row is gone."""
-    matches: list[staff.StaffRow] = []
-    for path in pane_record.record_directory().glob(".producer-retire-*"):
+    encoded = sha256(reference.encode()).hexdigest()
+    paths = [path for path in pane_record.record_directory().glob(".producer-retired-*")
+             if encoded in path.name.removeprefix(".producer-retired-").split("@")]
+    legacy_path = _path("retire", reference)
+    matches: dict[staff.StaffId, tuple[staff.StaffRow, Path]] = {}
+    for path in (legacy_path, *paths):
         raw = _read(path).get("completed_row")
         if raw is None:
             continue
         row = staff.StaffRow.from_json(raw)
-        if (row.kind == "producer" and path == _path("retire", row.id)
+        if (row.kind == "producer" and path in (_path("retire", row.id), _retirement_completion_path(row))
                 and record.by_id(row.id) is None and reference in (row.id, row.name, row.current_session)):
-            matches.append(row)
+            matches[row.id] = row, path
     if len(matches) > 1:
         raise ValueError(f"{reference}: several retirement receipts match; use a staff id")
     if not matches:
         return False
-    row = matches[0]
+    row, receipt = next(iter(matches.values()))
     _clear_retirement_state(row.id)
+    receipt.unlink(missing_ok=True)
     print(f"{row.name}: retired")
     return True
 
@@ -400,8 +411,11 @@ def requires_handoff(row: staff.StaffRow) -> bool:
 def _finish_retirement(row: staff.StaffRow) -> int:
     path = _path("retire", row.id)
     _write(path, {**_read(path), "completed_row": row.to_json()})
+    completion = _retirement_completion_path(row)
+    _write(completion, {"completed_row": row.to_json()})
     _ = staff.retire(row.id)
     _clear_retirement_state(row.id)
+    completion.unlink(missing_ok=True)
     print(f"{row.name}: retired")
     return 0
 
