@@ -51,8 +51,8 @@ from scripts.buildlog import treekey
 from scripts.lib.build_copies import CopyGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.build_queue.admission_records import (
-    ACTIVE_GATES as ACTIVE_GATES, COPY_ERROR_STATUS as COPY_ERROR_STATUS, OWNER as OWNER,
-    ActiveGate as ActiveGate, CopyError as CopyError, checked_owner as checked_owner, recorded_owner as recorded_owner,
+    ACTIVE_GATES as ACTIVE_GATES, COPY_ERROR_STATUS as COPY_ERROR_STATUS, OWNER,
+    ActiveGate, CopyError as CopyError, checked_owner, recorded_owner as recorded_owner,
 )
 from scripts.lib.build_steps import (
     GATE_SCRIPTS, MERGE_GATE_PROGRAMS,

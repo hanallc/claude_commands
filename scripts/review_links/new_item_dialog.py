@@ -11,7 +11,7 @@ from enum import Enum, StrEnum
 from typing import Literal, cast
 
 from scripts.production import staff
-from scripts.production.record_store import SubmissionConflict as SubmissionConflict, SubmissionError as SubmissionError
+from scripts.production.record_store import SubmissionConflict, SubmissionError
 from scripts.review_links import page_frame, reply_tokens
 
 

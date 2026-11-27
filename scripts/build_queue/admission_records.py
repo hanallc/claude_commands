@@ -31,7 +31,7 @@ from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, Li
 from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
-from scripts.agents.remote import local_machine
+from scripts.buildlog.store import host_name
 from scripts.lib import conf, copy_record, scratch
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.process_stat import PROC_ROOT, process_fields
@@ -2269,7 +2269,9 @@ def recorded_owner(source: Path, *,
         if isinstance(owner, str):
             return checked_owner(owner)
     try:
-        member = staff.local_snapshot().by_worktree(local_machine(), source.resolve())
+        snapshot = staff.local_snapshot()
+        machine = host_name() or ("mac" if sys.platform == "darwin" else "natedev")
+        member = snapshot.by_worktree(machine, source.resolve())
         if member is not None:
             return str(member.id)
     except staff.StaffUnreadable:

@@ -47,9 +47,8 @@ from types import CodeType, ModuleType
 from typing import IO, TYPE_CHECKING, Literal, Protocol, cast, override
 
 from scripts.agents import detached_run_process, worker_lifecycle
-from scripts.build_hold.build_hold import (
-    CONFIRMED_STOP_SUFFIX as CONFIRMED_STOP_SUFFIX, PaneDispatchUnavailable as PaneDispatchUnavailable,
-    RunRecord as RunRecord, StopFields as StopFields, confirms_hold_stop as confirms_hold_stop,
+from scripts.agents.detached_run_record import (
+    CONFIRMED_STOP_SUFFIX, RunRecord as RunRecord,
     is_detached_run_record as _is_run_record, read_detached_record as _read_record,
     read_detached_record_if_present as _read_record_if_present, read_detached_stop_fields as _read_stop_fields,
     with_confirmed_detached_stop as _with_confirmed_stop,
