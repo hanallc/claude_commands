@@ -86,16 +86,16 @@ class OffloadForwardTests(OffloadCommandFixture):
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
             + 'run_nextest_logged ~/.claude/scripts/lint/lint nextest --workspace || echo mac_nextest_setup=failed; '
-            + """{ if cd "$HOME"/'.local'/'state'/'mac-test'/'test-mirror'/'hana'; then trim_started=$(date +%s); """
+            + '{ if cd "$HOME"/.local/state/mac-test/test-mirror/hana; then trim_started=$(date +%s); '
             + 'if LINT_SWEEP_BUDGET_GIB=64 "$HOME/.claude/scripts/lib/py" -B -c '
             + shlex.quote('import sys; from scripts.lint import sweep; from scripts.lib import conf; '
                           + 'config = conf.read("lint"); '
                           + 'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
                           + 'config.number(sweep.RECENT_KEY)))')
-            + """ "$HOME"/'.local'/'state'/'mac-test'/'test-mirror'/'hana'/'target' >/dev/null 2>&1; then """
+            + ' "$HOME"/.local/state/mac-test/test-mirror/hana/target >/dev/null 2>&1; then '
             + 'trim_status=0; else trim_status=$?; fi; '
             + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
-            + """if trim_size=$(du -sk "$HOME"/'.local'/'state'/'mac-test'/'test-mirror'/'hana'/'target' 2>/dev/null); then """
+            + 'if trim_size=$(du -sk "$HOME"/.local/state/mac-test/test-mirror/hana/target 2>/dev/null); then '
             + 'trim_size=${trim_size%%[[:space:]]*}; '
             + 'over_budget=$(awk -v size="$trim_size" -v budget=64 '
             + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
@@ -106,9 +106,9 @@ class OffloadForwardTests(OffloadCommandFixture):
             + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
             + 'else free_gib=; fi; if awk -v free="$free_gib" -v floor=60 '
             + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + """if size_kib=$(du -sk "$HOME"/'.local'/'state'/'mac-test'/'test-mirror'/'hana'/'target' 2>/dev/null); then """
+            + 'if size_kib=$(du -sk "$HOME"/.local/state/mac-test/test-mirror/hana/target 2>/dev/null); then '
             + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-            + """if rm -rf -- "$HOME"/'.local'/'state'/'mac-test'/'test-mirror'/'hana'/'target'; then """
+            + 'if rm -rf -- "$HOME"/.local/state/mac-test/test-mirror/hana/target; then '
             + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
             + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi; '
             + 'else echo mac_cleanup=$?; fi; } 2>/dev/null'

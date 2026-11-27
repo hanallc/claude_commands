@@ -15,10 +15,10 @@ import unittest
 from typing import TextIO, cast, override
 from unittest import mock
 
-from scripts.mac_test import eligibility, offload
+from scripts.mac_test import claim_state, eligibility, offload
 from scripts.lib import conf
 from scripts.lint import sweep
-from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
+from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell, write_token_reader
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -69,23 +69,34 @@ class FloorSweepTests(unittest.TestCase):
     def test_host_probe_reads_disk_and_saved_mirror_processes_in_one_command(self) -> None:
         _ = write_config_fixture(self.settings, "host=fixture-mac\nmirror_root=~/fixture-mirrors\n")
         scans = self.root / "scans"
+        write_token_reader(self.root, r'''[[ $3 == probe && $4 == '[["episode/old"], ["episode/new"], []]' ]] || exit 99
+printf 'scan\n' >> "$HOME/scans"
+printf '0 41\n1 42\n'
+''')
         commands = (
             "df() { printf 'header\\nfs a b 164\\n'; }\n"
             + "hostname() { printf 'fixture-mac\\n'; }\n"
-            + "pgrep() { return 1; }\n"
-            + f"lsof() {{ printf 'scan\\n' >> {shlex.quote(str(scans))}; "
-            + "printf 'p41\\nn/home/fixture/fixture-mirrors/old\\np42\\nn/home/fixture/fixture-mirrors/new\\n'; }\n"
             + """ps() { printf 'fixture-start-%s\\n' "$2"; }""" + "\n"
         )
+        claims: list[claim_state.HeldClaim] = []
+        for name in ("old", "new"):
+            saved = claim_state.CleanupOnlyMacRepository(name, name, f"{name}.json", name).for_remote_claim()
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": name, "episode": "episode", "attempt": name, "remote_host": "fixture-mac",
+                "submitting_session": "", "pid": 1, "proc_start": "start", "what": "test",
+                "worktree": ".", "since": "", "mac_repository": saved.record(),
+            }
+            claims.append(claim_state.HeldClaim(claim_state.RepositoryScope(name, name), self.root / name, record))
 
         def capture(arguments: list[str], _deadline: offload.CommandDeadline) -> offload.CommandOutput:
             self.assertEqual((arguments[0], arguments[-2]), ("ssh", "fixture-mac"))
             result = subprocess.run(["/bin/sh", "-c", commands + arguments[-1]],
-                                    capture_output=True, text=True, timeout=5, check=False)
+                                    env={**os.environ, "HOME": str(self.root)}, capture_output=True, text=True, timeout=5, check=False)
             return offload.CommandOutput(result.returncode, result.stdout, result.stderr)
 
         settings = eligibility.probe_settings(conf.read(self.settings))
-        with mock.patch.object(self.controller, "capture", side_effect=capture) as command:
+        with (mock.patch.object(self.controller, "capture", side_effect=capture) as command,
+              mock.patch.object(claim_state, "read_claims", return_value=tuple(claims))):
             snapshot = offload.probe_mac_host(self.controller, settings, "mac", ("old", "new", "absent"))
         self.assertEqual(snapshot, offload.MacHostProbeSnapshot(offload.ProbeSnapshot(164, "fixture-mac"), {
             "old": offload.MacMirrorProcess(41, "fixture-start-41"),
@@ -199,42 +210,6 @@ class FloorSweepTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "mirror_root"):
                     _ = sweep.mac_floor_settings(conf.read(self.settings))
 
-    def test_selector_rejects_its_assignment_text_and_near_miss_paths(self) -> None:
-        configured = "~/.fixture-mirrors"
-        for root in (configured, "~/fixture-mirrors"):
-            _ = write_config_fixture(self.settings, f"mirror_root={root}\n")
-            relative = root.removeprefix("~/")
-            near = relative.replace(".", "X", 1) if "." in relative else relative.replace("-", "X", 1)
-            for scope in (offload.ALL_MIRRORS, self.repository):
-                with self.subTest(root=root, scope=type(scope).__name__):
-                    script = offload.mirror_selector_script(scope)
-                    suffix = "/hana" if isinstance(scope, eligibility.KnownRepository) else ""
-                    candidates = (script, f"cargo /Users/test/{near}{suffix}/Cargo.toml")
-                    # Use the generated selector with the same regular expression engine as pgrep.
-                    commands = r'''
-pgrep() {
-    printf '%s\n' "$candidates" | awk -v pattern="$4" '$0 ~ pattern { print 811 }'
-}
-lsof() { printf 'p812\nn/Users/test/%s/\n' "$cwd_candidate"; }
-select_leftovers
-'''
-                    for candidate in candidates:
-                        answer = subprocess.run(["/bin/sh", "-c",
-                            script + "candidates=" + shlex.quote(candidate) + "\n"
-                            + "cwd_candidate=" + shlex.quote(near + suffix) + "\n" + commands],
-                            capture_output=True, text=True, timeout=10, check=False)
-                        self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "", ""))
-                    positive = subprocess.run(["/bin/sh", "-c",
-                        script + "candidates=" + shlex.quote(f"cargo /Users/test/{relative}{suffix}/Cargo.toml")
-                        + "\ncwd_candidate=" + shlex.quote(relative + suffix) + "\n" + commands],
-                        capture_output=True, text=True, timeout=10, check=False)
-                    self.assertEqual((positive.returncode, positive.stdout, positive.stderr), (0, "811\n812\n", ""))
-                    if root == configured:
-                        pattern = subprocess.run(["/bin/sh", "-c", script + 'printf "%s" "$mirror_command_pattern"'],
-                            capture_output=True, text=True, timeout=10, check=False)
-                        expected = "[.]" + relative[1:] + ("/hana([/'\"[:space:]]|$)" if suffix else "/")
-                        self.assertEqual((pattern.returncode, pattern.stdout, pattern.stderr), (0, expected, ""))
-
     def test_waiter_rejects_empty_result_after_owner_exit(self) -> None:
         directory = self.root / "state"
         directory.mkdir()
@@ -292,7 +267,6 @@ select_leftovers
         _ = write_config_fixture(self.settings,
             f"mirror_root={root}\nsweep_floor_roots=/tmp ~/rust {root}\n")
         self.assertEqual(offload.remote_mirror(self.repository), "fixture-mirrors/hana")
-        self.assertIn("[f]ixture-mirrors/", offload.mirror_selector_script(offload.ALL_MIRRORS))
         _, roots = sweep.mac_floor_settings(conf.read(self.settings))
         self.assertIn(root, roots)
 

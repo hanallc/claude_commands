@@ -239,6 +239,8 @@ def kern_procargs2(pid: int) -> bytes:
         raise OSError(ctypes.get_errno(), "kernel process record unavailable")
     if size.value > ctypes.sizeof(buffer):
         raise OSError("kernel process record exceeds buffer")
+    if size.value == ctypes.sizeof(buffer):
+        raise OSError("kernel process record fills buffer")
     return buffer.raw[:size.value]
 
 

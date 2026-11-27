@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Sequence, Callable, Generator, Mapping
 import io
 import json
 import fcntl
@@ -3112,11 +3112,15 @@ class MacActivityScriptTests(NotificationGuardedTestCase):
                                  ("/toolchain/bin/cargo", 1), ("/toolchain/bin/rustc", 1),
                                  ("/toolchain/bin/cargo-nextest", 1)):
             with self.subTest(executable=executable):
-                # Shell functions supply the Mac process snapshot; execute the actual selector and awk.
-                setup = ("id() { echo 501; }\npgrep() { echo 42; }\nlsof() { printf 'p42\nn/mirror\\n'; }\n"
-                         + f"ps() {{ printf '42 501 {executable}\\n'; }}\n")
-                result = subprocess.run(["bash", "-c", setup + mac_test.mac_activity_script()],
-                                        capture_output=True, text=True, timeout=10, check=False)
+                from scripts.mac_test.offload_test_commands import write_token_reader
+
+                with tempfile.TemporaryDirectory() as home:
+                    write_token_reader(Path(home), '[[ $3 == observe ]] || exit 99\nprintf "42\\n"\n')
+                    setup = ("id() { echo 501; }\n"
+                             + f"ps() {{ printf '42 501 {executable}\\n'; }}\n")
+                    result = subprocess.run(["bash", "-c", setup + mac_test.mac_activity_script(("episode/attempt",))],
+                                            env={**os.environ, "HOME": home}, capture_output=True, text=True,
+                                            timeout=10, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, f"active=1\nwork={work}\nrc=0\n")
 
@@ -3216,17 +3220,18 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         from scripts.copies import copies
         from scripts.mac_test.offload_test_commands import write_shell
 
-        write_shell(self.root / "pgrep", '[[ $* == *"/hana("* ]] || exit 2\nexit 1\n')
+        from scripts.mac_test.offload_test_commands import write_token_reader
+
+        write_token_reader(self.root, r'''[[ $3 == observe ]] || exit 99
+if [[ -n ${WATCH_SELECTED_PID:-} ]]; then
+    printf '%s\n' "$WATCH_SELECTED_PID"
+fi
+''')
         write_shell(self.root / "ioreg", f'machine_id="${{WATCH_MACHINE_ID-{self.machine_id}}}"\n'
                     + '[[ -n "$machine_id" ]] || exit 0\n'
                     + 'printf \'"IOPlatformUUID" = "%s"\\n\' "$machine_id"\n')
         write_shell(self.root / "lsof", r'''
-if [[ $* == *"-d cwd"* ]]; then
-    printf 'p2345\nn%s/.local/state/mac-test/mirror/cargo-liner\n' "$HOME"
-    if [[ -n ${WATCH_ACTIVE_ROOT:-} ]]; then
-        printf 'p2347\nn%s/%s/hana/target\n' "$HOME" "$WATCH_ACTIVE_ROOT"
-    fi
-elif [[ -n ${WATCH_FENCE_GATE:-} ]]; then
+if [[ -n ${WATCH_FENCE_GATE:-} ]]; then
     read -r reply < "$WATCH_FENCE_GATE"
 elif [[ ${WATCH_FENCE_OPEN:-} == yes ]]; then
     printf 'p2346\0ccargo helper\0\n'
@@ -3305,7 +3310,7 @@ fi
         fence.touch()
         _ = write_config_fixture(self.root / "mac_test.conf",
                                   "host=config-mac\nmirror_root=~/.new/mirrors\nclaim_idle_minutes=15\n")
-        with mock.patch.dict(os.environ, {"WATCH_ACTIVE_ROOT": self.original_root}), \
+        with mock.patch.dict(os.environ, {"WATCH_SELECTED_PID": "2347"}), \
              mock.patch.object(copies, "remote_lease", wraps=copies.remote_lease) as lease, \
              self.watch_mirror(mac_test.MacActive(2, 2)) as check:
             _ = self.watch_once()
@@ -3502,7 +3507,7 @@ fi
     def test_active_pass_clears_idle_since_with_state_lock_released(self) -> None:
         record = self.write_claim(idle_since="2026-10-13T12:00:00+00:00")
 
-        def check(config: mac_test.MacTestConfig, host: str) -> mac_test.MacActive:
+        def check(config: mac_test.MacTestConfig, host: str, _tokens: Sequence[str]) -> mac_test.MacActive:
             self.assertEqual(host, "claim-mac")
             self.assertEqual(config.claim_idle_minutes, 15)
             with self.paths.lock.open("a+") as state_lock:
@@ -3712,7 +3717,7 @@ fi
              mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
              mock.patch.object(offload, "read_leftovers") as check, mock.patch.object(mac_test, "send_message") as send:
             _ = self.watch_once()
-        activity.assert_called_once_with(mac_test.read_config(), "claim-mac")
+        activity.assert_called_once_with(mac_test.read_config(), "claim-mac", [f"{identity.episode}/{identity.attempt}"])
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(pending.read_text(), "pending")
         check.assert_not_called()
@@ -3868,9 +3873,10 @@ printf 'p%s\0csettler\0\np2345\0ccargo helper\0\np3456\0crustc\0\n' "$PPID"
                     self.assertEqual(stderr.getvalue(), f"cannot release: the remote start fence {reason}\n")
 
     def test_stopped_release_keeps_the_fence_holder_outside_the_mirror(self) -> None:
+        from scripts.buildlog import store
         from scripts.copies import copies
         from scripts.mac_test import eligibility, offload
-        from scripts.mac_test.offload_test_commands import write_shell
+        from scripts.mac_test.offload_test_commands import write_shell, write_token_reader
 
         saved = claim_state.CleanupOnlyMacRepository("repo-key", "alpha", "alpha.json", "alpha").for_remote_claim()
         record = self.write_claim(mac_repository=saved.record(), repo_name=saved.mirror_name, repo_key=saved.key)
@@ -3898,15 +3904,15 @@ else
     printf 'p3456\nn/elsewhere\n'
 fi
 ''')
-        write_shell(self.root / "pgrep", '[ -e ended ] && exit 1; printf "4567\\n"\n')
-        write_shell(self.root / "sleep", "exit 0\n")
+        write_token_reader(self.root, r'''[[ $3 == kill ]] || exit 99
+printf 'leftover_killed pid=4567 command=fixture compiler\n'
+''')
 
         results: list[subprocess.CompletedProcess[str]] = []
 
         def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             del options
-            command = 'kill() { printf "%s\\n" "$*" >> signals; [ "$*" = "-9 4567" ] && touch ended; }\n'
-            result = self.run_private_shell(command + arguments[-1], self.root)
+            result = self.run_private_shell(arguments[-1], self.root)
             results.append(result)
             return result
 
@@ -3917,10 +3923,11 @@ fi
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
             answer = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "",
                                                    remote_work=stopped)
-        signals = self.root / "signals"
-        self.assertEqual(signals.read_text().splitlines(), ["4567", "-9 4567"])
-        self.assertIn("leftovers=1\n", results[0].stdout)
+        self.assertIn("leftover_killed pid=4567 command=fixture compiler\nleftovers=1\n", results[0].stdout)
         self.assertEqual(answer, mac_test.ClaimReleaseRefused("the remote start fence is held by 2345 outside worker"))
+        entry, = (row for path in store.root().glob("*/*.jsonl") for row in store.locked_rows(path)
+                  if row.get("kind") == "ssh_attempt")
+        self.assertEqual((entry["cleanup"], entry["unresolved_count"]), ("unconfirmed", 1))
         self.assertEqual(json.loads(claim_path.read_text()), record)
         self.assertTrue(lock.exists())
         self.assertTrue(pending.exists())
@@ -3954,7 +3961,8 @@ fi
                 self.assertTrue(pending.exists())
 
                 def end_work(repository: offload.MirrorScope, target: str, slot: int, *,
-                             fence: Path) -> str:
+                             fence: Path, identity: claim_state.ClaimIdentity) -> str:
+                    self.assertEqual(identity.claim_id, record["claim_id"])
                     self.assertEqual((repository, target, slot), (offload.ALL_MIRRORS, self.paths.target, 1))
                     self.assertEqual(self.root / fence, fence_directory / (pending.name + ".lock"))
                     return f"echo ended-work; printf 'leftovers={leftovers}\\nrc=0\\n'"
@@ -3984,7 +3992,7 @@ fi
                     pending.unlink()
                     self.paths.run.unlink()
 
-    def test_stopped_legacy_claim_counts_all_mirrors_without_a_pending_fence(self) -> None:
+    def test_stopped_legacy_claim_checks_its_token_without_a_pending_fence(self) -> None:
         from scripts.copies import copies
         from scripts.mac_test import eligibility, offload, claim_state
 
@@ -3995,11 +4003,40 @@ fi
         observation = offload.LeftoverObservation(offload.LeftoversRemain(1), "leftovers=1\nrc=0\n")
         with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
                 mock.patch.object(offload, "read_leftovers", return_value=observation), \
-                mock.patch.object(offload, "leftover_check_script", return_value="count all mirrors") as check:
+                mock.patch.object(offload, "leftover_check_script", return_value="check claim token") as check:
             result = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "", remote_work=stopped)
-        check.assert_called_once_with(offload.ALL_MIRRORS, self.paths.target, 1)
+        check.assert_called_once_with(offload.ALL_MIRRORS, self.paths.target, 1, fence=None, identity=identity)
         self.assertEqual(result, mac_test.ClaimReleaseRefused("the remote work of the claim has not ended"))
         self.assertEqual(self.read_claim(), record)
+
+    def test_stopped_copy_records_kill_lines_with_its_cleanup_result(self) -> None:
+        from scripts.buildlog import store
+        from scripts.copies import copies
+        from scripts.mac_test import eligibility, offload
+
+        line = "leftover_killed pid=4567 command=cargo nextest"
+        stopped = mac_test.EndStoppedWork(eligibility.KnownRepository("alpha", "repo-key"))
+        for confirmed in (True, False):
+            with self.subTest(confirmed=confirmed):
+                record = self.write_claim(copy=True)
+                identity = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", "fixture-attempt")
+                output = line + "\n" + ("leftovers=0\nrc=0\n" if confirmed else "")
+                observed = offload.LeftoverObservation(offload.parse_leftover_check(output), output)
+                with (mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"),
+                      mock.patch.object(offload, "read_leftovers", return_value=observed),
+                      mock.patch.dict(os.environ, {"BUILDLOG_CALL_ID": "copy-call"})):
+                    result = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "",
+                                                           remote_work=stopped)
+                self.assertIsInstance(result, mac_test.ClaimsReleased if confirmed else mac_test.ClaimReleaseRefused)
+                self.assertEqual(self.paths.run.exists(), not confirmed)
+
+        entries = [row for path in store.root().glob("*/*.jsonl") for row in store.locked_rows(path)
+                   if row.get("kind") == "ssh_attempt"]
+        self.assertEqual(len(entries), 2)
+        for row, cleanup, count in zip(entries, ("confirmed", "unconfirmed"), (0, None), strict=True):
+            self.assertEqual((row["call_id"], row["repo_identity"]), ("copy-call", "repo-key"))
+            self.assertEqual((row["placement_episode"], row["placement_attempt"]), ("fixture-episode", "fixture-attempt"))
+            self.assertEqual((row["cleanup"], row["unresolved_count"], row["leftover_killed"]), (cleanup, count, [line]))
 
     def test_release_survives_a_watcher_pass_during_the_fence_settle(self) -> None:
         from scripts.buildlog import sync as buildlog_sync
@@ -4151,7 +4188,7 @@ fi
                 original = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(hours=1)))
                 replacement = {**original, field: value}
 
-                def check(config: mac_test.MacTestConfig, host: str) -> mac_test.MacIdle:
+                def check(config: mac_test.MacTestConfig, host: str, _tokens: Sequence[str]) -> mac_test.MacIdle:
                     _ = config, host
                     _ = self.paths.run.write_text(json.dumps(replacement))
                     return mac_test.MacIdle()
@@ -4165,7 +4202,7 @@ fi
     def test_pass_does_not_restore_claim_removed_during_activity_check(self) -> None:
         _ = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(hours=1)))
 
-        def check(config: mac_test.MacTestConfig, host: str) -> mac_test.MacIdle:
+        def check(config: mac_test.MacTestConfig, host: str, _tokens: Sequence[str]) -> mac_test.MacIdle:
             _ = config, host
             self.paths.run.unlink()
             return mac_test.MacIdle()

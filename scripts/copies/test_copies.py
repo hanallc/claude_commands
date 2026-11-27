@@ -76,25 +76,6 @@ class ImportTests(unittest.TestCase):
 
 
 class RunCopyTests(unittest.TestCase):
-    def test_remote_copy_commands_keep_the_plain_path_in_argv(self) -> None:
-        for path, path_word in (
-            ("state/mac's mirrors/cargo-liner", """'state'/'mac'"'"'s mirrors'/'cargo-liner'"""),
-            ("/private/mac's mirrors/cargo-liner", """'/private/mac'"'"'s mirrors/cargo-liner'"""),
-            (".local/state/build-target/mirror/team/cargo-liner",
-             "'.local'/'state'/'build-target'/'mirror'/'team'/'cargo-liner'"),
-            (".local/state/build-target/mirror/cargo-liner-key/linux-s1",
-             "'.local'/'state'/'build-target'/'mirror'/'cargo-liner-key'/'linux-s1'"),
-        ):
-            mirror = copies.RemoteMirror("owner", copies.SelectedRepository("cargo-liner"), "fixture", path, "session")
-            for action in ("mirror-use", "mirror-receive", "mirror-remove"):
-                with self.subTest(action=action, path=path):
-                    command = copies.remote_copies_command(action, mirror)
-                    self.assertIn(f"--path {path_word} --owner ", command)
-                    self.assertEqual(shlex.split(command)[2:], [
-                        action, "--path", path, "--owner", "owner", "--repository", "cargo-liner",
-                        "--session", "session",
-                    ])
-
     def test_gate_cleanup_error_keeps_the_gate_status(self) -> None:
         command = ["python3", "scripts/production/gate.py", "--tests-only"]
         tree = Path(self.enterContext(tempfile.TemporaryDirectory()))

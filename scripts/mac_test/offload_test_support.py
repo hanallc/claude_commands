@@ -30,7 +30,7 @@ from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_con
 from scripts.mac_test import eligibility, offload, mac_test
 from scripts.buildlog import treekey
 from scripts.buildlog import sync as buildlog_sync
-from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
+from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell, write_token_reader
 from scripts.lib import test_hang_guard
 from scripts.lib.process_group import send_process_group
 from scripts.lib.shell_test_support import fixture_zsh_environment
@@ -100,8 +100,6 @@ class CommandFixture(TypedDict):
     cleanup_lines: list[str]
     cleanup_error: str
     selector_shell: str
-    selector_pgrep_status: int
-    selector_lsof_status: int
 
 
 class CommandEvent(TypedDict):
@@ -143,11 +141,6 @@ def split_mac_run_command(remote: str) -> tuple[list[str], str]:
     raise AssertionError(f"Missing Mac status command in {remote!r}")
 
 
-class SelectorEvent(TypedDict):
-    command: str
-    args: list[str]
-
-
 class WireResult(TypedDict):
     mac: str
     reason: str
@@ -175,9 +168,6 @@ HANA = eligibility.KnownRepository("hana")
 
 FIXTURE_MIRROR_ROOT = ".local/state/mac-test/test-mirror"
 
-HANA_COMMAND_PATTERN = offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana([/'\"[:space:]]|$)"
-
-HANA_CWD_PATTERN = "^n.*/" + offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana(/|$)"
 
 CLAIM_STUB = r'''
 from __future__ import annotations
@@ -311,8 +301,6 @@ class OffloadCommandFixture(unittest.TestCase):
             "cleanup_lines": ["leftovers=0", "rc=0"],
             "cleanup_error": "",
             "selector_shell": "",
-            "selector_pgrep_status": 1,
-            "selector_lsof_status": 0,
         }
 
     @override
@@ -389,8 +377,6 @@ class OffloadCommandFixture(unittest.TestCase):
             "cleanup_lines": ["leftovers=0", "rc=0"],
             "cleanup_error": "",
             "selector_shell": "",
-            "selector_pgrep_status": 1,
-            "selector_lsof_status": 0,
         }
         # Keep a reader open so release writes also remain safe during failure cleanup.
         for name in ("continue-copy", "continue-run", "continue-cleanup", "continue-probe", "finish-run"):
@@ -400,6 +386,11 @@ class OffloadCommandFixture(unittest.TestCase):
             self.addCleanup(os.close, descriptor)
         self.sync_config()
         self.sync_fixture()
+        write_token_reader(self.root / "home", r'''[[ $3 == kill ]] || exit 99
+if [[ -e $MAC_TEST_STUB_DIR/boot_id ]]; then
+    [[ $(cat "$MAC_TEST_STUB_DIR/boot_id") == second-boot ]] || exit 1
+fi
+''')
         write_mac_target_registry(self.root, self.config_path.name)
         _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
         self.environment = {
@@ -761,14 +752,10 @@ raise SystemExit(offload.main())
         return [event for event in self.events_for("ssh") if "select_leftovers()" in event["args"][-1]]
 
     def assert_leftover_selectors(self, remote: str) -> None:
-        self.assertIn(f"mirror_command_pattern={shlex.quote(HANA_COMMAND_PATTERN)}\n", remote)
-        self.assertIn(f"mirror_cwd_pattern={shlex.quote(HANA_CWD_PATTERN)}\n", remote)
-        self.assertIn('pgrep -u "$(id -u)" -f "$mirror_command_pattern"', remote)
-        self.assertIn('lsof -a -u "$(id -u)" -d cwd -Fpn', remote)
-        self.assertIn("awk -v pattern=\"$mirror_cwd_pattern\" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }'", remote)
-        self.assertNotIn("pkill", remote)
-        self.assertNotIn("PIPESTATUS", remote)
-        self.assertNotIn(FIXTURE_MIRROR_ROOT + "/", remote.replace(offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/", ""))
+        self.assertIn("from scripts.mac_test.run_token import main", remote)
+        self.assertIn('kill', remote)
+        self.assertNotIn("pgrep", remote)
+        self.assertNotIn(" -d cwd ", remote)
 
     def remote_claim(self) -> RemoteClaimRecord:
         return cast(RemoteClaimRecord, json.loads(self.claim_file.read_text()))
@@ -969,10 +956,10 @@ raise SystemExit(offload.main())
         # The Linux runner refuses an untrusted source before it claims.
         _ = write_config_fixture(self.root / "nix_env.conf", f"trusted_home_folders={self.repository.name}\n")
         self.environment["HOME"] = str(self.root)
-        # The Linux leftover selector has no lsof; answer it like the Mac selector.
+        # Use the fixture answer for the Linux selector too.
         stub = self.bin_directory / "command-stub"
         _ = stub.write_text(stub.read_text().replace(
-            "[[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]", "[[ $remote == *'select_leftovers()'* ]]"))
+            "[[ $remote == *'select_leftovers()'* && $remote == *'scripts.mac_test.run_token'* ]]", "[[ $remote == *'select_leftovers()'* ]]"))
         self.claim_file = claim_state.StatePaths(self.state_directory, "mac").run
         return ("--target", "box", "--settings", str(settings))
 

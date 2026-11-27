@@ -17,13 +17,12 @@ import io
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest import mock
-from scripts.mac_test import eligibility, offload, mac_test, nextest_log
-from scripts.mac_test.mirror_root import MacMirrorRoot
+from scripts.mac_test import claim_state, eligibility, offload, mac_test, nextest_log
 from scripts.mac_test.offload_test_commands import (
-    ACTIVITY_SELECTOR_STUB, install_nextest_log_writer, write_shell,
+    install_nextest_log_writer, write_shell, write_token_reader,
 )
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS
-from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
+from scripts.mac_test.offload_test_support import HANA
 from scripts.lib.checkout_test_support import fixture_shim_source
 from scripts.lib import conf, removal_guard, test_hang_guard
 from scripts.lib.shell_test_support import fixture_zsh_environment
@@ -659,137 +658,46 @@ class MacActivityShellTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
-        for name in ("pgrep", "lsof", "ps", "id"):
-            path = self.bin_directory / name
-            write_shell(path, ACTIVITY_SELECTOR_STUB)
+        write_shell(self.bin_directory / "id", 'printf "501\\n"\n')
 
-    def run_activity(self, shell: list[str], responses: dict[str, tuple[int, str]]) -> subprocess.CompletedProcess[str]:
-        for name, (status, answer) in responses.items():
-            _ = (self.root / f"{name}-response.sh").write_text(
-                f"status={status}\nanswer={shlex.quote(answer)}\n")
-        (self.root / "commands.jsonl").unlink(missing_ok=True)
-        environment = {**shell_environment(self.root), "ACTIVITY_TEST_DIR": str(self.root)}
-        checks = "\n".join(
-            '[ "$(command -v ' + name + ')" = ' + shlex.quote(str(self.bin_directory / name)) + ' ] || exit 99'
-            for name in ("pgrep", "lsof", "ps", "id")
-        )
-        text = "kill() { printf 'signal requested\\n' >&2; return 99; }\n" + checks + "\n" + mac_test.mac_activity_script()
-        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+    def run_activity(self, shell: list[str], *, pids: str, commands: str, status: int = 0) -> subprocess.CompletedProcess[str]:
+        environment = shell_environment(self.root)
+        write_token_reader(Path(environment["HOME"]),
+                           """[[ $3 == observe && $4 == '[["episode/attempt", "other/attempt"]]' ]] || exit 99""" + "\n"
+                           + f"printf %s {shlex.quote(pids)}\nexit {status}\n")
+        write_shell(self.bin_directory / "ps", f"printf %s {shlex.quote(commands)}\n")
+        text = mac_test.mac_activity_script(("episode/attempt", "other/attempt"))
+        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True,
+                              timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
 
-    def test_activity_text_has_zero_for_only_shells_in_clones_under_sh_and_zsh(self) -> None:
-        responses = {
-            "id": (0, "501\n"), "pgrep": (1, ""),
-            "lsof": (0, "p101\nn/Users/test/rust/hana\np102\nn/Users/test/rust/other\n"),
-            "ps": (0, "101 501 /bin/zsh\n102 501 /bin/sh\n103 999 /opt/cargo\n"),
-        }
+    def test_activity_counts_only_token_processes_under_sh_and_zsh(self) -> None:
+        commands = "101 501 /opt/rust/bin/cargo\n102 501 /mirror/target/debug/app\n103 501 /opt/bin/cargo\n"
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell):
-                answer = self.run_activity(shell, responses)
-                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=0\nwork=0\nrc=0\n", ""))
-
-    def test_activity_text_counts_each_matching_user_pid_once_under_sh_and_zsh(self) -> None:
-        responses = {
-            "id": (0, "501\n"), "pgrep": (0, "101\n102\n"),
-            "lsof": (0, "p102\nn/Users/test/.local/state/mac-test/test-mirror/hana\n"
-                     + "p103\nn/Users/test/.local/state/mac-test/test-mirror\np104\nn/Users/test/rust/hana\n"),
-            "ps": (0, "101 501 /opt/rust/bin/cargo\n105 501 /opt/rust/bin/rustc\n106 501 cargo-nextest\n"
-                   + "107 501 /Users/test/rust/hana/target/debug/app\n108 999 /opt/cargo\n"
-                   + "109 501 /bin/zsh\n110 501 /opt/cargo-helper\n112 501 /Users/test/my project/target/debug/app\n"),
-        }
-        for shell in (["/bin/sh"], ["zsh", "-f"]):
-            with self.subTest(shell=shell):
-                answer = self.run_activity(shell, responses)
-                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=7\nwork=5\nrc=0\n", ""))
-                calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
-                pgrep = [call for call in calls if call["command"] == "pgrep"]
-                lsof = [call for call in calls if call["command"] == "lsof"]
-                ps = [call for call in calls if call["command"] == "ps"]
-                self.assertEqual(len(pgrep), 1)
-                self.assertIn("-u", pgrep[0]["args"])
-                self.assertIn("501", pgrep[0]["args"])
-                self.assertIn("[.]local/state/mac-test/test-mirror/", pgrep[0]["args"])
-                self.assertEqual(lsof[0]["args"], ["-a", "-u", "501", "-d", "cwd", "-Fpn"])
-                self.assertEqual(len(ps), 1)
+                answer = self.run_activity(shell, pids="101\n102\n", commands=commands)
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr),
+                                 (0, "active=2\nwork=1\nrc=0\n", ""))
 
     def test_activity_selector_failure_prints_no_success_under_sh_and_zsh(self) -> None:
         for shell in (["/bin/sh"], ["zsh", "-f"]):
-            for name, status in (("pgrep", 2), ("lsof", 1), ("ps", 1)):
-                with self.subTest(shell=shell, selector=name):
-                    responses = {"id": (0, "501\n"), "pgrep": (1, ""), "lsof": (0, ""), "ps": (0, "")}
-                    responses[name] = (status, "")
-                    answer = self.run_activity(shell, responses)
-                    self.assertNotEqual(answer.returncode, 0)
-                    self.assertNotIn("rc=0", answer.stdout)
-                    self.assertNotIn("active=0", answer.stdout)
-                    self.assertNotIn("signal requested", answer.stderr)
-
-    def test_activity_and_leftover_texts_use_the_shared_mirror_selector(self) -> None:
-        marker = "select_leftovers() { return 1; }\n"
-        root = MacMirrorRoot("saved/mirror")
-        with mock.patch.object(offload, "mirror_selector_script", return_value=marker) as selector:
-            self.assertTrue(offload.leftover_check_script(HANA).startswith(marker))
-            self.assertTrue(mac_test.mac_activity_script().startswith(marker))
-            observation = offload.leftover_check_script(HANA, observe=True, mirror_root=root)
-            self.assertTrue(observation.startswith(marker))
-        self.assertEqual(selector.call_args_list, [mock.call(HANA, "mac", 1, mirror_root=None),
-            mock.call(offload.ALL_MIRRORS), mock.call(HANA, "mac", 1, mirror_root=root)])
-
-    def run_selector(
-        self, shell: list[str], scope: offload.MirrorScope, responses: dict[str, tuple[int, str]],
-    ) -> subprocess.CompletedProcess[str]:
-        for name, (status, answer) in responses.items():
-            _ = (self.root / f"{name}-response.sh").write_text(
-                f"status={status}\nanswer={shlex.quote(answer)}\n")
-        (self.root / "commands.jsonl").unlink(missing_ok=True)
-        environment = {**shell_environment(self.root), "ACTIVITY_TEST_DIR": str(self.root)}
-        text = offload.mirror_selector_script(scope) + "select_leftovers\n"
-        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
-
-    def test_repository_selector_stops_at_its_own_mirror_under_sh_and_zsh(self) -> None:
-        responses = {
-            "id": (0, "501\n"), "pgrep": (1, ""),
-            "lsof": (0, "p201\nn/Users/test/.local/state/mac-test/test-mirror/hana\n"
-                     + "p202\nn/Users/test/.local/state/mac-test/test-mirror/hana/crates/hana\n"
-                     + "p203\nn/Users/test/.local/state/mac-test/test-mirror/hana_other\n"
-                     + "p204\nn/Users/test/.local/state/mac-test/test-mirror/cargo-liner\n"
-                     + "p205\nn/Users/test/.local/state/mac-test/test-mirror\n"
-                     + "p206\nn/Users/test/rust/hana\n"),
-        }
-        for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell):
-                answer = self.run_selector(shell, HANA, responses)
-                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "201\n202\n", ""))
-                calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
-                pgrep = [call for call in calls if call["command"] == "pgrep"]
-                self.assertEqual(len(pgrep), 1)
-                self.assertEqual(pgrep[0]["args"], ["-u", "501", "-f", HANA_COMMAND_PATTERN])
+                answer = self.run_activity(shell, pids="101\n", commands="", status=1)
+                self.assertNotEqual(answer.returncode, 0)
+                self.assertNotIn("rc=0", answer.stdout)
+                self.assertNotIn("active=0", answer.stdout)
 
-    def test_repository_command_pattern_matches_only_its_own_mirror(self) -> None:
-        responses = {"id": (0, "501\n"), "pgrep": (1, ""), "lsof": (0, "")}
-        answer = self.run_selector(["/bin/sh"], HANA, responses)
-        self.assertEqual(answer.returncode, 0, answer.stderr)
-        calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
-        pattern = next(call["args"][-1] for call in calls if call["command"] == "pgrep")
-        matching = [
-            "sh -c cd .local/state/mac-test/test-mirror/hana && cargo nextest run",
-            "cargo build --manifest-path /Users/test/.local/state/mac-test/test-mirror/hana/Cargo.toml",
-            "sh -c cd '/Users/test/.local/state/mac-test/test-mirror/hana' && cargo test",
-            "sh -c cd \"/Users/test/.local/state/mac-test/test-mirror/hana\"",
-            "ls /Users/test/.local/state/mac-test/test-mirror/hana",
-        ]
-        other = [
-            "sh -c cd .local/state/mac-test/test-mirror/hana_other && cargo nextest run",
-            "sh -c cd .local/state/mac-test/test-mirror/cargo-liner && cargo nextest run",
-            "sh -c cd .local/state/mac-test/test-mirror/hanabi && cargo test",
-            "sh -c cd /Users/test/rust/hana && cargo test",
-        ]
-        selected = subprocess.run(["grep", "-E", "-e", pattern], input="\n".join(matching + other) + "\n",
-                                  env=shell_environment(self.root),
-                                  capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(selected.returncode, 0, selected.stderr)
-        self.assertEqual(selected.stdout.splitlines(), matching)
-
-
+    def test_activity_and_leftover_texts_use_the_shared_run_selector(self) -> None:
+        marker = "select_leftovers() { return 1; }\n"
+        identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        with mock.patch.object(offload, "mirror_selector_script", return_value=marker) as selector:
+            self.assertTrue(offload.leftover_check_script(HANA, identity=identity).startswith(marker))
+            self.assertTrue(mac_test.mac_activity_script(("other/attempt",)).startswith(marker))
+            self.assertTrue(offload.leftover_check_script(HANA, observe=True, identity=identity).startswith(marker))
+        self.assertEqual(selector.call_args_list, [
+            mock.call(HANA, "mac", 1, tokens=("episode/attempt",), mode="kill"),
+            mock.call(offload.ALL_MIRRORS, tokens=("other/attempt",)),
+            mock.call(HANA, "mac", 1, tokens=("episode/attempt",), mode="observe"),
+        ])
 
 
 if __name__ == "__main__":

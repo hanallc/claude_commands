@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import io
 import json
 import os
@@ -12,8 +13,9 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from typing import override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zoneinfo import TZPATH
 
 from scripts.whoami import account, agent_accounts
@@ -266,6 +268,13 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(parts.arguments, ("claude", "--name", "alpha unit", "--model", ""))
         self.assertEqual(parts.environment, {"CLAUDE_CONFIG_DIR": "/Users/n/.claude3", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
         self.assertNotIn("private", repr(parts))
+
+    def test_kern_procargs2_refuses_a_reply_that_fills_the_buffer(self) -> None:
+        sysctl = Mock(return_value=0)
+        with (patch.object(ctypes, "CDLL", return_value=SimpleNamespace(sysctl=sysctl)),
+              self.assertRaisesRegex(OSError, "kernel process record fills buffer")):
+            _ = account.kern_procargs2(321)
+        sysctl.assert_called_once()
 
     def test_a_short_kernel_record_is_refused(self) -> None:
         with self.assertRaises(ValueError):

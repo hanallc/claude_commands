@@ -8,7 +8,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Callable, Generator
+from collections.abc import Sequence, Callable, Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import copy
 from dataclasses import dataclass
@@ -1579,11 +1579,11 @@ def start_claim_watcher(paths: StatePaths) -> None:
               file=sys.stderr)
 
 
-def mac_activity_script() -> str:
+def mac_activity_script(tokens: Sequence[str] = ()) -> str:
     """Count the user's mirror work and build executables without sending signals."""
     from scripts.mac_test import offload
 
-    return offload.mirror_selector_script(offload.ALL_MIRRORS) + r'''
+    return offload.mirror_selector_script(offload.ALL_MIRRORS, tokens=tokens) + r'''
 mirror_pids=$(select_leftovers) || exit 1
 process_records=$(ps -axww -o pid=,uid=,comm=) || exit 1
 activity_user=$(id -u) || exit 1
@@ -1597,21 +1597,19 @@ executable_records=$(printf '%s\n' "$process_records" | awk -v user="$activity_u
         if (compiler || executable ~ /\/target\//)
             print $1, (!compiler && executable ~ /\/target\// && executable !~ /\/deps\//) ? "app" : "work"
     }') || exit 1
-executable_pids=$(printf '%s\n' "$executable_records" | awk '{ print $1 }') || exit 1
 app_pids=$(printf '%s\n' "$executable_records" | awk '$2 == "app" { print $1 }') || exit 1
-active_pids=$(printf '%s\n%s\n' "$mirror_pids" "$executable_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print $0 }') || exit 1
-work_count=$(printf '%s\n' "$app_pids" '--active--' "$active_pids" | awk '
+work_count=$(printf '%s\n' "$app_pids" '--active--' "$mirror_pids" | awk '
     $0 == "--active--" { active=1; next }
     /^[0-9]+$/ { if (!active) app[$0]=1; else if (!app[$0]) count++ }
     END { print count+0 }') || exit 1
-active_count=$(printf '%s\n' "$active_pids" | awk '/^[0-9]+$/ { count++ } END { print count+0 }') || exit 1
+active_count=$(printf '%s\n' "$mirror_pids" | awk '/^[0-9]+$/ { count++ } END { print count+0 }') || exit 1
 printf 'active=%s\nwork=%s\nrc=0\n' "$active_count" "$work_count"
 '''
 
 
-def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
+def check_mac_activity(config: MacTestConfig, host: str, tokens: Sequence[str] = ()) -> MacActivity:
     arguments = ["ssh", "-o", "BatchMode=yes", "-o",
-                 f"ConnectTimeout={config.connect_timeout_s:g}", host, mac_activity_script()]
+                 f"ConnectTimeout={config.connect_timeout_s:g}", host, mac_activity_script(tokens)]
     try:
         result = subprocess.run(
             arguments,
@@ -1670,14 +1668,23 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     if paths.platform == "linux":
         # The Linux controller must confirm remote cleanup before claim removal.
         return True
+    from scripts.mac_test import run_token
+
+    tokens: dict[str, list[str]] = {}
     activity: dict[str, MacActivity] = {}
-    traffic: dict[str, transfer_bytes.TransferLedger] = {}
     for claim in claims:
         host = claim_host(claim.record, config)
+        host_tokens = tokens.setdefault(host, [])
+        try:
+            host_tokens.append(run_token.token(claim_state.claim_identity(claim.record)))
+        except run_token.InvalidRunToken as error:
+            activity[host] = ActivityCheckFailed(str(error))
+    traffic: dict[str, transfer_bytes.TransferLedger] = {}
+    for host, host_tokens in tokens.items():
+        traffic[host] = transfer_bytes.TransferLedger()
         if host not in activity:
-            traffic[host] = transfer_bytes.TransferLedger()
             with transfer_bytes.measure_transfers(traffic[host]):
-                activity[host] = check_mac_activity(config, host)
+                activity[host] = check_mac_activity(config, host, host_tokens)
     now = utc_now()
     watched = False
     for claim in claims:
@@ -2657,8 +2664,8 @@ def release_exact_claims(
                     fence = (offload.start_fence_relative(identity, paths.target, scope_key=scope_key).with_suffix(".lock")
                              if fence_pending and paths.platform == "macos" else None)
                     slot = claim_state.legacy_linux_claim_name(path)[1] if paths.platform == "linux" else 1
-                    command = (offload.leftover_check_script(mirror, paths.target, slot, fence=fence)
-                               if fence is not None else offload.leftover_check_script(mirror, paths.target, slot)) + "\n"
+                    command = offload.leftover_check_script(
+                        mirror, paths.target, slot, fence=fence, identity=identity) + "\n"
                 else:
                     command = ""
                 origin = record.get("mac_watch_origin")
@@ -2666,10 +2673,9 @@ def release_exact_claims(
                     if origin is None or not isinstance(saved, claim_state.MacMirrorIdentity):
                         return ClaimReleaseRefused("the saved Mac or mirror is unavailable", idle_only=True)
                     machine_id = origin["machine_id"]
-                    root = MacMirrorRoot(origin["mirror_root"])
                     fence = offload.start_fence_relative(identity, paths.target, scope_key=scope_key).with_suffix(".lock")
                     observation = offload.leftover_check_script(offload.mac_cleanup_scope(saved), paths.target,
-                                                                fence=fence, observe=True, mirror_root=root)
+                                                                fence=fence, observe=True, identity=identity)
                     command = offload.start_fence_command(identity, paths.target, settle=True, scope_key=scope_key,
                         report_holders=True, leftover_observation=(observation, connection.leftover_timeout_s, machine_id))
                 elif fence_pending:
@@ -2699,8 +2705,16 @@ def release_exact_claims(
                             return ClaimReleaseRefused("the exact start fence is missing", fence_missing=True)
                     elif not isinstance(observed.result, offload.LeftoversEnded) or lines != [*prefix, f"dispatch_start_settled={key}"]:
                         return ClaimReleaseRefused(watched_mirror_refusal(record, identity, observed))
-                elif fence_pending:
-                    reason = offload.start_fence_reason(identity, observed.output)
+                else:
+                    reason = offload.start_fence_reason(identity, observed.output) if fence_pending else None
+                    if isinstance(remote_work, EndStoppedWork) and observed.result.killed:
+                        checked = observed.result
+                        if reason is not None and isinstance(checked, offload.LeftoversEnded):
+                            checked = offload.LeftoverCheckFailed(reason, checked.killed)
+                        try:
+                            offload.record_stopped_copy_cleanup(paths.target, record, remote_work.repository, checked)
+                        except OSError as error:
+                            print(f"Mac stopped-copy cleanup record failed: {error}", file=sys.stderr)
                     if reason is not None:
                         return ClaimReleaseRefused(reason)
                 if not isinstance(observed.result, offload.LeftoversEnded):

@@ -44,6 +44,13 @@ def write_shell(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
+def write_token_reader(home: Path, source: str) -> None:
+    """Install a test response for the remote token reader."""
+    path = home / ".claude/scripts/lib/py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_shell(path, '[[ $1 == -c && $2 == *scripts.mac_test.run_token* ]] || exit 99\n' + source)
+
+
 WORKSPACE_SWEEP_SETTINGS = """\
 # range: 0..
 recent_minutes=60
@@ -212,20 +219,15 @@ if [[ $remote == *fetch_kib=* ]]; then
 rc=0}"
     exit "${fetch_probe_status:-0}"
 fi
-if [[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]; then
+if [[ $remote == *'select_leftovers()'* && $remote == *'scripts.mac_test.run_token'* ]]; then
     printf 'called\n' > "$root/cleanup-called"
     if (( hold_cleanup )); then
         printf 'started\n' > "$root/cleanup-started"
         await_release continue-cleanup
     fi
     if [[ -n $selector_shell ]]; then
-        printf -v checks 'export PATH=%q:"$PATH"\n' "$root/selectors"
-        for name in pgrep lsof sleep; do
-            printf -v check '[ "$(command -v %s)" = %q ] || exit 99\n' "$name" "$root/selectors/$name"
-            checks+=$check
-        done
         if [[ $selector_shell == sh ]]; then shell=(/bin/sh); else shell=(zsh -f); fi
-        "${shell[@]}" -c "$checks$remote" > "$root/selector-answer"
+        "${shell[@]}" -c "$remote" > "$root/selector-answer"
         status=$?
         while IFS= read -r line; do printf '%s\n' "$line"; done < "$root/selector-answer"
         exit "$status"
@@ -294,18 +296,9 @@ root=$MAC_TEST_STUB_DIR
 source "$root/fixture.sh"
 { record_command "$@"; printf '}\n'; } >> "$root/selector-events.jsonl"
 case ${0##*/} in
-    pgrep) exit "$selector_pgrep_status" ;;
-    lsof) exit "$selector_lsof_status" ;;
+    pgrep) exit "${selector_pgrep_status:-1}" ;;
+    lsof) exit "${selector_lsof_status:-0}" ;;
     sleep) exit 0 ;;
     *) exit 99 ;;
 esac
-'''
-
-
-ACTIVITY_SELECTOR_STUB = r'''
-root=$ACTIVITY_TEST_DIR
-{ record_command "$@"; printf '}\n'; } >> "$root/commands.jsonl"
-source "$root/${0##*/}-response.sh"
-printf '%s' "$answer"
-exit "$status"
 '''

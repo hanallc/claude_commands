@@ -589,27 +589,40 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   `mirror-use` forwards the start fence descriptor with its mirror lease descriptors.
   A build child can keep the fence locked after the run wrapper exits.
   Other missing completions report the runner's exit status and exit 75 after cleanup.
-  `check_leftovers` uses the two selectors from `mirror_selector_script(scope)`.
-  The claim watcher uses `ALL_MIRRORS` for the host activity check and the saved mirror for the read-only release check.
-  The command selector uses `pgrep` for mirror command paths.
-  The working-directory selector uses `lsof` and `awk`.
+  Each Mac run exports `MAC_RUN_TOKEN=<episode>/<attempt>` from its claim before it starts the run pipeline.
+  The runner refuses a token component that contains a slash, an equals sign, a NUL, or whitespace.
+  The export applies to both sides of the pipeline.
+  The runner puts a temporary `sccache` wrapper before `$HOME/.cargo/bin` on PATH.
+  The Mac Cargo config uses bare `sccache` for PATH lookup, and an absolute sccache path in a config or `RUSTC_WRAPPER` bypasses the wrapper.
+  The wrapper runs `$HOME/.cargo/bin/sccache` through `env -u MAC_RUN_TOKEN`.
+  The sccache client and any server it starts have no run token.
+  The Mac's launchd entry also starts the shared sccache server without a run token.
 
-  Mac control scripts quote each mirror path component separately.
-  The copy command quotes each relative path component on all targets.
-  Leased child processes receive plain paths so the selector can count them.
-  The probe child receives a hex path because it can run outside a claim while the watcher checks the same mirror.
-  Rsync requires its own claim, and a kept claim blocks new claims for that repository during observation.
+  The Mac selector uses `KERN_PROCARGS2` to read the environment that started each process.
+  It uses the process's pointer width to find `argv` and reads exactly `argc` arguments.
+  An empty `argv[0]` makes the check uncertain because XNU can omit part of the environment from the reply.
+  It selects a process only when that environment contains the exact token.
+  A later call to `unsetenv` leaves the process eligible for selection.
+  The selector skips a process that starts with an empty environment, for example with `env -i`.
+  Processes of a claim made before the run token are not selected.
+  The activity check uses the tokens of live claims on each host.
+  The watcher observes the token of the claim it checks.
+  A record with no strings after `argv` makes the check uncertain.
+  The shared kernel reader refuses a reply that fills its buffer, so the check stays uncertain.
+  An unreadable record also makes the check uncertain.
+  The check leaves that process alive and omits `rc=0`, so the claim stays.
 
-  The stopped-work check includes processes with the exact start fence file open on descriptor 8 in the leftover count.
+  The stopped-work check also counts processes with the exact start fence open on descriptor 8.
   The fence check supplies PIDs only to the count.
-  The mirror command and working-directory selectors supply PIDs to TERM and KILL.
   Release and the watcher keep the claim while the fence is held.
   They report each holder's PID and command.
   If the holder check gives no answer, they report that result.
-  A `KnownRepository` scope stops both patterns at the repository boundary.
-  `extended_regex_literal` escapes the repository name.
-  Thus a lost hana run does not stop a cargo-liner run or a run under `mirror/hana_other`.
   Cleanup sends TERM, then KILL, then counts again.
+  The selector uses the kernel PID version to protect against PID reuse.
+  When a scan confirms an exit after a signal, the selector prints `leftover_killed pid=<pid> command=<first 200 characters of argv>`.
+  A later scan failure keeps the lines and leaves cleanup unconfirmed.
+  The SSH attempt record stores the kill lines with the cleanup result, including when the copy watcher stops a copy.
+  If the SSH cleanup times out, the record keeps the complete kill lines and marks cleanup unconfirmed.
   The cleanup SSH call uses `leftover_timeout_s` from `OffloadConfig`.
   The runner closes descriptor 8 and settles the fence in the command's SSH session.
   Each routed Mac command uses that limit from the time it receives the verdict.

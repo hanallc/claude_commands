@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 import hashlib
-import json
 import os
 import subprocess
 from typing import cast
@@ -13,8 +13,8 @@ from unittest import mock
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.mac_test import claim_state, eligibility, offload
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
-from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
-from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
+from scripts.mac_test.offload_test_commands import write_token_reader
+from scripts.mac_test.offload_test_support import write_mac_target_registry
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
@@ -121,15 +121,16 @@ class OffloadCommandTests(SeededCleanupFixture):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
         connection = eligibility.SshConnectionSettings("current-host", 7, 19, UNREACHABLE_WAIT_FIXTURE_SECONDS)
         repository = eligibility.KnownRepository("hana")
+        identity = claim_state.ClaimIdentity("claim", "retained", "attempt")
         response = subprocess.CompletedProcess(["ssh"], 0, "leftovers=0\nrc=0\n", "")
         with mock.patch.object(subprocess, "run", return_value=response) as run:
-            result = offload.check_leftovers(connection, "retained-host", repository)
+            result = offload.check_leftovers(connection, "retained-host", repository, identity=identity)
         self.assertEqual(result, offload.LeftoversEnded())
         arguments = cast(list[str], run.call_args.args[0])
         self.assertEqual(arguments[-2], "retained-host")
         self.assertNotIn("current-host", arguments)
         self.assertIn("ConnectTimeout=7", arguments)
-        self.assertEqual(arguments[-1], offload.leftover_check_script(repository))
+        self.assertEqual(arguments[-1], offload.leftover_check_script(repository, identity=identity))
         self.assertEqual(run.call_args.kwargs["timeout"], 19)
 
     def test_connection_reader_ignores_execution_values_and_reads_changes_at_use(self) -> None:
@@ -215,49 +216,26 @@ class OffloadCommandTests(SeededCleanupFixture):
                 self.assert_leftover_selectors(self.leftover_events()[0]["args"][-1])
                 self.assertEqual(float(self.wire_result()["seconds"]), 13.0 if outcome == "timeout" else 8.0)
 
-    def test_leftover_selectors_complete_under_sh_and_zsh_before_releasing_claim(self) -> None:
-        selectors = self.stub_directory / "selectors"
-        selectors.mkdir()
-        for name in ("pgrep", "lsof", "sleep"):
-            write_shell(selectors / name, SELECTOR_STUB)
-        self.fixture["run_status_reported"] = True
-        self.fixture["run_cleanup_line"] = ""
-        self.config["leftover_timeout_s"] = "300"
-        self.sync_config()
+    def test_token_reader_must_confirm_cleanup_under_sh_and_zsh(self) -> None:
         for shell in ("sh", "zsh"):
-            for pgrep_status, lsof_status in ((1, 1), (1, 0), (2, 0)):
-                with self.subTest(shell=shell, pgrep_status=pgrep_status, lsof_status=lsof_status):
+            for status in (0, 1):
+                with self.subTest(shell=shell, status=status):
                     self.reset_leftover_case()
-                    self.fixture["selector_shell"] = shell
-                    self.fixture["selector_pgrep_status"] = pgrep_status
-                    self.fixture["selector_lsof_status"] = lsof_status
+                    self.fixture.update(selector_shell=shell, run_cleanup_line="")
                     self.sync_fixture()
+                    write_token_reader(Path(self.environment["HOME"]), f'[[ $3 == kill ]] || exit 99\nexit {status}\n')
                     result = self.process_command(separate_stderr=True)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assert_wire("passed", "")
-                    cleanup = self.leftover_events()
-                    self.assertEqual(len(cleanup), 1)
-                    self.assert_leftover_selectors(cleanup[0]["args"][-1])
-                    path = self.stub_directory / "selector-events.jsonl"
-                    calls = [cast(SelectorEvent, json.loads(line)) for line in path.read_text().splitlines()]
-                    names = [call["command"] for call in calls]
-                    self.assertIn("pgrep", names)
-                    if pgrep_status == 1:
-                        self.assertIn("lsof", names)
-                    for call in calls:
-                        if call["command"] == "pgrep":
-                            self.assertEqual(call["args"], ["-u", str(os.getuid()), "-f", HANA_COMMAND_PATTERN])
-                        if call["command"] == "lsof":
-                            self.assertEqual(call["args"], ["-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"])
-                    answer = (self.stub_directory / "selector-answer").read_text()
-                    if pgrep_status == 1 and lsof_status == 0:
-                        self.assertIn("sleep", names)
-                        self.assertEqual(answer.splitlines(), ["leftovers=0", "rc=0"])
+                    cleanup, = self.leftover_events()
+                    self.assert_leftover_selectors(cleanup["args"][-1])
+                    answer = (self.stub_directory / "selector-answer").read_text().splitlines()
+                    if status == 0:
+                        self.assertEqual(answer, ["leftovers=0", "rc=0"])
                         self.assertFalse(self.claim_file.exists())
                     else:
-                        self.assertNotIn("rc=0", answer.splitlines())
+                        self.assertNotIn("rc=0", answer)
                         self.assert_claim_is_kept()
-                        self.assert_leftover_diagnostic(result.stderr, "missing_status")
 
 
 

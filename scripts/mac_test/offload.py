@@ -32,14 +32,14 @@ import time
 import traceback
 import uuid
 from types import FrameType
-from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO, TypedDict, assert_never, cast, final, override
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NotRequired, Protocol, TextIO, TypedDict, assert_never, cast, final, override
 from urllib.parse import quote
 
 
 from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_protocol
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
-from scripts.mac_test import claim_state
+from scripts.mac_test import claim_state, run_token
 from scripts.mac_test.claim_state import WAIT_CLAIM_CHECK_PREFIX, WaitClaimCheck, claim_worktree_path
 from scripts.mac_test.claim_state import pending_start_key as pending_start_key
 if TYPE_CHECKING:
@@ -403,6 +403,7 @@ class AttemptEvidence:
     completion: Literal["confirmed", "missing"] = "missing"
     cleanup: Literal["confirmed", "unconfirmed"] = "unconfirmed"
     unresolved_count: int | UnresolvedLeftoverCount = UnresolvedLeftoverCount()
+    leftover_killed: list[str] = field(default_factory=list)
     evidence_at: float = 0.0
     repository_key: str | ReadAttemptRepository = READ_ATTEMPT_REPOSITORY
     traffic: transfer_bytes.TransferLedger = field(default_factory=transfer_bytes.TransferLedger)
@@ -837,19 +838,22 @@ class MacHostProbeSnapshot:
 
 @dataclass(frozen=True)
 class LeftoversEnded:
-    """Both selectors completed and found no remaining remote work."""
+    """The check found no remaining remote work."""
+    killed: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class LeftoversRemain:
     """The cleanup found remaining work with this count or an unresolved count."""
     count: int | UnresolvedLeftoverCount
+    killed: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class LeftoverCheckFailed:
     """The reason explains why the cleanup check failed."""
     reason: str
+    killed: tuple[str, ...] = ()
 
 
 LeftoverCheckResult = LeftoversEnded | LeftoversRemain | LeftoverCheckFailed
@@ -1814,7 +1818,7 @@ def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1
     if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
-    return copies.mirror_probe_setup(remote_mirror(repository, target, slot), encode_path=True) + "\n" + _MAC_DISK_PROBE
+    return copies.mirror_probe_setup(remote_mirror(repository, target, slot)) + "\n" + _MAC_DISK_PROBE
 
 
 def parse_probe(output: str) -> ProbeResult:
@@ -2198,7 +2202,7 @@ def _probe_failure_reason(result: CapturedCommandResult, timeout_s: float) -> st
 
 
 def probe_mac_host(controller: ProcessController, config: eligibility.SshProbeSettings, target: str,
-                   mirrors: Sequence[str], *, setup_mirrors: Sequence[eligibility.LegacyMirrorName] = (),
+                     mirrors: Sequence[str], *, setup_mirrors: Sequence[eligibility.LegacyMirrorName] = (),
                    ) -> MacHostProbeSnapshot | UnavailableProbe:
     """Read disk space, prepare step mirrors, and scan saved mirrors in one SSH command."""
     from scripts.copies import copies
@@ -2207,20 +2211,37 @@ def probe_mac_host(controller: ProcessController, config: eligibility.SshProbeSe
     if setup_mirrors:
         root = mac_mirror_root()
         for index, mirror in enumerate(setup_mirrors):
-            setup = copies.mirror_probe_setup(f"{root.relative}/{mirror}", encode_path=True)
+            setup = copies.mirror_probe_setup(f"{root.relative}/{mirror}")
             script.extend((f"if ( {setup} ); then", f"printf 'mirror_setup={index}\\tready\\n'",
                            "else", f"printf 'mirror_setup={index}\\tfailed\\n'", "fi"))
     script.append(_MAC_DISK_PROBE)
     if mirrors:
-        script.append('if mac_cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn); then')
-        script.append('lsof() { printf "%s\\n" "$mac_cwd_records"; }')
-        for index, mirror in enumerate(mirrors):
-            selector = mirror_selector_script(KnownRepository(mirror), target)
-            script.extend(("(", selector, 'for pid in $(select_leftovers); do',
-                'start=$(ps -p "$pid" -o lstart=) || continue',
-                f"""printf 'mirror_process={index}\\t%s\\t%s\\n' "$pid" "$start" """,
-                "done", ")"))
-        script.append("fi")
+        # Admission supplies mirror names. Resolve each name to one saved claim on this host.
+        paths = claim_state.state_paths(target)
+        with claim_state.locked(paths.lock):
+            claims = claim_state.read_claims(paths)
+        matches: dict[str, list[claim_state.ClaimIdentity]] = {}
+        for claim in claims:
+            record = claim.record
+            saved = claim_state.saved_mac_repository(record)
+            if (record.get("remote_host") == config.host and not record.get("cleanup_pending", False)
+                    and isinstance(saved, claim_state.MacMirrorIdentity)):
+                matches.setdefault(saved.mirror_name, []).append(claim_state.claim_identity(record))
+        groups: list[list[str]] = []
+        for mirror in mirrors:
+            identities = matches.get(mirror, [])
+            try:
+                groups.append([run_token.token(identities[0])] if len(identities) == 1 else [])
+            except run_token.InvalidRunToken:
+                groups.append([])
+        if any(groups):
+            script.extend((f'mirror_records=$({run_token.command("probe", groups)}) &&',
+                           r'''printf '%s\n' "$mirror_records" | while read -r index pid; do
+    [ -n "$pid" ] || continue
+    start=$(ps -p "$pid" -o lstart=) || continue
+    printf 'mirror_process=%s\t%s\t%s\n' "$index" "$pid" "$start"
+done
+:'''))
     started_ns = time.time_ns()
     result = controller.capture([*ssh_prefix(config), "\n".join(script)], CommandTimeLimit(config.probe_timeout_s))
     if isinstance(result, CommandOutput) and result.status == 0:
@@ -2551,12 +2572,8 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
     """
     if any(word == "--target-dir" or word.startswith("--target-dir=") for word in request.nextest_words):
         return "echo mac_cleanup=skipped"
-    from scripts.copies import copies
-
     budget = config.values.get(f"mac_budget_gib.{repository.name}", config.default_target_budget_gib)
-    mirror = remote_mirror(repository, request.target, request.slot)
-    mirror_word = copies.mac_mirror_shell_path(mirror)
-    target = copies.mac_mirror_shell_path(f"{mirror}/target")
+    target = shlex.quote(mirror_target(repository, request.target, request.slot))
     program = (
         'import sys; from scripts.lint import sweep; from scripts.lib import conf; '
         'config = conf.read("lint"); '
@@ -2565,13 +2582,13 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
     )
     floor = shlex.quote(f"{config.free_floor_gib:g}")
     return (
-        f'{{ if cd {mirror_word}; then '
+        f'{{ if cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))}; then '
         + 'trim_started=$(date +%s); '
         + f'if LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
-        + f'-B -c {shlex.quote(program)} {target} >/dev/null 2>&1; then '
+        + f'-B -c {shlex.quote(program)} "$HOME"/{target} >/dev/null 2>&1; then '
         + 'trim_status=0; else trim_status=$?; fi; '
         + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
-        + f'if trim_size=$(du -sk {target} 2>/dev/null); then '
+        + f'if trim_size=$(du -sk "$HOME"/{target} 2>/dev/null); then '
         + 'trim_size=${trim_size%%[[:space:]]*}; '
         + f'over_budget=$(awk -v size="$trim_size" -v budget={shlex.quote(budget)} '
         + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
@@ -2583,13 +2600,30 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
         + 'else free_gib=; fi; '
         + f'if awk -v free="$free_gib" -v floor={floor} '
         + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-        + f'if size_kib=$(du -sk {target} 2>/dev/null); then '
+        + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
         + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-        + f'if rm -rf -- {target}; then '
+        + f'if rm -rf -- "$HOME"/{target}; then '
         + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
         + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi; "
         + "else echo mac_cleanup=$?; fi; } 2>/dev/null"
     )
+
+
+def sccache_wrapper_script() -> str:
+    """Put a token-free sccache wrapper ahead of the Mac's Cargo binaries."""
+    return f'''mac_sccache_tmp=${{TMPDIR:-/tmp}}
+case "$mac_sccache_tmp" in
+    /*) ;;
+    *) mac_sccache_tmp="$PWD/$mac_sccache_tmp" ;;
+esac
+mac_sccache_dir=$(mktemp -d "$mac_sccache_tmp/mac-sccache.XXXXXXXX") || exit 75
+trap 'rm -f -- "$mac_sccache_dir/sccache"; rmdir "$mac_sccache_dir"' EXIT
+cat > "$mac_sccache_dir/sccache" <<'MAC_SCCACHE' || exit 75
+#!/bin/sh
+exec /usr/bin/env -u {run_token.TOKEN_NAME} "$HOME/.cargo/bin/sccache" "$@"
+MAC_SCCACHE
+chmod 700 "$mac_sccache_dir/sccache" || exit 75
+'''
 
 
 def remote_test_command(
@@ -2598,6 +2632,7 @@ def remote_test_command(
     repository: KnownRepository,
     sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
     *, history_key: str = store.UNKNOWN_IDENTITY,
+    identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
 ) -> str:
     clear_environment = (result_environment.read_policy().clear_remote_environment()
                          if request.verb == "nextest" and request.environment else "")
@@ -2650,10 +2685,20 @@ def remote_test_command(
         # The writer reports the child status. A failed launch takes the setup path.
         report_status = f" || echo {MAC_NEXTTEST_SETUP_FAILURE}"
     runner = "run_nextest_logged " if capture else ""
-    return (
+    run_export = ""
+    wrapper_path = ""
+    if isinstance(identity, claim_state.ClaimIdentity):
+        if any(name == run_token.TOKEN_NAME for name, _ in request.environment):
+            raise ValueError(f"the Mac runner sets {run_token.TOKEN_NAME} from the claim")
+        export_token = f"export {run_token.TOKEN_NAME}={shlex.quote(run_token.token(identity))}"
+        run_export = sccache_wrapper_script() + export_token + "\n"
+        wrapper_path = "$mac_sccache_dir:"
+        if clear_environment:
+            clear_environment += export_token + " && "
+    return run_export + (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
         f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{environment}"
-        f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
+        f'PATH="{MAC_CARGO_GATE_BIN}:{wrapper_path}$HOME/.cargo/bin:$PATH" '
         f"{mac_placement}"
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
@@ -2705,24 +2750,6 @@ def report_fetch(folder: FetchFolder, result: FetchResult) -> None:
     print(f"mac_test: nothing fetched: {reason}")
 
 
-def fetch_size_command(repository: KnownRepository, target: str, slot: int, folder: FetchFolder) -> str:
-    """Check the fetch folder and report its size in KiB."""
-    mirror = remote_mirror(repository, target, slot)
-    if target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
-        from scripts.copies import copies
-
-        mirror_word = copies.quote_shell_path_parts(mirror)
-    else:
-        mirror_word = shlex.quote(mirror)
-    quoted = shlex.quote(folder.value)
-    return (
-        f"cd {mirror_word} && if [ -d {quoted} ]; then "
-        + f"if size=$(du -sk {quoted}); then "
-        + "printf 'fetch_kib=%s\\nrc=0\\n' \"${size%%[[:space:]]*}\"; else exit 1; fi; "
-        + "else printf 'fetch=missing\\nrc=0\\n'; fi"
-    )
-
-
 def fetch_folder(
     controller: ProcessController,
     config: OffloadConfig,
@@ -2751,7 +2778,14 @@ def fetch_folder(
                     entry.unlink()
         if destination.exists() or destination.is_symlink() or partial.exists() or partial.is_symlink():
             return FetchFailed("the fetched destination already exists")
-        size_command = fetch_size_command(repository, request.target, request.slot, folder)
+        quoted = shlex.quote(folder.value)
+        size_command = (
+            f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
+            + f"if [ -d {quoted} ]; then "
+            + f"if size=$(du -sk {quoted}); then "
+            + "printf 'fetch_kib=%s\\nrc=0\\n' \"${size%%[[:space:]]*}\"; else exit 1; fi; "
+            + "else printf 'fetch=missing\\nrc=0\\n'; fi"
+        )
         size = controller.capture([*ssh_prefix(config), size_command], CommandTimeLimit(config.probe_timeout_s))
         if not isinstance(size, CommandOutput) or size.status != 0:
             return FetchFailed("the Mac folder size could not be read")
@@ -2853,65 +2887,43 @@ def report_fix(result: FixResult) -> None:
         print(f"mac_test: {line}")
 
 
-def extended_regex_literal(text: str) -> str:
-    """Match text literally in pgrep's and awk's extended regular expressions.
-
-    A character that is special inside a bracket (`]`, `^`, `\\`) matches any
-    character instead, which can only widen the selection by that position.
-    """
-    return "".join(
-        character if character.isalnum() or character in "_-/"
-        else "." if character in "]^\\"
-        else f"[{character}]"
-        for character in text
-    )
-
-
 def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1, *,
-                           mirror_root: MacMirrorRoot | None = None) -> str:
-    """Define select_leftovers: the user's processes running from the scoped mirrors.
-
-    A repository's scope stops at its own mirror. Brackets around the first character prevent the pattern from matching its assignment.
-    """
+                           tokens: Sequence[str] = (), mode: run_token.Mode = "observe") -> str:
+    """Select Mac run tokens or use the existing Linux slot selector."""
     if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
         if not isinstance(scope, KnownRepository):
             raise ValueError("Linux cleanup requires a repository and slot")
         from scripts.mac_test import linux_runner
         return linux_runner.mirror_selector_script(remote_mirror(scope, target, slot),
                                                    require_boot_identity=False)
-    root = (mirror_root if mirror_root is not None else mac_mirror_root()).relative
-    mirror = f"[{root[0]}]" + root[1:].replace(".", "[.]")
-    if isinstance(scope, KnownRepository):
-        mirror += "/" + extended_regex_literal(scope.name)
-        command_pattern = f"{mirror}([/'\"[:space:]]|$)"
-        cwd_pattern = f"^n.*/{mirror}(/|$)"
-    else:
-        command_pattern = f"{mirror}/"
-        cwd_pattern = f"^n.*/{mirror}(/|$)"
-    return (
-        f"mirror_command_pattern={shlex.quote(command_pattern)}\n"
-        + f"mirror_cwd_pattern={shlex.quote(cwd_pattern)}\n"
-        + r'''select_leftovers() {
-    if command_pids=$(pgrep -u "$(id -u)" -f "$mirror_command_pattern"); then
-        :
-    else
-        selector_result=$?
-        [ "$selector_result" -eq 1 ] || return 1
-    fi
-    cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn) || return 1
-    cwd_pids=$(printf '%s\n' "$cwd_records" | awk -v pattern="$mirror_cwd_pattern" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }') || return 1
-    printf '%s\n%s\n' "$command_pids" "$cwd_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print }'
-}
-'''
-    )
+    command = run_token.command(mode, [tokens])
+    return f"select_leftovers() {{\n    {command}\n}}\n"
 
 
 def leftover_check_script(repository: MirrorScope, target: str = "mac", slot: int = 1, *,
                           fence: Path | None = None, observe: bool = False,
-                          mirror_root: MacMirrorRoot | None = None) -> str:
-    script = mirror_selector_script(repository, target, slot, mirror_root=mirror_root) + "\n"
-    if isinstance(repository, KnownRepository) and not observe:
-        script += r'''leftover_pids=$(select_leftovers) || exit "$?"
+                          identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY) -> str:
+    mac = target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform)
+    tokens: tuple[str, ...] = ()
+    if mac and isinstance(identity, claim_state.ClaimIdentity):
+        try:
+            tokens = (run_token.token(identity),)
+        except run_token.InvalidRunToken as error:
+            return f"printf '%s\\n' {shlex.quote(str(error))} >&2; exit 1"
+    mode = "observe" if observe else "kill"
+    script = mirror_selector_script(repository, target, slot, tokens=tokens, mode=mode) + "\n"
+    if mac:
+        if not tokens:
+            return "exit 1"
+        script += r'''leftover_status=0
+leftover_output=$(select_leftovers) || leftover_status=$?
+printf '%s\n' "$leftover_output" | awk '/^leftover_killed / { print }'
+[ "$leftover_status" -eq 0 ] || exit "$leftover_status"
+leftover_pids=$(printf '%s\n' "$leftover_output" | awk '/^[0-9]+$/ { print }') || exit 1
+'''
+    else:
+        if isinstance(repository, KnownRepository) and not observe:
+            script += r'''leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill "$leftover_pid" 2>/dev/null
 done
@@ -2921,7 +2933,7 @@ printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill -9 "$leftover_pid" 2>/dev/null
 done
 '''
-    script += 'leftover_pids=$(select_leftovers) || exit "$?"\n'
+        script += 'leftover_pids=$(select_leftovers) || exit "$?"\n'
     if fence is not None:
         program = FENCE_HOLDER_PROGRAM + '''import pathlib, sys
 path = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
@@ -2946,11 +2958,12 @@ def parse_leftover_check(output: str) -> LeftoverCheckResult:
         key, separator, value = line.partition("=")
         if separator:
             values[key] = value
+    killed = tuple(line for line in output.splitlines() if line.startswith(run_token.KILLED_PREFIX))
     count_text = values.get("leftovers", "")
     if values.get("rc") != "0" or not count_text.isascii() or not count_text.isdecimal():
-        return LeftoverCheckFailed("the leftover check answer could not be read")
+        return LeftoverCheckFailed("the leftover check answer could not be read", killed)
     count = int(count_text)
-    return LeftoversEnded() if count == 0 else LeftoversRemain(count)
+    return LeftoversEnded(killed) if count == 0 else LeftoversRemain(count, killed)
 
 
 @dataclass(frozen=True)
@@ -2980,31 +2993,56 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
             check=False,
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
-        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s"), "")
+    except subprocess.TimeoutExpired as error:
+        partial_output = cast(str | bytes | None, error.output) or b""
+        output = partial_output.decode(errors="replace") if isinstance(partial_output, bytes) else partial_output
+        complete, _, _ = output.rpartition("\n")
+        killed = tuple(line for line in complete.splitlines() if line.startswith(run_token.KILLED_PREFIX))
+        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s", killed), "")
     except OSError:
         return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {timeout:g} s)"), "")
     ledger = transfer_bytes.active_transfers.get()
     if isinstance(ledger, transfer_bytes.TransferLedger):
         ledger.observe("ssh_cleanup", arguments, result.stdout, result.stderr)
     if result.returncode != 0:
+        killed = tuple(line for line in result.stdout.splitlines() if line.startswith(run_token.KILLED_PREFIX))
         if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
             from scripts.mac_test import linux_runner
             if result.returncode == linux_runner.SLOT_PROCESSES_UNRESOLVED:
                 return LeftoverObservation(LeftoversRemain(UnresolvedLeftoverCount()), result.stdout)
-        return LeftoverObservation(LeftoverCheckFailed(" ".join(result.stderr.split()) or f"SSH cleanup exited with status {result.returncode}"), result.stdout)
+        return LeftoverObservation(LeftoverCheckFailed(" ".join(result.stderr.split()) or f"SSH cleanup exited with status {result.returncode}", killed), result.stdout)
     answer = parse_leftover_check(result.stdout)
     if isinstance(answer, LeftoverCheckFailed):
         reason = " ".join(result.stderr.split())
         if reason:
-            return LeftoverObservation(LeftoverCheckFailed(reason), result.stdout)
+            return LeftoverObservation(LeftoverCheckFailed(reason, answer.killed), result.stdout)
     return LeftoverObservation(answer, result.stdout)
 
 
 def check_leftovers(config: SshConnectionSettings, host: str, repository: MirrorScope,
-                   target: str = "mac", slot: int = 1) -> LeftoverCheckResult:
-    """End and count one mirror's work on its recorded host."""
-    return read_leftovers(config, host, leftover_check_script(repository, target, slot), target).result
+                    target: str = "mac", slot: int = 1, *,
+                    identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
+                    ) -> LeftoverCheckResult:
+    """End and count the remote work of the exact claim."""
+    if (isinstance(identity, claim_state.NoClaimIdentity)
+            and target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform)):
+        # The placement cleanup caller transfers the retained claim before it checks its work.
+        paths = claim_state.state_paths(target)
+        try:
+            with claim_state.locked(paths.lock):
+                owned = [
+                    claim_state.claim_identity(claim.record) for claim in claim_state.read_claims(paths)
+                    if claim.record["pid"] == os.getpid() and claim.record.get("cleanup_pending")
+                    and claim.record.get("remote_host") == host
+                    and mac_cleanup_scope(claim_state.saved_mac_repository(claim.record)) == repository
+                ]
+        except (OSError, claim_state.StateReadError) as error:
+            return LeftoverCheckFailed(f"the retained claim could not be read: {error}")
+        if len(owned) != 1:
+            return LeftoverCheckFailed("the retained claim's run token is unavailable")
+        identity = owned[0]
+    script = leftover_check_script(repository, target, slot, identity=identity)
+    return read_leftovers(config, host, script, target).result
 
 
 def settle_pending_start(controller: ProcessController, config: OffloadConfig, host: str,
@@ -3019,7 +3057,7 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
     except (OSError, ValueError) as error:
         return StartUnsettled(str(error), LeftoverCheckFailed(f"cleanup settings unavailable: {error}"))
     command = (start_fence_command(identity, target, settle=True, scope_key=controller.claim_scope_key) + " || exit 1\n"
-               + leftover_check_script(repository, target, slot))
+               + leftover_check_script(repository, target, slot, identity=identity))
     observed = read_leftovers(connection, host, command, target)
     if (isinstance(observed.result, LeftoversEnded)
             and "dispatch_start_settled=" + pending_start_key(identity) in observed.output.splitlines()):
@@ -3044,14 +3082,15 @@ def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) 
 
 
 def check_current_leftovers(
-    config: OffloadConfig, host: str, repository: MirrorScope, target: str = "mac", slot: int = 1,
+    config: OffloadConfig, host: str, repository: MirrorScope, target: str = "mac", slot: int = 1, *,
+    identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
 ) -> LeftoverCheckResult:
     """Read the current connection settings before checking retained work."""
     try:
         connection = eligibility.read_connection_settings(config.source)
     except (OSError, ValueError) as error:
         return LeftoverCheckFailed(f"cleanup settings unavailable: {error}")
-    return check_leftovers(connection, host, repository, target, slot)
+    return check_leftovers(connection, host, repository, target, slot, identity=identity)
 
 
 def check_taken_over_claim(
@@ -3068,7 +3107,8 @@ def check_taken_over_claim(
             return LeftoverCheckFailed("the kept claim's repository is unavailable")
         if isinstance(controller.pending, PendingStartOperation):
             return settle_pending_start(controller, config, claim.host, scope, target, claim.slot).leftovers
-        return check_current_leftovers(config, claim.host, scope, target, claim.slot)
+        return check_current_leftovers(config, claim.host, scope, target, claim.slot,
+                                       identity=controller.claim_identity)
     return LeftoverCheckFailed("the kept claim's host could not be read")
 
 
@@ -3151,6 +3191,7 @@ def claim_for_run(
 
 def observe_cleanup(evidence: AttemptEvidence, checked: LeftoverCheckResult) -> None:
     evidence.evidence_at = time.time()
+    evidence.leftover_killed.extend(checked.killed)
     evidence.cleanup = "confirmed" if isinstance(checked, LeftoversEnded) else "unconfirmed"
     evidence.unresolved_count = (0 if isinstance(checked, LeftoversEnded) else checked.count
                                  if isinstance(checked, LeftoversRemain) else UnresolvedLeftoverCount())
@@ -3193,13 +3234,15 @@ def claimed_run(
             release_allowed = False
             probe = probe_mac(controller, config, repository, request.target, request.slot)
             if isinstance(probe, UnresolvedSlotStartup):
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                                 identity=controller.claim_identity)
                 release_allowed = isinstance(checked, LeftoversEnded)
                 observe_cleanup(evidence, checked)
                 report_leftover_check(checked, request)
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
             if isinstance(probe, UnavailableProbe):
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                                 identity=controller.claim_identity)
                 release_allowed = isinstance(checked, LeftoversEnded)
                 observe_cleanup(evidence, checked)
                 report_leftover_check(checked, request)
@@ -3210,7 +3253,8 @@ def claimed_run(
                 write_backoff(time.time() + config.unreachable_backoff_s, request.target)
                 return declined("unreachable", started)
             if isinstance(check_mac_disk_floor(probe, config.free_floor_gib), MacDiskShort):
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                                 identity=controller.claim_identity)
                 release_allowed = isinstance(checked, LeftoversEnded)
                 observe_cleanup(evidence, checked)
                 report_leftover_check(checked, request)
@@ -3230,10 +3274,13 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+        if not linux and not isinstance(controller.claim_identity, claim_state.ClaimIdentity):
+            return DeclinedMacRun("state", elapsed_seconds(started), "the Mac run token is unavailable")
         try:
             history_key = evidence.repository_key
             step_command = remote_test_command(config, request, repository, copied.tree_key,
-                history_key=history_key if isinstance(history_key, str) else store.UNKNOWN_IDENTITY)
+                history_key=history_key if isinstance(history_key, str) else store.UNKNOWN_IDENTITY,
+                identity=controller.claim_identity)
         except ValueError as error:
             evidence.execution = execution_identity.ExecutionNotStarted()
             return DeclinedMacRun("state", elapsed_seconds(started), str(error))
@@ -3319,7 +3366,8 @@ def claimed_run(
             elif not isinstance(controller.pending, SettledDispatchOperations):
                 return LostMacRun(elapsed_seconds(started), "remote startup has no acknowledgement")
             else:
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                                 identity=controller.claim_identity)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
@@ -3351,7 +3399,8 @@ def claimed_run(
                        path=f"~/{mirror_target(repository, request.target, request.slot)}",
                        free_floor_gib=config.free_floor_gib)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
-            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                                 identity=controller.claim_identity)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
@@ -3376,7 +3425,8 @@ def claimed_run(
     except OffloadInterrupted:
         controller.stop()
         if not release_allowed and isinstance(controller.pending, SettledDispatchOperations):
-            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                                 identity=controller.claim_identity)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
@@ -4184,6 +4234,39 @@ def restore_ignored_interrupt_default(arguments: CliArguments) -> None:
         _ = signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
+def record_stopped_copy_cleanup(target: str, claim: claim_state.RemoteJobClaim, repository: KnownRepository,
+                                checked: LeftoverCheckResult) -> None:
+    """Save the stopped copy's kill lines with the cleanup evidence."""
+    from scripts.buildlog import record
+    from datetime import datetime
+
+    class StoppedCopyAttempt(record.SshAttempt):
+        leftover_killed: list[str]
+
+    evidence = AttemptEvidence()
+    observe_cleanup(evidence, checked)
+    since = datetime.fromisoformat(claim["since"]).timestamp()
+    attempt: StoppedCopyAttempt = {
+        "call_id": os.environ.get("BUILDLOG_CALL_ID") or claim["episode"],
+        "target": target or "mac",
+        "repo_identity": claim.get("repo_key") or repository.key or store.UNKNOWN_IDENTITY,
+        "queued_at": since,
+        "departed_at": since,
+        "slot": 1,
+        "outcome": "lost",
+        "completion": evidence.completion,
+        "cleanup": evidence.cleanup,
+        "unresolved_count": evidence.unresolved_count if isinstance(evidence.unresolved_count, int) else None,
+        "evidence_at": evidence.evidence_at,
+        "placement_episode": claim["episode"],
+        "placement_attempt": claim["attempt"],
+        "leftover_killed": evidence.leftover_killed,
+    }
+    if isinstance(checked, LeftoverCheckFailed):
+        attempt["reason"] = checked.reason
+    record.ssh_attempt(attempt)
+
+
 def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
                     evidence: AttemptEvidence, started: float) -> None:
     """Append each attempt independently of the final verify call target."""
@@ -4193,6 +4276,7 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
         transfers: list[transfer_bytes.TransferBytes]
         sent_bytes: int
         received_bytes: int
+        leftover_killed: NotRequired[list[str]]
 
     if not request.target:
         return
@@ -4221,6 +4305,8 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
         "sent_bytes": sum(transfer["sent_bytes"] for transfer in evidence.traffic.transfers),
         "received_bytes": sum(transfer["received_bytes"] for transfer in evidence.traffic.transfers),
     }
+    if evidence.leftover_killed:
+        attempt["leftover_killed"] = evidence.leftover_killed
     if isinstance(result, LostMacRun):
         attempt["reason"] = result.detail
     if isinstance(result, HanaCommandAdmissionRefused):

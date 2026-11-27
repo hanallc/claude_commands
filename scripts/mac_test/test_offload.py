@@ -53,7 +53,7 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test.offload_test_commands import install_nextest_log_writer
 from scripts.mac_test.offload_test_support import (
-    CLAIM_STUB, OffloadCommandFixture, FILTER, FIXTURE_MIRROR_ROOT, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
+    CLAIM_STUB, OffloadCommandFixture, FILTER, HANA, split_mac_run_command,
 )
 from scripts.mac_test.test_floor_sweep import install_floor_sweep_stub
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -888,40 +888,42 @@ class OffloadSettingsTests(unittest.TestCase):
 
     def test_leftover_check_requires_count_and_printed_success_on_the_named_host(self) -> None:
         config = eligibility.read_config(self.settings)
+        identity = claim_state.ClaimIdentity("claim", "retained", "attempt")
         for answer, expected in (("leftovers=0\nrc=0\n", offload.LeftoversEnded()),
                                  ("leftovers=4\nrc=0\n", offload.LeftoversRemain(4))):
             with self.subTest(answer=answer):
                 response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
                 with mock.patch.object(subprocess, "run", return_value=response) as run:
-                    self.assertEqual(offload.check_leftovers(config.connection, "kept-host", HANA), expected)
+                    self.assertEqual(offload.check_leftovers(config.connection, "kept-host", HANA, identity=identity), expected)
                 arguments = cast(list[str], run.call_args.args[0])
                 self.assertEqual(arguments[:-1], ["ssh", *offload.ssh_options(config.connection), "kept-host"])
                 self.assertEqual(run.call_args.kwargs["timeout"], 10)
-                self.assertIn('pgrep -u "$(id -u)" -f "$mirror_command_pattern"', arguments[-1])
-                self.assertIn(f"mirror_command_pattern={shlex.quote(HANA_COMMAND_PATTERN)}\n", arguments[-1])
+                self.assertIn("retained/attempt", arguments[-1])
+                self.assertIn("scripts.mac_test.run_token", arguments[-1])
         for answer in ("leftovers=0\n", "rc=0\n", "leftovers=-1\nrc=0\n", "leftovers=bad\nrc=0\n"):
             with self.subTest(answer=answer):
                 response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
                 with mock.patch.object(subprocess, "run", return_value=response):
-                    result = offload.check_leftovers(config.connection, "kept-host", HANA)
+                    result = offload.check_leftovers(config.connection, "kept-host", HANA, identity=identity)
                 self.assertIsInstance(result, offload.LeftoverCheckFailed)
                 if isinstance(result, offload.LeftoverCheckFailed):
                     self.assertIn("answer could not be read", result.reason)
 
     def test_leftover_check_reports_timeout_start_failure_and_ssh_error(self) -> None:
         config = eligibility.read_config(self.settings)
+        identity = claim_state.ClaimIdentity("claim", "retained", "attempt")
         for error, expected in ((subprocess.TimeoutExpired("ssh", 10), "timed out after 10"),
                                 (FileNotFoundError("ssh missing"), "could not start")):
             with self.subTest(error=type(error).__name__):
                 with mock.patch.object(subprocess, "run", side_effect=error):
-                    result = offload.check_leftovers(config.connection, "kept-host", HANA)
+                    result = offload.check_leftovers(config.connection, "kept-host", HANA, identity=identity)
                 self.assertIsInstance(result, offload.LeftoverCheckFailed)
                 if isinstance(result, offload.LeftoverCheckFailed):
                     self.assertIn(expected, result.reason)
                     self.assertIn("10", result.reason)
         response = subprocess.CompletedProcess(["ssh"], 255, "", "connection\n refused\tby host")
         with mock.patch.object(subprocess, "run", return_value=response):
-            result = offload.check_leftovers(config.connection, "kept-host", HANA)
+            result = offload.check_leftovers(config.connection, "kept-host", HANA, identity=identity)
         self.assertIsInstance(result, offload.LeftoverCheckFailed)
         if isinstance(result, offload.LeftoverCheckFailed):
             self.assertEqual(result.reason, "connection refused by host")
@@ -931,8 +933,9 @@ class OffloadSettingsTests(unittest.TestCase):
     def test_leftover_check_uses_configured_timeout_and_reports_it(self) -> None:
         _ = write_config_fixture(self.settings, "leftover_timeout_s=0.125\n", template="mac_test")
         config = eligibility.read_config(self.settings)
+        identity = claim_state.ClaimIdentity("claim", "retained", "attempt")
         with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 0.125)) as run:
-            result = offload.check_leftovers(config.connection, "kept-host", HANA)
+            result = offload.check_leftovers(config.connection, "kept-host", HANA, identity=identity)
         self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
         self.assertEqual(result, offload.LeftoverCheckFailed("SSH leftover check timed out after 0.125 s"))
         self.settings.unlink()
@@ -1191,11 +1194,9 @@ class OffloadCommandTests(OffloadCommandFixture):
 
         missing = self.repository
         _ = missing.rename(self.root / "former-checkout")
-        selectors = self.stub_directory / "selectors"
-        selectors.mkdir()
-        self.write_executable(selectors / "pgrep", "raise SystemExit(1)\n")
-        self.write_executable(selectors / "lsof", f"print('p41\\nn/home/fixture/{FIXTURE_MIRROR_ROOT}/old-mirror')\n")
-        self.write_executable(selectors / "sleep", "raise SystemExit(0)\n")
+        from scripts.mac_test.offload_test_commands import write_token_reader
+
+        write_token_reader(Path(self.environment["HOME"]), '[[ $3 == kill ]] || exit 99\nprintf "41\\n"\n')
         self.fixture["selector_shell"] = "sh"
         self.sync_fixture()
         result = self.command(repository=missing, subprocess_cli=True, assigned_adapter=True, settings=Path(settings), runner_options=(
@@ -1216,7 +1217,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(adopted["worktree"], ".")
         self.assertEqual(adopted["remote_host"], retained["remote_host"])
         script = cleanup["args"][-1]
-        self.assertNotIn("kill ", script)
+        self.assertIn(f"{retained['episode']}/{retained['attempt']}", script)
         self.assertEqual((self.stub_directory / "selector-answer").read_text().splitlines(), ["leftovers=1", "rc=0"])
 
     def test_claim_stub_preserves_the_host_and_worktree_during_cleanup_handoff(self) -> None:
@@ -1787,6 +1788,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                         redirect_stdout(io.StringIO()) as captured,
                     ):
                         config = eligibility.read_config(self.config_path)
+                        controller.claim_identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
                         outcome = offload.claimed_run(controller, config, request, HANA, time.monotonic())
                         status = offload.write_result(outcome, request.result, verb=verb)
                     output = captured.getvalue()
@@ -2029,6 +2031,16 @@ class OffloadCommandTests(OffloadCommandFixture):
                 else:
                     self.assertEqual(after, ["mac_cleanup=1"])
 
+    def test_direct_mac_command_exports_the_claim_run_token(self) -> None:
+        result = self.command("--workspace", direct_placement=True, separate_stderr=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_wire("passed", "")
+        event, = (event for event in self.events_for("ssh") if "lint nextest" in event["args"][-1])
+        assert "claim" in event
+        claim = event["claim"]
+        token = claim["episode"] + "/" + claim["attempt"]
+        self.assertIn("export MAC_RUN_TOKEN=" + shlex.quote(token) + "\n", event["args"][-1])
+
     def test_probe_copy_and_run_arguments_preserve_nextest_words(self) -> None:
         _ = (self.repository / ".gitignore").write_text(
             "generated/\n", encoding="utf-8"
@@ -2060,7 +2072,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(probe[: len(ssh_arguments)], ssh_arguments)
         probe_script = probe[len(ssh_arguments)]
         for fragment in (
-            "'.local'/'state'/'mac-test'/'test-mirror'/'hana'",
+            ".local/state/mac-test/test-mirror/hana",
             'df -g "$HOME"',
             "hostname -s",
         ):
@@ -2080,8 +2092,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                    or self.environment.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}")
         receiver_argument = (
             "--rsync-path=~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-receive "
-            + "--path '.local'/'state'/'mac-test'/'test-mirror'/'hana' "
-            + shlex.join(["--owner", "verify",
+            + shlex.join(["--path", ".local/state/mac-test/test-mirror/hana", "--owner", "verify",
                           "--repository", "hana", "--session", session, "--", "rsync"])
         )
         self.assertEqual(
@@ -2108,6 +2119,10 @@ class OffloadCommandTests(OffloadCommandFixture):
         run = events[2]["args"]
         self.assertEqual(run[: len(ssh_arguments)], ssh_arguments)
         remote = run[-1]
+        assert "claim" in events[2]
+        claim = events[2]["claim"]
+        token = claim["episode"] + "/" + claim["attempt"]
+        self.assertIn("export MAC_RUN_TOKEN=" + shlex.quote(token) + "\n", remote)
         remote_words, cleanup = split_mac_run_command(remote)
         self.assertIn("mac_cleanup=", cleanup)
         lint_index = remote_words.index("~/.claude/scripts/lint/lint")
@@ -2117,7 +2132,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         )
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
         self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
-        self.assertIn("PATH=$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH", remote_words)
+        self.assertIn("PATH=$HOME/.claude/scripts/mac_test/cargo_gate/bin:$mac_sccache_dir:$HOME/.cargo/bin:$PATH",
+                      remote_words)
         self.assertIn("BUILDLOG_CALLER=verify-mac", remote_words)
         self.assertIn("BUILDLOG_CALL_ID=call-17", remote_words)
         self.assertIn("BUILDLOG_SYNC=1", remote_words)
