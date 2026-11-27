@@ -103,7 +103,7 @@ class PushGateTests(unittest.TestCase):
     def marker(self, *, stamp: float = 1999.0, action: str | None = "Choose retry.") -> Path:
         directory = self.root / "failed"
         directory.mkdir(exist_ok=True)
-        message = ("Action: " + action if action is not None else "No action needed.") + "\nThe build stopped."
+        message = f"Action: {action}\nThe build stopped." if action is not None else "The build stopped."
         record: Marker = {"time": stamp, "title": "Build choice", "action": action,
                           "body": "The build stopped.", "message": message,
                           "fallback": "Title: Build choice\n" + message + "\n\nSent by: writer · Template: alert.blocked",
