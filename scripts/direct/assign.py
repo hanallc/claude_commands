@@ -37,7 +37,7 @@ from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.direct import assign_claude, phase_reservation, progress_history, recorder_state, remove_run_scratch, simplify_daily
 from scripts.production import staff, worker_admission
-from scripts.lib import conf, file_lock, models_registry, unit_runs
+from scripts.lib import conf, models_registry, unit_runs
 from scripts.herdr import herdr, side_pane, worker_panes
 from scripts.production import worker as staff_worker
 from scripts.lib.atomic_file import write_text_atomic
@@ -1032,10 +1032,11 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return staff_worker.ExitCode.BUSY
-        startup_lock = staff.record_path().parent / "locks" / f"astra-review-start-{parent.id}.lock"
-        # Reviewers wait for the caller's row during startup only.
-        with file_lock.exclusive(startup_lock):
-            current = launch(target, policy, lock=hold, phase="astra-review")
+        try:
+            with staff.reviewer_startup(parent):
+                current = launch(target, policy, lock=hold, phase="astra-review")
+        except (staff.StaffRefused, worker_lifecycle.OperationDeadlineExpired) as error:
+            current = worker_panes.AdmissionRefused(" ".join(str(error).splitlines()))
         staff_worker.arm_launch_cleanup(cleanup, before, current)
         if not isinstance(current, worker_panes.OpenWorker):
             return staff_worker.startup_result(target.name, current)

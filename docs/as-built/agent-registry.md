@@ -287,6 +287,9 @@ An ad hoc Astra review starts through `assign.sh --target consultation-pane --op
 Its command interface retains `send` and `close`.
 A managed Astra review starts through `assign.sh --role review --operation astra-review`.
 Managed reviewers for the same caller take turns opening their panes under the caller's staff row lock.
+The startup lock and the caller's row lock share one deadline from `operation_lock_seconds`.
+On timeout, the launcher names the lock and its holder when available.
+Both locks release before dispatch.
 Each reviewer uses its own worker lock through submission.
 Reviews can run in parallel after submission.
 The reviewer's role hold stays active until completion. After a failed close, the staff row remains the record of the reviewer.

@@ -1179,27 +1179,64 @@ def session_operation(session: str, *, native_key: str, join_recovery: bool = Fa
         yield record
 
 
+class SlotLockWait(Enum):
+    IMMEDIATE = "refuse a held slot"
+
+
+def _wait_for_slot(lock: IO[bytes], path: Path, name: str, deadline: float) -> None:
+    from scripts.agents import worker_lifecycle
+
+    try:
+        worker_lifecycle.acquire_flock(lock, deadline=deadline)
+    except worker_lifecycle.OperationDeadlineExpired as error:
+        holder = _slot_holder(lock)
+        named = f"pid {holder[0]}: {holder[1]}" if holder else _operation_lock_holder(path)
+        raise StaffRefused(f"{name}: timed out waiting for lock ({named})", holder=named) from error
+
+
 @contextmanager
-def slot_operation(key: str, name: str, *, join: bool = True) -> Generator[None]:
+def _slot_lock(path: Path, name: str, deadline: float | SlotLockWait) -> Generator[IO[bytes]]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b", buffering=0) as lock:
+        if deadline is SlotLockWait.IMMEDIATE:
+            _acquire_slot(lock, name)
+        else:
+            _wait_for_slot(lock, path, name, deadline)
+        _write_slot_holder(lock)
+        try:
+            yield lock
+        finally:
+            _clear_slot_holder(lock)
+
+
+@contextmanager
+def slot_operation(key: str, name: str, *, join: bool = True,
+                   deadline: float | SlotLockWait = SlotLockWait.IMMEDIATE) -> Generator[None]:
     """Lock a row or a named worker slot across inherited children."""
     path, variable = _row_lock(key)
     if join and _joined_operation(path, variable):
         yield
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b", buffering=0) as lock:
-        _acquire_slot(lock, name)
+    with _slot_lock(path, name, deadline) as lock:
         previous = os.environ.get(variable)
-        _write_slot_holder(lock)
         try:
             os.environ[variable] = str(lock.fileno())
             yield
         finally:
-            _clear_slot_holder(lock)
             if previous is None:
                 _ = os.environ.pop(variable, None)
             else:
                 os.environ[variable] = previous
+
+
+@contextmanager
+def reviewer_startup(caller: StaffRow) -> Generator[None]:
+    """Use one deadline for the reviewer startup lock and the caller's row."""
+    deadline = time.monotonic() + _wait_seconds("operation_lock_seconds")
+    path = _file().parent / "locks" / f"astra-review-start-{caller.id}.lock"
+    with _slot_lock(path, f"{caller.name}: reviewer startup", deadline):
+        with slot_operation(caller.id, f"{caller.name}: caller row", deadline=deadline):
+            yield
 
 
 @dataclass(frozen=True)
