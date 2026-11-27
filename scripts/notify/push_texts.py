@@ -18,7 +18,7 @@ from scripts.message import session_send
 from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 
 from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
-                         NoSessionLine, NO_SESSION_LINE, SessionLine, first_line)
+                         NoSessionLine, NO_SESSION_LINE, SessionLine, notification_message)
 
 Need = Literal["note", "decision", "blocked"]
 REVIEWED_FILE = Path(__file__).with_name("push_texts_reviewed.json")
@@ -69,8 +69,7 @@ class PushText:
     # One line for /nate help: when the push goes out. Not part of the approval fingerprint.
     purpose: str
     session: SessionTemplate | NoSessionLine = NO_SESSION_LINE
-    # False: the phone shows the title and body exactly as rendered, with no
-    # "No action needed." line. Only an entry with no action and no session can opt out.
+    # Only an entry with no action and no session can set header to False.
     header: bool = True
     # An agent writes the text at send time; no person approved it, so check it like free text.
     agent_written: bool = False
@@ -107,10 +106,7 @@ class RenderedPush:
     def message(self) -> str:
         if self.one_line:
             return self.title
-        if not self.header:
-            return self.body
-        header = first_line(self.action, self.session)
-        return f"{header}\n{self.body}" if self.body else header
+        return notification_message(self.action, self.body, self.session, header=self.header)
 
 
 def catalog() -> tuple[PushText, ...]:

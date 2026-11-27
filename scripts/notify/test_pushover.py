@@ -34,7 +34,7 @@ from scripts.notify import silence
 from scripts.notify.test_review import FakeReviewer, verdict, with_footer
 from scripts.production import record_store
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
-                         NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, first_line, parse_user_action, refused_at)
+                         NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, notification_header, parse_user_action, refused_at)
 from scripts.whoami import agent_accounts
 
 REAL_REVIEW = review.review
@@ -83,7 +83,7 @@ class UserActionTests(unittest.TestCase):
     def test_session_header_is_parsed_and_kept_above_the_action(self) -> None:
         self.assertEqual(split_session("Session: Owner\nReason: stopped"), (SessionLine("Owner"), "Reason: stopped"))
         self.assertEqual(split_session("Reason: stopped"), (NO_SESSION_LINE, "Reason: stopped"))
-        self.assertEqual(first_line(ActionRequired("run it"), SessionLine("Owner")), "Session: Owner\nAction: run it")
+        self.assertEqual(notification_header(ActionRequired("run it"), SessionLine("Owner")), "Session: Owner\nAction: run it")
 
     def test_messages_without_session_share_the_explicit_absence_state(self) -> None:
         entry = push_texts.PushText("test", "script", "note", "Done", push_texts.NoActionNeeded(),
@@ -101,9 +101,9 @@ class UserActionTests(unittest.TestCase):
         self.assertIs(parsed["session"], NO_SESSION_LINE)
         self.assertIs(split_session(rendered.body)[0], NO_SESSION_LINE)
 
-    def test_first_line_states_the_action(self) -> None:
-        self.assertEqual(first_line(ActionRequired("choose a branch")), "Action: choose a branch")
-        self.assertEqual(first_line(NoActionRequired()), "No action needed.")
+    def test_notification_header_states_the_action(self) -> None:
+        self.assertEqual(notification_header(ActionRequired("choose a branch")), "Action: choose a branch")
+        self.assertEqual(notification_header(NoActionRequired()), "")
 
 
 class ParentSourceTests(unittest.TestCase):
@@ -150,6 +150,7 @@ class MacDeliveryTests(unittest.TestCase):
                     "source": "Mac unit", "priority": priority, "title": "Build done",
                     "message": "Action: Check the build\nThe build passed.", "detail": "reviewed",
                     "key": "build", "text_id": "fixture.admitted", "due": "",
+                    "header": "Action: Check the build",
                     "need": "blocked" if priority == "2" else "note", "reference": push_reference.NO_REFERENCE})
                 asked.clear()
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -844,7 +845,22 @@ class PushoverTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post)), 0)
         self.assertEqual(silence.read_kept(), [])
-        self.assertEqual(posted, [footed(push["message"], "legacy-owner", "none (free text)")])
+        self.assertEqual(posted, [footed("The old notice.", "legacy-owner", "none (free text)")])
+
+    def test_silence_release_logs_the_action_from_an_older_priority_zero_push(self) -> None:
+        header = "Action: In a terminal on natedev, run github-warmup"
+        message = header + "\nWhy: GitHub credentials are cold.\nNext run: Tue 11-24 00:53 PST."
+        push: silence.KeptPush = {"source": "nightly", "priority": "0", "title": "Nightly check did not run",
+            "message": message, "detail": "", "key": "", "text_id": "nightly.not_run"}
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        self.silence_on()
+        self.assertIsInstance(silence.keep_here(push), silence.Kept)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post)), 0)
+        form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
+        self.assertEqual(form["message"], [footed(message, "nightly", "nightly.not_run")])
+        self.assertEqual(self.log_lines()[-1]["priority"], "0")
+        self.assertEqual(self.log_lines()[-1]["header"], header)
 
     def test_silence_drops_old_restart_failure_without_resume_values(self) -> None:
         push: silence.KeptPush = {"source": "shutdown", "priority": "0", "title": "Claude coding work remains stopped",
@@ -947,10 +963,11 @@ class PushoverTests(unittest.TestCase):
         return [cast(dict[str, object], json.loads(line)) for line in pushover.LOG_FILE.read_text().splitlines()]
 
     def assert_log(self, priority: str, title: str, message: str, outcome: str,
-                   source: str = "python test_pushover.py") -> None:
+                   source: str = "python test_pushover.py", *, header: str | None = None) -> None:
         entries = self.log_lines()
         self.assertEqual(len(entries), 1)
         entry = entries[0]
+        self.assertEqual(entry.pop("header", None), header)
         self.assertEqual(set(entry), {"time", "source", "priority", "title", "message", "outcome"})
         self.assertEqual((entry["source"], entry["priority"], entry["title"], entry["message"], entry["outcome"]),
                          (source, priority, title, message, outcome))
@@ -966,8 +983,24 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(form["user"], ["u123"])
         self.assertEqual(form["token"], ["a456"])
         self.assertEqual(form["priority"], ["0"])
-        self.assertEqual(form["message"], [footed("No action needed.\nmerged")])
+        self.assertEqual(form["message"], [footed("merged")])
         self.assertNotIn("retry", form)
+
+    def test_no_action_send_with_session_posts_session_and_body(self) -> None:
+        code, form = self.run_send(["--no-action", "Owner is ready", "Session: Owner\nThe check passed."])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["message"], [footed("Session: Owner\nThe check passed.")])
+
+    def test_note_posts_without_leading_blank_lines(self) -> None:
+        code, form = self.run_send(["--no-action", "Build done", " \n\t\r\n  The build passed.\n\nThe logs are ready."])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["message"], [footed("  The build passed.\n\nThe logs are ready.")])
+
+    def test_title_only_note_starts_its_message_with_the_footer(self) -> None:
+        code, form = self.run_send(["--text-id", "nixos.ups_power_back", "--value", "charge=80"])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["title"], ["Power is back on natedev"])
+        self.assertEqual(form["message"], ["Sent by: ups · Template: nixos.ups_power_back"])
 
     def test_emergency_repeats_until_acknowledged(self) -> None:
         code, form = self.run_send(["--priority", "2", "--action", "run github-warmup", "Hana: blocked",
@@ -977,7 +1010,7 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(form["expire"], [str(pushover.EXPIRE_S)])
         posted = footed("Action: run github-warmup\nGitHub credentials are cold.")
         self.assertEqual(form["message"], [posted])
-        self.assert_log("2", "Hana: blocked", posted, "sent, receipt r1")
+        self.assert_log("2", "Hana: blocked", posted, "sent, receipt r1", header="Action: run github-warmup")
 
     def test_keyed_emergency_carries_the_tag_of_its_key(self) -> None:
         code, form = self.run_send(["--priority", "2", "--key", "handler-prompt", "--action", "answer the prompt",
@@ -1039,7 +1072,7 @@ class PushoverTests(unittest.TestCase):
             code, form = self.run_send(["--no-action", "t", "m"])
         self.assertEqual((code, form), (2, {}))
         self.assertIn("pushover: refused before sending: keys missing", errors.getvalue())
-        self.assert_log("0", "t", footed("No action needed.\nm"), "refused before sending: keys missing")
+        self.assert_log("0", "t", footed("m"), "refused before sending: keys missing", header="")
 
     def test_bad_usage_sends_nothing(self) -> None:
         for argv in (["--priority", "3", "t", "m"], ["only title"], ["t", " "]):
@@ -1050,25 +1083,25 @@ class PushoverTests(unittest.TestCase):
         code, _ = self.run_send(["--no-action", "t", "m"], status=400,
                                 body=b'{"status":0,"errors":["application token is invalid"]}')
         self.assertEqual(code, 1)
-        self.assert_log("0", "t", footed("No action needed.\nm"), "refused: application token is invalid")
+        self.assert_log("0", "t", footed("m"), "refused: application token is invalid", header="")
 
     def test_array_reply_logs_http_refusal(self) -> None:
         code, _ = self.run_send(["--no-action", "t", "m"], body=b"[]")
         self.assertEqual(code, 1)
-        self.assert_log("0", "t", footed("No action needed.\nm"), "unconfirmed: HTTP 200")
+        self.assert_log("0", "t", footed("m"), "unconfirmed: HTTP 200", header="")
 
     def test_null_reply_logs_http_refusal(self) -> None:
         code, _ = self.run_send(["--no-action", "t", "m"], body=b"null")
         self.assertEqual(code, 1)
-        self.assert_log("0", "t", footed("No action needed.\nm"), "unconfirmed: HTTP 200")
+        self.assert_log("0", "t", footed("m"), "unconfirmed: HTTP 200", header="")
 
     def test_sent_log_keeps_multiline_text_after_limits(self) -> None:
         message = "first line\nsecond line"
         code, form = self.run_send(["--no-action", "Hana: unit", message])
         self.assertEqual(code, 0)
-        posted = footed("No action needed.\n" + message)
+        posted = footed(message)
         self.assertEqual(form["message"], [posted])
-        self.assert_log("0", "Hana: unit", posted, "sent")
+        self.assert_log("0", "Hana: unit", posted, "sent", header="")
 
     def test_overlong_title_and_message_log_the_posted_values(self) -> None:
         title = "T" * (pushover.TITLE_MAX + 3)
@@ -1077,10 +1110,10 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(form["title"], [title[:pushover.TITLE_MAX]])
         footer = footed("")
-        posted = ("No action needed.\n" + message)[:pushover.MESSAGE_MAX - len(footer)] + footer
+        posted = message[:pushover.MESSAGE_MAX - len(footer)] + footer
         self.assertEqual(len(posted), pushover.MESSAGE_MAX)
         self.assertEqual(form["message"], [posted])
-        self.assert_log("0", title[:pushover.TITLE_MAX], posted, "sent")
+        self.assert_log("0", title[:pushover.TITLE_MAX], posted, "sent", header="")
 
     def test_unreachable_log_keeps_text(self) -> None:
         def unavailable(_url: str, _data: bytes) -> tuple[int, bytes]:
@@ -1089,7 +1122,7 @@ class PushoverTests(unittest.TestCase):
         with mock.patch("sys.stderr"):
             code = registered_send(["--no-action", "t", "first\nsecond"], self.keys, unavailable)
         self.assertEqual(code, 1)
-        self.assert_log("0", "t", footed("No action needed.\nfirst\nsecond"), "unreachable: <urlopen error offline>")
+        self.assert_log("0", "t", footed("first\nsecond"), "unreachable: <urlopen error offline>", header="")
 
     def test_unwritable_log_does_not_change_exit_status(self) -> None:
         folder = pushover.LOG_FILE.parent / "directory"
@@ -1225,7 +1258,7 @@ class PushoverTests(unittest.TestCase):
         self.silence_on()
         with mock.patch.object(push_texts, "catalog", return_value=(entry,)), redirect_stdout(io.StringIO()):
             self.assertEqual(self.run_send(["--text-id", "test.kept"]), (0, {}))
-        self.assertEqual(self.log_lines()[-1]["message"], "No action needed.\nThe build passed.")
+        self.assertEqual(self.log_lines()[-1]["message"], "The build passed.")
         posted: list[str] = []
 
         def post(_url: str, data: bytes) -> tuple[int, bytes]:
@@ -1235,7 +1268,7 @@ class PushoverTests(unittest.TestCase):
         with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
               redirect_stdout(io.StringIO())):
             self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, post)), 0)
-        self.assertEqual(posted, [footed("No action needed.\nThe build passed.", "build-followups", "test.kept")])
+        self.assertEqual(posted, [footed("The build passed.", "build-followups", "test.kept")])
 
         action = "Action: To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts "
         for text_id, account, read_fails, legacy, expected in (
@@ -1257,6 +1290,7 @@ class PushoverTests(unittest.TestCase):
                     self.assertEqual([push["message"].strip() for push in kept], [action + "none"])
                     if legacy:
                         saved = {**kept[0], "detail": "registered text"}
+                        _ = saved.pop("header", None)
                         _ = silence.kept_file().write_text(json.dumps(saved) + "\n")
                     before_release = len(self.log_lines())
                     read.reset_mock()
@@ -1269,6 +1303,21 @@ class PushoverTests(unittest.TestCase):
                 self.assertTrue(outcomes[-1].startswith("sent, kept during silence"))
                 warning = "anomaly: kept paid-credit action uses the saved account list: accounts config unavailable"
                 self.assertEqual(outcomes[:-1], [warning] if read_fails else [])
+
+    def test_silence_releases_a_note_with_action_text_in_its_body(self) -> None:
+        body = "Action: backup complete.\nThe logs are ready."
+        draft = review.Draft("writer", "0", "Backup complete", NoActionRequired(), body, False, SessionLine("Owner"))
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        self.silence_on()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pushover.deliver(draft, self.keys, post), 0)
+        self.assertEqual(silence.read_kept()[0].get("header"), "Session: Owner")
+        post.assert_not_called()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, post)), 0)
+        form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
+        self.assertEqual(form["message"], [footed("Session: Owner\n" + body, "writer", "none (free text)")])
+        self.assertEqual(self.log_lines()[-1]["header"], "Session: Owner")
 
     def test_an_empty_sender_is_refused_and_nothing_is_posted(self) -> None:
         for source in ("", "  ", "send.py in "):
@@ -1287,11 +1336,11 @@ class PushoverTests(unittest.TestCase):
             return 200, b'{"status":1}'
 
         with redirect_stdout(io.StringIO()):
-            code = pushover.post_message("send.py in hana", "0", "t", "No action needed.\n" + "B" * 2000, self.keys, post,
+            code = pushover.post_message("send.py in hana", "0", "t", "B" * 2000, self.keys, post,
                                          "", text_id="auto_mode.refused")
         self.assertEqual(code, 0)
         self.assertEqual(len(sent[0]), pushover.MESSAGE_MAX)
-        self.assertTrue(sent[0].startswith("No action needed.\nBBB"))
+        self.assertTrue(sent[0].startswith("BBB"))
         self.assert_footer(sent[0], "hana", "auto_mode.refused")
 
     def draft(self, *, answerable: bool = False) -> review.Draft:
@@ -1317,10 +1366,10 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(code, 0)
         read.assert_called_once_with(draft, revision=False)
         self.assertEqual(form["title"], [version.title])
-        self.assertEqual(form["message"], [footed(first_line(version.action) + "\n" + version.body, draft.source)])
+        self.assertEqual(form["message"], [footed(notification_header(version.action) + "\n" + version.body, draft.source)])
         self.assertEqual(form["priority"], ["0"])
         self.assertIn("pushover: sent as rewritten:\n" + version.title + "\n" +
-                      first_line(version.action) + "\n" + version.body + "\n", output.getvalue())
+                      notification_header(version.action) + "\n" + version.body + "\n", output.getvalue())
         self.assertEqual(self.reviews()[0]["verdict"], "rewrite")
         self.assertEqual(cast(dict[str, object], self.reviews()[0]["sent"])["body"], version.body)
 
@@ -1432,7 +1481,7 @@ class PushoverTests(unittest.TestCase):
             code, form = self.run_send(["--text-id", "test"])
         self.assertEqual(code, 0)
         self.assertEqual(form["title"], [rendered.title])
-        self.assertEqual(form["message"], [footed(first_line(rendered.action) + "\n" + rendered.body, "script", "test")])
+        self.assertEqual(form["message"], [footed(notification_header(rendered.action) + "\n" + rendered.body, "script", "test")])
         self.assertEqual(self.reviews()[0]["text_id"], "test")
         self.assertIn("sent despite failed review", str(self.reviews()[0]["detail"]))
         fix.assert_called_once()
@@ -1449,7 +1498,7 @@ class PushoverTests(unittest.TestCase):
             code, form = self.run_send(["--text-id", "test"])
         self.assertEqual(code, 0)
         self.assertEqual(form["title"], [rendered.title])
-        self.assertEqual(form["message"], [footed(first_line(rendered.action) + "\n" + rendered.body, "script", "test")])
+        self.assertEqual(form["message"], [footed(notification_header(rendered.action) + "\n" + rendered.body, "script", "test")])
         self.assertNotIn("sent as rewritten", output.getvalue())
         self.assertEqual(self.reviews()[0]["verdict"], "rewrite")
         self.assertEqual(cast(dict[str, object], self.reviews()[0]["sent"])["body"], rendered.body)
@@ -1649,7 +1698,7 @@ class PushoverTests(unittest.TestCase):
         with mock.patch.object(review, "review", side_effect=AssertionError("review while off")):
             code, form = self.run_send(self.arguments())
         self.assertEqual(code, 0)
-        self.assertEqual(form["message"], [footed(first_line(self.draft().action) + "\n" + self.draft().body, "writer")])
+        self.assertEqual(form["message"], [footed(notification_header(self.draft().action) + "\n" + self.draft().body, "writer")])
         self.assertIn("review: off", str(self.log_lines()[0]["outcome"]))
 
     def test_review_off_preserves_multiline_and_single_line_actions(self) -> None:
@@ -1688,7 +1737,7 @@ class PushoverTests(unittest.TestCase):
             with self.subTest(why=why), mock.patch.object(review, "review", return_value=review.Unreviewed(why)):
                 code, form = self.run_send(self.arguments())
             self.assertEqual(code, 0)
-            self.assertEqual(form["message"], [footed(first_line(draft.action) + "\n" + draft.body, "writer")])
+            self.assertEqual(form["message"], [footed(notification_header(draft.action) + "\n" + draft.body, "writer")])
             self.assertIn("unreviewed: " + why, str(self.log_lines()[-1]["outcome"]))
             self.assertEqual(self.reviews()[-1]["verdict"], "unreviewed: " + why)
 
@@ -1724,7 +1773,7 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(len(posted), 1)
         self.assertEqual(elapsed[0], 105)
         self.assertEqual(urllib.parse.parse_qs(posted[0].decode())["message"],
-                         [footed(first_line(draft.action) + "\n" + draft.body, "writer")])
+                         [footed(notification_header(draft.action) + "\n" + draft.body, "writer")])
         self.assertIn("unreviewed: timeout", str(self.log_lines()[0]["outcome"]))
 
     def silence_on(self) -> None:
@@ -1827,8 +1876,8 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(output.getvalue(), "pushover: sent\n" * 2 + "silence off; 2 kept pushes delivered\n")
         self.assertEqual([(form["title"], form["message"]) for form in posted],
-                         [(["First"], [footed("No action needed.\nFirst body.")]),
-                          (["Second"], [footed("No action needed.\nSecond body.")])])
+                         [(["First"], [footed("First body.")]),
+                          (["Second"], [footed("Second body.")])])
         self.assertEqual(self.log_lines()[-1]["outcome"], "sent, kept during silence")
         with redirect_stdout(io.StringIO()):
             code, form = self.run_send(["--no-action", "Third", "Third body."])
