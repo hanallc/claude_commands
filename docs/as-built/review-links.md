@@ -323,6 +323,7 @@ The controls in the copy have no plate and no edge, so each part of the copy tha
 The copy itself takes no clicks: a click beside its controls goes to the window, as a click on the backdrop does.
 A window meets the action area when a part of the window and the controls of the area overlap from left to right.
 While a window meets the copy, the frame sets `--page-window-top` to the bottom of the copy.
+On pages with frozen desktop controls, the value also clears the bottom of the frozen top.
 The frame measures each open window at these times:
 - when the window opens, and when another window closes,
 - when the view or the action area changes size,
@@ -1608,7 +1609,7 @@ Escape, Close, and a click outside the card close the dialog.
 Focus returns to the List link.
 The dialog reaches the right edge of the List column, so it meets the action area and starts below it (`--page-window-top`).
 At the console's phone breakpoint, the dialog fills the screen below the action area, including in the Studio.
-On a desktop, the List centers the dialog horizontally, 16 px below the action area.
+On a desktop, the Studio centers the dialog horizontally, 16 px below the frozen top.
 On a page without an action area, the phone dialog fills the screen and the desktop dialog is 16 px from the top.
 The dialog dims the List with a 47 percent black backdrop.
 Switching browser tabs keeps the dialog and its draft.
