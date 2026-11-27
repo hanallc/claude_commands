@@ -13,7 +13,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 import contextlib
 import fcntl
 import json
@@ -37,7 +37,7 @@ from scripts.build_hold import override_guard
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession, owning_session
 from scripts.build_queue import admission_wire as wire
 from scripts.lib import conf, process_group
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.mac_test import claim_state, mac_test
 from scripts.mac_test.mac_transport import (BATCH_MODE, MacPlacement, RemoteRun, RemoteState, placement_value,
                                             remote_command, stop_command, stop_remote, stream_remote)
@@ -169,7 +169,7 @@ def clean_ended_runs(environment: dict[str, str]) -> None:
                     argv_file = directory / "argv.json"
                     with lifecycle_mirror_lease(argv_file, saved["host"]):
                         status = run_callback(str(script), phase, argv_file, saved["arguments"],
-                                              {**environment, "MAC_QUEUE_HOST": saved["host"]})
+                                              {**environment, "MAC_QUEUE_HOST": saved["host"], "MAC_QUEUE_RECOVER_SMOKE": "1"})
                 except OSError as error:
                     print(f"mac queue: cleanup of an ended run failed: {error}; kept {directory}", file=sys.stderr)
                     continue
@@ -271,7 +271,7 @@ def shell_session() -> OwningSession | NoOwningSession:
 
 
 def smoke_session(placement: MacPlacement, command: list[str], ssh: contextlib.ExitStack) -> subprocess.Popen[str]:
-    """Run the numbered copy with the SSH input open."""
+    """Run the smoke checkout with the SSH input open."""
     work = f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} {shlex.join(command)}"
     process = ssh.enter_context(subprocess.Popen(
         ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -f -c " + shlex.quote(work)],
@@ -293,6 +293,7 @@ class SmokeConnectionLost:
 @dataclass(frozen=True)
 class SmokeFinalStatus:
     status: int
+    retained_folder: bool = False
 
 
 @dataclass(frozen=True)
@@ -335,12 +336,23 @@ def take_smoke_status(episode: str) -> int:
     return 0
 
 
-def read_smoke_ready(output: TextIO, episode: str) -> bool:
+def read_smoke_ready(output: TextIO, control: TextIO, episode: str, upload: Callable[[], bool]) -> bool:
     ready = f"mac_smoke_ready={episode}\n"
+    register = f"mac_smoke_register={episode}\n"
+    upload_ready = f"mac_smoke_upload={episode}\n"
     for line in output:
         if line == ready:
             return True
-        print(line, end="", flush=True)
+        if line == register:
+            _ = control.write("+")
+            control.flush()
+        elif line == upload_ready:
+            if not upload():
+                return False
+            _ = control.write("\n")
+            control.flush()
+        else:
+            print(line, end="", flush=True)
     return False
 
 
@@ -363,9 +375,10 @@ def read_smoke_result(placement: MacPlacement, ssh_status: int, *, ready: bool) 
         return SmokeMissingStatus()
     prefix = b"mac_smoke_status="
     if result.stdout.startswith(prefix) and result.stdout.endswith(b"\n"):
-        status = result.stdout[len(prefix):-1]
-        if 1 <= len(status) <= 3 and status.isdigit() and int(status) <= 255:
-            return SmokeFinalStatus(int(status))
+        status, separator, retained = result.stdout[len(prefix):-1].partition(b"\n")
+        if ((not separator or retained == b"retained") and 1 <= len(status) <= 3
+                and status.isdigit() and int(status) <= 255):
+            return SmokeFinalStatus(int(status), bool(separator))
     return SmokeInvalidStatus()
 
 
@@ -382,8 +395,184 @@ def run_smoke_copy(command: list[str]) -> int:
     now = time.time()
     # The hourly sweep lists an orphaned status folder for manual removal after it expires.
     scratch.write_record(status_file.parent, scratch.task_or_default("", now), now, throwaway=True)
-    write_text_atomic(status_file, f"{status}\n", new_file_mode=0o600)
+    retained = "retained\n" if smoke_folder_record(episode).exists() else ""
+    write_text_atomic(status_file, f"{status}\n{retained}", new_file_mode=0o600)
     return 0
+
+
+def hold_offload_folder(machine: str, repository: str, unit: str, state: Path) -> int:
+    """Hold the folder until the offload coordinator confirms clearance."""
+    from scripts.agents import remote
+    from scripts.lib import build_folders
+    from scripts.mac_test.offload import retire_fixed_offload_fence
+
+    if machine != "mac-linux":
+        machine = remote.this_machine()
+    if state.is_absolute() or ".." in state.parts or state.suffix != ".folder":
+        raise ValueError("the offload record must name a relative folder record")
+    record = Path.home() / state
+    if record.exists() or record.is_symlink():
+        raise BlockingIOError(f"{record}: the attempt already has a saved build folder")
+    name = build_folders.build_repository_name(repository)
+    with build_folders.fixed_repository_build_folder(name, machine=machine, unit=unit) as checkout:
+        _ = build_folders.fixed_cargo_folder(checkout)
+        fence = record.with_suffix(".lock")
+        fence.parent.mkdir(parents=True, exist_ok=True)
+        marker = build_folders.copy_keep_file(checkout)
+        with fence.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if not os.path.samestat(fence.stat(), os.fstat(lock.fileno())):
+                return os.EX_TEMPFAIL
+            print("build_folder=" + json.dumps(str(checkout)), flush=True)
+            if sys.stdin.read(1) != "+":
+                fence.unlink()
+                return 1
+            write_text_atomic(record, str(checkout.resolve()) + "\n", new_file_mode=0o600)
+            write_text_atomic(marker, str(record) + "\n", new_file_mode=0o600)
+        # Release the dispatch fence before the receiver or test can start.
+        print("build_folder_confirmed", flush=True)
+        if sys.stdin.read(1) != "\n":
+            return 1
+        with retire_fixed_offload_fence(fence):
+            marker.unlink()
+            sync_folder(marker.parent)
+            record.unlink()
+            sync_folder(record.parent)
+        return 0
+
+
+class SavedSmokeFolder(TypedDict):
+    checkout: str
+    launch: str
+    bundle: str
+
+
+def smoke_folder_record(episode: str) -> Path:
+    """Name the recovery record on the Mac for this episode."""
+    if uuid.UUID(hex=episode).hex != episode:
+        raise ValueError("the Mac smoke run has an invalid episode")
+    return Path.home() / ".local/state/mac-queue/smoke-folders" / (episode + ".json")
+
+
+def smoke_launch_token(checkout: Path, episode: str) -> Path:
+    return checkout / f".mac-smoke-launch-{episode}"
+
+
+def clear_smoke_bundle(bundle: Path, episode: str) -> None:
+    """Remove the upload directory before a delayed SFTP open can use it."""
+    directory = bundle.parent
+    if directory.name != f"{bundle.name}.{episode}":
+        bundle.unlink(missing_ok=True)
+        return
+    retired = directory.with_name(directory.name + ".retired")
+    with contextlib.suppress(FileNotFoundError):
+        _ = directory.rename(retired)
+    with contextlib.suppress(FileNotFoundError):
+        shutil.rmtree(retired)
+
+
+def recover_smoke_folder(episode: str) -> int:
+    """Clear the saved smoke checkout under its original folder lock."""
+    from scripts.lib import build_folders
+
+    record = smoke_folder_record(episode)
+    try:
+        fields = cast(object, json.loads(record.read_text()))
+    except FileNotFoundError:
+        # The coordinator can permit a keep file only after the worker saves this record.
+        return 0
+    if not isinstance(fields, dict):
+        raise ValueError(f"{record}: the smoke recovery record is invalid")
+    values = cast(dict[str, object], fields)
+    checkout_path, launch, bundle = values.get("checkout"), values.get("launch"), values.get("bundle")
+    if not isinstance(checkout_path, str) or not isinstance(launch, str) or not isinstance(bundle, str):
+        raise ValueError(f"{record}: the smoke recovery record is invalid")
+    checkout = Path(checkout_path)
+    if not checkout.is_absolute() or checkout.resolve() != checkout:
+        raise ValueError(f"{record}: the saved smoke folder is invalid")
+    keep = build_folders.copy_keep_file(checkout)
+    with build_folders.fixed_folder_cleanup_lease(checkout, record) as lease:
+        if bundle:
+            clear_smoke_bundle(Path(bundle), episode)
+        if isinstance(lease, build_folders.HeldFixedFolderCleanup):
+            environment = {**os.environ, "MAC_SMOKE_LAUNCH_TOKEN": str(smoke_launch_token(checkout, episode)),
+                           build_folders.COPY_KEEP_ENV: str(keep)}
+            script = Path(__file__).resolve().parents[1] / "production/mac_run.sh"
+            result = subprocess.run([str(script), "cleanup-copy", str(checkout), launch],
+                                    cwd=Path.home(), env=environment, stdin=subprocess.DEVNULL,
+                                    pass_fds=build_folders.held_build_folder_descriptors())
+            if result.returncode or os.path.lexists(keep):
+                return 4
+        record.unlink(missing_ok=True)
+    return 0
+
+
+def run_smoke_folder(source: Path, unit: str, commit: str, bundle: str, ref: str, launch: str, command: list[str]) -> int:
+    """Prepare and run a smoke checkout under the Mac folder lease."""
+    from scripts.agents import remote
+    from scripts.copies import copies
+    from scripts.lib import build_copies, build_folders
+    from scripts.mac_test import floor_claims
+
+    machine = remote.this_machine()
+    registration = build_folders.FixedCheckoutRegistration.MAC_SMOKE
+    checkout_source = build_folders.FixedCheckoutSource(source, registration)
+    with (build_folders.fixed_repository_build_folder(build_folders.repo_word(source), machine=machine,
+                                                       unit=unit, checkout_source=checkout_source) as checkout,
+          copies.local_mirror_lease(checkout, unit, create_tree=False)):
+        locks = tuple(dict.fromkeys((*build_folders.held_build_folder_descriptors(), *copies.COMMAND_LOCKS.get())))
+        timeout = build_folders.repository_git_timeout()
+        episode = os.environ["MAC_PLACEMENT"].partition("/")[0]
+        record = smoke_folder_record(episode)
+        if os.path.lexists(record):
+            raise ValueError(f"{record}: the smoke run already has a saved folder")
+        marker = build_folders.copy_keep_file(checkout)
+        saved: SavedSmokeFolder = {"checkout": str(checkout.resolve()), "launch": launch,
+                                   "bundle": bundle if ref else ""}
+        write_text_atomic(record, json.dumps(saved), new_file_mode=0o600)
+        registration_permitted = False
+        try:
+            print(f"mac_smoke_register={episode}", flush=True)
+            registration_permitted = sys.stdin.read(1) == "+"
+        finally:
+            if not registration_permitted:
+                record.unlink(missing_ok=True)
+        if not registration_permitted:
+            return 4
+        write_text_atomic(marker, str(record) + "\n", new_file_mode=0o600)
+        if ref:
+            upload = Path(bundle)
+            if upload.parent.name != f"{upload.name}.{episode}":
+                raise ValueError("the smoke bundle must use the episode upload directory")
+            upload.parent.mkdir(mode=0o700)
+            try:
+                print(f"mac_smoke_upload={episode}", flush=True)
+                if sys.stdin.read(1) != "\n":
+                    return 4
+                _ = subprocess.run(["git", "-C", str(source), "fetch", "-q", "--no-tags", "--no-write-fetch-head",
+                                    "--", bundle, ref], stdin=subprocess.DEVNULL,
+                                   pass_fds=locks, timeout=timeout, check=True)
+            finally:
+                clear_smoke_bundle(upload, episode)
+        target = build_folders.fixed_cargo_folder(checkout)
+        environment = {**os.environ,
+                       "CARGO_TARGET_DIR": str(target), "CARGO_BUILD_BUILD_DIR": str(target),
+                       build_folders.COPY_KEEP_ENV: str(build_folders.copy_keep_file(checkout)),
+                       "MAC_SMOKE_SAVED_FOLDER": str(record),
+                       "COPIES_COMMAND_LEASE_FDS": ",".join(map(str, locks))}
+
+        reserved = ("target", build_folders.COPY_USE_STAMP, *floor_claims.MIRROR_METADATA,
+                    *(path.name for path in sorted(checkout.glob(".mac-smoke-launch-*"))))
+        with contextlib.ExitStack() as inherited:
+            for descriptor in copies.COMMAND_LOCKS.get():
+                _ = inherited.enter_context(build_folders.inherit_build_lock(descriptor))
+            build_copies.prepare_fixed_checkout(source, checkout, commit, reserved=reserved,
+                                               registration=registration)
+        status = subprocess.run(command, cwd=checkout, env=environment, pass_fds=locks, check=False).returncode
+        if os.path.lexists(marker):
+            return status or 4
+        record.unlink()
+        return status
 
 
 def run_smoke_work(work: str, cleanup: str) -> int:
@@ -398,10 +587,15 @@ def run_smoke_work(work: str, cleanup: str) -> int:
     environment = dict(os.environ)
     checkout = Path.cwd()
     keep_file = Path(os.environ[COPY_KEEP_ENV])
-    _ = keep_file.write_text("Mac smoke checkout clearance is unconfirmed.\n")
-    descriptor, token = tempfile.mkstemp(prefix=".mac-smoke-launch-", dir=checkout)
-    os.close(descriptor)
-    environment["MAC_SMOKE_LAUNCH_TOKEN"] = token
+    if environment.get("MAC_SMOKE_SAVED_FOLDER"):
+        token = smoke_launch_token(checkout, episode)
+        token.touch(exist_ok=False, mode=0o600)
+        environment["MAC_SMOKE_LAUNCH_TOKEN"] = str(token)
+    else:
+        _ = keep_file.write_text("Mac smoke checkout clearance is unconfirmed.\n")
+        descriptor, token_name = tempfile.mkstemp(prefix=".mac-smoke-launch-", dir=checkout)
+        os.close(descriptor)
+        environment["MAC_SMOKE_LAUNCH_TOKEN"] = token_name
     os.chdir(home)
     locks = tuple(int(number) for number in os.environ.get("COPIES_COMMAND_LEASE_FDS", "").split(",") if number)
     group = subprocess.Popen(["/bin/zsh", "-c", work], cwd=checkout, start_new_session=True,
@@ -428,7 +622,7 @@ def run_smoke_work(work: str, cleanup: str) -> int:
             _ = group.wait()
         _ = group.stdout.close()
         cleared = subprocess.run(["/bin/zsh", "-c", cleanup, "cleanup-copy", str(checkout)], cwd=home,
-                                 env=environment, stdin=subprocess.DEVNULL)
+                                 env=environment, stdin=subprocess.DEVNULL, pass_fds=locks)
     if disconnected:
         return 1
     status = group.wait()
@@ -514,6 +708,7 @@ def run_attempt(
         mac_run = args.is_mac_run
         smoke: subprocess.Popen[str] | None = None
         smoke_ready = False
+        smoke_retained = False
         cleaned = False
         try:
             while True:
@@ -583,7 +778,18 @@ def run_attempt(
                             smoke = smoke_session(placement, command, ssh)
                             remote.state = RemoteState.LIVE
                             assert smoke.stdin is not None and smoke.stdout is not None
-                            smoke_ready = read_smoke_ready(cast(TextIO, smoke.stdout), placement.episode)
+                            def upload() -> bool:
+                                upload_file = argv_file.with_suffix(".json.upload")
+                                if not upload_file.exists():
+                                    return False
+                                if run_callback(args.lifecycle_script, "upload", argv_file, original_command,
+                                                callback_environment, interrupt_prepare=args.owned_close):
+                                    return False
+                                upload_file.unlink()
+                                return True
+
+                            smoke_ready = read_smoke_ready(cast(TextIO, smoke.stdout), cast(TextIO, smoke.stdin),
+                                                           placement.episode, upload)
                             if smoke_ready:
                                 status = 0
                         else:
@@ -631,7 +837,8 @@ def run_attempt(
                         print(line, end="", flush=True)
                     smoke_result = read_smoke_result(placement, smoke.wait(), ready=smoke_ready)
                     match smoke_result:
-                        case SmokeFinalStatus(remote_status):
+                        case SmokeFinalStatus(remote_status, retained_folder):
+                            smoke_retained = retained_folder
                             remote.state = RemoteState.EXITED
                             status = remote_status or status
                             safe = True
@@ -652,7 +859,7 @@ def run_attempt(
                     print(f"mac queue: the Mac smoke session did not finish: {error}", file=sys.stderr)
                     status = status or 2
                     safe = False
-            if cleaned and safe:
+            if cleaned and safe and not smoke_retained:
                 (directory / "run.json").unlink()
             ssh.close()
             mirror.close()
@@ -791,6 +998,26 @@ def main(argv: list[str] | None = None) -> int:
         return run_smoke_work(words[1], words[2])
     if len(words) > 1 and words[0] == "smoke-copy":
         return run_smoke_copy(words[1:])
+    if len(words) == 5 and words[0] == "hold-offload-folder":
+        machine, repository, unit, state = words[1:]
+        try:
+            return hold_offload_folder(machine, repository, unit, Path(state))
+        except (OSError, ValueError) as error:
+            print(f"mac queue: {error}", file=sys.stderr)
+            return os.EX_TEMPFAIL if isinstance(error, BlockingIOError) else 2
+    if len(words) == 2 and words[0] == "smoke-recover":
+        try:
+            return recover_smoke_folder(words[1])
+        except (OSError, ValueError) as error:
+            print(f"mac queue: {error}", file=sys.stderr)
+            return 4
+    if len(words) > 8 and words[0] == "smoke-folder" and words[7] == "--":
+        source, unit, commit, bundle, ref, launch = words[1:7]
+        try:
+            return run_smoke_folder(Path(source).expanduser(), unit, commit, bundle, ref, launch, words[8:])
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"mac queue: {error}", file=sys.stderr)
+            return 4
     if len(words) == 2 and words[0] == "smoke-status":
         return take_smoke_status(words[1])
     parser = argparse.ArgumentParser(description=__doc__)

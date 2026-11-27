@@ -37,7 +37,6 @@ UNSHIPPED_IMPORTS = {
     'build_queue/snapshot_codec.py': {'message/unit_labels.py'},
     'build_queue/step_estimator.py': {'lint/tmp_sweep.py'},
     'buildlog/record.py': {'aws_target/config.py', 'direct/step_record.py'},
-    'buildlog/step_context.py': {'lib/cargo_target_config.py'},
     'copies/copies.py': {'lint/tmp_sweep.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'direct/local_release_wait.py': {'build_targets/build_targets.py', 'build_targets/targets.py', 'build_hold/build_hold.py'},
     'lib/build_folders.py': {'lib/descendants.py'},

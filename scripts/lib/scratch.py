@@ -897,6 +897,10 @@ def adopt(source: Path, task: str, word: str = "", now: float | None = None, *,
         raise ScratchError(f"{source} is no folder")
     if protected_build_path(source) or os.path.lexists(source / ".git"):
         raise ScratchError(f"{source}: use worktrees.py make <repo> <unit> <short-name> for editable work")
+    try:
+        build_folders.require_build_tree_move_allowed(source)
+    except (OSError, ValueError) as error:
+        raise ScratchError(str(error)) from error
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     path = target(task, word, scratch_settings=scratch_settings)

@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 import json
 import os
+import re
 import select
 import shlex
 import signal
@@ -30,7 +31,7 @@ from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_con
 from scripts.mac_test import eligibility, offload, mac_test
 from scripts.buildlog import treekey
 from scripts.buildlog import sync as buildlog_sync
-from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
+from scripts.mac_test.offload_test_commands import COMMAND_STUB, install_saved_folder_recovery, write_shell
 from scripts.lib import test_hang_guard
 from scripts.lib.process_group import send_process_group
 from scripts.lib.shell_test_support import fixture_zsh_environment
@@ -47,6 +48,40 @@ STATE_SCRIPT = Path(__file__).with_name("mac_test.py")
 FILTER = "package(hana) & (test(a) | test(b))"
 
 WORKING_TREE_SOURCE = offload.RepositoryWorkingTree()
+
+FIXED_FOLDER_HOLDER = r'''
+import os
+from pathlib import Path
+import shlex
+import sys
+from unittest.mock import patch
+
+from scripts.agents import remote
+from scripts.mac_test import mac_queue_run
+
+_, _, _, machine, repository, unit, record_name = shlex.split(sys.argv[1])
+record = Path(record_name)
+fixture = Path(os.environ["MAC_TEST_STUB_DIR"])
+write_text_atomic = mac_queue_run.write_text_atomic
+
+def record_checkout(path, text, **kwargs):
+    write_text_atomic(path, text, **kwargs)
+    if path == Path.home() / record:
+        (fixture / "fixed-checkout").write_text(text)
+
+with patch.object(remote, "this_machine", return_value=machine), \
+     patch.object(mac_queue_run, "write_text_atomic", side_effect=record_checkout):
+    sys.exit(mac_queue_run.hold_offload_folder(machine, repository, unit, record))
+'''
+
+SETTLE_FENCE_STUB = """        python3 - "$claim_file" <<'SETTLE_FENCE'"""
+OFFLOAD_COMMAND_STUB = r'''
+if [[ ${0##*/} == ssh && ${!#} == *'mac_queue_run.py hold-offload-folder '* ]]; then
+    exec "$MAC_TEST_STUB_DIR/fixed-folder-holder" "${!#}"
+fi
+''' + COMMAND_STUB.replace(SETTLE_FENCE_STUB, r'''        # The fixed folder holder retires its own fence.
+        if [[ $remote == *$'\ntest -f "$HOME"/'*'.folder || exit 75'* ]]; then exit "$run_ssh_status"; fi
+''' + SETTLE_FENCE_STUB, 1)
 
 
 def write_mac_target_registry(directory: Path, settings_name: str) -> None:
@@ -175,9 +210,11 @@ HANA = eligibility.KnownRepository("hana")
 
 FIXTURE_MIRROR_ROOT = ".local/state/mac-test/test-mirror"
 
-HANA_COMMAND_PATTERN = offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana([/'\"[:space:]]|$)"
+FIXTURE_MIRROR_PATTERN = "[.]local/state/mac-test/test-mirror"
 
-HANA_CWD_PATTERN = "^n.*/" + offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana(/|$)"
+HANA_COMMAND_PATTERN = FIXTURE_MIRROR_PATTERN + "/hana([/'\"[:space:]]|$)"
+
+HANA_CWD_PATTERN = "^n.*/" + FIXTURE_MIRROR_PATTERN + "/hana(/|$)"
 
 CLAIM_STUB = r'''
 from __future__ import annotations
@@ -347,7 +384,9 @@ class OffloadCommandFixture(unittest.TestCase):
         self.claim_file = paths.claims / repository.claim_file
         legacy_claim_file = mac_test.claim_path(paths, claim_state.RepositoryScope(repository.mirror_name))
         stub = self.bin_directory / "command-stub"
-        write_shell(stub, COMMAND_STUB)
+        write_shell(stub, OFFLOAD_COMMAND_STUB)
+        (self.stub_directory / "scripts").symlink_to(SCRIPT.resolve().parent.parent, target_is_directory=True)
+        self.write_executable(self.stub_directory / "fixed-folder-holder", FIXED_FOLDER_HOLDER)
         for name in ("ssh", "rsync", "gh", "systemd-run"):
             (self.bin_directory / name).symlink_to(stub)
         self.config = {
@@ -401,13 +440,18 @@ class OffloadCommandFixture(unittest.TestCase):
         self.sync_config()
         self.sync_fixture()
         write_mac_target_registry(self.root, self.config_path.name)
+        home = self.root / "home"
+        _ = write_config_fixture(self.root / "build_folders.conf",
+                                 "roots.build=~/build.fixture\nroots.build.natedev=~/build.fixture\n"
+                                 + f"roots.gate={home / 'gate.fixture'}\n")
         _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
+        install_saved_folder_recovery(home)
         self.environment = {
             **os.environ, **interpreter_cache_environment(self.root / "cache"),
             **config_environment(self.root),
             **copies_environment(self.root),
             **fixture_zsh_environment(),
-            "HOME": str(self.root / "home"),
+            "HOME": str(home),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             "MAC_TEST_FIXTURE_CLAIM_FILE": str(self.claim_file),
@@ -591,7 +635,8 @@ import subprocess
 import sys
 from scripts.mac_test import eligibility, offload
 
-clock = [100.0]
+start = offload.time.monotonic()
+clock = [start]
 offload.time.monotonic = lambda: clock[0]
 real_capture = offload.ProcessController.capture
 real_stream = offload.ProcessController.stream_mac_run
@@ -600,26 +645,26 @@ real_run = subprocess.run
 def capture(self, arguments, *args, **kwargs):
     answer = real_capture(self, arguments, *args, **kwargs)
     if arguments[0] == "ssh":
-        clock[0] = 101.0
+        clock[0] = start + 1
     elif arguments[0] == "rsync":
-        clock[0] = 102.0
+        clock[0] = start + 2
     return answer
 
 def stream(self, arguments, *args, **kwargs):
     answer = real_stream(self, arguments, *args, **kwargs)
-    clock[0] = 103.0
+    clock[0] = start + 3
     return answer
 
 def run(arguments, **kwargs):
     if arguments[0] != "ssh" or "select_leftovers()" not in arguments[-1]:
         return real_run(arguments, **kwargs)
-    clock[0] = 105.0
+    clock[0] = start + 5
     try:
         answer = real_run(arguments, **kwargs)
     except subprocess.TimeoutExpired:
-        clock[0] = 113.0
+        clock[0] = start + 13
         raise
-    clock[0] = 108.0
+    clock[0] = start + 8
     return answer
 
 offload.ProcessController.capture = capture
@@ -760,15 +805,44 @@ raise SystemExit(offload.main())
     def leftover_events(self) -> list[CommandEvent]:
         return [event for event in self.events_for("ssh") if "select_leftovers()" in event["args"][-1]]
 
+    def fixed_selector_patterns(self, remote: str = "") -> tuple[str, str]:
+        path = (self.stub_directory / "fixed-checkout").read_text().strip()
+        self.assertTrue(Path(path).is_absolute())
+        home = Path(self.environment["HOME"]).resolve()
+        self.assertEqual(path, str(home / "build.fixture" / "hana" / "mac"))
+        expected = re.escape(path)
+        if not remote:
+            remote = self.leftover_events()[-1]["args"][-1]
+        assignments = {match[1]: match[2] for match in
+                       re.finditer(r"^mirror_(command|cwd)_pattern=(.+)$", remote, re.MULTILINE)}
+        command, = shlex.split(assignments["command"])
+        cwd, = shlex.split(assignments["cwd"])
+        self.assertIn("build[.]fixture", command)
+
+        def normalize(pattern: str) -> str:
+            # Python also escapes a hyphen outside brackets.
+            return re.sub(r"\[(.)\]|-", lambda match: re.escape(match[1] or match[0]), pattern)
+
+        ending = "([/'\"[:space:]]|$)"
+        self.assertTrue(command.startswith("[/]") and command.endswith(ending), command)
+        self.assertEqual(normalize(command.removesuffix(ending)), expected)
+        self.assertTrue(cwd.startswith("^n[/]") and cwd.endswith("(/|$)"), cwd)
+        self.assertEqual(normalize(cwd.removeprefix("^n").removesuffix("(/|$)")), expected)
+        return command, cwd
+
     def assert_leftover_selectors(self, remote: str) -> None:
-        self.assertIn(f"mirror_command_pattern={shlex.quote(HANA_COMMAND_PATTERN)}\n", remote)
-        self.assertIn(f"mirror_cwd_pattern={shlex.quote(HANA_CWD_PATTERN)}\n", remote)
+        if (self.stub_directory / "fixed-checkout").exists() and "recover_fixed_offload_folder" not in remote:
+            command, cwd = self.fixed_selector_patterns(remote)
+        else:
+            command, cwd = HANA_COMMAND_PATTERN, HANA_CWD_PATTERN
+        self.assertIn(f"mirror_command_pattern={shlex.quote(command)}\n", remote)
+        self.assertIn(f"mirror_cwd_pattern={shlex.quote(cwd)}\n", remote)
         self.assertIn('pgrep -u "$(id -u)" -f "$mirror_command_pattern"', remote)
         self.assertIn('lsof -a -u "$(id -u)" -d cwd -Fpn', remote)
         self.assertIn("awk -v pattern=\"$mirror_cwd_pattern\" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }'", remote)
         self.assertNotIn("pkill", remote)
         self.assertNotIn("PIPESTATUS", remote)
-        self.assertNotIn(FIXTURE_MIRROR_ROOT + "/", remote.replace(offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/", ""))
+        self.assertNotIn(FIXTURE_MIRROR_ROOT + "/", remote.replace(FIXTURE_MIRROR_PATTERN + "/", ""))
 
     def remote_claim(self) -> RemoteClaimRecord:
         return cast(RemoteClaimRecord, json.loads(self.claim_file.read_text()))
@@ -810,11 +884,19 @@ raise SystemExit(offload.main())
             self.assertTrue(mac_test.run_is_live(decoded))
 
     def reset_leftover_case(self) -> None:
-        self.clear_events()
-        self.claim_file.unlink(missing_ok=True)
+        """Give each case its own claim state and fixed build folder."""
+        case = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="leftovers-", dir=self.root)))
+        home = case / "home"
+        install_saved_folder_recovery(home)
+        state = case / "state"
+        for key in ("MAC_TEST_FIXTURE_CLAIM_FILE", "MAC_TEST_FIXTURE_LEGACY_CLAIM_FILE"):
+            relative = Path(self.environment[key]).relative_to(self.state_directory)
+            self.environment[key] = str(state / relative)
+        self.state_directory = state
         self.claim_file = Path(self.environment["MAC_TEST_FIXTURE_CLAIM_FILE"])
-        (self.state_directory / "unreachable_until").unlink(missing_ok=True)
-        for name in ("run-started", "cleanup-called", "selector-events.jsonl", "selector-answer"):
+        self.environment.update(HOME=str(home), MAC_TEST_STATE_DIR=str(state))
+        self.clear_events()
+        for name in ("run-started", "cleanup-called", "selector-events.jsonl", "selector-answer", "fixed-checkout"):
             (self.stub_directory / name).unlink(missing_ok=True)
 
     def set_leftover_answer(self, outcome: str) -> None:
@@ -1054,8 +1136,9 @@ raise SystemExit(offload.main())
 
     def sent_command_words(self) -> list[str]:
         self.assertEqual(len(self.events_for("rsync")), 1)
-        remote = self.events_for("ssh")[-1]["args"][-1]
-        self.assertIn("lint nextest", remote)
+        launches = [event["args"][-1] for event in self.events_for("ssh") if "lint nextest" in event["args"][-1]]
+        self.assertEqual(len(launches), 1, self.events())
+        remote, = launches
         words, _ = split_mac_run_command(remote)
         return words
 

@@ -21,7 +21,8 @@ import unittest
 from unittest import mock
 
 from scripts.lib.fixture_test_support import set_up_fixture
-from scripts.lib import process_stat, removal_guard
+from scripts.lib import build_folders, process_stat, removal_guard
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -92,7 +93,7 @@ if [[ $tool == nix ]]; then
     done
 fi
 environment="" separator=""
-for name in ${!BUILDLOG_@} ${!LINT_@} ${!TEST_SHELL_@} ${!RUSTUP_@}; do
+for name in ${!BUILDLOG_@} ${!LINT_@} ${!TEST_SHELL_@} ${!RUSTUP_@} ${!CARGO_@}; do
     quote "$name"
     environment+="$separator$REPLY: "
     quote "${!name}"
@@ -338,6 +339,39 @@ class LinuxShellTests(unittest.TestCase):
         events = self.events("lint")
         self.assertTrue(events, result.stdout + result.stderr)
         return events[-1]
+
+    def test_guest_command_uses_the_verify_run_identity(self) -> None:
+        request = replace(self.request(verb="check"), run_id="123:456")
+        event = self.assert_ran(request)
+        self.assertEqual(event["environment"]["BUILDLOG_RUN"], request.run_id)
+
+    def test_guest_uses_the_leased_checkout_and_keeps_cargo_output_inside_it(self) -> None:
+        _ = write_config_fixture(self.root / "direct.conf")
+        folder = self.root / "guest build/hana/mac-linux"
+        folder.parent.mkdir(parents=True)
+        _ = self.mirror.rename(folder)
+        token = offload.offload_fixed_folder.set(offload.HeldOffloadFolder(folder))
+        try:
+            request = replace(self.request(verb="nextest"),
+                              environment=(("CARGO_TARGET_DIR", str(self.root / "outside")),))
+            event = self.assert_ran(request)
+            self.assertEqual(event["cwd"], str(folder))
+            self.assertEqual(event["environment"]["CARGO_TARGET_DIR"], str(folder / "target"))
+            self.assertEqual(event["environment"]["CARGO_BUILD_BUILD_DIR"], str(folder / "target"))
+            self.assertFalse((self.root / "outside").exists())
+        finally:
+            offload.offload_fixed_folder.reset(token)
+
+    def test_fixed_guest_refuses_a_marker_without_a_boot_identity(self) -> None:
+        marker = self.mirror / ".linux-run.json"
+        _ = marker.write_text(json.dumps({"pid": 2, "start_time": 3, "process_group": 2, "token": "saved"}))
+        output = io.StringIO()
+        with mock.patch.object(linux_runner, "execute_slot") as execute, redirect_stdout(output):
+            status = linux_runner.run(self.mirror, {"fixed_folder": "1"}, "hana", "check", (), "call", "")
+        self.assertEqual(status, 75, output.getvalue())
+        self.assertIn(linux_runner.STARTUP_REFUSAL_RECORD, output.getvalue())
+        execute.assert_not_called()
+        self.assertTrue(marker.is_file())
 
     def test_step_removes_only_old_abandoned_sessions_before_building(self) -> None:
         minutes = eligibility.read_config(self.settings).abandoned_session_minutes
@@ -694,6 +728,40 @@ class LinuxShellTests(unittest.TestCase):
         self.assertTrue(recent.exists())
         self.assertEqual((self.mirror / "custom-build/warm-proof").read_text(), "warm\n")
         self.assertEqual((self.mirror / "target/retained").read_text(), "default folder\n")
+
+    def test_row_73_low_disk_cleanup_refuses_a_former_fixed_folder(self) -> None:
+        private = private_copy_config(self.root / "private-build")
+        with mock.patch.dict(os.environ, private.environment):
+            root = build_folders.build_root()
+            with build_folders.fixed_repository_build_folder("hana", machine="mac-linux", unit="verify") as folder:
+                _ = (folder / "compiled").write_text("Cargo output")
+        target = self.mirror / "custom-build"
+        _ = root.rename(target)
+        self.environment["FAKE_FREE_GIB"] = "1"
+
+        result = self.execute(self.request(words=("--target-dir", target.name)))
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("mac_cleanup=1", result.stdout)
+        self.assertEqual((target / folder.relative_to(root) / "compiled").read_text(), "Cargo output")
+
+    def test_row_73_low_disk_cleanup_reports_the_test_result_with_a_malformed_lease(self) -> None:
+        private = private_copy_config(self.root / "private-build")
+        with mock.patch.dict(os.environ, private.environment):
+            root = build_folders.build_root()
+            with build_folders.fixed_repository_build_folder("hana", machine="mac-linux", unit="verify") as folder:
+                _ = (folder / "compiled").write_text("Cargo output")
+        _ = build_folders.lease_path(folder).write_text("{")
+        target = self.mirror / "custom-build"
+        _ = root.rename(target)
+        self.environment.update({"FAKE_FREE_GIB": "1", "FAKE_LINT_STATUS": "7"})
+
+        result = self.execute(self.request(words=("--target-dir", target.name)))
+
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-2:], ["mac_exit=7", "mac_cleanup=1"])
+        self.assertIn("invalid build folder lease", result.stderr)
+        self.assertEqual((target / folder.relative_to(root) / "compiled").read_text(), "Cargo output")
 
     def test_explicit_build_folder_cannot_escape_the_selected_slot(self) -> None:
         neighbor = self.root / offload.remote_mirror(self.identity, "linux", 1) / "target/retained"

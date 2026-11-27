@@ -111,11 +111,17 @@ def local_remote_transport(root: Path) -> Generator[None]:
     tools.mkdir(exist_ok=True)
     _ = copy_helpers(root, *COPY_HELPERS)
     ssh = tools / "ssh"
-    _ = ssh.write_text(f"#!{sys.executable}\n" + '''import os, sys
+    _ = ssh.write_text(f"#!{sys.executable}\n" + '''from getopt import getopt
+import os
+import sys
+
+_, remote = getopt(sys.argv[1:], '46AaCfGgKkMNnqsTtVvXxYyZ'
+                   + 'B:b:c:D:E:e:F:I:i:J:L:l:m:O:o:P:p:Q:R:S:W:w:')
+host, *command = remote
 environment = dict(os.environ)
-if sys.argv[-2] == 'natedev':
+if host == 'natedev':
     environment['MAC_TEST_STATE_DIR'] = environment['REMOTE_CLAIM_STATE']
-os.execve('/bin/bash', ['bash', '-c', sys.argv[-1]], environment)
+os.execve('/bin/bash', ['bash', '-c', ' '.join(command)], environment)
 ''')
     ssh.chmod(0o755)
     seed_interpreter_cache(root / "cache")

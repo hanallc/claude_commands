@@ -3439,6 +3439,23 @@ print(scratch.target('gate:proof', 'tree'))
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, ROW)
 
+    def test_adopt_refuses_build_roots_and_former_fixed_folders(self) -> None:
+        root = build_folders.build_root()
+        with (self.subTest(source="configured build root ancestor"),
+              mock.patch.object(shutil, "move", side_effect=AssertionError("Adopt tried to move the build root")),
+              self.assertRaisesRegex(scratch.ScratchError, "configured build root")):
+            _ = scratch.adopt(self.base, ROW)
+
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="demo") as folder:
+            _ = (folder / "output").write_text("Keep this output\n")
+        former = self.base / "former-build"
+        _ = root.rename(former)
+        with (self.subTest(source="former fixed folder ancestor"),
+              mock.patch.object(shutil, "move", side_effect=AssertionError("Adopt tried to move a fixed folder")),
+              self.assertRaisesRegex(scratch.ScratchError, "fixed build folder")):
+            _ = scratch.adopt(former, ROW)
+        self.assertEqual((former / folder.relative_to(root) / "output").read_text(), "Keep this output\n")
+
     def test_renew_moves_the_records_time(self) -> None:
         path = scratch.new(RUN)
         scratch.renew(path, now=1_000.0)

@@ -43,7 +43,7 @@ from scripts.build_queue import execution_identity
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
 from scripts.buildlog import machine_facts, store
-from scripts.lib import atomic_file, build_folders, conf, process_group, process_start
+from scripts.lib import atomic_file, build_copies, build_folders, conf, git_exclude, process_group, process_start
 from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import (
@@ -91,9 +91,10 @@ MISSING_PREREQUISITE_MESSAGE = 'Repository lacks these prerequisite commits:'
 GUEST_END_PENDING_STATUS = 76
 RUN_LOCK_PATH = '.git/mac-linux-run.lock'
 RUN_LOCK_FD = 9
-# The argv word after the request that makes the runner run the gate in the numbered copy. The reply descriptor
-# number comes after it.
+# The runner takes this word and the reply descriptor to run the gate in the leased folder.
 RUN_COPY = '--run-copy'
+GUEST_FOLDER_LOCK_ENV = 'MAC_LINUX_BUILD_FOLDER_FD'
+GUEST_FOLDER_RECORD_PREFIX = 'mac-linux-folder'
 ARM_RECORD_PREFIX = 'mac-linux-armed'
 # The guest keeps placed arm and refusal records after the armed deadline.
 PLACED_GUEST_ATTEMPT_PREFIX = 'gate-'
@@ -329,7 +330,7 @@ class GuestGateDispatch:
 
 
 class GuestRunRequest(TypedDict):
-    """Each guest request names the attempt, the source commit, and the copy owner."""
+    """The fields of each guest request: the attempt, the commit and the unit that owns the lease."""
     attempt: str
     commit: str
     tree: str
@@ -340,7 +341,7 @@ class GuestRunRequest(TypedDict):
 
 @final
 class GuestRequest(GuestRunRequest):
-    """Run the gate suites in the numbered copy; the result is one JSON line."""
+    """Run the gate suites in the leased folder. Send one JSON result line."""
     mode: str
     full: bool
     selection: list[str] | Literal['all']
@@ -352,7 +353,7 @@ class GuestRequest(GuestRunRequest):
 
 @final
 class GuestCommandRequest(GuestRunRequest):
-    """Run one argv in the numbered copy. Its output and exit status are those of the guest run.
+    """Run one argv in the leased folder. Return the output and status of the guest run.
 
     checked holds the path in the checkout of each file that natedev read for a word of the argv.
     """
@@ -781,10 +782,66 @@ class GuestEndUnproven(GuestUnavailable):
         self.retry_before_settlement: bool = retry_before_settlement
 
 
-GUEST_ARM_RECORDS = '''\
+GUEST_FOLDER_CLEARANCE = f'RECORD_PREFIX = {GUEST_FOLDER_RECORD_PREFIX!r}\nTARGET = {TARGET!r}\n' + '''\
 import fcntl
 import os
+from pathlib import Path
 import stat
+
+
+def read_regular(path, directory):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags, dir_fd=directory), encoding='utf-8') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError(f'{path}: expected a regular file with one link')
+        return stream.read()
+
+
+def clear_build_folder(git, attempt):
+    record = f'{RECORD_PREFIX}.{attempt}'
+    try:
+        folder = Path(read_regular(record, git).removesuffix('\\n'))
+    except FileNotFoundError:
+        return
+    if not folder.is_absolute() or folder.name != TARGET or folder.parent.resolve() != folder.parent:
+        raise ValueError(f'{folder}: invalid saved guest build folder')
+    marker = folder.name + '.keep'
+    try:
+        parent = os.open(folder.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        os.unlink(record, dir_fd=git)
+        os.fsync(git)
+        return
+    try:
+        try:
+            owner = read_regular(marker, parent).strip()
+        except FileNotFoundError:
+            owner = ''
+        if owner == str(Path.cwd() / '.git' / record):
+            name = folder.name + '.lock'
+            lock = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            try:
+                status = os.fstat(lock)
+                if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+                    raise ValueError(f'{folder}: invalid guest build folder lock')
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if not os.path.samestat(status, os.stat(name, dir_fd=parent, follow_symlinks=False)):
+                    raise ValueError(f'{folder}: the guest build folder lock changed')
+                if read_regular(marker, parent).strip() != owner:
+                    raise ValueError(f'{folder}: the guest build folder keep file changed')
+                os.unlink(marker, dir_fd=parent)
+                os.fsync(parent)
+            finally:
+                os.close(lock)
+        os.unlink(record, dir_fd=git)
+        os.fsync(git)
+    finally:
+        os.close(parent)
+'''
+
+
+GUEST_ARM_RECORDS = GUEST_FOLDER_CLEARANCE + '''\
 import sys
 import time
 
@@ -824,6 +881,8 @@ if placed_attempt:
         except FileExistsError:
             if not stat.S_ISREG(os.stat(refusal, dir_fd=git, follow_symlinks=False).st_mode):
                 sys.exit('The guest refusal record must be a regular file.')
+        for candidate in attempts:
+            clear_build_folder(git, candidate)
         sync_checkout()
         print('ended' if armed else 'not started', flush=True)
         sys.exit(0)
@@ -953,10 +1012,7 @@ def open_run_lock_command(descriptor: int, shell: str) -> str:
     return shlex.join(('python3', '-I', '-S', '-c', OPEN_RUN_LOCK, RUN_LOCK_PATH, str(descriptor), shell))
 
 
-GUEST_ATTEMPT_RECORDS = '''\
-import fcntl
-import os
-import stat
+GUEST_ATTEMPT_RECORDS = GUEST_FOLDER_CLEARANCE + '''\
 import sys
 import time
 
@@ -978,6 +1034,7 @@ if mode == 'cancel':
     except FileExistsError:
         if not stat.S_ISREG(os.stat(cancel, dir_fd=git, follow_symlinks=False).st_mode):
             sys.exit('The guest cancel record must be a regular file.')
+    clear_build_folder(git, attempt)
     now = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
     for name in os.listdir(git):
         fields = name.split('.')
@@ -1088,6 +1145,39 @@ read -r group _ < "/proc/$$/fd/{RUN_LOCK_FD}"
 watcher=$!
 trap 'kill "$watcher" 2>/dev/null || :; rm -rf -- "$bootstrap"' EXIT
 exec </dev/null
+refuse_guest_reset() {{
+    printf '%s\\n' "$1" >&2
+    printf '%s\\n' {shlex.quote(run_refused_line(armed.attempt))}
+    exit 1
+}}
+check_guest_git_config() {{
+    if [[ -v GIT_WORK_TREE ]]; then
+        refuse_guest_reset 'The guest Git environment sets GIT_WORK_TREE.'
+    fi
+    local scope worktree_config result status
+    local -a config_args=()
+    for scope in effective worktree; do
+        if [[ "$scope" == worktree ]]; then
+            # Git can leave the worktree configuration inactive.
+            worktree_config=$(git rev-parse --git-path config.worktree)
+            [[ -e "$worktree_config" || -L "$worktree_config" ]] || return 0
+            config_args=(--file "$worktree_config")
+        fi
+        status=0
+        result=$(env -u GIT_CONFIG git config --no-includes --show-scope --name-only "${{config_args[@]}}" \\
+            --get-regexp '^(include(if[.].*)?[.]path|core[.]worktree)$') || status=$?
+        if (( status == 0 )); then
+            if [[ "$result" =~ [[:space:]]core[.]worktree($|[[:space:]]) ]]; then
+                refuse_guest_reset "The guest Git configuration sets core.worktree: $result"
+            fi
+            refuse_guest_reset "The guest Git configuration contains an include: $result"
+        fi
+        if (( status != 1 )); then
+            refuse_guest_reset 'Cannot check the guest Git configuration.'
+        fi
+    done
+}}
+check_guest_git_config
 commit={shlex.quote(source.commit)}
 origin_main={shlex.quote(source.origin_main)}
 tree=$(git rev-parse --verify "$commit^{{tree}}")
@@ -1101,8 +1191,10 @@ git symbolic-ref HEAD refs/heads/main
 git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
 printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$origin_main" "$origin_main" | git update-ref --stdin
 git reset --hard -q "$origin_main"
+check_guest_git_config
 git archive {shlex.quote(source.runner_commit)} scripts config | tar -xf - -C "$bootstrap"
 umask 022
+"$bootstrap/scripts/lib/py" "$bootstrap/{RUNNER_PATH}" "$bootstrap/request.json" --check-placement
 "$bootstrap/scripts/lib/py" "$bootstrap/{RUNNER_PATH}" "$bootstrap/request.json"'''
     lock = guest_attempt_command('lock', armed, RUN_LOCK_FD)
     start = guest_attempt_command('start', armed, RUN_LOCK_FD)
@@ -2942,7 +3034,7 @@ def setup_failed(status: int, status_fd: int) -> bool:
 
 def limited_command(bwrap: str, status_fd: int, tmp: Path, copy: Path, environment: Mapping[str, str], home: Path,
                     attempt: str, argv: Sequence[str]) -> list[str]:
-    """The bwrap words that start the argv of a hand made run in the numbered copy under the read limit.
+    """Start the command in the leased folder under the read limit.
 
     The program writes the copy and its Cargo folders. The copy holds the run home and the build output.
     The program sees the attempt temp folder as /tmp.
@@ -2983,20 +3075,62 @@ def run_limited(tmp: Path, argv: Sequence[str], copy: Path, environment: dict[st
         os.close(status_read)
 
 
-def run_guest(request_path: Path) -> int:
-    """Take a numbered copy, then run the gate or the argv of the request in it."""
-    from scripts.lib import build_copies
+def prepare_guest_folder(source: Path, checkout: Path, commit: str) -> Path:
+    """Set up the commit in the leased folder and retain its Cargo output."""
+    reserved = ('target', build_folders.COPY_USE_STAMP)
+    target = build_folders.fixed_cargo_folder(checkout)
+    build_copies.prepare_fixed_checkout(source, checkout, commit, reserved=reserved)
+    for name in reserved:
+        git_exclude.ensure_excluded(checkout, f'/{name}')
+    target.mkdir(exist_ok=True)
+    build_folders.mark_folder_use(checkout)
+    return target
 
+
+def save_guest_build_folder(source: Path, checkout: Path, attempt: str) -> None:
+    """Record the exact folder before the guest starts work."""
+    if re.fullmatch(r'[0-9a-z-]+', attempt) is None:
+        raise GuestUnavailable('The guest attempt ID is invalid.')
+    record = source / '.git' / f'{GUEST_FOLDER_RECORD_PREFIX}.{attempt}'
+    if os.path.lexists(record):
+        raise GuestUnavailable(f'{record}: the guest attempt already has a saved build folder.')
+    atomic_file.write_text_atomic(record, str(checkout.resolve()) + '\n', new_file_mode=0o600)
+    marker = build_folders.copy_keep_file(checkout)
+    atomic_file.write_text_atomic(marker, str(record) + '\n', new_file_mode=0o600)
+
+
+def check_guest_placement(request_path: Path) -> int:
+    """Check the published checkout with the live allocator paths."""
+    try:
+        source = Path.cwd()
+        repository = build_folders.repo_word(source)
+        checkout_source = build_folders.FixedCheckoutSource(source, build_folders.FixedCheckoutRegistration.MAC_LINUX)
+        _ = build_folders.check_fixed_repository_placement(repository, machine=TARGET, checkout_source=checkout_source)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return refuse_run(str(error), guest_request(request_path)['attempt'])
+    return 0
+
+
+def run_guest(request_path: Path) -> int:
+    """Run the gate or command in the guest's fixed repository folder."""
     request = guest_request(request_path)
     main = Path.cwd()
-    work = request['work'] if 'argv' in request else request['mode']
-    with (build_folders.inherit_build_lock(RUN_LOCK_FD),
-          build_copies.take_copy(main, request['commit'], showrunner='', unit=request['unit'],
-                                work=work, purpose=TARGET) as copy):
-        with build_folders.tool_folder(TARGET, copy.cargo_dir) as runtime:
+    repository = build_folders.repo_word(main)
+    checkout_source = build_folders.FixedCheckoutSource(main, build_folders.FixedCheckoutRegistration.MAC_LINUX)
+    with ExitStack() as allocation:
+        _ = allocation.enter_context(build_folders.inherit_build_lock(RUN_LOCK_FD))
+        try:
+            checkout = allocation.enter_context(
+                build_folders.fixed_repository_build_folder(
+                    repository, machine=TARGET, unit=request['unit'], checkout_source=checkout_source))
+        except build_folders.InvalidFixedBuildRoot as error:
+            return refuse_run(str(error), request['attempt'])
+        save_guest_build_folder(main, checkout, request['attempt'])
+        target = prepare_guest_folder(main, checkout, request['commit'])
+        with build_folders.tool_folder(TARGET, target) as runtime:
             home = runtime / 'home'
             (home / '.claude').mkdir(parents=True)
-            (home / '.claude/config').symlink_to(copy.path / 'config', target_is_directory=True)
+            (home / '.claude/config').symlink_to(checkout / 'config', target_is_directory=True)
             browser = shutil.which('chromium')
             if browser is None:
                 raise GuestUnavailable('Chromium is absent from the guest PATH.')
@@ -3007,16 +3141,19 @@ def run_guest(request_path: Path) -> int:
             runtime_dir.mkdir(mode=0o700)
             tmp = runtime / 'tmp'
             tmp.mkdir()
-            environment = {**os.environ, **copy.env, 'HOME': str(home), 'XDG_RUNTIME_DIR': str(runtime_dir),
+            environment = {**os.environ, 'CARGO_TARGET_DIR': str(target),
+                           'CARGO_BUILD_BUILD_DIR': str(target),
+                           GUEST_FOLDER_LOCK_ENV: str(build_folders.build_folder_lock_fd(checkout)),
+                           'HOME': str(home), 'XDG_RUNTIME_DIR': str(runtime_dir),
                            'XDG_CACHE_HOME': str(home / '.cache'), 'TMPDIR': str(tmp),
                            'CARGO_HOME': str(home / '.cargo'), 'RUSTUP_HOME': str(home / '.rustup'),
                            'PATH': str(binaries) + os.pathsep + os.environ['PATH']}
             if 'argv' in request:
                 command = list(request['argv'])
-                refusal = command_refusal(copy.path, command, request['checked'], environment['PATH'])
+                refusal = command_refusal(checkout, command, request['checked'], environment['PATH'])
                 if refusal:
                     return refuse_run(refusal, request['attempt'])
-                return run_limited(tmp, command, copy.path, environment, request['attempt'])
+                return run_limited(tmp, command, checkout, environment, request['attempt'])
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
             environment['MAC_LINUX_GUEST_HOME'] = str(Path.home())
@@ -3024,7 +3161,7 @@ def run_guest(request_path: Path) -> int:
             try:
                 return run_sandboxed_gate(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
                                                                   request_path, reply),
-                                          copy.path, environment, reply)
+                                          checkout, environment, reply)
             finally:
                 os.close(reply)
 
@@ -3048,7 +3185,7 @@ def session_command(tmp: Path, command: Sequence[str]) -> list[str]:
 
 
 def gate_entry_command(jobs: int, runner: Path, request_path: Path, reply: int) -> list[str]:
-    """Start the archived runner with the numbered copy as the working directory."""
+    """Start the archived runner in the leased folder."""
     return [str(runner.parents[1] / 'lib/py'), '-X', f'cpu_count={jobs}',
             str(runner), str(request_path), RUN_COPY, str(reply)]
 
@@ -3061,7 +3198,6 @@ def run_copy(request_path: Path, reply: int) -> None:
     """Run the candidate's gate and send progress and one JSON result on the reply descriptor."""
     os.set_inheritable(reply, False)
     from scripts.copies import copies
-    from scripts.lib import build_folders
     from scripts.production import gate
     from scripts.production.gate_routes import ALL_MODULES, SelectedModules
     from scripts.test_times.gate_record import GateTimeLimit
@@ -3074,13 +3210,14 @@ def run_copy(request_path: Path, reply: int) -> None:
         raise GuestUnavailable(f'The guest Python did not set the CPU count to {request["jobs"]}.')
     type_dirs = tuple((repo / name).resolve() for name in request['type_dirs'])
     if any(not path.is_relative_to(repo) for path in type_dirs):
-        raise GuestUnavailable('A type-check path leaves the numbered copy.')
+        raise GuestUnavailable('A type-check path leaves the leased folder.')
     if type_dirs:
         for key, program in (('GATE_BASEDPYRIGHT', 'basedpyright'), ('GATE_UV', 'uv')):
             tool = os.environ.get(key, program)
             if shutil.which(tool) is None:
                 raise GuestUnavailable(f'The guest cannot find the type-check tool {tool}.')
-    descriptors = (int(os.environ[build_folders.NUMBERED_COPY_LOCK_ENV]), RUN_LOCK_FD)
+    folder_descriptor = int(os.environ.pop(GUEST_FOLDER_LOCK_ENV))
+    descriptors = (folder_descriptor, RUN_LOCK_FD)
     refs = subprocess.check_output(['git', 'rev-parse', 'HEAD', ORIGIN_MAIN, 'HEAD^{tree}'], cwd=repo,
                                    text=True, pass_fds=descriptors).splitlines()
     commit, origin_main, tree = refs
@@ -3095,6 +3232,7 @@ def run_copy(request_path: Path, reply: int) -> None:
     print(guest_start_line(request['attempt'], repo, home), file=sys.stderr, flush=True)
     try:
         with (build_folders.inherit_build_lock(RUN_LOCK_FD),
+              build_folders.inherit_build_lock(folder_descriptor),
               os.fdopen(reply, 'w', encoding='utf-8') as output):
             def send_progress(line: str) -> None:
                 print(GUEST_PROGRESS + json.dumps(line), file=output, flush=True)
@@ -3123,5 +3261,7 @@ if __name__ == '__main__':
         reconcile_guest_end(sys.argv[2], int(sys.argv[3]))
     elif sys.argv[2:3] == [RUN_COPY]:
         run_copy(Path(sys.argv[1]), int(sys.argv[3]))
+    elif sys.argv[2:3] == ['--check-placement']:
+        raise SystemExit(check_guest_placement(Path(sys.argv[1])))
     else:
         raise SystemExit(run_guest(Path(sys.argv[1])))

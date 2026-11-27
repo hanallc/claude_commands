@@ -3,11 +3,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+import os
+import signal
+import stat
+import subprocess
+import sys
 
 from scripts.buildlog.store import host_name
 from scripts.lib import conf
 from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -41,7 +48,7 @@ names.suffix_length=8
 names.repository_key_length=8
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
 roots.system=/tmp
-roots.gate=/dev/shm
+roots.gate={root / 'gate'}
 roots.temporary={root / 'temporary'}
 roots.build={root / 'build'}
 roots.build.natedev={root / 'build'}
@@ -88,3 +95,85 @@ folders.unused_days=2"""
         "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
     })
     return CopyTestConfiguration(settings, machine, environment)
+
+
+def fixed_registration_snapshot(
+    build: Path, source: Path, *records: Path,
+) -> dict[Path, bytes | tuple[str, ...]]:
+    """Record the fixed folders, registrations, and recovery records."""
+    git = source / ".git"
+    roots = (build, git / "worktrees", git / "mac-linux-worktree", git / "mac-smoke-worktree", *records)
+    entries: dict[Path, bytes | tuple[str, ...]] = {}
+    for root in roots:
+        for entry in (root, *sorted(root.rglob("*"))):
+            try:
+                mode = entry.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(mode):
+                entries[entry] = ("link", str(entry.readlink()))
+            elif stat.S_ISDIR(mode):
+                entries[entry] = ("directory",)
+            else:
+                entries[entry] = entry.read_bytes()
+    return entries
+
+
+class FixedRegistrationKillPoint(Enum):
+    """Select where to stop the first registration with KILL."""
+
+    BEFORE_GIT = "before-git"
+    DURING_RESCUE = "during-rescue"
+
+
+def kill_fixed_registration(
+    source: Path, checkout: Path, commit: str, environment: Mapping[str, str], point: FixedRegistrationKillPoint,
+) -> None:
+    """Leave the registration mark after KILL at the selected point."""
+    program = """
+import os
+from pathlib import Path
+import signal
+import sys
+from unittest.mock import patch
+
+from scripts.lib import build_copies, build_folders, git_rescue
+
+source, checkout = map(Path, sys.argv[1:3])
+commit, point = sys.argv[3:5]
+registration = (build_folders.FixedCheckoutRegistration.MAC_SMOKE if checkout.name == "mac"
+                else build_folders.FixedCheckoutRegistration.MAC_LINUX)
+checkout_source = build_folders.FixedCheckoutSource(source, registration)
+run_rescue_git = git_rescue._git
+
+def kill_before_git(*args):
+    os.kill(os.getpid(), signal.SIGKILL)
+
+def kill_during_rescue(folder, *words, **options):
+    if words[0] == "update-ref":
+        os.kill(os.getpid(), signal.SIGKILL)
+    return run_rescue_git(folder, *words, **options)
+
+stop = (patch.object(build_folders, "_register_fixed_build_checkout", side_effect=kill_before_git)
+        if point == "before-git" else patch.object(git_rescue, "_git", side_effect=kill_during_rescue))
+with build_folders.fixed_repository_build_folder(
+    checkout.parent.name, machine=checkout.name, unit="first", checkout_source=checkout_source,
+) as folder, stop:
+    assert folder == checkout, (folder, checkout)
+    (folder / "user-work").write_bytes(b"work before registration")
+    (folder / "target").mkdir()
+    (folder / "target/cache").write_bytes(b"Cargo output")
+    build_copies.prepare_fixed_checkout(source, folder, commit, reserved=("target",), registration=registration)
+"""
+    tree = Path(__file__).resolve().parents[2]
+    result = subprocess.run([sys.executable, "-c", program, str(source), str(checkout), commit, point.value],
+                            cwd=tree, env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+    if result.returncode != -signal.SIGKILL:
+        raise AssertionError(f"The registration worker did not die by KILL: {result.returncode}\n{result.stderr}")
+    git_entry = checkout / ".git"
+    if point is FixedRegistrationKillPoint.BEFORE_GIT:
+        unexpected_entry = os.path.lexists(git_entry)
+    else:
+        unexpected_entry = not git_entry.is_file()
+    if unexpected_entry:
+        raise AssertionError(f"{checkout}: unexpected Git pointer after KILL at {point.value}")

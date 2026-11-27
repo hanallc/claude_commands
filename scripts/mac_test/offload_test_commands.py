@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import shlex
 from pathlib import Path
 
-from scripts.lib.checkout_test_support import fixture_shim_source, python_tool_source
+from scripts.lib.checkout_test_support import SOURCE, fixture_shim_source, python_tool_source
 
 
 JSON_SHELL = r'''
@@ -121,6 +121,15 @@ def install_nextest_log_writer(home: Path) -> Path:
     shim.parent.mkdir(parents=True, exist_ok=True)
     configure_nextest_trim(shim, 0)
     return shim
+
+
+def install_saved_folder_recovery(home: Path) -> None:
+    """Give the SSH fixture access to the saved folder recovery code."""
+    shim = home / ".claude/scripts/lib/py"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    runtime = shlex.quote(str(SOURCE / "scripts/lib/py"))
+    _ = shim.write_text(f'#!/bin/sh\nexec {runtime} "$@"\n')
+    shim.chmod(0o755)
 
 
 COMMAND_STUB = r'''

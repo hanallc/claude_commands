@@ -197,8 +197,11 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         self.environment["TEST_METADATA"] = json.dumps(metadata)
         _ = self.runner.write_text(self.runner.read_text().replace(
             'build_target_directory=target', 'build_target_directory=/remote/cargo output'))
-        result = self.verify("build", "sample", "--target", "linux")
+        result = self.verify("build", "sample", "--target", "linux", extra={"BUILDLOG_RUN": "123:456"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        words, = self.received_arguments()
+        self.assertEqual(words[words.index("--target") + 1], "linux")
+        self.assertEqual(words[words.index("--run-id") + 1], "123:456")
         self.assertIn("binary: linux:/remote/cargo output/debug/sample-cli", result.stdout)
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["build"]], [])
 
