@@ -287,10 +287,10 @@ An ad hoc Astra review starts through `assign.sh --target consultation-pane --op
 Its command interface retains `send` and `close`.
 A managed Astra review starts through `assign.sh --role review --operation astra-review`.
 Managed reviewers for the same caller take turns opening their panes under the caller's staff row lock.
-Each startup lock holder has a budget of `pane_agent_start_seconds` plus `operation_lock_seconds`.
-When a new holder takes the startup lock, waiting reviewers use that holder's budget.
-The wait for the caller's staff row has a separate limit from `operation_lock_seconds`.
-On timeout, the launcher names the lock and its holder when available.
+The startup lock waits until its holder releases it or exits.
+Pane opening and the first Codex turn use their own time limits.
+The wait for the caller's staff row uses `operation_lock_seconds`.
+If the row wait times out, the launcher names the row and its holder when available.
 Both locks release before dispatch.
 Each reviewer uses its own worker lock through submission.
 Reviews can run in parallel after submission.

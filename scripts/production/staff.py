@@ -1068,10 +1068,10 @@ def _holder_fields() -> dict[str, object]:
     return {"pid": os.getpid(), "command": shlex.join(sys.argv)}
 
 
-def _write_slot_holder(lock: IO[bytes], holder: dict[str, object]) -> None:
+def _write_slot_holder(lock: IO[bytes]) -> None:
     with suppress(OSError):
         os.ftruncate(lock.fileno(), 0)
-        _ = lock.write((json.dumps(holder) + "\n").encode("utf-8"))
+        _ = lock.write((json.dumps(_holder_fields()) + "\n").encode("utf-8"))
 
 
 def _clear_slot_holder(lock: IO[bytes]) -> None:
@@ -1079,24 +1079,19 @@ def _clear_slot_holder(lock: IO[bytes]) -> None:
         os.ftruncate(lock.fileno(), 0)
 
 
-def _slot_record(lock: IO[bytes]) -> dict[str, object]:
+def _slot_holder(lock: IO[bytes]) -> tuple[int, str] | None:
     try:
         line = os.pread(lock.fileno(), 4096, 0).partition(b"\n")[0]
-        value = cast(object, json.loads(line))
+        holder = cast(object, json.loads(line))
     except (OSError, ValueError):
-        return {}
-    return cast(dict[str, object], value) if isinstance(value, dict) else {}
-
-
-def _named_slot_holder(record: Mapping[str, object]) -> tuple[int, str] | None:
+        return None
+    if not isinstance(holder, dict):
+        return None
+    record = cast(dict[str, object], holder)
     pid, command = record.get("pid"), record.get("command")
     if type(pid) is not int or pid <= 0 or not isinstance(command, str) or not command:
         return None
     return pid, command
-
-
-def _slot_holder(lock: IO[bytes]) -> tuple[int, str] | None:
-    return _named_slot_holder(_slot_record(lock))
 
 
 _UPKEEP_LOCK_WAIT: ContextVar[float | None] = ContextVar("_UPKEEP_LOCK_WAIT", default=None)
@@ -1186,64 +1181,26 @@ class SlotLockWait(Enum):
     IMMEDIATE = "refuse a held slot"
 
 
-@dataclass(frozen=True)
-class ReviewerStartupWait:
-    seconds_per_holder: float
-
-
-def _slot_timeout(path: Path, name: str, holder: tuple[int, str] | None) -> StaffRefused:
-    named = f"pid {holder[0]}: {holder[1]}" if holder else _operation_lock_holder(path)
-    return StaffRefused(f"{name}: timed out waiting for lock ({named})", holder=named)
-
-
 def _wait_for_slot(lock: IO[bytes], path: Path, name: str, deadline: float) -> None:
     from scripts.agents import worker_lifecycle
 
     try:
         worker_lifecycle.acquire_flock(lock, deadline=deadline)
     except worker_lifecycle.OperationDeadlineExpired as error:
-        raise _slot_timeout(path, name, _slot_holder(lock)) from error
-
-
-def _wait_for_reviewer_startup(lock: IO[bytes], path: Path, name: str, wait: ReviewerStartupWait) -> None:
-    import select
-
-    from scripts.agents import worker_lifecycle
-
-    deadline = time.monotonic() + wait.seconds_per_holder
-    while True:
-        try:
-            worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return
-        except worker_lifecycle.OperationDeadlineExpired as error:
-            raise _slot_timeout(path, name, _slot_holder(lock)) from error
-        except BlockingIOError as error:
-            record = _slot_record(lock)
-            holder = _named_slot_holder(record)
-            now = time.monotonic()
-            acquired_at = record.get("acquired_at")
-            if holder and isinstance(acquired_at, (float, int)) and 0 < acquired_at <= now:
-                deadline = acquired_at + wait.seconds_per_holder
-            remaining = worker_lifecycle.effective_deadline(deadline) - now
-            if remaining <= 0:
-                raise _slot_timeout(path, name, holder) from error
-            _ = select.select([], [], [], min(0.05, remaining))
+        holder = _slot_holder(lock)
+        named = f"pid {holder[0]}: {holder[1]}" if holder else _operation_lock_holder(path)
+        raise StaffRefused(f"{name}: timed out waiting for lock ({named})", holder=named) from error
 
 
 @contextmanager
-def _slot_lock(path: Path, name: str, wait: float | SlotLockWait | ReviewerStartupWait) -> Generator[IO[bytes]]:
+def _slot_lock(path: Path, name: str, wait: float | SlotLockWait) -> Generator[IO[bytes]]:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b", buffering=0) as lock:
         if wait is SlotLockWait.IMMEDIATE:
             _acquire_slot(lock, name)
-        elif isinstance(wait, ReviewerStartupWait):
-            _wait_for_reviewer_startup(lock, path, name, wait)
         else:
             _wait_for_slot(lock, path, name, wait)
-        holder = _holder_fields()
-        if isinstance(wait, ReviewerStartupWait):
-            holder["acquired_at"] = time.monotonic()
-        _write_slot_holder(lock, holder)
+        _write_slot_holder(lock)
         try:
             yield lock
         finally:
@@ -1272,13 +1229,12 @@ def slot_operation(key: str, name: str, *, join: bool = True,
 
 @contextmanager
 def reviewer_startup(caller: StaffRow) -> Generator[None]:
-    """Wait for each reviewer startup and bound the wait for the caller's row."""
-    from scripts.lib import conf
+    """Wait for reviewer startup and limit the wait for the caller's row."""
+    from scripts.lib import file_lock
 
-    pane_seconds = conf.read("direct").number("pane_agent_start_seconds")
-    wait = ReviewerStartupWait(pane_seconds + _seconds("operation_lock_seconds"))
     path = _file().parent / "locks" / f"astra-review-start-{caller.id}.lock"
-    with _slot_lock(path, f"{caller.name}: reviewer startup", wait):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock.exclusive(path):
         deadline = time.monotonic() + _wait_seconds("operation_lock_seconds")
         with slot_operation(caller.id, f"{caller.name}: caller row", deadline=deadline):
             yield
