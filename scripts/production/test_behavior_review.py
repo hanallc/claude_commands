@@ -23,7 +23,7 @@ from scripts.notify import review
 from scripts.production import (
     behavior_check, behavior_request, behavior_review, record_store, session_staff, staff, the_list, update_registration, worker,
 )
-from scripts.review_links import list_draft, question_record, review_events
+from scripts.review_links import image_store, images, list_draft, question_record, review_events
 
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
@@ -51,6 +51,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         super().setUp()
         self.environment["SHOWRUNNER_STATE_DIR"] = str(self.root / "showrunner")
         self.environment["ASTRA_ROLES_STATE"] = str(self.root / "astra-roles")
+        self.environment["REVIEW_LINKS_ROOT"] = str(self.root / "review-links")
         self.folder = self.root / "review-run"
         self.folder.mkdir()
         _ = self.enterContext(mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root))
@@ -384,6 +385,56 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                 self.assertIsInstance(finding, expected)
                 if isinstance(finding, behavior_review.NateRequest):
                     self.assertEqual(finding.day.isoformat(), "2026-11-23")
+
+    def save_image_answer(self, item: str, identity: str, action: str, *,
+                          save_record: bool = True, different_key: bool = False) -> str:
+        words = f"Image {identity}: {images.ANSWERS[action]}"
+        keeper = self.producer.id
+        event_key = f"review:{identity}"
+        if save_record:
+            directory = images.images_root(Path(self.environment["REVIEW_LINKS_ROOT"]))
+            directory.mkdir(parents=True, exist_ok=True)
+            key = "review:other" if different_key else event_key
+            image_store.write_answers(directory, {
+                "id": identity, "owner": keeper, "registered_at": "2026-11-20T15:00:00+00:00",
+                "list_item": item, "list_keeper": keeper, "attempts": {key: {
+                    "message": images.ANSWER_PREFIX + images.ANSWERS[action],
+                    "words": words, "answered": [], "recipients": [keeper], "confirmed": [keeper],
+                }},
+            })
+        moment = datetime(2026, 11, 23, 23, 5, tzinfo=timezone.utc)
+        with (staff.supplied_snapshot(self.identities.record),
+              mock.patch.object(the_list, "now", return_value=moment)):
+            _ = the_list.save_image_answer(keeper, item, event_key, words,
+                                           image_id=identity, approved=action == "approved")
+        return words
+
+    def test_image_approval_with_matching_record_verifies(self) -> None:
+        store, item = self.new_list_record()
+        approved = self.save_image_answer(item, "a12345678901", "approved")
+        self.assertEqual(behavior_request.verified_dates(
+            store.path(item), {approved, images.ANSWERS["approved"]}), {approved: date(2026, 11, 23)})
+
+    def test_image_feedback_does_not_verify_as_approval(self) -> None:
+        store, item = self.new_list_record()
+        approved = self.save_image_answer(item, "a12345678901", "approved")
+        feedback = self.save_image_answer(item, "b12345678901", "feedback")
+        self.assertEqual(behavior_request.verified_dates(store.path(item), {approved, feedback}),
+                         {approved: date(2026, 11, 23)})
+
+    def test_image_approval_without_a_server_record_does_not_verify(self) -> None:
+        store, item = self.new_list_record()
+        approved = self.save_image_answer(item, "a12345678901", "approved")
+        unverified = self.save_image_answer(item, "b12345678901", "approved", save_record=False)
+        self.assertEqual(behavior_request.verified_dates(store.path(item), {approved, unverified}),
+                         {approved: date(2026, 11, 23)})
+
+    def test_image_approval_with_a_different_delivery_key_does_not_verify(self) -> None:
+        store, item = self.new_list_record()
+        approved = self.save_image_answer(item, "a12345678901", "approved")
+        unverified = self.save_image_answer(item, "b12345678901", "approved", different_key=True)
+        self.assertEqual(behavior_request.verified_dates(store.path(item), {approved, unverified}),
+                         {approved: date(2026, 11, 23)})
 
     def test_an_unverified_request_requires_a_question(self) -> None:
         args, key = self.changed_range()

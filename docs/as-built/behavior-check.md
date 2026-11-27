@@ -22,6 +22,7 @@ A clear record names the saved reviewer reply.
 The reviewer filters transcript files before parsing them and runs each command in one tool call without `write_stdin`.
 The gate checks each changed test for no user decision or a verified request from Nate.
 The check accepts typed Claude turns, sent List Tell feedback from Nate, and Nate's saved List or Question answers.
+An Images page approval counts as Nate's words when its List event matches the server's delivery key and exact approval text with the image ID.
 It matches consecutive full sentences or lines and treats each run of whitespace as one space.
 The check reports the date from the source. If the source cannot prove the author or quote, the finding needs a question.
 Status fails if it cannot read or parse the saved proof for a clear record.
