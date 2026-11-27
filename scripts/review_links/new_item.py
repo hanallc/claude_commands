@@ -346,6 +346,8 @@ def producer_line(member: staff.StaffRow, mapped: producer_map.MappedProducer) -
     """Name the producer selected for a new filing."""
     if member.kind == "producer":
         return ""
+    if mapped.set_by.id == mapped.producer.id:
+        return f" Producer: {mapped.producer.name}."
     why = "set for" if mapped.set_by == member else "from"
     return f" Producer: {mapped.producer.name} ({why} {mapped.set_by.name})."
 

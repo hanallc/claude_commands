@@ -4888,6 +4888,20 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(notify.call_count, 2)
         self.assertEqual(the_list.records(morty.id), [item])
 
+    def test_scheduled_new_item_omits_the_repeated_producer_source(self) -> None:
+        case = self.review_fixture()
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
+        request = {"token": self.server.new_item_token, "kind": "scheduled", "page": "list",
+                   "page_recipient": "producer", "request_id": "s1-" + uuid4().hex,
+                   "recipient_id": morty.id, "assignee_id": case.fixture.unit.id,
+                   "words": "Check the Scheduled item. Start 2099-11-30T09:00Z."}
+        reply = self.new_item_http(json.dumps(request).encode(), finished=True)
+        self.assertEqual(reply.status, 200, reply.body)
+        saved = cast(dict[str, str], json.loads(reply.body))
+        item = the_list.load(morty.id, saved["id"])
+        self.assertTrue(saved["receipt"].endswith(f" Producer: morty. List item {item.number}."), saved["receipt"])
+
     def scheduled_notice_fixture(self) -> tuple[bytes, staff.StaffId, staff.StaffId, Path]:
         case = self.review_fixture()
         producer = fixture_member("producer", name="dwight")

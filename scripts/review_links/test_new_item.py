@@ -354,6 +354,15 @@ class NewItemTests(ServerFixture):
         self.assertEqual(self.server.posts[0]["recipient_id"], DWIGHT.id)
         self.assertEqual(self.server.posts[0]["assignee_id"], MODELS.id)
 
+    def test_a_unit_under_a_producer_omits_the_repeated_source(self) -> None:
+        showrunner = replace(SPACETIME, parent=staff.ReportsTo(DWIGHT.id))
+        members = replace(MEMBERS, rows=tuple(showrunner if row.id == showrunner.id else row for row in MEMBERS.rows))
+        with mock.patch.object(staff, "snapshot", return_value=members):
+            code, output, errors = self.run_main("bug", "models", "The frame time graph has a gap.")
+        self.assertEqual((code, output, errors),
+                         (0, "Bug → models, a unit of spacetime. Producer: dwight. List item 3.\n", ""))
+        self.assertEqual(self.server.posts[0]["recipient_id"], DWIGHT.id)
+
     def test_a_unit_row_wins_over_its_showrunner_row(self) -> None:
         self.map_row(NATEDEV, DWIGHT)
         self.map_row(POSTMASTER, BOB)
