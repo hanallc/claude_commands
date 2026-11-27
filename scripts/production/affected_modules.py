@@ -315,60 +315,70 @@ class _SourceFactWalk:
         self.definitions: dict[str, tuple[ScopeDefinition, list[ScanNode]]] = {"": (tree, [])}
         self.imports_by_depth: dict[int, list[ast.Import | ast.ImportFrom]] = defaultdict(list)
         self.config_calls: list[tuple[ast.expr, str]] = []
-        self.active_calls: list[ast.Call] = []
         self.ls_files_calls: set[ast.Call] = set()
-        self.config_reads: set[str] = config_reads
-        self.visit(tree, 0, "", self.definitions[""][1])
+        self.walk(tree, config_reads)
 
-    def visit(self, node: ast.AST, depth: int, name: str,
-              scope: list[ScanNode] | None, in_copy_source: bool = False) -> None:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            name = f"{name}.{node.name}".lstrip(".")
-            body: list[ScanNode] = []
-            self.definitions[name] = node, body
-            # Scans use only the body. Imports and definitions can also occur in other fields.
-            for field, value in cast(Iterator[tuple[str, object]], ast.iter_fields(node)):
-                children = cast(list[object], value) if isinstance(value, list) else [value]
-                for child in children:
-                    if isinstance(child, ast.AST):
-                        self.visit(child, depth + 1, name, body if field == "body" else None, in_copy_source)
-            return
+    def walk(self, tree: ast.Module, config_reads: set[str]) -> None:
+        stack: list[tuple[ast.AST, int, str, list[ScanNode] | None, bool] | None] = [
+            (tree, 0, "", self.definitions[""][1], False)
+        ]
+        active_calls: list[ast.Call] = []
+        while stack:
+            entry = stack.pop()
+            if entry is None:
+                _ = active_calls.pop()
+                continue
+            node, depth, name, scope, in_copy_source = entry
+            child_depth = depth + 1
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{name}.{node.name}".lstrip(".")
+                body: list[ScanNode] = []
+                self.definitions[name] = node, body
+                # Scans use only the body. Imports and definitions can also occur in other fields.
+                fields = list(cast(Iterator[tuple[str, object]], ast.iter_fields(node)))
+                for field, value in reversed(fields):
+                    children = cast(list[object], value) if isinstance(value, list) else [value]
+                    child_scope = body if field == "body" else None
+                    for child in reversed(children):
+                        if isinstance(child, ast.AST):
+                            stack.append((child, child_depth, name, child_scope, in_copy_source))
+                continue
 
-        if isinstance(node, ast.Lambda):
-            scope = None
-        copy_source: ast.expr | None = None
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            self.imports_by_depth[depth].append(node)
-            if scope is not None:
-                scope.append(node)
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-            if scope is not None:
-                scope.append(node)
-        elif isinstance(node, ast.Call):
-            if scope is not None:
-                scope.append(node)
-            self.active_calls.append(node)
-            if node.args:
-                first = node.args[0]
-                if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                    self.config_calls.append((node.func, first.value))
-                if isinstance(node.func, ast.Attribute) and node.func.attr == "copytree":
-                    copy_source = first
-        elif isinstance(node, ast.Constant):
-            if node.value == "ls-files":
-                self.ls_files_calls.update(self.active_calls)
-            if in_copy_source and node.value == "config":
-                self.config_reads.add("*")
-            return
-        elif isinstance(node, ast.JoinedStr) and any(
-                isinstance(part, ast.Constant) and isinstance(part.value, str) and part.value.endswith(".conf")
-                for part in node.values):
-            self.config_reads.add("*")
+            if isinstance(node, ast.Lambda):
+                scope = None
+            copy_source: ast.expr | None = None
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                self.imports_by_depth[depth].append(node)
+                if scope is not None:
+                    scope.append(node)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                if scope is not None:
+                    scope.append(node)
+            elif isinstance(node, ast.Call):
+                if scope is not None:
+                    scope.append(node)
+                active_calls.append(node)
+                # Pop the active call after its children.
+                stack.append(None)
+                if node.args:
+                    first = node.args[0]
+                    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                        self.config_calls.append((node.func, first.value))
+                    if isinstance(node.func, ast.Attribute) and node.func.attr == "copytree":
+                        copy_source = first
+            elif isinstance(node, ast.Constant):
+                if node.value == "ls-files":
+                    self.ls_files_calls.update(active_calls)
+                if in_copy_source and node.value == "config":
+                    config_reads.add("*")
+                continue
+            elif isinstance(node, ast.JoinedStr) and any(
+                    isinstance(part, ast.Constant) and isinstance(part.value, str) and part.value.endswith(".conf")
+                    for part in node.values):
+                config_reads.add("*")
 
-        for child in ast.iter_child_nodes(node):
-            self.visit(child, depth + 1, name, scope, in_copy_source or child is copy_source)
-        if isinstance(node, ast.Call):
-            _ = self.active_calls.pop()
+            for child in reversed(list(ast.iter_child_nodes(node))):
+                stack.append((child, child_depth, name, scope, in_copy_source or child is copy_source))
 
 
 def extract_facts(text: str, path: str) -> SourceFacts:
