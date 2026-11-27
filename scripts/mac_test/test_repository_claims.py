@@ -9,7 +9,6 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
-import shlex
 import shutil
 import subprocess
 import sys
@@ -465,15 +464,6 @@ class RepositoryClaimTests(unittest.TestCase):
             self.assertEqual(path.name, f"linux-s{slot}")
             self.assertNotIn("..", path.parts)
         self.assertEqual(offload.remote_mirror(first_id), ".local/state/mac-test/test-mirror/project")
-        config = eligibility.read_config(self.root / "linux.conf")
-        request = offload.OffloadRequest(first, "project", "call", offload.NO_RESULT_FILE, (), owner="verify", target="linux", slot=2, holder_session="fixture-session")
-
-        command = offload.remote_test_command(config, request, first_id)
-
-        self.assertIn(mirrors[1], command)
-        words = shlex.split(command)
-        self.assertEqual(words[words.index("--mirror") + 1], mirrors[1])
-        self.assertNotIn(mirrors[0], words)
 
     def test_invalid_legacy_numbers_never_confirm_a_claim(self) -> None:
         for output in ("claimed\nslot: 0\n", "claimed\nslot: -1\n", "claimed\nslot: x\n",

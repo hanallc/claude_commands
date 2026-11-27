@@ -52,14 +52,15 @@ runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
     def test_disk_decline_during_eligibility_leaves_memory_wait_for_a_free_mac(self) -> None:
         self.assert_disk_decline_leaves_for_mac()
 
-    def test_mac_disk_with_linux_off_leaves_memory_wait_for_a_free_mac(self) -> None:
+    def test_mac_disk_with_second_mac_off_leaves_memory_wait_for_a_free_mac(self) -> None:
         config = self.root / "build_targets.conf"
-        _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=mac,natedev,linux")
-                              + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
-        _ = write_config_fixture(self.root / "linux.conf", "offload=off\nkinds=test\n", template="mac_test")
-        self.assert_disk_decline_leaves_for_mac(disabled_linux=True)
+        _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=mac,natedev,mac2")
+                              + "kind.mac2=ssh\nplatform.mac2=macos\nsettings.mac2=mac2.conf\n")
+        _ = write_config_fixture(self.root / "mac2.conf", "host=fixture-mac2\noffload=off\nkinds=test\n",
+                                 template="mac_test")
+        self.assert_disk_decline_leaves_for_mac()
 
-    def assert_disk_decline_leaves_for_mac(self, *, disabled_linux: bool = False) -> None:
+    def assert_disk_decline_leaves_for_mac(self) -> None:
         _ = self.hold_memory()
         available = self.runner_state / "available-gib"
         _ = available.write_text("0\n")
@@ -78,8 +79,7 @@ printf 'free_gib=%s\\nhost=test-mac\\nrc=0\\n' "$(cat '{available}')"
             record = step_record.read(paths[0].stem)
         if not isinstance(record, step_record.StepRecord):
             self.fail(f"Expected a live step record, got {record!r}")
-        self.assertEqual(record.runs_on, step_record.AnyTarget(
-            ("mac", "natedev", "linux") if disabled_linux else ("mac", "natedev"), ("mac",)))
+        self.assertEqual(record.runs_on, step_record.AnyTarget(("mac", "natedev"), ("mac",)))
         self.assertEqual(len(list((self.root / "mac-idle/calls").glob("*.json"))), 0)
         self.assertEqual(len(self.runner_events()), 0)
         _ = available.write_text("1000\n")
