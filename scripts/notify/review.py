@@ -852,8 +852,8 @@ class QuestionPartVerdict:
 
 
 PART_RULES = ("console-standard-5", "times-carry-zone")
-# Rule 10 can fail the wording of a single title or point.
-CROSS_LINE_RULES = frozenset({
+# Keep the original fingerprint for saved line verdicts and draft approvals.
+LINE_REVIEW_FINGERPRINT_V1_RULES = frozenset({
     "console-standard-2", "console-standard-3", "console-standard-4",
     "console-standard-6", "console-standard-7", "console-standard-9", "console-standard-12",
     "before-and-after", "every-choice-says-what-it-does", "what-happened-why-what-you-do",
@@ -986,16 +986,16 @@ class ConsoleLineReview:
                 lines.append(ConsoleDraftLine(stripped, start, start + len(stripped)))
             offset += len(raw)
         text = tuple(line.text for line in lines)
-        changed = text != self.lines
         previous = {line for index, line in enumerate(line_occurrences(self.lines)) if index in self.passed}
         passed_before = {index for index, line in enumerate(line_occurrences(text)) if line in previous}
         passed_now = set(range(len(lines)))
         kept: list[RuleFailure] = []
         for failure in failures:
             overlap = quoted_lines(body, lines, failure.quote)
-            if (failure.rule not in CODE_RULES and overlap and overlap <= passed_before
-                    and not (changed and failure.rule in CROSS_LINE_RULES)):
-                continue
+            if failure.rule not in CODE_RULES and overlap:
+                overlap.difference_update(passed_before)
+                if not overlap:
+                    continue
             kept.append(failure)
             passed_now.difference_update(overlap)
         return tuple(kept), ConsoleLineReview(text, frozenset(passed_now))
@@ -1110,7 +1110,7 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
     rules = question_part_digest((prompt, schema, CODE_RULES, PART_RULES, review_date_and_zone))
     line_rules = question_part_digest((system_prompt, part_system_prompt, SCHEMA, PART_REVIEW_SCHEMA,
                                       CODE_RULES, PART_RULES, review_date_and_zone, context.caption_layout,
-                                      sorted(CROSS_LINE_RULES)))
+                                      sorted(LINE_REVIEW_FINGERPRINT_V1_RULES)))
     draft_fingerprint = question_part_digest((line_rules, context.console_kind, key.console_draft_digest, draft.body))
     cache_rules = draft_fingerprint if whole else rules
     fingerprints = ({number: question_part_digest((cache_rules, part, parts[:number - 1].count(part)))

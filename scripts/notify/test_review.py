@@ -728,7 +728,7 @@ class LocalReviewTests(unittest.TestCase):
         revised = draft.replace("A partial file is on disk.", "You get the full file.")
         key = review.QuestionKey("demo", title)
         runner = FakeReviewer(verdict(self.draft))
-        failure = review.RuleFailure("console-standard-2", recommendation)
+        failure = review.RuleFailure("console-standard-2", "You get the full file.")
         requests: list[QuestionReviewRequest] = []
 
         def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:

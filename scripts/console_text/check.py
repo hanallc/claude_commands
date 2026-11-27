@@ -127,7 +127,7 @@ def fast_check(text: str, kind: Kind) -> tuple[review.RuleFailure, ...]:
 
 def check(text: str, kind: Kind, *, key: review.QuestionKey | None = None,
           title: str = "", caption_layout: review.CaptionLayout | None = None) -> review.QuestionOutcome:
-    """Run the filing check. Use a stable key to save the hold for a revised draft."""
+    """Run the filing check. Use a stable key to retain line approvals and holds across revisions."""
     failures = fast_check(text, kind)
     heading = f"## {title}"
     lines = text.splitlines()
