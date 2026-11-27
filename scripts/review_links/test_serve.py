@@ -6881,7 +6881,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with capture_sender("send_to_staff") as send:
             status, answer = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
         self.assertEqual(status, 200, answer)
-        send.assert_called_once()
+        self.assert_studio_question_message(send, row, "Use the wide layout.")
         self.assertEqual(self.list_filter_markup("?show=questions")[0], [])
         stored = the_list.load(row.keeper, row.item.id)
         self.assertEqual(stored.state, the_list.ItemState.WORKING)
@@ -6891,7 +6891,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(exchange.answer.text, "Use the wide layout.")
         self.assertEqual(self.request(fragment).status, 404)
 
-    def test_studio_inline_team_question_can_wait_or_ask_for_more(self) -> None:
+    def assert_studio_question_message(self, send: Mock, row: list_page.ListRecord, words: str) -> None:
+        send.assert_called_once()
+        recipient, sender, message = cast(tuple[str, str, str], send.call_args.args)
+        self.assertEqual((recipient, sender), (row.item.owner, change_page.SENDER))
+        self.assertIn(words, message)
+
+    def test_studio_inline_team_question_later_sends_words_to_the_owner(self) -> None:
         case, key, row = self.filed_studio_team_question()
         page = self.server.review_cache.get()
         data = page.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
@@ -6901,19 +6907,26 @@ class ReviewLinksServerTests(unittest.TestCase):
         later = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
         body = case.body(key, "later", "Wait for the desktop check.") + "&" + revision
         with capture_sender("send_to_staff") as send:
-            status, reply = self.post(review_page.PAGE_PATH, body + "&" + urlencode({"later": later.isoformat()}))
+            status, reply = self.post(review_page.PAGE_PATH, body + "&" + urlencode({"later": later.isoformat()}),
+                                      headers={send_hold.REPLAY_HEADER: "1"})
             self.assertEqual(status, 200, reply)
-            send.assert_not_called()
+            self.assert_studio_question_message(send, row, "Wait for the desktop check.")
             self.assertEqual(self.list_filter_markup("?show=questions")[0], [])
             item = the_list.load(row.keeper, row.item.id)
             self.assertEqual(item.parked_until, later)
-            self.assertEqual(item.log[-1].what, "Later: Wait for the desktop check.")
-            _ = the_list.unpark(row.keeper, row.item.id, source="nate")
-            ask = "Does the wide layout fit on a laptop?"
-            body = case.body(key, "question", ask) + "&" + revision
+            self.assertIn("Later: Wait for the desktop check.", [entry.what for entry in item.log])
+
+    def test_studio_inline_team_question_ask_sends_words_to_the_owner(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        ask = "Does the wide layout fit on a laptop?"
+        body = case.body(key, "question", ask) + "&" + urlencode({"revision": shown[1].decode()})
+        with capture_sender("send_to_staff") as send:
             status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
         self.assertEqual(status, 200, reply)
-        send.assert_called_once()
+        self.assert_studio_question_message(send, row, ask)
         current = self.server.review_cache.get().records[key].source
         assert isinstance(current, review_items.QuestionSource)
         self.assertEqual(current.record.item.get("followup", {}).get("text"), ask)

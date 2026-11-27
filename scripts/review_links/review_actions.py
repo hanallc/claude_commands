@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, tzinfo
 from importlib import import_module
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import urlencode
 
 from scripts.for_you.action import REVIEW_PATH
@@ -21,7 +21,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, investigation, proposal_issue, record_store, staff, the_list, update_registration
 from scripts.production.production_doc import Production
-from scripts.review_links import change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
+from scripts.review_links import change_browser, change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
 from scripts.review_links import question_path, question_record, reply_tokens, review_events
 from scripts.review_links.review_events import KeepMark, MarkChange, NoMark, ReviewMark
 
@@ -266,7 +266,6 @@ def track_question(delivery: change_page.MessageDelivery, key: str, words: str,
 def question_action(item: review_items.ReviewItem, action: change_page.QuestionOutcome, words: str,
                     status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery, str]:
     """Save the action against the selected Question."""
-    from scripts.review_links import change_browser
     source = item.source
     assert isinstance(source, review_items.QuestionSource)
     if not words.strip():
@@ -279,6 +278,55 @@ def question_action(item: review_items.ReviewItem, action: change_page.QuestionO
     question = change_browser.WaitingQuestion(item.key, review_items.name(item.owner, identities.record), source.record,
         update_registration.question_source(scope), item.owner, review_items.name(source.record.asker, identities.record))
     return change_browser.submit_question(question, action, words, status, save=change_browser.SelectedQuestionSave())
+
+
+def studio_question_row(item: review_items.ReviewItem) -> tuple[staff.StaffId, the_list.ListItem]:
+    handoff = item.exchange_handoff
+    if not isinstance(handoff, review_items.FiledReviewExchange) or not handoff.open_staff_question:
+        raise question_record.AnswerRefused('This question is no longer open on the Studio.')
+    destination = handoff.destination
+    row = the_list.load(destination.keeper, f'L{destination.number}')
+    if isinstance(row.owner, the_list.UnassignedOwner):
+        raise question_record.AnswerRefused('This item has no owner.')
+    return destination.keeper, row
+
+
+def studio_question_action(item: review_items.ReviewItem, record: update_registration.QuestionRecord,
+                           action: Literal['answer', 'question'], words: str,
+                           status: change_page.DeliveryStatus, route: change_browser.QuestionRoute
+                           ) -> tuple[change_page.MessageDelivery, str]:
+    _, row = studio_question_row(item)
+    owner = row.owner
+    assert not isinstance(owner, the_list.UnassignedOwner)
+    question = change_browser.WaitingQuestion(item.key, '', record, update_registration.question_source(route.production),
+                                              record.owner, '')
+    message = change_browser.question_message(action, route.production.name, item.title, route.relay.unit, words, item.key)
+    document = route.production.doc if isinstance(route.production, Production) else record.path.parent
+    saved: change_page.StoredUserAnswer = {
+        'saved': False, 'source': str(record.path), 'production': str(document), 'owner': record.owner,
+        'question': item.title, 'answer': words if action == 'answer' else '', 'message': message, 'kind': action,
+    }
+    opened: change_page.NoQuestion | change_page.OpenQuestion = change_page.NoQuestion()
+    if action == 'question':
+        identity = secrets.token_hex(4)
+        saved['question_id'] = identity
+        saved['question_text'] = words.strip()
+        saved['message'] = message.replace(change_page.reply_command(item.key), change_page.reply_command(item.key, identity))
+        opened = change_page.OpenQuestion(identity, words.strip(), change_page.NoDelivery())
+    page = change_page.UserQuestionPage(record.path, document, (record.path.stem,), '', saved)
+
+    def save() -> None:
+        change_browser.save_question_record(route.production, question, action, words,
+                                            change_browser.SelectedQuestionSave(), before_write=lambda: None)
+
+    return save_delivery(page, owner, save, status, opened), words
+
+
+@dataclass(frozen=True)
+class ListFeedbackDelivery:
+    keeper: staff.StaffId
+    identity: str
+    request: str
 
 
 def sent_question_action(item: review_items.ReviewItem, record: update_registration.QuestionRecord,
@@ -389,6 +437,39 @@ def _save_review_park(item: review_items.ReviewItem, until: datetime, words: str
           else nullcontext()):
         review_later.save(item.key, until, record_log=record_later)
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
+
+
+def studio_later(item: review_items.ReviewItem, value: str, words: str, *,
+                 verify_revision: Callable[[], object]
+                 ) -> tuple[ListFeedbackDelivery | change_page.NoMessageDelivery, str]:
+    keeper, row = studio_question_row(item)
+    owner = row.owner
+    assert not isinstance(owner, the_list.UnassignedOwner)
+    zone = user_zone()
+    request = secrets.token_hex(16)
+
+    def save(until: datetime, check: Callable[[datetime], None]
+             ) -> tuple[ListFeedbackDelivery | change_page.NoMessageDelivery, str]:
+        until = until.astimezone(zone)
+        label = 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
+        message = f'Studio: nate parked item {row.number} {label}.\n\n{words}'
+        notice = (the_list.PageItemNotice(request, message, 'park', words, recipient=owner,
+                                          origin=the_list.PageNoticeOrigin.STUDIO)
+                  if words.strip() else the_list.NoPageRequest.ABSENT)
+
+        def check_current(moment: datetime) -> None:
+            _ = verify_revision()
+            if the_list.load(keeper, row.id).owner != owner:
+                raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
+            check(moment)
+
+        saved = the_list.park(keeper, row.id, until, source=the_list.PAGE_SOURCE, notice=notice,
+                              note='Later: '+words if words.strip() else '', check_deadline=check_current)
+        delivery = (ListFeedbackDelivery(keeper, row.id, request)
+                    if request in the_list.feedback_requests(saved) else change_page.NoMessageDelivery())
+        return delivery, label
+
+    return save_timed_park(value, zone, save)
 
 
 def later(item: review_items.ReviewItem, value: str, words: str, *,

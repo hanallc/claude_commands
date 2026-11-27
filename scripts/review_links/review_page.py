@@ -689,6 +689,7 @@ class ReviewSave:
     version: str
     item: ReviewItem | ReviewRecordNotPublished
     detail: ReviewActionDetail = field(default_factory=ReviewDetailUnavailable)
+    list_notice: review_actions.ListFeedbackDelivery | None = None
 
 
 @dataclass(frozen=True)
@@ -763,8 +764,9 @@ class ReviewSnapshotCache:
         key = fields['row'][0]
         with self._save_lock:
             current = self.get()
+            list_notices: list[review_actions.ListFeedbackDelivery] = []
             try:
-                delivery, answer = submit_snapshot(self.root, current, fields, status)
+                delivery, answer = submit_snapshot(self.root, current, fields, status, list_notice=list_notices.append)
             except review_items.ReviewRecordChanged:
                 try:
                     if key in current.records:
@@ -804,7 +806,7 @@ class ReviewSnapshotCache:
                 logging.getLogger(__name__).warning('Review saved %s. Publication will retry: %s', key, error)
             finally:
                 self.invalidate()
-            return ReviewSave(delivery, answer, version, item, detail)
+            return ReviewSave(delivery, answer, version, item, detail, next(iter(list_notices), None))
 
     def publish_delivery_result(self, key: str) -> None:
         """Publish the delivery result before reporting that delivery ended."""
@@ -1102,6 +1104,14 @@ def assign_menu(item: ReviewItem, names: staff_names.StaffNames) -> str:
         f'<option value=""{names.style(item.owner)}>{html.escape(shown)} decides</option>'+''.join(options))
 
 
+def words_field(identity: str, name: str, rows: int, *, placeholder: str = 'Type your words. They go with the button that you press.',
+                maxlength: int = 0) -> str:
+    field = html.escape(identity, quote=True)
+    limit = f' maxlength="{maxlength}"' if maxlength else ''
+    return (f'<label for="{field}">Your words</label><textarea id="{field}" name="{name}" rows="{rows}"{limit} '
+            + f'placeholder="{html.escape(placeholder, quote=True)}"></textarea>')
+
+
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
          owner: str = '', validator: str = '', assignment: str = '',
          receivers: Mapping[str, page_frame.SendReceiver] = NO_SEND_RECEIVERS,
@@ -1155,15 +1165,15 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
     if item.type == ReviewType.FOR_YOU or (acknowledge and not (closes or returns or later)):
         words = '<input type="hidden" name="feedback" value="">'
     elif closes or returns or later:
-        field = 'words-'+html.escape(item.key, quote=True)
+        field = 'words-'+item.key
         if item.type == ReviewType.RESPONSE:
             placeholder = 'Type your words for Ask a follow-up.'
         elif validator:
             placeholder = 'Ask the validator about this item.'
         else:
-            placeholder = 'Type your words. They go with the button that you press.'
-        words = (f'<label for="{field}">Your words</label><textarea id="{field}" name="feedback" rows="{words_rows}" '
-                 + f'placeholder="{placeholder}"></textarea>')
+            placeholder = ''
+        words = (words_field(field, 'feedback', words_rows, placeholder=placeholder) if placeholder
+                 else words_field(field, 'feedback', words_rows))
     if inline:
         groups = '<div class="review-actions">'+''.join((*closes, *returns))+later+'</div>'
     elif item.type == ReviewType.RESPONSE:
@@ -1279,6 +1289,14 @@ def review_receivers(item: ReviewItem, members: staff.StaffSnapshot, *,
     return labels
 
 
+def studio_question_receivers(item: ReviewItem, members: staff.StaffSnapshot) -> dict[str, page_frame.SendReceiver]:
+    _, row = review_actions.studio_question_row(item)
+    owner = row.owner
+    assert not isinstance(owner, the_list.UnassignedOwner)
+    receiver = change_browser.receiver_names(members, (owner,))
+    return dict.fromkeys(('answer', 'question'), receiver)
+
+
 def details(item: ReviewItem, inputs: ReviewBodyInputs, *,
             question_route: change_browser.QuestionRoute | change_browser.QuestionRouteReading =
                 change_browser.QuestionRouteReading.RESOLVE) -> str:
@@ -1375,7 +1393,8 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs, *,
     if isinstance(source, review_items.QuestionSource) and question_route is change_browser.QuestionRouteReading.RESOLVE:
         question_route = change_browser.shown_question_route(source.record, inputs.members)
     revision = record_revision(item, inputs.assets, inputs.members, question_route=question_route)
-    receivers = review_receivers(item, inputs.members, question_route=question_route)
+    receivers = (studio_question_receivers(item, inputs.members) if studio_card and studio_question_open(item)
+                 else review_receivers(item, inputs.members, question_route=question_route))
     actions = form(item, inputs.browser, inputs.words_rows, revision, owner=owner, validator=validator,
                    receivers=receivers, names=names, view=inputs.view,
                    assignment=assign_menu(item, names) if 'approve' in item.actions else '')
@@ -1520,7 +1539,9 @@ def submit_response(item: ReviewItem, outcome: str, words: str, status: change_p
 
 
 def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list[str]],
-                    status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
+                    status: change_page.DeliveryStatus, *,
+                    list_notice: Callable[[review_actions.ListFeedbackDelivery], None] | None = None
+                    ) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     key, token, outcome, words = (fields[field][0] for field in ('row', 'token', 'outcome', 'feedback'))
     if not secrets.compare_digest(token, change_browser.row_token(snapshot.browser, key)):
         raise question_record.AnswerRefused('row or page token does not match this page')
@@ -1556,8 +1577,9 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
             if outcome == 'approve' and assignee:
                 receiver = change_browser.receiver_names(members, (staff.StaffId(assignee),))
             else:
-                receiver = change_browser.action_receiver(
-                    review_receivers(current, members, question_route=question_route), outcome, words)
+                receivers = (studio_question_receivers(current, members) if studio_question_open(current)
+                             else review_receivers(current, members, question_route=question_route))
+                receiver = change_browser.action_receiver(receivers, outcome, words)
             if shown[0] != change_browser.receiver_field(receiver):
                 raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
         return current
@@ -1604,7 +1626,9 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
             if not words.strip():
                 raise question_record.AnswerRefused('enter an answer')
             action = cast(change_page.QuestionOutcome, outcome)
-            if 'review_submission' in source.record.item:
+            if studio_question_open(item) and outcome in ('answer', 'question'):
+                delivery, answer = review_actions.studio_question_action(item, source.record, outcome, words, status, route)
+            elif 'review_submission' in source.record.item:
                 delivery, answer = review_actions.sent_question_action(
                     item, source.record, route.production, action, words, status)
             else:
@@ -1613,6 +1637,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
                 delivery, answer = change_browser.submit_question(
                     question, action, words, status, save=change_browser.SelectedQuestionSave(), route=route)
             if outcome == 'question':
+                if studio_question_open(item):
+                    return delivery, 'question sent'
                 with review_items.after_store_write(item.key):
                     delivery = review_actions.track_question(delivery, key, words, status)
                 return delivery, 'question sent'
@@ -1632,6 +1658,12 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     if waiting_change(item) or (item.state == ReviewState.VALIDATING and outcome != 'question'):
         raise change_page.ChangeHandoffRefused(change_page.WITH_SHOWRUNNER)
     if outcome == 'later':
+        if list_notice is not None and studio_question_open(item):
+            notice, answer = review_actions.studio_later(
+                item, fields.get('later', [''])[0], words, verify_revision=validate)
+            if isinstance(notice, review_actions.ListFeedbackDelivery):
+                list_notice(notice)
+            return change_page.NoMessageDelivery(), answer
         return change_page.NoMessageDelivery(), review_actions.later(
             item, fields.get('later', [''])[0], words, verify_revision=validate, root=root)
     if outcome not in item.actions:

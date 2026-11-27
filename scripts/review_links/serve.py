@@ -2245,7 +2245,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, RuntimeError, change_page.Refusal) as error:
             self.browser_failure(503, "The answer could not be saved.", error)
             return
-        pending = isinstance(saved.delivery, change_page.MessageDelivery)
+        pending = saved.list_notice is not None or isinstance(saved.delivery, change_page.MessageDelivery)
         result: dict[str, object] = {'answer':saved.answer, 'version':saved.version, 'delivery_pending':pending}
         if isinstance(saved.detail, review_page.ConfirmedReviewDetail):
             result.update(detail_html=saved.detail.body, detail_revision=saved.detail.revision)
@@ -2258,9 +2258,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             state = review_items.ReviewState.DONE if review_items.on_list(saved.item) else saved.item.state
             result.update(state=state, type=saved.item.type,
                           later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
-        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
+        def deliver_saved(*, report_outcome: bool = False) -> change_page.DeliveryOutcome:
+            if saved.list_notice is not None:
+                return list_page.deliver_with_outcome(saved.list_notice)
             delivery = change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status)
-            outcome = self.deliver_review(server, delivery, report_outcome=True)
+            return self.deliver_review(server, delivery, report_outcome=report_outcome)
+
+        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
+            outcome = deliver_saved(report_outcome=True)
             result.update(held_delivery_result(outcome, not pending))
             result['delivery_pending'] = False
             if pending:
@@ -2273,7 +2278,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             try:
                 self.json_response(200, result)
             finally:
-                _ = self.deliver_review(server, change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status))
+                _ = deliver_saved()
                 if pending:
                     self.publish_review_delivery(server, key)
 

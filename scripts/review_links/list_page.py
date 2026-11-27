@@ -32,6 +32,7 @@ from scripts.review_links import change_browser, change_page, console, go_ledger
 from scripts.review_links import record_table, review_actions, review_items, review_legacy, review_link, review_page
 from scripts.review_links import search_fold, staff_names, studio_page
 from scripts.review_links import question_record
+from scripts.review_links.review_actions import ListFeedbackDelivery as ListFeedbackDelivery
 from scripts.statusline import counts_row, rebuild_row
 
 PAGE_PATH = page_frame.LIST_PAGE_PATH
@@ -781,14 +782,14 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
     if question and entry.item.state is the_list.ItemState.ANSWERED:
         owner = entry.item.owner
         receiver = html.escape(owner_name(members, owner), quote=True)
-        label = f"Your words for {receiver}"
+        field = "words-" + entry.key.replace("/", "-")
         route = None if isinstance(owner, the_list.UnassignedOwner) else routing.followup_receiver(owner)
         ask = (page_frame.send_button("Ask question", page_frame.SendTo(route.name),
                                       'name="action" value="question" disabled') if route is not None else '')
         signature = route.signature if route is not None else the_list.ListQuestionRoute.CURRENT
         return (f'<form method="post" data-feedback-form data-question-read data-read-receiver="{receiver}">'
                 + signed_form_fields(entry, secret, ask_signature=signature) + '<input type="hidden" name="until" value="">'
-                + f'<textarea name="words" rows="4" maxlength="10000" placeholder="{label}" aria-label="{label}"></textarea>'
+                + review_page.words_field(field, "words", 4, maxlength=10000)
                 + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
                 + ask + '<button name="action" value="read">Mark read</button></div></form>')
     read = ('<button name="action" value="read">Mark read</button>'
@@ -1518,13 +1519,6 @@ def detail_revision(item: the_list.ListItem, body: str) -> str:
     version = re.sub(r'(name="request" value=")[a-f0-9]{32}', r'\1', version)
     version = re.sub(r'(name="token" value=")[a-f0-9]{64}', r'\1', version)
     return hashlib.sha256(f'{item.updated}\0{item.title}\0{version}'.encode()).hexdigest()
-
-@dataclass(frozen=True)
-class ListFeedbackDelivery:
-    keeper: staff.StaffId
-    identity: str
-    request: str
-
 
 @dataclass(frozen=True)
 class ListQuestionDelivery:

@@ -2891,6 +2891,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  check(item.querySelector('[data-new-answer]'),'The answer is unread.');
  item.querySelector('.list-toggle').click();await paint();
  const form=recordDetails(item).querySelector('[data-question-read]'),words=form.elements.words;
+ check(words.labels[0]?.textContent==='Your words','The words field has a visible label.');
  const submit=form.querySelector('[value="read"]');
  const ask=form.querySelector('[value="question"]');
  check(ask.disabled && !submit.disabled,'Only Ask question needs words.');
@@ -2939,7 +2940,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                          ("Answered", "true", "false"))
         detail = saved.get("detail_html", "")
         self.assertIn('data-question="Q2"', detail)
-        self.assertIn('aria-label="Your words for sdlc"', detail)
+        self.assertIn('>Your words</label>', detail)
         self.assertIn('value="read">Mark read</button>', detail)
         self.assertNotIn('data-waiting-actions', detail)
 
