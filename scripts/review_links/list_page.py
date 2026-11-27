@@ -608,12 +608,13 @@ def state_badge(state: the_list.ItemState) -> str:
     return f'<span class="list-state {STATE_TONES.get(state, "muted")}">{html.escape(state.value)}</span>'
 
 
-def titled_item_link(entry: ListRecord, style: str) -> str:
+def titled_item_link(entry: ListRecord, *, overlay: bool = False) -> str:
     item = entry.item
     link = item_link(entry.keeper, item.number)
     if item.state is the_list.ItemState.CLOSED:
         link += "&reveal=1"
-    return (f'<a class="{style}" data-record-jump href="{html.escape(link)}">'
+    action = 'data-list-linked-card aria-haspopup="dialog"' if overlay else 'data-record-jump'
+    return (f'<a class="list-top-link" {action} href="{html.escape(link)}">'
             f'#{item.number} {html.escape(item.title)}</a>')
 
 
@@ -1234,11 +1235,13 @@ def linked_items_html(entry: ListRecord, linked_records: Mapping[tuple[Path, int
     for number in sorted(entry.item.related_to):
         linked = linked_records.get((the_list.list_folder_identity(entry.keeper), number))
         if linked is None:
-            rows.append(f'<li>#{number} not found</li>')
+            href = html.escape(item_link(entry.keeper, number))
+            rows.append(f'<li><a class="list-top-link" data-list-linked-card aria-haspopup="dialog" href="{href}">'
+                        + f'#{number} not found</a></li>')
             continue
         state = linked.item.state
         closed += int(state is the_list.ItemState.CLOSED)
-        text = titled_item_link(linked, "list-linked-title") + state_badge(state)
+        text = titled_item_link(linked, overlay=True) + state_badge(state)
         rows.append(f'<li>{text}</li>')
     return (f'<section class="item-links" data-linked-items><h3>Linked items · {closed} of {len(rows)} closed</h3><ul>'
             + ''.join(rows) + '</ul></section>') if rows else ''
@@ -2350,7 +2353,7 @@ def top_bands(top_items: Iterable[ListRecord], today: datetime, names: staff_nam
         value = f"staff:{item.producer}"
         values.append(css_string(value))
         bands.append(top_band(value, '<div class="list-top-what">'
-                              + titled_item_link(entry, "list-top-link")
+                              + titled_item_link(entry)
                               + '<div class="list-top-next">' + field_html("next_step", item.next_step, today, names)
                               + '</div></div>'
                               + '<div class="list-top-meta">' + state_badge(item.state)
@@ -2552,7 +2555,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + page_frame.CONSOLE_DIALOG_ASSETS
                + '<dialog data-list-review-dialog aria-labelledby="list-review-title">'
                + '<header class="list-review-heading"><h2 id="list-review-title"></h2>'
-               + '<button class="list-review-close" type="button" data-close autofocus>Close</button></header></dialog>'
+               + '<button class="list-review-close" type="button" data-close autofocus>Close</button></header>'
+               + '<div class="list-table" data-list-linked-overlay hidden></div></dialog>'
                + record_table.render_inline_detail()
                + SCHEDULE_TEMPLATES + '<script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, studio_page.TITLE), started, read_at)
@@ -2627,6 +2631,13 @@ padding:12px 24px;border-bottom:1px solid var(--line)}
 margin:0;font-size:17px;line-height:32px}
 .list-review-close{flex:none;margin:0;min-height:32px;padding:4px 12px;
 font-size:13px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
+[data-list-linked-overlay]{min-height:0;overflow:auto;margin:0;border:0;border-radius:0}
+[data-list-linked-overlay] [data-list-item]{margin:0}
+[data-list-linked-overlay]>[role=status]{margin:0;padding:16px 24px}
+[data-list-review-dialog]:has([data-list-linked-overlay]:not([hidden])) .list-review-heading h2{
+position:absolute;clip-path:inset(50%);width:1px;height:1px;overflow:hidden;white-space:nowrap}
+[data-list-linked-overlay]:not([hidden]){flex:0 1 auto}
+[data-list-review-dialog]:has([data-list-linked-overlay]:not([hidden])) .list-review-close{margin-inline-start:auto}
 [data-list-review-dialog] iframe{display:block;width:100%;height:var(--review-card-height,15rem);
 min-height:0;border:0}
 :root:has([data-list-review-dialog][open]){overflow:hidden}
@@ -2683,9 +2694,9 @@ scrollbar-width:thin;scrollbar-color:var(--ink-3) transparent}
 [data-linked-items]>ul{display:grid;grid-template-columns:minmax(0,1fr) max-content;column-gap:12px}
 [data-linked-items]>ul>li{display:grid;grid-column:1/-1;grid-template-columns:subgrid;align-items:start;justify-items:start;padding-inline-end:8px}
 .item-links .item-link-label{color:var(--accent);font-weight:600}
-a:is(.list-top-link,.list-linked-title){color:var(--ink);overflow-wrap:anywhere}
-:is(.item-links .item-link-label,.list-top-link,.list-linked-title){text-decoration:none}
-:is(.item-links .item-link-label,.list-top-link,.list-linked-title):is(:hover,:focus-visible){text-decoration:underline}
+a.list-top-link{color:var(--ink);overflow-wrap:anywhere}
+:is(.item-links .item-link-label,.list-top-link){text-decoration:none}
+:is(.item-links .item-link-label,.list-top-link):is(:hover,:focus-visible){text-decoration:underline}
 .item-link-field{color:var(--ink-2);margin-inline-start:8px}
 .item-link-address{display:block;color:var(--ink-3);font-size:12px;margin-top:2px}
 .list-actions{position:relative}
@@ -2873,7 +2884,7 @@ function startListSave(){
 }
 function refreshAfterListSave(needed){
  refreshNeeded ||= needed;
- if(saving) return;
+ if(saving || activeListCard) return;
  if(savedReviews.size) void refreshSavedReview();
  else if(refreshNeeded || parkExpiryOwed) void pageRefresh.refresh(true);
 }
@@ -3097,18 +3108,18 @@ function syncUnread(item,form,unread,unreadSort){
   else form.querySelector('.list-actions,.list-tell')?.prepend(button);
  }
 }
-function installListDetail(item){
+function installListDetail(item,view=tableView){
   const detail=recordDetails(item),loading=detail.querySelector('[data-list-closed-loading]');
-  if(loading){void loadClosedListDetail(item,loading);return;}
+  if(loading){void loadClosedListDetail(item,loading,view);return;}
   const form=detail.querySelector('[data-feedback-form]');
-  if(form && !form.retainDraft) bindFeedbackForm(form);
-  for(const card of detail.querySelectorAll('[data-studio-question-card]')) if(!card.dataset.loaded) void loadStudioQuestion(item,card);
-  tableView.showDraftCopy(drafts.get(item.dataset.key)?.words,form?.elements.words?.type==='textarea');
+  if(form && !form.retainDraft) bindFeedbackForm(form,view);
+  for(const card of detail.querySelectorAll('[data-studio-question-card]')) if(!card.dataset.loaded) void loadStudioQuestion(item,card,view);
+  view.showDraftCopy(drafts.get(item.dataset.key)?.words,form?.elements.words?.type==='textarea');
 }
-async function loadStudioQuestion(item,card){
+async function loadStudioQuestion(item,card,view){
  if(card.dataset.loaded==='loading') return;
- const session=tableView.openSession;
- const current=()=>tableView.openItem===item && tableView.openSession===session && card.isConnected;
+ const session=view.openSession;
+ const current=()=>view.openItem===item && view.openSession===session && card.isConnected;
  const query=new URLSearchParams({body:card.dataset.studioQuestionCard,view:'studio-inline',item:item.dataset.key});
  const notice=card.querySelector('[data-send-status]');
  card.dataset.loaded='loading';
@@ -3120,22 +3131,23 @@ async function loadStudioQuestion(item,card){
   const form=template.content.querySelector('[data-review-form]');
   if(!form) throw new Error('The item is unavailable.');
   if(!current()) return;
-  tableView.preserveRecordRowTop(()=>card.replaceChildren(template.content));
+  view.preserveRecordRowTop(()=>card.replaceChildren(template.content));
   card.dataset.loaded='ready';
-  bindStudioQuestion(item,card,form);
+  if(view!==tableView) nameOverlayFields(item);
+  bindStudioQuestion(item,card,form,view);
  }catch(error){
   if(current()) showActionFailure(notice,error.message);
  }finally{
   if(card.dataset.loaded==='loading') delete card.dataset.loaded;
  }
 }
-function bindStudioQuestion(item,card,form){
+function bindStudioQuestion(item,card,form,view){
  const showNotice=text=>showActionFailure(card.querySelector('[data-send-status]'),text);
  const send=async(data,button)=>{
-  if(tableView.openItem!==item || cardSubmitBlocked(form,tableView.rowFading(item.dataset.key))) return;
+  if(view.openItem!==item || cardSubmitBlocked(form,view.rowFading(item.dataset.key))) return;
   const action=data.get('outcome'),key=item.dataset.key;
   const draftKey=reviewFormKey(form), submittedDraft=rememberReviewDraft(form);
-  const hold=holdCard(item,hidden=>{if(hidden) tableView.applyAction();});
+  const hold=holdCard(item,hidden=>{if(hidden) view.applyAction();});
   let saved=false;
   startListSave();
   showNotice('');
@@ -3151,27 +3163,27 @@ function bindStudioQuestion(item,card,form){
    undone:message=>{showNotice(message);form.elements.feedback.focus({preventScroll:true});},
    displayFailed:()=>showNotice('Saved; the item could not refresh.'),
    recover:async reason=>{
-    await loadStudioQuestion(item,card);
+    await loadStudioQuestion(item,card,view);
     if(card.isConnected) showNotice('Not saved: '+reason);
    },
    finished:()=>{
     hold.restore();
     saving--;
-    tableView.preserveRecordRowTop(()=>{
-     if(saved && (action==='answer' || action==='later')) tableView.closeCard(key,{focusShow:true});
+    view.preserveRecordRowTop(()=>{
+     if(saved && (action==='answer' || action==='later')) view.closeCard(key,{focusShow:true});
      else if(form.isConnected){setCardSubmitting(form,false);syncControls();}
-     tableView.applyAction();
+     view.applyAction();
     });
-    if(saved && action==='question') void loadStudioQuestion(item,card);
+    if(saved && action==='question') void loadStudioQuestion(item,card,view);
     refreshAfterListSave(saved);
    },
   });
  };
  const syncControls=bindReviewForm(form,{zone:()=>content.dataset.zone,settings:()=>JSON.parse(content.dataset.parking),send});
 }
-async function loadClosedListDetail(item,loading){
- const session=tableView.openSession;
- const current=()=>tableView.openItem===item && tableView.openSession===session && recordDetails(item).contains(loading);
+async function loadClosedListDetail(item,loading,view){
+ const session=view.openSession;
+ const current=()=>view.openItem===item && view.openSession===session && recordDetails(item).contains(loading);
  const [keeper,id]=item.dataset.key.split('/');
  const query=new URLSearchParams({'item-state':id,keeper});
  loading.textContent='Loading the item…';
@@ -3181,8 +3193,8 @@ async function loadClosedListDetail(item,loading){
   const result=await response.json();
   if(!result.detail_closed || typeof result.detail_html!=='string') throw new Error('The Closed detail is unavailable.');
   if(current()){
-   tableView.updateItemDetail(item,detail=>replaceListDetail(detail,result.detail_html));
-   installListDetail(item);
+   view.updateItemDetail(item,detail=>replaceListDetail(detail,result.detail_html));
+   installListDetail(item,view);
   }
  }catch(_){
   if(current()) loading.textContent='The item could not load. Close and open it to try again.';
@@ -3193,22 +3205,22 @@ function replaceListDetail(detail,text,{retainLinkedItems=true}={}){
  detail.innerHTML=text;
  if(linked && !detail.querySelector('[data-linked-items]')) detail.querySelector('.list-item-fields')?.after(linked);
 }
-function renderListDetail(revision,text,{retainLinks=false}={}){
+function renderListDetail(revision,text,{retainLinks=false,view=tableView}={}){
  return (row,detail)=>{
   const links=retainLinks ? detail.querySelector('[data-list-review-links]') : null;
   row.dataset.detailRevision=revision;
   replaceListDetail(detail,text,{retainLinkedItems:revision.startsWith('action:')});
   if(links) detail.querySelector('[data-list-review-links]')?.replaceWith(links);
-  installListDetail(row);
+  installListDetail(row,view);
  };
 }
-function installSavedListDetail(request,revision,text,options){
- tableView.installOwnItemResult(request,revision,renderListDetail(revision,text,options));
+function installSavedListDetail(request,revision,text,options,view=tableView){
+ view.installOwnItemResult(request,revision,renderListDetail(revision,text,{...options,view}));
 }
-function presentListDetail(item,result){
+function presentListDetail(item,result,view=tableView){
  const revision=result.detail_revision,text=result.detail_html;
  if(revision && typeof text==='string')
-  tableView.presentItemRevision(item,revision,renderListDetail(revision,text,{retainLinks:true}));
+  view.presentItemRevision(item,revision,renderListDetail(revision,text,{retainLinks:true,view}));
 }
 const tableView=createRecordTable({content:()=>content,
  shows,
@@ -3320,19 +3332,6 @@ function bindListControls(){
  }
  sizeListColumns();
 }
-document.addEventListener('click',event=>{
- const link=event.target.closest('[data-linked-items] a[data-record-jump]');
- if(!link || event.defaultPrevented || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
- const place=new URLSearchParams(link.hash.slice(1));
- const key=place.get('item');
- if(!key || place.get('reveal')!=='1') return;
- // The shared item jump reads the explicit request to show a closed item.
- event.preventDefault();
- tableView.saveDeparturePlace();
- place.set('jump',key);
- history.pushState(null,'','#'+place);
- tableView.followItemLink({inheritFilters:true});
-},true);
 function listPickerSummary(zone){
  const format=new Intl.DateTimeFormat('en-US',{timeZone:zone,month:'short',day:'numeric',
   hour:'2-digit',minute:'2-digit',hourCycle:'h23',timeZoneName:'short'});
@@ -3642,12 +3641,12 @@ function bindScheduleFields(form,until,zone,draft,edit){
   showError:message=>{status.textContent=message;},
  };
 }
-function bindFeedbackForm(form){
+function bindFeedbackForm(form,view=tableView){
   let item=recordFromDetail(form);
   const key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
   const unpark=form.querySelector('[value="unpark"]'),parkedDetail=form.querySelector('[data-parked-detail]');
-  showActionFailure(notice,tableView.actionNotice(item));
+  showActionFailure(notice,view.actionNotice(item));
   const waitingForm=form.hasAttribute('data-waiting-actions');
   const zone=content.dataset.zone;
   const confirmation=()=>({state:item.dataset.state,parked:item.dataset.parked,
@@ -3671,7 +3670,7 @@ function bindFeedbackForm(form){
    if(typeof result.item_state==='string') confirmed.state=result.item_state;
    if(confirmed.state==='Closed'){
     closedKeys.add(key);
-    if(!metadataOnly) tableView.closeCard(key);
+    if(!metadataOnly) view.closeCard(key);
    }
    const unread=result.unread==='true';
    if(['true','false'].includes(result.parked))
@@ -3740,7 +3739,7 @@ function bindFeedbackForm(form){
      const field=keepDetailFocus && listOwnsFocus() && detail.contains(document.activeElement)
       ? document.activeElement : null;
      const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
-     tableView.updateItemDetail(item,detail=>replaceListDetail(detail,result.waiting_details_html));
+     view.updateItemDetail(item,detail=>replaceListDetail(detail,result.waiting_details_html));
      if(reviewLink) restoreReviewLink(reviewLink);
      else if(field?.id && field!==unpark) document.getElementById(field.id)?.focus({preventScroll:true});
      return detail.querySelector('[data-feedback-form]');
@@ -3846,8 +3845,8 @@ function bindFeedbackForm(form){
    event.preventDefault();
    const formKey=form.elements.keeper.value+'/'+form.elements.id.value;
    const current=recordFromDetail(form);
-   if(!tableView.canSubmit(form,formKey) || current!==tableView.openItem || !content.contains(current) ||
-    cardSubmitBlocked(form,tableView.rowFading(key))) return;
+   if(!view.canSubmit(form,formKey) || current!==view.openItem ||
+    cardSubmitBlocked(form,view.rowFading(key))) return;
    if(item!==current){item=current;confirmed=confirmation();}
    const submitter=event.submitter,buttonAction=submitter?.value || 'tell';
    const parkForDelivery=buttonAction==='park-until-delivered',preset=Boolean(submitter?.dataset.laterPreset);
@@ -3858,7 +3857,7 @@ function bindFeedbackForm(form){
    const scheduleWrite=['schedule','unschedule','start-now'].includes(action);
    const parkingReceipt=parks || scheduleWrite;
    const changesParking=parks || action==='unpark' || scheduleWrite;
-   const closeSavedCard=()=>tableView.closeCard(key,{focusShow:parkForDelivery});
+   const closeSavedCard=()=>view.closeCard(key,{focusShow:parkForDelivery});
    const focusUnpark=buttonAction==='unpark' && document.activeElement===unpark;
    const rejectsRepair=action==='not works';
    const usesWords=action==='tell' || action==='question' || rejectsRepair;
@@ -3877,7 +3876,7 @@ function bindFeedbackForm(form){
    const schedule=scheduleEditor?.data(action);
    if(scheduleEditor?.repeating && (changesParking || action==='remove')){
     schedule.scope=action==='start-now' ? 'this' : await scheduleEditor.scope(action,schedule);
-    if(!schedule.scope || !tableView.canSubmit(form,formKey) || !form.isConnected) return;
+    if(!schedule.scope || !view.canSubmit(form,formKey) || !form.isConnected) return;
    }
    if(action==='schedule' && !scheduleEditor.applySeriesRepeat(schedule)) return;
    const scopedRemove=action==='remove' && Boolean(schedule?.scope);
@@ -3931,7 +3930,7 @@ function bindFeedbackForm(form){
     retiredDraft=true;
     if(clearWords) persistDraft();
    };
-   const request=tableView.startItemRequest(key);
+   const request=view.startItemRequest(key);
    item.listRequest=request;
    startListSave();
    const hadFocus=asksQuestion && recordDetails(item).contains(document.activeElement);
@@ -3943,7 +3942,7 @@ function bindFeedbackForm(form){
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    const releasesLink=action==='read' || parks || scheduleWrite || action==='remove' || (action==='unpark' && heldSave);
    let restoreLink;
-   const submission=tableView.preserveRecordRowTop(()=>{
+   const submission=view.preserveRecordRowTop(()=>{
     setCardSubmitting(form,true,recordDetails(item));
     showActionFailure(notice);
     if(action==='remove' && schedule?.scope!=='this'){
@@ -3954,17 +3953,17 @@ function bindFeedbackForm(form){
     if(parks && action!=='schedule') item.dataset.parked=parkForDelivery ? deliveryParking : 'true';
     if(clearsUnread) item.dataset.unread='false';
     if(heldSave) item.dataset.undoPending='true';
-    if(releasesLink) restoreLink=tableView.releaseLink(key);
-    return tableView.startAction(item);
+    if(releasesLink) restoreLink=view.releaseLink(key);
+    return view.startAction(item);
    });
-   const hold=holdCard(item,hidden=>{if(hidden) tableView.applyAction();});
+   const hold=holdCard(item,hidden=>{if(hidden) view.applyAction();});
    const hidUnread=clearsUnread && wasVisible && item.hidden;
    const showUnparkResult=result=>{
     const unparked=result.unpark_outcome==='cleared';
     const message=unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable';
     const label='Item #'+item.dataset.number;
     const hiddenMessage=unparked ? label+' unparked.' : label+': '+message+'.';
-    tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
+    view.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
    };
    const post=async()=>{
     if(repair){
@@ -3973,7 +3972,7 @@ function bindFeedbackForm(form){
      if(outcome.error) throw new Error(outcome.error);
      repairDelivered=outcome.delivered;
      saved=true;
-     stale=!tableView.currentItemRequest(request);
+     stale=!view.currentItemRequest(request);
      if(item.listRequest!==request) return;
      if(!stale && outcome.clearDraft && draftStamp===repair.payload.stamp && words.value===repair.payload.words)
       words.value='';
@@ -3990,13 +3989,13 @@ function bindFeedbackForm(form){
      throw new Error('The save is unconfirmed.');
     }
     if(questionRead) saved=response.ok;
-    if(saved && tableView.currentItemRequest(request) && (usesWords || questionRead) &&
+    if(saved && view.currentItemRequest(request) && (usesWords || questionRead) &&
        draftStamp===stampAtSubmit && words.value===attempt.words){
      words.value='';
      retainDraft();
      persistDraft();
     }
-    stale=!tableView.currentItemRequest(request);
+    stale=!view.currentItemRequest(request);
     if(item.listRequest!==request) return;
     delete item.dataset.undoPending;
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
@@ -4015,31 +4014,31 @@ function bindFeedbackForm(form){
     saved=true;
     clearConfirmedDraft();
     if(stale){
-     if(tableView.openItem?.dataset.key===key) return;
+     if(view.openItem?.dataset.key===key) return;
      hold.restore();
-     tableView.preserveRecordRowTop(()=>{
+     view.preserveRecordRowTop(()=>{
       applySavedState(result,{metadataOnly:true});
       if(action==='unpark') showUnparkResult(result);
-      else tableView.applyAction();
+      else view.applyAction();
      });
      return;
     }
     const closes=parks || scheduleWrite || action==='remove' || result.detail_closed;
     if(closes){
      hold.restore();
-     tableView.preserveRecordRowTop(()=>{
+     view.preserveRecordRowTop(()=>{
       if((scheduleWrite || schedule?.scope) && result.detail_html && result.detail_revision)
-       presentListDetail(item,result);
+       presentListDetail(item,result,view);
       nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail:true});
       closeSavedCard();
-      tableView.applyAction();
+      view.applyAction();
       if(result.detail_unavailable)
-       tableView.showActionResult(item,submission,'Item '+item.dataset.number,
+       view.showActionResult(item,submission,'Item '+item.dataset.number,
         {kind:'failure',message:'Saved; the item could not refresh.'});
      });
      return;
     }
-    tableView.startDeliveryWindow(request,result);
+    view.startDeliveryWindow(request,result);
     let revision=result.detail_revision,text=result.detail_html ?? result.waiting_details_html;
     if(typeof text!=='string' && ('delivery_pending' in result || revision || result.detail_unavailable)){
      const response=await fetch(location.pathname,{cache:'no-store',signal:listRequestSignal()});
@@ -4050,11 +4049,11 @@ function bindFeedbackForm(form){
      revision=updated.dataset.detailRevision;
      text=recordDetails(updated).innerHTML;
     }
-    stale=!tableView.currentItemRequest(request);
+    stale=!view.currentItemRequest(request);
     if(stale) return;
     const hasDetail=typeof text==='string' && Boolean(revision);
     hold.restore();
-    tableView.preserveRecordRowTop(()=>{
+    view.preserveRecordRowTop(()=>{
      nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail});
      if(action==='unpark' && result.unpark_outcome==='cleared'){
       until.value='';
@@ -4063,7 +4062,7 @@ function bindFeedbackForm(form){
      if(hasDetail){
       if(!rejectsRepair) unconfirmed.delete(attempt);
       retainDraft();
-      installSavedListDetail(request,revision,text);
+      installSavedListDetail(request,revision,text,undefined,view);
      }
      if(action==='unpark'){
       showUnparkResult(result);
@@ -4073,18 +4072,18 @@ function bindFeedbackForm(form){
       const message=(deliveryFailed && (result.send_failure || 'The sender has not confirmed delivery.')) ||
        ('sent to '+recipient+(result.unread==='true' ? '; update remains unread' : ''));
       const kind=deliveryFailed ? 'failure' : 'success';
-      tableView.showActionResult(item,submission,'Item #'+item.dataset.number,{kind,message});
-     }else tableView.applyAction();
-     if(wasVisible && item.hidden && tableView.opened.has(key)){
+      view.showActionResult(item,submission,'Item #'+item.dataset.number,{kind,message});
+     }else view.applyAction();
+     if(wasVisible && item.hidden && view.opened.has(key)){
       const focus=document.activeElement;
       const inside=recordDetails(item).contains(focus);
       focusParkedAfterClose=focusUnpark && (inside || focus===document.body);
-      tableView.closeCard(key);tableView.applyAction();
+      view.closeCard(key);view.applyAction();
       if(hadFocus && listOwnsFocus() && (inside || focus===document.body)) focusAfterQuestion(item);
      }
     });
    }catch(error){
-    stale=!tableView.currentItemRequest(request);
+    stale=!view.currentItemRequest(request);
     if(item.listRequest!==request) return;
     delete item.dataset.undoPending;
     // An undone send saved nothing, so the item returns to its state before Send and keeps the words.
@@ -4094,14 +4093,14 @@ function bindFeedbackForm(form){
     if(saved){
      clearConfirmedDraft();
      if(stale) return;
-     if(hold.restore()) tableView.applyAction();
-     tableView.preserveRecordRowTop(()=>{
+     if(hold.restore()) view.applyAction();
+     view.preserveRecordRowTop(()=>{
       if(parkingReceipt || action==='remove'){
        if(action==='remove' && schedule?.scope!=='this') closedKeys.add(key);
        closeSavedCard();
-       tableView.showActionResult(item,submission,'Item '+item.dataset.number,
+       view.showActionResult(item,submission,'Item '+item.dataset.number,
         {kind:'failure',message:'Saved; the item could not refresh.'});
-      }else tableView.savedItemError(request);
+      }else view.savedItemError(request);
      });
      return;
     }
@@ -4115,13 +4114,13 @@ function bindFeedbackForm(form){
       if(!response.ok) throw new Error('HTTP '+response.status);
       current=await response.json();
      }catch(_){}
-     stale=!tableView.currentItemRequest(request);
+     stale=!view.currentItemRequest(request);
      if(item.listRequest!==request) return;
      // A failed read back after a retry does not show that the server refused the park.
      if(retried && !current) refused=false;
     }
     hold.restore();
-    tableView.preserveRecordRowTop(()=>{
+    view.preserveRecordRowTop(()=>{
      let restore=refused || releasesLink,confirmedByReadback=false;
      if(parkingReceipt || action==='remove'){
       if(current){
@@ -4134,10 +4133,10 @@ function bindFeedbackForm(form){
         if(action!=='remove' || receipt===true) clearConfirmedDraft();
        }
        if(!stale){
-        presentListDetail(item,current);
+        presentListDetail(item,current,view);
         if(confirmedByReadback) closeSavedCard();
        }
-       if(confirmedByReadback) tableView.applyAction();
+       if(confirmedByReadback) view.applyAction();
       }else{
        syncConfirmed(stale);
        restore=confirmed.state!=='Closed';
@@ -4145,26 +4144,26 @@ function bindFeedbackForm(form){
      }else if(clearsUnread) item.dataset.unread=unreadBefore;
      if(restore) restoreLink?.();
      if(!confirmedByReadback){
-      if(!stale && (refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
+      if(!stale && (refused || hidUnread) && !view.opened.size) view.openCard(key);
       const prefix=refused ? 'Not saved: ' : repairRequests.get(key)?.accepted && rejectsRepair
        ? 'Delivery not confirmed: ' : 'Save not confirmed: ';
       const message=undone ? error.message : prefix+error.message;
-      tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:undone ? 'undone' : 'failure',message});
+      view.showActionResult(item,submission,'Item '+item.dataset.number,{kind:undone ? 'undone' : 'failure',message});
      }
      // The return animation uses the confirmed sort keys.
-     if(!saved && refused && wasHidden && !item.hidden) tableView.applyAction();
+     if(!saved && refused && wasHidden && !item.hidden) view.applyAction();
     });
    }
    finally{
-    if(hold.restore()) tableView.applyAction();
+    if(hold.restore()) view.applyAction();
     if(!rejectsRepair && (saved || refused)) unconfirmed.delete(attempt);
-    tableView.preserveRecordRowTop(()=>{
+    view.preserveRecordRowTop(()=>{
      setCardSubmitting(form,false,stale ? form : recordDetails(item));syncTell();
      if(!stale) retainDraft();
      if(nextForm && !stale){
-      bindFeedbackForm(nextForm);
-      if(tableView.currentItemRequest(request))
-       tableView.showDraftCopy(drafts.get(key)?.words,nextForm.elements.words?.type==='textarea');
+      bindFeedbackForm(nextForm,view);
+      if(view.currentItemRequest(request))
+       view.showDraftCopy(drafts.get(key)?.words,nextForm.elements.words?.type==='textarea');
      }
     });
     if(!stale && focusUnpark && listOwnsFocus() &&
@@ -4184,18 +4183,18 @@ function bindFeedbackForm(form){
      }
     }
     if(!stale && !saved && parks){
-     await tableView.settled();
+     await view.settled();
      if(listOwnsFocus() && document.activeElement===document.body && parkToggle.getClientRects().length && !parkToggle.disabled){
       parkToggle.focus({preventScroll:true});
      }
     }
-    if(focusDraft && tableView.currentItemRequest(request)){
-     await tableView.rowSettled(item);
-     if(tableView.currentItemRequest(request))
+    if(focusDraft && view.currentItemRequest(request)){
+     await view.rowSettled(item);
+     if(view.currentItemRequest(request))
       recordDetails(item).querySelector('textarea[name="words"]')?.focus();
     }
     if(!stale && hadFocus && !item.hidden && document.activeElement===document.body)
-     await tableView.rowSettled(item);
+     await view.rowSettled(item);
     saving--;
     if(hadFocus){
      document.removeEventListener('focusin',trackFocus);
@@ -4207,7 +4206,7 @@ function bindFeedbackForm(form){
       }
      }
     }
-    refreshAfterListSave(stale || Boolean(tableView.deliveryRequest()) ||
+    refreshAfterListSave(stale || Boolean(view.deliveryRequest()) ||
       (saved && (changesParking || action==='remove' || action==='top' || item.dataset.waitingForAnswer!=='true')) ||
       (!saved && (refused && asksQuestion || !refused && (parkingReceipt || action==='remove'))));
    }
@@ -4216,7 +4215,9 @@ function bindFeedbackForm(form){
 // A Go form sends nate's Go or Approved for one ask; the server closes the ask.
 document.addEventListener('submit',async event=>{
  const form=event.target instanceof Element ? event.target.closest('form[data-go-form]') : null;
- if(!form || !content.contains(form)) return;
+ if(!form) return;
+ const view=listOverlay.contains(form) ? activeListCard?.view : tableView;
+ if(!view || (view===tableView && !content.contains(form))) return;
  event.preventDefault();
  const item=recordFromDetail(form),box=form.closest('[data-ask]'),button=form.querySelector('button');
  if(button.disabled) return;
@@ -4224,21 +4225,21 @@ document.addEventListener('submit',async event=>{
  const data=new URLSearchParams(new FormData(form));data.set('page',location.href);
  button.disabled=true;
  startListSave();
- const submission=tableView.startAction(item);
+ const submission=view.startAction(item);
  let saved=false;
  try{
   const response=await fetch(form.action,{method:'POST',body:data});
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
   saved=true;
-  tableView.preserveRecordRowTop(()=>{
+  view.preserveRecordRowTop(()=>{
    const asks=box.parentElement;
    box.remove();
    if(!asks.children.length) asks.remove();
    // The row's feedback form applies the saved state, so a Go that sets Working moves the row as Mark read does.
-   recordDetails(item).querySelector('[data-feedback-form]').applySavedState(result);
-   tableView.applyAction();
-   if(item.hidden && tableView.opened.has(key)){tableView.closeCard(key);tableView.applyAction();}
+   recordDetails(item).querySelector('[data-feedback-form]')?.applySavedState?.(result);
+   view.applyAction();
+   if(item.hidden && view.opened.has(key)){view.closeCard(key);view.applyAction();}
   });
   if(hadFocus && listOwnsFocus()){
    if(item.hidden) focusAfterQuestion(item);
@@ -4246,7 +4247,7 @@ document.addEventListener('submit',async event=>{
   }
  }catch(error){
   button.disabled=false;
-  tableView.showActionResult(item,submission,'Item '+item.dataset.number,
+  view.showActionResult(item,submission,'Item '+item.dataset.number,
    {kind:'failure',message:'Not sent: '+(error instanceof Error ? error.message : String(error))});
  }finally{
   saving--;
@@ -4328,6 +4329,7 @@ function keepRowBelowHeader(update){
  },{topInset:stuckPageActionsBottom});
 }
 async function refresh(_supersede=false,current=()=>true){
+ if(activeListCard) return;
  if(!_supersede && document.activeElement?.closest('[data-studio-question-card]')) return;
  if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh()) return;
  const signal=listRequestSignal();
@@ -4342,7 +4344,7 @@ async function refresh(_supersede=false,current=()=>true){
  const facts=pageRefreshFacts(page);
  decodeListKeys(fresh);
  await tableView.settled();
- if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh() || !current()) return;
+ if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh() || activeListCard || !current()) return;
  refreshNeeded=false;
  keepRowBelowHeader(()=>applyListSnapshot(fresh));
  reviewRefreshError.textContent='';
@@ -4356,8 +4358,8 @@ function applyListSnapshot(fresh){
  const field=listOwnsFocus() && content.contains(document.activeElement) ? document.activeElement : null;
  const focus=field?.id,start=field?.selectionStart,end=field?.selectionEnd;
  const direction=field?.selectionDirection;
- const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
- const topLink=field?.matches('.list-top-link') ? field.getAttribute('href') : null;
+ const reviewLink=field?.matches('[data-list-review-card],[data-list-linked-card]') ? reviewLinkPlace(field) : null;
+ const topLink=field?.matches('[data-top-band] .list-top-link') ? field.getAttribute('href') : null;
  const action=field?.matches('button[name="action"]') ? field.value : '';
  const copyCommand=field?.matches('.list-command [data-copy-code]');
  const focusedRow=action || copyCommand || field?.matches('.list-toggle') ? recordFromDetail(field) : null;
@@ -4412,6 +4414,7 @@ function applyListSnapshot(fresh){
  void loadListCounts();
 }
 const reviewDialog=document.querySelector('[data-list-review-dialog]');
+const listOverlay=reviewDialog.querySelector('[data-list-linked-overlay]');
 const reviewTitle=reviewDialog.querySelector('#list-review-title'),reviewClose=reviewDialog.querySelector('[data-close]');
 const reviewPagePath=''' + json.dumps(review_page.PAGE_PATH) + r''';
 // The Studio source serves the card even after the answer moves to the List.
@@ -4419,7 +4422,7 @@ const studioCardSource=''' + json.dumps(review_page.ReviewBodyView.STUDIO_QUESTI
 const reviewMotion=createCardMotion(()=>content);
 const listHost=window.frameElement?.matches('iframe[data-console-page="list"],iframe[data-console-page="studio"]')
  ? window.frameElement : null;
-let activeReview,refreshingReview=false;
+let activeReview,activeListCard,refreshingReview=false;
 const savedReviews=new Set(),returnedReviews=[];
 const reviewRefreshError=document.querySelector('[data-review-refresh-error]');
 function fitReviewDialog(){
@@ -4499,7 +4502,7 @@ function hideReviewCard(card){
  }
 }
 function reopenReturnedReview(){
- if(!activeReview && returnedReviews.length) showReviewCard(returnedReviews.shift());
+ if(!activeReview && !activeListCard && returnedReviews.length) showReviewCard(returnedReviews.shift());
 }
 function closeReviewCard(){
  const card=activeReview;
@@ -4536,7 +4539,133 @@ if(listHost) new MutationObserver(()=>{
  if(!form?.elements.feedback?.value && !form?.elements.later?.value && !doc?.querySelector('[data-review-draft]'))
   closeReviewCard();
 }).observe(listHost,{attributes:true,attributeFilter:['hidden']});
-bindConsoleDialog(reviewDialog,closeReviewCard);
+bindConsoleDialog(reviewDialog,()=>{
+ if(activeListCard) closeListCard();
+ else closeReviewCard();
+});
+reviewDialog.addEventListener('keydown',event=>{
+ if(activeListCard && event.key==='Escape'){
+  event.preventDefault();
+  closeListCard();
+ }
+},true);
+
+function closeListCard({resume=true}={}){
+ const card=activeListCard;
+ if(!card) return;
+ activeListCard=null;
+ reviewDialog.close();
+ card.restoreHost();
+ listOverlay.hidden=true;
+ listOverlay.replaceChildren();
+ scrollTo({top:card.scrollTop,behavior:'instant'});
+ restoreReviewLink(card.link);
+ if(resume){
+  reopenReturnedReview();
+  refreshAfterListSave(false);
+ }
+}
+
+function listOverlayView(item){
+ let request;
+ const current=()=>activeListCard?.item===item;
+ const notice=message=>showActionFailure(recordDetails(item).querySelector('[data-send-status]'),message);
+ const update=change=>{
+  change(item,recordDetails(item));
+  nameOverlayFields(item);
+ };
+ return {
+  get openItem(){return current() ? item : null;},
+  openSession:item,
+  opened:new Set([item.dataset.key]),
+  canSubmit:(form,key)=>current() && key===item.dataset.key && recordDetails(item).contains(form),
+  rowFading:()=>false,
+  actionNotice:()=>'',
+  preserveRecordRowTop:change=>change(),
+  updateItemDetail:(_item,change)=>update((_row,detail)=>change(detail)),
+  presentItemRevision:(_item,_revision,render)=>{if(current()) update(render);},
+  installOwnItemResult:(saved,_revision,render)=>{if(current() && request===saved) update(render);},
+  startItemRequest:key=>(request={key}),
+  currentItemRequest:saved=>current() && request===saved,
+  startAction:()=>notice(''),
+  showActionResult:(_item,_submission,_label,result)=>{if(current()) notice(result.message);},
+  savedItemError:()=>notice('Saved; the item could not refresh.'),
+  closeCard:()=>{if(current()) closeListCard();},
+  applyAction:()=>{},
+  releaseLink:()=>{},
+  openCard:()=>{},
+  startDeliveryWindow:()=>{},
+  deliveryRequest:()=>null,
+  settled:()=>Promise.resolve(),
+  rowSettled:()=>Promise.resolve(),
+  showDraftCopy:()=>{},
+ };
+}
+
+function nameOverlayFields(item){
+ const ids=new Map();
+ for(const field of item.querySelectorAll('[id]')){
+  if(field.id.startsWith('linked-overlay-')) continue;
+  const id='linked-overlay-'+field.id;
+  ids.set(field.id,id);field.id=id;
+ }
+ for(const field of item.querySelectorAll('[for],[list],[aria-controls],[aria-describedby],[aria-labelledby]')){
+  for(const attr of ['for','list','aria-controls','aria-describedby','aria-labelledby']){
+   const value=field.getAttribute(attr);
+   if(value) field.setAttribute(attr,value.split(' ').map(id=>ids.get(id) ?? id).join(' '));
+  }
+ }
+}
+
+function showListCard(link,key){
+ const source=rowIn(content,key);
+ if(!activeListCard){
+  if(activeReview) return;
+  pageRefresh.abandon();
+  activeListCard={link:reviewLinkPlace(link),scrollTop:scrollY,restoreHost:fitReviewDialog()};
+ }
+ const card=activeListCard;
+ listOverlay.hidden=false;
+ listOverlay.replaceChildren();
+ listOverlay.scrollTop=0;
+ card.item=null;
+ card.view=null;
+ reviewTitle.textContent=link.textContent;
+ if(source){
+  const item=source.cloneNode(true),detail=recordDetails(item);
+  if(source.openDetails) detail.replaceChildren(...[...source.openDetails.childNodes].map(node=>node.cloneNode(true)));
+  const fallback=detail.querySelector('[data-studio-question-card]');
+  if(fallback?.dataset.loaded==='loading') delete fallback.dataset.loaded;
+  item.hidden=false;
+  nameOverlayFields(item);
+  item.querySelector('[data-detail]').hidden=false;
+  item.querySelector('.list-row').classList.add('open');
+  const toggle=item.querySelector('.list-toggle');
+  toggle.setAttribute('aria-expanded','true');
+  toggle.setAttribute('aria-label','Hide item '+item.dataset.number);
+  toggle.addEventListener('click',()=>closeListCard());
+  const table=document.createElement('table');
+  table.setAttribute('aria-label',link.textContent);
+  table.append(source.closest('table').querySelector('colgroup').cloneNode(true),item);
+  for(const name of ['--list-owner-width','--list-next-step-width','--list-log-max-height'])
+   listOverlay.style.setProperty(name,content.style.getPropertyValue(name));
+  listOverlay.append(table);
+  card.item=item;
+  card.view=listOverlayView(item);
+  installListDetail(item,card.view);
+  const question=fallback?.querySelector('[data-review-form]');
+  if(fallback?.dataset.loaded==='ready' && question) bindStudioQuestion(item,fallback,question,card.view);
+ }else{
+  const notice=document.createElement('p');
+  notice.role='status';
+  const number=key.match(/\/L([1-9]\d*)$/)?.[1];
+  notice.textContent=number ? 'Item #'+number+' is not on the List' : 'The List item is unavailable.';
+  listOverlay.append(notice);
+ }
+ reviewClose.disabled=false;
+ if(!reviewDialog.open) reviewDialog.showModal();
+ reviewClose.focus({preventScroll:true});
+}
 function studioReviewCard(link,row){
  const marked=link.hasAttribute('data-list-review-card');
  if((!marked && !row.dataset.listReviewKeys) || !URL.canParse(link.href)) return;
@@ -4560,16 +4689,23 @@ document.addEventListener('click',event=>{
  if(!link || event.defaultPrevented || event.button!==0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
  const row=recordFromDetail(link);
  if(!row) return;
+ if(link.hasAttribute('data-list-linked-card')){
+  const key=new URLSearchParams(link.hash.slice(1)).get('item');
+  if(key){event.preventDefault();showListCard(link,key);}
+  return;
+ }
  const href=studioReviewCard(link,row);
  if(!href) return;
  event.preventDefault();
  if(activeReview || [...reviewDialog.querySelectorAll('iframe[data-saving]')].some(frame=>frame.src===href)) return;
+ const listCard=activeListCard;
+ if(listCard) closeListCard({resume:false});
  const frame=document.createElement('iframe');
  frame.title='Review card';
  frame.src=href;
- const card={frame,link:reviewLinkPlace(link),
+ const card={frame,link:listCard?.link ?? reviewLinkPlace(link),
   title:'Item '+row.dataset.number+' · '+row.querySelector('[data-label="Item"] strong').textContent};
- if(!recordIsOpen(row)){
+ if(!listCard && !recordIsOpen(row)){
   const top=row.getBoundingClientRect().top;
   tableView.openCard(row.dataset.key);tableView.apply();
   scrollBy({top:row.getBoundingClientRect().top-top,behavior:'instant'});

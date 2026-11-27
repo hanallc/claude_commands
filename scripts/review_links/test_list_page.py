@@ -1518,7 +1518,7 @@ if(example.filterOn){
         self.assertEqual(markup.count(' data-linked-items>'), 1)
         panel = markup.split('data-number="494"', 1)[1].split('</tbody>', 1)[0]
         section = panel.split('<section class="item-links" data-linked-items>', 1)[1].split('</section>', 1)[0]
-        parsed = ElementTree.fromstring('<section>' + section.replace(' data-record-jump ', ' data-record-jump="" ')
+        parsed = ElementTree.fromstring('<section>' + section.replace(' data-list-linked-card ', ' data-list-linked-card="" ')
                                         + '</section>')
         self.assertEqual(parsed.findtext('h3'), 'Linked items · 1 of 6 closed')
         rows = parsed.findall('ul/li')
@@ -1527,13 +1527,13 @@ if(example.filterOn){
             ('#414 Check the dependency', 'Blocked'), ('#464 Ask for a decision', 'Waiting for nate'),
             ('#467 Publish the result', 'Delivered'),
         ])
-        self.assertIsNone(rows[1].find('a'))
         anchors = parsed.findall('ul/li/a')
-        numbers = (210, 413, 414, 464, 467)
+        self.assertTrue(all(anchor.attrib.get('aria-haspopup') == 'dialog' for anchor in anchors))
+        numbers = (210, 406, 413, 414, 464, 467)
         self.assertEqual([anchor.attrib['href'] for anchor in anchors], [
             list_page.item_link(MORTY.id, number) + ('&reveal=1' if number == 210 else '') for number in numbers
         ])
-        for number, badge in zip(numbers, parsed.findall('ul/li/span'), strict=True):
+        for number, badge in zip((210, 413, 414, 464, 467), parsed.findall('ul/li/span'), strict=True):
             row = markup.split(f'data-number="{number}"', 1)[1].split('</tr>', 1)[0]
             self.assertIn(ElementTree.tostring(badge, encoding='unicode'), row)
 
@@ -1576,16 +1576,13 @@ if(example.filterOn){
  const [real,alias,distinct]=KEEPERS;
  const item=(keeper,number)=>document.querySelector('[data-key="'+keeper+'/L'+number+'"]');
  const target=number=>item(alias,number);
- const clickLink=(keeper,number,reveal=false)=>{
-  const link=document.createElement('a');
-  link.dataset.recordJump='';
-  link.href='#item='+encodeURIComponent(keeper+'/L'+number)+(reveal ? '&reveal=1' : '');
-  const group=document.createElement('div');
-  group.dataset.linkedItems='';
-  group.append(link);
-  document.querySelector('[data-list]').append(group);
+ const dialog=document.querySelector('[data-list-review-dialog]');
+ const opened=()=>dialog.querySelector('[data-list-item]');
+ const clickLink=(keeper,number)=>{
+  const link=[...recordDetails(target(4)).querySelectorAll('[data-list-linked-card]')]
+   .find(link=>link.textContent.startsWith('#'+number+' '));
+  link.href='#item='+encodeURIComponent(keeper+'/L'+number);
   link.click();
-  group.remove();
  };
  check(recordIsOpen(item(real,4)),'The item is open before the alias becomes the displayed key.');
  refreshMarkup=FRESH;
@@ -1593,20 +1590,23 @@ if(example.filterOn){
  await flush();await flush();
  check(recordIsOpen(target(4)),'Refresh keeps the open item when its displayed keeper changes.');
  clickLink(real,1);
- check(recordIsOpen(target(1)) && !recordIsOpen(item(distinct,1)),'The saved alias opens only its physical row.');
+ check(opened()?.dataset.key===target(1).dataset.key && !recordIsOpen(item(distinct,1)),
+  'The saved alias opens only its physical row.');
+ dialog.querySelector('[data-close]').click();
  show('working');
  check(target(2).hidden,'The Working filter hides the target.');
- clickLink(alias,2);
- check(recordIsOpen(target(2)) && !target(2).hidden,'The displayed alias opens its filtered target.');
- show('working');
- check(target(2).hidden,'The Working filter hides the target.');
- clickLink(real,2);
- check(recordIsOpen(target(2)) && !target(2).hidden,'The saved alias opens its filtered target.');
+ for(const keeper of [real,alias]){
+  clickLink(keeper,2);
+  check(opened()?.dataset.key===target(2).dataset.key && target(2).hidden,'The alias opens the filtered target.');
+  dialog.querySelector('[data-close]').click();
+ }
  itemSnapshots.set(target(3).dataset.key,CLOSED);
  for(const keeper of [real,alias]){
-  clickLink(keeper,3,true);
+  clickLink(keeper,3);
   await flush();
-  check(recordIsOpen(target(3)) && !target(3).hidden,'The closed link opens through '+keeper+'.');
+  check(opened()?.dataset.key===target(3).dataset.key && recordDetails(opened()).textContent.includes('The check passed.'),
+   'The closed link opens through '+keeper+'.');
+  dialog.querySelector('[data-close]').click();
  }
 '''
         steps = (steps.replace("KEEPERS", json.dumps([MORTY.id, alias, distinct]))
@@ -1623,28 +1623,24 @@ if(example.filterOn){
         umbrella = self.add("The workflow is consistent and simple", number=494)
         _ = the_list.update(MORTY.id, umbrella.id, {"related_to": (open_item.number, closed.number, waiting.number)},
                             source="morty")
+        _ = the_list.make_top_priority(MORTY.id, umbrella.id)
         root = self.root / "reviews"
         initial = list_page.render(root, include_counts=False).decode()
         _ = the_list.close(MORTY.id, closed.id, "The check passed.", source="morty")
         fresh = list_page.render(root, include_counts=False).decode()
-        closed_detail = list_page.saved_action_state(MORTY.id, closed.id, include_detail=True)
         steps = r'''
  const item=number=>document.querySelector('[data-number="'+number+'"]');
  const links=()=>recordDetails(item(494)).querySelector('[data-linked-items]');
  const states=()=>[...links().querySelectorAll('.list-state')].map(badge=>badge.textContent).join(',');
  const heading=()=>links().querySelector('h3').textContent;
- const back=async()=>{
-  const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-  history.back();await changed;
- };
  check(states()==='Working,Working,Waiting for nate','The section shows the states from the first page.');
  check(heading()==='Linked items · 0 of 3 closed','The heading counts all links and no Closed items.');
  const [longTitle,shortTitle]=links().querySelectorAll('a');
  check(longTitle.offsetHeight>shortTitle.offsetHeight,'The long title wraps.');
  const titleStyle=getComputedStyle(longTitle);
- const rowStyle=getComputedStyle(item(494).querySelector('.list-row [data-label="Item"] strong'));
- check(titleStyle.color===rowStyle.color && titleStyle.fontWeight==='400' && titleStyle.textDecorationLine==='none',
-  'The link uses the row text color and regular weight without an underline at rest.');
+ const topStyle=getComputedStyle(document.querySelector('[data-top-band] .list-top-link'));
+ check(['color','fontSize','fontWeight','textDecorationLine'].every(field=>titleStyle[field]===topStyle[field]),
+  'The linked item uses the same style as the Top priority link.');
  refreshMarkup=FRESH_PAGE;
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await flush();
@@ -1657,26 +1653,14 @@ if(example.filterOn){
  check(badges.every(badge=>sectionRight-badge.right>=8),'Each badge has at least 8 px to the section edge.');
  check([...links().querySelectorAll('li')].every(row=>row.getBoundingClientRect().right===sectionRight),
   'The row dividers reach the section edge.');
- const count=document.querySelector('[data-list-count]').textContent;
- itemSnapshots.set(item(210).dataset.key,CLOSED_DETAIL);
- links().querySelectorAll('a')[0].click();
- const closed=item(210);
- check(recordIsOpen(closed) && !closed.hidden && closed.closest('[data-linked-item]'),
-  'The closed item link opens its detail outside the results.');
- await flush();
- check(!recordDetails(closed).querySelector('form') &&
-  recordDetails(closed).textContent.includes('The check passed.'),'The closed detail shows the log and no actions.');
- check(document.querySelector('[data-list-count]').textContent===count,'The closed item does not change the counts.');
- await back();
- check(recordIsOpen(item(494)) && closed.hidden,'Back restores the umbrella and hides the closed item.');
- links().querySelectorAll('a')[1].click();
- const target=item(OPEN_NUMBER);
- check(recordIsOpen(target) && !target.hidden && !recordIsOpen(item(494)) &&
-  new URLSearchParams(location.hash.slice(1)).get('item')===target.dataset.key,'The open item link opens its item.');
+ const openLink=links().querySelectorAll('a')[1];
+ openLink.click();
+ const dialog=document.querySelector('[data-list-review-dialog]');
+ check(dialog.open && dialog.querySelector('[data-list-item]').dataset.number==='413',
+  'The refreshed link opens its item in the overlay.');
+ check(recordIsOpen(item(494)) && !recordIsOpen(item(413)),'The original row remains open.');
 '''
-        steps = (steps.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
-                 .replace('CLOSED_DETAIL', json.dumps(closed_detail).replace('</', '<\\/'))
-                 .replace('OPEN_NUMBER', str(open_item.number)))
+        steps = steps.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
         for width in (1440, 390):
             with self.subTest(width=width):
                 self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial,
@@ -1745,16 +1729,107 @@ if(example.filterOn){
   !recordDetails(leaf).querySelector('.list-log'),'The snapshot keeps the Closed summaries without either log.');
  recordDetails(row).querySelector('[data-linked-items] a').click();
  await flush();
- const middleDetail=recordDetails(middle),link=middleDetail.querySelector('[data-linked-items] a');
+ const dialog=document.querySelector('[data-list-review-dialog]');
+ const opened=()=>dialog.querySelector('[data-list-item]');
+ const middleDetail=recordDetails(opened()),link=middleDetail.querySelector('[data-linked-items] a');
  check(closedReads.join()==='L2' && middleDetail.textContent.includes('The middle log is complete.') &&
   !middleDetail.querySelector('form'),'Opening the middle item reads only its read-only detail.');
  check(link?.textContent==='#1 Check the last result' &&
   link.nextElementSibling?.textContent==='Closed','The middle item shows the Closed target and its title.');
  link.click();await flush();
- check(recordIsOpen(leaf) && !leaf.hidden && recordDetails(leaf).textContent.includes('The leaf log is complete.') &&
-  !recordDetails(leaf).querySelector('form') && closedReads.join()==='L2,L1','The target opens and reads its own log.');
+ check(opened().dataset.number==='1' && recordDetails(opened()).textContent.includes('The leaf log is complete.') &&
+  !recordDetails(opened()).querySelector('form') && closedReads.join()==='L2,L1','The target replaces the overlay item.');
+ check(recordIsOpen(row) && leaf.hidden && middle.hidden,'The Studio keeps the original row open.');
 '''.replace('CLOSED_BODIES', json.dumps(bodies).replace('</', '<\\/'))
         self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=markup, open_number=3)
+
+    def linked_overlay_fixture(self) -> list_page.ListRecord:
+        leaf = self.add("Publish the last result", number=1)
+        middle = self.add("Check the middle result", number=2)
+        for number in range(3, 18):
+            _ = self.add(f"Studio result {number}", number=number)
+        source = self.add("Studio result with two checks", number=18)
+        missing = self.add("An item to remove from the fixture", number=99)
+        _ = the_list.update(MORTY.id, middle.id, {"related_to": (leaf.number, missing.number)}, source="morty")
+        (the_list.folder(MORTY.id) / f"{missing.id}.md").unlink()
+        source = the_list.update(MORTY.id, source.id, {"related_to": (middle.number,)}, source="morty")
+        return list_page.ListRecord(MORTY.id, source)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_linked_overlay_replaces_the_item_and_escape_restores_focus(self) -> None:
+        source = self.linked_overlay_fixture()
+        with self.studio_review_server() as origin:
+            self.open_studio_review_fixture(origin, "#" + urlencode({"show": "working", "q": "Studio result", "item": source.key}))
+            self.studio_review_check(r"""
+ const original=row(18),search=document.querySelector('#list-search');
+ await until(()=>recordIsOpen(original));
+ const link=recordDetails(original).querySelector('[data-list-linked-card]');
+ link.scrollIntoView({block:'center',behavior:'instant'});
+ await paint();
+ const place=location.href,top=scrollY,historySize=history.length,searchWords=search.value;
+ const show=document.querySelector('[data-filter-row="show"] [aria-pressed="true"]');
+ const openingForm=recordDetails(original).querySelector('[data-feedback-form]');
+ const fetchPage=window.fetch;
+ let reads=0;
+ window.fetch=(...args)=>{reads++;return fetchPage(...args);};
+ link.focus({preventScroll:true});link.click();
+ const opened=()=>dialog.querySelector('[data-list-item]');
+ check(dialog.open && opened()?.dataset.number==='2','The link opens the item in the shared window.');
+ check(reads===0 && row(2).hidden && !recordIsOpen(row(2)),'The overlay uses the snapshot outside the filter.');
+ check(recordDetails(opened()).querySelector('[data-feedback-form]').elements.id.value==='L2',
+  'The overlay has the same action form as the row.');
+ recordDetails(opened()).querySelector('[data-list-linked-card]').click();
+ check(document.querySelectorAll('dialog[open]').length===1 && opened()?.dataset.number==='1',
+  'The second link replaces the item in the same window.');
+ check(reads===0,'Neither open item needs another request.');
+ dialog.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+ check(!dialog.open && !opened(),'Escape closes the window without a back step.');
+ check(document.activeElement===link && recordIsOpen(original),'Escape returns focus to the first link.');
+ check(location.href===place && history.length===historySize,'The URL and history stay the same.');
+ check(top>0 && scrollY===top && search.value===searchWords && searchWords==='Studio result' &&
+  show.getAttribute('aria-pressed')==='true','Scroll and filters stay the same.');
+ check(openingForm.isConnected,'The original form stays in place.');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_linked_overlay_close_handles_missing_item_and_returns_focus(self) -> None:
+        _ = self.linked_overlay_fixture()
+        with self.studio_review_server() as origin:
+            self.open_studio_review_fixture(origin)
+            self.studio_review_check(r"""
+ row(18).querySelector('.list-toggle').click();
+ const link=recordDetails(row(18)).querySelector('[data-list-linked-card]');
+ link.click();
+ dialog.querySelector('[data-list-linked-card]:last-of-type[href$="L99"]').click();
+ check(dialog.open && dialog.querySelector('[data-list-linked-overlay] [role="status"]')?.textContent===
+  'Item #99 is not on the List','An unavailable item shows the normal notice.');
+ close();
+ check(!dialog.open && document.activeElement===link && recordIsOpen(row(18)),
+  'Close restores the original link and leaves its row open.');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_linked_overlay_submits_the_target_form(self) -> None:
+        target = self.add("Check the linked result", number=1)
+        source = self.add("Read the first result", number=2)
+        _ = the_list.update(MORTY.id, source.id, {"related_to": (target.number,)}, source="morty")
+        self.browser_action_sequence(r"""
+ const original=recordDetails(row).querySelector('[data-feedback-form]');
+ recordDetails(row).querySelector('[data-list-linked-card]').click();
+ const dialog=document.querySelector('[data-list-review-dialog]');
+ const item=dialog.querySelector('[data-list-item]');
+ const target=recordDetails(item).querySelector('[data-feedback-form]');
+ target.elements.words.value='The linked result is ready.';
+ target.elements.words.dispatchEvent(new Event('input'));
+ target.querySelector('[value="tell"]').click();
+ const request=requests.at(-1);
+ check(request?.get('id')==='L1' && request?.get('words')==='The linked result is ready.',
+  'The overlay sends the linked item and its words.');
+ finishPost({item_state:'Working',unread:'false'});
+ await flush();
+ check(dialog.open && recordIsOpen(row) && original.elements.words.value==='',
+  'Saving the linked item keeps the original form and row in place.');
+""", add_item=False, reduced_motion=True, open_number=2)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_tab_filters_the_rows_to_its_producer(self) -> None:
@@ -3263,9 +3338,11 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         for index, entry in enumerate(records):
             if entry.item.id == source.id:
                 dependencies = (*entry.item.blocked_by, the_list.ItemDependency(29, "Check the closed blocker."),
-                                the_list.ItemDependency(99, "Check the missing blocker."))
+                                the_list.ItemDependency(99, "Check the missing blocker."),
+                                the_list.ItemDependency(2, "Check item 2."),
+                                the_list.ItemDependency(31, "Check item 31."))
                 records[index] = list_page.ListRecord(entry.keeper, replace(
-                    entry.item, related_to=(2, 31), blocked_by=dependencies, unread_since=NOW))
+                    entry.item, blocked_by=dependencies, unread_since=NOW))
             elif entry.item.id == "L30":
                 records[index] = list_page.ListRecord(entry.keeper, replace(entry.item, unread_since=NOW))
         with patch.object(list_page, "records", return_value=records), patch.object(list_page, "counts_strip", return_value=""):
@@ -10175,10 +10252,11 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
 """, add_item=False, reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_related_link_reveals_waiting_item_without_changing_filters(self) -> None:
+    def test_browser_blocker_link_reveals_waiting_item_without_changing_filters(self) -> None:
         first = self.add("Check the current result", number=1)
         target = self.add("Check the later result", number=2)
-        _ = the_list.update(MORTY.id, first.id, {"related_to": (target.number,)}, source="nate")
+        _ = the_list.update(MORTY.id, first.id, {
+            "blocked_by": (the_list.ItemDependency(target.number, "The check passes."),)}, source="nate")
         status = change_page.DeliveryStatus(self.root / "reviews")
         delivery = the_list.ask_question(MORTY.id, target.id, the_list.PageRequest("ask", "question", "What passed?"), status)
         with patch.object(change_page, "send_question", return_value=question_outcome()):
@@ -10195,9 +10273,9 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  recordDetails(row).querySelector('a[data-record-jump]').click();
  const place=new URLSearchParams(location.hash.slice(1));
  check(!target.hidden && target.closest('[data-linked-item]:not([hidden])') &&
-  recordIsOpen(target),'The related link opens the waiting item outside the results.');
+  recordIsOpen(target),'The blocker link opens the waiting item outside the results.');
  check(place.get('show')==='working' && place.get('owner')===row.dataset.owner && search.value==='check',
-  'The related link keeps Show, Owner and the search');
+  'The blocker link keeps Show, Owner and the search');
  staffChip('producer',row.dataset.producer).click();
  check(!target.hidden && recordIsOpen(target) &&
   target.closest('[data-linked-item]:not([hidden])'),'Clicking the selected Producer keeps the linked item open.');
@@ -10235,7 +10313,8 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         root = self.root / "reviews"
         source = self.add("Follow the delivered item", number=1)
         target = self.add("Check the delivered item", the_list.ItemState.DELIVERED, number=2)
-        _ = the_list.update(MORTY.id, source.id, {"related_to": (2,)}, source="morty")
+        _ = the_list.update(MORTY.id, source.id, {
+            "blocked_by": (the_list.ItemDependency(2, "The check passes."),)}, source="morty")
         _ = the_list.update(MORTY.id, target.id, {
             "latest_status": "\n\n".join(f"Check {n} passed." for n in range(55))}, source="morty")
         with patch.object(change_page, "send_question", return_value=question_outcome()):
