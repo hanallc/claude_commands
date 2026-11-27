@@ -767,6 +767,29 @@ class AstraReviewTests(StaffTestCase):
         self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(run))
         self.assertEqual(old_state.read_bytes(), before)
 
+    def test_direct_astra_review_uses_its_run_when_two_runs_are_open(self) -> None:
+        owner = self.fixture.fixture.parent
+        ended = self.fixture.run_dir.with_name("a-ended")
+        ended.mkdir()
+        _ = (ended / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: owner.id,
+            "status": "completed", "finished_at": 1}))
+        self.world.activate(str(owner.current_session), "w1:p0", "codex")
+        self.fixture.agent.without_done = False
+        environment = dict(self.environment, UNIT_RUN_DIR=str(ended), CODEX_THREAD_ID=str(owner.current_session))
+        run = self.root / "runs" / "direct-review"
+        run.mkdir(parents=True)
+        arguments = ["--role", "review", "--operation", "astra-review", "--target", "staff-worker",
+            "--policy", "astra-reviewer", "--new-worker", "astra-reviewer", "--session-dir", str(run),
+            "--cwd", str(self.root), "--prompt", str(self.document), "--reply-file", str(run / "review.md")]
+        with self.world.process_starts():
+            result = invoke_cli(assign, assign.main, arguments, environment, self.root)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("submitted", result.stdout.splitlines())
+        self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(run))
+        reviewer, = staff.snapshot().find(kind="worker", parent=owner.id)
+        self.assertEqual(worker_panes.worker_pass(reviewer, run)["status"], "active")
+
 
 if __name__ == "__main__":
     _ = unittest.main()

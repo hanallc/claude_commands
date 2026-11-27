@@ -2286,6 +2286,84 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(directories.by_worker[earlier.id][0], ended)
         self.assertEqual(ended_state.read_bytes(), before)
 
+    def test_held_astra_dispatch_uses_the_explicit_run_when_two_runs_are_open(self) -> None:
+        parent = self.fixture.parent
+        run = self.run_dir.with_name("z-explicit")
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_bytes((self.run_dir / unit_runs.STATE_FILE).read_bytes())
+        ended = self.run_dir.with_name("a-ended")
+        ended.mkdir()
+        _ = (ended / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: parent.id,
+            "status": "completed", "finished_at": 1}))
+        router = PaneCommandRouter()
+        router.setup(self, self.fixture.root)
+
+        arguments = ["--role", "review", "--target", "durable-design-role", "--policy", "astra-reviewer",
+            "--parent", str(parent.id), "--to", "held-reviewer", "--phase", "8", "--session-dir", str(run),
+            "--prompt", str(self.prompt), "--reply-file", str(self.reply)]
+        environment = dict(os.environ, UNIT_RUN_DIR=str(ended), ROSTER_RUN_ROOT=str(run.parent))
+        with self.fixture.world.process_starts():
+            result = invoke_cli(assign, assign.main, arguments, environment, self.fixture.root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.world.requests[-1][2]["UNIT_RUN_DIR"], str(run))
+        reviewer, = staff.snapshot().find(kind="worker", parent=parent.id)
+        self.assertEqual(worker_panes.worker_pass(reviewer, run)["status"], "active")
+
+    def test_dispatch_restarts_a_worker_from_another_run(self) -> None:
+        opened = self.opened()
+        world = self.fixture.world
+        old_pid = world.foreground[opened.pane][0]
+        run = self.run_dir.with_name("z-dispatch")
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_bytes((self.run_dir / unit_runs.STATE_FILE).read_bytes())
+        self.run_dir = run
+
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        self.assertNotEqual(world.foreground[opened.pane][0], old_pid)
+        self.assertEqual(world.requests[-1][2]["UNIT_RUN_DIR"], str(run))
+        self.assertEqual(worker_panes.worker_pass(opened.row, run)["status"], "active")
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        self.assertEqual(len(world.launches), 2)
+        self.assertEqual(len(self.agent.submitted), 1)
+
+    def test_unnamed_assignment_starts_the_team_only_in_its_open_run(self) -> None:
+        run = self.run_dir.with_name("z-team")
+        run.mkdir()
+        state_path = run / unit_runs.STATE_FILE
+        state = unit_runs.read_run_fields(self.run_dir)
+        _ = state_path.write_text(json.dumps({**state, "status": "completed", "finished_at": 1}))
+
+        def assign_team() -> worker.DispatchSubmission | worker.ExitCode:
+            return worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=run,
+                                 slot="impl", phase="8", kind="assign", launcher_command=["assign.sh"])
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertIs(assign_team(), worker.ExitCode.REFUSED)
+        self.assertIn("the run has ended dispatch admission", errors.getvalue())
+        self.assertEqual(self.fixture.world.launches, [])
+        _ = state_path.write_text(json.dumps(state))
+
+        self.assertIs(assign_team(), worker.DispatchSubmission.SUBMITTED)
+        self.assertEqual(len(self.fixture.world.launches), 4)
+        self.assertEqual({request[2]["UNIT_RUN_DIR"] for request in self.fixture.world.requests}, {str(run)})
+
+    def test_dispatch_refuses_a_run_owned_by_another_parent(self) -> None:
+        parent = self.fixture.parent
+        foreign = staff.snapshot().parent_of(parent)
+        assert foreign is not None
+        run = self.run_dir.with_name("foreign")
+        run.mkdir()
+        state = unit_runs.read_run_fields(self.run_dir)
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({**state, unit_runs.OWNER_FIELD: foreign.id}))
+        self.run_dir = run
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertIs(self.dispatch(), worker.ExitCode.REFUSED)
+        self.assertIn("run is not owned by", errors.getvalue())
+        self.assertEqual(self.fixture.world.launches, [])
+        self.assertEqual(self.agent.submitted, [])
+
     def test_launched_agent_reads_the_kept_launch_settings(self) -> None:
         row = fixture_worker("called-agent", self.fixture.parent.id)
         codex = pane_launch.launch("w1:p9", str(row.current_session), str(self.fixture.root), {},

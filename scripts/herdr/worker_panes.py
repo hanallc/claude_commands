@@ -158,6 +158,13 @@ class HolderRun(Enum):
     CURRENT = "holder's run"
 
 
+def dispatch_run_fields(parent: StaffId, run: Path) -> dict[str, object] | AdmissionRefused:
+    fields = unit_runs.read_run_fields(run)
+    if fields.get(unit_runs.OWNER_FIELD) != parent:
+        return AdmissionRefused(f"{run}: the run is not owned by {parent}")
+    return fields
+
+
 @dataclass(frozen=True)
 class CreatedWorkerPane:
     """This start created the pane with this terminal."""
@@ -1237,10 +1244,16 @@ class CloseEndedPane(Enum):
     CHECK = "use the normal closure rules"
 
 
+class LegacyPassCloseProof(Enum):
+    DISPATCH_DONE = "require the dispatch DONE line"
+    RESTART_REPLY = "accept a final reply before restart"
+
+
 def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
               run: DispatchRun | HolderRun = HolderRun.CURRENT,
               lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
-              park: ParkWaitingPass | CloseEndedPane = CloseEndedPane.CHECK) -> CloseAllowed | Kept:
+              park: ParkWaitingPass | CloseEndedPane = CloseEndedPane.CHECK,
+              legacy_proof: LegacyPassCloseProof = LegacyPassCloseProof.DISPATCH_DONE) -> CloseAllowed | Kept:
     record = staff.snapshot()
     parent = record.parent_of(worker.row)
     if parent is None:
@@ -1267,6 +1280,8 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
             completion = recorded_completion_close(worker.row, directory, passed, worker_is_working=working)
         elif isinstance(worker, StoppedWorker):
             return CloseAllowed()
+        elif legacy_proof is LegacyPassCloseProof.RESTART_REPLY and worker.status.idle and passed.get("status") == "completed":
+            completion = _final_reply(worker.row)
         else:
             completion = _completed_turn(worker.row, state.dispatch_id)
     elif state is ReleasedWorkerPass.ENDED:
@@ -1624,6 +1639,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
                     policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT, runs: dict[str, list[str]] | None = None,
+                    dispatch_run: DispatchRun | HolderRun = HolderRun.CURRENT,
                     codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
                     selection: SelectedWorkerRows | Literal["by_name"] = "by_name",
                     ) -> WorkerStart:
@@ -1662,23 +1678,29 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                 if isinstance(checked, StartRefused):
                     return checked
                 policy = checked.launch
-            run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
-            if existing is not None and not isinstance(worker_dispatch_state(existing, run, held), DispatchHoldsWorker):
-                run = worker_run(owner, record=record, scanned=runs)
+            if isinstance(dispatch_run, DispatchRun):
+                run = dispatch_run.directory.absolute()
+            else:
+                run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
+                if existing is not None and not isinstance(worker_dispatch_state(existing, run, held), DispatchHoldsWorker):
+                    run = worker_run(owner, record=record, scanned=runs)
             if isinstance(paths, EnrolledPaths):
                 if refusal := review_run_refusal(owner, run, paths):
                     return refusal
                 if policy.sandbox != READ_ONLY_SANDBOX or policy.permission != "plan":
                     return AdmissionRefused("showrunner review requires a read-only launch policy")
                 policy = replace(policy, tools=ToolAccess.SHOWRUNNER_REVIEW)
-            if unit_runs.terminal_run(unit_runs.read_run_fields(run)):
+            fields = dispatch_run_fields(parent, run) if isinstance(dispatch_run, DispatchRun) else unit_runs.read_run_fields(run)
+            if isinstance(fields, AdmissionRefused):
+                return fields
+            if unit_runs.terminal_run(fields):
                 return AdmissionRefused(f"{run}: the run has ended dispatch admission")
             allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
                 worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
             target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
             with worker_admission.worker_operation(allowed):
                 result = _start_locked(owner, name, role, policy, account, allowed, held, codex, paths,
-                                       keep_model=keep_model, selection=target)
+                                       keep_model=keep_model, selection=target, dispatch_run=dispatch_run)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1723,12 +1745,17 @@ def unpublished_cleanup_text(result: UnpublishedWorker) -> str:
     return result.cleanup.value.format(pane=result.pane)
 
 
+def _uses_dispatch_run(process: herdr.NativeAgentProcess, run: Path) -> bool:
+    directory = process.environment.get("UNIT_RUN_DIR")
+    return bool(directory and Path(directory).is_absolute() and Path(directory).resolve() == run.resolve())
+
+
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead,
                   paths: EnrolledPaths | OrdinaryWorkerOwner, *, keep_model: bool,
-                  selection: SelectedWorkers | SelectedWorkerRows) -> WorkerStart:
+                  selection: SelectedWorkers | SelectedWorkerRows, dispatch_run: DispatchRun | HolderRun) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1757,6 +1784,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     row = current.row if current is not None else None
     backend = staff.backend(row) if row is not None else staff.BACKEND_UNAVAILABLE
     switching = not isinstance(backend, staff.BackendUnavailable) and backend.family != policy.settings.kind
+    explicit = isinstance(dispatch_run, DispatchRun)
     if row is not None and not lock.owns(row):
         return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
@@ -1789,6 +1817,14 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 return ProcessUnknownWorker(owner, identity, _text(pane, "terminal_id"), str(error))
             if not isinstance(activity, herdr.PaneAtShell):
+                if explicit:
+                    try:
+                        running = client.native_pane_process(identity, policy.settings.kind,
+                            herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane)
+                        if not _uses_dispatch_run(running, allowed.run):
+                            return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "interrupted worker uses another run")
+                    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                        return _uncertain(owner, f"running launch environment is unproved: {error}")
                 if isinstance(paths, EnrolledPaths):
                     try:
                         require_review_process(client, identity, paths)
@@ -1835,10 +1871,12 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     pane_row = next(pane for pane in evidence.panes if pane.get("pane_id") == current.pane)
                     launched = client.native_pane_process(current.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane_row)
                 except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                    if passed.get("status") != "active":
+                    if explicit or passed.get("status") != "active":
                         return _uncertain(current.row, f"running launch environment is unproved: {error}")
                 else:
-                    if check_run:
+                    if explicit:
+                        same_run = _uses_dispatch_run(launched, allowed.run)
+                    elif check_run:
                         same_run = launched.environment.get("UNIT_RUN_DIR") == str(allowed.run)
                     expected = launch_environment(policy, account, True)
                     if isinstance(expected, StartRefused):
@@ -1853,7 +1891,11 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             if matches and same_run and same_account:
                 _layout(owner.id, evidence)
                 return current
-            closable = can_close(current, lock=lock)
+            changing_run = explicit and not same_run
+            if changing_run and not current.status.idle:
+                return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, f"agent state is {current.status.value}")
+            proof = LegacyPassCloseProof.RESTART_REPLY if changing_run else LegacyPassCloseProof.DISPATCH_DONE
+            closable = can_close(current, lock=lock, legacy_proof=proof)
             if isinstance(closable, Kept):
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
     if switching and current is not None:
@@ -1866,7 +1908,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     launch_home = (staff.SessionHome(Path(environment["CODEX_HOME"]))
                    if policy.settings.kind == "codex" else staff.HomeUnknown())
     environment["UNIT_TEAM_ROLE"] = name.value
-    if owner.kind == "unit" or isinstance(paths, EnrolledPaths):
+    if explicit or owner.kind == "unit" or isinstance(paths, EnrolledPaths):
         environment["UNIT_RUN_DIR"] = str(allowed.run)
     if temporary := os.environ.get("TMPDIR"):
         environment["TMPDIR"] = temporary
