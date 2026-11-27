@@ -24,6 +24,7 @@ from scripts.lib import conf
 from scripts.for_you.action import ActionStore, ActionStoreError, REVIEW_PATH
 from scripts.lib.user_zone import CONF as USER_ZONE_CONF, user_zone
 from scripts.production import change_review, change_routing, proposal_issue, staff, update_registration
+from scripts.production.production_doc import Refusal as ProductionRefusal
 from scripts.production.record_store import FileStamp, state_root
 from scripts.rebuild import need
 from scripts.lib import urgency
@@ -61,6 +62,8 @@ LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', Review
           ReviewType.RESPONSE: 'Responses', ReviewType.FOR_YOU: 'For you'}
 FRONT_MATTER = re.compile(r'\A\ufeff?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)', re.DOTALL)
 CARD_ERROR = b'<p role="status" data-review-card-unavailable>This card is not available.</p>'
+REVIEW_REVISION_CHANGED = 'this item changed while Review was open.'
+REVIEW_DRAFT_CHOICE_CHANGED = 'this item changed. Open the card to choose again.'
 
 
 class ReviewBodyView(Enum):
@@ -1005,7 +1008,8 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
             names = names if names is not None else staff_names.StaffNames(staff.StaffSnapshot(()))
             heading = 'Sends to ' + names.role_label('showrunner', 'showrunner')
         groups = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading_html=heading)
-    return (f'<form method="post" data-review-form {routes}>'+hidden+words+groups+acknowledge
+    return (f'<form method="post" data-review-form data-review-type="{item.type}" data-review-state="{item.state}" {routes}>'
+            +hidden+words+groups+acknowledge
             +'<span role="status" data-send-status hidden></span></form>')
 
 
@@ -1067,34 +1071,52 @@ def for_you_details(item: ReviewItem, row: for_you.ForYouRow, inputs: ReviewBody
                   routes=change_browser.send_route_attributes({"done": None}))+'</div>')
 
 
-def review_toast_routes(item: ReviewItem, members: staff.StaffSnapshot) -> str:
-    """Give the form the routes for this card's actions."""
+def review_action_recipients(item: ReviewItem, members: staff.StaffSnapshot) -> dict[str, tuple[staff.StaffId, ...]]:
+    """Resolve the staff IDs that each action uses."""
     source = item.source
+    recipients: dict[str, tuple[staff.StaffId, ...]] = {'read': (), 'later': ()}
     if isinstance(source, review_items.ChangeSource):
-        routed = source.assignment.owner
         if item.state == ReviewState.VALIDATING:
-            return change_browser.send_route_attributes({
-                "question": change_browser.receiver_names(members, source.validators),
-                "read": None,
-            })
-        label = change_browser.receiver_names(members, routed.showrunner_recipients)
-        return change_browser.send_route_attributes({
-            **{action: label for action in change_page.CHANGE_HANDOFFS},
-            **change_browser.verdict_toast_labels(routed, members),
-            "read": None,
-        })
+            return {**recipients, 'question': source.validators}
+        routed = source.assignment.owner
+        return {**recipients, **{action: routed.showrunner_recipients for action in change_page.CHANGE_HANDOFFS},
+                'works': change_page.verdict_recipients(routed, 'works'),
+                'works-with-words': change_page.verdict_recipients(routed, 'works: words'),
+                'not works': change_page.verdict_recipients(routed, 'not works')}
     if isinstance(source, review_items.QuestionSource):
-        labels = change_browser.question_toast_labels(source.record, members)
-        labels['read'] = None
+        record = source.record
+        owner = (record.owner,)
+        recipients.update(question=owner, feedback=owner)
         if item.type == ReviewType.RESPONSE:
-            labels['read-with-words'] = labels['feedback']
-        return change_browser.send_route_attributes(labels)
-    label = change_browser.receiver_names(members, (item.owner,))
-    labels: dict[str, str | None] = {action: label for action in item.actions}
-    labels["read"] = None
+            recipients['read-with-words'] = owner
+        if 'review_submission' in record.item:
+            return {**recipients, 'answer': owner, 'followup': owner}
+        try:
+            scope = update_registration.question_scope(record.owner, members)
+            relay = change_browser.question_relay(record, scope, update_registration.QuestionStaff.for_record(members))
+        except (OSError, ValueError, ProductionRefusal, update_registration.RegistrationFailure):
+            return recipients
+        return {**recipients, 'answer': (change_browser.question_receiver(record.owner, 'answer', relay),),
+                'followup': (change_browser.question_receiver(record.owner, 'followup', relay),)}
+    recipients = {**{action: (item.owner,) for action in item.actions}, **recipients}
     if isinstance(source, review_items.EfficiencySource):
-        labels["decline"] = None
-    return change_browser.send_route_attributes(labels)
+        recipients['decline'] = ()
+    return recipients
+
+
+def review_toast_routes(item: ReviewItem, members: staff.StaffSnapshot) -> str:
+    """Give the form the recipient IDs and their names for the toast."""
+    recipients = review_action_recipients(item, members)
+    labels: dict[str, str | None] = {}
+    for action, route in recipients.items():
+        if action == 'later':
+            continue
+        if action in ('works', 'works-with-words', 'not works'):
+            route = tuple(reversed(route))
+        named_handoff = isinstance(item.source, review_items.ChangeSource) and action in change_page.CHANGE_HANDOFFS
+        labels[action] = change_browser.receiver_names(members, route) if route or named_handoff else None
+    return (change_browser.send_route_attributes(labels)
+            +f' data-review-recipients="{html.escape(json.dumps(recipients), quote=True)}"')
 
 
 def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
@@ -1253,14 +1275,18 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +CARD_COLUMNS+'<thead><tr>'+headers+'</tr></thead>'
         +'<tbody data-window-before></tbody><tbody data-window-after></tbody>'
         +'</table><p data-empty hidden>No items in this view.</p></div></div></div>'
-        +record_table.render_inline_detail()+'<script>'+SCRIPT+'</script>')
+        +record_table.render_inline_detail()
+        +'<div class="review-drafts" hidden><ul id="review-draft-list" aria-label="Unsaved Review words" tabindex="0" hidden></ul>'
+        +'<button type="button" data-review-draft-toggle aria-controls="review-draft-list" aria-expanded="false"></button></div>'
+        +'<script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
 
 def review_fields(body: str) -> dict[str, list[str]]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     required = {'row', 'token', 'outcome', 'feedback'}
-    if not required <= fields.keys() <= required | {'later', 'revision', 'assignee'} or any(len(values)!=1 for values in fields.values()):
+    optional = {'later', 'revision', 'assignee', 'retry_recipients'}
+    if not required <= fields.keys() <= required | optional or any(len(values)!=1 for values in fields.values()):
         raise question_record.AnswerRefused('use the answer form on this page')
     return fields
 
@@ -1315,12 +1341,20 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     if retained is None:
         raise review_items.ReviewRecordMissing('This item is no longer on the list.')
 
-    def read_current() -> ReviewItem:
-        return review_items.read_current(root, retained, staff.snapshot())
+    checked_recipients = fields.get('retry_recipients')
+    retry_recipients = cast(object, json.loads(checked_recipients[0])) if checked_recipients is not None else None
+    assignee = fields.get('assignee', [''])[0]
 
-    def validate_revision(current: ReviewItem) -> ReviewItem:
+    def validate_revision(current: ReviewItem, members: staff.StaffSnapshot) -> ReviewItem:
         if current.state == ReviewState.DONE:
             raise review_items.ReviewRecordChanged('This item is already Done.')
+        if checked_recipients is not None:
+            routes = review_action_recipients(current, members)
+            with_words = outcome+'-with-words'
+            route = with_words if words.strip() and with_words in routes else outcome
+            recipients = (staff.StaffId(assignee),) if outcome == 'approve' and assignee else routes.get(route)
+            if recipients is None or list(recipients) != retry_recipients:
+                raise review_items.ReviewRecordChanged(REVIEW_DRAFT_CHOICE_CHANGED)
         assets: dict[str, str] = {}
         try:
             retain_asset(current, assets)
@@ -1329,21 +1363,23 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         revision = fields.get('revision', [''])[0]
         if revision != record_revision(current, assets) and not (
                 outcome == 'feedback' and _matches_feedback_retry(current, assets, revision, token, words)):
-            raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
+            raise review_items.ReviewRecordChanged(REVIEW_REVISION_CHANGED)
         return current
 
     def validate() -> ReviewItem:
-        return validate_revision(read_current())
+        members = staff.snapshot()
+        return validate_revision(review_items.read_current(root, retained, members), members)
 
     if retained.type == ReviewType.FOR_YOU:
-        item = read_current()
+        members = staff.snapshot()
+        item = review_items.read_current(root, retained, members)
         source = item.source
         if (outcome != 'done' or not isinstance(source, review_items.ForYouSource)
                 or source.row.kind != 'action'):
             raise question_record.AnswerRefused('Choose an action on this card.')
         if source.row.status == 'done':
             return ReviewActionSave(change_page.NoMessageDelivery(), 'Done', words_saved=False)
-        _ = validate_revision(item)
+        _ = validate_revision(item, members)
         store = ActionStore()
         try:
             _ = store.mark_done(key, evidence='Marked Done in Review.')
@@ -1402,7 +1438,7 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         delivery, answer = review_actions.investigation_action(item, outcome, words, status, verify_revision=validate)
     else:
         delivery, answer = review_actions.decision_action(
-            item, outcome, words, status, assignee=fields.get('assignee', [''])[0], verify_revision=validate)
+            item, outcome, words, status, assignee=assignee, verify_revision=validate)
     if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery) and item.type == ReviewType.QUESTION:
         with review_items.after_store_write(item.key):
             delivery = review_actions.track_question(delivery, key, words, status)
@@ -1439,13 +1475,13 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
         question_item = next((item for item in review_items.read(root, kinds=review_items.QUESTION_TYPES)
                               if item.key == key), None)
         if question_item is not None and repeats_response_followup(question_item, outcome, words, status):
-            raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
+            raise review_items.ReviewRecordChanged(REVIEW_REVISION_CHANGED)
         if (question_item is not None and question_item.type == ReviewType.RESPONSE
                 and not (outcome == 'read' and can_acknowledge_answer(question_item))):
             def validate_response() -> ReviewItem:
                 current = review_items.read_current(root, question_item, staff.snapshot())
                 if current != question_item:
-                    raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
+                    raise review_items.ReviewRecordChanged(REVIEW_REVISION_CHANGED)
                 return current
 
             saved = submit_response(question_item, outcome, words, status, validate_response)
@@ -1457,7 +1493,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
         if item is not None and can_acknowledge_answer(item):
             def verify_answer() -> None:
                 if review_items.read_current(root, item, staff.snapshot()) != item:
-                    raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
+                    raise review_items.ReviewRecordChanged(REVIEW_REVISION_CHANGED)
 
             saved = acknowledge_answer(root, item, verify_answer)
             return saved.delivery, saved.answer
@@ -1537,8 +1573,25 @@ background:var(--card);border:1px solid var(--line);border-radius:999px;color:va
 .review-log-column>.list-log-panel:not(:last-child){min-height:8rem}
 .review-panel [data-review-form]{grid-column:1/-1;border-top:1px solid var(--line);padding-top:12px;margin-top:10px}
 [data-review-form] label{display:block;font-weight:600;margin-bottom:6px}
-[data-review-form] textarea,[data-review-draft]{display:block;box-sizing:border-box;width:100%;font:inherit;padding:9px 12px;background:var(--bg);
+[data-review-form] textarea,[data-review-draft],.review-drafts textarea{display:block;box-sizing:border-box;width:100%;font:inherit;padding:9px 12px;background:var(--bg);
 color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
+.review-drafts{--draft-gutter:24px;--draft-bottom:max(24px,calc(var(--send-undo-space,0px) + 8px));
+position:fixed;z-index:6;right:var(--draft-gutter);bottom:var(--draft-bottom);
+display:flex;flex-direction:column;align-items:flex-end;gap:8px;max-width:calc(100vw - 2 * var(--draft-gutter));
+max-height:max(0px,calc(100dvh - var(--draft-bottom) - 8px));overflow:hidden}
+@media(max-width:560px){.review-drafts{--draft-gutter:16px}}
+.review-drafts [hidden],.review-drafts[hidden]{display:none}
+.review-drafts button,.review-drafts ul{background:var(--card);color:var(--ink);border:1px solid var(--line);
+border-radius:8px;font:inherit}
+.review-drafts button{flex:none;min-height:36px;margin:0;padding:5px 12px;font-weight:600}
+.review-drafts button:not(:disabled):hover,.review-drafts [aria-expanded=true]{border-color:var(--accent)}
+.review-drafts ul{box-sizing:border-box;min-height:0;width:min(26rem,calc(100vw - 2 * var(--draft-gutter)));overflow:auto;overscroll-behavior:contain;
+list-style:none;padding:0;margin:0}
+.review-drafts li{padding:12px 16px;overflow-wrap:anywhere}
+.review-drafts li+li{border-top:1px solid var(--line)}
+.review-drafts p{margin:4px 0 10px}
+.review-drafts label{display:block;font-weight:600}
+.review-drafts textarea{margin:4px 0 8px;resize:none;font-weight:400}
 .review-actions{margin-top:12px}
 .review-later{margin-left:auto}
 .list-table small[data-new-answer]{color:var(--accent)}
@@ -1627,7 +1680,7 @@ const reviewWaiting=entry=>entry.state==='Waiting' && entry.waitingWhy
  ? '<span class="review-waiting-why">'+escapeText(entry.waitingWhy)+'</span>' : '';
 function reviewCardSummary(entry,titleLimit,icon){
  const node=document.createElement('tbody'),panel=detailId(entry.key);
- Object.assign(node.dataset,{listItem:'',key:entry.key,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
+ Object.assign(node.dataset,{listItem:'',key:entry.key,cardId:entry.id,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
   owner:entry.owner,sourceOwner:entry.sourceOwner,sourceName:entry.sourceName,state:entry.state,type:entry.type,
   order:entry.order,updated:entry.updated,unreadAnswer:entry.unreadAnswer,parked:'false',
   sortValues:JSON.stringify(entrySortValues(entry))});
@@ -1682,9 +1735,18 @@ function installReviewBody(row,body){
 }
 const reviewDrafts=window.frameElement?.linkedReviewDrafts ?? new Map();
 const reviewFormEdits=new WeakMap();
-let presentReviewDraftCopy=update=>update();
+let presentReviewDraftCopy=update=>update(),reviewDraftsChanged=()=>{};
 // Match Python str.strip() when the server checks for words.
 const blankReviewWords=/^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/;
+function reviewActionData(form,outcome,until){
+ const data=new URLSearchParams(new FormData(form));data.set('outcome',outcome);
+ if(outcome==='later') data.set('later',until);
+ if(outcome!=='approve') data.delete('assignee');
+ return data;
+}
+function reviewActionLabel(button){
+ return (button.querySelector('span') ?? button).textContent.trim();
+}
 function bindReviewForm(form,{zone,settings,send}){
  const remember=event=>rememberReviewDraft(form,event?.detail?.edited!==false);
  const words=form.elements.feedback,later=form.elements.later,assignee=form.elements.assignee;
@@ -1693,12 +1755,7 @@ function bindReviewForm(form,{zone,settings,send}){
  if(stored) restoreReviewDraft(form,stored.edit.draft);
  reviewFormEdits.set(form,stored?.edit);
  const choices=recordDetails(row).querySelectorAll('input[name=choice]');
- const submit=(outcome,until)=>{
-  const data=new URLSearchParams(new FormData(form));data.set('outcome',outcome);
-  if(outcome==='later') data.set('later',until);
-  if(outcome!=='approve') data.delete('assignee');
-  void send(outcome,data);
- };
+ const submit=(outcome,until,button)=>send(outcome,reviewActionData(form,outcome,until),reviewActionLabel(button));
  choices.forEach(choice=>choice.addEventListener('change',()=>{words.value=choice.value;remember();words.focus();}));
  [words,later,assignee].filter(Boolean).forEach(field=>{
   field.addEventListener('input',remember);field.addEventListener('change',remember);
@@ -1708,12 +1765,13 @@ function bindReviewForm(form,{zone,settings,send}){
   const button=event.submitter,outcome=button.value;
   if(outcome==='later' || button.dataset.laterPreset){
    const until=parkRequestTime(form,button,zone(),settings(),later.value);
-   if(until) submit('later',until);
+   if(until) void submit('later',until,button);
    return;
   }
-  submit(outcome);
+  void submit(outcome,undefined,button);
  });
  if(later) bindDateTimePicker(form,{zone,settings,summaryPrefix:'Hides until '});
+ return send;
 }
 function readReviewDraft(form){
  if(!form?.elements.feedback) return null;
@@ -1727,7 +1785,7 @@ function readReviewDraft(form){
 function rememberReviewDraft(form,edited=false){
  const draft=readReviewDraft(form);
  if(!draft) return;
- const key=recordFromDetail(form).dataset.key;
+ const row=recordFromDetail(form),{key,cardId}=row.dataset;
  const stored=reviewDrafts.get(key);
  const previous=stored?.edit;
  if(form.elements.feedback.type!=='textarea' || (!edited && reviewFormEdits.get(form)!==previous))
@@ -1737,17 +1795,22 @@ function rememberReviewDraft(form,edited=false){
  if(!edited && previous && Object.keys(draft).every(field=>draft[field]===previous.draft[field])) return previous;
  if(!previous && !draft.feedback && !draft.later && !draft.choice && !draft.assignee) return;
  const edit={draft};
- const record=stored ?? {message:'',notice:null};
- if(previous?.draft.feedback!==draft.feedback) record.message='';
+ const record=stored ?? {cardId:cardId || key,title:row.querySelector('.review-title')?.title,message:'',notice:null};
+ if(previous?.draft.feedback!==draft.feedback){
+  record.message='';
+  delete record.retry;
+ }
  record.edit=edit;
  reviewDrafts.set(key,record);
  reviewFormEdits.set(form,edit);
  drawReviewDraftNotice(record);
+ reviewDraftsChanged();
  return edit;
 }
 function clearReviewDraft(key){
  hideReviewDraftNotice(key);
  reviewDrafts.delete(key);
+ reviewDraftsChanged();
 }
 function confirmReviewDraft(key,submitted,words,form){
  const stored=reviewDrafts.get(key);
@@ -1780,21 +1843,23 @@ function restoreReviewDraft(form,draft){
 function drawReviewDraftNotice(record,anchor){
  const copy=record?.notice;
  if(!copy) return;
+ showActionFailure(copy.querySelector('p'),reviewDraftMessage(record));
  presentReviewDraftCopy(()=>{
   if(record.notice!==copy) return;
   const words=record.edit.draft.feedback;
   copy.hidden=!words;
-  showActionFailure(copy.querySelector('p'),record.message || 'Your words are unsent.');
   const field=copy.querySelector('textarea');
   if(field.value!==words) field.value=words;
   if(anchor?.isConnected && copy.previousElementSibling!==anchor) anchor.after(copy);
  });
 }
+function reviewDraftMessage(record){return record.message || 'Your words are unsent.';}
 function setReviewDraftMessage(key,message){
  const record=reviewDrafts.get(key);
  if(!record) return;
  record.message=message;
  drawReviewDraftNotice(record);
+ reviewDraftsChanged();
 }
 function hideReviewDraftNotice(key){
  const record=reviewDrafts.get(key);
@@ -1813,7 +1878,7 @@ function showReviewDraftNotice(key,anchor){
   status.className='action-failure';
   status.setAttribute('role','status');
   const label=doc.createElement('label'),words=doc.createElement('textarea');
-  label.textContent='Your unsaved words';
+  label.textContent='Your words';
   words.readOnly=true;words.dataset.reviewDraft='';
   label.append(words);copy.append(status,label);
   record.notice=copy;
@@ -2427,10 +2492,11 @@ function applyReviewDetail(key,row,detail,text,bodyVersion=''){
  syncReviewDraft();
  focus?.focus({preventScroll:true});
 }
-function loadBodies(){
+function loadBodies(refreshKey=''){
  view.opened.forEach(key=>{
   const row=view.openItem;
-  if(row?.dataset.key!==key || !index.has(key) || !needsBody(row)) return;
+  const refresh=key===refreshKey;
+  if(row?.dataset.key!==key || !index.has(key) || (!refresh && !needsBody(row))) return;
   const install=({text,version})=>{
    const current=view.openItem;
    if(current?.dataset.key!==key || !index.has(key)) return;
@@ -2445,13 +2511,13 @@ function loadBodies(){
     restoreFocus(key);
    });
   };
-  const cached=bodies.get(key);
+  const cached=refresh ? undefined : bodies.get(key);
   if(cached){install(cached);return;}
   if(bodyRequests.has(key)) return;
   drawSaveControls(recordDetails(row).querySelector('[data-review-form]'));
   const requestedIndex=index;
   const version=content.dataset.version;
-  const prefetched=firstRequest?.key===key && firstRequest.version===version;
+  const prefetched=!refresh && firstRequest?.key===key && firstRequest.version===version;
   const result=prefetched ? firstRequest.result : requestReviewCard(key,version);
   if(prefetched) firstRequest=null;
   const current=()=>bodyRequests.get(key)===request && view.openItem?.dataset.key===key &&
@@ -2509,13 +2575,34 @@ function drawSaveState(key,form=recordDetails(reviewRow(key))?.querySelector('[d
  drawSaveControls(form);
  showActionFailure(form.querySelector('[data-send-status]'),pendingSaves.get(key)?.notice || view.actionNotice(recordFromDetail(form)));
 }
+const reviewFormSubmissions=new WeakMap();
+const reviewDraftChoiceChanged=''' + json.dumps(REVIEW_DRAFT_CHOICE_CHANGED) + r''';
+function reviewActionIntent(form,data){
+ const outcome=data.get('outcome'),until=outcome==='later' ? data.get('later') : '';
+ const assignee=data.get('assignee') || '';
+ let recipients;
+ if(assignee){
+  const selected=form.elements.assignee?.selectedOptions[0];
+  if(selected?.value===assignee && selected.hasAttribute('data-send-receiver')) recipients=[assignee];
+ }else{
+  const routes=JSON.parse(form.dataset.reviewRecipients || '{}'),withWords=outcome+'-with-words';
+  const route=!blankReviewWords.test(data.get('feedback') ?? '') && Object.hasOwn(routes,withWords) ? withWords : outcome;
+  recipients=routes[route];
+ }
+ return {outcome,until,assignee,recipients};
+}
+function sameReviewAction(chosen,current){
+ return chosen.outcome===current.outcome && chosen.until===current.until && chosen.assignee===current.assignee &&
+  Array.isArray(chosen.recipients) && Array.isArray(current.recipients) && chosen.recipients.length===current.recipients.length &&
+  chosen.recipients.every((recipient,at)=>recipient===current.recipients[at]);
+}
 function bindForm(row){
  const form=recordDetails(row).querySelector('[data-review-form]');if(!form || form.dataset.bound) return;
  form.dataset.bound='true';
  const key=row.dataset.key;
  drawSaveState(key,form);
  if(!form.elements.feedback) return;
- const send=async(outcome,data)=>{
+ const send=async(outcome,data,label)=>{
    const current=recordFromDetail(form);
    if(!view.canSubmit(form,data.get('row')) || view.openItem!==current || current.dataset.bodyLoaded!=='true' ||
     !index.has(key) || cardSubmitBlocked(form,view.rowFading(key)) ||
@@ -2524,6 +2611,10 @@ function bindForm(row){
    recovering.delete(key);
    failedDelivery=null;
    const draftAtSubmit=rememberReviewDraft(form,true);
+   const draft=reviewDrafts.get(key);
+   const {reviewType:cardType,reviewState:cardState}=form.dataset;
+   const retry={cardType,cardState,label,action:reviewActionIntent(form,data),refusedRevision:''};
+   if(draftAtSubmit && draft) draft.retry=retry;
    const notice=reviewNotice();
    showActionFailure(notice);
    const validationQuestion=row.dataset.state==='Validating' && outcome==='question';
@@ -2536,6 +2627,7 @@ function bindForm(row){
    const departing=!validationQuestion && !(undoEnabled && responseFollowup);
    const pending={saved:false,departing,held,keepOpen,toast:false,top:scrollY};
    pendingSaves.set(key,pending);pageRefresh.abandon();drawSaveState(key);
+   reviewDraftsChanged();
    const request=view.startItemRequest(key),session=view.openSession;
    const closes=outcome==='later' || !['question','feedback','validate'].includes(outcome);
    const submission=view.preserveRecordRowTop(()=>view.startAction(row));
@@ -2551,6 +2643,7 @@ function bindForm(row){
    };
    const settle=async()=>{
     pendingSaves.delete(key);setCardSubmitting(form,false);drawSaveState(key);
+    reviewDraftsChanged();
     if(isDeferredLink(key)){
      const link=deferredLink;
      await afterRowAnimations(()=>{
@@ -2563,7 +2656,7 @@ function bindForm(row){
     }
    };
    const showFailure=message=>{
-    if(!reopened()) setReviewDraftMessage(key,message);
+    setReviewDraftMessage(key,message);
     pendingSaves.delete(key);
     view.preserveRecordRowTop(()=>showResult({kind:'failure',message}));
    };
@@ -2656,6 +2749,15 @@ function bindForm(row){
     });
    },
    recover:async reason=>{
+    bodies.delete(key);
+    if(reason===reviewDraftChoiceChanged){
+     if(draft?.retry===retry) delete draft.retry;
+     showFailure('Not saved: '+reason);
+     await settle();
+     if(!pendingSaves.size) void pageRefresh.refresh(true);
+     return;
+    }
+    if(draft?.retry===retry) retry.refusedRevision=data.get('revision');
     if(!view.currentItemRequest(request)){
      setReviewDraftMessage(key,'Not saved: '+reason);
      showReviewDraftNotice(key,notice);
@@ -2689,6 +2791,7 @@ function bindForm(row){
       recovering.delete(key);
       const fresh=recordDetails(reviewRow(key))?.querySelector('[data-review-form]');
       drawSaveControls(fresh);
+      reviewDraftsChanged();
      }
     }
    },
@@ -2698,7 +2801,8 @@ function bindForm(row){
     if(!pendingSaves.size) void pageRefresh.refresh(true);
    }});
   };
- bindReviewForm(form,{zone:()=>content.dataset.zone,settings:()=>JSON.parse(content.dataset.later),send});
+ const submit=bindReviewForm(form,{zone:()=>content.dataset.zone,settings:()=>JSON.parse(content.dataset.later),send});
+ reviewFormSubmissions.set(form,submit);
 }
 function bind(){view.replace(false);}
 content.addEventListener('click',event=>{
@@ -2817,11 +2921,137 @@ function applyReviewIndex(payload){
  if(focusedOwner && (!ownerRow.contains(document.activeElement) || document.activeElement.hidden))
   ownerRow.querySelector('[aria-pressed="true"]')?.focus({preventScroll:true});
  content.dataset.loaded='true';
+ reviewDraftsChanged();
  revealNewItem();
  content.dispatchEvent(new Event('review-refreshed'));
 }
 bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+const draftArea=document.querySelector('.review-drafts');
+const draftList=draftArea.querySelector('ul'),draftToggle=draftArea.querySelector('button');
+const draftRows=new Map();
+let openingDraftKey='';
+function setDraftListOpen(open){
+ draftList.hidden=!open;
+ draftToggle.setAttribute('aria-expanded',String(open));
+}
+function createDraftRow(key){
+ const row=document.createElement('li'),title=document.createElement('strong'),message=document.createElement('p');
+ message.className='action-failure';message.setAttribute('role','status');
+ const label=document.createElement('label'),words=document.createElement('textarea');
+ label.textContent='Your words';
+ words.readOnly=true;words.rows=3;
+ label.append(words);
+ const action=document.createElement('button');
+ action.type='button';
+ action.addEventListener('click',()=>void sendReviewDraft(key));
+ row.dataset.draftListKey=key;
+ row.append(title,message,label,action);draftList.append(row);
+ return {row,title,message,words,action};
+}
+function renderReviewDrafts(){
+ const drafts=[...reviewDrafts].filter(([,record])=>record.edit.draft.feedback);
+ draftArea.hidden=!drafts.length;
+ if(!drafts.length) setDraftListOpen(false);
+ const count='Not saved: '+drafts.length;
+ if(draftToggle.textContent!==count) draftToggle.textContent=count;
+ for(const [key,entry] of draftRows){
+  if(reviewDraftWords(key)) continue;
+  entry.row.remove();draftRows.delete(key);
+ }
+ for(const [key,record] of drafts){
+  const entry=draftRows.get(key) ?? createDraftRow(key);
+  draftRows.set(key,entry);
+  const title=record.title ? record.cardId+' · '+record.title : record.cardId;
+  if(entry.title.textContent!==title) entry.title.textContent=title;
+  showActionFailure(entry.message,reviewDraftMessage(record));
+  const words=record.edit.draft.feedback;
+  if(entry.words.value!==words) entry.words.value=words;
+  const action=record.retry?.label || 'Open the card';
+  if(entry.action.textContent!==action) entry.action.textContent=action;
+  entry.action.disabled=!index.has(key) || Boolean(openingDraftKey) || pendingSaves.has(key) || recovering.has(key);
+ }
+}
+function requireReviewDraftChoice(key,record){
+ delete record.retry;
+ setReviewDraftMessage(key,'Not saved: '+reviewDraftChoiceChanged);
+}
+async function sendReviewDraft(key){
+ const record=reviewDrafts.get(key),retry=record?.retry;
+ if(!record?.edit.draft.feedback || !index.has(key) || openingDraftKey || pendingSaves.has(key) || recovering.has(key)) return;
+ openingDraftKey=key;
+ renderReviewDrafts();
+ try{
+  const session=view.openSession;
+  await afterRowAnimations(()=>{
+   if(view.openItem?.dataset.key!==key){view.openCard(key);view.apply();}
+  },()=>view.openSession===session);
+  const openedSession=view.openSession;
+  const current=()=>view.openSession===openedSession && view.openItem?.dataset.key===key &&
+   reviewDrafts.get(key)===record && record.retry===retry;
+  const openForm=()=>recordDetails(view.openItem)?.querySelector('[data-review-form]');
+  const needsRevision=()=>retry?.refusedRevision && openForm()?.elements.revision?.value===retry.refusedRevision;
+  while(current() && bodyRequests.has(key)) await bodyRequests.get(key);
+  if(current() && needsRevision()){
+   loadBodies(key);
+   while(current() && bodyRequests.has(key)) await bodyRequests.get(key);
+  }
+  await afterRowAnimations(()=>{
+   const form=openForm();
+   if(!retry){
+    setDraftListOpen(false);
+    const words=form?.querySelector('textarea[name="feedback"]');
+    (words ?? view.openItem.querySelector('.list-toggle'))?.focus();
+    return;
+   }
+   if(view.openItem.dataset.bodyLoaded!=='true'){
+    setReviewDraftMessage(key,'Not saved: The card is unavailable.');
+    return;
+   }
+   const {outcome,until}=retry.action;
+   const button=form?.querySelector('button[name="outcome"][value="'+CSS.escape(outcome)+'"]');
+   if(!button || !retry.cardType || !retry.cardState ||
+    form.dataset.reviewType!==retry.cardType || form.dataset.reviewState!==retry.cardState ||
+    form.elements.feedback?.type!=='textarea'){
+    requireReviewDraftChoice(key,record);
+    return;
+   }
+   const data=reviewActionData(form,outcome,until);
+   data.set('feedback',record.edit.draft.feedback);
+   if(!sameReviewAction(retry.action,reviewActionIntent(form,data))){
+    requireReviewDraftChoice(key,record);
+    return;
+   }
+   if(needsRevision()) return;
+   const submit=reviewFormSubmissions.get(form);
+   if(!submit || !view.canSubmit(form,key)){
+    setReviewDraftMessage(key,'Not saved: The card is unavailable.');
+    return;
+   }
+   if(outcome!=='later' && button.disabled) return;
+   data.set('retry_recipients',JSON.stringify(retry.action.recipients));
+   form.elements.feedback.value=data.get('feedback');
+   void submit(outcome,data,retry.label);
+  },current);
+ }finally{
+  openingDraftKey='';
+  renderReviewDrafts();
+ }
+}
+reviewDraftsChanged=renderReviewDrafts;
+draftToggle.addEventListener('click',()=>{
+ const open=draftList.hidden;
+ setDraftListOpen(open);
+ renderReviewDrafts();
+ if(open) draftList.focus({preventScroll:true});
+});
+document.addEventListener('keydown',event=>{
+ if(event.key!=='Escape' || event.defaultPrevented || event.isComposing || draftList.hidden) return;
+ event.preventDefault();
+ setDraftListOpen(false);
+ draftToggle.focus({preventScroll:true});
+});
+renderReviewDrafts();
 setInterval(updateHandoffAges,5000);
 document.addEventListener('review-item-saved',()=>{
  const notice=content.querySelector('[data-review-notice]');
