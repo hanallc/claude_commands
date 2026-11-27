@@ -4335,7 +4335,7 @@ document.addEventListener('click',event=>{
  frame.title='Review card';
  frame.src=href;
  const card={frame,link:reviewLinkPlace(link),
-  title:'L'+row.dataset.number+' · '+row.querySelector('[data-label="Item"] strong').textContent};
+  title:'Item '+row.dataset.number+' · '+row.querySelector('[data-label="Item"] strong').textContent};
  if(!recordIsOpen(row)){
   const top=row.getBoundingClientRect().top;
   tableView.openCard(row.dataset.key);tableView.apply();

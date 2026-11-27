@@ -1583,7 +1583,8 @@ The existing Review body route supplies the title, metadata, body, and controls.
 The window uses the Studio card route to show a review whose answer has moved to the List.
 The standalone card link still redirects to the item with the filed answer.
 The Review table and the dialog use the same body renderer and action code.
-The window heading shows the List item number and title, with Close beside it.
+The window heading shows the item number and title as `Item 499 · The review link of an item opens a window`.
+Close appears beside the heading.
 The review card shows its own title above its metadata.
 Opening a review from the State cell expands that item.
 Close and Escape restore the open item's position in the viewport after a refresh.
