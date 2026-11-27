@@ -2336,12 +2336,13 @@ def forget_restart(row: staff.StaffRow) -> None:
 
 def _layout_after_open(parent: StaffId, evidence: PaneEvidence, publish_lock_seconds: float) -> None:
     try:
-        _layout(parent, evidence, layout_deadline=time.monotonic() + publish_lock_seconds)
+        _layout(parent, evidence, deadline=time.monotonic() + publish_lock_seconds)
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"herdr {parent}: skipped worker layout. {' '.join(str(error).splitlines())}", file=sys.stderr)
 
 
-def _layout(parent: StaffId, evidence: PaneEvidence, *, layout_deadline: float | Literal["no_wait"] = "no_wait") -> None:
+def _layout(parent: StaffId, evidence: PaneEvidence, *,
+            deadline: float | staff.SlotLockWait = staff.SlotLockWait.IMMEDIATE) -> None:
     client = _client()
     parent_tabs = {_text(pane, "tab_id") for pane in evidence.scan.found.get(parent, [])} - {""}
     selected = {item.terminal for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
@@ -2354,9 +2355,9 @@ def _layout(parent: StaffId, evidence: PaneEvidence, *, layout_deadline: float |
         key = hashlib.sha256(f"layout:{client.session}:{tab}".encode()).hexdigest()
         with ExitStack() as locks:
             try:
-                _ = locks.enter_context(staff.slot_operation(key, "worker layout", layout_deadline=layout_deadline))
+                _ = locks.enter_context(staff.slot_operation(key, "worker layout", deadline=deadline))
             except staff.StaffRefused as error:
-                if layout_deadline == "no_wait":
+                if deadline is staff.SlotLockWait.IMMEDIATE:
                     raise
                 holder = " ".join(error.holder.split()) or "an unknown process"
                 print(f"herdr {client.session}:{tab}: skipped worker layout. The slot holder is {holder}.", file=sys.stderr)

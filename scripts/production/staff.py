@@ -1069,10 +1069,9 @@ def _holder_fields() -> dict[str, object]:
 
 
 def _write_slot_holder(lock: IO[bytes]) -> None:
-    holder = _holder_fields()
     with suppress(OSError):
         os.ftruncate(lock.fileno(), 0)
-        _ = lock.write((json.dumps(holder) + "\n").encode("utf-8"))
+        _ = lock.write((json.dumps(_holder_fields()) + "\n").encode("utf-8"))
 
 
 def _clear_slot_holder(lock: IO[bytes]) -> None:
@@ -1082,8 +1081,7 @@ def _clear_slot_holder(lock: IO[bytes]) -> None:
 
 def _slot_holder(lock: IO[bytes]) -> tuple[int, str] | None:
     try:
-        _ = lock.seek(0)
-        line = lock.read(4096).partition(b"\n")[0]
+        line = os.pread(lock.fileno(), 4096, 0).partition(b"\n")[0]
         holder = cast(object, json.loads(line))
     except (OSError, ValueError):
         return None
@@ -1116,7 +1114,7 @@ def _upkeep_pid(holder: tuple[int, str]) -> int | None:
     return None
 
 
-def _acquire_slot(lock: IO[bytes], name: str, *, layout_deadline: float | Literal["no_wait"] = "no_wait") -> None:
+def _acquire_slot(lock: IO[bytes], name: str) -> None:
     seconds = _UPKEEP_LOCK_WAIT.get()
     deadline = time.monotonic() + seconds if seconds is not None else 0.0
     upkeep_pid: int | None = None
@@ -1126,16 +1124,7 @@ def _acquire_slot(lock: IO[bytes], name: str, *, layout_deadline: float | Litera
             return
         except BlockingIOError as error:
             holder = _slot_holder(lock)
-            if layout_deadline != "no_wait":
-                from scripts.agents import worker_lifecycle
-
-                try:
-                    worker_lifecycle.acquire_flock(lock, deadline=layout_deadline)
-                except worker_lifecycle.OperationDeadlineExpired:
-                    holder = _slot_holder(lock) or holder
-                else:
-                    return
-            elif seconds is not None:
+            if seconds is not None:
                 if holder is not None:
                     upkeep_pid = _upkeep_pid(holder)
                 if upkeep_pid is not None:
@@ -1188,28 +1177,74 @@ def session_operation(session: str, *, native_key: str, join_recovery: bool = Fa
         yield record
 
 
+class SlotLockWait(Enum):
+    IMMEDIATE = "refuse a held slot"
+
+
+def _wait_for_slot(lock: IO[bytes], path: Path, name: str, deadline: float) -> None:
+    from scripts.agents import worker_lifecycle
+
+    holder = None
+    try:
+        try:
+            # The slot deadline limits the wait after contention.
+            worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            holder = _slot_holder(lock)
+        worker_lifecycle.acquire_flock(lock, deadline=deadline)
+    except worker_lifecycle.OperationDeadlineExpired as error:
+        holder = _slot_holder(lock) or holder
+        named = f"pid {holder[0]}: {holder[1]}" if holder else _operation_lock_holder(path)
+        raise StaffRefused(f"{name}: timed out waiting for lock ({named})", holder=named) from error
+
+
+@contextmanager
+def _slot_lock(path: Path, name: str, wait: float | SlotLockWait) -> Generator[IO[bytes]]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b", buffering=0) as lock:
+        if wait is SlotLockWait.IMMEDIATE:
+            _acquire_slot(lock, name)
+        else:
+            _wait_for_slot(lock, path, name, wait)
+        _write_slot_holder(lock)
+        try:
+            yield lock
+        finally:
+            _clear_slot_holder(lock)
+
+
 @contextmanager
 def slot_operation(key: str, name: str, *, join: bool = True,
-                   layout_deadline: float | Literal["no_wait"] = "no_wait") -> Generator[None]:
-    """Lock a slot across inherited children. Only the layout slot can wait for any holder."""
+                   deadline: float | SlotLockWait = SlotLockWait.IMMEDIATE) -> Generator[None]:
+    """Lock a row or a named worker slot across inherited children."""
     path, variable = _row_lock(key)
     if join and _joined_operation(path, variable):
         yield
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b", buffering=0) as lock:
-        _acquire_slot(lock, name, layout_deadline=layout_deadline)
+    with _slot_lock(path, name, deadline) as lock:
         previous = os.environ.get(variable)
-        _write_slot_holder(lock)
         try:
             os.environ[variable] = str(lock.fileno())
             yield
         finally:
-            _clear_slot_holder(lock)
             if previous is None:
                 _ = os.environ.pop(variable, None)
             else:
                 os.environ[variable] = previous
+
+
+@contextmanager
+def reviewer_startup(caller: StaffRow) -> Generator[None]:
+    """Wait for reviewer startup and limit the wait for the caller's row."""
+    from scripts.lib import file_lock
+
+    path = _file().parent / "locks" / f"astra-review-start-{caller.id}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock.exclusive(path):
+        deadline = time.monotonic() + _wait_seconds("operation_lock_seconds")
+        with slot_operation(caller.id, f"{caller.name}: caller row", deadline=deadline):
+            yield
 
 
 @dataclass(frozen=True)
