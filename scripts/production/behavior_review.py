@@ -501,8 +501,7 @@ def read_question(path: Path, evidence: list[NateSpecified]) -> update_registrat
     for finding in evidence:
         if not any(re.search(rf"\b{finding.day.isoformat()}\b", text) for text in title_and_point):
             raise behavior_check.BehaviorCheckError(f"{path}: the title and point omit {finding.day} for {finding.test}.")
-    verdict_items = [f"The verdict is {finding.verdict}. {finding.reason}" for finding in evidence]
-    return {**parts, "items": [*parts["items"], *verdict_items]}
+    return parts
 
 
 def question_route(key: str) -> Path:

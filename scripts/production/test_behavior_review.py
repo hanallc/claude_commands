@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import io
 import json
 import os
@@ -408,13 +408,17 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
               mock.patch.object(update_registration, "ask") as ask):
             code, output = self.cli("run", *args)
             self.assertEqual(code, 1, output)
+            self.assertIn("test_fixture.py::test_move unclear The cited source did not verify the quote.\n", output)
             self.assertIn(f"Nate's words (2000-01-01, {source}): {MOVE_REQUEST}", output)
             self.assertIn("Nate was not asked.", output)
             ask.assert_not_called()
         self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
         self.assertEqual(self.cli("check", *args)[0], 1)
-        prior_clear = behavior_check.Clear(self.folder / "completed-reply.txt", frozenset({"test_fixture.py::test_move"}))
-        behavior_check.write_record(key, prior_clear)
+        _ = self.write(behavior_check.record_path(key), json.dumps({
+            "state": "clear",
+            "reply": str(self.folder / "completed-reply.txt"),
+            "unverified_requests": ["test_fixture.py::test_move"],
+        }))
         self.assertEqual(self.cli("status", "--key", key), (1, f"{key}: the saved approval has no valid proof.\n"))
         self.assertIn("no valid proof", self.cli("check", *args)[1])
         draft = self.question_file({**MOVE_QUESTION, "ask": "Allow a wait before an account move? (2000-01-01)"})
@@ -487,9 +491,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         text_check.assert_called_once()
         self.assertIsInstance(behavior_check.read_record(key), behavior_check.Waiting)
         records = update_registration.question_records_for_owner(self.producer.id, strict=True)
-        self.assertEqual([record.item.get("parts") for record in records], [
-            {**MOVE_QUESTION, "items": [*MOVE_QUESTION["items"], f"The verdict is against. {MOVE_REASON}"]},
-        ])
+        self.assertEqual([record.item.get("parts") for record in records], [MOVE_QUESTION])
 
     def test_a_submitted_review_is_collected_without_starting_another_worker(self) -> None:
         args, key = self.changed_range()
@@ -616,9 +618,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         records = update_registration.question_records_for_owner(self.producer.id, strict=True)
         self.assertEqual(len(records), 1)
         question = records[0]
-        item = f"The verdict is {verdict}. {reason}"
-        self.assertEqual(question.item.get("parts"), {**MOVE_QUESTION, "items": [*MOVE_QUESTION["items"], item]})
-        self.assertIn(item, question.item.get("question", ""))
+        self.assertEqual(question.item.get("parts"), MOVE_QUESTION)
         self.assertIn(MOVE_QUOTE, (self.folder / "completed-reply.txt").read_text())
         self.assertNotIn("scripts/direct/assign.py", question.item.get("question", ""))
         self.assertNotIn("test_move", question.item.get("question", ""))
@@ -631,10 +631,10 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                                 "source": str(source), "date": "2026-11-23",
                                 "change": "The move waits for the current step.", "verdict": verdict, "reason": reason}]))
 
-    def test_against_verdict_files_a_question_with_its_reason(self) -> None:
+    def test_against_verdict_files_the_author_draft(self) -> None:
         _ = self.filed_question()
 
-    def test_unclear_verdict_files_a_question_with_its_reason(self) -> None:
+    def test_unclear_verdict_files_the_author_draft(self) -> None:
         _ = self.filed_question("unclear", "The words do not give a time for a move during a build.")
 
     def assert_clear_verdict(self, verdict: str, reason: str) -> None:
@@ -682,6 +682,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
               mock.patch.object(update_registration, "ask") as ask):
             code, output = self.cli("run", *args)
         self.assertEqual(code, 1)
+        self.assertIn(f"test_fixture.py::test_move against {MOVE_REASON}\n", output)
         self.assertIn(f"Nate's words (2026-11-23, {self.root / 'decision.md'}): {MOVE_QUOTE}", output)
         self.assertIn("Change: The move waits for the current step.\nAsk moves (phase 7)\n", output)
         self.assertIn("Nate was not asked. Write the question for nate in the question template as JSON, "
@@ -708,6 +709,19 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             self.assertIn(f"{MOVE_QUOTE}\nChange: The move waits for the current step.\n"
                           + f"Ask the author of {head}\nNate was not asked.", output)
         runner.assert_called_once()
+
+    def test_four_findings_preserve_the_authors_three_facts(self) -> None:
+        parts: update_registration.QuestionParts = {
+            **MOVE_QUESTION, "items": [*MOVE_QUESTION["items"], "The account is idle.", "The move uses the current account."],
+        }
+        draft = self.question_file(parts)
+        evidence = [
+            behavior_review.NateSpecified(f"test_fixture.py::test_move_{number}", MOVE_QUOTE, self.root / "decision.md",
+                                          date(2026, 11, 23), "The move waits.", behavior_review.BehaviorVerdict.AGAINST,
+                                          "The flow in scripts/direct/assign.py waits for the build.")
+            for number in range(4)
+        ]
+        self.assertEqual(behavior_review.read_question(draft, evidence), parts)
 
     def test_a_question_requires_both_choice_starts_and_the_date(self) -> None:
         args, key = self.changed_range()
