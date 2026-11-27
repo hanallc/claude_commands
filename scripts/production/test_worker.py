@@ -2254,6 +2254,38 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertNotIn(opened.pane, self.fixture.world.locations)
                 self.assertEqual(errors.getvalue(), "")
 
+    def test_held_astra_dispatch_skips_an_inherited_ended_run(self) -> None:
+        parent = self.fixture.parent
+        ended = self.run_dir.with_name("a-ended")
+        ended.mkdir()
+        ended_state = ended / unit_runs.STATE_FILE
+        earlier = self.fixture.worker("earlier-reviewer")
+        _ = ended_state.write_text(json.dumps({unit_runs.OWNER_FIELD: parent.id, "status": "completed", "finished_at": 1,
+            "pass": {earlier.name: {"worker_id": earlier.id, "instance_id": "earlier-pass", "status": "completed"}}}))
+        before = ended_state.read_bytes()
+        _ = staff.set_run(parent.id, staff.OpenRun(ended))
+        idle = self.fixture.worker("idle-reviewer")
+        router = PaneCommandRouter()
+        router.setup(self, self.fixture.root)
+
+        arguments = ["--role", "review", "--target", "durable-design-role", "--policy", "astra-reviewer",
+            "--parent", str(parent.id), "--to", "held-reviewer", "--phase", "8", "--session-dir", str(self.run_dir),
+            "--prompt", str(self.prompt), "--reply-file", str(self.reply)]
+        environment = dict(os.environ, UNIT_RUN_DIR=str(ended), ROSTER_RUN_ROOT=str(self.run_dir.parent))
+        with self.fixture.world.process_starts():
+            result = invoke_cli(assign, assign.main, arguments, environment, self.fixture.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "submitted")
+        self.assertEqual(self.fixture.world.requests[-1][2]["UNIT_RUN_DIR"], str(self.run_dir))
+        reviewer, = (row for row in staff.find(kind="worker", parent=parent.id) if row.name == "held-reviewer")
+        self.assertEqual(worker_panes.worker_pass(reviewer, self.run_dir)["status"], "active")
+        with patch.dict(os.environ, environment):
+            directories = worker_panes.worker_run_directories(staff.snapshot())
+            self.assertEqual(worker_panes.worker_run(earlier), ended)
+        self.assertEqual(directories.by_worker[idle.id][0], self.run_dir)
+        self.assertEqual(directories.by_worker[earlier.id][0], ended)
+        self.assertEqual(ended_state.read_bytes(), before)
+
     def test_launched_agent_reads_the_kept_launch_settings(self) -> None:
         row = fixture_worker("called-agent", self.fixture.parent.id)
         codex = pane_launch.launch("w1:p9", str(row.current_session), str(self.fixture.root), {},
