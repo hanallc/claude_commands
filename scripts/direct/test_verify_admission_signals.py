@@ -12,6 +12,7 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.direct.verify_doc_test_support import VERIFY, VerifyDocFixture
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 CONNECT_OBSERVER = '''import os, runpy, sys
@@ -71,11 +72,14 @@ class VerifyAdmissionSignalsTests(VerifyDocFixture):
                 process = subprocess.Popen(["bash", str(VERIFY), "doc"], cwd=self.repo,
                                            env=environment, stdout=subprocess.PIPE,
                                            stderr=subprocess.PIPE, text=True, start_new_session=True)
-                self.addCleanup(process.wait, timeout=5)
+                self.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
                 self.addCleanup(reap, marker)
                 wait_until(ready.exists, self.root, processes=(process,))
                 process.terminate()
-                output, errors = process.communicate(timeout=5)
+                try:
+                    output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                except subprocess.TimeoutExpired:
+                    self.fail("The doc step did not exit after SIGTERM during admission.")
                 self.assertEqual(process.returncode, 143, output + errors)
                 self.assertEqual(processes_carrying(marker), set())
                 self.assertEqual(list((self.root / "slots").glob("*")), [])

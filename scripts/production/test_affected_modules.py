@@ -16,8 +16,10 @@ import tempfile
 import unittest
 from typing import cast, override
 from unittest import mock
+from weakref import ref
 
 from scripts.buildlog import index as buildlog_index
+from scripts.mac_test.eligibility import MAC_LINUX_TARGET
 from scripts.production import affected_modules as affected
 from scripts.test_times.gate_record_test_support import gate_run
 
@@ -182,6 +184,75 @@ class AffectedModulesTests(unittest.TestCase):
                     self.write(path, "from scripts.production import staff\n" if label == "added accessor" else "changed\n")
                 _ = self.commit()
                 self.assertEqual(tuple(module.name for module in self.selection().modules), expected)
+
+    def test_extraction_preserves_import_order_and_lexical_scan_scope(self) -> None:
+        facts = affected.extract_facts("""
+if enabled:
+    import deep as renamed
+import shallow
+from scripts.lib import conf
+ROOT = Path(__file__).parent
+
+@capture(ROOT.glob("decorator"))
+def scan(root=ROOT.glob("default")):
+    nested = lambda: ROOT.glob("lambda")
+    outer(root, lambda: check("ls-files"))
+    def child():
+        return ROOT.glob("child")
+
+def scan(root):
+    outer(root, lambda: check("ls-files"))
+    conf.read("nested_setting")
+shutil.copytree(factory() / "config", destination)
+""", "fixture.py")
+        self.assertEqual(facts.imports, ((0, "shallow", ()), (0, "scripts.lib", ("conf",)), (0, "deep", ())))
+        self.assertEqual(facts.config_reads, frozenset({"*", "nested_setting"}))
+        root = affected.ScanPath(affected.SourceFileRoot(), ("..",))
+        parameter = affected.ScanPath(affected.ParameterRoot("root"))
+        self.assertEqual(tuple((scope.name, scope.parameters, scope.scans) for scope in facts.scan_scopes), (
+            ("", (), ()),
+            ("scan", ("root",), (affected.ScanPattern(parameter, "*", True),)),
+            ("scan.child", (), (affected.ScanPattern(root, "child", False),)),
+        ))
+
+    def test_deep_defaults_keep_facts_and_select_the_config_reader(self) -> None:
+        template = ('from scripts.lib import conf\n'
+                    + 'def read(value={negations}conf.read("deep_setting")):\n'
+                    + '    return value\n')
+        path = "scripts/checks/test_reader.py"
+        shallow = template.format(negations="not ")
+        expected = affected.extract_facts(shallow, path)
+        self.assertEqual(expected.config_reads, frozenset({"deep_setting"}))
+        self.add_test("checks/test_reader.py", shallow)
+        for depth in (988, 1800):
+            with self.subTest(depth=depth):
+                source = template.format(negations="not " * depth)
+                self.assertEqual(affected.extract_facts(source, path), expected)
+                self.write(path, source)
+                self.write("config/deep_setting.conf", "value=before\n")
+                self.certify()
+                self.write("config/deep_setting.conf", "value=after\n")
+                _ = self.commit()
+                self.assertEqual(self.selection().modules, (self.repo / path,))
+
+    def test_extraction_releases_ast_nodes(self) -> None:
+        original_parse = ast.parse
+        functions: list[ref[ast.expr]] = []
+
+        def parse(text: str, *, filename: str) -> ast.Module:
+            tree = original_parse(text, filename=filename)
+            statement = tree.body[0]
+            assert isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+            functions.append(ref(statement.value.func))
+            return tree
+
+        with mock.patch.object(ast, "parse", new=parse):
+            _ = affected.extract_facts('read("settings")', "fixture.py")
+            self.assertIsNone(functions[0]())
+
+    def test_copytree_config_detection_applies_to_the_source(self) -> None:
+        facts = affected.extract_facts('shutil.copytree(source, destination / "config")', "fixture.py")
+        self.assertEqual(facts.config_reads, frozenset())
 
     def test_scan_graph_reuses_shared_acyclic_calls(self) -> None:
         caller = "scripts/checks/test_caller.py"
@@ -454,7 +525,7 @@ FILES = collect(Path(__file__).parent)
             for statement in buildlog_index.schema_statements():
                 _ = connection.execute(statement)
             plan = cast(list[tuple[int, int, int, str]],
-                        connection.execute("EXPLAIN QUERY PLAN " + query).fetchall())
+                        connection.execute("EXPLAIN QUERY PLAN " + query, (MAC_LINUX_TARGET,)).fetchall())
             details = [row[3] for row in plan]
             self.assertIn("SEARCH gate_modules USING INDEX sqlite_autoindex_gate_modules_1 (run_id=?)", details)
             self.assertFalse(any(detail.startswith("SCAN gate_modules") for detail in details), details)
@@ -471,7 +542,7 @@ FILES = collect(Path(__file__).parent)
             insert = ("INSERT INTO gate_modules (run_id, suite, module, attempt, config_reads, folder_scans, "
                       + "content_reads) VALUES (?, 'checks', 'test_reader.py', ?, ?, ?, ?)")
             _ = connection.execute(insert, ("shared", 1, '["shared"]', '[]', '["assets/x"]'))
-            shared = cast(list[tuple[object, ...]], connection.execute(query).fetchall())
+            shared = cast(list[tuple[object, ...]], connection.execute(query, (MAC_LINUX_TARGET,)).fetchall())
             self.assertCountEqual(shared, cast(list[tuple[object, ...]], connection.execute(old_query).fetchall()))
             self.assertEqual(shared, [("checks", "test_reader.py", '["shared"]', '[]', '["assets/x"]')])
 
@@ -484,7 +555,7 @@ FILES = collect(Path(__file__).parent)
                 ("aborted", 1, '[]', '[]', '[]'),
                 ("affected", 1, '[]', '[]', '[]'),
             ))
-            separate = cast(list[tuple[object, ...]], connection.execute(query).fetchall())
+            separate = cast(list[tuple[object, ...]], connection.execute(query, (MAC_LINUX_TARGET,)).fetchall())
             self.assertCountEqual(separate, cast(list[tuple[object, ...]], connection.execute(old_query).fetchall()))
             self.assertCountEqual(separate, [
                 ("checks", "test_reader.py", None, None, '["assets/x"]'),
@@ -521,6 +592,22 @@ FILES = collect(Path(__file__).parent)
             self.write("assets/new.txt", "added\n")
             self.assertEqual({module.name for module in self.selection().modules},
                              {"test_config.py", "test_folder.py", "test_unrecorded.py"})
+
+    def test_newer_guest_gate_does_not_supply_module_reads(self) -> None:
+        module = {"suite": "checks", "module": "test_reader.py", "attempt": 1}
+        run = {**gate_run(), "kind": "gate_run", "v": 1, "id": "full", "host": "mac",
+               "selection": "full", "aborted": False, "started_at": "2026-01-01T00:00:00Z",
+               "modules": [{**module, "config_reads": ["limits"], "folder_scans": ["assets"],
+                            "content_reads": ["docs/index.md"]}]}
+        self.write(".git/buildlog/mac/fixture.jsonl", json.dumps(run) + "\n")
+        expected = affected.latest_module_reads()
+        self.assertEqual(set(expected), {"scripts/checks/test_reader.py"})
+
+        guest_module: dict[str, object] = {**module, "config_reads": [], "folder_scans": [], "content_reads": []}
+        guest: dict[str, object] = {**run, "id": "guest-full", "host": "mac-linux", "source": "mac-linux",
+                                    "started_at": "2026-01-02T00:00:00Z", "modules": [guest_module]}
+        self.write(".git/buildlog/mac-linux/2026-01.jsonl", json.dumps(guest) + "\n")
+        self.assertEqual(affected.latest_module_reads(), expected)
 
     def test_landing_bases_exclude_changes_that_already_passed_the_gate(self) -> None:
         self.write("scripts/landed/subject.py", "VALUE = 1\n")
@@ -646,6 +733,38 @@ FILES = collect(Path(__file__).parent)
                 compared = [call.args[-2] for call in git.call_args_list if call.args[1] == "diff"]
                 self.assertEqual(len(compared), len(set(compared)))
 
+    def test_cached_scopes_share_identical_binding_tuples(self) -> None:
+        facts = affected.extract_facts("""
+ROOT = Path(__file__).parent
+
+def left():
+    return ROOT.glob("left")
+
+def right():
+    return ROOT.rglob("right")
+
+def shadow(root):
+    ROOT = root
+    return ROOT.glob("shadow")
+""", "fixture.py")
+        _, payload, _ = affected.fact_row("blob", facts)
+        row = cast(dict[str, object], json.loads(payload))
+        self.assertIsInstance(row["scan_bindings"], list)
+        self.assertEqual(len(cast(list[object], row["scan_bindings"])), 2)
+        decoded = affected.decoded_facts(row)
+        self.assertEqual(decoded, facts)
+        module, left, right, shadow = decoded.scan_scopes
+        self.assertIs(module.bindings, left.bindings)
+        self.assertIs(left.bindings, right.bindings)
+        self.assertIsNot(shadow.bindings, left.bindings)
+
+        scope_rows = cast(list[list[object]], row["scan_scopes"])
+        for index in (-1, 2, True, "0"):
+            with self.subTest(index=index):
+                scope_rows[0][2] = index
+                with self.assertRaisesRegex(ValueError, "invalid scan binding index"):
+                    _ = affected.decoded_facts(row)
+
     def test_cached_and_uncached_graphs_are_equal(self) -> None:
         sources = {
             "scripts/component/__init__.py": "VALUE = 1\n",
@@ -715,7 +834,7 @@ FILES = collect(Path(__file__).parent)
                 if condition in {"old format", "old extractor", "bad digest", "bad payload"}:
                     with closing(sqlite3.connect(cache)) as database, database:
                         if condition == "old format":
-                            _ = database.execute("UPDATE cache_version SET format = -1")
+                            _ = database.execute("UPDATE cache_version SET format = ?", (affected.CACHE_FORMAT_VERSION - 1,))
                         elif condition == "old extractor":
                             _ = database.execute("UPDATE cache_version SET extractor = -1")
                         elif condition == "bad digest":
@@ -745,28 +864,126 @@ FILES = collect(Path(__file__).parent)
         graph_for_files = affected.graph_for_files
 
         def interleave(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
-                       cached: dict[str, affected.SourceFacts], *, worktree: bool) -> affected.SourceGraph:
+                       cached: dict[str, affected.SourceFacts], *, worktree: bool,
+                       run: affected.SelectionRun | None = None) -> affected.SourceGraph:
             with (mock.patch.object(affected, "graph_for_files", graph_for_files),
                   mock.patch.object(ast, "parse", wraps=ast.parse) as parse,
                   mock.patch.object(affected, "write_fact_cache", wraps=affected.write_fact_cache) as write,
                   mock.patch.object(fcntl, "flock", wraps=fcntl.flock) as lock):
                 reader = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
             self.assertEqual(reader, expected)
+            assert isinstance(reader.run, affected.SelectionRun)
+            self.assertIs(reader.run.lock, affected.FactCacheLock.BUSY_SNAPSHOT)
+            self.assertEqual((reader.run.cache_hits, reader.run.cache_misses), (11, 1))
             self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list], [subject])
             attempts = [call for call in lock.call_args_list if call.args[1] == fcntl.LOCK_EX | fcntl.LOCK_NB]
             self.assertEqual(len(attempts), 1)
             write.assert_not_called()
             self.assertEqual(self.cache_file().read_bytes(), before)
-            return graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree)
+            return graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree, run=run)
 
         with mock.patch.object(affected, "graph_for_files", side_effect=interleave) as graph:
             writer = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
         graph.assert_called_once()
         self.assertEqual(writer, expected)
+        assert isinstance(writer.run, affected.SelectionRun)
+        self.assertIs(writer.run.lock, affected.FactCacheLock.PUBLISHED)
         facts = affected.read_fact_cache(self.cache_file())
         self.assertIsNotNone(facts)
         assert facts is not None
         self.assertIn(self.git("rev-parse", f"HEAD:{subject}"), facts)
+
+    def test_selection_run_counts_cold_and_warm_facts(self) -> None:
+        self.add_test("checks/test_reader.py", "VALUE = 1\n")
+        self.certify()
+        self.write("scripts/checks/test_reader.py", "VALUE = 2\n")
+        _ = self.commit()
+        cold = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        warm = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        self.assertIsInstance(cold, affected.AffectedSelection)
+        self.assertEqual(warm, cold)
+        assert isinstance(cold.run, affected.SelectionRun) and isinstance(warm.run, affected.SelectionRun)
+        self.assertEqual((cold.run.cache_hits, cold.run.cache_misses), (9, 2))
+        self.assertEqual(cold.run.extracted_files, 2)
+        self.assertIs(cold.run.lock, affected.FactCacheLock.PUBLISHED)
+        self.assertEqual((warm.run.cache_hits, warm.run.cache_misses), (11, 0))
+        self.assertIs(warm.run.lock, affected.FactCacheLock.TAKEN)
+        self.assertEqual(warm.run.extracted_files, 0)
+        self.assertEqual(warm.run.extraction_s, 0)
+        for run in (cold.run, warm.run):
+            self.assertGreaterEqual(run.cache_read_s, 0)
+            self.assertGreaterEqual(run.graph_s, 0)
+            self.assertGreaterEqual(run.other_s, 0)
+
+    def test_invalid_source_reads_count_misses_before_extraction(self) -> None:
+        invalid = self.repo / "scripts/broken.py"
+        _ = invalid.write_bytes(b"\xff")
+        self.certify()
+        current = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        invalid.unlink()
+        _ = self.commit()
+        historical = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        for result, extracted in ((current, 0), (historical, 1)):
+            assert isinstance(result, affected.FullSuite)
+            self.assertIn("utf-8", result.reason)
+            assert isinstance(result.run, affected.SelectionRun)
+            self.assertEqual(result.run.extracted_files, extracted)
+            self.assertEqual(result.run.cache_misses, extracted + 1)
+
+    def test_source_reads_in_both_graphs_count_as_extraction_time(self) -> None:
+        current = "scripts/current.py"
+        historical = "scripts/historical.py"
+        self.write(historical, "VALUE = 2\n")
+        self.certify()
+        (self.repo / historical).unlink()
+        self.write(current, "VALUE = 3\n")
+        _ = self.commit()
+        now = 0.0
+        read_text = Path.read_text
+        blob_texts = affected.blob_texts
+
+        def clock() -> float:
+            return now
+
+        def read_current(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            nonlocal now
+            if path == self.repo / current:
+                now += 20.0
+            return read_text(path, encoding=encoding, errors=errors)
+
+        def read_historical(repo: Path, blobs: set[str]) -> dict[str, str]:
+            nonlocal now
+            now += 40.0
+            return blob_texts(repo, blobs)
+
+        with (mock.patch.object(affected, "monotonic", side_effect=clock),
+              mock.patch.object(Path, "read_text", autospec=True, side_effect=read_current),
+              mock.patch.object(affected, "blob_texts", side_effect=read_historical)):
+            result = affected.select_affected(self.repo, self.base, self.modules, set())
+
+        assert isinstance(result, affected.AffectedSelection)
+        assert isinstance(result.run, affected.SelectionRun)
+        self.assertEqual(result.run.extraction_s, 60.0)
+        self.assertEqual(result.run.graph_s, 0.0)
+        self.assertEqual(result.run.total_s, 60.0)
+
+    def test_cache_cleanup_error_after_replacement_keeps_publication_result(self) -> None:
+        run = affected.SelectionRun(lock=affected.FactCacheLock.TAKEN)
+        cache_path = self.cache_file()
+        cache_path.parent.mkdir()
+        facts = {"example": affected.extract_facts("VALUE = 1\n", "example.py")}
+        cache = affected.FactCache(facts, cache_path, run=run)
+
+        class FailingCleanup(tempfile.TemporaryDirectory[str]):
+            @override
+            def cleanup(self) -> None:
+                super().cleanup()
+                raise OSError("cleanup failed")
+
+        with mock.patch.object(tempfile, "TemporaryDirectory", FailingCleanup):
+            cache.retain(set(facts))
+        self.assertIs(run.lock, affected.FactCacheLock.PUBLISHED)
+        self.assertEqual(affected.read_fact_cache(cache_path), facts)
 
     def test_deleted_blob_is_pruned_and_new_targets_resolve_cached_facts(self) -> None:
         self.write("scripts/component/test_caller.py", "import test_future_subject\n")
@@ -1149,8 +1366,9 @@ FILES = collect(Path(__file__).parent)
         graph_for_files = affected.graph_for_files
 
         def without_base_imports(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
-                                 cached: dict[str, affected.SourceFacts], *, worktree: bool) -> affected.SourceGraph:
-            graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree)
+                                 cached: dict[str, affected.SourceFacts], *, worktree: bool,
+                                 run: affected.SelectionRun | None = None) -> affected.SourceGraph:
+            graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree, run=run)
             return graph if worktree else replace(graph, imports={})
 
         with mock.patch.object(affected, "graph_for_files", side_effect=without_base_imports):
@@ -1254,7 +1472,7 @@ FILES = collect(Path(__file__).parent)
         blob = self.git("rev-parse", "HEAD:scripts/checks/test_reader.py")
         facts = cache[blob]
         cache[blob] = replace(facts, scan_scopes=(*facts.scan_scopes, affected.ScanScope("", (), (), (), ())))
-        affected.write_fact_cache(cache_path, cache, None, set(cache))
+        self.assertTrue(affected.write_fact_cache(cache_path, cache, None, set(cache)))
         with mock.patch.object(ast, "parse", side_effect=AssertionError("warm cache parsed source")):
             result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
         self.assertEqual(result, expected)
@@ -1270,6 +1488,9 @@ FILES = collect(Path(__file__).parent)
         self.assertIsInstance(result, affected.FullSuite)
         assert isinstance(result, affected.FullSuite)
         self.assertIn("scripts/checks/test_deleted.py", result.reason)
+        assert isinstance(result.run, affected.SelectionRun)
+        self.assertGreater(result.run.cache_misses, 0)
+        self.assertGreaterEqual(result.run.graph_s, 0)
 
     def test_optimized_selection_matches_baseline(self) -> None:
         self.write("scripts/component/deleted.py", "VALUE = 1\n")
