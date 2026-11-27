@@ -499,7 +499,7 @@ def alert(directory: Path, limits: HealLimits, session: HealSession, history: He
                     print(f"nix-heal: {session.session_id}: cannot save the alert key; sending anyway. {error}",
                           file=sys.stderr)
             command = session_send.send_argv("--to", str(owner.id), "--from", "nix-heal",
-                                             "--key", history["showrunner_alert_key"], "--text", text)
+                                             "--key", history["showrunner_alert_key"], "--once-per-key", "--text", text)
             outcome, detail = send_alert(command, limits)
             if outcome in {"sent", "queued", "kept", "skipped"}:
                 history["notified"] = True

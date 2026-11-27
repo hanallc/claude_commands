@@ -406,6 +406,7 @@ class HealTests(NixFixture):
             nonlocal stopped
             del kwargs
             keys.append(command[command.index("--key") + 1])
+            self.assertIn("--once-per-key", command)
             if not stopped:
                 stopped = True
                 raise SweepKilled
@@ -449,7 +450,7 @@ class HealTests(NixFixture):
                 run.assert_called_once()
                 command = cast(list[str], run.call_args.args[0])
                 self.assertEqual(command[2:-1], ["--to", owner.id, "--from", "nix-heal",
-                                                 "--key", history["showrunner_alert_key"], "--text"])
+                                                 "--key", history["showrunner_alert_key"], "--once-per-key", "--text"])
                 text = command[-1]
                 for detail in (session.name, socket.gethostname(), str(self.work), raw,
                                "The .envrc file loaded, but no nix shell started.", "Get Nate's approval",
