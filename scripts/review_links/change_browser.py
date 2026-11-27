@@ -339,10 +339,12 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
     items = [text[mark.end():end].strip() for mark, end in zip(best, ends)]
     last = items[-1]
     blocks = list(page_frame.CODE_BLOCK.finditer(last))
+    block_ends = {block.end() for block in blocks}
     trailing = ""
     for blank in BLANK_LINE.finditer(last):
         if any(block.start() <= blank.start() < block.end()
-               or block.start() == blank.end() and last[:blank.start()].rstrip().endswith(":") for block in blocks):
+               or block.start() == blank.end()
+               and (blank.start() in block_ends or last[:blank.start()].rstrip().endswith(":")) for block in blocks):
             continue
         items[-1], trailing = last[:blank.start()], last[blank.end():]
         break
@@ -350,10 +352,9 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
 
 
 def item_html(entry: str) -> str:
-    """Show a code block alone or after an item's text that ends with a colon."""
-    whole = page_frame.CODE_BLOCK.fullmatch(entry.strip())
-    if whole is not None:
-        return page_frame.code_block_html(whole)
+    """Show code blocks alone or after an item's text that ends with a colon."""
+    if blocks := page_frame.code_block_run(entry.strip()):
+        return "".join(page_frame.code_block_html(block) for block in blocks)
     for block in page_frame.CODE_BLOCK.finditer(entry):
         before, after = entry[:block.start()].rstrip(), entry[block.end():].strip()
         if before.endswith(":"):
@@ -363,11 +364,13 @@ def item_html(entry: str) -> str:
 
 def item_list(items: list[str]) -> str:
     entries: list[str] = []
+    accepts_code = False
     for entry in items:
-        if entries and entries[-1].rstrip().endswith(":") and page_frame.CODE_BLOCK.fullmatch(entry.strip()) is not None:
+        if accepts_code and page_frame.code_block_run(entry.strip()):
             entries[-1] += "\n" + entry
         else:
             entries.append(entry)
+            accepts_code = entry.rstrip().endswith(":")
     return '<h2>Items</h2><ol class="question-items">' + "".join(f"<li>{item_html(entry)}</li>" for entry in entries) + "</ol>"
 
 

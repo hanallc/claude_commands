@@ -893,6 +893,13 @@ def report_state_time(item: the_list.ListItem, today: datetime) -> str:
     return ""
 
 
+NEXT_STEP_COMMAND_LABEL = "Run this command:"
+NEXT_STEP_FENCE = re.compile(
+    r"(?m)^[ \t]*(?P<marker>(?P<char>`|~)(?P=char){2,})[^\n]*\n"
+    + r"(?:(?P<body>[\s\S]*?)^[ \t]*(?P=marker)(?P=char)*[ \t]*(?=\n|$)|[\s\S]*\Z)"
+)
+
+
 class ListProgress(NamedTuple):
     latest_status: str
     status_time: the_list.Timestamp
@@ -903,9 +910,35 @@ class ListProgress(NamedTuple):
     def next_step_html(self, *, link_urls: bool = False) -> str:
         if self.repair_producer_html:
             return '<p>' + self.repair_producer_html + ' repairs it again</p>'
-        if self.show_next_step:
-            return item_text_html(self.next_step or "Not recorded", paragraphs=True, link_urls=link_urls)
-        return ""
+        if not self.show_next_step:
+            return ""
+        original = self.next_step or "Not recorded"
+        label = NEXT_STEP_COMMAND_LABEL
+        if label not in original:
+            return item_text_html(original, paragraphs=True, link_urls=link_urls)
+        text = original.replace("\r\n", "\n").replace("\r", "\n")
+        fences = list(NEXT_STEP_FENCE.finditer(text))
+        paragraphs: list[str] = []
+        start = 0
+        for blank in change_browser.BLANK_LINE.finditer(text):
+            if any(fence.start() <= blank.start() < fence.end() for fence in fences):
+                continue
+            paragraphs.append(text[start:blank.start()])
+            start = blank.end()
+        if paragraphs and paragraphs[-1] == label and label not in paragraphs[:-1]:
+            command = text[start:]
+            fence = next((fence for fence in fences if fence.start() >= start), None)
+            if fence is not None:
+                body = fence["body"]
+                command = (body.removesuffix("\n") if body is not None and fence.span() == (start, len(text))
+                           else "")
+            elif (block := page_frame.CODE_BLOCK.fullmatch(command)) and block[2] is not None:
+                command = block[2]
+            if command.strip():
+                prose = item_text_html(text[:start], paragraphs=True, link_urls=link_urls)
+                code = page_frame.copy_code_block(command)
+                return prose + '<div class="list-command">' + code + '</div>'
+        return item_text_html(original, paragraphs=True, link_urls=link_urls)
 
 
 def item_progress(item: the_list.ListItem, names: staff_names.StaffNames, schedule: DisplayedSchedule) -> ListProgress:
@@ -2409,6 +2442,10 @@ background:var(--ink-2);border-radius:50%}
 .list-next-step-column{width:var(--list-next-step-width,23%)}
 .list-owner-name{display:block;overflow-wrap:anywhere;hyphens:none}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
+.list-command{contain:inline-size}
+.list-command .code-block{margin:0}
+.list-command pre code{display:block;white-space:pre;overflow-wrap:normal;overflow-x:auto;
+scrollbar-width:thin;scrollbar-color:var(--ink-3) transparent}
 .list-item-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:16px}
 .list-item-fields section{grid-column:span 2}
 .list-item-fields :is(.list-field-state,.list-field-eta){grid-column:auto}
@@ -3909,7 +3946,9 @@ function applyListSnapshot(fresh){
  const direction=field?.selectionDirection;
  const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
  const action=field?.matches('button[name="action"]') ? field.value : '';
- const focusedRow=action || field?.matches('.list-toggle') ? field.closest('[data-list-item]')?.dataset.key : '';
+ const copyCommand=field?.matches('.list-command [data-copy-code]');
+ const focusedRow=action || copyCommand || field?.matches('.list-toggle') ? recordFromDetail(field) : null;
+ const copyInDetail=copyCommand && recordDetails(focusedRow)?.contains(field);
  recordDetails(tableView.openItem)?.querySelector('[data-feedback-form]')?.retainDraft?.();
  tableView.holdLog();
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
@@ -3937,8 +3976,11 @@ function applyListSnapshot(fresh){
    field.setSelectionRange(start,end,direction);}
  if(reviewLink && !field?.isConnected) restoreReviewLink(reviewLink);
  if(focusedRow && !field?.isConnected){
-  const row=[...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===focusedRow && !item.hidden);
-  const button=action && recordDetails(row)?.querySelector('button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
+  const match=rowIn(content,focusedRow.dataset.key);
+  const row=match && !match.hidden ? match : null;
+  const scope=copyInDetail ? recordDetails(row) : row?.querySelector('[data-label="Next step"]');
+  const button=copyCommand ? scope?.querySelector('.list-command [data-copy-code]') :
+   action && recordDetails(row)?.querySelector('button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
   (button || row?.querySelector('.list-toggle') || content.querySelector('#list-search')).focus({preventScroll:true});
  }
  void loadListCounts();

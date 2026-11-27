@@ -3836,6 +3836,148 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
         self.assertIn('<ul><li>One</li><li>Two</li></ul>', details)
         self.assertIn('<ol><li>First</li><li>Second</li></ol>', details)
 
+    def test_next_step_renders_one_labeled_command(self) -> None:
+        command = "  printf '%s\\n' '<tag> & value'  "
+        for source in (command, f"`{command}`", f"```sh\n{command}\n```"):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, f"Check the result.\n\nRun this command:\n\n{source}", "", True)
+                markup = progress.next_step_html(link_urls=True)
+                self.assertTrue(markup.startswith('<p>Check the result.</p><p>Run this command:</p>'))
+                self.assertIn('<pre><code>' + html.escape(command) + '</code></pre>', markup)
+                self.assertIn(page_frame.COPY_BUTTON, markup)
+        for source in ("Check the result.\n\nOpen https://example.org/preview.", "Run this command:",
+                       "Run this command:\n\n ", "Run this command:\n\nprintf x\n\nRead the result.",
+                       "Run this command:\n\nprintf x\n\nRun this command:\n\nprintf y"):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, source, "", True)
+                self.assertEqual(progress.next_step_html(link_urls=True),
+                                 list_page.item_text_html(source, paragraphs=True, link_urls=True))
+
+    def test_next_step_finds_command_labels_and_paragraphs_outside_fences(self) -> None:
+        example = "```text\nExample\n\nRun this command:\n\nprintf x\n```"
+        command = "printf x\n\nprintf y"
+        label = "Run this command:\n\n"
+        for source in (example, example.removesuffix("\n```"),
+                       label + "```sh\nprintf x\n```\n```sh\nprintf y\n```",
+                       label + "```sh\n```\n\n```sh\nprintf x\n```"):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, source, "", True)
+                self.assertEqual(progress.next_step_html(),
+                                 list_page.item_text_html(source, paragraphs=True, link_urls=False))
+        for source in (f"{label}```sh\n{command}\n```", f"{example}\n\n{label}~~~sh\n{command}\n~~~"):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, source, "", True)
+                block = '<div class="list-command">' + page_frame.copy_code_block(command) + '</div>'
+                self.assertTrue(progress.next_step_html().endswith(block))
+
+    def test_next_step_normalizes_carriage_returns_in_a_command(self) -> None:
+        label = "Run this command:"
+        for source in (label + "\r\n\r\nprintf x\rprintf y", label + "\r\r```sh\r\nprintf x\rprintf y\n```"):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, source, "", True)
+                block = '<div class="list-command">' + page_frame.copy_code_block("printf x\nprintf y") + '</div>'
+                self.assertEqual(progress.next_step_html(), f'<p>{label}</p>' + block)
+
+    def test_next_step_keeps_original_prose_line_endings(self) -> None:
+        prose = "Check the result.\rRead the log."
+        expected = "<p>Check the result.</p><p>Read the log.</p>"
+        for source, markup in ((prose, expected),
+                               (prose + "\rRun this command:", expected + "<p>Run this command:</p>")):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, source, "", True)
+                self.assertEqual(progress.next_step_html(), markup)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for this browser test")
+    def test_browser_next_step_fences_keep_each_copy_button_with_its_code(self) -> None:
+        label = "Run this command:\n\n"
+        first = 'printf "<x> & y"'
+        second = "printf z"
+        example = "Example\n\n" + label + first
+        lf_cases = (
+            (f"{label}```sh\n```\n```sh\n{first}\n```", ["", first]),
+            (f"{label}```sh\n{first}\n```\n```sh\n{second}\n```", [first, second]),
+            (f"```text\n{example}\n```", [example]),
+        )
+        cases = lf_cases + tuple((source.replace("\n", "\r\n") + ending, codes)
+                                for source, codes in lf_cases for ending in ("", "\r\n"))
+        sections = "".join(
+            "<section>" + list_page.ListProgress("", NOW, source, "", True).next_step_html() + "</section>"
+            for source, _ in cases
+        )
+        probe = r'''
+const failures=[];
+const expected=EXPECTED_CODES;
+const copied=[];
+Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{copied.push(text);}}});
+for(const [index,section] of [...document.querySelectorAll('section')].entries()){
+ const start=copied.length;
+ for(const button of section.querySelectorAll('[data-copy-code]')) button.click();
+ const codes=copied.slice(start);
+ if(JSON.stringify(codes)!==JSON.stringify(expected[index]))
+  failures.push('Unexpected code for case '+index+': '+JSON.stringify(codes));
+ if(section.querySelector('.list-command')) failures.push('Unexpected Studio command for case '+index);
+}
+void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+'''.replace("EXPECTED_CODES", json.dumps([codes for _, codes in cases]))
+        page = f"<!doctype html><meta charset=utf-8>{sections}<script>{page_frame.COPY_SCRIPT}\n{probe}</script>"
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_studio_copies_the_next_step_command_once_after_refresh(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Check the command", number=1)
+        command = "printf '%s\\n' '<tag> & \"value\"' '" + "x" * 180 + "'"
+        updated = command.replace("<tag>", "<new tag>")
+
+        def page(words: str) -> str:
+            _ = the_list.update(MORTY.id, item.id, {"next_step": "Run this command:\n\n" + words}, source="morty")
+            return list_page.render(root, include_counts=False).decode()
+
+        initial, fresh = page(command), page(updated)
+        steps = r'''
+ const copied=[];
+ Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async text=>{copied.push(text);}}});
+ const summary=()=>row.querySelector('[data-label="Next step"]');
+ const detail=()=>recordDetails(row).querySelector('.list-field-next_step');
+ const copy=field=>field.querySelector('[data-copy-code]');
+ const oldCopy=copy(detail());
+ const code=detail().querySelector('pre code');
+ check(innerWidth===VIEWPORT_WIDTH && document.documentElement.scrollWidth<=innerWidth,
+  'The Studio fits the requested viewport.');
+ code.scrollLeft=code.scrollWidth;
+ check(code.scrollLeft>0,'The long command scrolls inside its block.');
+ check(code.getBoundingClientRect().right<=oldCopy.getBoundingClientRect().left,
+  'The scroll area leaves room for the copy button.');
+ oldCopy.focus();
+ check(oldCopy.matches(':focus-visible') && getComputedStyle(oldCopy).opacity==='1',
+  'Keyboard focus shows the copy button.');
+ copy(summary()).click();await flush();
+ check(recordIsOpen(row),'A click on the summary copy button keeps the item open.');
+ oldCopy.click();await flush();
+ check(copied.length===2 && copied.every(text=>text===ORIGINAL_COMMAND),
+  'Each click copies the exact original command once.');
+ const focusField=FOCUS_DETAIL ? detail : summary;
+ const focusedCopy=copy(focusField());
+ focusedCopy.focus();
+ refreshMarkup=FRESH_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();
+ const newCopy=copy(detail());
+ check(pageReads===1 && recordIsOpen(row) && newCopy!==oldCopy,'The refresh replaces the open command block.');
+ const renewedCopy=copy(focusField());
+ check(renewedCopy!==focusedCopy && document.activeElement===renewedCopy,
+  'The replacement copy button has focus in the same field.');
+ newCopy.click();await flush();
+ check(copied.length===3 && copied[2]===UPDATED_COMMAND,'A click after the refresh copies the new command once.');
+'''
+        steps = (steps.replace("ORIGINAL_COMMAND", json.dumps(command)).replace("UPDATED_COMMAND", json.dumps(updated))
+                 .replace("FRESH_PAGE", json.dumps(fresh).replace("</", "<\\/")))
+        for width, focus_detail in ((1440, False), (390, True)):
+            with self.subTest(width=width, focus_detail=focus_detail):
+                probe = steps.replace("VIEWPORT_WIDTH", str(width)).replace("FOCUS_DETAIL", json.dumps(focus_detail))
+                self.browser_action_sequence(probe, markup=initial,
+                                             add_item=False, reduced_motion=True, window_size=(width, 900))
+
     def test_bad_records_leave_valid_rows_and_nav_news(self) -> None:
         good = self.add("Valid item")
         bad = self.add("Invalid item")
