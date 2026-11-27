@@ -79,7 +79,7 @@ class ReviewPending:
 
 
 class ReviewerBlocker(behavior_check.BehaviorCheckError):
-    """The reviewer returned a blocker in prose."""
+    """The reviewer reported that it could not complete the review."""
 
 
 def read_findings(text: str) -> dict[str, ReviewFinding]:
@@ -91,8 +91,13 @@ def read_findings(text: str) -> dict[str, ReviewFinding]:
         payload = payload[len("```json\n"):-len("\n```")]
     try:
         result = cast(object, json.loads(payload))
-        if not isinstance(result, list):
-            raise ValueError("expected a list of findings")
+        match result:
+            case [{"blocker": str(blocker)}]:
+                raise ReviewerBlocker(blocker)
+            case list():
+                pass
+            case _:
+                raise ValueError("expected a list of findings")
         findings: dict[str, ReviewFinding] = {}
         for value in cast(list[object], result):
             if not isinstance(value, dict):
@@ -169,6 +174,9 @@ def parse_reply(text: str, tests: Iterable[behavior_check.TestChange]) -> dict[s
     return findings
 
 
+CHECKER_ROOT = Path(__file__).resolve().parents[2]
+
+
 REVIEW_INSTRUCTIONS = """
 You are the independent reviewer. You did not author this change.
 Read the old and new test text in {test_file}.
@@ -182,13 +190,19 @@ For exec_command, use `timeout --kill-after=1s 20s` and set `yield_time_ms` to 2
 Never call `write_stdin`. Do not start interactive or background commands.
 If a search times out, split its input into smaller groups and search each group.
 
+The checker's code root is `{checker_root}`.
+Start a fresh Python process when you import from the checker.
+Run `import sys` and `sys.path.insert(0, {checker_root!r})` before you import from the checker.
+
 Use these sources:
 1. List records and their questions and answers in {state_root}/*/list/L*.md.
-2. Question records from scripts/production/update_registration.py and change review verdicts.
+2. Question records and change review verdicts.
+   Read `{checker_root}/scripts/production/update_registration.py` for the question record code.
+   To use its functions, run `from scripts.production import update_registration`.
    Follow the store paths in the showrunner documents and the showrunner state root.
 3. User turns in Claude session transcripts. Do not count assistant, tool, or peer messages.
-   Use scripts/lib/transcripts.py to find distinct paths.
-   Import `transcript_lines` from `scripts.lib.transcripts`.
+   Use `{checker_root}/scripts/lib/transcripts.py` to find distinct paths.
+   Use `from scripts.lib.transcripts import transcript_lines`.
    Read plain and compressed transcripts with `with contextlib.closing(transcript_lines(Path(path))) as lines:`.
    Use `rg --search-zip --files-with-matches --hidden --no-ignore` on groups of transcript paths.
    Select files by terms for the affected behaviors. Parse only those files for matching user turns.
@@ -199,9 +213,9 @@ Check that Nate wrote the words and used them to set behavior.
 Find Nate's newest words that set each affected behavior. Check for later words that set it differently.
 Quote the words you used to decide the finding.
 In `change`, write one plain line for the author about how the behavior changes.
-If you cannot complete the review, report the blocker instead of a finding.
+If you cannot complete the review, return `[{{"blocker":"what stopped the review"}}]`.
 
-Return one JSON array. Give one object for each test ID in tests.json.
+For a complete review, return one JSON array. Give one object for each test ID in tests.json.
 Use {{"test":"ID","finding":"none"}} when you find no such words.
 Use "requested" only when Nate's newest words on the behavior ask for this change.
 For "requested", cite Nate's typed Claude turn, sent List Tell, or saved question answer or feedback.
@@ -342,7 +356,8 @@ def prepare_review(change: behavior_check.GitRange, part: ReviewPart, folder: Pa
                                      datetime.now(timezone.utc).isoformat(),
                                      str(reply), astra_work.StandaloneWork())
     return astra_work.header_line(assignment) + part.instructions.format(
-        test_file=test_file, diff_file=diff_file, state_root=state_root(), repo=change.repo)
+        test_file=test_file, diff_file=diff_file, state_root=state_root(), repo=change.repo,
+        checker_root=str(CHECKER_ROOT))
 
 
 class ReviewNeedsDispatch:
@@ -390,7 +405,7 @@ def recover_reply(folder: Path) -> Path | ReviewPending | ReviewNeedsDispatch:
 def reviewer_reply(change: behavior_check.GitRange, key: str, part: ReviewPart,
                    pointer: Path, lock: file_lock.ExclusiveLock, staff_open_lock: Lock) -> Path | ReviewPending:
     """Recover the prior reply or start one review while the lock is held."""
-    instructions_digest = sha256(part.instructions.encode("utf-8")).hexdigest()
+    instructions_digest = sha256(f"{CHECKER_ROOT}\n{part.instructions}".encode("utf-8")).hexdigest()
     try:
         folder = review_folder(pointer)
     except FileNotFoundError:

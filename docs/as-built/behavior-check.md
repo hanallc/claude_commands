@@ -19,7 +19,10 @@ The PR script checks the range from the merge base to the PR head.
 It reads the head and base again before merge and supplies the checked head to GitHub.
 
 A clear record names the saved reviewer reply.
-The reviewer filters transcript files before parsing them and runs each command in one tool call without `write_stdin`.
+The reviewer filters transcript files before parsing them.
+The prompt gives the checker's absolute code root and paths to the transcript reader and question record code.
+The reviewer adds the checker's code root to `sys.path` before it imports the transcript reader.
+The reviewer runs each command in one tool call without `write_stdin`.
 The gate checks each changed test for no user decision or a verified request from Nate.
 The check accepts typed Claude turns, sent List Tell feedback from Nate, and Nate's saved List or Question answers.
 It matches consecutive full sentences or lines and treats each run of whitespace as one space.
@@ -58,6 +61,8 @@ The command files one question per key with `blocks` urgency.
 Once the command files the question, later runs track the answer without the file.
 
 A retry starts a new review if the prior reviewer process ended before it saved a valid reply.
+The reviewer can report a blocked part as `[{"blocker":"what stopped the review"}]`.
+The command prints the part number and blocker text. A retry starts a new review for that part.
 The collector reads the first word of the answer. It ignores letter case and punctuation at the end of that word.
 If the Console review holds the question, the command prints the review's questions and failed rules.
 Revise the JSON file and run the command again with `--question FILE`.

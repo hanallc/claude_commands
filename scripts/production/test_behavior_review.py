@@ -156,8 +156,15 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
 
         self.assertEqual(code, 0, output)
         prompt = cast(str, runner.call_args.args[1])
+        checker_root = Path(behavior_review.__file__).resolve().parents[2]
+        self.assertEqual(runner.call_args.kwargs["cwd"], self.repo)
+        self.assertIn(f"The checker's code root is `{checker_root}`.", prompt)
+        self.assertIn(f"`sys.path.insert(0, {str(checker_root)!r})`", prompt)
+        self.assertIn(f"`{checker_root}/scripts/production/update_registration.py`", prompt)
+        self.assertIn("`from scripts.production import update_registration`", prompt)
+        self.assertIn(f"`{checker_root}/scripts/lib/transcripts.py`", prompt)
+        self.assertIn("`from scripts.lib.transcripts import transcript_lines`", prompt)
         self.assertIn("`with contextlib.closing(transcript_lines(Path(path))) as lines:`", prompt)
-        self.assertIn("Import `transcript_lines` from `scripts.lib.transcripts`.", prompt)
 
     def test_clear_requires_a_saved_reply_for_this_patch_and_each_test(self) -> None:
         args, key = self.changed_range()
@@ -367,6 +374,29 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         _ = self.write(saved, saved.read_text() + "\n")
         self.assertIn("no valid proof", self.cli("check", *args)[1])
         self.assertEqual(self.cli("status", "--key", key)[0], 1)
+
+    def test_split_review_reports_json_blockers_with_and_without_a_source(self) -> None:
+        args, key = self.split_range("VALUE = 'new'\n")
+        blockers = {
+            "test_first.py": {"blocker": "I could not read the transcript."},
+            "test_second.py": {"blocker": "The transcript reader raised ImportError.", "source": "/scripts/lib/transcripts.py"},
+        }
+
+        def review_part(reply: Path, _prompt: str, _log: Path, **_options: object) -> int:
+            test_file = self.part_tests(reply.parent)[0].split("::", 1)[0]
+            payload = json.dumps([blockers[test_file]])
+            _ = self.write(reply, f"```json\n{payload}\n```\nDONE fixture-pass\n")
+            return 0
+
+        with (mock.patch.object(astra_review, "review_attempt_folder", side_effect=lambda: Path(mkdtemp(dir=self.root))),
+              mock.patch.object(astra_review, "run_review", side_effect=review_part)):
+            code, output = self.cli("run", *args)
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("The reviewer could not complete part 1: I could not read the transcript.\n", output)
+        self.assertIn("The reviewer could not complete part 2: The transcript reader raised ImportError.\n", output)
+        self.assertNotIn("Invalid reviewer reply", output)
+        self.assertIs(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
 
     def test_split_review_indexes_a_large_shared_diff(self) -> None:
         args, key = self.split_range(f"VALUE = '{'new' * 1500}'\n")
