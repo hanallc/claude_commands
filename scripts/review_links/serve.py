@@ -3119,7 +3119,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
 
     def finish_bug_evidence(self, created: review_page.PublishedSubmission, request: new_item_dialog.NewItemRequest | None,
                             host: str, screenshot: new_item_dialog.SubmissionScreenshot) -> None:
-        """Save the evidence after the response and delivery."""
+        """Save Bug evidence alongside delivery after an early response."""
         saved = created.saved
         if (request is not None and request.page_state is not None
                 and isinstance(screenshot, new_item_dialog.PageScreenshot)):
