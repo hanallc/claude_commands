@@ -3745,7 +3745,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                              else row_progress((step,), progress.TOKEN_WAIT_REASON)),
                 "queued": False, "keep_text": memory.reason, "group": "", "parts": [],
                 "machine": MAC_LINUX_TARGET if guest_gate else admission_records.execution_host(step, machine),
-                "vcpus": step.guest_vcpus if guest and step.guest_vcpus is not None else queue_view.UnknownCpuCount(),
+                "vcpus": guest.vcpus if guest and isinstance(guest.vcpus, int) else queue_view.UnknownCpuCount(),
                 **call_notes(step.verify, step.step),
                 **job_notes(job, names, step=step.step, verify=step.verify,
                             ci=step.unit in ci_runners)}

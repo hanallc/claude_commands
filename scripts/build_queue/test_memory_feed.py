@@ -1508,7 +1508,8 @@ process.stdout.write($("leftover-rows").innerHTML);
         now = base.explanation.now
         memory = admission_records.GuestMemoryUnavailable() if memory_age is None else admission_records.ConfirmedGuestMemory(
             attempt=memory_attempt, resident_bytes=admission_records.GIB * 3 // 2, read_at=now - memory_age)
-        confirmed = admission_records.ConfirmedGuest("guest-attempt", memory)
+        confirmed = admission_records.ConfirmedGuest("guest-attempt", memory,
+            vcpus if vcpus is not None else admission_records.GuestCpuCountUnavailable())
         guest = GatePlacementStep("gate-session", "fixture gate", "gate", "/fixture/claude_commands", 0,
             admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
             pid=8200, started_at=now - 30, assignment_host="guest-ssh-name", assignment_target="mac-linux",
@@ -1516,11 +1517,11 @@ process.stdout.write($("leftover-rows").innerHTML);
             job=StepJob("gate"), confirmed_guest=confirmed,
             execution=execution_identity.ObservedExecution(execution_identity.GuestExecution(
                 "mac-linux", "guest-attempt", "/home/gate-runner/build/claude/guest/8", "/home/gate-runner")),
-            guest_vcpus=vcpus, counter=progress_profile.ProgressCounter("modules", 7, 12),
+            counter=progress_profile.ProgressCounter("modules", 7, 12),
             placement_candidates=gate_candidates(placement.AllowedHost()))
         # The queue names no Mac placement for an unconfirmed guest attempt.
         pending = replace(guest, pid=8201, started_at=now - unconfirmed_age, mac_placement="",
-                          confirmed_guest=None, guest_vcpus=None,
+                          confirmed_guest=None,
                           execution=execution_identity.ExecutionEvidenceUnavailable("guest has no start record", now))
         running = (guest, pending)
         explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
@@ -1566,6 +1567,17 @@ process.stdout.write($("leftover-rows").innerHTML);
         encoded = cast(dict[str, object], codec.snapshot_value(step))
         self.assertEqual(encoded["confirmed_guest_run"], legacy["confirmed_guest_run"])
         self.assertIsNone(replace(step, confirmed_guest=None).confirmed_guest)
+
+    def test_clearing_guest_confirmation_clears_the_vcpu_count(self) -> None:
+        legacy = cast(dict[str, object], codec.snapshot_value(leftover_step(1)))
+        legacy["confirmed_guest"] = {"kind": "ConfirmedGuest", "attempt": "guest-attempt"}
+        legacy["guest_vcpus"] = 8
+        step = cast(admission_records.RunningStep, codec.parse_snapshot_value(legacy, admission_records.RunningStep))
+        self.assertEqual(step.confirmed_guest, admission_records.ConfirmedGuest("guest-attempt", vcpus=8))
+
+        cleared = cast(dict[str, object], codec.snapshot_value(replace(step, confirmed_guest=None)))
+        self.assertNotIn("guest_vcpus", cleared)
+        self.assertNotIn("confirmed_guest_run", cleared)
 
     def test_guest_vcpu_uses_the_count_recorded_for_its_attempt(self) -> None:
         from scripts.build_queue.test_placement import (

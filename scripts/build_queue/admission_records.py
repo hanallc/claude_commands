@@ -1361,11 +1361,17 @@ class GuestMemoryUnavailable:
 
 
 @dataclass(frozen=True)
+class GuestCpuCountUnavailable:
+    """There is no vCPU count for the confirmed guest attempt."""
+
+
+@dataclass(frozen=True)
 class ConfirmedGuest:
-    """Keep the confirmed attempt with its memory reading."""
+    """Keep the confirmed attempt with its memory reading and vCPU count."""
 
     attempt: str
     memory: ConfirmedGuestMemory | GuestMemoryUnavailable = GuestMemoryUnavailable()
+    vcpus: int | GuestCpuCountUnavailable = GuestCpuCountUnavailable()
 
     def __post_init__(self) -> None:
         if isinstance(self.memory, ConfirmedGuestMemory) and self.memory.attempt != self.attempt:
@@ -1407,13 +1413,15 @@ def publish_guest_cpu_count(sidecar: Path, attempt: str, jobs: int) -> None:
     atomic_sample(progress.progress_path(sidecar, "guest-cpus.json"), json.dumps(record))
 
 
-def read_guest_cpu_count(sidecar: Path, attempt: str) -> int | None:
+def read_guest_cpu_count(sidecar: Path, attempt: str) -> int | GuestCpuCountUnavailable:
     try:
         raw = cast(object, json.loads(progress.progress_path(sidecar, "guest-cpus.json").read_bytes()))
         record = cast(GuestCpuCount, parse_snapshot_value(raw, GuestCpuCount))
     except (OSError, ValueError, TypeError, RecursionError, OverflowError):
-        return None
-    return record["jobs"] if record["attempt"] == attempt and record["jobs"] > 0 else None
+        return GuestCpuCountUnavailable()
+    if record["attempt"] == attempt and record["jobs"] > 0:
+        return record["jobs"]
+    return GuestCpuCountUnavailable()
 
 
 @dataclass(frozen=True)
@@ -1435,7 +1443,6 @@ class RunningStep:
     assignment_target: str = field(default="", kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
     confirmed_guest: ConfirmedGuest | None = field(default=None, kw_only=True)
-    guest_vcpus: int | None = field(default=None, kw_only=True)
     counter: progress.ProgressCounter | progress.NoCounter = field(default_factory=progress.NoCounter, kw_only=True)
     mac_placement: str = field(default="", kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)

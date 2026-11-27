@@ -113,8 +113,11 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
             record = {**record, "identity": ended_step_facts(record.get("identity", {"kind": "HoldPredatesStepFacts"}))}
         elif schema.__name__ == "RunningStep":
             if writing and isinstance(guest := record.get("confirmed_guest"), dict):
-                # Keep the confirmation field for older snapshot readers.
-                record["confirmed_guest_run"] = {"target": "mac-linux", "attempt": cast(dict[str, object], guest)["attempt"]}
+                # Keep the confirmation and count fields for older readers.
+                fields = cast(dict[str, object], guest)
+                record["confirmed_guest_run"] = {"target": "mac-linux", "attempt": fields["attempt"]}
+                if type(vcpus := fields.get("vcpus")) is int:
+                    record["guest_vcpus"] = vcpus
             elif not writing and "confirmed_guest" not in record and (legacy := record.get("confirmed_guest_run")) is not None:
                 if not isinstance(legacy, dict):
                     raise ValueError("invalid confirmed guest attempt")
@@ -123,6 +126,11 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
                 if fields.get("target") != "mac-linux" or not isinstance(attempt, str) or not attempt:
                     raise ValueError("invalid confirmed guest attempt")
                 record = {**record, "confirmed_guest": {"kind": "ConfirmedGuest", "attempt": attempt}}
+            if (not writing and isinstance(guest := record.get("confirmed_guest"), dict)
+                    and type(vcpus := record.get("guest_vcpus")) is int and vcpus > 0):
+                fields = cast(dict[str, object], guest)
+                if "vcpus" not in fields:
+                    record = {**record, "confirmed_guest": {**fields, "vcpus": vcpus}}
     if schema.__module__ == "scripts.build_queue.admission_records" and "running" in record:
         if writing:
             running = record["running"]

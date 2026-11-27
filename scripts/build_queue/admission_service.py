@@ -4058,15 +4058,14 @@ class AdmissionServer:
             sidecar = Path(local.sidecar) if isinstance(local, wire.LocalAdmissionContext) and local.sidecar else None
             counter = progress.read_counter(sidecar) if guest and consumed and sidecar is not None else progress.NoCounter()
             confirmed = None
-            vcpus = None
             if consumed and guest and (isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)
                                        or confirms_guest_run(assignment, evidence)):
                 attempt = assignment.attempt
                 memory = (records.read_guest_memory(sidecar, attempt, now) if sidecar is not None
                           else records.GuestMemoryUnavailable())
-                confirmed = records.ConfirmedGuest(attempt, memory)
-                if sidecar is not None:
-                    vcpus = records.read_guest_cpu_count(sidecar, attempt)
+                vcpus = (records.read_guest_cpu_count(sidecar, attempt) if sidecar is not None
+                         else records.GuestCpuCountUnavailable())
+                confirmed = records.ConfirmedGuest(attempt, memory, vcpus)
             pid: int | records.PidNotRecorded = records.PidNotRecorded()
             if isinstance(evidence, execution_identity.ObservedExecution) and isinstance(evidence.identity, execution_identity.ProcessExecution):
                 pid = evidence.identity.pid
@@ -4077,7 +4076,7 @@ class AdmissionServer:
                 assignment_host=assignment.destination.host, verify=identity.verify,
                 assignment_target=assignment.destination.target if guest else "",
                 placement_candidates=saved.placement_candidates or self._placement_candidate_reading(request),
-                confirmed_guest=confirmed, guest_vcpus=vcpus, counter=counter,
+                confirmed_guest=confirmed, counter=counter,
                 route=request.route if guest else records.DIRECT_CARGO, job=identity.job if guest else GATE_JOB_NOT_RECORDED,
                 mac_placement=f"{assignment.episode}/{assignment.attempt}"
                     if (assignment.destination.provider == "mac" or confirmed is not None

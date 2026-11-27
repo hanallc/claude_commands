@@ -446,7 +446,6 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .kill-buttons button { padding: 7px 14px; border: 1px solid #9c9a92; border-radius: 8px;
   background: transparent; color: inherit; font: inherit; font-weight: 600; cursor: pointer; }
 .kill-buttons [type=submit] { background: #b83126; border-color: #b83126; color: white; }
-.walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .row-add { display: grid; place-items: center; width: 22px; height: 22px;
   padding: 0; border: 1px solid var(--line); border-radius: 5px; background: var(--card); color: var(--ink-2); cursor: pointer; }
 .row-add:is(:hover, :focus-visible) { color: var(--accent); border-color: currentColor; }
@@ -479,7 +478,8 @@ body:not(:has(#review-new-item)) .walk-table .row-action { display: none; }
 /* Narrow the column gaps to keep the chart beside the table. */
 .walk.tight .walk-table { --column-gap: 4px; --machine-icon-width: 24px; --machine-icon-gap: 7px; }
 /* The last machine badge extends 7 px past its icon. */
-.walk.tight .walk-table td.machine:has(> .machine-icon:is([data-badge], :has(> .machine-badge)):last-child) { padding-right: var(--machine-badge-outset); }
+.walk.tight .walk-table td.machine:has(> .machine-icon[data-badge]:last-child,
+  > .machine-icon:last-child > .machine-badge) { padding-right: var(--machine-badge-outset); }
 .walk.has-cap.tight .walk-table :is(th, td):not(:last-child, .machine, .moved) { padding-right: 3px; }
 .walk.has-cap.tight .walk-table .moved { padding-right: 0; }
 .walk.tight .walk-table .row-action { padding-left: 4px; }

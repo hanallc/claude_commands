@@ -117,7 +117,6 @@ function waitForMoveHandle(evaluate, rowId) {
 // With a shot folder, save the Running and Queued card and a crop of the four-icon row.
 async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
   await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-  const columns = {};
   for (const width of [1440, 900]) {
     await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
     await navigate(path);
@@ -189,15 +188,10 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
       const queueHead = walk.querySelector('.walk-table tr.queue-head').getBoundingClientRect();
       return {rows, headers:[...walk.querySelectorAll('thead th, tr.queue-head th')].map(cell => cell.textContent),
         fourFits:iconBoxes.every(box => box.top === iconBoxes[0].top && box.right <= fourBounds.right),
-        columns:[...walk.querySelectorAll('.walk-table thead th')].map(cell => {
-          const {left, width} = cell.getBoundingClientRect();
-          return [left, width];
-        }),
         fourClip:{x:card.left+scrollX,y:queueHead.top+scrollY-4,width:card.width,
           height:fourBounds.bottom-queueHead.top+8,scale:1},
         clip:{x:card.left+scrollX,y:card.top+scrollY,width:card.width,height:card.height,scale:1}};
     })()`);
-    columns[width] = shown.columns;
     assert.ok(shown.fourFits, `The four machine icons do not fit on one line at ${width} px.`);
     if (shotFolder) {
       const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:shown.clip});
@@ -232,11 +226,11 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
         if (mismatches.length) return {mismatches};
         const fourIcons = [...table.querySelectorAll('tr.wait td.machine')]
           .find(cell => cell.querySelectorAll('.machine-icon').length === 4);
+        if (!fourIcons) return {mismatches,fourIcons:false};
         const positions = () => [...table.querySelectorAll('thead th, tr.queue-head th'), fourIcons].map(cell => {
           const {left,width} = cell.getBoundingClientRect();
           return [left,width];
         });
-        if (!fourIcons) return {mismatches,fourIcons:false};
         const right = positions();
         for (const cell of leftBefore) cell.style.textAlign = 'left';
         fitLabels();
@@ -286,7 +280,6 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
         assert.match(row.hover, word(machine), `Orders 3 and 5: the hover of ${where} does not name ${machine}.`);
     }
   }
-  return columns;
 }
 
 async function assertRowCenters(evaluate) {
@@ -826,12 +819,29 @@ try {
           })()`);
           assert.deepEqual(unavailable.slice(1).map(({text,memory}) => [text,memory]),
             [['Used unavailable',null],['Used unavailable',null]]);
+          await call('Emulation.setDeviceMetricsOverride', {width:800,height:1100,deviceScaleFactor:1,mobile:false});
+          const compactBadges = await evaluate(`(() => {
+            fitLabels();
+            return [...document.querySelectorAll('#walk.tight td.machine > .machine-icon:last-child > .machine-badge')]
+              .map(badge => {
+                const icon = badge.parentElement;
+                const cell = icon.parentElement;
+                const padding = parseFloat(getComputedStyle(cell).paddingRight);
+                const outset = badge.getBoundingClientRect().right - icon.getBoundingClientRect().right;
+                return [icon.dataset.machine, outset > 0 && padding >= outset &&
+                  badge.getBoundingClientRect().right <= cell.getBoundingClientRect().right];
+              });
+          })()`);
+          assert.deepEqual(compactBadges, [['mac-linux',true],['aws',true]],
+            'Each SVG badge must fit in its compact Machine cell.');
           if (guestMemoryProof) {
             const path = join(folder, 'after-dark.png');
             await writeFile(path, Buffer.from(shot.data,'base64'));
             console.log(JSON.stringify({pass:true,shot:path,rows:[...measured, waiting]}));
             break browserProof;
           }
+          await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+          await evaluate('fitLabels()');
         }
         if (killProof) {
           const source = structuredClone(base.walk.find(row => row.queued && !row.ci));
