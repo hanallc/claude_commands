@@ -7934,7 +7934,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertTrue(result.detail.endswith(send.UNREVIEWED_FALLBACK))
         marker = send.as_dict(send.loads(self.failure_marker().read_text()))
         self.assertIsNone(marker["action"])
-        self.assertEqual(marker["message"], "No action needed.\nUpdate is ready.")
+        self.assertEqual(marker["message"], "Update is ready.")
         with (mock.patch.object(send, "run", return_value=(1, reviewed, "post failed")),
               mock.patch.object(send, "write_atomic", side_effect=OSError("state unavailable")),
               redirect_stderr(io.StringIO()) as errors):

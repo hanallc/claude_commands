@@ -12,6 +12,7 @@ from dataclasses import dataclass
 FIX = ('Say what the user does with --action "<what they do>", or pass '
        "--no-action when nothing is needed (priority 0 only).")
 REFUSED_BEFORE_SENDING = "refused before sending"
+LEGACY_NO_ACTION_LINE = "No action needed."
 
 _PLACEHOLDERS = frozenset(("none", "n/a", "nothing", "no action", "-"))
 
@@ -90,11 +91,54 @@ def split_session(message: str) -> tuple[NotificationSession, str]:
     return NO_SESSION_LINE, message
 
 
-def first_line(action: UserAction, session: NotificationSession = NO_SESSION_LINE) -> str:
-    """The notification header, with its session when stated."""
+def notification_header(action: UserAction, session: NotificationSession = NO_SESSION_LINE) -> str:
+    """Return the session and action lines when present."""
     if isinstance(action, ActionRequired):
         return session_prefix(session) + f"Action: {action.text}"
-    return session_prefix(session) + "No action needed."
+    return session_prefix(session).removesuffix("\n")
+
+
+_LEADING_BLANK_LINES = re.compile(r"\A(?:[^\S\r\n]*(?:\r\n|[\r\n]))*(?:[^\S\r\n]*\Z)?")
+
+
+def notification_body(action: UserAction, body: str) -> str:
+    """Remove leading blank lines and the old header from a note."""
+    if isinstance(action, ActionRequired):
+        return body
+    body = _LEADING_BLANK_LINES.sub("", body)
+    line, _, rest = body.partition("\n")
+    if line.removesuffix("\r") == LEGACY_NO_ACTION_LINE:
+        return _LEADING_BLANK_LINES.sub("", rest)
+    return body
+
+
+def notification_message(action: UserAction, body: str, session: NotificationSession = NO_SESSION_LINE,
+                         *, header: bool = True) -> str:
+    """Join the header and body when both are present."""
+    body = notification_body(action, body)
+    lines = notification_header(action, session) if header else ""
+    if not lines:
+        return body
+    return f"{lines}\n{body}" if body else lines
+
+
+def read_notification(message: str, header: str | None) -> tuple[UserAction, str, NotificationSession]:
+    """Read the saved header or parse the first lines of a legacy message."""
+    if header is not None:
+        if not header:
+            return NoActionRequired(), message, NO_SESSION_LINE
+        session, action_line = split_session(header)
+        action = ActionRequired(action_line.removeprefix("Action: ")) if action_line.startswith("Action: ") else NoActionRequired()
+        body = "" if message == header else message.removeprefix(header + "\n")
+        return action, body, session
+    session, text = split_session(message)
+    line, _, body = text.partition("\n")
+    if line.removesuffix("\r") == LEGACY_NO_ACTION_LINE:
+        action = NoActionRequired()
+        return action, notification_body(action, text), session
+    if line.startswith("Action: "):
+        return ActionRequired(line.removeprefix("Action: ")), body, session
+    return NoActionRequired(), message, NO_SESSION_LINE
 
 
 # A literal thing to type in a body: "type" or "type:" and its text, or a "! <command>" shell escape.

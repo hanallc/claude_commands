@@ -189,8 +189,8 @@ from scripts.notify import silence  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
-                         UserAction, NoActionRequired, action_conflicts, first_line, named_places, parse_user_action,
-                         SessionLine, split_session, session_prefix, typed_texts)  # noqa: E402
+                         UserAction, NoActionRequired, action_conflicts, named_places, notification_header, notification_message,
+                         parse_user_action, SessionLine, split_session, session_prefix, typed_texts)  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message"
 CLAUDE = Path.home() / ".local" / "bin" / "claude"
@@ -745,7 +745,7 @@ class FailedPush:
     @property
     def message(self) -> str:
         session, body = split_session(self.body)
-        return first_line(self.action, session) + "\n" + body
+        return notification_message(self.action, body, session)
 
     @property
     def text(self) -> str:
@@ -5121,7 +5121,7 @@ def reviewed_waits(options: Options) -> Options:
     outcome = review.review(draft, False, limit=waits_review_seconds(), text_id=AUTO_MODE_TEXT)
     if isinstance(outcome, review.Approved):
         return options
-    header = first_line(draft.action, draft.session)
+    header = notification_header(draft.action, draft.session)
     if outcome.failures and all(failure.quote and (failure.quote in draft.title or failure.quote in header)
                                 for failure in outcome.failures):
         return options
