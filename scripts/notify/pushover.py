@@ -24,9 +24,8 @@ sender is the source; "send.py in hana" shows as "hana". A long body is cut so t
 always fits. A push with no sender is refused and nothing is posted.
 
 While the user's silence is on (silence.py), a push below priority 2 is kept unless it uses --through-silence.
-A kept push prints "pushover: kept: silence until ..." and exits 0, and
-`silence.py off` posts it later. A kept push with the same --key from the same
---source replaces the older kept one.
+A kept push prints "pushover: kept: silence until ..." and exits 0.
+`silence.py off` posts it later. Replacement matches the source, key and Question reference.
 --through-silence preserves review and priority. A normal push does not repeat or need acknowledgement.
 --user-asked sends a requested nate.adhoc push as written. Silence rules still apply.
 
@@ -573,7 +572,7 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
             paid_credit_account: str = "") -> int:
     """Post an already reviewed version, including expiry sends; do not review again.
 
-    During silence a non-empty `key` makes the kept push replace an older kept one from the same source.
+    A keyed push replaces a pending push from the same source only when their Question references match.
     """
     source, priority, title = draft.source, draft.priority, draft.title
     if not key and draft.reference["kind"] == "question":
@@ -735,8 +734,20 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
         message = refresh_paid_credit_action(push, account)
     need = push.get("need") or {"0": "note", "1": "decision", "2": "blocked"}[push["priority"]]
     priority = decision_priority.priority(need, push.get("due", ""))
-    return post_message(push["source"], priority, title, message, keys_file, post, detail,
-                        binding.tag_key if binding is not None else push["key"], push["text_id"])
+
+    def post_once(url: str, data: bytes) -> tuple[int, bytes]:
+        silence.mark_post_started(push)
+        return post(url, data)
+
+    code = 1
+    try:
+        code = post_message(push["source"], priority, title, message, keys_file, post_once, detail,
+                            binding.tag_key if binding is not None else push["key"], push["text_id"])
+        return code
+    finally:
+        if code != 0 and push.get("post_started", False):
+            log(push["source"], priority, title, message, "kept push post unconfirmed",
+                key=push["key"], template=text_id, reference=reference)
 
 
 def post_message(source: str, priority: str, title: str, message: str,

@@ -54,8 +54,8 @@ it reaches them is `user()`'s business: no caller names the channel.
 same recipient inside the window is skipped; `ack` skips every later send with
 the key until `reopen`. A failed send does not count. A delivered send or a
 message kept for later delivery holds the window, so a retry cannot deliver a
-queued copy twice. While the user's silence is on, a
-kept push with the same key from the same sender replaces the older kept one.
+queued copy twice. During silence, a keyed push can replace a pending push from the same sender.
+The key and the Question reference must match.
 `--through-silence` sends a user push during silence. Review and priority stay the same.
 `--user-asked` sends a requested `nate.adhoc` push as written. Silence rules still apply.
 A normal push does not repeat or need acknowledgement.
@@ -106,10 +106,8 @@ message text as one JSON line in STATE/log.jsonl:
         the user to type a go: the detail gives the auto_mode.refused, quota.paid_credits
         (quota.paid_credits_queued when a workers move is queued) or session.needs_go call
         to send instead
-`retire --to user` forgets the key's last send to the user, prints "retired N queued messages", then "dropped N kept pushes": the
-pushes kept during silence with KEY from SENDER (silence.drop), so an obsolete alert never goes out
-when silence ends. Then one line from pushover.py cancel, which stops the emergency (--need blocked)
-push sent with KEY:
+`retire --to user` forgets the key's last send to the user and removes queued and kept copies without a Question reference.
+It prints the counts, then the result of cancelling emergency repeats for KEY.
   cancelled: the emergency push for KEY stopped                 exit 0
   nothing to cancel: no emergency push for KEY is repeating      exit 0
   FAILED: the emergency push for KEY may still repeat: why       exit 3
@@ -1328,8 +1326,12 @@ def _new_queue_row(entry: QueuedMessage) -> ReadableQueueRow:
 
 
 def _matches_queued_key(entry: QueuedMessage, key: str,
-                        recipient: StableRecipient | TransportQueueOwner, *, own_path: bool) -> bool:
-    if entry["key"] != key:
+                        recipient: StableRecipient | TransportQueueOwner, *, own_path: bool,
+                        reference: push_reference.PushReference = push_reference.NO_REFERENCE,
+                        sender: str = "") -> bool:
+    if entry["key"] != key or entry.get("reference", push_reference.NO_REFERENCE) != reference:
+        return False
+    if reference["kind"] == "question" and entry["from"] != sender:
         return False
     if "claude_recipient" in entry or "stable_recipient" in entry:
         owner = _saved_mailbox_key(entry)
@@ -1486,7 +1488,9 @@ def _queue_paths_for_address(to: str, membership: staff.StaffSnapshot | None = N
 def remove_queued_key(to: str, key: str, *,
                       recipient: StableRecipient | TransportQueueOwner = TRANSPORT_QUEUE_OWNER,
                       order: QueueOrder | LegacyQueueOrder = LEGACY_QUEUE_ORDER,
-                      membership: staff.StaffSnapshot | None = None) -> int:
+                      membership: staff.StaffSnapshot | None = None,
+                      reference: push_reference.PushReference = push_reference.NO_REFERENCE,
+                      sender: str = "") -> int:
     """Remove matching copies no newer than the delivered send."""
     paths = _queue_paths_for_address(to, membership)
     removed = 0
@@ -1502,7 +1506,8 @@ def remove_queued_key(to: str, key: str, *,
                 continue
             kept = [entry for entry in entries
                     if isinstance(entry, QueueRowNeedsInspection)
-                    or not (_matches_queued_key(entry.message, key, recipient, own_path=path in paths)
+                    or not (_matches_queued_key(entry.message, key, recipient, own_path=path in paths,
+                                                reference=reference, sender=sender)
                             and _queued_not_newer(entry.message, order))]
             if len(kept) != len(entries):
                 _rewrite_queue(path, kept)
@@ -1550,10 +1555,10 @@ def retire(to: str, sender: str, key: str, *, reference: push_reference.Question
                 saved = _saved_mailbox_key(entry)
                 legacy_owner = (path == direct and "stable_recipient" not in entry and "claude_recipient" not in entry
                                 and not entry["to"].startswith(("uds:", "session:", "staff:")))
-                matched = (entry["key"] == key and entry["from"] == sender and entry.get("reference") == reference
-                           if reference is not None
+                same_opening = entry.get("reference", push_reference.NO_REFERENCE) == (reference or push_reference.NO_REFERENCE)
+                matched = (entry["key"] == key and entry["from"] == sender if reference is not None
                            else entry["key"] == key or entry["key"] is None and entry["from"] == sender)
-                if (saved == owner or legacy_owner) and matched:
+                if (saved == owner or legacy_owner) and same_opening and matched:
                     removed += 1
                 else:
                     kept.append(row)
@@ -5178,8 +5183,8 @@ def parse(argv: list[str]) -> Options:
                             help="to `user` with --need blocked: a shell command that exits 0 when the cause is fixed;"
                             + " the push is then cancelled")
     _ = clears.add_argument("--self-clearing", action="store_true", help=argparse.SUPPRESS)
-    _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue; a kept push to"
-                                           + " the user replaces an older kept one with this key from the same sender"))
+    _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue. During silence,"
+                                           + " replacement matches the sender, key and Question reference."))
     _ = parser.add_argument("--recipient-key", help="stable logical recipient for keyed deduplication across address changes")
     repeat = parser.add_mutually_exclusive_group()
     _ = repeat.add_argument("--repeat-minutes", type=float,
@@ -6328,7 +6333,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                      else tuple(dict.fromkeys((message.to, options.to))))
         for address in addresses:
             _ = remove_queued_key(address, message.key, recipient=attempt_recipient, order=order,
-                                  membership=membership)
+                                  membership=membership, reference=options.reference, sender=message.sender)
     if isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
         if (not refused and held is None and isinstance(claim_result, ClaimGranted)
                 and not isinstance(result, RecordedDeliveryAcceptance)
