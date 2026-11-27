@@ -322,7 +322,7 @@ def sent_question_action(item: review_items.ReviewItem, record: update_registrat
             update_registration.review_sent_question(record, scope, action, words,
                                                     scoped.proof if isinstance(scoped, ScopedWait) else reply_tokens.MINT_REPLY_PROOF)
 
-    delivery = save_delivery(page, record.owner, save, status, change_page.NoQuestion())
+    delivery = save_delivery(page, record.owner, lambda _key: save(), status, change_page.NoQuestion())
     return delivery, {'answer': words, 'question': 'question sent', 'feedback': 'feedback sent'}[action]
 
 
@@ -400,6 +400,16 @@ class NoActionFeedbackReceipt:
     """The request has no saved action or feedback."""
 
 
+@dataclass(frozen=True)
+class ReviewActionWordsDelivery:
+    key: str
+
+
+@dataclass(frozen=True)
+class NoReviewActionWordsDelivery:
+    """The action has no words to send."""
+
+
 def action_feedback_page(status: change_page.DeliveryStatus, key: str, action: str, words: str,
                          revision: str, until: str) -> change_page.ReviewPage:
     """Use the form identity even if the action removes the Review card."""
@@ -422,13 +432,18 @@ def retry_action_feedback(status: change_page.DeliveryStatus, key: str, action: 
         answer = stored.saved['action_feedback']['answer']
         if stored.delivery_confirmed():
             return change_page.NoMessageDelivery(), answer
-        intent = status.slots(stored, row).verdict
+        slots = status.slots(stored, row)
+        intent = slots.verdict
         if not isinstance(intent, change_page.DeliveryIntent):
             return NoActionFeedbackReceipt()
-        if not stored.saved['saved'] and not status.has_review_save_receipt(stored, row, intent):
-            raise OSError("The Review action save is unconfirmed.")
         if status.owns_live_claim(stored, row, intent.attempt):
             raise OSError("The Review words are still sending.")
+        save_state = status.review_save_state(stored, row, intent)
+        if save_state is change_page.ReviewMessageSaveState.NOT_SAVED:
+            status.clear_locked(stored, row, slots, 'verdict')
+            return NoActionFeedbackReceipt()
+        if save_state is change_page.ReviewMessageSaveState.UNKNOWN:
+            raise OSError("The Review action save is unconfirmed.")
         status.request_attempts[intent.attempt] = change_page.AttemptOwnership(status.path(stored, row), 'claimed')
         if not stored.saved['saved']:
             stored = replace(stored, saved={**stored.saved, 'saved': True})
@@ -438,21 +453,26 @@ def retry_action_feedback(status: change_page.DeliveryStatus, key: str, action: 
 
 
 def save_action_feedback(item: review_items.ReviewItem, action: str, label: str, words: str,
-                         save: Callable[[], str], status: change_page.DeliveryStatus, *,
+                         save: Callable[[ReviewActionWordsDelivery | NoReviewActionWordsDelivery], str],
+                         status: change_page.DeliveryStatus, *,
                          revision: str, until: str = '') -> ActionFeedbackResult:
     """Save the action and send its words without replacing an open question."""
     words = new_item_dialog.optional_feedback(words)
     if not words or not item.owner:
-        return change_page.NoMessageDelivery(), save()
+        return change_page.NoMessageDelivery(), save(NoReviewActionWordsDelivery())
     page = action_feedback_page(status, item.key, action, words, revision, until)
     message = new_item_dialog.append_feedback(f'Review {item.id}: {label}\n{item.title}', words)
     feedback: change_page.ReviewActionFeedback = {'answer': '', 'delivered': False}
+    source = item.source
+    if action == 'read' and isinstance(source, review_items.InvestigationSource):
+        feedback['answer'] = 'marked read'
+        feedback['mark_read'] = {'path': str(source.path)}
     record: change_page.StoredReviewMessage = {
         'saved': False, 'source': str(page.review_list), 'owner': item.owner, 'message': message,
         'row': page.rows[0], 'action_feedback': feedback,
     }
-    def save_answer() -> None:
-        feedback['answer'] = save()
+    def save_answer(key: str) -> None:
+        feedback['answer'] = save(ReviewActionWordsDelivery(key))
 
     with status.locked():
         previous = retry_action_feedback(status, item.key, action, words, revision, until)
@@ -468,7 +488,7 @@ def later_action(item: review_items.ReviewItem, value: str, words: str, status: 
                  verify_revision: Callable[[], object] | None = None, root: Path | None = None,
                  feedback_revision: str = '') -> ActionFeedbackResult:
     return save_action_feedback(item, 'later', 'Later', words,
-        lambda: later(item, value, words, verify_revision=verify_revision, root=root), status,
+        lambda _delivery: later(item, value, words, verify_revision=verify_revision, root=root), status,
         revision=feedback_revision, until=value)
 
 
@@ -490,7 +510,7 @@ def send(item: review_items.ReviewItem, path: Path, row: str, message: str, save
         question = change_page.OpenQuestion(identity, question_text, change_page.NoDelivery())
         saved['message'] = message.replace(change_page.reply_command(item.key), reply)
     page = change_page.ReviewMessagePage(path,path.parent,(row,),'',saved)
-    return save_delivery(page, recipient, save, status, question)
+    return save_delivery(page, recipient, lambda _key: save(), status, question)
 
 
 class SubmissionDeliveryPending(OSError):
@@ -771,7 +791,7 @@ def recover_submission_deliveries(status: change_page.DeliveryStatus, review_pat
 
 
 def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestionPage, owner: staff.StaffId,
-                  save: Callable[[], object], status: change_page.DeliveryStatus,
+                  save: Callable[[str], object], status: change_page.DeliveryStatus,
                   question: change_page.NoQuestion | change_page.OpenQuestion) -> change_page.MessageDelivery:
     row = page.rows[0]
     with status.locked():
@@ -783,7 +803,7 @@ def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestion
         status.write_slots(page,row,slots)
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page,row),'claimed')
         try:
-            _ = save()
+            _ = save(change_page.review_delivery_key(page.review_list, row, attempt))
         except BaseException:
             status.write_slots(previous_page, row, previous_slots)
             raise
@@ -800,6 +820,30 @@ def message_text(item: review_items.ReviewItem, action: str, words: str) -> str:
     return message
 
 
+def save_investigation_read_with_words(source: review_items.InvestigationSource, words: str,
+                                       delivery: ReviewActionWordsDelivery, *, waiting: bool,
+                                       check: Callable[[], object] | None) -> None:
+    """Save Mark read and its delivery key in one native write."""
+    before = source.record
+    store = investigation.Investigations(before.owner, "investigations", "I", "investigation",
+                                          investigation.InvestigationError)
+    with store.locked(check=check):
+        path = investigation.review_record_path(before.owner, before.id)
+        current = investigation.read_review_record(path)
+        if current.belongs_on_list:
+            raise investigation.InvestigationError("Open the report on the List.")
+        expected = investigation.InvestigationState.OPEN if waiting else investigation.InvestigationState.ANSWER_READY
+        if current.state != expected or current.submission != before.submission or current.filed != before.filed:
+            raise investigation.InvestigationError("The selected investigation changed.")
+        moment = datetime.now(user_zone() if waiting else UTC)
+        stamp = moment.isoformat()
+        event = review_events.ReviewLog(moment, "nate", "Marked read: " + words, feedback_request_id=delivery.key)
+        updated = replace(current, state=investigation.InvestigationState.READ,
+                          answered=current.answered or stamp, read=stamp, log=(*current.log, event))
+        # Use the native writer for the record and its submission fields.
+        _ = investigation._save(store, updated, path)  # pyright: ignore[reportPrivateUsage]
+
+
 def investigation_action(item: review_items.ReviewItem, action: str, words: str,
                          status: change_page.DeliveryStatus, *,
                          verify_revision: Callable[[], object] | None = None, feedback_revision: str = ''
@@ -813,23 +857,23 @@ def investigation_action(item: review_items.ReviewItem, action: str, words: str,
               if action == 'question' and isinstance(record.submission, new_item_dialog.ReviewSubmission) else NO_SCOPED_WAIT)
     if action != 'read' and not words.strip():
         raise investigation.InvestigationError('enter your words')
-    def save() -> None:
-        if waiting:
-            if isinstance(scoped, ScopedWait):
-                _ = investigation.review_action(record.owner, record.id, action, words, new_reply_proof=scoped.proof, check=verify_revision)
-            else:
-                investigation.change_waiting(record, action, words, check=verify_revision)
-            with review_items.after_store_write(item.key):
-                record_superseded(item, action)
+    def save(delivery: ReviewActionWordsDelivery | NoReviewActionWordsDelivery) -> None:
+        if isinstance(delivery, ReviewActionWordsDelivery):
+            save_investigation_read_with_words(source, words, delivery, waiting=waiting, check=verify_revision)
         elif isinstance(scoped, ScopedWait):
             _ = investigation.review_action(record.owner, record.id, action, words, new_reply_proof=scoped.proof, check=verify_revision)
+        elif waiting:
+            investigation.change_waiting(record, action, words, check=verify_revision)
         elif action == 'read':
             _ = investigation.mark_read(record.owner, record.id, words, check=verify_revision)
         else:
             _ = investigation.review_action(record.owner, record.id, action, words, check=verify_revision)
+        if waiting:
+            with review_items.after_store_write(item.key):
+                record_superseded(item, action)
     if action == 'read':
-        def mark_read() -> str:
-            save()
+        def mark_read(delivery: ReviewActionWordsDelivery | NoReviewActionWordsDelivery) -> str:
+            save(delivery)
             with review_items.after_store_write(item.key):
                 clear_wait(item, status)
             return 'marked read'
@@ -838,7 +882,7 @@ def investigation_action(item: review_items.ReviewItem, action: str, words: str,
     if action == 'question':
         message += '\nAnswer with this command:\n'+change_page.reply_command(item.key)
     path = source.path
-    delivery = send(item,path,record.id,message,save,status,recipient=item.owner,
+    delivery = send(item,path,record.id,message,lambda: save(NoReviewActionWordsDelivery()),status,recipient=item.owner,
                     question_text=words if action == 'question' else '', scoped=scoped)
     return delivery,('question sent' if action == 'question' else 'feedback sent')
 
@@ -883,7 +927,7 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
     if isinstance(source, review_items.EfficiencySource):
         identity = decision_store.efficiency_identity(item)
         if action == 'decline':
-            def decline() -> str:
+            def decline(_delivery: ReviewActionWordsDelivery | NoReviewActionWordsDelivery) -> str:
                 try:
                     with efficiency_reviews.ledger_lock(source.path, check=verify_revision):
                         _ = candidates.record_outcome(identity,'declined','',source.path)

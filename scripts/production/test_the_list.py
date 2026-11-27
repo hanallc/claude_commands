@@ -2380,6 +2380,31 @@ the_list.fire_scheduled(timedelta(minutes=2))
         self.assertEqual(self.top_items(), (staff.TopItem(second.number), staff.NoTopItem()))
         self.assertEqual(the_list.load(MORTY.id, second.id), second)
 
+    def test_priority_words_are_prepared_before_the_staff_write(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        request = "fixture-priority"
+        words = "Keep these words."
+        settle = staff.settle_priority_request
+
+        def inspect(key: staff.PriorityRequestKey, command: staff.ApplyPriorityRequest | staff.RefuseUnappliedPriority
+                    ) -> staff.PriorityRequestOutcome:
+            saved = the_list.action_words_notice(the_list.load(MORTY.id, item.id), request)
+            assert isinstance(saved, the_list.PageFeedback)
+            assert isinstance(saved.priority, the_list.PriorityWordsRequest)
+            self.assertIs(saved.priority.save, the_list.PriorityWordsSave.PREPARED)
+            self.assertFalse(saved.can_deliver())
+            self.assertEqual(saved.form_words, words)
+            self.assertEqual(saved.recipient_id(MORTY.id), OTHER.id)
+            self.assertTrue(saved.priority.delivery_key == key)
+            return settle(key, command)
+
+        with patch.object(staff, "settle_priority_request", side_effect=inspect) as native:
+            result = the_list.save_priority_words(MORTY.id, item.id, request, words)
+        native.assert_called_once()
+        self.assertTrue(result.new_request)
+        self.assertTrue(result.notice.can_deliver())
+        self.assertEqual(self.top_items(), (staff.TopItem(item.number), staff.NoTopItem()))
+
     def test_make_top_priority_refuses_a_closed_unknown_or_other_producer_item(self) -> None:
         closed = self.add(changes={"producer": OTHER.id})
         _ = the_list.close(MORTY.id, closed.id, "Done", source="fixture")

@@ -207,14 +207,14 @@ def mark_reported(root: Path, go_id: str, recipients: Iterable[staff.StaffId]) -
 
 
 def unsent(root: Path) -> tuple[str, ...]:
-    """Find each Go whose message did not reach every recipient."""
+    """Find each Go with an unsent message or unconfirmed words."""
     found: list[str] = []
     for path in sorted((root / LEDGER_FOLDER).glob("*.json")):
         try:
             entry = read(root, path.stem)
         except (OSError, ValueError):
             continue
-        if not all(entry["sent"].values()):
+        if not all(entry["sent"].values()) or entry.get("words_unconfirmed"):
             found.append(entry["go_id"])
     return tuple(found)
 
