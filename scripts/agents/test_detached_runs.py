@@ -7397,6 +7397,46 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.inputs), 1)
         self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], f"sent: worker {row.name} at {pane}")
 
+    def test_supervisor_alerts_the_director_when_a_busy_worker_retires(self) -> None:
+        row = self.fixture.worker(family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        self.fixture.world.locations[pane]["agent_status"] = "working"
+        record = self.record(row, "retired-before-retry")
+        record["pane_dispatch_id"] = ""
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+
+        def retire_worker(_seconds: float) -> None:
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual((saved["status"], saved["delivery"]), ("finished", detached_runs.BUSY_WORKER_RESULT))
+            self.fixture.world.remove_pane(pane)
+            self.assertIsNotNone(staff.retire(row.id))
+
+        def receive_alert(options: send.Options) -> send.Result:
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved["push_alert_delivery"], saved["delivery"])
+            self.assertEqual(options.to, self.fixture.parent.id)
+            self.assertEqual(options.key, f"detached-result-alert:{path.stem}")
+            self.assertTrue(options.once_per_key)
+            self.assertIn("exit 7", options.text or "")
+            self.assertIn(row.name, options.text or "")
+            return send.Result("sent", "director received the alert")
+
+        with (patch.object(detached_runs, "_run", return_value=7),
+              patch.object(time, "sleep", side_effect=retire_worker) as delay,
+              patch.object(send, "send", side_effect=receive_alert) as alert):
+            _ = detached_runs.main(["supervise", str(path)])
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        alert.assert_called_once()
+        delay.assert_called_once_with(5)
+        self.assertEqual(self.inputs, [])
+        self.assertEqual(self.notices, [])
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertIs(saved["push_alert_attempted"], True)
+        self.assertNotIn("push_alert_delivery", saved)
+        self.assertNotIn("push_retries", saved)
+
     def test_supervisor_retries_a_self_stop_after_the_workers_pane_closes(self) -> None:
         row = self.fixture.worker(family="codex")
         pane = "w1:p1"

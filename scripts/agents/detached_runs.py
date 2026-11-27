@@ -2723,6 +2723,9 @@ def _prepare_result_delivery(record: RunRecord, result: CommandResult, *,
                 not self_stop or membership.by_id(staff.StaffId(record["staff_id"])) is not None):
             if _result_push_failed(saved) and not _pane_submission_not_started(saved):
                 return saved
+            if (not self_stop and current_record["status"] == "finished"
+                    and _worker_result_pending(saved) and saved != ORPHAN_RESULT_PENDING):
+                return _save_delivery(path, FAILED_RESULT_PUSH + member.reason, if_current=saved, stage_push_alert=True)
             print(f"anomaly: {member.reason}", file=sys.stderr)
             return _save_delivery(path, "finished: worker retired")
         checkpoint = UNCONFIRMED_RESULT_PUSH + "the send did not record an outcome"
@@ -3018,7 +3021,7 @@ class KeepWorkerResultReceipt(Enum):
     EXISTING = "retain the saved receipt"
 
 
-def _save_delivery(path: Path, delivery: str, *, if_current: str | None = None,
+def _save_delivery(path: Path, delivery: str, *, if_current: str | None = None, stage_push_alert: bool = False,
                    worker_result_receipt: WorkerResultReceipt | KeepWorkerResultReceipt = KeepWorkerResultReceipt.EXISTING,
                    ) -> str:
     with record_lock(path):
@@ -3031,6 +3034,8 @@ def _save_delivery(path: Path, delivery: str, *, if_current: str | None = None,
         if _result_delivery_accepted(delivery):
             _ = record.pop("push_alert_delivery", None)
         record["delivery"] = delivery
+        if stage_push_alert and _can_alert_failed_push(record) and not record.get("push_alert_delivery"):
+            record["push_alert_delivery"] = delivery
         if _needs_pane_input_retry(record) or _awaits_pane_receipt(record):
             record["completion_pending"] = True
         if isinstance(worker_result_receipt, WorkerResultReceipt):
