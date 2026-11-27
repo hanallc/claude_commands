@@ -152,11 +152,14 @@ class DetachedRunsTests(unittest.TestCase):
                                                  side_effect=deliver_in_fixture))
 
     def record_worker(self, name: str, thread_id: str) -> staff.StaffRow:
-        fixture_session(thread_id, staff.CodexBackend(self.root / "codex-home"))
+        codex_home = self.root / "codex-home"
+        fixture_session(thread_id, staff.CodexBackend(codex_home))
         rows = [row for row in staff.find(kind="worker", parent=self.unit.id) if row.name == name]
         if rows:
-            return staff.update_current_session(rows[0].current_session, staff.native_id(thread_id))
-        return staff.ensure_worker(staff.native_id(thread_id), name, self.unit.id)
+            row = staff.update_current_session(rows[0].current_session, staff.native_id(thread_id))
+        else:
+            row = staff.ensure_worker(staff.native_id(thread_id), name, self.unit.id)
+        return staff.set_home(row.id, staff.SessionHome(codex_home))
 
     def pending(self) -> dict[str, object]:
         path = session_staff.inbox_path(self.worker_id)
