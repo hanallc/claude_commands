@@ -2079,6 +2079,163 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_studio_rechecks_an_unavailable_question_route_after_the_keeper_returns(self) -> None:
         self.check_studio_question_route_recovery(save_fallback=False)
 
+    def test_studio_active_keeper_reuses_the_legacy_row_after_repair(self) -> None:
+        self.check_studio_legacy_row_read_failure("invalid row")
+
+    def test_studio_active_keeper_defers_after_a_filesystem_read_error(self) -> None:
+        self.check_studio_legacy_row_read_failure("read error")
+
+    def check_studio_legacy_row_read_failure(self, failure: Literal["invalid row", "read error"]) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        review_key = review_items.submission_review_key(saved)
+        number = the_list.add_review_item(keeper.id, "Choose a layout", owner=owner.id, producer=owner.id, unit="",
+            words=saved.words, evidence=review_page.PAGE_PATH + "#" + urlencode({"jump": review_key}),
+            review_key=review_key, source="nate via New item", reservation=self.root / "legacy-number")
+        identity = f"L{number}"
+        folder = the_list.folder(keeper.id)
+        row = folder / f"{identity}.md"
+        before = row.read_bytes()
+        counter = (folder / ".next-number").read_bytes()
+        original_route = route.read_bytes()
+        original_question = saved.path.read_bytes()
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        restarted = change_page.DeliveryStatus(case.root)
+        if failure == "invalid row":
+            _ = row.write_bytes(b"Invalid List row.\n")
+        failing_read = (patch.object(the_list, "load", side_effect=PermissionError("The row read failed."))
+                        if failure == "read error" else nullcontext())
+        with (new_item_notice_log(self.root, keeper.id) as log,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            with failing_read, redirect_stderr(StringIO()) as errors:
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_not_called()
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            self.assertIn("Incomplete List destination check", errors.getvalue())
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(route.read_bytes(), original_route)
+            self.assertEqual(saved.path.read_bytes(), original_question)
+            self.assertEqual((folder / ".next-number").read_bytes(), counter)
+            self.assertEqual(list(folder.glob("L*.md")), [row])
+            self.assertFalse(reservation.exists())
+            self.assertEqual(read_new_item_notices(log), [])
+            self.assertEqual(row.read_bytes(), b"Invalid List row.\n" if failure == "invalid row" else before)
+            _ = row.write_bytes(before)
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        item, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(item.id, identity)
+        self.assertEqual(item.native_question, the_list.NativeQuestionItem(
+            the_list.QuestionItemKind.FROM_NATE, f"submission/question/{saved.request_id}"))
+        self.assertEqual((folder / ".next-number").read_bytes(), counter)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [identity])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_studio_defers_fallback_for_a_broken_list_folder_symlink(self) -> None:
+        case = self.review_fixture()
+        keeper = fixture_member("producer", name="recovering-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        before = route.read_bytes()
+        original = saved.path.read_bytes()
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        folder = the_list.folder(keeper.id)
+        folder.parent.mkdir(parents=True, exist_ok=True)
+        target = self.root / "missing-list-folder"
+        folder.symlink_to(target, target_is_directory=True)
+        _ = staff.set_producer_retirement(keeper.id, staff.RetiredProducer("claude:sonnet:high"))
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()) as errors,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_not_called()
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            self.assertIn("Incomplete List destination check", errors.getvalue())
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(route.read_bytes(), before)
+            self.assertEqual(saved.path.read_bytes(), original)
+            self.assertFalse(reservation.exists())
+            self.assertEqual(folder.readlink(), target)
+            self.assertFalse(target.exists())
+            self.assertEqual(read_new_item_notices(log), [])
+            target.mkdir()
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.NoListFiling)
+        self.assertEqual(list(target.iterdir()), [])
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_studio_preserves_a_broken_reserved_row_symlink(self) -> None:
+        self.check_studio_reserved_row_recovery("broken symlink")
+
+    def test_studio_resumes_a_valid_reservation_with_no_row(self) -> None:
+        self.check_studio_reserved_row_recovery("absent row")
+
+    def check_studio_reserved_row_recovery(self, failure: Literal["broken symlink", "absent row"]) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        before = route.read_bytes()
+        original = saved.path.read_bytes()
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()) as errors,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            with patch.object(the_list, "_save", side_effect=OSError("The row write stopped.")):
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_not_called()
+            number = the_list.reserved_review_number(reservation)
+            assert isinstance(number, int)
+            folder = the_list.folder(keeper.id)
+            counter = (folder / ".next-number").read_bytes()
+            row = folder / f"L{number}.md"
+            self.assertEqual(list(folder.glob("L*.md")), [])
+            if failure == "broken symlink":
+                target = self.root / "missing-list-row.md"
+                row.symlink_to(target)
+                _ = errors.truncate(0)
+                _ = errors.seek(0)
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                claim.assert_not_called()
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn("Incomplete List destination check", errors.getvalue())
+                self.assertEqual(row.readlink(), target)
+                self.assertFalse(target.exists())
+                row.unlink()
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(route.read_bytes(), before)
+            self.assertEqual(saved.path.read_bytes(), original)
+            self.assertEqual((folder / ".next-number").read_bytes(), counter)
+            self.assertEqual(the_list.reserved_review_number(reservation), number)
+            self.assertEqual(read_new_item_notices(log), [])
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        item, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(item.number, number)
+        self.assertEqual(item.native_question, the_list.NativeQuestionItem(
+            the_list.QuestionItemKind.FROM_NATE, f"submission/question/{saved.request_id}"))
+        self.assertEqual((folder / ".next-number").read_bytes(), counter)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [item.id])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
     def test_studio_rechecks_a_skipped_question_route_before_the_first_claim(self) -> None:
         self.check_studio_question_route_recovery(save_fallback=True)
 

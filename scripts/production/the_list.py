@@ -15,6 +15,7 @@ import re
 import secrets
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -2194,9 +2195,7 @@ def _checked_item(identity: str, item: ListItem) -> ListItem:
 def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[str, str], body: str) -> ListItem:
     try:
         if "question_kind" in fields and "question_source_key" not in fields:
-            row = _read_keyless_question(store, identity, fields, body)
-            print(f"List question conversion for {store.owner}/{identity}: no saved source key.", file=sys.stderr)
-            return row.item
+            return _read_keyless_question(store, identity, fields, body).item
         exchanges = list_exchange.decode(fields.get("filed_exchanges", "[]"))
         origin = _read_native_question(fields, exchanges)
         return _checked_item(identity, _decode_item(store, fields, body, exchanges, origin))
@@ -2291,25 +2290,55 @@ def _save(store: record_store.NumberedRecords, item: ListItem, *, previous_produ
         store.write(item.id, fields, body)
 
 
-class ListRead(StrEnum):
-    SKIP_INVALID = "omit invalid rows from the List"
-    REQUIRE_COMPLETE = "require every List row to be readable"
-
-
-def records(keeper: staff.StaffId, *, include_closed: bool = False, sources: list[Path] | None = None,
-            read: ListRead = ListRead.SKIP_INVALID) -> list[ListItem]:
-    def require_row(identity: str) -> ListItem:
-        try:
-            return load(keeper, identity)
-        except (ListError, OSError) as error:
-            raise OSError(f"{keeper}/{identity}: {error}") from error
-
-    if read is ListRead.REQUIRE_COMPLETE:
-        # The source collector also reports directory read errors.
-        items = _store(keeper).records(require_row, sources=[] if sources is None else sources)
-    else:
-        items = _store(keeper).records(lambda identity: load(keeper, identity), sources=sources)
+def records(keeper: staff.StaffId, *, include_closed: bool = False,
+            sources: list[Path] | None = None) -> list[ListItem]:
+    """Read the available rows for display."""
+    items = _store(keeper).records(lambda identity: load(keeper, identity), sources=sources)
+    for item in items:
+        if isinstance(item.keyless_question_kind, QuestionItemKind):
+            print(f"List question conversion for {keeper}/{item.id}: no saved source key.", file=sys.stderr)
     return sorted((item for item in items if include_closed or item.state != ItemState.CLOSED), key=lambda item: item.number)
+
+
+class IncompleteListScan(OSError):
+    """A destination check could not read the whole List."""
+
+
+@dataclass(frozen=True)
+class ScannedListRow:
+    keeper: staff.StaffId
+    item: ListItem
+
+    @property
+    def destination(self) -> investigation.ListDestination:
+        return investigation.ListDestination(self.keeper, self.item.number)
+
+
+def scan_list_records() -> tuple[ScannedListRow, ...]:
+    """Read all List rows or raise one error if any row or folder fails."""
+    rows: list[ScannedListRow] = []
+    path = record_store.state_root()
+    location = str(path)
+    try:
+        if not record_store.saved_path_exists(path):
+            return ()
+        for owner in sorted(path.iterdir()):
+            location = str(owner)
+            if not stat.S_ISDIR(owner.lstat().st_mode):
+                continue
+            keeper = staff.StaffId(owner.name)
+            path = folder(keeper)
+            location = str(path)
+            if not record_store.saved_path_exists(path):
+                continue
+            for row in sorted(path.iterdir()):
+                if row.name.startswith("L") and row.suffix == ".md":
+                    location = f"{keeper}/{row.stem}"
+                    rows.append(ScannedListRow(keeper, load(keeper, row.stem)))
+    except (OSError, ListError) as error:
+        detail = " ".join(str(error).splitlines())
+        raise IncompleteListScan(f"{location}: {detail}") from error
+    return tuple(rows)
 
 
 def _producer_records(keeper: staff.StaffId, producer: staff.StaffId, *, include_closed: bool) -> ProducerListRead:
@@ -2515,14 +2544,36 @@ def reserved_review_number(path: Path) -> int | NextNumber:
     try:
         value = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
+        if record_store.saved_path_exists(path):
+            raise
         return NextNumber.AVAILABLE
     if not re.fullmatch(r"[1-9][0-9]*", value):
         raise ListError(f"{path}: invalid List number reservation")
     return int(value)
 
 
+def _review_source_rows(rows: tuple[ScannedListRow, ...], key: str) -> set[investigation.ListDestination]:
+    return {row.destination for row in rows if key in row.item.reviews or original_question_link(row.item) == key
+            or isinstance(row.item.report, ListReport) and row.item.report.evidence_key == key}
+
+
+def review_fallback_destination(key: str) -> investigation.ListDestination | investigation.NoListDestination:
+    """Check for a Review row before the caller saves a fallback under the List lock."""
+    matches = _review_source_rows(scan_list_records(), key)
+    if len(matches) > 1:
+        raise ListError("The Review source has two List destinations.")
+    return next(iter(matches)) if matches else investigation.NoListDestination.ABSENT
+
+
 def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, producer: staff.StaffId,
                     unit: str, words: str, evidence: str, review_key: str, source: str, reservation: Path) -> int:
+    return file_review_item(keeper, title, owner=owner, producer=producer, unit=unit, words=words, evidence=evidence,
+                            review_key=review_key, source=source, reservation=reservation).number
+
+
+def file_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, producer: staff.StaffId,
+                     unit: str, words: str, evidence: str, review_key: str, source: str,
+                     reservation: Path) -> investigation.ListDestination:
     """Reserve a number for this Review filing and publish its List row."""
     if review_key.startswith("investigation/"):
         try:
@@ -2535,33 +2586,47 @@ def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, 
                 path = investigation.review_record_path(record.owner, record.id)
                 def finish_report(current: investigation.Investigation) -> investigation.ListDestination:
                     report = report_from_investigation(current, report_kind, review_key)
-                    number = file_report(keeper, report, current.title, owner=owner, producer=producer, unit=unit,
-                                         source=source, reservation=reservation)
-                    return investigation.ListDestination(keeper, number)
+                    return file_report(keeper, report, current.title, owner=owner, producer=producer, unit=unit,
+                                       source=source, reservation=reservation)
 
                 record = investigation.file_on_list(path, finish_report)
                 assert isinstance(record.list_destination, investigation.ListDestination)
-                return record.list_destination.number
+                return record.list_destination
     store = _store(keeper)
-    number = reserved_review_number(reservation)
-    if isinstance(number, int) and store.path(f"L{number}").is_file():
-        sync_folder(store.folder())
-        return number
-    with _list_allocation(store):
+    with record_store.list_destination_lock():
+        rows = scan_list_records()
         number = reserved_review_number(reservation)
-        if isinstance(number, int) and store.path(f"L{number}").is_file():
-            sync_folder(store.folder())
-            return number
-        chosen = store.next_number() if isinstance(number, NextNumber) else number
-        item = _new_item(chosen, title, owner, keeper, source,
-                         {"producer": producer, "unit": unit, "latest_status": words, "evidence": evidence},
-                         reviews=(review_key,))
-        _require_active_open_producers((item,))
-        if isinstance(number, NextNumber):
-            store.reserve_number(chosen)
-            write_text_atomic(reservation, f"{chosen}\n", new_file_mode=0o600)
-        _save(store, item)
-        return chosen
+        matches = _review_source_rows(rows, review_key)
+        if isinstance(number, int):
+            matches.add(investigation.ListDestination(keeper, number))
+        if len(matches) > 1:
+            raise ListError("The Review source has two List destinations.")
+        if matches:
+            destination, = matches
+            store = _store(destination.keeper)
+            number = destination.number
+            identity = f"L{number}"
+            if record_store.saved_path_exists(store.path(identity)):
+                item = load(destination.keeper, identity)
+                if review_key not in item.reviews and original_question_link(item) != review_key and not (
+                        isinstance(item.report, ListReport) and item.report.evidence_key == review_key):
+                    raise ListError(f"{identity}: the Review reservation names a different item")
+                if destination.keeper == keeper and isinstance(reserved_review_number(reservation), NextNumber):
+                    write_text_atomic(reservation, f"{number}\n", new_file_mode=0o600)
+                sync_folder(store.folder())
+                return destination
+        lock = _list_allocation(store) if isinstance(number, NextNumber) else store.locked()
+        with lock:
+            chosen = store.next_number() if isinstance(number, NextNumber) else number
+            item = _new_item(chosen, title, owner, keeper, source,
+                             {"producer": producer, "unit": unit, "latest_status": words, "evidence": evidence},
+                             reviews=(review_key,))
+            _require_active_open_producers((item,))
+            if isinstance(number, NextNumber):
+                store.reserve_number(chosen)
+                write_text_atomic(reservation, f"{chosen}\n", new_file_mode=0o600)
+            _save(store, item)
+            return investigation.ListDestination(keeper, chosen)
 
 
 class QuestionFiling(Enum):
@@ -2758,6 +2823,8 @@ def _exchange_reservation(path: Path) -> ExchangeDestination | NextNumber:
     try:
         value = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
+        if record_store.saved_path_exists(path):
+            raise
         return NextNumber.AVAILABLE
     mode, separator, location = value.partition(" ")
     keeper, list_prefix, number = location.partition("/L")
@@ -2786,7 +2853,7 @@ def exchange_reservation(key: str) -> ExchangeDestination | NextNumber:
 def exchange_filing_started(key: str) -> bool:
     """Check for changes or receipts from an earlier List filing."""
     path = _exchange_path(key)
-    return path.with_suffix(".pending").exists() or path.with_suffix(".saved").exists()
+    return any(record_store.saved_path_exists(path.with_suffix(suffix)) for suffix in (".pending", ".saved"))
 
 
 @dataclass(frozen=True)
@@ -2799,14 +2866,17 @@ class LockedExchangeSource:
 def lock_exchange_source(key: str) -> Generator[LockedExchangeSource]:
     reservation = _exchange_path(key)
     reservation.parent.mkdir(parents=True, exist_ok=True)
-    with exclusive(reservation.with_suffix(".lock")):
+    with exclusive(reservation.with_suffix(".lock")), record_store.list_destination_lock():
         yield LockedExchangeSource(key, reservation)
 
 
 def _read_pending_exchanges(reservation: Path) -> tuple[list_exchange.FiledExchange, ...]:
+    path = reservation.with_suffix(".pending")
     try:
-        return list_exchange.decode(reservation.with_suffix(".pending").read_text(encoding="utf-8"))
+        return list_exchange.decode(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
+        if record_store.saved_path_exists(path):
+            raise
         return ()
 
 
@@ -2825,12 +2895,8 @@ def exchange_history(key: str) -> tuple[list_exchange.FiledExchange, ...]:
     if isinstance(destination, ExchangeDestination):
         keeper, identity = destination.destination.keeper, f"L{destination.destination.number}"
         path = _store(keeper).path(identity)
-        try:
+        if record_store.saved_path_exists(path):
             row = load(keeper, identity)
-        except ListError:
-            if path.exists():
-                raise
-        else:
             saved = tuple(exchange for exchange in row.filed_exchanges if exchange.source_key == key)
     return combine_exchange_history(saved, _read_pending_exchanges(reservation))
 
@@ -2858,6 +2924,8 @@ def confirmed_exchanges(key: str, destination: investigation.ListDestination,
     try:
         receipt = set(path.read_text(encoding="utf-8").splitlines())
     except FileNotFoundError:
+        if record_store.saved_path_exists(path):
+            raise
         return frozenset()
     return frozenset(exchange for exchange in exchanges if _exchange_receipt_line(destination, exchange) in receipt)
 
@@ -2872,6 +2940,8 @@ def _read_exchange_allocation(journal: Path) -> ExchangeAllocation | NextNumber:
     try:
         value = journal.read_text(encoding="utf-8")
     except FileNotFoundError:
+        if record_store.saved_path_exists(journal):
+            raise
         return NextNumber.AVAILABLE
     saved = re.fullmatch(r"([a-f0-9]{64}) ([^ /\n]+)/L([1-9][0-9]*)\n", value)
     if saved is None:
@@ -2886,15 +2956,37 @@ def _recover_exchange_allocation(store: record_store.NumberedRecords, journal: P
     if isinstance(allocation, NextNumber):
         return
     destination = allocation.destination
+    for row in scan_list_records():
+        item = row.item
+        filed = {exchange.source_key for exchange in item.filed_exchanges}
+        if row.destination == destination:
+            keys, must_match = filed, True
+        else:
+            keys, must_match = filed.union(item.reviews), False
+            if isinstance(item.report, ListReport):
+                keys.add(item.report.evidence_key)
+            if isinstance(origin := item.native_question, NativeQuestionItem):
+                keys.add(origin.source_key)
+        same_source = any(hashlib.sha256(key.encode()).hexdigest() == allocation.digest for key in keys)
+        if same_source != must_match:
+            raise ListError("The interrupted exchange has a conflicting List destination.")
     reservation = journal.parent / ".list-exchanges" / allocation.digest
     previous = _exchange_reservation(reservation)
     if isinstance(previous, ExchangeDestination) and previous != ExchangeDestination(destination, True):
         raise ListError(f"{journal}: the exchange already has a different reservation")
     sync_folder(journal.parent)
-    if store.next_number() <= destination.number:
-        store.reserve_number(destination.number)
+    reserved_store = _store(destination.keeper)
+    if store.owner != destination.keeper:
+        with reserved_store.locked():
+            _finish_exchange_allocation(reserved_store, allocation, reservation, journal)
     else:
-        sync_folder(store.folder())
+        _finish_exchange_allocation(store, allocation, reservation, journal)
+
+
+def _finish_exchange_allocation(store: record_store.NumberedRecords, allocation: ExchangeAllocation,
+                                reservation: Path, journal: Path) -> None:
+    destination = allocation.destination
+    store.finish_reserved_number(destination.number)
     _save_exchange_reservation(reservation, destination, "new")
     journal.unlink()
     sync_folder(journal.parent)
@@ -2924,6 +3016,14 @@ def _reserve_exchange_number(store: record_store.NumberedRecords, reservation: P
 _NO_UNRESOLVED_REPLIES: frozenset[str] = frozenset()
 
 
+def _exchange_list_destinations(key: str, rows: tuple[ScannedListRow, ...]) -> set[investigation.ListDestination]:
+    return {row.destination for row in rows if (
+        any(exchange.source_key == key for exchange in row.item.filed_exchanges)
+        or key in row.item.reviews
+        or isinstance(row.item.report, ListReport) and row.item.report.evidence_key == key
+    )}
+
+
 def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.Exchange, ...], title: str, *,
                    linked: investigation.ListDestination | NextNumber,
                    owner: staff.StaffId, members: staff.StaffSnapshot,
@@ -2935,9 +3035,27 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
     if not exchanges or any(exchange.source_key != key for exchange in exchanges):
         raise ListError("File one exchange source at a time.")
     filed = tuple(list_exchange.FiledExchange.from_exchange(exchange) for exchange in exchanges)
+    rows = scan_list_records()
+    journal = reservation.parent.parent / ".list-exchange-allocation"
+    allocation = _read_exchange_allocation(journal)
+    if isinstance(allocation, ExchangeAllocation) and allocation.digest == reservation.name:
+        store = _store(allocation.destination.keeper)
+        with store.locked():
+            _recover_exchange_allocation(store, journal)
     reserved = _exchange_reservation(reservation)
+    known = {row.destination for row in rows if any(exchange.source_key == key for exchange in row.item.filed_exchanges)}
+    if isinstance(linked, NextNumber):
+        known.update(_exchange_list_destinations(key, rows))
+    else:
+        known.add(linked)
+    if isinstance(reserved, ExchangeDestination):
+        known.add(reserved.destination)
+    if len(known) > 1:
+        raise ListError("The exchange source has two List destinations.")
+    if known and isinstance(reserved, NextNumber):
+        linked, = known
     if isinstance(linked, investigation.ListDestination) and isinstance(reserved, NextNumber):
-        if (record_store.state_root() / ".list-exchange-allocation").exists():
+        if record_store.saved_path_exists(journal):
             keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
             if keeper is None:
                 raise ListError("The List keeper is unavailable.")
@@ -2948,9 +3066,13 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
             if reserved.destination != linked:
                 raise ListError("The exchange source has two List destinations.")
         else:
+            if not any(row.destination == linked for row in rows):
+                raise ListError("The linked List destination has no readable row.")
             _save_exchange_reservation(reservation, linked, "linked")
             reserved = ExchangeDestination(linked, False)
     if isinstance(reserved, NextNumber):
+        if record_store.saved_path_exists(reservation.with_suffix(".saved")):
+            raise ListError("The exchange has a save receipt without a verified List destination.")
         proposed = combine_exchange_history(_read_pending_exchanges(reservation), filed)
         conflicts = list_exchange.conflicting_reply_ids(proposed, members) | unresolved_reply_ids
         if all(exchange.exchange_id in conflicts for exchange in proposed):
@@ -2961,7 +3083,7 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
     store = _store(destination.keeper)
     with store.locked():
         identity = f"L{destination.number}"
-        new_row = reserved.reserved_new_item and not store.path(identity).exists()
+        new_row = reserved.reserved_new_item and not record_store.saved_path_exists(store.path(identity))
         item = None if new_row else load(destination.keeper, identity)
         if item is None:
             history: tuple[list_exchange.FiledExchange, ...] = ()
@@ -3048,22 +3170,6 @@ def _read_keyless_question(store: record_store.NumberedRecords, identity: str, f
     return KeylessQuestionItem(_checked_item(identity, replace(item, keyless_question_kind=kind)))
 
 
-def question_migration_records(keeper: staff.StaffId) -> list[ListItem | KeylessQuestionItem]:
-    """Read List items and legacy question items that still need a source key."""
-    store = _store(keeper)
-
-    def read(identity: str) -> ListItem | KeylessQuestionItem:
-        fields, body = store.read(identity)
-        if "question_kind" in fields and "question_source_key" not in fields:
-            try:
-                return _read_keyless_question(store, identity, fields, body)
-            except (ValueError, KeyError, TypeError) as error:
-                raise store.invalid(identity, error) from None
-        return _read_item(store, identity, fields, body)
-
-    return store.records(read)
-
-
 def convert_legacy_question_source(keeper: staff.StaffId, identity: str,
                                    resolve: Callable[[KeylessQuestionItem], NativeQuestionItem | NoQuestionItem]) -> bool:
     """Save the resolved source and read marks under the List lock."""
@@ -3127,9 +3233,8 @@ def file_investigation_report(
         report_recipients = report_route(owner, members)
         keeper, producer, unit = report_recipients.keeper, report_recipients.producer, report_recipients.unit
     report = report_from_investigation(record, report_kind, review_items.investigation_record_key(record))
-    number = file_report(keeper, report, record.title, owner=owner, producer=producer,
-                         unit=unit, source=source, reservation=reservation)
-    return investigation.ListDestination(keeper, number)
+    return file_report(keeper, report, record.title, owner=owner, producer=producer,
+                       unit=unit, source=source, reservation=reservation)
 
 
 @dataclass(frozen=True)
@@ -3212,57 +3317,79 @@ def move_review_waits(root: Path, members: staff.StaffSnapshot) -> list[investig
     return moved
 
 
-@dataclass(frozen=True)
-class ReservedReportNumber:
-    number: int
-
-
 class NewReportItem(Enum):
     ALLOCATE = "allocate a report without selecting a linked item"
 
 
-def reserve_moved_report(keeper: staff.StaffId, evidence_key: str) -> ReservedReportNumber:
-    """Select the number for a source marker before the source writer runs."""
+def _report_destination(rows: tuple[ScannedListRow, ...], evidence_key: str,
+                        scope: str | NoReportScope = NoReportScope.NATIVE_RECORD
+                        ) -> ScannedListRow | investigation.NoListDestination:
+    reports = [row for row in rows if isinstance(report := row.item.report, ListReport)
+               and (report.evidence_key == evidence_key or scope and report.submission_scope == scope)]
+    linked = [row for row in rows if row.item.report is NoListReport.ABSENT and row.item.state != ItemState.CLOSED
+              and evidence_key in row.item.reviews]
+    candidates = reports or linked
+    if len(candidates) > 1:
+        raise ListError("The report has two List destinations.")
+    return candidates[0] if candidates else investigation.NoListDestination.ABSENT
+
+
+def verify_report_destination(destination: investigation.ListDestination, report: ListReport) -> None:
+    with record_store.list_destination_lock():
+        row = _report_destination(scan_list_records(), report.evidence_key, report.submission_scope)
+        if not isinstance(row, ScannedListRow) or row.destination != destination or not isinstance(row.item.report, ListReport):
+            raise ListError(f"Cannot confirm the report source for L{destination.number}.")
+
+
+def moved_report_candidate(keeper: staff.StaffId, evidence_key: str) -> investigation.ListDestination:
+    """Select a marker number without reserving it before the source check."""
     store = _store(keeper)
-    with _list_allocation(store):
-        items = records(keeper, include_closed=True)
-        for item in items:
-            if isinstance(item.report, ListReport) and item.report.evidence_key == evidence_key:
-                return ReservedReportNumber(item.number)
-        for item in items:
-            if (isinstance(item.report, NoListReport) and item.state != ItemState.CLOSED
-                    and evidence_key in item.reviews):
-                return ReservedReportNumber(item.number)
-        number = store.next_number()
-        store.reserve_number(number)
-        return ReservedReportNumber(number)
+    with record_store.list_destination_lock():
+        existing = _report_destination(scan_list_records(), evidence_key)
+        if isinstance(existing, ScannedListRow):
+            return existing.destination
+        with store.locked(check=store.require_list_keeper):
+            number = store.next_number()
+        return investigation.ListDestination(keeper, number)
 
 
 def file_report(keeper: staff.StaffId, report: ListReport, title: str, *, owner: ItemOwner,
                 producer: staff.StaffId, unit: str, source: str,
-                reservation: Path | NextNumber | ReservedReportNumber | investigation.ListDestination |
+                reservation: Path | NextNumber | investigation.ListDestination |
                              NewReportItem = NextNumber.AVAILABLE,
                 state: ItemState = ItemState.NEW,
-                retry: ReportRetry = ReportRetry.KEEP) -> int:
+                retry: ReportRetry = ReportRetry.KEEP) -> investigation.ListDestination:
     """File a report once, or add its evidence to an existing linked List item."""
-    store = _store(keeper)
-    with _list_allocation(store):
+    with record_store.list_destination_lock(), ExitStack() as locks:
+        rows = scan_list_records()
         reserved = reserved_review_number(reservation) if isinstance(reservation, Path) else reservation
+        existing = _report_destination(rows, report.evidence_key, report.submission_scope)
         if isinstance(reserved, investigation.ListDestination):
             if reserved.keeper != keeper:
                 raise ListError("The report destination has a different List keeper.")
+            if isinstance(existing, ScannedListRow) and existing.destination != reserved:
+                raise ListError("The selected List destination conflicts with the saved report.")
             reserved = reserved.number
-            candidates = (load(keeper, f"L{reserved}"),)
-        elif isinstance(reserved, NewReportItem):
-            reserved = NextNumber.AVAILABLE
-            candidates = ()
-        elif isinstance(reserved, ReservedReportNumber):
-            reserved = reserved.number
-            candidates = records(keeper, include_closed=True)
-        elif isinstance(reserved, int) and store.path(f"L{reserved}").is_file():
             candidates = (load(keeper, f"L{reserved}"),)
         else:
-            candidates = records(keeper, include_closed=True)
+            if isinstance(reserved, NewReportItem):
+                reserved = NextNumber.AVAILABLE
+            if isinstance(existing, ScannedListRow):
+                if isinstance(reservation, Path) and isinstance(reserved, int) and (
+                        existing.destination != investigation.ListDestination(keeper, reserved)):
+                    raise ListError("The report reservation conflicts with the saved List destination.")
+                keeper = existing.keeper
+                candidates = (existing.item,)
+            elif isinstance(reserved, int) and record_store.saved_path_exists(_store(keeper).path(f"L{reserved}")):
+                candidates = (load(keeper, f"L{reserved}"),)
+            else:
+                candidates = ()
+        store = _store(keeper)
+        if isinstance(reserved, NextNumber) and not candidates:
+            _ = locks.enter_context(_list_allocation(store))
+        else:
+            _ = locks.enter_context(store.locked())
+            candidates = tuple(load(keeper, candidate.id) for candidate in candidates)
         linked = next((item for item in candidates if isinstance(item.report, NoListReport)
                        and item.state != ItemState.CLOSED and report.evidence_key in item.reviews), None)
         for item in candidates:
@@ -3277,7 +3404,7 @@ def file_report(keeper: staff.StaffId, report: ListReport, title: str, *, owner:
                     if updated_report != item.report:
                         _save(store, replace(item, report=updated_report, updated=now()))
                 sync_folder(store.folder())
-                return item.number
+                return investigation.ListDestination(keeper, item.number)
         if linked is not None:
             reviews = (linked.reviews if not report.evidence_key.startswith('investigation/')
                        else tuple(key for key in linked.reviews if key != report.evidence_key))
@@ -3305,7 +3432,7 @@ def file_report(keeper: staff.StaffId, report: ListReport, title: str, *, owner:
         if isinstance(reservation, Path) and isinstance(reserved, NextNumber):
             write_text_atomic(reservation, f"{item.number}\n", new_file_mode=0o600)
         _save(store, item)
-        return item.number
+        return investigation.ListDestination(keeper, item.number)
 
 
 def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, datetime], ListItem],
@@ -4302,7 +4429,8 @@ def link(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         return replace(item, reviews=tuple(dict.fromkeys((*item.reviews, *chosen))))
-    return _change(keeper, identity, edit, ReviewLinksChanged("Linked reviews", chosen), source).item
+    with record_store.list_destination_lock():
+        return _change(keeper, identity, edit, ReviewLinksChanged("Linked reviews", chosen), source).item
 
 
 def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source: str) -> ListItem:
@@ -4312,7 +4440,8 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         return replace(item, reviews=tuple(review for review in item.reviews if review not in chosen))
-    return _change(keeper, identity, edit, ReviewLinksChanged("Unlinked reviews", chosen), source).item
+    with record_store.list_destination_lock():
+        return _change(keeper, identity, edit, ReviewLinksChanged("Unlinked reviews", chosen), source).item
 
 
 def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
