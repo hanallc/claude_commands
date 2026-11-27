@@ -1007,7 +1007,6 @@ The entry point accepts the box directory, links, and mutable result dictionary.
 The candidate supplies its own suite, timing, and record code.
 The guest installs no signal handler.
 The module time limit and process groups stop the gate.
-The bootstrap names no `merge_gate` attribute and copies no host function source.
 A paired trial uses the changed candidate's entry point to supervise both verified trees.
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
 The controller reports the failure to the queue.

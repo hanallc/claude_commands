@@ -242,7 +242,7 @@ def write_outside_queue_fixture(root: Path, *, siblings: tuple[int, ...] = ()) -
     for pid, state, parent, argv, cpu in (
         (8100, "S", 1, "/bin/bash\0--login\0--norc", (200, 0, 0, 0)),
         (8101, "S", 8100, f"/bin/codex\0resume\0{worker.current_session}", (200, 0, 0, 0)),
-        (8102, "S", 8101, "/bin/python3\0/fixture/scripts/production/targeted_test.py", (41, 17, 23, 7)),
+        (8102, "S", 8101, "/bin/python3\0/fixture/scripts/production/gate.py\0--affected", (41, 17, 23, 7)),
         (8103, "Z", 8105, "", (35, 13, 0, 0)),
         (8104, "S", 8101, "/bin/rustc", (80, 40, 0, 0)),
         (8105, "S", 8102, "/bin/python3", (44, 4, 0, 0)),
@@ -321,7 +321,7 @@ class MemoryFeedTests(unittest.TestCase):
                 with self.subTest(script=script):
                     _ = (self.root / "proc/8100/cmdline").write_text(f"/bin/python3\0/fixture/{script}\0")
                     row, = memory_feed.outside_queue_processes(inputs, owners)
-                    self.assertEqual((row["pid"], row["command"], row["cpu_seconds"]), (8102, "targeted_test.py", 136.0))
+                    self.assertEqual((row["pid"], row["command"], row["cpu_seconds"]), (8102, "gate.py", 136.0))
 
     def test_outside_queue_is_empty_for_a_launcher_and_its_agent(self) -> None:
         owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root))
@@ -743,7 +743,7 @@ class MemoryFeedTests(unittest.TestCase):
         rows = memory_feed.outside_queue_processes(captured_reading().explanation.decided_from, owners)
 
         self.assertEqual([(row["pid"], row["command"], row["cpu_seconds"]) for row in rows],
-                         [(8102, "targeted_test.py", 136.0), (8200, "pytest", 121.0)])
+                         [(8102, "gate.py", 136.0), (8200, "pytest", 121.0)])
 
     def test_outside_queue_marks_a_login_shell_that_execs_a_script(self) -> None:
         owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root))
@@ -775,7 +775,7 @@ class MemoryFeedTests(unittest.TestCase):
             page = memory_feed.reading()
         row, = page["outside_queue"]
         self.assertEqual((row["pid"], row["unit"], row["owner"], row["command"], row["cpu_seconds"]),
-                         (8102, "queue", "test", "targeted_test.py", 136.0))
+                         (8102, "queue", "test", "gate.py", 136.0))
         inputs = reading.explanation.decided_from
         owners = memory_feed.FeedStaff(staff_members)
         cmdline = self.root / "proc/8102/cmdline"
@@ -874,7 +874,7 @@ class MemoryFeedTests(unittest.TestCase):
             rows = memory_feed.outside_queue_processes(inputs, owners)
             self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), rows)
         self.assertEqual([(row["pid"], row["command"], row["owner"]) for row in rows],
-                         [(8102, "targeted_test.py", "test")])
+                         [(8102, "gate.py", "test")])
         self.assertEqual(byte_reads[cmdline], 2)
         self.assertEqual(byte_reads[environ], 0)
 
@@ -2095,7 +2095,7 @@ process.stdout.write(JSON.stringify({
             self.assertTrue(row["name"].startswith("solo: "))
 
     def test_gate_rows_name_the_job_from_the_command_arguments(self) -> None:
-        gate_command = ["python3", "/repo/scripts/production/merge_gate.py", "--merge-branch", "sdlc"]
+        gate_command = ["python3", "/repo/scripts/production/gate.py", "--merge-branch", "sdlc"]
         cases = (
             (["--unit", "handler", "--checkpoint", "abc"], StepJob("integrate", unit="handler", branch="sdlc")),
             (["--tests-only", "--full"], StepJob("test-all", branch="")),
@@ -2119,10 +2119,9 @@ process.stdout.write(JSON.stringify({
             self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
             self.assertIsInstance(memory_feed.step_job("gate", 99, proc), memory_feed.CommandUnreadable)
         for command, named in (
-            (["python3", "-X", "dev", "/repo/scripts/production/targeted_test.py"], StepJob("test-affected")),
-            (["py", "targeted_test.py", "--full"], StepJob("test-all")),
-            (["python3", "targeted_test.py", "--module", "a"], StepJob("test-modules", modules=1)),
-            (["python3", "-m", "scripts.production.merge_gate", "--tests-only"], StepJob("test-all")),
+            (["python3", "-X", "dev", "/repo/scripts/production/gate.py", "--affected"], StepJob("test-affected")),
+            (["py", "gate.py", "--affected", "--full"], StepJob("test-all")),
+            (["python3", "gate.py", "--affected", "--module", "a"], StepJob("test-modules", modules=1)),
             (["python3", "/repo/scripts/production/gate.py", "--unit", "handler", "--merge-branch", "sdlc"],
              StepJob("integrate", unit="handler", branch="sdlc")),
             (["python3", "-m", "scripts.production.gate", "--unit", "handler", "--merge-branch=sdlc"],
@@ -2145,19 +2144,18 @@ process.stdout.write(JSON.stringify({
             (["python3", "-m", "scripts.production.gate", "--affected", "--full"], StepJob("test-all")),
             (["python3", "-m", "scripts.production.gate", "--affected", "--module=a"],
              StepJob("test-modules", modules=1)),
-            (["merge_gate.py", "--affected"], StepJob("test-affected")),
+            (["merge_gate.py", "--affected"], OTHER_COMMAND),
+            (["targeted_test.py"], OTHER_COMMAND),
             (["python3", "-c", "pass", "gate.py"], OTHER_COMMAND),
             (["python3", "tool.py", "gate.py", "--affected"], OTHER_COMMAND),
             (["verify.sh", "--session-dir", "/session", "lint"], StepJob("lint")),
             (["bash", "verify.sh", "test", "hana"], StepJob("test")),
-            (["python3", "-c", "pass", "merge_gate.py"], OTHER_COMMAND),
-            (["python3", "-cpass", "merge_gate.py"], OTHER_COMMAND),
-            (["python3", "-Bc", "pass", "merge_gate.py"], OTHER_COMMAND),
-            (["python3", "-", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-cpass", "gate.py"], OTHER_COMMAND),
+            (["python3", "-Bc", "pass", "gate.py"], OTHER_COMMAND),
+            (["python3", "-", "gate.py"], OTHER_COMMAND),
             (["bash", "-c", "true", "verify.sh"], OTHER_COMMAND),
-            (["python3", "-Xdev", "-mscripts.production.merge_gate", "--nightly"], StepJob("test-nightly")),
-            (["python3", "-u", "-W", "ignore", "merge_gate.py", "--tests-only", "--full"], StepJob("test-all")),
-            (["python3", "tool.py", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-Xdev", "-mscripts.production.gate", "--nightly"], StepJob("test-nightly")),
+            (["python3", "-u", "-W", "ignore", "gate.py", "--tests-only", "--full"], StepJob("test-all")),
             (["cargo", "build"], OTHER_COMMAND),
         ):
             with self.subTest(command=command):
@@ -2197,13 +2195,19 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(notes.get("about"), expected)
 
     def test_full_targeted_test_keeps_changes_without_a_unit(self) -> None:
+        self.assert_full_affected_test_keeps_changes("targeted-test")
+
+    def test_full_affected_test_keeps_changes_without_a_unit(self) -> None:
+        self.assert_full_affected_test_keeps_changes("test-affected")
+
+    def assert_full_affected_test_keeps_changes(self, step: str) -> None:
         reading = with_wait_reason(captured_reading(), admission_records.ReadyForAdmission())
-        waiter = replace(reading.view.waiting[0], step="targeted-test", session_id="missing-session", unit="")
+        waiter = replace(reading.view.waiting[0], step=step, session_id="missing-session", unit="")
         reading = replace(reading, view=replace(reading.view, waiting=(waiter,)))
         proc = self.root / "proc"
         command = proc / str(waiter.pid) / "cmdline"
         command.parent.mkdir()
-        _ = command.write_bytes(b"python3\0targeted_test.py\0--full\0")
+        _ = command.write_bytes(b"python3\0gate.py\0--affected\0--full\0")
         _ = write_config_fixture(self.root / "build_steps.conf",
                                  "names.test-all=test all\nabout.test-all=runs every test\nabout.gate-job=\n"
                                  + "changes.default=no branch\n")
@@ -2215,7 +2219,6 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(row.get("about"), "runs every test")
         self.assertEqual(row["unit"], "")
         self.assertIn("test all", row["name"])
-
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:
         for step in ("test-affected", "gate", "nextest", "test", "t"):
@@ -3662,8 +3665,8 @@ const refresh = createPageRefresh(tick);
         accepted = re.search(r'^case "\$CMD" in\n    ([\w|-]+)\) ;;', script.read_text(), re.MULTILINE)
         assert accepted is not None
         verbs = set(accepted[1].split("|"))
-        jobs = (("merge_gate.py",), ("merge_gate.py", "--tests-only"), ("merge_gate.py", "--nightly"),
-                ("merge_gate.py", "--promote-only"), ("targeted_test.py",), ("targeted_test.py", "--module", "test_sample"))
+        jobs = (("gate.py",), ("gate.py", "--tests-only"), ("gate.py", "--nightly"),
+                ("gate.py", "--promote-only"), ("gate.py", "--affected"), ("gate.py", "--affected", "--module", "test_sample"))
         recorded_jobs: list[str] = []
         for command in jobs:
             job = command_job(command)
@@ -4562,7 +4565,7 @@ const refresh = createPageRefresh(tick);
         modes = {mode.value for mode in SuiteMode}
         self.assertEqual(modes | {"merge-gate", "targeted-test"}, memory_feed.GATE_STEPS)
         for mode in sorted(modes):
-            cases = (("--affected",), ("--affected", "--full"), ("--affected", "--module", "test_sample")) if mode == SuiteMode.TARGETED_TEST.value else (
+            cases = (("--affected",), ("--affected", "--full"), ("--affected", "--module", "test_sample")) if mode == SuiteMode.TARGETED.value else (
                 ("--unit", "devtools", "--merge-branch", "sdlc"),
                 ("--tests-only", "--full"), ("--tests-only", "--module", "test_sample"),
                 ("--nightly", "--merge-branch", "sdlc"), ("--promote-only",))
@@ -4589,7 +4592,7 @@ const refresh = createPageRefresh(tick);
                         self.assertEqual(row.get("changes", ""), names.changes(job) if isinstance(job, StepJob) else "")
 
         copied = ("python3", "/repo/scripts/copies/copies.py", "run", "--repo=/repo", "--",
-                  "python3", "/repo/scripts/production/merge_gate.py", "--tests-only", "--full")
+                  "python3", "/repo/scripts/production/gate.py", "--tests-only", "--full")
         for step in ("gate", "merge-gate"):
             with self.subTest(step=step):
                 page = self.gate_job_page(step, copied)
