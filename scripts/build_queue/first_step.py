@@ -187,9 +187,8 @@ def _placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGrant
 def _program_request(command: Sequence[str], source: Path, owner: wire.Owner,
                      position: CopyQueuePosition, run: wire.RunIdentity) -> queue_place.RefreshedRequest:
     program = parse_command_program(command)
-    script, script_arguments = ('', ()) if isinstance(program, OtherCommand) else program
-    affected = script == 'targeted_test.py' or '--affected' in script_arguments
-    name = 'test-affected' if affected else 'gate'
+    script_arguments = () if isinstance(program, OtherCommand) else program[1]
+    name = 'test-affected' if '--affected' in script_arguments else 'gate'
     resolved_job = command_job(command)
     job = resolved_job if isinstance(resolved_job, StepJob) else GATE_JOB_NOT_RECORDED
     what = read_step_names().shown(job.step) if isinstance(job, StepJob) else ""
