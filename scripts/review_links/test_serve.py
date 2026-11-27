@@ -6296,6 +6296,73 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(sum(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Closed"
                                  for entry in closed.log), 1)
 
+    def working_studio_question(self, keeper: staff.StaffId, owner: staff.StaffId) -> the_list.ListItem:
+        key = "submission/question/studio-workflow"
+        exchange = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "followup:1",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which layout?", datetime.now(timezone.utc),
+            list_exchange.Nate.USER, owner, list_exchange.QuestionWithoutAnswer.OPEN)
+        with the_list.lock_exchange_source(key) as source:
+            row = the_list.file_exchanges(source, (exchange,), exchange.question, linked=the_list.NextNumber.AVAILABLE,
+                                          owner=owner, members=staff.snapshot())
+        self.assertEqual(row.keeper, keeper)
+        return the_list.load(keeper, f"L{row.number}")
+
+    def test_question_state_rejects_ordinary_close_remove_and_update(self) -> None:
+        keeper = self.configure_list_keeper()
+        item = self.working_studio_question(keeper.id, keeper.id)
+        with self.assertRaisesRegex(the_list.ListError, "Only the asker can close this question"):
+            _ = the_list.close(keeper.id, item.id, "Cancel the work.", source="fixture")
+        with self.assertRaisesRegex(the_list.ListError, "Use the question actions"):
+            _ = the_list.update(keeper.id, item.id, {"state": the_list.ItemState.DONE}, source="fixture")
+        prefix, token = list_page.signed_item_request(list_page.ListRecord(keeper.id, item), list_page.form_secret(self.root))
+        body = urlencode({"keeper": keeper.id, "id": item.id, "request": prefix, "token": token,
+                          "action": "remove", "words": "", "until": ""})
+        page = list_page.render(self.root, include_counts=False)
+        self.assertNotIn(b'<button name="action" value="remove">Remove</button>', page)
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            code, response = self.post(studio_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+        self.assertEqual(code, 400, response)
+        self.assertIn(b"Only the asker can close this question", response)
+        self.assertEqual(the_list.load(keeper.id, item.id), item)
+
+    def test_question_ask_and_tell_use_their_own_signed_recipients_on_retry(self) -> None:
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        producer = fixture_member("producer", name="layout-producer")
+        item = self.working_studio_question(keeper.id, owner.id)
+        item = the_list.update(keeper.id, item.id, {"producer": producer.id}, source="fixture")
+        status = change_page.DeliveryStatus(self.root)
+        with patch.object(the_list.ListQuestionRouting, "_available", return_value=True):
+            page = list_page.render(self.root, include_counts=False)
+            entry = list_page.ListRecord(keeper.id, item)
+            secret = list_page.form_secret(self.root)
+            route = the_list.ListQuestionRouting(staff.snapshot()).receiver(keeper.id, producer.id)
+            ask, ask_token = list_page.signed_item_request(entry, secret, ask_signature=route.signature)
+            tell, tell_token = list_page.signed_item_request(entry, secret)
+        self.assertIn(b'value="question" disabled>Ask layout-producer</button>', page)
+        self.assertIn(b'value="tell" disabled>Tell layout-owner</button>', page)
+        self.assertIn(b'aria-label="Your words about this item"', page)
+        common = {"keeper": keeper.id, "id": item.id, "until": ""}
+        ask_body = urlencode({**common, "request": ask, "token": ask_token,
+                              "action": "question", "words": "Which size fits?"})
+        tell_body = urlencode({**common, "request": tell, "token": tell_token,
+                               "action": "tell", "words": "The 800 pixel layout fits."})
+        with (patch.object(change_page, "send_question", return_value=question_outcome()) as ask_send,
+              patch.object(the_list.ListQuestionRouting, "_available", return_value=True)):
+            list_page.deliver(list_page.submit(self.root, ask_body, status))
+            _ = the_list.update(keeper.id, item.id, {"producer": keeper.id}, source="fixture")
+            list_page.deliver(list_page.submit(self.root, ask_body, status))
+        ask_send.assert_called_once()
+        self.assertEqual(ask_send.call_args.args[0], producer.id)
+        with capture_sender("send_to_staff") as tell_send:
+            for _ in range(2):
+                list_page.deliver(list_page.submit(self.root, tell_body, status))
+        tell_send.assert_called_once()
+        self.assertEqual(tell_send.call_args.args[0], owner.id)
+        saved = the_list.load(keeper.id, item.id)
+        self.assertEqual(saved.questions[0].recipient_id(keeper.id), producer.id)
+        self.assertEqual(the_list.feedback_requests(saved)[tell].recipient, owner.id)
+
     def test_review_card_shows_only_the_unfiled_answer(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="layout-owner")

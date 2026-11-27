@@ -1578,7 +1578,8 @@ class NoExchangeFiling(StrEnum):
     SOURCE_NO_LONGER_ELIGIBLE = "The source no longer has eligible exchanges."
 
 
-def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadExchanges
+def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadExchanges, *,
+                question_filing: the_list.QuestionFiling = the_list.QuestionFiling.LIVE
                 ) -> investigation.ListDestination | NoExchangeFiling:
     """Read the current source under its filing lock before saving to the List."""
     planned = plan.exchanges[0]
@@ -1618,10 +1619,9 @@ def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadEx
             raise the_list.ListError("The source question has no text.")
         title = review_submissions.submission_title(first.question)
         try:
-            if isinstance(current, AcceptedExchanges) and current.conflicting_ids:
-                return the_list.file_exchanges(source, exchanges, title, linked=link, owner=owner, members=members,
-                                               unresolved_reply_ids=current.conflicting_ids)
-            return the_list.file_exchanges(source, exchanges, title, linked=link, owner=owner, members=members)
+            conflicts: frozenset[str] = current.conflicting_ids if isinstance(current, AcceptedExchanges) else frozenset()
+            return the_list.file_exchanges(source, exchanges, title, linked=link, owner=owner, members=members,
+                                           question_filing=question_filing, unresolved_reply_ids=conflicts)
         except the_list.ConflictingExchangeReplies:
             return NoExchangeFiling.SOURCE_NO_LONGER_ELIGIBLE
 
@@ -1731,7 +1731,9 @@ def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, 
                 pending = the_list.pending_exchanges(key, sources=sources)
                 history = the_list.combine_exchange_history(saved, pending)
                 verifier = ExchangeVerifier(item, zone, members, history)
-                handoff = verifier.review_handoff(item, key, destination, saved)
+                confirmed = the_list.confirmed_exchanges(key, destination, saved, sources=sources)
+                handoff = verifier.review_handoff(item, key, destination,
+                                                  tuple(exchange for exchange in saved if exchange in confirmed))
         projected.append(item if item.exchange_handoff == handoff else replace(item, exchange_handoff=handoff))
     return projected
 
@@ -1760,13 +1762,22 @@ def migrate(inventory: ExchangeInventory, members: staff.StaffSnapshot, *, apply
         for plan in pending:
             key = plan.exchanges[0].source_key
             try:
-                link = file_source(plan, members, inventory.reload[key])
+                link = file_source(plan, members, inventory.reload[key], question_filing=the_list.QuestionFiling.HISTORY)
             except (OSError, ValueError) as error:
                 failures += 1
                 print(f"  {key}: {error}", file=sys.stderr)
             else:
                 if isinstance(link, investigation.ListDestination):
                     print(f"  {key} -> {link.keeper}/L{link.number}")
+    if apply:
+        for entry in list_page.records(include_closed=True):
+            item = entry.item
+            if item.question_kind is the_list.NoQuestionItem.ORDINARY and the_list.question_item_exchanges(item):
+                try:
+                    the_list.migrate_question_item(entry.keeper, item.id)
+                except (OSError, ValueError) as error:
+                    failures += 1
+                    print(f"  {entry.keeper}/{item.id}: {error}", file=sys.stderr)
     for line in _unresolved_lines(inventory):
         print(line)
     return int(bool(failures))

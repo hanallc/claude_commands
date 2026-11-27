@@ -610,7 +610,7 @@ def titled_item_link(entry: ListRecord, style: str) -> str:
 
 @dataclass(frozen=True)
 class ListFormRequestPrefix:
-    """Identify the form, its unread update, and its feedback recipient."""
+    """Identify the form, its unread update, and the recipients of its words."""
 
     nonce: str
     seen_update: the_list.UnreadUpdate | the_list.NoUnreadUpdate
@@ -793,6 +793,8 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
     schedule_editor = schedule_fields(entry, schedule, members, key, zone)
     recipient_name = owner_name(members, feedback_recipient(entry.item))
     words_label = html.escape(f"Your words for {recipient_name} about this item", quote=True)
+    remove = ('<button name="action" value="remove">Remove</button>'
+              if entry.item.question_kind is the_list.NoQuestionItem.ORDINARY else '')
     repair = ''
     if isinstance(entry.item.report, the_list.ListReport):
         repaired = entry.item.state == the_list.ItemState.REPAIRED
@@ -804,14 +806,18 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
     if not scheduled:
         route = routing.receiver(entry.keeper, entry.item.producer)
         ask_signature = route.signature
-        ask = page_frame.send_button("Ask question", page_frame.SendTo(route.name),
-                                     'name="action" value="question" disabled')
+        split = entry.item.question_kind is not the_list.NoQuestionItem.ORDINARY and route.name != recipient_name
+        if split:
+            words_label = "Your words about this item"
+        ask = page_frame.send_button("Ask" if split else "Ask question", page_frame.SendTo(route.name),
+                                     'name="action" value="question" disabled', show_receiver=split)
     hidden = signed_form_fields(entry, secret, ask_signature=ask_signature)
     tell = page_frame.send_button("Tell", page_frame.SendTo(recipient_name),
                                   'name="action" value="tell" disabled', show_receiver=True)
-    return ('<form method="post" data-feedback-form>' + hidden
+    studio_question = ' data-studio-question' if entry.item.question_kind is not the_list.NoQuestionItem.ORDINARY else ''
+    return (f'<form method="post" data-feedback-form{studio_question}>' + hidden
             + f'<p data-parked-detail{parked}>{note}</p>'
-            + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read + top
+            + '<div class="list-actions">' + remove + read + top
             + f'<div class="list-parking-actions">{start_now}<button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
             + '<div class="list-park">' + record_table.park_control(
                 picker_label, field="until", action="action", value="park", identity="park-" + key, allow_delivery=True)
@@ -1341,7 +1347,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     sections = review_links(item, reviews, today)
     failed: frozenset[str] = visibility.failed if isinstance(visibility, the_list.QuestionAttention) else frozenset()
     questions = panel_questions(item, today, unread_answers, failed) if isinstance(schedule, the_list.NoSchedule) else ''
-    waits_for_answer = (the_list.question_item(item) is list_exchange.Direction.QUESTION_TO_NATE
+    waits_for_answer = (the_list.question_item(item) is the_list.QuestionItemKind.TO_NATE
                         and item.state is the_list.ItemState.WAITING_FOR_NATE)
     form = '' if waits_for_answer else feedback_form(
         entry, secret, members=names.members, parking_label=parking_label, schedule=schedule, today=today,
@@ -1657,7 +1663,8 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
 
 def _mark_seen_update_read(keeper: staff.StaffId, item: the_list.ListItem,
                            update: the_list.UnreadUpdate | the_list.NoUnreadUpdate) -> None:
-    if isinstance(update, the_list.UnreadUpdate) and update == the_list.unread_update(item):
+    if (item.question_kind is the_list.NoQuestionItem.ORDINARY
+            and isinstance(update, the_list.UnreadUpdate) and update == the_list.unread_update(item)):
         try:
             _ = the_list.mark_read(keeper, item.id, source=the_list.PAGE_SOURCE, update=update)
         except (OSError, the_list.ListError):
@@ -3612,15 +3619,18 @@ function bindFeedbackForm(form){
    if(!tell) return;
    const retry=matching('tell');
    const name=retry?.receiver ?? signed.receiver;
-   const wordsLabel=canReject ? 'Your words about this repair' : 'Your words for '+name+' about this item';
+   const askRetry=matching('question','');
+   const askReceiver=askRetry ? askRetry.askReceiver : signed.askReceiver;
+   const split=signed.showAskName && askReceiver && askReceiver!==name;
+   const wordsLabel=canReject ? 'Your words about this repair' :
+    split ? 'Your words about this item' : 'Your words for '+name+' about this item';
    tell.textContent=retry?.tellLabel ?? signed.tellLabel;
    tell.dataset.sendReceiver=name;
    words.placeholder=wordsLabel;
    words.setAttribute('aria-label',wordsLabel);
    tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();
    if(ask){
-    const askRetry=matching('question','');
-    const askReceiver=askRetry ? askRetry.askReceiver : signed.askReceiver;
+    ask.textContent=split ? 'Ask '+askReceiver : 'Ask question';
     if(askReceiver==null) ask.removeAttribute('data-send-receiver');
     else ask.dataset.sendReceiver=askReceiver;
     updateSendLabel(ask);
@@ -3629,7 +3639,8 @@ function bindFeedbackForm(form){
   };
   // Keep the signed update and recipient from the rendered form.
   const signed={request:form.elements.request.value,token:form.elements.token.value,receiver:sendReceiver(tell),
-   tellLabel:tell?.textContent,askReceiver:sendReceiver(ask)};
+   tellLabel:tell?.textContent,askReceiver:sendReceiver(ask),
+   showAskName:form.hasAttribute('data-studio-question')};
   let fresh=signed;
   const newRequest=()=>({
    ...signed,
