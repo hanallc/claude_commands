@@ -135,6 +135,16 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         runner.assert_not_called()
         self.assertFalse(Path(self.environment["SHOWRUNNER_STATE_DIR"]).exists())
 
+    def test_reviewer_prompt_names_the_read_only_transcript_reader(self) -> None:
+        args, _ = self.changed_range()
+        self.reply(CLEAR_REPLY)
+        with mock.patch.object(astra_review, "run_review", return_value=0) as runner:
+            code, output = self.cli("run", *args)
+
+        self.assertEqual(code, 0, output)
+        prompt = cast(str, runner.call_args.args[1])
+        self.assertIn("`transcript_lines(Path(path))` from `scripts.lib.transcripts`", prompt)
+
     def test_clear_requires_a_saved_reply_for_this_patch_and_each_test(self) -> None:
         args, key = self.changed_range()
         self.reply(CLEAR_REPLY)

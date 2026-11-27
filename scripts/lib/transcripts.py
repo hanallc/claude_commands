@@ -112,6 +112,16 @@ def compressed_transcript_lines(path: Path) -> Generator[bytes]:
             raise subprocess.CalledProcessError(status, command)
 
 
+def transcript_lines(path: Path) -> Generator[bytes]:
+    """Yield plain or compressed transcript lines without writing a file."""
+    source = transcript_source(path)
+    if source.suffix == ".zst":
+        yield from compressed_transcript_lines(source)
+        return
+    with source.open("rb") as stream:
+        yield from stream
+
+
 def compress_transcript(path: Path, output: BinaryIO) -> int:
     """Write zstd data and return its size without removing the transcript."""
     _ = subprocess.run(["zstd", "-q", "-c", "--", str(path)],

@@ -6,11 +6,33 @@ import tempfile
 import unittest
 from unittest import mock
 
+from scripts.lib import transcripts
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.transcripts import codex_transcript_homes, compressed_transcript_lines, open_transcript, transcript_paths
 
 
 class TranscriptTests(unittest.TestCase):
+    def test_transcript_lines_reads_plain_and_compressed_files_without_temp_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            content = b'{"message":"one"}\n{"message":"two"}'
+            plain = root / "plain.jsonl"
+            archived = root / "archived.jsonl"
+            _ = plain.write_bytes(content)
+            _ = archived.write_bytes(content)
+            compressed = compressed_copy(archived)
+            missing = str(root / "missing")
+            with (
+                mock.patch.dict(os.environ, {key: missing for key in ("TMPDIR", "TMP", "TEMP")}),
+                mock.patch.object(tempfile, "tempdir", None),
+                mock.patch.object(tempfile, "_candidate_tempdir_list", return_value=[missing]),
+            ):
+                with self.assertRaises(FileNotFoundError):
+                    _ = tempfile.gettempdir()
+                for path in (plain, archived, compressed):
+                    with self.subTest(path=path.name):
+                        self.assertEqual(list(transcripts.transcript_lines(path)), content.splitlines(keepends=True))
+
     def test_compressed_lines_stream_in_order_and_report_a_decoder_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session.jsonl"

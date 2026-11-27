@@ -152,7 +152,8 @@ Use these sources:
 2. Question records from scripts/production/update_registration.py and change review verdicts.
    Follow the store paths in the showrunner documents and the showrunner state root.
 3. User turns in Claude session transcripts. Do not count assistant, tool, or peer messages.
-   Use scripts/lib/transcripts.py to find distinct paths and read plain and compressed transcripts.
+   Use scripts/lib/transcripts.py to find distinct paths.
+   Use `transcript_lines(Path(path))` from `scripts.lib.transcripts` to read plain and compressed transcripts.
    Use `rg --search-zip --files-with-matches --hidden --no-ignore` on groups of transcript paths.
    Select files by terms for the affected behaviors. Parse only those files for matching user turns.
 4. Commit messages in {change.repo}.
