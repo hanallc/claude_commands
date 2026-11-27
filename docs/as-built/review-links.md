@@ -2327,7 +2327,7 @@ New anonymous log exchanges use a digest of the prompt, its time, and the reply 
 Verified Feedback replies remain in Review outside the unresolved question count.
 The preview reports each unresolved source key and its reply count.
 Review keeps an Investigation or native Question visible while an outgoing question waits or a reply remains unresolved.
-Review hides a card when verified List exchanges cover every reply and the current answer.
+Review hides a card when verified List exchanges with matching save receipts cover every reply and the current answer.
 An Open Change with one verified slot answer on the List can move to the List when the answerer is unknown.
 A later slot change leaves the filed reply binding and answer text intact.
 A filed question can receive an answer or close after withdrawal.
@@ -2345,8 +2345,8 @@ A retry keeps the saved answer entry and its read state.
 Old bindings keep their encoded form for receipt checks.
 Migration rewrites verified bindings in place and issues receipts after the new List data is durable.
 An unverified Investigation binding remains visible in Review and requires a separate repair.
-Review hides a sent question filed from a List item when its answer is durable in that item's log.
-Review requires a confirmed receipt for every other handoff.
+Review keeps the answer visible if the List receipt write fails.
+A successful retry saves the receipt and hides the Review copy.
 Review reads the List file without taking the writer lock.
 A failed pending exchange read leaves that card in Review.
 A unique reply digest can verify a moved log event.

@@ -1161,10 +1161,13 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
 def log_html(item: ReviewItem, inputs: ReviewBodyInputs, owner: str) -> str:
     rows: list[str] = []
     response = item.response
+    handoff = item.exchange_handoff
+    filed_copies = item.filed_followup_log_indices
     for index, entry in enumerate(item.log):
+        if index in filed_copies:
+            continue
         time = entry.time.isoformat()
         words = entry.words
-        handoff = item.exchange_handoff
         if isinstance(handoff, review_items.FiledReviewExchange) and index in handoff.answer_events:
             words = 'Answer filed on the List'
         elif index in item.body_answer_events and words != 'Answered the question':

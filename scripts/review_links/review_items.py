@@ -370,6 +370,15 @@ class ReviewItem:
                                    later=question_path.later_active(self.times.later, now))
 
     @property
+    def filed_followup_log_indices(self) -> frozenset[int]:
+        """Find display copies of follow-up replies saved on the List."""
+        handoff = self.exchange_handoff
+        if not isinstance(handoff, FiledReviewExchange):
+            return frozenset()
+        return frozenset(copy.log_index for copy in self.followup_log_copies
+                         if copy.followup_index in handoff.filed_followup_indices)
+
+    @property
     def unread_answer(self) -> bool:
         if self.state not in (ReviewState.OPEN, ReviewState.VALIDATING):
             return False
@@ -377,6 +386,7 @@ class ReviewItem:
         log = self.log
         handoff = self.exchange_handoff
         if isinstance(handoff, FiledReviewExchange):
+            filed_log_indices = handoff.answer_events | self.filed_followup_log_indices
             slot = self.source.slots.question if isinstance(self.source, ChangeSource) else delivery_state.NoQuestion()
             if isinstance(slot, delivery_state.AnsweredQuestion):
                 if handoff.filed_slot_id == slot.question_id:
@@ -384,9 +394,9 @@ class ReviewItem:
             elif isinstance(self.source, InvestigationSource):
                 if handoff.filed_investigation_answer:
                     time = AnswerTimeFromLog.USE_LOG
-            elif isinstance(time, datetime) and any(self.log[index].time == time for index in handoff.answer_events):
+            elif isinstance(time, datetime) and any(self.log[index].time == time for index in filed_log_indices):
                 time = AnswerTimeFromLog.USE_LOG
-            log = tuple(event for index, event in enumerate(log) if index not in handoff.answer_events)
+            log = tuple(event for index, event in enumerate(log) if index not in filed_log_indices)
         if time is AnswerTimeFromLog.USE_LOG:
             time = question_path.answer_time(question_path.NO_ANSWER_TIME, log)
         return question_path.has_unread_answer(time, log)
@@ -1029,9 +1039,10 @@ def list_reply(item: ReviewItem) -> str:
         return '' if isinstance(handoff, FiledReviewExchange) and handoff.filed_slot_id == question.question_id else question.answer
     if isinstance(handoff, FiledReviewExchange) and handoff.filed_investigation_answer:
         return ''
+    filed_copies = item.filed_followup_log_indices
     for index in reversed(range(len(item.log))):
         words = item.log[index].words
-        if isinstance(handoff, FiledReviewExchange) and index in handoff.answer_events:
+        if index in filed_copies or (isinstance(handoff, FiledReviewExchange) and index in handoff.answer_events):
             return ''
         if words.startswith('Answer: '):
             return words.removeprefix('Answer: ')

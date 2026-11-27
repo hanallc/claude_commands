@@ -1196,7 +1196,6 @@ class ExchangeVerifier:
         events, slot_id = self._handoff_reply_events(item, accepted, verified)
         followups = source.item.get("followups", ()) if native else ()
         filed_followups = frozenset(index for index in range(len(followups)) if f"followup:{index + 1}" in ids)
-        events |= frozenset(copy.log_index for copy in item.followup_log_copies if copy.followup_index in filed_followups)
         open_staff_question = any(exchange.direction is Direction.QUESTION_TO_NATE
                                   and exchange.answer is QuestionWithoutAnswer.OPEN for exchange in verified)
         offset = len(item.log) - len(self.log)
@@ -1705,24 +1704,10 @@ def file_saved_picture(root: Path, identity: str) -> None:
         _file_live(partial(_reload_picture, root, identity, keepers, user_zone()), entries, staff.snapshot())
 
 
-def _review_handoff_exchanges(item: review_items.ReviewItem, key: str, row: the_list.ListItem,
-                              destination: investigation.ListDestination, saved: tuple[list_exchange.FiledExchange, ...],
-                              sources: list[Path] | None) -> tuple[list_exchange.FiledExchange, ...]:
-    durable = the_list.confirmed_exchanges(key, destination, saved, sources=sources)
-    if (item.type in review_items.QUESTION_TYPES and len(durable) < len(saved)
-            and the_list.exchange_has_linked_destination(key, destination, sources=sources)):
-        logged = {event.what for event in row.log if isinstance(event.what, the_list.ReturnedAnswer)}
-        durable |= frozenset(exchange for exchange in saved
-            if exchange.source is Source.SCOPED_REPLY and exchange.direction is Direction.ANSWER_TO_NATE
-            and isinstance(exchange.answer, ExchangeAnswer)
-            and the_list.ReturnedAnswer(the_list.ReturnedAnswerId(key, exchange.exchange_id), exchange.answer.text) in logged)
-    return tuple(exchange for exchange in saved if exchange in durable)
-
-
 def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, *,
                           sources: list[Path] | None = None,
                           members: staff.StaffSnapshot | None = None) -> list[review_items.ReviewItem]:
-    """Verify handoffs against the exchanges in the saved List items."""
+    """Verify handoffs against List exchanges with matching save receipts."""
     keys = {item.key: _review_source_key(item) for item in items if item.type in _REVIEW_SOURCE_KINDS}
     if not keys:
         return items
@@ -1735,18 +1720,25 @@ def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, 
     projected: list[review_items.ReviewItem] = []
     for item in items:
         handoff = review_items.NoFiledReviewExchange.ABSENT
-        filed = index.get(keys.get(item.key, ""), ())
-        if len(filed) == 1:
-            entry = filed[0]
-            destination = investigation.ListDestination(entry.keeper, entry.item.number)
+        key = keys.get(item.key, "")
+        filed = index.get(key, ())
+        if filed:
             with review_items.after_store_write(item.key):
-                key = keys[item.key]
-                saved = tuple(exchange for exchange in entry.item.filed_exchanges if exchange.source_key == key)
-                pending = the_list.pending_exchanges(key, sources=sources)
-                history = the_list.combine_exchange_history(saved, pending)
-                verifier = ExchangeVerifier(item, zone, members, history)
-                filed_exchanges = _review_handoff_exchanges(item, key, entry.item, destination, saved, sources)
-                handoff = verifier.review_handoff(item, key, destination, filed_exchanges)
+                saved_history: list[list_exchange.FiledExchange] = []
+                destinations: list[tuple[investigation.ListDestination, tuple[list_exchange.FiledExchange, ...]]] = []
+                for entry in filed:
+                    destination = investigation.ListDestination(entry.keeper, entry.item.number)
+                    saved = tuple(exchange for exchange in entry.item.filed_exchanges if exchange.source_key == key)
+                    saved_history.extend(saved)
+                    confirmed = the_list.confirmed_exchanges(key, destination, saved, sources=sources)
+                    if confirmed:
+                        destinations.append((destination, tuple(exchange for exchange in saved if exchange in confirmed)))
+                if len(destinations) == 1:
+                    destination, confirmed_rows = destinations[0]
+                    pending = the_list.pending_exchanges(key, sources=sources)
+                    history = the_list.combine_exchange_history(tuple(saved_history), pending)
+                    verifier = ExchangeVerifier(item, zone, members, history)
+                    handoff = verifier.review_handoff(item, key, destination, confirmed_rows)
         projected.append(item if item.exchange_handoff == handoff else replace(item, exchange_handoff=handoff))
     return projected
 
