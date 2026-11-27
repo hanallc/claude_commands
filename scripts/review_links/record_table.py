@@ -677,13 +677,14 @@ let shownRevision,statusError='',savedDisplayFailed=false;
 let itemRequest=null;
 const measured=new Map(),mounted=new Map(),windowGaps=[];
 const resize=typeof ResizeObserver==='function' ? new ResizeObserver(()=>scheduleWindow()) : null;
-function preserveRecordRowTop(update){
+function preserveRecordRowTop(update,{topInset}={}){
  const before=visibleRecordRow(openItem),key=openItem?.dataset.key;
  const top=before?.getBoundingClientRect().top;
+ const wasClear=topInset && top!==undefined && top>=topInset()-0.5 && top<innerHeight;
  const result=update();
  const after=visibleRecordRow(openItem);
  if(top!==undefined && after && key===openItem.dataset.key)
-  trackRecordRowDuringMotion(after,top,rowMotion);
+  trackRecordRowDuringMotion(after,wasClear ? Math.max(top,topInset()) : top,rowMotion);
  return result;
 }
 /** @typedef {{key: string, index: string, offset: number}} LogPosition */

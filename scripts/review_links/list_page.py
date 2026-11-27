@@ -4007,7 +4007,10 @@ async function refresh(_supersede=false,current=()=>true){
  const facts=pageRefreshFacts(page);
  decodeListKeys(fresh);
  refreshNeeded=false;
- tableView.preserveRecordRowTop(()=>applyListSnapshot(fresh));
+ tableView.preserveRecordRowTop(()=>{
+  applyListSnapshot(fresh);
+  measurePageActions();
+ },{topInset:()=>stuckPageActionsBottom()+content.querySelector('table').tHead.getBoundingClientRect().height});
  reviewRefreshError.textContent='';
  reviewRefreshError.hidden=true;
  if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false')
@@ -4041,6 +4044,7 @@ function applyListSnapshot(fresh){
  // Keep the title, status, and actions that the page frame observes.
  const top=content.querySelector('.page-top'),nextTop=fresh.querySelector('.page-top');
  const controls=top.querySelector('[data-page-top-controls]');
+ const filterScroll=controls.scrollTop;
  // Keep the old controls in the old list until the table reads their values.
  top.replaceWith(...controls.childNodes);
  controls.append(...nextTop.querySelector('[data-page-top-controls]').childNodes);
@@ -4048,6 +4052,7 @@ function applyListSnapshot(fresh){
  content.replaceWith(fresh);content=fresh;
  closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
  bindListControls();tableView.replace();
+ controls.scrollTop=filterScroll;
  const openItem=tableView.openItem;
  if(links && openItem?.dataset.key===key) presentReviewLinks(openItem,links);
  tableView.restoreLog();
