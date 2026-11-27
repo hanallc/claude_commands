@@ -38,7 +38,7 @@ from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import (
-    atomic_file, build_folder_lock, build_folders, build_copies, build_copies_test_support, conf, git_files, process_group, process_start,
+    atomic_file, build_folder_lock, build_folders, build_copies, build_copies_test_support, conf, git_files, origin_deletion, process_group, process_start,
     socket_test_support, unit_runs,
 )
 from scripts.lib.atomic_file import write_text_atomic
@@ -974,8 +974,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         tip = git(self.checkout, "rev-parse", branch)
         _ = git(self.checkout, "checkout", "alpha-branch")
         code, output = self.retire()
-        self.assertEqual(code, 1, output)
+        self.assertEqual(code, 0, output)
         self.assertIn("cannot delete branch 'alpha-branch' used by worktree", output)
+        self.assertIn("Cleanup journal retained.", output)
         self.assertEqual(git(self.checkout, "rev-parse", branch), tip)
         self.assertEqual(git(self.root / "origin.git", "rev-parse", branch), tip)
 
@@ -991,7 +992,10 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with mock.patch.object(shutdown, "retirement_run", side_effect=fail_scan):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
-        self.assertIn("retire: cannot list Git worktrees: scan failed", output)
+        self.assertEqual(output.splitlines(), [
+            "Retirement failed: cannot list Git worktrees: scan failed. Retirement removed nothing. " +
+            f"Run agents retire {self.unit_staff_id} again.",
+        ])
         self.assertTrue(self.worktree.is_dir())
         self.assertEqual(self.calls, [])
 
@@ -1328,7 +1332,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         tip = git(self.worktree, "rev-parse", "HEAD")
         with mock.patch.object(shutdown, "retirement_remove", side_effect=OSError("TEST interrupted retirement")):
             code, output = self.retire()
-        self.assertEqual(code, 1, output)
+        self.assertEqual(code, 0, output)
         self.assertIn("interrupted retirement", output)
         self.assertIsNone(staff.by_id(row.id))
         self.assertTrue(self.worktree.is_dir())
@@ -1373,7 +1377,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with mock.patch.object(shutdown, "retirement_release_reservations", side_effect=try_to_assign) as attempt:
             with mock.patch.object(shutdown, "retirement_remove", return_value=["fixture cleanup refusal"]):
                 code, output = self.retire()
-            self.assertEqual(code, 1, output)
+            self.assertEqual(code, 0, output)
             self.assertIn("fixture cleanup refusal", output)
             self.assertTrue(self.worktree.exists())
             code, output = self.retire()
@@ -1403,8 +1407,11 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         remove = staff.remove_unit_for_retirement
         with mock.patch.object(staff, "remove_unit_for_retirement", side_effect=lose_response):
             code, output = self.retire()
-        self.assertEqual(code, 1, output)
-        self.assertIn("fixture response lost", output)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output.splitlines(), [
+            "Staff removal response failed: fixture response lost. Cleanup journal retained. " +
+            f"Run agents retire {row.id} again.",
+        ])
         self.assertIsNone(staff.by_id(row.id))
         self.assertEqual(journal.read_bytes(), saved)
         self.assertEqual(self.stops(), [])
@@ -1649,6 +1656,89 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertTrue(git(self.checkout, "branch", "--list", "alpha-branch"))
         self.assertTrue(git(self.root / "origin.git", "branch", "--list", "alpha-branch"))
 
+    def test_retirement_classifies_origin_push_failures_and_reports_completed_removals(self) -> None:
+        for failure in ("stale lease", "unrelated push error", "stale lease with local ref absent"):
+            with self.subTest(failure=failure):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    row = staff.by_id(case.unit_staff_id)
+                    assert row is not None
+                    ref = "refs/heads/alpha-branch"
+                    old = git(case.checkout, "rev-parse", ref)
+                    new = git(case.checkout, "commit-tree", "-p", old, "-m", "New tip", f"{old}^{{tree}}")
+                    local_absent = failure == "stale lease with local ref absent"
+                    if local_absent:
+                        case.park_without_worktree()
+                        _ = git(case.checkout, "update-ref", "-d", ref, old)
+                    push = origin_deletion._git  # pyright: ignore[reportPrivateUsage]
+
+                    def after_lease(repository: Path, timeout: float, *args: str) -> subprocess.CompletedProcess[str]:
+                        if args[:1] == ("push",):
+                            if failure == "unrelated push error":
+                                return subprocess.CompletedProcess(args, 1, "", "permission denied to push")
+                            _ = git(case.checkout, "push", "-q", "origin", f"{new}:{ref}")
+                        return push(repository, timeout, *args)
+
+                    with mock.patch.object(origin_deletion, "_git", side_effect=after_lease):
+                        code, output = case.retire()
+                    if failure == "unrelated push error":
+                        self.assertEqual(code, 0, output)
+                        self.assertEqual(output.splitlines(), [
+                            f"Checkout cleanup is incomplete: Kept origin ref {ref}: stderr: permission denied to push. " +
+                            f"Cleanup journal retained. Run agents retire {row.id} again.",
+                        ])
+                    else:
+                        self.assertEqual(code, 1, output)
+                        facts = ("The checkout was already absent. The local ref was already absent" if local_absent
+                                 else "This attempt removed the checkout. This attempt removed the local ref")
+                        self.assertEqual(output.splitlines(), [
+                            f"The origin branch changed after the merge check. {facts}. " +
+                            f"Git rejected the origin lease. Run agents retire {row.id} again.",
+                        ])
+                    self.assertFalse(case.worktree.exists())
+                    self.assertEqual(git(case.checkout, "branch", "--list", "alpha-branch"), "")
+                    self.assertEqual(git(case.root / "origin.git", "rev-parse", ref),
+                                     old if failure == "unrelated push error" else new)
+                    self.assertTrue(shutdown.retirement_journal(row).exists())
+                finally:
+                    case.doCleanups()
+
+    def test_retirement_reports_a_local_ref_missing_before_the_merge_check(self) -> None:
+        row = staff.by_id(self.unit_staff_id)
+        assert row is not None
+        sample = shutdown.retirement_branch_tips
+
+        def no_local(unit: shutdown.RetiringUnit, branch: str, *, settings: conf.ConfigRead) -> shutdown.BranchTips:
+            checked = sample(unit, branch, settings=settings)
+            return shutdown.BranchTips("", checked.origin) if branch == unit.branch else checked
+
+        with mock.patch.object(shutdown, "retirement_branch_tips", side_effect=no_local):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(output.splitlines(), [
+            "The local branch was missing before the merge check. The checkout is present. " +
+            f"This attempt removed no branch refs. Run agents retire {row.id} again.",
+        ])
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertTrue(self.worktree.is_dir())
+
+    def test_retirement_keeps_dirty_work_hidden_from_the_default_status(self) -> None:
+        dirty = self.worktree / "untracked.txt"
+        write_text_atomic(dirty, "keep this work\n")
+        _ = git(self.checkout, "config", "status.showUntrackedFiles", "no")
+        self.assertEqual(git(self.worktree, "status", "--short"), "")
+        tip = git(self.checkout, "rev-parse", "alpha-branch")
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output.splitlines(), [
+            f"Retirement kept {self.worktree} and its branch refs: uncommitted work in {self.worktree}: untracked.txt.",
+        ])
+        self.assertIsNone(staff.by_id(self.unit_staff_id))
+        self.assertEqual(dirty.read_text(), "keep this work\n")
+        self.assertEqual(git(self.checkout, "rev-parse", "alpha-branch"), tip)
+        self.assertEqual(git(self.root / "origin.git", "rev-parse", "alpha-branch"), tip)
+
     def test_legacy_retirement_keeps_a_replacement_checkout_at_the_old_path(self) -> None:
         self.park_without_worktree()
         row = staff.by_id(self.unit_staff_id)
@@ -1664,47 +1754,66 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertIn(commit, git(self.checkout, "ls-remote", "--heads", "origin", "replacement"))
         self.assertEqual(self.stops(), [])
 
-    def test_remote_legacy_retirement_uses_the_production_checkout(self) -> None:
+    def test_remote_legacy_retirement_skips_repository_discovery(self) -> None:
         self.park_without_worktree()
         origin = self.root / "origin.git"
-        caller = self.root / "caller-checkout"
-        _ = git(self.root, "clone", "-q", str(origin), str(caller))
-        _ = git(caller, "branch", "alpha-branch", "origin/alpha-branch")
-        tip = git(caller, "rev-parse", "alpha-branch")
-        production = read_production("alpha")
+        tip = git(self.checkout, "rev-parse", "alpha-branch")
         row = self.move_to_other_machine()
         row = staff.set_worktree(row.id, staff.RemovedWorktree("mac", self.worktree,
             staff.ParkedBranch("alpha-branch")), expected=row.worktree)
-        self.assertFalse((self.worktree.parent / ".git").exists())
-
-        def peer_checkout(word: str) -> Path:
-            self.assertEqual(remote.local_machine(), "mac")
-            self.assertEqual(word, "origin")
-            return self.checkout
-
-        with (mock.patch.object(shutdown, "retirement_production_of", return_value=replace(production, checkout=caller)),
-              mock.patch.object(worktree_records, "main_checkout_path", side_effect=peer_checkout)):
+        self.pane_world.add(row, "w1:p1", live=False)
+        with (mock.patch.object(build_folders, "repo_word", side_effect=OSError("repository word unreadable")) as word,
+              mock.patch.object(shutdown, "retirement_production_of") as production,
+              mock.patch.object(shutdown, "retirement_check") as check,
+              mock.patch.object(shutdown, "retirement_remove") as remove):
             code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertIsNone(staff.by_id(row.id))
         self.assertFalse(shutdown.retirement_journal(row).exists())
-        self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
-        self.assertEqual(git(origin, "branch", "--list", "alpha-branch"), "")
-        self.assertEqual(git(caller, "rev-parse", "alpha-branch"), tip)
+        self.assertNotIn("w1:p1", self.pane_world.locations)
+        self.assertEqual(git(self.checkout, "rev-parse", "alpha-branch"), tip)
+        self.assertEqual(git(origin, "rev-parse", "alpha-branch"), tip)
+        word.assert_not_called()
+        production.assert_not_called()
+        check.assert_not_called()
+        remove.assert_not_called()
 
-    def test_retirement_reports_a_pane_close_failure_and_retries_from_the_journal(self) -> None:
+    def test_retirement_retries_a_failed_pane_session_read_or_parked_config_removal(self) -> None:
+        for failure in ("pane session read", "parked configuration removal"):
+            with self.subTest(failure=failure):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    case.check_remote_cleanup_retry(failure)
+                finally:
+                    case.doCleanups()
+
+    def check_remote_cleanup_retry(self, failure: str) -> None:
         row = self.move_to_other_machine()
         journal = self.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
         self.pane_world.add(row, "w1:p1", live=False)
-        with mock.patch.object(self.pane_world, "close_retained_pane", return_value=False):
+        def fail_session_read() -> herdr.Herdr:
+            self.assertIsNone(staff.authority_snapshot().by_id(row.id))
+            raise PermissionError("fixture pane session read failed")
+
+        if failure == "pane session read":
+            patch = mock.patch.object(worker_panes, "_client", side_effect=fail_session_read)
+            reason = "Cleanup is incomplete: fixture pane session read failed."
+        elif failure == "parked configuration removal":
+            patch = mock.patch.object(unit_config, "discard_parked",
+                                      side_effect=PermissionError("fixture parked configuration removal failed"))
+            reason = "Cleanup is incomplete: fixture parked configuration removal failed."
+        else:
+            patch = mock.patch.object(self.pane_world, "close_retained_pane", return_value=False)
+            reason = "Pane cleanup is unconfirmed: alpha:w1:p1."
+        with patch:
             code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertIsNone(staff.by_id(row.id))
-        self.assertFalse(self.worktree.exists())
-        message = (f"Pane cleanup is unconfirmed: alpha:w1:p1. Cleanup journal retained. " +
-                   f"Run agents retire {row.id} again.")
-        self.assertIn(message, output.splitlines())
-        self.assertEqual(output.count("Cleanup journal retained."), 1, output)
+        self.assertEqual(self.worktree.exists(), failure == "pane session read")
+        self.assertEqual(output.splitlines(), [
+            f"{reason} Cleanup journal retained. Run agents retire {row.id} again.",
+        ])
         self.assertTrue(journal.exists())
         self.assertNotIn('"cleanup_complete": true', journal.read_text())
         self.assertTrue(shutdown.retirement_journal(row).exists())
@@ -1716,7 +1825,134 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertFalse(shutdown.retirement_journal(row).exists())
         self.assertNotIn(row.id, staff.authority_snapshot().retirement_cleanup)
 
+    def test_retirement_reports_worker_pane_read_reasons_once(self) -> None:
+        row = staff.snapshot().find(kind="worker", parent=self.unit_staff_id)[0]
+        for fails_in_stop in (False, True):
+            with self.subTest(fails_in_stop=fails_in_stop):
+                def observe(_parent: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+                    if fails_in_stop:
+                        raise PermissionError("fixture pane evidence unavailable")
+                    return [worker_panes._uncertain(row, "fixture pane evidence unavailable")]  # pyright: ignore[reportPrivateUsage]
+
+                read = observe if not fails_in_stop else mock.Mock(side_effect=[[], PermissionError("fixture pane evidence unavailable")])
+                with mock.patch.object(worker_panes, "observe", side_effect=read):
+                    code, output = self.retire()
+                self.assertEqual(code, 0, output)
+                owner = self.unit_staff_id if fails_in_stop else row.name
+                self.assertEqual(output.splitlines(), [
+                    f"Session cleanup is incomplete: {owner}: fixture pane evidence unavailable. " +
+                    f"Cleanup journal retained. Run agents retire {self.unit_staff_id} again.",
+                ])
+                self.assertTrue(self.worktree.is_dir())
+
+    def test_retirement_reports_a_saved_staff_parse_failure_without_deleting_the_checkout(self) -> None:
+        row = self.move_to_other_machine()
+        journal = self.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
+        with mock.patch.object(copies, "remove_trees", side_effect=copies.CopyError("fixture copy failure")):
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        original = journal.read_text()
+        saved = cast(dict[str, object], json.loads(original))
+        saved["parent"] = 1
+        write_text_atomic(journal, json.dumps(saved))
+        with mock.patch.object(shutdown, "retirement_remove") as remove:
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(output.splitlines()), 1, output)
+        self.assertIn("Cleanup is incomplete:", output)
+        self.assertIn("Cleanup journal retained.", output)
+        self.assertNotIn('"cleanup_complete": true', journal.read_text())
+        self.assertTrue(self.worktree.is_dir())
+        self.assertIsNone(staff.by_id(row.id))
+        self.assertTrue(shutdown.retirement_journal(row).exists())
+        remove.assert_not_called()
+        write_text_atomic(journal, original)
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(self.worktree.exists())
+        self.assertFalse(journal.exists())
+
+    def test_retirement_reports_remote_completion_errors_and_preserves_race_refusals(self) -> None:
+        row = self.move_to_other_machine()
+        journal = self.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
+        with mock.patch.object(copies, "remove_trees", side_effect=copies.CopyError("fixture copy failure")):
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+
+        def fail_completion(args: list[str], stdin: str = "",
+                            limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT) -> tuple[int, str]:
+            del limit
+            request = cast(dict[str, object], json.loads(stdin))
+            self.assertEqual(args, ["_unit-local"])
+            self.assertEqual(request["action"], "retire-complete")
+            return 1, json.dumps({
+                "code": 1, "identity": row.id, "session": row.current_session,
+                "machine": "mac", "worktree": str(self.worktree), "output": "fixture remote completion failed",
+            })
+
+        with mock.patch.object(shutdown, "run_remote", side_effect=fail_completion):
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output.splitlines(), [
+            "Remote cleanup is incomplete: fixture remote completion failed. Cleanup journal retained. "
+            + f"Run agents retire {row.id} again.",
+        ])
+        self.assertTrue(journal.exists())
+        self.assertTrue(shutdown.retirement_journal(row).exists())
+        _ = git(self.worktree, "switch", "-qc", "replacement")
+        code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(output.splitlines(), [
+            "The local branch changed after the merge check. The checkout is present. "
+            + f"This attempt removed no branch refs. Run agents retire {row.id} again.",
+        ])
+        self.assertEqual(git(self.worktree, "branch", "--show-current"), "replacement")
+        self.assertTrue(journal.exists())
+        self.assertTrue(shutdown.retirement_journal(row).exists())
+
+    def test_retirement_reports_missing_cleanup_facts_at_both_journal_reads(self) -> None:
+        for when in ("before the first read", "before the second read"):
+            with self.subTest(when=when):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    row = case.move_to_other_machine()
+                    journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
+                    with mock.patch.object(copies, "remove_trees", side_effect=copies.CopyError("fixture copy failure")):
+                        code, output = case.retire()
+                    case.assertEqual(code, 0, output)
+                    locks = shutdown.retirement_member_locks
+
+                    @contextmanager
+                    def erase_after_lock(owner: staff.StaffRow, record: staff.StaffSnapshot) -> Generator[None]:
+                        with locks(owner, record):
+                            journal.unlink()
+                            yield
+
+                    if when == "before the first read":
+                        journal.unlink()
+                    with mock.patch.object(shutdown, "retirement_member_locks", erase_after_lock):
+                        code, output = case.retire()
+                    case.assertEqual(code, 0, output)
+                    case.assertEqual(output.splitlines(), [
+                        f"Cleanup is incomplete: the staff claim for {row.id} remains, but the cleanup facts are missing.",
+                    ])
+                    case.assertTrue(case.worktree.exists())
+                    case.assertFalse(journal.exists())
+                    case.assertTrue(shutdown.retirement_journal(row).exists())
+                    case.assertIn(row.id, staff.authority_snapshot().retirement_cleanup)
+                finally:
+                    case.doCleanups()
+
     def test_retirement_retry_keeps_the_new_terminal_after_the_old_shell_exits(self) -> None:
+        with self.subTest("remote pane close"):
+            case = RetireUnitTests()
+            case.setUp()
+            try:
+                case.check_remote_cleanup_retry("pane close")
+            finally:
+                case.doCleanups()
+
         row = staff.by_id(self.unit_staff_id)
         assert row is not None
         identity = "w1:p1"
@@ -1761,7 +1997,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
 
         with mock.patch.object(shutdown, "retirement_run", side_effect=fail_remove):
             code, output = self.retire()
-        self.assertEqual(code, 1, output)
+        self.assertEqual(code, 0, output)
         self.assertIn("fixture removal failed", output)
         self.assertTrue(shutdown.retirement_journal(row).exists())
         _ = git(self.worktree, "switch", "-qc", "replacement")
@@ -1986,7 +2222,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         code, output = case.retire()
                     send.assert_not_called()
                     case.assertEqual(case.pane_world.signals, [])
-                    case.assertEqual(code, 0 if succeeds else 1, output)
+                    case.assertEqual(code, 0 if succeeds or removal_fails else 1, output)
                     case.assertEqual(case.pane_world.closed, [("w1:p1", "terminal-w1:p1")] if closes else [])
                     if succeeds:
                         if closes:
@@ -2156,10 +2392,13 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         commit = git(case.worktree, "commit-tree", tree, "-p", "main^1", "-p", "main^2", "-m", "Keep merge work")
                         _ = git(case.worktree, "reset", "--hard", commit)
                         code, output = case.retire()
-                        case.assertEqual(code, 1, output)
-                        case.assertIn(f"unmerged commits on alpha-branch: {commit}", output)
+                        case.assertEqual(code, 0, output)
+                        case.assertEqual(output.splitlines(), [
+                            f"Retirement kept {case.worktree} and its branch refs: unmerged commits on alpha-branch: {commit}.",
+                        ])
                         case.assertEqual(git(case.worktree, "rev-parse", "HEAD"), commit)
-                        case.assertIsNotNone(staff.by_id(case.unit_staff_id))
+                        case.assertEqual(git(case.checkout, "rev-parse", "alpha-branch"), commit)
+                        case.assertIsNone(staff.by_id(case.unit_staff_id))
                         continue
                     if branch_state == "custom driver":
                         _ = git(case.checkout, "config", "merge.keepours.driver", "true")
@@ -2266,14 +2505,18 @@ fi
 
                     with mock.patch.object(shutdown, "retirement_run", side_effect=move_during_read):
                         status, output = case.retire()
-                    self.assertEqual(status, 1, output)
+                    self.assertEqual(status, 0, output)
+                    self.assertIn("Checkout cleanup is incomplete:", output)
                     self.assertIn(f"unmerged commits on alpha-branch: {unmerged}", output)
+                    self.assertIn("Cleanup journal retained.", output)
                     self.assertEqual(git(case.checkout, "rev-parse", ref), moved)
                     self.assertIn(unit_tip, git(case.checkout, "ls-remote", "origin", unit_ref))
                     self.assertTrue(case.worktree.is_dir())
                     status, output = case.retire()
-                    self.assertEqual(status, 1, output)
+                    self.assertEqual(status, 0, output)
+                    self.assertIn("Checkout cleanup is incomplete:", output)
                     self.assertIn(f"unmerged commits on alpha-branch: {unmerged}", output)
+                    self.assertIn("Cleanup journal retained.", output)
                 finally:
                     case.doCleanups()
 
@@ -2474,7 +2717,7 @@ fi
                         if failure in ("authority write", "legacy authority write", "authority response"):
                             with mock.patch.object(staff, "remove_unit_for_retirement", side_effect=fail_authority):
                                 code, output = case.retire()
-                            case.assertEqual(code, 1, output)
+                            case.assertEqual(code, 0 if failure == "authority response" else 1, output)
                             case.assertIn(f"fixture {failure} failed", output)
                             case.assertEqual(staff.by_id(row.id), None if failure == "authority response" else row)
                             case.assertEqual(case.stops(), [])
@@ -2491,7 +2734,7 @@ fi
                             case.assertEqual(git(case.root / "origin.git", "branch", "--list", branch), "")
                             continue
                         code, output = case.retire()
-                    if failure in ("stop", "copy", "hold"):
+                    if failure in ("stop", "copy", "hold", "remove", "branch", "origin"):
                         case.assertEqual(code, 0, output)
                         case.assertIn(f"Cleanup journal retained. Run agents retire {row.id} again.", output)
                     else:
@@ -2510,8 +2753,8 @@ fi
                         _ = git(case.checkout, "switch", "main")
                         _ = git(case.checkout, "push", "-q", "origin", f"{commit}:refs/heads/alpha-branch")
                         code, output = case.retire()
-                        case.assertEqual(code, 1, output)
-                        case.assertIn("refused: unmerged commits on alpha-branch", output)
+                        case.assertEqual(code, 0, output)
+                        case.assertIn("Checkout cleanup is incomplete: unmerged commits on alpha-branch", output)
                         case.assertIsNone(staff.by_id(row.id))
                         case.assertTrue(journal.exists())
                         case.assertIn(commit, git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch"))

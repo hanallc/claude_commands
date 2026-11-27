@@ -1258,7 +1258,8 @@ NO_WORKERS_TO_KEEP_RUNNING: frozenset[StaffId] = frozenset()
 def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
                       codex: herdr.CodexConversations | None = None,
                       keep_running: frozenset[StaffId] = NO_WORKERS_TO_KEEP_RUNNING,
-                      failures: dict[StaffId, str] | None = None) -> list[str]:
+                      failures: dict[StaffId, str] | None = None,
+                      report_read_failure: bool = True) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
     from scripts.herdr import worker_panes
     from scripts.agents import restart
@@ -1286,7 +1287,8 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
         reason = " ".join(str(error).splitlines())
         unresolved = [f"{unit}: {reason}"]
         failed = {row.id: reason for row in members}
-        print(f"anomaly: {unresolved[0]}", file=sys.stderr)
+        if report_read_failure:
+            print(f"anomaly: {unresolved[0]}", file=sys.stderr)
     if failures is not None:
         failures.update(failed)
     return unresolved
