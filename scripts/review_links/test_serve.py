@@ -1796,11 +1796,18 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             restarted = change_page.DeliveryStatus(case.root)
             change_page.recover_pending(restarted)
+            answered_rows: list[the_list.ListItem] = []
             if answered_marker:
                 waiting = case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id)
                 answered = review_submissions.submit(waiting, initial_delivery=review_submissions.InitialDelivery())
                 self.assertTrue(review_submissions.answer(answered.key, "The check passed.",
                                                           answered.details.reply_token))
+                answered_rows = the_list.records(morty.id, include_closed=True)
+                answered_row, = answered_rows
+                self.assertEqual(answered_row.number, 2)
+                exchange, = answered_row.filed_exchanges
+                assert isinstance(exchange.answer, list_exchange.ExchangeAnswer)
+                self.assertEqual(exchange.answer.text, "The check passed.")
                 expected_records = investigation.records(owner.id)
                 self.assertEqual(len(expected_records), 2)
                 pending = {item.address.request_id for item in review_submissions.pending_initial_deliveries(case.root)}
@@ -1816,10 +1823,14 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertIn(str(failure), errors.getvalue())
                 self.assertEqual([item.address.request_id for item in
                                   review_submissions.pending_initial_deliveries(case.root)], [pending_request_id])
-                self.assertEqual(the_list.records(morty.id, include_closed=True), [])
+                self.assertEqual(the_list.records(morty.id, include_closed=True), answered_rows)
                 self.assertEqual(read_new_item_notices(log), [])
             review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
             rows = the_list.records(morty.id, include_closed=True)
+            report_rows = rows
+            if answered_marker:
+                self.assertEqual(rows[1:], answered_rows)
+                report_rows = rows[:1]
             notice, = read_new_item_notices(log)
             self.assertEqual(notice["rows"], [row.id for row in rows])
             self.assertIn(request.words, notice["words"])
@@ -1838,7 +1849,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertNotIn("list_number", receipt)
             self.assertEqual(errors.getvalue().count(f"{owner.name}: retired producer."), 1)
             return
-        row, = rows
+        row, = report_rows
         if before:
             self.assertEqual(row, before[0])
         else:
