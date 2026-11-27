@@ -161,10 +161,10 @@ class HolderRun(Enum):
 def dispatch_run_fields(parent: StaffId, run: Path, *, record: staff.StaffSnapshot) -> dict[str, object] | AdmissionRefused:
     fields = unit_runs.read_run_fields(run)
     try:
-        owner = pass_recorder.resolve_run_owner(run, fields, record)
+        _ = pass_recorder.resolve_run_owner(run, fields, record)
     except (ValueError, staff.StaffUnreadable) as error:
         return AdmissionRefused(str(error))
-    if not isinstance(owner, staff.StaffRow) or owner.id != parent:
+    if fields.get(unit_runs.OWNER_FIELD) != parent:
         return AdmissionRefused(f"{run}: the run is not owned by {parent}")
     return fields
 

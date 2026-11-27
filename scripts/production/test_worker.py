@@ -2483,16 +2483,26 @@ class WorkerCommandTests(unittest.TestCase):
         first_turn.assert_called_once()
         self.assertIsInstance(result, worker_panes.OpenWorker)
 
-    def test_explicit_start_accepts_the_unique_staff_run_pointer(self) -> None:
+    def test_dispatch_refuses_a_run_without_a_saved_owner_before_launch(self) -> None:
         fields = unit_runs.read_run_fields(self.run_dir)
         del fields[unit_runs.OWNER_FIELD]
         _ = (self.run_dir / unit_runs.STATE_FILE).write_text(json.dumps(fields))
 
+        with redirect_stderr(io.StringIO()) as errors:
+            result = self.dispatch()
+
+        self.assertIs(result, worker.ExitCode.REFUSED, errors.getvalue())
+        self.assertEqual(self.fixture.world.launches, [])
+        self.assertEqual(self.agent.submitted, [])
+
+    def test_explicit_start_refuses_a_run_without_a_recorder_file(self) -> None:
+        (self.run_dir / unit_runs.STATE_FILE).unlink()
+
         result = worker_panes.start_or_resume(self.fixture.parent.id, staff.WorkerName.parse("impl"),
             "impl", dispatch_run=worker_panes.DispatchRun(self.run_dir))
 
-        self.assertIsInstance(result, worker_panes.OpenWorker)
-        self.assertEqual(self.fixture.world.requests[-1][2]["UNIT_RUN_DIR"], str(self.run_dir))
+        self.assertIsInstance(result, worker_panes.AdmissionRefused)
+        self.assertEqual(self.fixture.world.launches, [])
 
     def test_launched_agent_reads_the_kept_launch_settings(self) -> None:
         row = fixture_worker("called-agent", self.fixture.parent.id)
