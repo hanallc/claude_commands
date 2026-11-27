@@ -24,7 +24,7 @@ from scripts.notify import review
 from scripts.production import (
     behavior_check, behavior_review, record_store, session_staff, staff, the_list, update_registration, worker,
 )
-from scripts.review_links import list_draft, question_record, review_events
+from scripts.review_links import images, list_draft, question_record, review_events
 
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
@@ -190,7 +190,9 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def test_clear_requires_a_saved_reply_for_this_patch_and_each_test(self) -> None:
         args, key = self.changed_range()
         self.reply(CLEAR_REPLY)
-        with mock.patch.object(astra_review, "run_review", return_value=0) as runner:
+        review_root = self.root / "review-links"
+        with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(review_root)}),
+              mock.patch.object(astra_review, "run_review", return_value=0) as runner):
             code, output = self.cli("run", *args)
             self.assertEqual(code, 0, output)
             self.assertEqual(self.cli("run", *args), (0, output))
@@ -203,6 +205,10 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("Never call `write_stdin`.", prompt)
         self.assertIn("rg --search-zip --files-with-matches --hidden --no-ignore", prompt)
         self.assertIn("Parse only those files for matching user turns.", prompt)
+        self.assertIn(f"Nate's Images page answers in {images.decision_root(review_root)}/*.json.", prompt)
+        self.assertIn('the source is "nate via Images" and `image_answer.signed` is true.', prompt)
+        self.assertIn("Use `image_text` for context. Quote only `answer` and `feedback`.", prompt)
+        self.assertIn("You can cite Nate's Images page answer from the store or the List log.", prompt)
         self.assertIn("Find Nate's newest words that set each affected behavior.", prompt)
         self.assertIn("saved question answer or feedback.", prompt)
         self.assertIn('Use "specified" when you find words to assess', prompt)
@@ -243,7 +249,10 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def split_range(self, shared_text: str) -> tuple[list[str], str]:
         config = self.root / "config"
         _ = self.write(config / "production.conf", "# whole: 1..\nreview_part_bytes=2400\n")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(config),
+            "REVIEW_LINKS_ROOT": str(self.root / "review-links"),
+        })))
         first = f"def test_move():\n    assert 'old {'a' * 190}'\n\ndef test_stop():\n    assert 'old {'b' * 190}'\n"
         second = f"def test_start():\n    assert 'old {'c' * 310}'\n"
         _ = self.write(self.repo / "test_first.py", first)
@@ -433,6 +442,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
 
         def review_part(reply: Path, prompt: str, _log: Path, **_options: object) -> int:
             self.assertIn("Read the diffs for the listed tests and the files those tests exercise.", prompt)
+            self.assertIn(f"Nate's Images page answers in {images.decision_root(self.root / 'review-links')}/*.json.", prompt)
             folder = reply.parent
             index = folder / "diffs" / "index.json"
             paths = cast(dict[str, str], json.loads(index.read_text()))

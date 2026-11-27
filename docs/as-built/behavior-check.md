@@ -29,6 +29,9 @@ If several messages contain relevant words, the reviewer quotes the newest messa
 The gate checks the finding for each changed test.
 Source verification applies only to `requested` findings.
 The check accepts typed Claude turns, sent List Tell feedback from Nate, and Nate's saved List or Question answers.
+For List entries with source `nate via Images`, the check requires `image_answer.signed` to be `true`.
+The Images store keeps standalone answers in `.review-link-image-decisions/*.json` under the configured review links directory.
+The check reads `answer` and `feedback` as Nate's words. The reviewer uses `image_text` for context.
 It matches consecutive full sentences or lines and treats each run of whitespace as one space.
 The check reports the date from the source. A `requested` finding needs a question if the source cannot prove the author or quote.
 Status fails if it cannot read or parse the saved proof for a clear record.

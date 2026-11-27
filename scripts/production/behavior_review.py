@@ -24,7 +24,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.showrunner_state import state_root
 from scripts.production import behavior_check, behavior_request, staff, update_registration, worker
 from scripts.production.production_doc import Refusal
-from scripts.review_links import review_events
+from scripts.review_links import images, review_events, review_link
 
 
 @dataclass(frozen=True)
@@ -205,6 +205,7 @@ print(getfile(update_registration))
 
 Use these sources:
 1. List records and their questions and answers in {state_root}/*/list/L*.md.
+   Cite Images answers in the log only if the source is "nate via Images" and `image_answer.signed` is true.
 2. Question records and change review verdicts.
    Read `{checker_root}/scripts/production/update_registration.py` for the question record code.
    Follow the store paths in the showrunner documents and the showrunner state root.
@@ -215,6 +216,8 @@ Use these sources:
    Select files by terms for the affected behaviors. Parse only those files for matching user turns.
 4. Commit messages in {repo}.
 5. ~/.claude/docs/decision_criteria.md and memory files that quote Nate.
+6. Nate's Images page answers in {image_answers}/*.json.
+   Use `image_text` for context. Quote only `answer` and `feedback`.
 
 Check that Nate wrote the words and used them to set behavior.
 Find Nate's newest words that set each affected behavior. Check for later words that set it differently.
@@ -226,6 +229,7 @@ For a complete review, return one JSON array. Give one object for each test ID i
 Use {{"test":"ID","finding":"none"}} when you find no such words.
 Use "requested" only when Nate's newest words on the behavior ask for this change.
 For "requested", cite Nate's typed Claude turn, sent List Tell, or saved question answer or feedback.
+You can cite Nate's Images page answer from the store or the List log.
 Quote one or more complete sentences or lines in order from one source message only.
 If several messages contain relevant words, quote the newest message that sets the behavior.
 Use the source date.
@@ -366,7 +370,8 @@ def prepare_review(change: behavior_check.GitRange, part: ReviewPart, folder: Pa
                                      str(reply), astra_work.StandaloneWork())
     return astra_work.header_line(assignment) + part.instructions.format(
         test_file=test_file, diff_file=diff_file, state_root=state_root(), repo=change.repo,
-        checker_root=CHECKER_ROOT, checker_root_shell=shlex.quote(str(CHECKER_ROOT)))
+        checker_root=CHECKER_ROOT, checker_root_shell=shlex.quote(str(CHECKER_ROOT)),
+        image_answers=images.decision_root(review_link.review_root()))
 
 
 class ReviewNeedsDispatch:
