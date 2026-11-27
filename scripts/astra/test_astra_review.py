@@ -26,7 +26,7 @@ from scripts.production import test_worker as worker_tests
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.herdr import herdr, pass_notices, side_pane, turn_end, worker_panes
-from scripts.direct import assign, progress_history, remove_run_scratch, workers
+from scripts.direct import assign, pass_record, progress_history, remove_run_scratch, workers
 from scripts.message import send
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
 from scripts.lib import unit_runs
@@ -111,10 +111,15 @@ class AstraReviewTests(StaffTestCase):
                                                           assignment_claim="active-dispatch" if busy else "")))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         run = design_roles.design_directory(design_id)
-        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
+        history = run / "history.jsonl"
+        state: dict[str, object] = {
+            "run_id": run.name,
+            "history_file": str(history),
             unit_runs.OWNER_FIELD: parent.id,
             "pass": {worker.name: {"worker_id": worker.id, "confirmed_delivery_ids": ["earlier-review"]}},
-        }))
+        }
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps(state))
+        _ = history.write_text(json.dumps(pass_record.record_event(state, "run_started", 1)) + "\n")
         return design
 
     def test_document_with_a_held_reviewer_resumes_that_thread_and_saves_each_reply(self) -> None:

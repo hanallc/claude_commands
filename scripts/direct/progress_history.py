@@ -1327,6 +1327,8 @@ def _start_phase(args: argparse.Namespace) -> None:
     record = staff.initial_snapshot()
     state = _read_state(session_dir, record=record)
     if unit_runs.terminal_run(state):
+        if getattr(args, "require_open_run", False) is True:
+            raise SystemExit(f"{session_dir}: the run has ended")
         if isinstance(_run_pointer(session_dir, record), staff.StaffRow):
             raise SystemExit(f"{session_dir}: complete the pending run end before reopening it")
         owner = unit_runs.run_owner(state, record)
@@ -7557,6 +7559,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_phase.add_argument("--session-dir", required=True)
     _ = start_phase.add_argument("--phase-id", "--phase", required=True)
     _ = start_phase.add_argument("--phase-title", required=True)
+    _ = start_phase.add_argument("--require-open-run", action="store_true")
     _ = start_phase.add_argument("--work-order-file", default="")
     _ = start_phase.add_argument("--started-at", default="")
     start_phase.set_defaults(handler=_start_phase)

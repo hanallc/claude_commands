@@ -766,9 +766,11 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
         state = unit_runs.read_run_fields(run)
         if state.get(unit_runs.OWNER_FIELD) != parent.id:
             raise RoleRefused(f'{run}: the run is not owned by {parent.id}')
+        if unit_runs.terminal_run(state):
+            raise RoleRefused(f'{run}: the run has ended')
         if phase not in recorder_state.open_phase_ids(state):
             _recorder_command(['start-phase', '--session-dir', str(run), '--phase-id', phase,
-                               '--phase-title', 'Held Astra review'])
+                               '--phase-title', 'Held Astra review', '--require-open-run'])
     result = _assign_command(['--role', 'review' if role == 'reviewer' else 'implement',
         '--target', 'durable-design-role', '--policy', 'astra-' + role,
         '--session-dir', str(run), '--parent', str(parent.id), '--to', name,
@@ -798,13 +800,19 @@ def _ensure_review_recorder(design: HeldDesign, directory: Path, parent: staff.S
         env['CLAUDE_CODE_SESSION_ID'] = director
         _recorder_command(['start-run', '--session-dir', str(directory), '--working-dir', design_repository(design),
                            '--main-session-id', director], env=env)
-    if unit_runs.read_run_fields(directory).get(unit_runs.OWNER_FIELD) != parent.id:
+    state = unit_runs.read_run_fields(directory)
+    if state.get(unit_runs.OWNER_FIELD) != parent.id:
         raise RoleRefused(f'{directory}: the run is not owned by {parent.id}')
+    history = pass_recorder.string(state.get('history_file'))
+    started = plan_history.run_started_event(Path(history)) if history else None
+    if started is None or started.get('run_id') != directory.name:
+        raise RoleRefused(f'{directory}: the recorder has no matching run_started event')
 
 
 def _review_submitted(state: dict[str, object], worker_id: staff.StaffId) -> bool:
+    passes = (*pass_recorder.pass_slots(state).values(), *pass_recorder.retained_passes(state).values())
     if any(passed.get('worker_id') == worker_id and pass_recorder.string_list(passed.get('confirmed_delivery_ids'))
-           for passed in pass_recorder.pass_slots(state).values()):
+           for passed in passes):
         return True
     history = pass_recorder.string(state.get('history_file'))
     return bool(history and any(event.get('event_type') == 'pass_finished' and event.get('worker_id') == worker_id
@@ -818,6 +826,8 @@ def _review_submission_parent(design: HeldDesign, role: Role, worker: HeldWorker
     state = unit_runs.read_run_fields(directory)
     if state and state.get(unit_runs.OWNER_FIELD) != parent.id:
         raise RoleRefused(f'{directory}: the run is not owned by {parent.id}')
+    if unit_runs.terminal_run(state):
+        raise RoleRefused(f'{directory}: the run has ended')
     if parent.current_session != staff.runtime_id() and not _review_submitted(state, worker.staff_id):
         raise RoleRefused('only the review run parent may submit its first turn')
     return parent

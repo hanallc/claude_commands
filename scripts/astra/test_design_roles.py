@@ -29,7 +29,7 @@ from scripts.astra import astra_roles  # noqa: E402
 from scripts.accounts import role_map  # noqa: E402
 from scripts.agents import remote, worker_lifecycle  # noqa: E402
 from scripts.astra import astra_review, astra_work, design_roles  # noqa: E402
-from scripts.direct import progress_history, recorder_state
+from scripts.direct import pass_record, plan_history, progress_history, recorder_state
 from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record
 from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld, idle_transcript, prepare_recorder_history
@@ -227,6 +227,86 @@ class HeldRolePaneTests(HeldRolePaneCase):
 
         reply = self.panes.resume(design, "reviewer")
         self.assertIn("The work is complete.", reply.read_text())
+        self.assertEqual(unit_runs.read_run_fields(run)[unit_runs.OWNER_FIELD], parent.id)
+
+    def test_unbound_resume_keeps_a_stopped_run_closed(self) -> None:
+        parent = self.panes.command_case.fixture.parent
+        _ = staff.clear_run(parent.id, self.panes.command_case.run_dir)
+        design = self.panes.open("reviewer", bound=False)
+        _ = self.panes.resume(design, "reviewer")
+        run = design_roles.design_directory(design.placement.design_id)
+        launches = self.panes.world.launches.copy()
+
+        def stop_before_phase_start(arguments: list[str], *, env: Mapping[str, str] = os.environ) -> None:
+            self.assertEqual(arguments[0], "start-phase")
+            self.panes.record(["finish-run", "--session-dir", str(run), "--status", "stopped"])
+            self.panes.record(arguments, env=env)
+
+        with (patch.object(design_roles, "_recorder_command", side_effect=stop_before_phase_start),
+              self.assertRaisesRegex(design_roles.RoleRefused, "the run has ended")):
+            _ = self.panes.resume(design, "reviewer")
+
+        state = unit_runs.read_run_fields(run)
+        self.assertTrue(unit_runs.terminal_run(state))
+        history = Path(cast(str, state["history_file"]))
+        events = [event["event_type"] for event in plan_history.read_run_events(history)]
+        self.assertEqual(events.count("phase_started"), 1)
+        self.assertNotIn("reopened", events)
+        self.assertEqual(events[-1], "run_finished")
+        saved_history = history.read_bytes()
+
+        with self.assertRaisesRegex(design_roles.RoleRefused, "the run has ended"):
+            _ = self.panes.resume(design, "reviewer")
+
+        self.assertEqual(unit_runs.read_run_fields(run), state)
+        self.assertEqual(history.read_bytes(), saved_history)
+        self.assertEqual(self.panes.world.launches, launches)
+        self.assertEqual(len(self.panes.command_case.agent.submitted), 1)
+
+    def test_unbound_open_refuses_a_recorder_without_run_started(self) -> None:
+        parent = self.panes.command_case.fixture.parent
+        with stop_once(progress_history, "_append_event", when="before"), self.assertRaises(InjectedStop):
+            _ = self.panes.open("reviewer", bound=False)
+        path, = design_roles.state_root().glob("*/design.json")
+        run = path.parent
+        state = unit_runs.read_run_fields(run)
+        self.assertEqual(state[unit_runs.OWNER_FIELD], parent.id)
+        history = Path(cast(str, state["history_file"]))
+        self.assertIsNone(plan_history.run_started_event(history))
+
+        with self.assertRaisesRegex(design_roles.RoleRefused, "run_started"):
+            _ = self.panes.open("reviewer", bound=False)
+
+        self.assertEqual(unit_runs.read_run_fields(run), state)
+        self.assertEqual(self.panes.world.launches, [])
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=parent.id), [])
+
+    def test_unbound_resume_accepts_a_retained_confirmed_first_turn(self) -> None:
+        parent = self.panes.command_case.fixture.parent
+        other = fixture_member("unit", name="another-holder", parent=parent.parent)
+        self.panes.world.add(other, "w1:p-other")
+        design = self.panes.open("reviewer", bound=False)
+        run = design_roles.design_directory(design.placement.design_id)
+        self.panes.command_case.agent.finish_after = 1
+        _ = design_roles.resume(run.name + "/reviewer", self.panes.command_case.prompt)
+        pane = self.panes.command_case.agent.submitted[-1][0]
+        self.panes.world.locations[pane]["agent_status"] = "idle"
+        self.panes.record(["finish-phase", "--session-dir", str(run), "--phase-id", "astra-review",
+                           "--status", "stopped"])
+        self.panes.record(["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
+                           "--phase-title", "Held Astra review"])
+        state = unit_runs.read_run_fields(run)
+        self.assertEqual(pass_record.pass_slots(state), {})
+        first, = pass_record.retained_passes(state).values()
+        self.assertEqual(first["status"], "interrupted")
+        self.assertTrue(first["confirmed_delivery_ids"])
+
+        self.panes.command_case.agent.finish_after = 0
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": str(other.current_session)}):
+            reply = self.panes.resume(design, "reviewer")
+
+        self.assertIn("The work is complete.", reply.read_text())
+        self.assertEqual(len(self.panes.command_case.agent.submitted), 2)
         self.assertEqual(unit_runs.read_run_fields(run)[unit_runs.OWNER_FIELD], parent.id)
 
     def test_interrupted_unbound_creation_keeps_recorder_and_worker(self) -> None:
