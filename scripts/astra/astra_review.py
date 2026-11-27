@@ -22,8 +22,10 @@ import sys
 import time
 from tempfile import mkdtemp
 from collections.abc import Mapping
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import cast
 
 from scripts.astra import astra_work, design_roles  # noqa: E402
@@ -35,6 +37,7 @@ from scripts.lib.atomic_file import write_text_atomic
 
 MODEL = "gpt-6-astra"
 REASONING = "xhigh"
+INDEPENDENT_STAFF_OPEN = nullcontext()
 # Lines of Codex's own output a failure prints.
 ERROR_TAIL_LINES = 40
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -119,6 +122,9 @@ def _managed_review(review: Path, log: Path, target: str, cwd: Path,
     name = f"astra-reviewer-{run.name}" if dispatch_lock is not None else f"astra-reviewer{os.getpid()}"
     if dispatch_lock is not None and target == "consultation-pane":
         write_text_atomic(run / "consultation-session", herdr.shared_session() + "\n", new_file_mode=0o600)
+    environment = dict(os.environ)
+    if target == "staff-worker":
+        environment["UNIT_RUN_DIR"] = str(run.absolute())
     # Keep the lock until the launcher exits if its caller stops.
     with log.open("w", encoding="utf-8") as output:
         result = subprocess.run([
@@ -127,7 +133,7 @@ def _managed_review(review: Path, log: Path, target: str, cwd: Path,
             "--new-worker", name, "--session-dir", str(run), "--cwd", str(cwd),
             "--prompt", str(run / "prompt.md"), "--reply-file", str(review.resolve()), "--log", str(run / "turn.log"),
             "--model", MODEL, "--effort", REASONING,
-        ], stdout=output, stderr=subprocess.STDOUT, text=True, check=False,
+        ], stdout=output, stderr=subprocess.STDOUT, env=environment, text=True, check=False,
             pass_fds=() if dispatch_lock is None else (dispatch_lock.descriptor,))
     if result.returncode == 0 and log.read_text(encoding="utf-8").splitlines()[-1:] == ["submitted"]:
         return worker.DispatchSubmission.SUBMITTED
@@ -135,7 +141,8 @@ def _managed_review(review: Path, log: Path, target: str, cwd: Path,
 
 
 def run_review(review: Path, prompt: str, log: Path, *, cwd: Path | None = None,
-               dispatch_lock: file_lock.ExclusiveLock | None = None) -> int:
+               dispatch_lock: file_lock.ExclusiveLock | None = None,
+               staff_open_lock: Lock | nullcontext[None] = INDEPENDENT_STAFF_OPEN) -> int:
     """Run each review through its explicit assign.sh target."""
     manager = staff.runtime_id()
     caller = staff.snapshot().by_current_session(manager) if manager else None
@@ -143,7 +150,9 @@ def run_review(review: Path, prompt: str, log: Path, *, cwd: Path | None = None,
     if caller is not None and caller.kind in ("unit", "showrunner"):
         target = "staff-worker"
     write_text_atomic(log.parent / "prompt.md", prompt)
-    return _managed_review(review, log, target, cwd if cwd is not None else Path.cwd(), dispatch_lock)
+    # Staff assign returns after submission. Consultation assign waits for the reply.
+    with staff_open_lock if target == "staff-worker" else nullcontext():
+        return _managed_review(review, log, target, cwd if cwd is not None else Path.cwd(), dispatch_lock)
 
 
 submitted_review = design_roles.submitted_review

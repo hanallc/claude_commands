@@ -109,12 +109,12 @@ class HeldRolePaneFixture:
             status = worker.main(arguments)
         return subprocess.CompletedProcess(arguments, status, output.getvalue(), errors.getvalue())
 
-    def assign(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    def assign(self, arguments: list[str], *, env: Mapping[str, str] = os.environ) -> subprocess.CompletedProcess[str]:
         from scripts.direct import assign
         from scripts.production.cli_fixture import invoke_cli
 
         self.commands.append(arguments.copy())
-        return invoke_cli(assign, assign.main, arguments, os.environ.copy(), self.command_directory)
+        return invoke_cli(assign, assign.main, arguments, env, self.command_directory)
 
     def record(self, arguments: list[str], *, env: Mapping[str, str] = os.environ) -> None:
         self.recorder_commands.append(arguments.copy())
@@ -122,8 +122,9 @@ class HeldRolePaneFixture:
         if result.returncode:
             raise design_roles.RoleRefused(result.stderr.strip() or "held dispatch recording did not complete")
 
-    def open(self, role: design_roles.Role, *, bound: bool = True) -> design_roles.HeldDesign:
-        return design_roles.open_role("private-repo", "design.md", role, "design",
+    def open(self, role: design_roles.Role, *, bound: bool = True,
+             document: str = "design.md") -> design_roles.HeldDesign:
+        return design_roles.open_role("private-repo", document, role, "design",
                                       binding=self.binding if bound else design_roles.UNBOUND)
 
     def resume(self, design: design_roles.HeldDesign, role: design_roles.Role) -> Path:
