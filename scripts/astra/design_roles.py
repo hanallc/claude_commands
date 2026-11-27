@@ -873,13 +873,14 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
             if value.role == role else value for value in current.roles))
         _save(design)
     design = _begin_creation(design, role, 'pane-start')
-    run = Path(design.binding.run_directory) if isinstance(design.binding, DesignBoundToPhase) else directory
+    run, phase = ((Path(design.binding.run_directory), design.binding.phase) if isinstance(design.binding, DesignBoundToPhase)
+                  else (directory, 'astra-review'))
     parent = staff.snapshot().by_current_session(staff.runtime_id())
     if parent is None or parent.kind not in ('unit', 'showrunner'):
         raise RoleRefused('staff: caller: not opened: caller is not a unit or showrunner')
     result = _assign_command(['--role', 'review' if role == 'reviewer' else 'implement',
         '--target', 'durable-design-role', '--policy', 'astra-' + role, '--new-worker', name,
-        '--session-dir', str(run), '--parent', str(parent.id)])
+        '--session-dir', str(run), '--phase', phase, '--parent', str(parent.id)])
     if result.returncode:
         raise RoleRefused(result.stderr.strip() or 'held worker startup did not complete; creation claim is retained')
     fields = _object(cast(object, json.loads(result.stdout)))

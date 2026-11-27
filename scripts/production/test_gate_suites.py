@@ -304,10 +304,10 @@ class MergeGateSuitesTests(GateSuitesFixture):
                         self.assertEqual(output.getvalue().splitlines().count("full suite: no certified base"), 1)
                     else:
                         self.assertEqual(selected.paths, ("scripts/hooks/test_first.py",))
-                        self.assertIn("affected: 1 of 2 modules", output.getvalue())
+                        self.assertRegex(output.getvalue(), r"affected: 1 of 2 modules[^\n]+\(cache \d+ hits, \d+ misses;")
                 else:
                     self.assertEqual(routed, [])
-                    self.assertIn("affected: 0 of 2 modules", output.getvalue())
+                    self.assertRegex(output.getvalue(), r"affected: 0 of 2 modules[^\n]+\(cache \d+ hits, \d+ misses;")
                     self.assertIn("(none)", output.getvalue())
                 self.assertEqual(self.module_events(), [])
                 if decline:

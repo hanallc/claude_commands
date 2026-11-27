@@ -102,7 +102,7 @@ from scripts.production.gate_routes import (
     SuiteMode as SuiteMode, TreeSelection as TreeSelection,
 )
 from scripts.production.affected_modules import (  # noqa: E402
-    AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
+    AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, SelectionRun, select_affected,
 )
 from scripts.lib.release_waiter import local_release_waiter  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
@@ -1639,8 +1639,15 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int) -> No
         print(f"full suite: {selection.reason}", flush=True)
         return
     when = datetime.fromisoformat(selection.base.at).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
+    details = ""
+    selection_s = 0.0
+    if isinstance(run := selection.run, SelectionRun):
+        selection_s = run.total_s
+        details = (f" (cache {run.cache_hits} hits, {run.cache_misses} misses; read {run.cache_read_s:.1f} s, "
+                   + f"extract {run.extracted_files} files {run.extraction_s:.1f} s, graph {run.graph_s:.1f} s, "
+                   + f"other {run.other_s:.1f} s; lock {run.lock.value})")
     print(f"affected: {len(selection.modules)} of {total} modules (base {selection.base.commit[:12]}, {when}), "
-          + f"{len(selection.changed_files)} changed files", flush=True)
+          + f"{len(selection.changed_files)} changed files, selected in {selection_s:.1f} s{details}", flush=True)
     if len(selection.modules) <= 10:
         print(", ".join(f"{path.parent.name}/{path.name}" for path in selection.modules) or "(none)", flush=True)
 
@@ -1654,8 +1661,10 @@ def select_targeted_modules(repo: Path, tested_tree: CleanTestTree | Unrecordabl
         raise GateRefused("the test list is empty")
     ledger = PassedTreeLedger(repo, source, tested_tree, sorted({suite for suite, _ in modules}))
     dirty = set(tested_tree.dirty_paths) if isinstance(tested_tree, UnrecordableTestTree) else set[str]()
-    selection = select_affected(repo, ledger.certified_base(), [path for _, path in modules], dirty,
-                                state_dir=gate_state_dir())
+    base = ledger.certified_base()
+    paths = [path for _, path in modules]
+    state_dir = gate_state_dir()
+    selection = select_affected(repo, base, paths, dirty, state_dir=state_dir)
     report_selection(selection, len(modules))
     return selection, ledger
 
@@ -1953,8 +1962,8 @@ def _run_suites(repo: Path, type_dirs: Sequence[str], module_time_limit_s: float
                     selection = FullSuite(f"{read_step_names().prose(mode.value)} runs all modules")
                 else:
                     selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-                if mode is SuiteMode.GATE or full:
-                    report_selection(selection, len(modules))
+                if isinstance(selection, FullSuite) and (mode is SuiteMode.GATE or full):
+                    print(f"full suite: {selection.reason}", flush=True)
                 if isinstance(selection, AffectedSelection):
                     selected_paths = set(selection.modules)
                     modules = [(suite, path) for suite, path in modules if path in selected_paths]
