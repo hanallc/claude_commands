@@ -21,11 +21,11 @@ from scripts.herdr import herdr
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.shell_test_support import fixture_zsh_environment
-from scripts.production import add_unit, demote_showrunner as demote, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_effort, unit_lookup, update_registration
+from scripts.production import add_unit, demote_showrunner as demote, production_lifecycle, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_effort, unit_lookup, update_registration
 from scripts.production.production_doc import Production, read_production
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
-from scripts.agents import pane_record, remote, stop_resume
+from scripts.agents import pane_record, remote, shutdown, stop_resume
 
 
 class DemoteShowrunnerTests(StaffTestCase):
@@ -541,7 +541,17 @@ class DemoteShowrunnerTests(StaffTestCase):
         commit = self.git("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "unmerged work")
         for name in ("handoff-a", "handoff-b"):
             _ = self.git("branch", name, commit)
-            _ = self.retired_unit(name, name)
+            row = self.retired_unit(name, name)
+            path = production_lifecycle.wrap_branch_path(row)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(json.dumps({**production_lifecycle.wrap_branch_facts(row), "branch": "absent"}))
+        journal = shutdown.retirement_journal(row)
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        _ = journal.write_text(json.dumps({
+            "session": row.current_session, "worktree": str(self.root / row.name),
+            "checkout": str(self.checkout), "branch": "journal-work", "pane_id": "", "pane_session": "",
+        }))
+        _ = self.git("branch", "journal-work", commit)
         before = self.staff_file.read_bytes()
         for remote in (False, True):
             with self.subTest(remote=remote):
@@ -553,6 +563,7 @@ class DemoteShowrunnerTests(StaffTestCase):
                 self.assertEqual(code, 2, errors)
                 for name in ("handoff-a", "handoff-b"):
                     self.assertIn(name, errors)
+                self.assertIn("journal-work", errors)
                 self.assert_no_actions(before)
         _ = self.git("-C", str(self.child_tree), "merge", "--ff-only", commit)
         self.assertEqual(self.run_command("--check")[0], 0)

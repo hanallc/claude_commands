@@ -1295,11 +1295,16 @@ esac
         _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.alpha, staff.ParkedBranch("alpha-branch")), expected=row.worktree)
         _ = self.git("worktree", "remove", str(self.alpha))
         _ = self.git("branch", "-D", "alpha-branch")
+        wrap_record = Path(self.env["SHOWRUNNER_STATE_DIR"]) / self.owner_id() / "wrap_units" / f"{row.id}.json"
+        self.write(wrap_record, json.dumps({**production_lifecycle.wrap_branch_facts(row), "branch": "absent"}))
+        before = self.staff.staff_file.read_bytes()
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "held")
         self.assertIn("alpha-branch", result.stdout)
         self.assertEqual(self.git("ls-remote", "--heads", "origin", "alpha-branch").split()[1],
                          "refs/heads/alpha-branch")
+        self.assertEqual(self.staff.staff_file.read_bytes(), before)
+        self.assertTrue(self.beta.is_dir())
 
     def test_wrap_reports_already_retired_unit_with_no_branches(self) -> None:
         self.running()

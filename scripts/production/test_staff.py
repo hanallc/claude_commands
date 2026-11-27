@@ -1497,6 +1497,8 @@ class StaffTests(StaffCommandTestCase):
 
         unit = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", tree, staff.ParkedBranch("models")),
                                   expected=unit.worktree)
+        self.save_retirement_branch(unit, "other-absent")
+
         def git(*args: str) -> None:
             _ = subprocess.run(["git", *args], cwd=checkout, check=True, capture_output=True,
                                timeout=TEST_HANG_GUARD_SECS)
@@ -1505,7 +1507,11 @@ class StaffTests(StaffCommandTestCase):
         _ = (checkout / "file").write_text("unmerged\n")
         git("add", "file")
         git("commit", "-m", "Add work from the unit")
+        git("branch", "journal-only")
         git("switch", "main")
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(staff.apply_seed(seed).by_id(unit.id), unit)
+        self.assertIn("unmerged commits on models", errors.getvalue())
         for remote_only in (False, True):
             with self.subTest(remote_only=remote_only):
                 if remote_only:
@@ -1515,6 +1521,18 @@ class StaffTests(StaffCommandTestCase):
                     self.assertEqual(staff.retire_pending(), (unit.id,))
                 self.assertIn("unmerged commits on models", errors.getvalue())
                 self.assertEqual(staff.by_id(unit.id), unit)
+        journal = shutdown.retirement_journal(unit)
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        _ = journal.write_text(json.dumps({
+            "session": unit.current_session, "worktree": str(tree), "checkout": str(checkout),
+            "branch": "journal-only", "pane_id": "", "pane_session": "",
+        }))
+        git("push", "origin", "--delete", "models")
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(staff.retire_pending(), (unit.id,))
+        self.assertIn("unmerged commits on journal-only", errors.getvalue())
+        self.assertEqual(staff.by_id(unit.id), unit)
+        git("push", "origin", "journal-only:models")
         git("merge", "--ff-only", "origin/models")
         self.assertEqual(staff.retire_pending(), ())
         self.assertIsNone(staff.by_id(unit.id))
