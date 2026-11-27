@@ -1246,6 +1246,7 @@ class DeliveryStatus:
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.request_attempts: dict[str, AttemptOwnership] = {}
+        self._attempt_lock: threading.RLock = threading.RLock()
         self.question_jobs: WeakSet[IO[str]] = WeakSet()
         self.startup_recovery_pending: threading.Event = threading.Event()
         self.deferred_questions: dict[Path, MessageDelivery | None] = {}
@@ -1283,7 +1284,7 @@ class DeliveryStatus:
     @contextmanager
     def locked(self) -> Generator[None, None, None]:
         self.root.mkdir(parents=True, exist_ok=True)
-        with change_review.review_delivery_lock(self.root):
+        with change_review.review_delivery_lock(self.root), self._attempt_lock:
             yield
 
     def path(self, page: ReviewPage, row: str) -> Path:
@@ -1311,15 +1312,15 @@ class DeliveryStatus:
         owner = self.request_attempts.get(attempt)
         return owner is not None and owner.row_file == self.path(page, row) and owner.request_thread.is_alive()
 
-    def release_recovery_claims(self, attempts: tuple[str, ...]) -> None:
-        """Release this recovery thread's claims after its sends end."""
+    def release_owned_claims(self, attempts: tuple[str, ...]) -> None:
+        """Release the current thread's claims even if the file lock fails."""
         if not attempts:
             return
-        recovery_thread = threading.current_thread()
-        with self.locked():
+        thread = threading.current_thread()
+        with self._attempt_lock:
             for attempt in attempts:
                 owner = self.request_attempts.get(attempt)
-                if owner is not None and owner.request_thread is recovery_thread:
+                if owner is not None and owner.request_thread is thread:
                     del self.request_attempts[attempt]
 
     def _image_question_message(self, page: ReviewPage, row: str) -> dict[str, object]:
@@ -3018,7 +3019,7 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
         _defer_question_error(status, status.path(page, row), row, failure, delivery=delivery)
         return DeliveryUnconfirmed()
     finally:
-        status.release_recovery_claims((delivery.attempt,))
+        status.release_owned_claims((delivery.attempt,))
 
 
 def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatus) -> None:
@@ -3069,7 +3070,7 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
     try:
         outbound = outbound_review_message(delivery)
     except ReportAwaitingList as error:
-        status.release_recovery_claims((delivery.attempt,))
+        status.release_owned_claims((delivery.attempt,))
         print(f"review-links delivery {delivery.row}: {error}", file=sys.stderr)
         return DeliveryUnconfirmed()
     except (OSError, ValueError) as error:
@@ -3285,7 +3286,7 @@ def recover_pending(status: DeliveryStatus, *,
             except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
                 print(f"review-links recovery {path.name}: {error}", file=sys.stderr)
             finally:
-                status.release_recovery_claims(recovered_attempts)
+                status.release_owned_claims(recovered_attempts)
 
 
 def recover_deferred_questions(status: DeliveryStatus) -> None:
@@ -3348,7 +3349,7 @@ def recover_review_messages(status: DeliveryStatus) -> None:
         except (OSError,ValueError,KeyError,TypeError) as error:
             print(f'review-links recovery {path.name}: {error}',file=sys.stderr)
         finally:
-            status.release_recovery_claims(claimed)
+            status.release_owned_claims(claimed)
 
 
 def recover_question_answers(status: DeliveryStatus) -> None:
@@ -3398,7 +3399,7 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 update_registration.InputError) as error:
             print(f"review-links recovery {path.name}: {error}", file=sys.stderr)
         finally:
-            status.release_recovery_claims(claimed)
+            status.release_owned_claims(claimed)
 
 
 def console_folder(root: Path) -> Path:

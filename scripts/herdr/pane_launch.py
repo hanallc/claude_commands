@@ -26,7 +26,8 @@ from scripts.lib import atomic_file, legacy_identity, models_registry
 from scripts.production import staff
 
 # The launch environment a resume must give back. Credentials never enter the record.
-KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", PROBE_ENV})
+BERTH_SESSION_ENV = "CARGO_BERTH_SESSION_ID"
+KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", BERTH_SESSION_ENV, PROBE_ENV})
 # Claude flags whose value the resume repeats; every other argument stays out of the record.
 NAME_FLAGS = frozenset({"-n", "--name"})
 MODEL_FLAGS = frozenset({"--model"})

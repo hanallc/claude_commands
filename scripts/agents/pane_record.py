@@ -342,7 +342,8 @@ def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> d
             same_conversation = previous["session_id"] == launch["session_id"]
         if same_conversation:
             environment.update({key: value for key, value in previous["environment"].items()
-                                if key in herdr_types.NATIVE_ID_MARKS or _needed(key)})
+                                if key != pane_launch.BERTH_SESSION_ENV
+                                and (key in herdr_types.NATIVE_ID_MARKS or _needed(key))})
     environment.update(launch["environment"])
     current = launch.copy()
     current["environment"] = environment

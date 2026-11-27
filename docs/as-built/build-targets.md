@@ -49,6 +49,8 @@ Standalone named module tests use the same default targets as full gates.
 Direct gates can use natedev or `mac-linux`.
 The prepared gate wrappers can also use AWS when the queue grants an AWS assignment.
 Named module tests on `mac-linux` use `run.time_limit_seconds` for each module and the full run.
+The controller writes a gate record for a full-suite guest request in the `mac-linux` folder of Buildlog.
+The record includes module times and Mac load at the start and end.
 A nested named gate reuses its live parent reservation on natedev.
 Copy wrappers apply this rule before target overrides.
 Promotion without tests uses natedev.
