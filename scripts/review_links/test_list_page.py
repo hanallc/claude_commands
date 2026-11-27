@@ -1198,8 +1198,7 @@ if(example.filterOn){
             (root / folder).mkdir(parents=True)
             for size in studio_page.SIZES:
                 _ = (root / folder / f"01-{size}.webp").write_bytes(b"RIFF")
-        with (self.root / "config/review_links.conf").open("a") as settings:
-            _ = settings.write(f"studio_avatar_root={root}\n")
+        _ = write_config_fixture(self.root / "config/review_links.conf", f"studio_avatar_root={root}\n")
         return root
 
     def test_studio_view_swaps_the_producer_chip_row_for_picture_tabs(self) -> None:
