@@ -261,6 +261,11 @@ Placement waits before it considers any later candidate.
 A reading taken before the last backoff failure is also stale.
 The queue allows 30 seconds for the reading, including time spent in the reader's queue.
 The SSH probe shares the same 30-second limit across its connection attempts.
+The guest main probe and the background end check share the `mac-linux` backoff.
+A connection failure starts the backoff for `mac_test.unreachable_backoff_s` seconds.
+Both checks skip SSH during the backoff.
+The first good guest answer clears the backoff.
+The queue holds the slot until it gets the exact end proof.
 The usual queue pass and client poll still apply after the reading or deadline.
 A current `mac-linux` assignment of another episode makes the guest busy.
 The guest gate consumes its launch permission before the guest run starts, so its assignment stays current while the gate runs.
