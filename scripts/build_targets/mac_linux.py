@@ -71,6 +71,8 @@ INNER_CONNECT_STATUS = 254
 GUEST_ACCEPTED = 'mac-linux command accepted'
 INNER_CONNECT_ERROR = re.compile(
     r'ssh: connect to host [^\s]+ port [0-9]+: Connection (?:reset by peer|refused)\r?\n?')
+SSH_CONNECT_ERROR = re.compile(
+    r'^ssh: (?:connect to host \S+ port [0-9]+: |Could not resolve hostname )', re.MULTILINE)
 SSH_OPTIONS = ('-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no')
 # Allow time for setup, cleanup, and result transfer.
 TRANSFER_ALLOWANCE_SECONDS = 120
@@ -602,12 +604,19 @@ def retry_guest_connect[Output: (bytes, str)](
     if not attempts:
         raise GuestConnectAttemptsFailed('the guest connect deadline expired before SSH')
     suffix = 'attempt' if attempts == 1 else 'attempts'
-    raise GuestConnectAttemptsFailed(f'{diagnostic} after {attempts} connect {suffix}')
+    raise GuestConnectionFailed(f'{diagnostic} after {attempts} connect {suffix}')
 
 
 def run_guest_ssh(command: tuple[str, ...], timeout: float) -> subprocess.CompletedProcess[str]:
+    environment = guest_ssh_environment()
+    environment['LC_ALL'] = 'C'
     return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
-                          timeout=timeout, check=False, env=guest_ssh_environment())
+                          timeout=timeout, check=False, env=environment)
+
+
+def ssh_could_not_connect(reply: subprocess.CompletedProcess[str]) -> bool:
+    return (reply.returncode == 255 and not reply.stdout
+            and SSH_CONNECT_ERROR.search(reply.stderr) is not None)
 
 
 def record_guest_probe_failure(error: BaseException) -> None:
@@ -630,7 +639,7 @@ def guest_probe() -> Generator[None]:
         raise GuestUnavailable('guest unreachable during retry backoff')
     try:
         yield
-    except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
+    except GuestConnectionFailed as error:
         record_guest_probe_failure(error)
         raise
     else:
@@ -653,7 +662,8 @@ fi'''
         reply = retry_guest_connect(lambda remaining: run_guest_ssh(command, min(GUEST_REF_TIMEOUT_SECONDS, remaining)),
                                     deadline)
         if reply.returncode:
-            raise GuestUnavailable(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
+            failure = GuestConnectionFailed if ssh_could_not_connect(reply) else GuestUnavailable
+            raise failure(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
         commit = reply.stdout.strip()
         if not commit:
             return EmptyGuestMain()
@@ -707,7 +717,11 @@ class GuestPermissionUnknown(GuestTookNoRun):
 
 
 class GuestConnectAttemptsFailed(GuestTookNoRun):
-    """The inner SSH connection failed before the guest received a command."""
+    """The command did not connect before its deadline."""
+
+
+class GuestConnectionFailed(GuestConnectAttemptsFailed):
+    """An SSH client could not connect to one of the hosts."""
 
 
 @dataclass(frozen=True)
@@ -1119,8 +1133,10 @@ class GuestNotStartedProven:
 def run_guest_end_probe(command: tuple[str, ...], timeout: float) -> subprocess.CompletedProcess[str]:
     with guest_probe():
         reply = run_guest_ssh(command, timeout)
-        if reply.returncode == 255 or inner_connect_failure(reply):
-            raise GuestUnavailable(reply.stderr.strip() or f'cleanup SSH exited {reply.returncode}')
+        if ssh_could_not_connect(reply) or inner_connect_failure(reply):
+            raise GuestConnectionFailed(reply.stderr.strip())
+        if reply.returncode == 255:
+            raise GuestUnavailable(reply.stderr.strip() or 'cleanup SSH exited 255')
         return reply
 
 

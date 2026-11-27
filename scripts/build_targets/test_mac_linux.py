@@ -126,6 +126,7 @@ if fault in ('reset-before-lock', 'forged-marker'):
     sys.exit(254 if fault == 'forged-marker' else 255)
 home = Path(os.environ['FIXTURE_GUEST_HOME'])
 if scenario == 'offline' or scenario == 'main-probe-failure' and probe and not identity:
+    print('ssh: connect to host fixture-mac port 22: Connection refused', file=sys.stderr)
     print('fixture SSH refused the connection', file=sys.stderr)
     sys.exit(255)
 environment = dict(os.environ, HOME=str(home))
@@ -2798,6 +2799,17 @@ with (patch.object(conf, 'read', read_config),
         self.assertIs(eligibility.read_backoff(now + delay - 1, mac_linux.TARGET), eligibility.ACTIVE_BACKOFF)
         self.assertIs(eligibility.read_backoff(now + delay + 1, mac_linux.TARGET), eligibility.NO_BACKOFF)
 
+    def test_guest_main_invalid_reply_does_not_start_backoff(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        invalid = subprocess.CompletedProcess(['ssh'], 0, 'invalid commit ID\n', '')
+        valid = subprocess.CompletedProcess(['ssh'], 0, 'a' * 40 + '\n', '')
+        with patch.object(mac_linux, 'run_guest_ssh', side_effect=[invalid, valid]) as ssh:
+            with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'invalid commit ID'):
+                _ = mac_linux.read_guest_main(settings)
+            self.assertFalse(eligibility.backoff_path(mac_linux.TARGET).exists())
+            self.assertEqual(mac_linux.read_guest_main(settings), mac_linux.GuestMain('a' * 40))
+        self.assertEqual(ssh.call_count, 2)
+
     def test_guest_main_first_success_clears_backoff(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
         offload.write_backoff(time.time(), mac_linux.TARGET, strict=True)
@@ -2905,6 +2917,7 @@ with (patch.object(conf, 'read', read_config),
         with patch.dict(os.environ, {'FIXTURE_GUEST_PATH': str(binaries)}):
             result = self.not_started(self.route())
         self.assertIn('bwrap is absent from the guest PATH', result)
+        self.assertFalse(eligibility.backoff_path(mac_linux.TARGET).exists())
         self.assert_guest_clean('probe')
         self.assertFalse((self.guest_home / '.claude').exists())
 
@@ -3522,6 +3535,7 @@ with (patch.object(conf, 'read', read_config),
                   patch.object(subprocess, 'run',
                                return_value=subprocess.CompletedProcess(command, status, stdout, stderr)) as ssh):
                 environment = {key: value for key, value in os.environ.items() if key != 'BUILDLOG_PLACEMENT_SIDECAR'}
+                environment['LC_ALL'] = 'C'
                 self.assertEqual(mac_linux.prove_kept_guest_end(armed), expected)
                 ssh.assert_called_once_with(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                             errors='replace', timeout=settings.unreachable_wait_seconds,
