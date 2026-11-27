@@ -5009,39 +5009,6 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertEqual(len(self.fixture.world.launches), launches + (effort == "low"))
                 self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
 
-    def test_restore_uses_the_current_phase_key_before_continuing_an_open_worker(self) -> None:
-        world = self.fixture.world
-        key = "CARGO_BERTH_SESSION_ID"
-        expected = f"{self.fixture.parent.current_session}.phase-8"
-        for index, saved in enumerate((expected, "", "old-director.phase-8")):
-            with self.subTest(saved=saved):
-                name = f"impl-{index}"
-                opened = self.opened(name)
-                dispatch = progress_history.begin_dispatch(self.run_dir, slot=name, phase="8", role="impl",
-                    worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh"],
-                    prompt=self.prompt, kind="impl", lens="")
-                line = f"Check the file. End your final reply with DONE {dispatch}."
-                progress_history.save_dispatch_delivery(self.run_dir, dispatch,
-                    pass_recorder.DispatchDelivery(line, dispatch, str(self.reply)))
-                self.agent.append(opened.pane, "user", line)
-                process = world.processes[world.foreground[opened.pane][0]]
-                if saved:
-                    process.environment[key] = saved
-                else:
-                    _ = process.environment.pop(key, None)
-                world.locations[opened.pane]["agent_status"] = "idle"
-                launches = len(world.launches)
-
-                self.assertIs(worker.restore(self.fixture.parent.id, only=frozenset({opened.row.id})), worker.ExitCode.OK)
-
-                prompt = self.fixture.prompts()[-1]
-                self.assertEqual(prompt[2], opened.pane)
-                self.assertIn(f"Continue pass {dispatch} in this conversation.", prompt[3])
-                process = world.processes[world.foreground[opened.pane][0]]
-                self.assertEqual(process.current_identity, opened.row.current_session)
-                self.assertEqual(process.environment.get(key), expected)
-                self.assertEqual(len(world.launches), launches + (saved != expected))
-
     def test_restore_keeps_a_working_worker_with_a_submitted_dispatch(self) -> None:
         opened = self.opened()
         dispatch = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",

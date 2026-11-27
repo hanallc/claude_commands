@@ -42,7 +42,7 @@ from scripts.accounts import accounts, moves
 from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import account as account_reader
 from scripts.whoami import agent_accounts, note_file
-from scripts.lib import agent_program, conf, models_registry, nix_env, operation_deadline, unit_runs
+from scripts.lib import agent_program, conf, models_registry, nix_env, operation_deadline
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
@@ -1368,14 +1368,13 @@ def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, ac
 
 
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch,
-                      account: str, message: str, *, codex_prompt: bool = False,
-                      unset_environment: frozenset[str] = herdr.NO_ENVIRONMENT_REMOVALS) -> Never:
+                      account: str, message: str, *, codex_prompt: bool = False) -> Never:
     """Replace the foreground command with the saved account launch."""
     kind = pane_launch.saved_kind(entry)
     environment = accounts.launch_shell_environment(Path(entry["cwd"]))
     unset, pane_environment = _pane_environment(tab, entry)
     environment.update(pane_environment)
-    for key in unset_environment.union(unset):
+    for key in unset:
         _ = environment.pop(key, None)
     implicit = pane_launch.implicit_claude_home(entry)
     if kind == "claude":
@@ -1970,22 +1969,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         else:
             _ = entry.pop("config_dir", None)
-        unset_environment = herdr.NO_ENVIRONMENT_REMOVALS
-        worker_run: Path | None = None
-        if row is not None and row.kind == "worker" and kind == "codex":
-            from scripts.herdr import worker_panes
-
-            worker_run = worker_panes.worker_run(row, record=names.tab_record)
-            berth_key = pane_launch.BERTH_SESSION_ENV
-            _ = entry["environment"].pop(berth_key, None)
-            parent = names.tab_record.parent_of(row)
-            if parent is not None:
-                phase = worker_panes.worker_phase(unit_runs.read_run_fields(worker_run), parent, row, names.tab_record)
-                berth_session = worker_panes.phase_berth_session(parent, phase)
-                if berth_session:
-                    entry["environment"][berth_key] = berth_session
-            if berth_key not in entry["environment"]:
-                unset_environment = frozenset({berth_key})
         if row is not None and row.kind == "producer" and not (
                 isinstance(tab, herdr.TabSession) and os.environ.get("HERDR_SESSION") == client.session
                 and os.environ.get("HERDR_PANE_ID") == tab.pane_id):
@@ -2021,13 +2004,12 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         own = NO_OWN_PASS
         detached = ""
         from scripts.production import worker
-
         try:
             if row is not None and row.kind == "worker":
                 from scripts.agents import detached_runs
                 from scripts.herdr import worker_panes
 
-                run = worker_run if worker_run is not None else worker_panes.worker_run(row, record=names.tab_record)
+                run = worker_panes.worker_run(row, record=names.tab_record)
                 own = worker.own_pass(row, names.tab_record, run=worker_panes.DispatchRun(run))
                 detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
             elif isinstance(mode, WorkersHeld):
@@ -2061,12 +2043,11 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     pane_record.save(client.session, entries)
             attempt_pane = tab.pane_id
             if keep_workers:
-                _exec_in_own_pane(tab, entry, label, script_prompt(PAUSED_CONTINUATION), codex_prompt=True,
-                                  unset_environment=unset_environment)
-            _exec_in_own_pane(tab, entry, label, message, unset_environment=unset_environment)
+                _exec_in_own_pane(tab, entry, label, script_prompt(PAUSED_CONTINUATION), codex_prompt=True)
+            _exec_in_own_pane(tab, entry, label, message)
         started: herdr.AgentLaunched | sessions.LiveSessionProcess
         if kind == "codex":
-            prepared = herdr.prepare_session_environment(identity, entry["cwd"], entry["environment"], unset_environment)
+            prepared = herdr.prepare_session_environment(identity, entry["cwd"], entry["environment"], herdr.NO_ENVIRONMENT_REMOVALS)
             if isinstance(prepared, nix_env.Refused):
                 raise OSError(str(prepared))
             attempt_pane = tab.pane_id

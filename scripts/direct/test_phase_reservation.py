@@ -638,32 +638,6 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertEqual(phase_reservation.read_state(phase.directory)["kind"],
                          phase_reservation.AWAITING_FIRST_TOUCH)
 
-    def test_claim_names_an_unmapped_reservation_with_an_unrelated_session_mapping(self) -> None:
-        output = self.claim_with_unmapped_reservation(sibling_holds=False, mapped=("other", "c1"))
-        self.assertEqual(output, "phase reservation: the reservation is not mapped to a session: r1\n")
-
-    def test_claim_names_the_sibling_that_holds_the_mapped_reservation(self) -> None:
-        output = self.claim_with_unmapped_reservation(sibling_holds=True, mapped=("r1", "c1"))
-        self.assertEqual(output, "phase reservation: a sibling phase's reservation holds every file; "
-                         + "still awaiting first touch\n")
-
-    def claim_with_unmapped_reservation(self, *, sibling_holds: bool, mapped: tuple[str, str]) -> str:
-        phase, sibling = self.phases({"1": self.first, "2": self.first})
-        _ = phase_reservation.enroll(phase.directory, phase.phase, "board_ready")
-        _ = phase_reservation.enroll(sibling.directory, sibling.phase, "board_ready")
-        held = phase_reservation.Acquisition("r1", "c1", phase_reservation.commit_id(self.first, "HEAD"))
-        if sibling_holds:
-            self.assertTrue(phase_reservation.record_active(sibling.directory, held))
-        answer = phase_reservation.CheckAnswer(phase_reservation.CLEAR, "", held, phase_reservation.LEFT_UNMAPPED)
-        args = ["claim", "--session-dir", str(self.session), "--phase", phase.phase, "--repo", str(self.first)]
-        with (mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "director"}),
-              mock.patch.object(phase_reservation, "check", return_value=answer),
-              mock.patch.object(phase_reservation, "session_reservation", return_value=mapped),
-              contextlib.redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(phase_reservation.main(args), 0)
-        self.assertEqual(phase_reservation.read_state(phase.directory)["kind"], phase_reservation.AWAITING_FIRST_TOUCH)
-        return output.getvalue()
-
     def test_codex_record_active_overrides_an_inherited_session_for_another_phase(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
         _ = phase_reservation.enroll(directory, "1", "board_ready")
