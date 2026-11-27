@@ -613,6 +613,51 @@ class PushoverTests(unittest.TestCase):
             self.assertEqual(question_pushes.drain(path), 0)
         cancel.assert_called_once_with(identity)
 
+    def test_release_posts_an_emergency_when_binding_read_is_denied(self) -> None:
+        path, push = self.kept_question()
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        push["need"] = "blocked"
+        binding_path = question_pushes.binding_path(push["source"], push["key"])
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+            saved = binding_path.read_bytes()
+            path.unlink()
+            with mock.patch.object(question_pushes, "read_binding", side_effect=PermissionError("fixture")) as read:
+                release = silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post))
+        read.assert_called_once_with(binding_path)
+        self.assertEqual((release, post.call_count), (0, 1))
+        body = cast(bytes, post.call_args.args[1])
+        self.assertEqual(urllib.parse.parse_qs(body.decode())["priority"], ["2"])
+        self.assertEqual(binding_path.read_bytes(), saved)
+        self.assertEqual(silence.read_kept(), [])
+
+    def test_release_posts_both_pushes_when_binding_json_is_malformed(self) -> None:
+        path, push = self.kept_question()
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        push["need"] = "blocked"
+        binding_path = question_pushes.binding_path(push["source"], push["key"])
+        notice: silence.KeptPush = {
+            "source": "drawer", "key": "build done", "priority": "0", "title": "Build done",
+            "message": "The build passed.", "detail": "", "text_id": "",
+        }
+        posted: list[tuple[list[str], list[str]]] = []
+
+        def post(_url: str, body: bytes) -> tuple[int, bytes]:
+            fields = urllib.parse.parse_qs(body.decode())
+            posted.append((fields["title"], fields["priority"]))
+            return 200, b'{"status":1}'
+
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+            self.assertIsInstance(silence.keep_here(notice), silence.Kept)
+            _ = binding_path.write_bytes(b"{")
+            path.unlink()
+            self.assertEqual(silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post)), 0)
+        self.assertEqual(posted, [(["Choose"], ["2"]), (["Build done"], ["0"])])
+        self.assertEqual(binding_path.read_bytes(), b"{")
+        self.assertEqual(silence.read_kept(), [])
+
     def test_releasing_an_older_question_emergency_preserves_the_newer_one(self) -> None:
         old_path, older = self.kept_question()
         older["need"] = "blocked"

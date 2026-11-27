@@ -160,11 +160,14 @@ def _write_binding(path: Path, binding: Binding) -> None:
 def bind_released_emergency_locked(identity: PushIdentity, *, confirmed_open: bool) -> None:
     """Record repeat cancellation before posting a released emergency."""
     path = binding_path(identity.sender, identity.key)
-    previous = read_binding(path)
-    if previous is not None and previous.identity != identity:
-        # Keep the active binding for the newer push.
-        path = _released_binding_path(identity)
+    try:
         previous = read_binding(path)
+        if previous is not None and previous.identity != identity:
+            # Keep the active binding for the newer push.
+            path = _released_binding_path(identity)
+            previous = read_binding(path)
+    except (OSError, ValueError):
+        return
     if previous is None and not confirmed_open:
         return
     binding = Binding(identity, emergency=True)
