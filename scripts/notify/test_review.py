@@ -576,6 +576,34 @@ class LocalReviewTests(unittest.TestCase):
                                  review.QuestionReviewUnavailable(revised, "no claude binary: PATH: claude"))
             call.assert_not_called()
 
+    def test_console_question_uses_saved_approval_without_a_reviewer_account(self) -> None:
+        title = "Retry the download?"
+        draft = f"{title}\n\n1. The download stopped.\n\nRecommended: Yes."
+        key = review.QuestionKey("demo", title)
+        runner = FakeReviewer(verdict(self.draft))
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            return question_batch(question_request(prompt))
+
+        with mock.patch.object(review, "structured_call", side_effect=judge) as call:
+            self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                             review.QuestionAccepted(draft))
+            call.reset_mock()
+            reason = "units account is not configured"
+            with (mock.patch.object(accounts, "group_account", side_effect=accounts.AccountsError(reason)) as account,
+                  mock.patch.object(review, "reviewer_binary", wraps=review.reviewer_binary) as binary,
+                  mock.patch.object(review, "reviewer_assignment", wraps=review.reviewer_assignment) as model):
+                self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                                 review.QuestionAccepted(draft))
+                account.assert_not_called()
+                binary.assert_not_called()
+                model.assert_not_called()
+                revised = draft.replace("stopped", "paused")
+                self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"),
+                                 review.QuestionReviewUnavailable(revised, f"review unavailable: {reason}"))
+                account.assert_called_once_with("units")
+            call.assert_not_called()
+
     def test_console_question_keeps_the_passed_title_after_two_other_lines_change(self) -> None:
         title = "## The change for your 07:15 PST Yes is ready: may it go in?"
         question = (

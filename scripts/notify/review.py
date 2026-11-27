@@ -799,14 +799,19 @@ def validate(value: object, draft: Draft, revision: bool,
         return Unreviewed(str(error), metadata, tuple(failures))
 
 
+def review_process_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"):
+        _ = environment.pop(key, None)
+    return environment
+
+
 def reviewer_environment(group: accounts.ClaudeGroup = "units") -> tuple[dict[str, str], str]:
     """The environment and account label of a headless model call on the account of the group."""
     # Import the shared account modules from this checkout, not the writer's login.
     if not TYPE_CHECKING:
         from scripts.accounts import accounts
-    environment = dict(os.environ)
-    for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"):
-        _ = environment.pop(key, None)
+    environment = review_process_environment()
     selected = accounts.group_account(group)
     prepared = accounts.prepare_claude_launch(selected.label, resume=False)
     for name in prepared.remove:
@@ -1242,8 +1247,10 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
     try:
         if not GUIDE.is_dir():
             return Unreviewed("no guide", details())
-        environment, account = reviewer_environment()
-        if not console:
+        if console:
+            environment = review_process_environment()
+        else:
+            environment, account = reviewer_environment()
             binary = reviewer_binary()
             if isinstance(binary, MissingReviewerBinary):
                 return model_failure(binary, draft, details(), console=False)
@@ -1303,15 +1310,21 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
 
         def ask(schema: Mapping[str, object], system_prompt: str,
                 text: str) -> StructuredOutcome | MissingReviewerBinary:
-            nonlocal binary, model
+            nonlocal account, binary, model
             if time.monotonic() >= started + timeout:
                 return ModelTimeout()
+            model_environment = environment
+            if console:
+                try:
+                    model_environment, account = reviewer_environment()
+                except (OSError, ValueError) as error:
+                    return ModelUnavailable(str(error))
             if isinstance(binary, ReviewerNotResolved):
                 binary = reviewer_binary()
             if isinstance(binary, MissingReviewerBinary):
                 return binary
-            model, effort = reviewer_assignment(runner, environment, min(2.0, remaining()))
-            call = structured_call(runner, binary.path, environment, model=model, effort=effort,
+            model, effort = reviewer_assignment(runner, model_environment, min(2.0, remaining()))
+            call = structured_call(runner, binary.path, model_environment, model=model, effort=effort,
                                    system_prompt=system_prompt, schema=schema, prompt=text,
                                    deadline=started + timeout)
             model = call.model
