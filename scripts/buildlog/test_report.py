@@ -3165,6 +3165,31 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| other | 0.0 GiB |", lines)
         self.assertNotIn("| other | -20.0 GiB |", lines)
 
+    def test_disk_fallback_counts_top_level_rows_and_keeps_walk_order(self) -> None:
+        gibibyte = 1 << 30
+        snapshot: disk.DiskSnapshot = {
+            "measured_at": "2026-10-04T16:14:00+00:00",
+            "host": "natedev",
+            "rows": [
+                {"label": "/build/hana", "bytes": 8 * gibibyte},
+                {"label": "/build/hana/research", "bytes": 6 * gibibyte, "within": "/build/hana"},
+                {"label": "/build/hana/research/b4check", "bytes": 5 * gibibyte, "within": "/build/hana/research"},
+                {"label": "/build/sccache", "bytes": 3 * gibibyte},
+            ],
+            "used": 15 * gibibyte, "free": 2 * gibibyte, "floor": None,
+        }
+
+        with mock.patch.object(disk, "read_snapshot", return_value=snapshot):
+            lines = report.disk_section()
+
+        self.assertEqual([line for line in lines if line.startswith(("| /build/", "| other"))], [
+            "| /build/hana | 8.0 GiB |",
+            "| /build/hana/research | 6.0 GiB |",
+            "| /build/hana/research/b4check | 5.0 GiB |",
+            "| /build/sccache | 3.0 GiB |",
+            "| other | 4.0 GiB |",
+        ])
+
     def test_disk_table_reads_old_and_new_snapshot_shapes(self) -> None:
         base: disk.DiskSnapshot = {
             "measured_at": "2026-10-04T16:14:00+00:00",

@@ -26,7 +26,7 @@ from scripts.buildlog import store
 from scripts.lint import sweep
 from scripts.buildlog import test_index
 from scripts.message.session_send_test_support import forbid_real_sender
-from scripts.lib import copy_record
+from scripts.lib import build_folders, copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -51,11 +51,26 @@ class DiskTests(unittest.TestCase):
         }))
         # snapshot() walks SCCACHE_DIR as one more folder; the host's real cache must stay out of the test.
         _ = os.environ.pop("SCCACHE_DIR", None)
+        _ = self.enterContext(mock.patch.object(disk, "_lower_walk_priority"))
         _ = (root / "buildlog.conf").write_text(
             "# whole: 1..\ndisk_walk_minutes=60\n# whole: 0..23\ndisk_walk_hour=3\n")
 
     def base(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+
+    def mock_build_mount(self, root: Path) -> None:
+        original_stat = Path.stat
+        build_device = root.stat().st_dev + 1
+
+        def stat_path(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            info = original_stat(path, follow_symlinks=follow_symlinks)
+            if path == root:
+                fields = list(info)
+                fields[2] = build_device
+                return os.stat_result(fields)
+            return info
+
+        _ = self.enterContext(mock.patch.object(Path, "stat", stat_path))
 
     def test_mapping_asks_cargo_only_for_checkouts_no_saved_row_maps(self) -> None:
         base = self.base()
@@ -255,6 +270,189 @@ class DiskTests(unittest.TestCase):
         self.assertIn(str(output), text)
         self.assertIn("2:1, cargo-device", text)
         self.assertEqual([row["device"] for row in result.get("filesystems", [])], ["1:1", "2:1"])
+
+    def test_snapshot_lists_build_folders_and_skips_gone_outputs(self) -> None:
+        base = self.base()
+        root = base / "build"
+        repo = root / "hana"
+        unit = repo / "research"
+        folder = unit / "b4check"
+        runner = repo / "ci" / "1"
+        main = repo / "main"
+        cache = root / "sccache"
+        outside = base / "external-output"
+        target = main / "work" / "target"
+        for directory in (folder, target, runner, cache / "0" / "a", outside):
+            directory.mkdir(parents=True)
+
+        def write(path: Path) -> int:
+            _ = path.write_bytes(os.urandom(4096))
+            return path.stat().st_blocks * 512
+
+        folder_bytes = write(folder / "source")
+        unit_bytes = folder_bytes + write(unit / "unit-record")
+        runner_bytes = write(runner / "file")
+        main_bytes = write(main / "work" / "file") + write(target / "output")
+        repo_bytes = unit_bytes + runner_bytes + main_bytes + write(repo / "repo-record")
+        cache_bytes = write(cache / "0" / "a" / "file")
+        outside_bytes = write(outside / "file")
+        gone = (root / "gone", base / "gone")
+        sweep.save_cargo_output_roots(sweep.CargoOutputIndex((
+            CargoOutputRoots(base / "old-checkout", *gone),
+            CargoOutputRoots(base / "saved-checkout", target, outside),
+        )))
+        saved = sweep.cargo_output_cache_path().read_bytes()
+
+        with (
+            mock.patch.object(build_folders, "build_root", return_value=root),
+            mock.patch.object(disk, "FOLDERS", []),
+            mock.patch.object(disk, "read_floor", return_value=None),
+            mock.patch.object(disk, "outside_directories", wraps=disk.outside_directories) as outside_report,
+            mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(root / "scratch"), "SCCACHE_DIR": str(cache)}),
+        ):
+            result = disk.snapshot()
+
+        self.assertEqual(result["rows"], [
+            {"label": str(repo), "bytes": repo_bytes},
+            {"label": str(repo / "ci"), "bytes": runner_bytes, "within": str(repo)},
+            {"label": "CI runner 1", "bytes": runner_bytes, "within": str(repo / "ci")},
+            {"label": str(main), "bytes": main_bytes, "within": str(repo)},
+            {"label": str(unit), "bytes": unit_bytes, "within": str(repo)},
+            {"label": str(folder), "bytes": folder_bytes, "within": str(unit)},
+            {"label": str(cache), "bytes": cache_bytes},
+            {"label": str(outside), "bytes": outside_bytes},
+        ])
+        self.assertGreater(runner_bytes, 0)
+        self.assertEqual(repo_bytes + cache_bytes, sweep.directory_blocks(str(root), set()))
+        expected_inputs = [("CI runner 1", str(runner)), ("scratch", str(root / "scratch"))]
+        expected_inputs.extend((str(path), str(path)) for path in sorted([target, outside, *gone]))
+        expected_inputs.append(("sccache", str(cache)))
+        outside_report.assert_called_once_with(expected_inputs, disk.NO_EARLIER_OUTSIDE_MEASUREMENT)
+        self.assertEqual(sweep.cargo_output_cache_path().read_bytes(), saved)
+
+    def test_drive_rows_use_metadata_and_assign_hard_links_once(self) -> None:
+        root = self.base()
+        unit = root / "repo" / "unit"
+        first = unit / "a"
+        second = unit / "b"
+        first.mkdir(parents=True)
+        second.mkdir()
+        (unit / "b.lease.json").touch()
+        source = first / "source"
+        _ = source.write_bytes(os.urandom(4096))
+        os.link(source, second / "linked")
+        # A broken link does not create a folder row.
+        link = unit / "link"
+        link.symlink_to("missing", target_is_directory=True)
+        used = source.stat().st_blocks * 512
+        total = used + link.lstat().st_blocks * 512
+
+        self.assertEqual(disk.drive_rows(root, set(), {}), [
+            {"label": str(unit.parent), "bytes": total},
+            {"label": str(unit), "bytes": total, "within": str(unit.parent)},
+            {"label": str(first), "bytes": used, "within": str(unit)},
+            {"label": str(second), "bytes": 0, "within": str(unit)},
+        ])
+
+    def test_snapshot_mount_other_uses_top_level_totals(self) -> None:
+        root = self.base() / "build"
+        child = root / "repo" / "ci" / "1"
+        child.mkdir(parents=True)
+        file = child / "output"
+        _ = file.write_bytes(os.urandom(4096))
+        size = file.stat().st_blocks * 512
+        self.mock_build_mount(root)
+
+        for used, other in ((size + 100, 100), (size - 1, 0)):
+            def usage(path: str) -> filesystem.FilesystemUsage:
+                if path == str(root):
+                    return filesystem.FilesystemUsage(used, 0, device="2:1")
+                return filesystem.FilesystemUsage(0, 0, device="1:1")
+
+            with (
+                self.subTest(used=used),
+                mock.patch.object(build_folders, "build_root", return_value=root),
+                mock.patch.object(disk, "FOLDERS", []),
+                mock.patch.object(disk, "read_floor", return_value=None),
+                mock.patch.object(disk, "mapped_output_paths", return_value=([], [])),
+                mock.patch.object(filesystem, "filesystem_usage", side_effect=usage),
+            ):
+                rows = disk.snapshot()["rows"]
+            self.assertIn({"label": f"{root} other", "bytes": other}, rows)
+
+    def test_snapshot_excludes_nested_mounts_from_rows_and_other(self) -> None:
+        root = self.base() / "build"
+        repo = root / "repo"
+        unit = repo / "ci"
+        child = unit / "1"
+        foreign = (root / "mounted", unit / "2", child / "attached mount")
+        child.mkdir(parents=True)
+        for mount in foreign:
+            mount.mkdir()
+            _ = (mount / "external").write_bytes(os.urandom(8192))
+        file_mount = child / "attached file"
+        _ = file_mount.write_bytes(os.urandom(8192))
+        file = child / "output"
+        _ = file.write_bytes(os.urandom(4096))
+        size = file.stat().st_blocks * 512
+        self.mock_build_mount(root)
+
+        table = b"".join(
+            b"%d 1 8:%d / %s rw - ext4 /dev/mock rw\n" % (index, index, os.fsencode(mount).replace(b" ", rb"\040"))
+            for index, mount in enumerate((root, *foreign, file_mount), start=2)
+        )
+        read_bytes = Path.read_bytes
+
+        def read_path(path: Path) -> bytes:
+            return table if path == Path("/proc/self/mountinfo") else read_bytes(path)
+
+        def usage(path: str) -> filesystem.FilesystemUsage:
+            if path == str(root):
+                return filesystem.FilesystemUsage(size + 100, 0, device="2:1")
+            return filesystem.FilesystemUsage(0, 0, device="1:1")
+
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch.object(Path, "read_bytes", read_path),
+            mock.patch.object(build_folders, "build_root", return_value=root),
+            mock.patch.object(disk, "scanned_folders", return_value=[]),
+            mock.patch.object(disk, "read_floor", return_value=None),
+            mock.patch.object(filesystem, "filesystem_usage", side_effect=usage),
+        ):
+            rows = disk.snapshot()["rows"]
+
+        self.assertEqual(rows, [
+            {"label": str(repo), "bytes": size},
+            {"label": str(unit), "bytes": size, "within": str(repo)},
+            {"label": str(child), "bytes": size, "within": str(unit)},
+            {"label": f"{root} other", "bytes": 100},
+        ])
+
+    def test_snapshot_uses_resolved_coverage_for_saved_output_links(self) -> None:
+        base = self.base()
+        root = base / "build"
+        main = root / "repo" / "main"
+        main.mkdir(parents=True)
+        output = base / "external" / "cargo"
+        output.mkdir(parents=True)
+        file = output / "output"
+        _ = file.write_bytes(os.urandom(4096))
+        size = file.stat().st_blocks * 512
+        link = main / "target"
+        link.symlink_to(output, target_is_directory=True)
+        sweep.save_cargo_output_roots(sweep.CargoOutputIndex((
+            CargoOutputRoots(base / "checkout", link, main / "gone"),
+        )))
+
+        for fixed in ([], [("fixed", str(output.parent))]):
+            with (
+                self.subTest(fixed=fixed),
+                mock.patch.object(build_folders, "build_root", return_value=root),
+                mock.patch.object(disk, "scanned_folders", return_value=fixed.copy()),
+                mock.patch.object(disk, "read_floor", return_value=None),
+            ):
+                external = disk.snapshot()["rows"][2:]
+                self.assertEqual(external, [{"label": "fixed" if fixed else str(link), "bytes": size}])
 
     def test_filesystem_total_preserves_reserved_blocks_and_top_layer_identity(self) -> None:
         from scripts.buildlog import cgroup_capture

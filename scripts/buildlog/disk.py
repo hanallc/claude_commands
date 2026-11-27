@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
+import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from stat import S_ISDIR
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 from scripts.lib import build_folders, conf, copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
@@ -19,10 +23,14 @@ from scripts.lib.user_zone import user_zone
 from scripts.buildlog import store
 from scripts.buildlog import filesystem
 
+if TYPE_CHECKING:
+    from scripts.lint.sweep import InodeKey
+
 
 class DiskRow(TypedDict):
     label: str
     bytes: int
+    within: NotRequired[str]
 
 
 class OutsideBuildCacheDirectory(TypedDict):
@@ -226,17 +234,114 @@ def outside_directories(
     return earlier, rows, totals
 
 
+@dataclass(frozen=True)
+class _DriveFolder:
+    path: Path
+    children: tuple[_DriveFolder, ...] = ()
+
+
+def _child_directories(path: Path, excluded: Collection[str] = ()) -> list[Path]:
+    children: list[Path] = []
+    with suppress(OSError), os.scandir(path) as entries:
+        for entry in entries:
+            with suppress(OSError):
+                if entry.path not in excluded and entry.is_dir(follow_symlinks=False):
+                    children.append(Path(entry.path))
+    return sorted(children)
+
+
+def _has_folder_metadata(path: Path) -> bool:
+    for suffix in (".lock", ".lease.json"):
+        with suppress(OSError):
+            if path.with_name(path.name + suffix).is_file():
+                return True
+    return False
+
+
+def _top_level_folder(path: Path, mounts: frozenset[str]) -> _DriveFolder:
+    directories = _child_directories(path)
+    units = tuple(_DriveFolder(unit, tuple(map(_DriveFolder, _child_directories(unit, mounts)))
+                               if unit.name != "main" else ())
+                  for unit in directories if str(unit) not in mounts)
+    # Only split repositories identified by main, CI, or a unit's folder metadata.
+    if any(unit.name in ("main", "ci") for unit in directories) or any(
+        _has_folder_metadata(child.path) for unit in units for child in unit.children
+    ):
+        return _DriveFolder(path, units)
+    return _DriveFolder(path)
+
+
+def _foreign_file_mount_inodes(root: Path, mounts: set[Path]) -> set[InodeKey]:
+    inodes: set[InodeKey] = set()
+    if mounts:
+        device = root.stat().st_dev
+        for path in mounts:
+            with suppress(OSError):
+                entry = path.stat()
+                if entry.st_dev != device and not S_ISDIR(entry.st_mode):
+                    inodes.add((entry.st_dev, entry.st_ino))
+    return inodes
+
+
+def drive_rows(root: Path, seen: set[InodeKey], fixed_labels: Mapping[Path, str]) -> list[DiskRow]:
+    """Measure the build root and list each parent before its children."""
+    from scripts.lint import sweep
+
+    mounts: set[Path] = set()
+    if sys.platform == "linux":
+        mounts.update(mount.point for mount in build_folders.linux_mounts()
+                      if mount.point != root and mount.point.is_relative_to(root))
+    excluded_mounts = frozenset(map(str, mounts))
+    # The block walk uses directory exclusions. Mark foreign mounted files as seen during this walk.
+    foreign_inodes = _foreign_file_mount_inodes(root, mounts) - seen
+    seen.update(foreign_inodes)
+    rows: list[DiskRow] = []
+
+    def walk(folder: _DriveFolder, within: str | None = None) -> int:
+        label = fixed_labels.get(folder.path, str(folder.path))
+        row: DiskRow = {"label": label, "bytes": 0}
+        if within is not None:
+            row["within"] = within
+        rows.append(row)
+        child_bytes = sum(walk(child, label) for child in folder.children)
+        excluded = excluded_mounts.union(str(child.path) for child in folder.children)
+        row["bytes"] = child_bytes + sweep.directory_blocks(str(folder.path), seen, excluded=excluded)
+        return row["bytes"]
+
+    try:
+        for path in _child_directories(root, excluded_mounts):
+            _ = walk(_top_level_folder(path, excluded_mounts))
+    finally:
+        seen.difference_update(foreign_inodes)
+    return rows
+
+
+def _folder_rows(folders: list[tuple[str, str]], seen: set[InodeKey], *,
+                 drive_root: Path | None = None) -> list[DiskRow]:
+    from scripts.lint import sweep
+
+    rows: list[DiskRow] = []
+    for label, path in folders:
+        expanded = os.path.expanduser(path)
+        if drive_root is not None and drive_root.is_relative_to(resolved := Path(expanded).resolve()):
+            size = sweep.directory_blocks(str(resolved), seen, excluded=(str(drive_root),))
+        else:
+            size = sweep.directory_blocks(expanded, seen)
+        rows.append({"label": label, "bytes": size})
+    return rows
+
+
 def measure(
     folders: list[tuple[str, str]], usage: Callable[[], filesystem.FilesystemUsage], floor: int | None,
     previous: PreviousOutsideMeasurement = NO_EARLIER_OUTSIDE_MEASUREMENT,
 ) -> MeasuredDiskSnapshot:
-    from scripts.lint import sweep
+    return _measured_snapshot(_folder_rows(folders, set()), folders, usage, floor, previous)
 
-    seen: set[sweep.InodeKey] = set()
-    rows: list[DiskRow] = [
-        {"label": label, "bytes": sweep.directory_blocks(os.path.expanduser(path), seen)}
-        for label, path in folders
-    ]
+
+def _measured_snapshot(
+    rows: list[DiskRow], folders: list[tuple[str, str]], usage: Callable[[], filesystem.FilesystemUsage],
+    floor: int | None, previous: PreviousOutsideMeasurement,
+) -> MeasuredDiskSnapshot:
     previous_measured_at, outside_build_caches, outside_build_cache_totals = outside_directories(folders, previous)
     current_usage = usage()
     measured_at = store.utc_iso(time.time())
@@ -371,6 +476,15 @@ def mapped_output_paths(folders: list[tuple[str, str]]) -> tuple[list[Path], lis
                    for path in (roots.target_directory, roots.build_directory)}), unavailable
 
 
+def _lower_walk_priority() -> None:
+    with suppress(OSError):
+        os.setpriority(os.PRIO_PROCESS, 0, 19)
+    if sys.platform == "linux":
+        with suppress(OSError):
+            _ = subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def snapshot() -> MeasuredDiskSnapshot:
     previous_snapshot = read_snapshot()
     floor = read_floor()
@@ -402,15 +516,43 @@ def snapshot() -> MeasuredDiskSnapshot:
                 "outside_build_cache_totals": previous_snapshot["outside_build_cache_totals"],
                 "previous_measured_at": previous_snapshot["previous_measured_at"],
             }
+    _lower_walk_priority()
     previous = previous_outside_measurement(previous_snapshot)
+    root = build_folders.build_root().resolve()
     folders = scanned_folders()
+    fixed_labels = {Path(path).expanduser().resolve(): label for label, path in folders}
+    seen: set[InodeKey] = set()
+    drive = drive_rows(root, seen, fixed_labels)
+    external = [(label, path) for label, path in folders
+                if not Path(path).expanduser().resolve().is_relative_to(root)]
+    cache_report_roots = set(fixed_labels)
+    external_roots = cache_report_roots.copy()
     outputs, unavailable = mapped_output_paths(folders)
+    capacity_paths = [Path("/")]
+    if root.is_dir():
+        capacity_paths.append(root)
+    capacity_paths.extend(Path(path) for _, path in folders)
     for output in outputs:
-        if not any(output.is_relative_to(Path(path).expanduser().resolve()) for _, path in folders):
+        resolved = output.resolve()
+        exists = False
+        with suppress(OSError):
+            exists = resolved.is_dir()
+        if exists:
+            capacity_paths.append(resolved)
+        # The outside-cache report keeps the saved mapping as an input.
+        if output not in cache_report_roots and cache_report_roots.isdisjoint(output.parents):
             folders.append((str(output), str(output)))
+            cache_report_roots.add(resolved)
+        if (exists and not resolved.is_relative_to(root)
+                and resolved not in external_roots and external_roots.isdisjoint(resolved.parents)):
+            external.append((str(output), str(resolved)))
+            external_roots.add(resolved)
     cache = os.environ.get("SCCACHE_DIR")
     if cache and not any(Path(cache).expanduser().is_relative_to(Path(path).expanduser()) for _, path in folders):
         folders.append(("sccache", cache))
+        capacity_paths.append(Path(cache))
+        if not Path(cache).expanduser().resolve().is_relative_to(root):
+            external.append(("sccache", cache))
     measured: list[tuple[int, filesystem.FilesystemUsage]] = []
 
     def root_usage() -> filesystem.FilesystemUsage:
@@ -418,8 +560,16 @@ def snapshot() -> MeasuredDiskSnapshot:
         measured.append((Path("/").stat().st_dev, usage))
         return usage
 
-    result = measure(folders, root_usage, floor, previous)
-    result["filesystems"] = capacity_rows([Path("/"), *(Path(path) for _, path in folders), *outputs], tuple(measured))
+    result = _measured_snapshot([*drive, *_folder_rows(external, seen, drive_root=root)],
+                                folders, root_usage, floor, previous)
+    with suppress(OSError):
+        device = root.stat().st_dev
+        if device != root.parent.stat().st_dev:
+            usage = filesystem.filesystem_usage(str(root))
+            measured.append((device, usage))
+            named_bytes = sum(row["bytes"] for row in drive if "within" not in row)
+            result["rows"].insert(len(drive), {"label": f"{root} other", "bytes": max(0, usage.used - named_bytes)})
+    result["filesystems"] = capacity_rows(capacity_paths, tuple(measured))
     result["output_unavailable"] = unavailable
     return result
 

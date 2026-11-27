@@ -2307,7 +2307,8 @@ def disk_section() -> list[str]:
             rows.append([f"{label} used", gib(capacity["used"])])
             rows.append([f"{label} free", gib(capacity["free"])])
     else:
-        rows.append(["other", gib(max(0, snapshot["used"] - sum(row["bytes"] for row in snapshot["rows"])))])
+        named_bytes = sum(row["bytes"] for row in snapshot["rows"] if "within" not in row)
+        rows.append(["other", gib(max(0, snapshot["used"] - named_bytes))])
         floor = snapshot["floor"]
         free_label = f"free (floor {gib(floor)})" if floor is not None else "free"
         rows.append([free_label, gib(snapshot["free"])])

@@ -122,14 +122,30 @@ The walk is too slow for report time, so a job measures and the report reads.
 
 **Measuring.** `buildlog disk` runs `disk.write_snapshot(disk.snapshot())` and prints nothing on success. `snapshot()` reads the floor first. Without a newer walk request, `snapshot()` walks when no full previous snapshot exists. Otherwise, it walks when the last walk is at least `disk_walk_minutes` old and the hour is `disk_walk_hour` in the user's zone. Other runs refresh free and used space only and set `capacity_measured_at`. Folder freshness uses `measured_at`; a capacity refresh does not refresh folder sizes. A large unnamed fall requests one walk through `disk-walk-request.json`. A request newer than the last walk permits a walk outside the configured hour. The request needs recent floor records with the same held roots and filesystem. The floor sweep deletes the request after it sends the folder growth follow-up. `write_snapshot` writes `<store.root()>/disk.json.tmp` and renames it over `disk.json` (`store.DISK_NAME`). A malformed floor raises `InvalidFloor` before any walk. The command prints `buildlog disk: <key> in <config> must be a non-negative number of GiB` to stderr. It exits 1 and keeps the previous `disk.json`.
 
+Before a full walk, `snapshot()` sets CPU nice to 19. On Linux it also requests the idle I/O class. It continues if the request fails.
+
 `FOLDERS` holds the fixed rows for `~/rust`, `~/.local/state`, and `/tmp`.
-`scanned_folders()` uses `build_folders.ci_folders("hana")` to list numbered folders under `<build root>/hana/ci`.
-It adds one row named `CI runner <N>` per folder, in number order.
+`scanned_folders()` adds the numbered Hana CI folders and the scratch folder if it is separate.
+The drive walk uses the fixed label `CI runner <N>` for each of those CI folders.
+It lists each CI folder once, under its unit.
+
+`drive_rows()` measures each top-level directory under `build_folders.build_root()`.
+A repository has a `main` or `ci` directory, or a unit with a directory and its `.lock` or `.lease.json` file.
+The walk lists each repository's units and each unit's immediate folders. It lists `main` as a leaf.
+Folders such as `sccache` and `test-runs` each get one row.
+Each parent adds its child totals to the size of its loose entries. A child row names its parent in `within`.
+
+When the build root is a separate mount, `<root> other` shows used space minus the top-level drive totals, with a minimum of zero.
+On Linux the drive walk excludes nested mounts listed in `/proc/self/mountinfo`.
+An existing Cargo output gets a separate row if its resolved path is outside the build root and the fixed folders.
+The row uses the saved path as its label.
+`SCCACHE_DIR` can add a row for a cache outside the build root. The drive walk covers caches inside the root.
 
 ```python
 class DiskRow(TypedDict):
     label: str
     bytes: int
+    within: NotRequired[str]
 
 class MeasuredDiskSnapshot(TypedDict):
     measured_at: str     # store.utc_iso, stamped after the walk
@@ -151,7 +167,11 @@ The disk floor alerts in `scripts/lint/sweep.py` use these three fields.
 They track growth since `previous_measured_at` for directories one or two levels below a measured folder.
 The snapshot includes these directories when they hold at least 1 GiB outside Cargo target directories.
 
-`measure` expands `~` and walks the rows in order with one `seen: set[sweep.InodeKey]` passed to every `sweep.directory_blocks(path, seen)` call, then measures the outside-cache directories, then calls `usage()` once, then stamps `measured_at`. A row's size is allocated blocks (`st_blocks * 512`, symlinks not followed), each `(st_dev, st_ino)` counted once across all rows: a file hard-linked into two rows counts in the first. `directory_blocks` skips any directory or entry it cannot read; called without `seen`, it counts per directory, as the sweep's own doc-index sizing does.
+The walk uses one inode set for the drive and external rows. It excludes child folders when measuring the parent's loose entries.
+Each file or symbolic link contributes its allocated blocks (`st_blocks * 512`).
+The first folder measured for an inode gets its size. The walk skips entries it cannot read and does not follow symbolic links.
+The outside-cache report measures growth from the fixed folders, Cargo mappings, and `SCCACHE_DIR` with its own inode set.
+The snapshot stamps `measured_at` after the walk and the root filesystem usage reading.
 
 `filesystem.filesystem_usage(path)` is a frozen `FilesystemUsage(used, free, total, device, device_name)` from `os.statvfs` and `os.stat`: used is `(f_blocks - f_bfree) * f_frsize`, free is `f_bavail * f_frsize`, the numbers `df -B1 /` prints as Used and Avail; total is `f_blocks * f_frsize`, and the device is the path's `st_dev` as `major:minor` with its block name. `disk.py` and `sample.py` both import it from `filesystem.py`, which imports neither `sweep` nor `record`.
 
@@ -164,10 +184,12 @@ The snapshot includes these directories when they hold at least 1 GiB outside Ca
 
 | Where | Size |
 |---|--:|
-| ~/rust | … GiB |
-| /tmp | … GiB |
+| /build/hana | … GiB |
+| /build/hana/ci | … GiB |
 | CI runner 1 | … GiB |
 | CI runner 2 | … GiB |
+| ~/rust | … GiB |
+| /tmp | … GiB |
 | other | … GiB |
 | free (floor 500.0 GiB) | … GiB |
 
@@ -180,7 +202,9 @@ After a capacity refresh, the report shows both times:
 Folder sizes measured by the buildlog disk job at 03:14 EDT; free and used space at 12:14 EDT: allocated blocks, each hard-linked file once.
 ```
 
-`other` is used minus the sum of the rows, clamped at zero. The free label is `free` alone when the floor is None. The time goes through `sync_time`, which adds the date when it is not today.
+The report keeps walk order, with each parent before its children.
+If the snapshot has no filesystem capacity rows, `other` is used space minus the rows without `within`, with a minimum of zero.
+The free label is `free` alone when the floor is None. `sync_time` adds the date for a measurement from a previous day.
 
 ### Test log isolation
 
