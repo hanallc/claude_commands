@@ -674,14 +674,17 @@ def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff
 
 
 def _assignment_notices(title: str, producer_id: staff.StaffId, keeper: staff.StaffId, member: staff.StaffRow,
-                        members: staff.StaffSnapshot) -> tuple[tuple[review_submissions.ListAssignmentNotice, ...], str]:
+                        members: staff.StaffSnapshot, *, producer_assigns: bool = False
+                        ) -> tuple[tuple[review_submissions.ListAssignmentNotice, ...], str]:
     if producer_id == keeper:
         return (), ""
     producer = members.by_id(producer_id)
     if producer is None:
         return (), "At least one assignment notice failed. The List item is saved."
-    showrunner = producer_map.showrunner_of(member, members)
     title = title if title.endswith((".", "?", "!")) else title + "."
+    if producer_assigns:
+        return (review_submissions.ListAssignmentNotice(producer.id, "producer", f"{title} You assign it."),), ""
+    showrunner = producer_map.showrunner_of(member, members)
     if showrunner.kind == "showrunner":
         notices = (
             review_submissions.ListAssignmentNotice(producer.id, "producer", f"{title} Its showrunner is {showrunner.name}."),
@@ -749,7 +752,9 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission, *,
             producer = recipient if request.producer_route else None
             owner = review_submissions.assigned_member(request.assignment, recipient, members)
             filing = prepare_scheduled(owner, words, members, producer=producer)
-            notices, warning = _assignment_notices(filing.title, filing.producer, filing.keeper, owner, members)
+            notices, warning = _assignment_notices(
+                filing.title, filing.producer, filing.keeper, owner, members,
+                producer_assigns=request.producer_route and isinstance(request.assignment, new_item_dialog.ProducerAssigns))
             claim = review_submissions.ListDraftClaim(digest, filing.keeper, filing.assignment, filing.readback, notices, warning)
             draft = review_submissions.NewItemDraft(request.request_id, claim)
             copy = (the_list.ScheduledAssigneeCopy(request.request_id, owner.id, words)

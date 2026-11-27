@@ -2605,6 +2605,140 @@ class NewItemDialogTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_none_assignee_is_first_and_sends_null(self) -> None:
+        self.check_assignee_choice("none")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_builds_assignee_stays_selected_with_none_available(self) -> None:
+        self.check_assignee_choice("default")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_none_assignee_stays_selected_when_the_producer_changes(self) -> None:
+        self.check_assignee_choice("producer")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_none_assignee_survives_separate_edits_reload_and_retry(self) -> None:
+        self.check_assignee_choice("retry")
+
+    def check_assignee_choice(self, scenario: str) -> None:
+        probe = r"""
+const scenario = __SCENARIO__, nativeFetch = window.fetch;
+const draftKey = 'console.new-item.submitted';
+const submitted = JSON.parse(sessionStorage.getItem(draftKey));
+const recovering = scenario === 'retry' && Boolean(submitted);
+const dialog = document.querySelector('#review-new-item');
+const trigger = document.querySelector('[data-owner-new]');
+const route = dialog.querySelector('[data-route]');
+const change = route.querySelector('[data-route-change]');
+const send = dialog.querySelector('[type="submit"]');
+const words = dialog.querySelector('textarea');
+const separate = dialog.querySelector('[data-later-draft]');
+const assignees = () => [...route.querySelectorAll('[name="assignee_id"]')];
+const checked = () => assignees().find(input => input.checked);
+const copy = () => route.querySelector('[data-route-copy]').textContent;
+const routeEnd = () => route.querySelector('[data-route-assignee]').textContent;
+const posts = [];
+const check = (ok, message) => { if (!ok) throw new Error(message); };
+const observe = (test, message) => new Promise((resolve, reject) => {
+ const ready = () => {
+  if (!test()) return;
+  clearTimeout(deadline);
+  observer.disconnect();
+  resolve();
+ };
+ const observer = new MutationObserver(ready);
+ const deadline = setTimeout(() => {
+  observer.disconnect();
+  reject(new Error(message));
+ }, 8000);
+ observer.observe(dialog, {attributes:true, childList:true, subtree:true});
+ ready();
+});
+window.fetch = (path, options) => {
+ if (String(path).startsWith('/send-hold/')) return Promise.resolve(Response.json({}));
+ if (!String(path).startsWith('/console/review/new-item')) return nativeFetch(path, options);
+ if (!options.body) return Promise.resolve(Response.json({
+  token:recovering ? 'fresh' : 'first', page_owner:'dwight', page_assignee:recovering ? 'tests' : 'builds',
+  recipients:[{id:'dwight',name:'dwight',proposal:true},{id:'release',name:'release',proposal:true}],
+  assignees:[{id:'builds',name:'builds'},{id:'tests',name:'tests'}],
+ }));
+ const payload = JSON.parse(options.body);
+ if (payload.page_capture) return Promise.resolve(Response.json({}, {status:503}));
+ if (payload.discard_capture) return Promise.resolve(Response.json({}));
+ posts.push(payload);
+ if (scenario === 'retry' && !recovering) {
+  return Promise.resolve(Response.json({error:'The reply was lost.'}, {status:503}));
+ }
+ return Promise.resolve(Response.json({id:'I1',key:'investigation/dwight/I1'}));
+};
+(async () => {
+ const failures = [];
+ try {
+  trigger.click();
+  await observe(() => !route.hidden, 'The route did not open.');
+  const [none, builds, tests] = assignees();
+  if (recovering) {
+   check(send.textContent === 'Retry' && words.readOnly, 'The submitted draft did not recover.');
+   check(checked() === none && none.value === '', 'Recovery must select None even if the page default changes.');
+   check(copy() === 'dwight tracks this bug and assigns it.', 'Recovery must show the saved route.');
+  } else {
+   change.click();
+   check(!none.closest('fieldset').hidden, 'Change must open the assignee choices.');
+   check(none.value === '' && none.labels[0].textContent === 'None',
+         'The first assignee chip must offer None.');
+   check(checked() === builds && builds.value === 'builds', 'Builds must stay selected at open.');
+   check(copy() === 'dwight tracks this bug and gives it to builds.', 'The route must show the page default.');
+   if (scenario !== 'default') {
+    tests.click();
+    none.click();
+    check(checked() === none && copy() === 'dwight tracks this bug and assigns it.' && routeEnd() === 'dwight assigns it',
+          'None must clear the assignee and show the producer route.');
+   }
+   if (scenario === 'producer') {
+    dialog.querySelector('[name="recipient_id"][value="release"]').click();
+    check(checked() === none && copy() === 'release tracks this bug and assigns it.' && routeEnd() === 'release assigns it',
+          'The new producer must keep None.');
+   }
+   const include = dialog.querySelector('[name="include_page"]');
+   if (include.checked) include.click();
+   words.value = 'Check the Builds queue.';
+   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+  }
+  const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+  check(!send.disabled, 'Send must be available.');
+  send.click();
+  if (scenario === 'retry' && !recovering) {
+   await observe(() => send.textContent === 'Retry' && !send.disabled, 'The lost reply did not offer Retry.');
+   const stored = JSON.parse(sessionStorage.getItem(draftKey));
+   check(stored.payload.assignee_id === null && posts[0].assignee_id === null,
+         'The saved draft and first Send must use null.');
+   separate.click();
+   tests.click();
+   check(checked() === tests, 'The separate draft must accept a different assignee.');
+   separate.click();
+   check(checked() === none && send.textContent === 'Retry', 'Return to Retry must restore None.');
+   location.reload();
+   return;
+  }
+  await created;
+  check(posts.length === 1 && posts[0].assignee_id === (scenario === 'default' ? 'builds' : null),
+        'Send must use the assignee shown in the route.');
+  check(posts[0].recipient_id === (scenario === 'producer' ? 'release' : 'dwight'), 'Send must use the selected producer.');
+  if (recovering) {
+   check(posts[0].request_id === submitted.payload.request_id && posts[0].token === 'fresh',
+         'Retry must keep the draft ID and use the current token.');
+  }
+ } catch (error) {
+  failures.push(String(error));
+ }
+ await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();
+"""
+        page = bug_fixture_page(script=probe.replace("__SCENARIO__", json.dumps(scenario))).replace(
+            b'data-page-owner="review"', b'data-page-owner="builds"')
+        self.assertEqual(firefox_probe_results(page), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_producer_route_and_assignee_change_in_the_browser(self) -> None:
         script = r"""
 const failures = [], check = (ok, message) => { if (!ok) failures.push(message); };
@@ -2649,7 +2783,7 @@ window.fetch = (path, options) => {
         'To shows only producers.');
   if (list) {
    dialog.querySelector('[data-kind="investigation"] input').click();
-   check(text('producer') === 'a producer' && text('assignee') === 'the producer assigns it', 'The List has no default route.');
+   check(text('producer') === 'a producer' && text('assignee') === 'The producer assigns it', 'The List has no default route.');
    check(send.disabled && !hint.hidden && hint.textContent === 'Pick a producer', 'The List requires a producer.');
    send.click();
    check(posts.length === 0, 'A disabled Send makes no request.');

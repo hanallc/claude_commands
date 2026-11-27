@@ -635,12 +635,14 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
                     label = notice.kind.capitalize()
                 if notice.from_command:
                     source = ""
-            assignee = ""
+            assignment_line = ""
             assignment = saved.details.assignment
             if isinstance(assignment, new_item_dialog.ChosenAssignee):
                 name = review_items.name(assignment.id, staff.snapshot())
-                assignee = f"\n{name} is the assignee."
-            message = (f'New {label} {saved.id}{source}.{assignee}\n\n{words or saved.words}{evidence}\n\n'
+                assignment_line = f"\n{name} is the assignee."
+            elif (recipient := staff.by_id(saved.owner)) is not None and recipient.kind == "producer":
+                assignment_line = "\nYou assign it."
+            message = (f'New {label} {saved.id}{source}.{assignment_line}\n\n{words or saved.words}{evidence}\n\n'
                        + change_page.reply_command(saved.key))
             record: change_page.StoredReviewMessage = {
                 'source': str(path), 'row': row, 'saved': True, 'owner': saved.owner,

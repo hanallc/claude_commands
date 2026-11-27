@@ -1498,7 +1498,7 @@ function bindDraft(dialog, fresh = false) {
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
  let pageOwner = '';
- let assignees, selectedAssignee = '';
+ let assignees, selectedAssignee = null;
  let captureSession, pageContext, savedItem, laterDraft, laterBase;
  let awaitingEarlierSend = false, awaitingNativeRecovery = false, submittedDraft;
  let separateFromNativeDraft = false, nativeListEdit, separateListEdit;
@@ -1645,18 +1645,20 @@ function bindDraft(dialog, fresh = false) {
  function showRoute() {
   route.hidden = !assignees;
   if (route.hidden) return;
+  for (const input of assigneeChips.querySelectorAll('input'))
+   input.checked = input.value === (selectedAssignee ?? '');
   const producer = recipients.find(choice => choice.id === selectedRecipient);
   const assignee = assignees.find(choice => choice.id === selectedAssignee);
   const kind = form.elements.kind.value || 'item';
+  const subject = producer?.name || 'The producer';
   routeProducer.textContent = producer?.name || 'a producer';
-  routeAssignee.textContent = assignee?.name || 'the producer assigns it';
+  routeAssignee.textContent = assignee?.name || subject + ' assigns it';
   routeAssigned.hidden = !assignee;
   changeAssignee.hidden = !producer || !assignees.length;
   if (changeAssignee.hidden) showAssigneeChoices(false);
-  const subject = producer?.name || 'The producer';
   routeCopy.textContent = producer && assignee
    ? subject + ' tracks this ' + kind + ' and gives it to ' + assignee.name + '.'
-   : subject + ' tracks this ' + kind + ' and chooses who does the work.';
+   : subject + ' tracks this ' + kind + ' and assigns it.';
  }
 
  function showRecipients() {
@@ -1709,7 +1711,7 @@ function bindDraft(dialog, fresh = false) {
    showOwnerReason();
   }
   if (event?.target.name === 'assignee_id') {
-   selectedAssignee = event.target.value;
+   selectedAssignee = event.target.value || null;
    storeListDraft();
   }
   if (event?.target === includePage && !pendingPayload()) startCapture();
@@ -1827,11 +1829,12 @@ function bindDraft(dialog, fresh = false) {
   ownerReasonText.textContent = data.page_owner_reason || '';
   if (newDraft) {
    selectedRecipient = ownerPage ? pageOwner : recipients.find(recipient => recipient.name === recipientName)?.id || '';
-   selectedAssignee = assignees ? data.page_assignee || '' : '';
+   selectedAssignee = assignees ? data.page_assignee || null : null;
   }
-  if (assignees && !assignees.some(choice => choice.id === selectedAssignee))
-   selectedAssignee = '';
-  assigneeChips.replaceChildren(...(assignees || []).map(choice => choiceChip('assignee_id', choice, selectedAssignee)));
+  if (assignees && selectedAssignee !== null && !assignees.some(choice => choice.id === selectedAssignee))
+   selectedAssignee = null;
+  const choices = assignees ? [{id:'', name:'None'}, ...assignees] : [];
+  assigneeChips.replaceChildren(...choices.map(choice => choiceChip('assignee_id', choice, selectedAssignee ?? '')));
   showRecipients();
   showRoute();
   updateSend();
@@ -2362,7 +2365,7 @@ function bindDraft(dialog, fresh = false) {
   form.elements.kind.value = draft.kind;
   draftId = draft.id;
   selectedRecipient = draft.recipient;
-  selectedAssignee = draft.assignee || '';
+  selectedAssignee = draft.assignee || null;
   words.value = draft.words;
   includePage.checked = draft.include;
   replaceImages(draft.files);
@@ -2404,7 +2407,7 @@ function bindDraft(dialog, fresh = false) {
   awaitingEarlierSend = true;
   form.elements.kind.value = draft.selectedKind || original.kind;
   selectedRecipient = original.recipient_id;
-  selectedAssignee = original.assignee_id || '';
+  selectedAssignee = original.assignee_id || null;
   words.value = original.words;
   includePage.checked = draft.includeScreenshot ?? Boolean(original.capture_key);
   pageContext = draft.pageContext || {
@@ -2604,7 +2607,7 @@ function bindDraft(dialog, fresh = false) {
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
-    selectedAssignee = stored.assignee || '';
+    selectedAssignee = stored.assignee || null;
     if (stored.kind) kind = stored.kind;
     // The shipped List dialog stores no Send state.
     awaitingNativeRecovery = isShippedListDraft(stored);
@@ -2614,7 +2617,7 @@ function bindDraft(dialog, fresh = false) {
   const newDraft = !keepDraft && !draftId;
   if (newDraft) {
    selectedRecipient = '';
-   selectedAssignee = '';
+   selectedAssignee = null;
    showAssigneeChoices(false);
   }
   if (!keepDraft) {
@@ -2694,7 +2697,7 @@ function bindDraft(dialog, fresh = false) {
   const kind = type === 'feedback' ? 'investigation' : type;
   const payload = {request_id: ensureDraftId(), kind, recipient_id: recipient.value, words: words.value,
                    ...(ownerPage && {page: ownerPage, page_recipient: assignees ? 'producer' : 'selected'}),
-                   ...(assignees && {assignee_id: selectedAssignee || null}),
+                   ...(assignees && {assignee_id: selectedAssignee}),
                    ...(type === 'feedback' && {notice: {kind: type}})};
   storeListDraft();
   if (kind === 'scheduled') return payload;
