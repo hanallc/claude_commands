@@ -1915,6 +1915,18 @@ class LocalReviewTests(unittest.TestCase):
                          {"verdict", "title", "action", "body", "questions", "failed_rules"})
         self.assertTrue(all(0 < call.timeout <= 60 for call in runner.calls))
 
+    def test_reviewer_counts_only_the_displayed_header_lines(self) -> None:
+        draft = replace(self.draft, action=NoActionRequired(), priority="0", body="B" * 499)
+        for session, expected in ((NO_SESSION_LINE, "none"), (SessionLine("Owner"), "push-body-under-500")):
+            note = replace(draft, session=session)
+            runner = FakeReviewer(verdict(note))
+            _ = review.review(note, False, runner=runner)
+            command = next(call.argv for call in runner.calls if Path(call.argv[0]).name == "claude")
+            prompt = command[command.index("--system-prompt") + 1]
+            self.assertIn("The message length includes the body and all displayed header lines.", prompt)
+            self.assertIn(f"Code-counted length failures: {expected}", command[-1])
+            self.assertNotIn("\nno action\n", command[-1])
+
     def test_unresolved_registry_uses_opus_medium(self) -> None:
         registry = write_registry(self.root / "models.conf")
         caller = claude_catalog_environment(self.root / "caller-review", {"opus": "claude-opus-caller-fixture"})
@@ -2349,6 +2361,42 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual([draft.title for draft in drafts], ["new", "old"])
         self.assertEqual([(draft.action, draft.body) for draft in drafts], [(NoActionRequired(), "body")] * 2)
         self.assertNotIn("No action needed.", output.getvalue())
+
+    def test_replay_preserves_note_body_lines_that_look_like_headers(self) -> None:
+        keys = self.root / "keys"
+        _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        body = "Action: backup complete.\nThe logs are ready."
+        drafts = (
+            review.Draft("script", "0", "Session note", NoActionRequired(), body, False, SessionLine("Owner")),
+            review.Draft("script", "0", "Plain note", NoActionRequired(), "Session: archive\n" + body, False),
+        )
+        with redirect_stdout(io.StringIO()):
+            for draft in drafts:
+                self.assertEqual(pushover.deliver(draft, keys, post), 0)
+        pushover.log("script", "0", "Older note", body, "sent")
+
+        def approve(draft: review.Draft, _revision: bool) -> review.ReviewOutcome:
+            return review.Approved(draft)
+
+        with (mock.patch.object(review, "review", side_effect=approve) as read,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(review.replay(), 0)
+        replayed = [cast(review.Draft, call.args[0]) for call in read.call_args_list]
+        self.assertEqual(replayed[0], review.Draft("script", "0", "Older note", NoActionRequired(), body, False))
+        for actual, original in zip(replayed[1:], reversed(drafts), strict=True):
+            self.assertEqual(actual, replace(original, body=with_footer(original.body, "script", "none (free text)")))
+
+    def test_check_omits_the_legacy_header_from_a_note(self) -> None:
+        def approve(draft: review.Draft, _revision: bool) -> review.ReviewOutcome:
+            self.assertEqual(draft.body, "The build passed.")
+            return review.Approved(draft)
+
+        with mock.patch.object(review, "review", side_effect=approve), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(["check", "--no-action", "--title", "Build passed", "--text",
+                                          "Session: Owner\nNo action needed.\nThe build passed."]), 0)
+        self.assertEqual(output.getvalue().splitlines(),
+                         ["send; failed rules: none", "Build passed", "Session: Owner", "The build passed."])
 
     def test_check_is_dry_even_when_reviewer_asks(self) -> None:
         def ask(draft: review.Draft, _revision: bool) -> review.ReviewOutcome:

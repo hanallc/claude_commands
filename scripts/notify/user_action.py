@@ -98,13 +98,48 @@ def notification_header(action: UserAction, session: NotificationSession = NO_SE
     return session_prefix(session).removesuffix("\n")
 
 
+_LEADING_BLANK_LINES = re.compile(r"\A(?:[^\S\r\n]*(?:\r\n|[\r\n]))*(?:[^\S\r\n]*\Z)?")
+
+
+def notification_body(action: UserAction, body: str) -> str:
+    """Remove leading blank lines and the old header from a note."""
+    if isinstance(action, ActionRequired):
+        return body
+    body = _LEADING_BLANK_LINES.sub("", body)
+    line, _, rest = body.partition("\n")
+    if line.removesuffix("\r") == LEGACY_NO_ACTION_LINE:
+        return _LEADING_BLANK_LINES.sub("", rest)
+    return body
+
+
 def notification_message(action: UserAction, body: str, session: NotificationSession = NO_SESSION_LINE,
                          *, header: bool = True) -> str:
     """Join the header and body when both are present."""
+    body = notification_body(action, body)
     lines = notification_header(action, session) if header else ""
     if not lines:
-        return body.lstrip("\r\n")
+        return body
     return f"{lines}\n{body}" if body else lines
+
+
+def read_notification(message: str, header: str | None, *, action_expected: bool = False
+                      ) -> tuple[UserAction, str, NotificationSession]:
+    """Read a saved message using its header or the action required by its record."""
+    if header is not None:
+        if not header:
+            return NoActionRequired(), message, NO_SESSION_LINE
+        session, action_line = split_session(header)
+        action = ActionRequired(action_line.removeprefix("Action: ")) if action_line.startswith("Action: ") else NoActionRequired()
+        body = "" if message == header else message.removeprefix(header + "\n")
+        return action, body, session
+    session, text = split_session(message)
+    line, _, body = text.partition("\n")
+    if line.removesuffix("\r") == LEGACY_NO_ACTION_LINE:
+        action = NoActionRequired()
+        return action, notification_body(action, text), session
+    if action_expected and line.startswith("Action: "):
+        return ActionRequired(line.removeprefix("Action: ")), body, session
+    return NoActionRequired(), message, NO_SESSION_LINE
 
 
 # A literal thing to type in a body: "type" or "type:" and its text, or a "! <command>" shell escape.

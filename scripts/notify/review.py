@@ -43,7 +43,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.file_lock import LockAvailability, LockResult, exclusive, probe_existing_exclusive, take_exclusive
 
 from scripts.notify.user_action import (LEGACY_NO_ACTION_LINE, ActionRequired, NoActionRequired, UserAction,
-                         action_conflicts, notification_header, notification_message, parse_user_action,
+                         action_conflicts, notification_body, notification_header, notification_message, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
 
 if TYPE_CHECKING:
@@ -1112,6 +1112,9 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
             "Keep title empty and action null. Questions are empty unless the verdict is ask. "
             "No phone length limits apply. The previous reply and date are context for ask-once and time-zone rules. "
             "Times are in the user zone the draft gives.")
+        if isinstance(context, PushReview):
+            prompt += ("\nUse the code-counted length failures. The message length includes the body and all displayed header lines. "
+                       "It includes the line breaks between them. A push with no action has no action line.\n")
         if isinstance(context, PushReview) and check_template_fit:
             prompt += ("\nRegistered fixed templates (id: purpose):\n"
                        + "\n".join(f"{entry.id}: {entry.purpose}" for entry in push_texts.catalog() if not entry.agent_written)
@@ -1144,9 +1147,9 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
                 draft_prompt = (f"Console text kind: {context.console_kind}\n{layout}"
                                 f"Draft:\n{draft.body}\nRevision: {str(revision).lower()}")
         else:
-            header = notification_header(draft.action, draft.session)
-            draft_prompt = (f"Title: {draft.title}\n{header or 'no action'}\n"
-                            f"Body: {draft.body}\n"
+            body = notification_body(draft.action, draft.body)
+            message = notification_message(draft.action, f"Body: {body}", draft.session)
+            draft_prompt = (f"Title: {draft.title}\n{message}\n"
                             f"Priority: {draft.priority}\nRevision: {str(revision).lower()}\n"
                             f"Code-counted length failures: {', '.join(length_failures(draft)) or 'none'}\n"
                             f"Code-found second actions: {'; '.join(action_conflicts(draft.action, draft.body)) or 'none'}")
@@ -1688,15 +1691,11 @@ def replay(limit: int = 0) -> int:
             if not _text(record, "outcome").startswith("sent"):
                 continue
             message = _text(record, "message")
-            session, message_body = split_session(message)
-            action_line, _, body = message_body.partition("\n")
-            if action_line.startswith("Action: "):
-                action: UserAction = ActionRequired(action_line.removeprefix("Action: "))
-            elif action_line == LEGACY_NO_ACTION_LINE:
-                action = NoActionRequired()
-            else:
-                action, body = NoActionRequired(), message_body
-            draft = Draft(_text(record, "source"), _text(record, "priority"),
+            priority = _text(record, "priority")
+            header = _text(record, "header") if "header" in record else None
+            template = _text(record, "template") if "template" in record else ""
+            action, body, session = push_texts.read_saved_message(message, header, priority, template)
+            draft = Draft(_text(record, "source"), priority,
                           _text(record, "title"), action, body, False, session)
             stamp = _text(record, "time")
         except ValueError:
@@ -2068,7 +2067,7 @@ def main(argv: list[str]) -> int:
         parser.error("state a non-empty action")
     session, body = split_session(cast(str, arguments.text))
     draft = Draft("review.check", cast(str, arguments.priority), cast(str, arguments.title),
-                  chosen, body, False, session)
+                  chosen, notification_body(chosen, body), False, session)
     outcome = review(draft, False)
     print_review(draft, outcome)
     log_review(draft, outcome, dry=True)
