@@ -10,6 +10,7 @@ from hashlib import sha256
 from pathlib import Path
 import json
 import re
+import shlex
 import sys
 from textwrap import indent
 from threading import Lock
@@ -91,19 +92,17 @@ def read_findings(text: str) -> dict[str, ReviewFinding]:
         payload = payload[len("```json\n"):-len("\n```")]
     try:
         result = cast(object, json.loads(payload))
-        match result:
-            case [{"blocker": str(blocker)}]:
-                raise ReviewerBlocker(blocker)
-            case list():
-                pass
-            case _:
-                raise ValueError("expected a list of findings")
+        if not isinstance(result, list):
+            raise ValueError("expected a list of findings")
+        rows = cast(list[object], result)
         findings: dict[str, ReviewFinding] = {}
-        for value in cast(list[object], result):
+        for value in rows:
             if not isinstance(value, dict):
                 raise ValueError("expected an object for each finding")
             row = cast(dict[str, object], value)
             match row:
+                case {"blocker": str(blocker)} if len(rows) == 1 and row.keys() <= {"blocker", "source"}:
+                    raise ReviewerBlocker(blocker)
                 case {"test": str(test), "finding": "none"} if len(row) == 2:
                     finding = NoNateDecision(test)
                 case {"test": str(test), "finding": "specified" | "requested" as kind, "quote": str(quote), "source": str(source),
@@ -191,18 +190,24 @@ Never call `write_stdin`. Do not start interactive or background commands.
 If a search times out, split its input into smaller groups and search each group.
 
 The checker's code root is `{checker_root}`.
-Start a fresh Python process when you import from the checker.
-Run `import sys` and `sys.path.insert(0, {checker_root!r})` before you import from the checker.
+Use this command to import the checker modules.
+Add your record reads after the imports and before `PY`.
+
+```sh
+(cd -- {checker_root_shell} && timeout --kill-after=1s 20s ./scripts/lib/py --isolated -B - <<'PY'
+from scripts.lib.transcripts import transcript_lines
+from scripts.production import update_registration
+PY
+)
+```
 
 Use these sources:
 1. List records and their questions and answers in {state_root}/*/list/L*.md.
 2. Question records and change review verdicts.
    Read `{checker_root}/scripts/production/update_registration.py` for the question record code.
-   To use its functions, run `from scripts.production import update_registration`.
    Follow the store paths in the showrunner documents and the showrunner state root.
 3. User turns in Claude session transcripts. Do not count assistant, tool, or peer messages.
    Use `{checker_root}/scripts/lib/transcripts.py` to find distinct paths.
-   Use `from scripts.lib.transcripts import transcript_lines`.
    Read plain and compressed transcripts with `with contextlib.closing(transcript_lines(Path(path))) as lines:`.
    Use `rg --search-zip --files-with-matches --hidden --no-ignore` on groups of transcript paths.
    Select files by terms for the affected behaviors. Parse only those files for matching user turns.
@@ -357,7 +362,7 @@ def prepare_review(change: behavior_check.GitRange, part: ReviewPart, folder: Pa
                                      str(reply), astra_work.StandaloneWork())
     return astra_work.header_line(assignment) + part.instructions.format(
         test_file=test_file, diff_file=diff_file, state_root=state_root(), repo=change.repo,
-        checker_root=str(CHECKER_ROOT))
+        checker_root=CHECKER_ROOT, checker_root_shell=shlex.quote(str(CHECKER_ROOT)))
 
 
 class ReviewNeedsDispatch:

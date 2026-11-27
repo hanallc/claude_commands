@@ -159,12 +159,25 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         checker_root = Path(behavior_review.__file__).resolve().parents[2]
         self.assertEqual(runner.call_args.kwargs["cwd"], self.repo)
         self.assertIn(f"The checker's code root is `{checker_root}`.", prompt)
-        self.assertIn(f"`sys.path.insert(0, {str(checker_root)!r})`", prompt)
         self.assertIn(f"`{checker_root}/scripts/production/update_registration.py`", prompt)
-        self.assertIn("`from scripts.production import update_registration`", prompt)
         self.assertIn(f"`{checker_root}/scripts/lib/transcripts.py`", prompt)
-        self.assertIn("`from scripts.lib.transcripts import transcript_lines`", prompt)
         self.assertIn("`with contextlib.closing(transcript_lines(Path(path))) as lines:`", prompt)
+
+        _ = self.write(self.repo / "scripts/__init__.py", 'raise ImportError("The checked repo supplied scripts.")\n')
+        command = prompt.split("```sh\n", 1)[1].split("\n```", 1)[0]
+        imports, end, suffix = command.partition("\nPY\n")
+        self.assertIn("from scripts.lib.transcripts import transcript_lines", imports)
+        self.assertIn("from scripts.production import update_registration", imports)
+        self.assertTrue(end)
+        check_paths = (
+            "\nfrom inspect import getfile\n"
+            "print(getfile(transcript_lines))\n"
+            "print(getfile(update_registration))"
+        )
+        result = self.run_in_repo("env", f"PYTHONPATH={self.repo}", "bash", "-c", imports + check_paths + end + suffix)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [str(checker_root / "scripts/lib/transcripts.py"),
+                                                      str(checker_root / "scripts/production/update_registration.py")])
 
     def test_clear_requires_a_saved_reply_for_this_patch_and_each_test(self) -> None:
         args, key = self.changed_range()
@@ -397,6 +410,12 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("The reviewer could not complete part 2: The transcript reader raised ImportError.\n", output)
         self.assertNotIn("Invalid reviewer reply", output)
         self.assertIs(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
+
+    def test_json_blocker_rejects_fields_other_than_blocker_and_source(self) -> None:
+        for reply in ('[{"blocker":"cannot read","extra":"value"}]',
+                      '[{"blocker":"cannot read","test":"x","finding":"none"}]'):
+            with self.subTest(reply=reply), self.assertRaisesRegex(behavior_check.BehaviorCheckError, "Invalid reviewer reply"):
+                _ = behavior_review.read_findings(reply)
 
     def test_split_review_indexes_a_large_shared_diff(self) -> None:
         args, key = self.split_range(f"VALUE = '{'new' * 1500}'\n")
