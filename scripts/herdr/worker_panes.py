@@ -1876,11 +1876,27 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 else:
                     return _uncertain(row, "retained launch proof is incomplete")
     if isinstance(current, OpenWorker) and continuation is not None:
-        launched = client.native_pane_process(current.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
-        if launched.current_identity != current.row.current_session or not berth_session:
-            return _uncertain(current.row, "continuation launch identity is unproved")
+        try:
+            herdr.forget_pane_evidence(client.session, current.pane)
+            info = herdr.json_object(client.result("pane", "process-info", "--pane", current.pane).get("process_info"),
+                                     "continuation process info")
+            foreground = herdr.foreground_pane_owner(info)
+            pane = client.pane_row(current.pane)
+            if (not isinstance(foreground, (herdr.ProvedCodexForeground, herdr.ProvedClaudeForeground))
+                    or foreground.kind != policy.settings.kind or isinstance(pane, herdr.NoPane)
+                    or pane.get("terminal_id") != current.terminal):
+                return _uncertain(current.row, "continuation launch is unproved")
+            launched = herdr.read_foreground_pane_owner(foreground, pane)
+            if launched.current_identity != current.row.current_session or not berth_session:
+                return _uncertain(current.row, "continuation launch identity is unproved")
+        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            return _uncertain(current.row, f"continuation launch is unproved: {error}")
         if launched.environment.get(phase_reservation.SESSION_ENVIRONMENT) == berth_session:
             return current
+        settings = kept_settings(models_registry.LaunchSettings(foreground.kind, "", "", ""), foreground.arguments)
+        if not settings.model:
+            return _uncertain(current.row, "continuation model is unproved")
+        policy = replace(policy, settings=settings)
         if isinstance(account, ConfiguredWorkerAccount):
             from scripts.accounts import accounts
 
@@ -2016,7 +2032,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         identity = str(row.current_session) if row is not None and not switching else ""
         launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
         resume_policy = policy
-        if (identity and row is not None and keep_model and policy.settings.kind == "claude"
+        if (identity and row is not None and continuation is None and keep_model and policy.settings.kind == "claude"
                 and row.role == staff.KnownWorkerRole(role)):
             homes = [row.home.path] if isinstance(row.home, staff.SessionHome) else []
             if target_home := environment.get("CLAUDE_CONFIG_DIR"):
