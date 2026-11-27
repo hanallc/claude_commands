@@ -79,6 +79,10 @@ class TuneTests(PublicationTestCase):
                 'The Hana image is now stale. Build and register a current Hana image.'), expected)
 
     def test_invalid_file_key_value_or_empty_approval_refuses_without_changing_anything(self) -> None:
+        repo = self.repository
+        _ = repo.config.write_text(repo.config.read_text() + "\n# Label\nlabel=main\n")
+        _ = repo.git(repo.checkout, "commit", "-qam", "Add the label fixture")
+        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
         cases = (
             ("missing", "amount", "3", "valid reason", "approved"),
             ("example", "missing", "3", "valid reason", "approved"),
@@ -94,6 +98,7 @@ class TuneTests(PublicationTestCase):
             ("example", "amount", "3", "   ", "approved"),
             ("example", "amount", "3", "valid reason", ""),
             ("example", "amount", "3", "valid reason", "   "),
+            ("example", "label", "main\u2028[extra]", "valid reason", "approved"),
         )
         for file, key, value, why, approval in cases:
             with self.subTest(file=file, key=key, value=value, why=why, approval=approval):

@@ -8,16 +8,20 @@ except FileNotFoundError:
 import argparse
 import fcntl
 import json
+import os
 import sys
 import time
-from collections.abc import Generator
+from collections.abc import Collection, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
-from typing import cast
+from threading import Lock
+from typing import IO, cast
 
 
-from scripts.lib import conf
+from scripts.lib import conf, lock_holder
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
 from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX
@@ -63,6 +67,10 @@ def _activity_path() -> Path:
     return record_path().with_suffix(".active")
 
 
+def _holder_folder() -> Path:
+    return record_path().with_suffix(".holders")
+
+
 _RECORD_LOCK_SECONDS: ContextVar[float | None] = ContextVar("_RECORD_LOCK_SECONDS", default=None)
 
 
@@ -78,22 +86,135 @@ def record_lock_seconds() -> float:
     return config.number(key)
 
 
+def _gap_path(pid: int, row_id: str) -> Path:
+    return _holder_folder() / "claims" / f"{pid}-{sha256(row_id.encode()).hexdigest()}"
+
+
+@dataclass
+class RestartActivity:
+    holder_path: Path
+    _recorded: bool = field(default=False, init=False)
+    _reported: bool = field(default=False, init=False)
+    _guard: Lock = field(default_factory=Lock, init=False)
+    _claims: dict[str, IO[str]] = field(default_factory=dict, init=False)
+
+    def _anomaly(self, error: OSError | ValueError) -> None:
+        if not self._reported:
+            self._reported = True
+            detail = str(error).partition("\n")[0] or type(error).__name__
+            print(f"restart: holder record anomaly: {detail}", file=sys.stderr)
+
+    def publish(self) -> None:
+        try:
+            self.holder_path.parent.mkdir(exist_ok=True)
+            write_text_atomic(self.holder_path, json.dumps(lock_holder.own_fields()), new_file_mode=0o600)
+            self._recorded = True
+        except (OSError, ValueError) as error:
+            self._anomaly(error)
+
+    def claim_rows(self, rows: Collection[str]) -> None:
+        """Hold the rows between their confirmed stop and their start."""
+        if not self._recorded:
+            return
+        with self._guard:
+            for row_id in rows:
+                if row_id in self._claims:
+                    continue
+                path = _gap_path(os.getpid(), row_id)
+                try:
+                    path.parent.mkdir(exist_ok=True)
+                    stream = path.open("a")
+                    try:
+                        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError:
+                        stream.close()
+                        raise
+                    self._claims[row_id] = stream
+                except (OSError, ValueError) as error:
+                    self._anomaly(error)
+
+    def release_rows(self, rows: Collection[str]) -> None:
+        with self._guard:
+            for row_id in rows:
+                stream = self._claims.pop(row_id, None)
+                if stream is None:
+                    continue
+                try:
+                    stream.close()
+                    _gap_path(os.getpid(), row_id).unlink(missing_ok=True)
+                except (OSError, ValueError) as error:
+                    self._anomaly(error)
+
+    def close(self) -> None:
+        self.release_rows(tuple(self._claims))
+        try:
+            self.holder_path.unlink(missing_ok=True)
+        except (OSError, ValueError) as error:
+            self._anomaly(error)
+
+
 @contextmanager
-def active_operation(*, record_lock_seconds: float | None = None) -> Generator[None]:
+def active_operation(*, record_lock_seconds: float | None = None) -> Generator[RestartActivity]:
     path = _activity_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_SH)
-        token = _RECORD_LOCK_SECONDS.set(record_lock_seconds)
-        try:
-            yield
-        finally:
-            _RECORD_LOCK_SECONDS.reset(token)
+        activity = RestartActivity(_holder_folder() / str(os.getpid()))
+        with lock_holder.restart_operation(), _record_wait(record_lock_seconds):
+            activity.publish()
+            try:
+                yield activity
+            finally:
+                activity.close()
 
 
-def active() -> bool:
+@contextmanager
+def _record_wait(seconds: float | None) -> Generator[None]:
+    token = _RECORD_LOCK_SECONDS.set(seconds)
     try:
-        with _activity_path().open("r") as lock:
+        yield
+    finally:
+        _RECORD_LOCK_SECONDS.reset(token)
+
+
+def _read_holder(path: Path) -> lock_holder.HolderRecord | None:
+    try:
+        with path.open("rb") as stream:
+            holder = lock_holder.read_record(stream)
+    except OSError:
+        return None
+    if holder is not None and holder.restart_scope and holder.start and path.name == str(holder.pid):
+        return holder
+    return None
+
+
+def has_holder_record(record: lock_holder.HolderRecord) -> bool:
+    saved = _read_holder(_holder_folder() / str(record.pid))
+    return saved is not None and saved.start == record.start and saved.restart_scope == record.restart_scope
+
+
+def restart_holders(row_id: str) -> list[lock_holder.HolderRecord]:
+    return [holder for path in sorted(_holder_folder().glob("[0-9]*"))
+            if (holder := _read_holder(path)) is not None and _lock_is_held(_gap_path(holder.pid, row_id))]
+
+
+def prove_restart_holder(row_id: str) -> lock_holder.ProvedLockHolder | None:
+    """Prove the restart's active claim on this row."""
+    holders = [proof for holder in restart_holders(row_id)
+               if (proof := lock_holder.prove(_gap_path(holder.pid, row_id), [holder])) is not None]
+    return holders[0] if len(holders) == 1 else None
+
+
+def forget_moved(row_id: str) -> None:
+    """Remove a confirmed move from recovery while the caller holds its row lock."""
+    if row_id in read():
+        with _record_wait(record_lock_seconds()):
+            remove_started([row_id])
+
+
+def _lock_is_held(path: Path) -> bool:
+    try:
+        with path.open("r") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -101,6 +222,10 @@ def active() -> bool:
     except FileNotFoundError:
         pass
     return False
+
+
+def active() -> bool:
+    return _lock_is_held(_activity_path())
 
 
 def read() -> list[str]:

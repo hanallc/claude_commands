@@ -39,7 +39,6 @@ from scripts.build_targets.target_config import pinned_target_names
 from scripts.build_targets.targets import (
     ConfigError, Held, LocalTarget, StateUnreadable, local_hold_states, read_targets, ssh_target_state,
 )
-from scripts.lib import conf_reads
 from scripts.lib import conf as tunables
 from scripts.message import session_send
 from scripts.lib.atomic_file import write_text_atomic
@@ -59,14 +58,13 @@ from scripts.message import sessions  # noqa: E402
 from scripts.herdr import herdr, worker_panes  # noqa: E402
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
+    from collections.abc import Callable, Generator, Iterable, Iterator
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / ".claude/projects")
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or session_send.SEND_SCRIPT)
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
-WATCH_DEFAULTS = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 COMPACTION_WAKE_KIND = "blocked"
 HOLDING_KIND = "holding"
@@ -474,18 +472,18 @@ def login_limited(pid: int, session_id: str, pattern: re.Pattern[str]) -> LoginV
         return LoginVerdict.LIMITED
 
 
-def context_near_compaction(session_id: str) -> bool:
+def context_near_compaction(session_id: str, pid: int) -> bool:
     """Wake at the context hook's shared handoff threshold using its bounded tail reading."""
     try:
         transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
         if transcript is None:
             return False
-        reading = context_usage.latest_reading(transcript)
+        reading = context_usage.latest_reading(transcript, tunables.read("context_usage"))
     except OSError:
         return False
     if reading is None:
         return False
-    window = context_usage.auto_compact_window(reading["model"])
+    window = context_usage.auto_compact_window(reading["model"], pid=pid)
     return (window is not None
             and context_usage.estimate_tokens(reading, 0) >= context_usage.handoff_threshold(window))
 
@@ -655,30 +653,16 @@ def prompt_alert_seconds() -> float:
     return tunables.read("production").number("prompt_alert_seconds")
 
 
-def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) -> Mapping[str, str]:
-    """Read person-edited settings at use, without an import-time cache."""
-    defaults = WATCH_DEFAULTS
-    path = defaults if packaged_only else Path(os.environ.get("STALL_WATCH_CONFIG") or defaults)
-    paths = (defaults, path) if status_defaults and path != defaults else (path,)
-    fields: dict[str, str] = {}
-    shifts: dict[str, conf_reads.ShiftedConfigKey] = {}
-    for source in paths:
-        try:
-            content = conf_reads.read_text(source)
-        except FileNotFoundError:
-            if status_defaults and source != defaults:
-                continue
-            raise
-        origins = conf_reads.shift_origins(source, content)
-        for line in content.splitlines():
-            if line.strip() and not line.lstrip().startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                fields[key] = value
-                if (origin := origins.get(key)) is not None:
-                    shifts[key] = origin
-                elif shifts:
-                    _ = shifts.pop(key, None)
-    return conf_reads.ShiftTracedValues(fields, shifts) if shifts else fields
+def watch_config(*, status_defaults: bool = False) -> dict[str, str]:
+    """Read the current watch settings and recover missing status patterns when requested."""
+    settings = tunables.read("stall_watch")
+    fields = settings.values()
+    if status_defaults:
+        for key in ("paused_status_pattern", "external_wait_pattern", "external_owner_pattern",
+                    "holding_party_pattern", "login_limit_pattern"):
+            if key not in fields:
+                fields[key] = settings.text(key)
+    return fields
 
 
 def name_spans(text: str, name: str) -> list[tuple[int, int]]:
@@ -761,24 +745,24 @@ def holding_names_outside(status: str, peers: Iterable[str], own_names: tuple[st
 
 def prompt_grace_seconds() -> float:
     """Read the person-edited grace each tick; missing or invalid settings are reported by the caller."""
-    fields = watch_config()
     try:
-        grace = float(fields["prompt_grace_seconds"].strip())
-        if not math.isfinite(grace) or grace < 0:
-            raise ValueError("expected a finite nonnegative number")
-    except (KeyError, ValueError) as error:
+        return tunables.read("stall_watch").value("prompt_grace_seconds", nonnegative_seconds)
+    except tunables.Unusable as error:
         raise ValueError(f"invalid prompt_grace_seconds: {error}") from error
-    return grace
+
+
+def nonnegative_seconds(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("expected a finite nonnegative number")
+    return value
 
 
 def delivery_reserve_seconds() -> float:
     """Leave the configured part of the pass for alert delivery."""
     try:
-        reserve = float(watch_config(status_defaults=True)["delivery_reserve_seconds"])
-        if not math.isfinite(reserve) or reserve < 0:
-            raise ValueError("expected a finite nonnegative number")
-        return reserve
-    except (OSError, KeyError, ValueError) as error:
+        return tunables.read("stall_watch").value("delivery_reserve_seconds", nonnegative_seconds)
+    except tunables.Unusable as error:
         print(f"stall-watch: invalid delivery reserve: {error}; using zero reserve", file=sys.stderr)
         return 0.0
 
@@ -793,26 +777,29 @@ class SenderConfiguration(NamedTuple):
     exit_code: int
 
 
-def sender_limits(fields: Mapping[str, str]) -> SenderLimits:
-    values: list[float] = []
-    for key in ("sender_batch_seconds", "sender_cleanup_seconds"):
-        try:
-            value = float(fields[key])
-        except (KeyError, ValueError) as error:
-            raise ValueError(f"invalid {key}: expected a finite positive number") from error
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"invalid {key}: expected a finite positive number")
-        values.append(value)
-    return SenderLimits(*values)
+def positive_sender_seconds(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("expected a finite positive number")
+    return value
+
+
+def sender_limit(settings: tunables.ConfigRead, key: str) -> tunables.UsableLiveValue[float] | tunables.RecoveredValue[float]:
+    limit = settings.origin(key, positive_sender_seconds)
+    if isinstance(limit, tunables.UnavailableValue):
+        raise tunables.Unusable(f"{limit.reason}; no usable committed value")
+    return limit
 
 
 def sender_configuration() -> SenderConfiguration:
     """A bad override must not suppress pending work; retain failure in the pass result."""
-    try:
-        return SenderConfiguration(sender_limits(watch_config(status_defaults=True)), 0)
-    except (OSError, ValueError) as error:
-        print(f"stall-watch: sender config: {error}; using packaged defaults", file=sys.stderr)
-        return SenderConfiguration(sender_limits(watch_config(packaged_only=True)), 1)
+    settings = tunables.read("stall_watch")
+    batch = sender_limit(settings, "sender_batch_seconds")
+    cleanup = sender_limit(settings, "sender_cleanup_seconds")
+    recovered = [limit.reason for limit in (batch, cleanup) if isinstance(limit, tunables.RecoveredValue)]
+    if recovered:
+        print(f"stall-watch: sender config: {', '.join(recovered)}; using recovered values", file=sys.stderr)
+    return SenderConfiguration(SenderLimits(batch.value, cleanup.value), int(bool(recovered)))
 
 
 def inspection_order(work: list[PaneInspection]) -> list[PaneInspection]:
@@ -1589,7 +1576,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             held_until = (stated_hold_end(turn.group(0), now, zone)
                           if turn and turn.group("kind") == HOLDING_KIND else None)
             if deferred or (turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now))
-                            and not (turn.group("kind") == COMPACTION_WAKE_KIND and context_near_compaction(session_id))):
+                            and not (turn.group("kind") == COMPACTION_WAKE_KIND and context_near_compaction(session_id, pid))):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)

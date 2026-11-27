@@ -21,7 +21,7 @@ from typing import Literal, TypedDict, cast
 
 
 from scripts.whoami.agent_accounts import AccountSourceUnspecified, ClaudeDirectorySource, CodexHomeSource, KnownUsageLogin, NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome, UsageReadClaim, UsageReadHeld
-from scripts.whoami.agent_accounts import LoginEndUnknown, login_end_from_iso, login_end_iso
+from scripts.whoami.agent_accounts import FABLE_WEEKLY_QUOTA_LABEL, LoginEndUnknown, login_end_from_iso, login_end_iso
 from scripts.whoami.note_file import canonical_label
 
 
@@ -47,6 +47,8 @@ class StoredUsage(TypedDict, total=False):
     # Absent beside a weekly window when the account has no 5-hour window.
     five_hour: StoredWindow
     weekly: StoredWindow
+    # Claude only: the scoped weekly window for Fable.
+    weekly_fable: StoredWindow
     # Codex only: the credits that carry work once an allowance is used up.
     credits: StoredCredits
     # The latest attempt skipped this login; successful reading timestamps stay unchanged.
@@ -146,6 +148,8 @@ def save_timer_usage(signature: str, reports: list[Report], at: datetime) -> Non
                 usage["weekly"] = window
         if report.five_hour is not None and (window := _read(report.five_hour, at)) is not None:
             usage["five_hour"] = window
+        if isinstance(report.weekly_fable, Quota) and (window := _read(report.weekly_fable, at)) is not None:
+            usage["weekly_fable"] = window
         if report.credit_balance is not None:
             usage["credits"] = StoredCredits(balance=report.credit_balance, at=at.isoformat())
         usage["read_outcome"] = report.usage_read_outcome
@@ -201,6 +205,14 @@ def recent_timer_usage(signature: str, now: datetime) -> RecentTimerUsage | Time
                     report.quotas.append(quota)
                 else:
                     report.five_hour = quota
+            if report.tool == "Claude" and (fable := _window(entry["usage"].get("weekly_fable"))) is not None:
+                try:
+                    reset = datetime.fromisoformat(fable["resets"]) if fable["resets"] else None
+                except ValueError:
+                    pass
+                else:
+                    if 0 <= fable["left"] <= 100 and (reset is None or reset.tzinfo is not None and reset > now):
+                        report.weekly_fable = Quota(FABLE_WEEKLY_QUOTA_LABEL, 100 - fable["left"], reset)
             credits = _credits(entry["usage"].get("credits"))
             report.credit_balance = credits["balance"] if credits is not None else None
             reports.append(report)
@@ -321,6 +333,8 @@ def load() -> UsageReadings:
             usage["five_hour"] = five_hour
         if (weekly := _window(held.get("weekly"))) is not None:
             usage["weekly"] = weekly
+        if not login.startswith("codex:") and (fable := _window(held.get("weekly_fable"))) is not None:
+            usage["weekly_fable"] = fable
         if (credits := _credits(held.get("credits"))) is not None:
             usage["credits"] = credits
         if held.get("weekly_read_skip") == "stale_token":
@@ -432,6 +446,12 @@ def merge(stored: UsageReadings, reports: list[Report], checked_at: datetime) ->
         if weekly is None:
             continue
         usage["weekly"] = weekly
+        if report.tool == "Claude":
+            fable = _read(report.weekly_fable, read_at) if isinstance(report.weekly_fable, Quota) else None
+            if fable is None:
+                _ = usage.pop("weekly_fable", None)
+            else:
+                usage["weekly_fable"] = fable
         if report.credit_balance is not None:
             usage["credits"] = StoredCredits(
                 balance=report.credit_balance, at=read_at.isoformat(timespec="seconds"),

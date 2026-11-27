@@ -6,6 +6,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
+from importlib import import_module
 import json
 import logging
 import os
@@ -13,15 +14,14 @@ from pathlib import Path
 import re
 import sys
 from zoneinfo import ZoneInfo
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, Protocol, cast, override
 
 from scripts.production import unit_lookup, showrunner_tree
 from scripts.agents.remote import local_machine
 if TYPE_CHECKING:
     from scripts.production.update_registration import QuestionStaff
 
-from scripts.lib import urgency
-from scripts.lib import user_zone as user_zone_config
+from scripts.lib import conf, urgency
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, delivery_state, investigation, staff, update_registration
@@ -241,6 +241,9 @@ def delivery_time(fields: object, field: str) -> datetime | None:
         return None
 
 
+NO_SAVED_CHANGE_ANSWERER = staff.StaffId("")
+
+
 @dataclass(frozen=True)
 class ChangeSource:
     path: Path
@@ -249,6 +252,8 @@ class ChangeSource:
     slots: delivery_state.DeliverySlots
     handed_at: datetime | None = None
     validators: tuple[staff.StaffId, ...] = ()
+    answered_by: staff.StaffId = NO_SAVED_CHANGE_ANSWERER
+    answered_at: question_path.AnswerTime = question_path.NO_ANSWER_TIME
 
 
 @dataclass(frozen=True)
@@ -301,6 +306,21 @@ class AnswerTimeFromLog(StrEnum):
     USE_LOG = 'use log'
 
 
+class NoFiledReviewExchange(StrEnum):
+    ABSENT = 'no exchange on the List'
+
+
+@dataclass(frozen=True)
+class FiledReviewExchange:
+    destination: investigation.ListDestination
+    hides_card: bool
+    answer_events: frozenset[int]
+    exchange_ids: frozenset[str]
+    open_staff_question: bool
+    filed_slot_id: str = ""
+    filed_investigation_answer: bool = False
+
+
 @dataclass(frozen=True)
 class ReviewItem:
     key: str
@@ -325,10 +345,11 @@ class ReviewItem:
     response: review_submissions.QuestionResponse | None = None
     answer_time: question_path.AnswerTime | AnswerTimeFromLog = AnswerTimeFromLog.USE_LOG
     body_answer_events: frozenset[int] = frozenset()
+    exchange_handoff: FiledReviewExchange | NoFiledReviewExchange = NoFiledReviewExchange.ABSENT
 
     def for_you(self, now: datetime) -> bool:
         """Count Open records whose next action belongs to the user."""
-        return self.queue_at(now) is question_path.Queue.NEEDS_ME
+        return not on_list(self) and self.queue_at(now) is question_path.Queue.NEEDS_ME
 
     def hidden_until(self, now: datetime) -> bool:
         return self.queue_at(now) is question_path.Queue.LATER
@@ -342,9 +363,22 @@ class ReviewItem:
         if self.state not in (ReviewState.OPEN, ReviewState.VALIDATING):
             return False
         time = self.answer_time
+        log = self.log
+        handoff = self.exchange_handoff
+        if isinstance(handoff, FiledReviewExchange):
+            slot = self.source.slots.question if isinstance(self.source, ChangeSource) else delivery_state.NoQuestion()
+            if isinstance(slot, delivery_state.AnsweredQuestion):
+                if handoff.filed_slot_id == slot.question_id:
+                    time = AnswerTimeFromLog.USE_LOG
+            elif isinstance(self.source, InvestigationSource):
+                if handoff.filed_investigation_answer:
+                    time = AnswerTimeFromLog.USE_LOG
+            elif isinstance(time, datetime) and any(self.log[index].time == time for index in handoff.answer_events):
+                time = AnswerTimeFromLog.USE_LOG
+            log = tuple(event for index, event in enumerate(log) if index not in handoff.answer_events)
         if time is AnswerTimeFromLog.USE_LOG:
-            time = question_path.answer_time(question_path.NO_ANSWER_TIME, self.log)
-        return question_path.has_unread_answer(time, self.log)
+            time = question_path.answer_time(question_path.NO_ANSWER_TIME, log)
+        return question_path.has_unread_answer(time, log)
 
     @property
     def answer_read_event(self) -> str:
@@ -504,6 +538,7 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
                 slots: delivery_state.DeliverySlots, *, zone: ZoneInfo, handed_at: datetime | None = None,
                 validators: tuple[staff.StaffId, ...] = (),
                 answered_at: question_path.AnswerTime = question_path.NO_ANSWER_TIME,
+                answered_by: staff.StaffId = NO_SAVED_CHANGE_ANSWERER,
                 sources: list[Path] | None = None) -> ReviewItem:
     """Project a change once for the page, counts and queue."""
     prefix = path.stem.removeprefix(change_review.PREFIX)
@@ -565,7 +600,7 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
                 if not validating or not feedback:
                     body_answer_events.add(len(logs))
                 logs.append(ReviewLog(answered_at if isinstance(answered_at, datetime) else filed,
-                                      name(identity, members), validation_log_label(answer, validator_name)
+                                      name(answered_by or identity, members), validation_log_label(answer, validator_name)
                                       if validating and not feedback else answer,
                                       question_path.answer_log_id(request.question_id)))
     if validating and isinstance(status_time, datetime):
@@ -599,7 +634,8 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
         row['Change'], state, ReviewTimes(filed, max(event.time for event in logs)), tuple(logs),
         ('works', 'not works', 'validate', 'feedback', 'question') if state == ReviewState.OPEN
         else ('question',) if state == ReviewState.VALIDATING and identity else (),
-        ChangeSource(path, row, assignment, slots, handed_at, validators), entry.urgency, after, queue,
+        ChangeSource(path, row, assignment, slots, handed_at, validators, answered_by, answered_at),
+        entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
         entry.value, change_review.describe(row | {'#':shown},record=members),
         review_events.waiting_why(slots.waiting_why), answer_time=status_time,
@@ -697,9 +733,11 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, zone: ZoneInfo, do
                     recipients = validation_recipients(fields) if state == ReviewState.VALIDATING else ()
                     handed_at = delivery_time(fields, 'handed_at')
                     answered_at = delivery_time(fields, 'answered_at') or question_path.NO_ANSWER_TIME
+                    answer_owner = cast(dict[str, object], fields).get("answered_by") if isinstance(fields, dict) else None
+                    answered_by = staff.StaffId(answer_owner) if isinstance(answer_owner, str) else NO_SAVED_CHANGE_ANSWERER
                     list_items.append(change_item(path, row, assignment, members, queue, current, slots,
                                                   zone=zone, handed_at=handed_at, validators=recipients,
-                                                  answered_at=answered_at,
+                                                  answered_at=answered_at, answered_by=answered_by,
                                                   sources=sources if document is not None else None))
             found.extend(list_items)
     return found
@@ -817,7 +855,6 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    kinds: tuple[ReviewType, ...] = QUESTION_TYPES,
                    owner_options: dict[staff.StaffId, str] | None = None,
                    selection: ReviewSelection = ALL_RECORDS) -> list[ReviewItem]:
-    identities = update_registration.QuestionStaff.for_record(members)
     selected = owners or tuple(member for member in members.rows if member.kind == 'producer' or
         member.kind == 'showrunner' and (include_unowned or
             isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc)) and member.doc.path in documents))
@@ -848,7 +885,7 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
         current: tuple[Path, ...] = ()
         if document is not None:
             with guard_source(document, sources, skip=(FileNotFoundError,)):
-                folder = update_registration.question_folder(document, identities)
+                folder = update_registration.question_folder(document, members)
                 if isinstance(folder, update_registration.QuestionFolder):
                     current = (folder.path,)
         with guard_source(location, sources, skip=(FileNotFoundError,)):
@@ -940,6 +977,96 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
 
 def investigation_type(record: investigation.Investigation) -> ReviewType:
     return ReviewType.BUG if record.kind == investigation.InvestigationKind.BUG else ReviewType.INVESTIGATION
+
+
+def on_list(item: ReviewItem) -> bool:
+    """Check if the source record belongs to a List item."""
+    if isinstance(item.exchange_handoff, FiledReviewExchange) and item.exchange_handoff.hides_card:
+        return True
+    source = item.source
+    if isinstance(source, InvestigationSource) and source.record.belongs_on_list:
+        return True
+    return any(list_move_event(event) for event in item.log)
+
+
+def list_move_event(event: ReviewLog) -> bool:
+    words = cast(object, event.words)
+    return (event.who == 'nate' and isinstance(words, str)
+            and re.fullmatch(r'moved to List item [1-9][0-9]*', words) is not None)
+
+
+def change_on_list(row: dict[str, str]) -> bool:
+    return any(list_move_event(event) for event in review_events.decode(row.get('Review log', '')))
+
+
+def can_move_wait(item: ReviewItem) -> bool:
+    return (item.type != ReviewType.FOR_YOU and item.state in (ReviewState.WAITING, ReviewState.VALIDATING)
+            and not on_list(item))
+
+
+def list_reply(item: ReviewItem) -> str:
+    """Read the latest reply from the native evidence for the List."""
+    source = item.source
+    if isinstance(source, ChangeSource):
+        question = source.slots.question
+        return question.answer if isinstance(question, delivery_state.AnsweredQuestion) else ''
+    for index in reversed(range(len(item.log))):
+        words = item.log[index].words
+        if words.startswith('Answer: '):
+            return words.removeprefix('Answer: ')
+        if index in item.body_answer_events:
+            return words
+    return ''
+
+
+@dataclass(frozen=True)
+class ValidationLogStart:
+    first_result_index: int
+
+
+class LegacyValidationLog(StrEnum):
+    MOVE_MARKER = 'use the List move entry'
+
+
+def validation_request_words(feedback: str) -> str:
+    return 'validate' + (': ' + feedback if feedback else '')
+
+
+def validation_log_start(row: dict[str, str], pending_request: str = '') -> ValidationLogStart:
+    """Start at the next log entry after the validation request."""
+    events = review_events.decode(row.get('Review log', ''))
+    if pending_request and not any(
+            (event.who, event.words, event.feedback_request_id) == ('nate', pending_request, '')
+            for event in events[-1:]):
+        return ValidationLogStart(len(events)+1)
+    return ValidationLogStart(len(events))
+
+
+def validation_problem(item: ReviewItem, list_number: int, start: ValidationLogStart | LegacyValidationLog) -> str:
+    """Read the problem for the validation that moved to this List item."""
+    source = item.source
+    if not isinstance(source, ChangeSource):
+        return ''
+    log = review_events.decode(source.row.get('Review log', ''))
+    if isinstance(start, ValidationLogStart):
+        events = iter(log[start.first_result_index:])
+    else:
+        marker = f'moved to List item {list_number}'
+        events = iter(log)
+        for event in events:
+            if event.who == 'nate' and event.words == marker:
+                break
+        else:
+            return ''
+
+    prefix = 'Check found a problem: '
+    problem = ''
+    for event in events:
+        if event.words.partition(':')[0] == 'validate':
+            break
+        if event.words.startswith(prefix):
+            problem = event.words.removeprefix(prefix)
+    return problem
 
 
 def investigation_item(record: investigation.Investigation, members: staff.StaffSnapshot, path: Path, *,
@@ -1338,7 +1465,19 @@ class ReviewRecordMissing(ReviewRecordChanged):
     """The source no longer contains the displayed record."""
 
 
-def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> ReviewItem:
+class ApplyListHandoffs(Protocol):
+    def __call__(self, items: list[ReviewItem], zone: ZoneInfo, *,
+                 sources: list[Path] | None = None, members: staff.StaffSnapshot) -> list[ReviewItem]: ...
+
+
+def _apply_list_handoffs(items: list[ReviewItem], zone: ZoneInfo, *,
+                         sources: list[Path] | None = None, members: staff.StaffSnapshot) -> list[ReviewItem]:
+    apply = cast(ApplyListHandoffs, import_module("scripts.review_links.answer_sources").apply_review_handoffs)
+    return apply(items, zone, sources=sources, members=members)
+
+
+def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot, *,
+                 include_filed: bool = False) -> ReviewItem:
     """Reread the exact record. Use the snapshot owner for an Efficiency ledger."""
     source = item.source
     if isinstance(source, ForYouSource):
@@ -1353,8 +1492,10 @@ def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> 
         raise ReviewRecordMissing('This item is no longer on the list.')
     prerequisite = Path(item.queue_after) if isinstance(source, ProposalSource) and item.queue_after else None
     selection = ExactReviewRecord(source_path(item), item.key, item.owner, prerequisite)
+    zone = user_zone()
     if isinstance(source, ProposalSource) and 'review_submission' in source.record.fields:
-        return read_sent_proposal(selection, source.record, members)
+        record = read_sent_proposal(selection, source.record, members)
+        return record if include_filed else _apply_list_handoffs([record], zone, members=members)[0]
     kinds = QUESTION_TYPES if item.type in QUESTION_TYPES else (item.type,)
     try:
         records = project(root, members, kinds, REVIEW_STATES, None, [], selection, user_zone())
@@ -1362,7 +1503,7 @@ def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> 
         records = []
     for record in records:
         if record.key == item.key:
-            return record
+            return record if include_filed else _apply_list_handoffs([record], zone, members=members)[0]
     raise ReviewRecordMissing('This item is no longer on the list.')
 
 
@@ -1444,11 +1585,14 @@ def ordered(items: list[ReviewItem], sources: list[Path] | None, zone: ZoneInfo)
 def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
          owner_options: dict[staff.StaffId, str] | None = None,
-         sources: list[Path] | None = None, zone: ZoneInfo | None = None) -> list[ReviewItem]:
+         sources: list[Path] | None = None, zone: ZoneInfo | None = None,
+         include_filed: bool = False) -> list[ReviewItem]:
     """Read each record from its existing store without another stored copy."""
     members = staff.snapshot() if members is None else members
     zone = zone or user_zone()
     items = project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS, zone)
+    if not include_filed:
+        items = _apply_list_handoffs(items, zone, sources=sources, members=members)
     if open_view(show):
         now = datetime.now(zone)
         return [item for item in items if item.for_you(now)]
@@ -1515,7 +1659,8 @@ def read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.Sta
     zone = zone or user_zone()
     items = _read_kind(kind, scope, members, below=below, sources=sources, own=own,
                        states=selected_states(show), zone=zone)
-    return with_later([normalize_times(item, zone) for item in items], sources, zone=zone)
+    return _apply_list_handoffs(with_later([normalize_times(item, zone) for item in items], sources, zone=zone),
+                                 zone, sources=sources, members=members)
 
 
 def _read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.StaffSnapshot, *,
@@ -1623,7 +1768,7 @@ def question_counts(owner: staff.StaffRow, _production_zone: ZoneInfo, identitie
                     source: str = '') -> tuple[int,str]:
     """Count Questions in the same zone as Review and /next."""
     if sources is not None and not os.environ.get('USER_ZONE'):
-        sources.append(Path(user_zone_config.CONF))
+        sources.append(conf.path('user_zone'))
     zone = user_zone()
     items = read_kind(ReviewType.QUESTION,owner,identities.record,sources=sources,show='open',zone=zone)
     now = datetime.now(zone)
@@ -1633,8 +1778,10 @@ def question_counts(owner: staff.StaffRow, _production_zone: ZoneInfo, identitie
 
 def ready_investigations(owner: staff.StaffId, *, sources: list[Path] | None = None) -> int:
     zone = user_zone()
-    items = investigation_items(staff.snapshot(), owners=(owner,), sources=sources, states=(ReviewState.OPEN,), zone=zone)
-    return count_items(with_later(items, sources, zone=zone), datetime.now(zone))
+    members = staff.snapshot()
+    items = investigation_items(members, owners=(owner,), sources=sources, states=(ReviewState.OPEN,), zone=zone)
+    return count_items(_apply_list_handoffs(with_later(items, sources, zone=zone), zone, sources=sources, members=members),
+                       datetime.now(zone))
 
 
 def next_queue(kind: str, scope: Path | staff.StaffRow, below: bool, members: staff.StaffSnapshot) -> tuple[str,list[urgency.Entry[str]]]:

@@ -78,7 +78,10 @@ The Mac gives the inner SSH client a private log and deletes it when the shell e
 When SSH exits 255 and the log contains only the connect error, the shell reports the error with a reserved status.
 The route checks the reserved status, the Mac marker, and empty standard output before it retries.
 The gate stream also retries status 0 with the exact connect diagnostic and no reply data.
-The probe, arm, and gate stream allow three attempts within the unreachable wait, with one second between attempts.
+The `ssh.connect_attempts` key in `config/mac_linux.conf` sets the attempt limit.
+It ships with a value of 3.
+The probe, arm, and gate stream apply the limit within the unreachable wait.
+They wait one second between attempts.
 The arm covers the gate stream's connect window and allows time for the arm reply and guest lock setup.
 The gate stream sends the remaining connect time to the Mac after the outer SSH hop starts the Mac shell.
 The Mac applies that time to the inner SSH hop. The sender declines the inner hop when less than one second remains.
@@ -86,7 +89,9 @@ The local stream enforces the deadline until the guest accepts the command.
 The guest acceptance line starts the transfer timeout and the bundle upload.
 If the deadline expires before acceptance, the queue uses the retry rule for an unconfirmed start.
 Cleanup continues until it gets end proof or the proof deadline expires.
-It waits one second between the first three connect attempts, then uses the normal proof interval before a new group.
+Cleanup applies the same attempt limit to each group.
+It waits one second between attempts in a group.
+It uses the normal proof interval before the next group.
 An interrupt preserves the proof deadline and the count of attempts in the current group.
 The hand-made command stream combines output and diagnostics and uses one stream attempt.
 

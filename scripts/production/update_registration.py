@@ -1067,14 +1067,15 @@ class QuestionOwnerUnavailable:
     document: Path
 
 
-def question_folder(document: Path | staff.StaffRow, identities: QuestionStaff, *,
+def question_folder(document: Path | staff.StaffRow, identities: QuestionStaff | staff.StaffSnapshot, *,
                     lines: list[str] | None = None) -> QuestionFolder | QuestionOwnerUnavailable:
     """Select the production's question folder from its document and staff context."""
     if isinstance(document, staff.StaffRow):
         if document.kind != "producer":
             raise RegistrationFailure("questions", f"{document.id}: expected a producer")
         return QuestionFolder(record_store.default_question_folder(document.id), document.id)
-    owner = identities.record.by_doc(local_machine(), document)
+    members = identities.record if isinstance(identities, QuestionStaff) else identities
+    owner = members.by_doc(local_machine(), document)
     if owner is None or owner.kind != "showrunner":
         return QuestionOwnerUnavailable(document)
     assert isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
@@ -1519,6 +1520,8 @@ def record_review_log(source: Path | QuestionRecord, words: str, who: str = "nat
         event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, words)
         record.item["review_log"] = review_events.encode(review_events.append(events, event))
         _ = _publish_question(record)
+    if who == "nate" and words.startswith("answer: "):
+        _file_list_exchange(record, staff.snapshot())
 
 
 def store_questions(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff, *,
@@ -1592,6 +1595,14 @@ def store_questions(production: QuestionScope, entries: list[OutstandingItem], i
         write_list()
         for record, text in final:
             write(record, text)
+    for record, _text in final:
+        _file_list_exchange(record, identities.record)
+
+
+def _file_list_exchange(record: QuestionRecord, members: staff.StaffSnapshot) -> None:
+    file_exchange = cast(Callable[[QuestionRecord, staff.StaffSnapshot], None],
+                         import_module("scripts.review_links.answer_sources").file_saved_question)
+    file_exchange(record, members)
 
 
 def question_member(production: QuestionScope, item: OutstandingItem, identities: QuestionStaff) -> staff.StaffRow:
@@ -2019,6 +2030,7 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
             raise RegistrationFailure("ask", "the request key is empty")
         saved = keyed_question(production, identities, outgoing.request_key)
         if saved is not None:
+            _file_list_exchange(saved, identities.record)
             return saved
     asker = identities.asker(production, unit)
     for option, title in (("--text", text), ("--ask", parts["ask"])):
@@ -2049,6 +2061,7 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
         if isinstance(outgoing, KeyedStaffQuestion):
             saved = keyed_question(production, identities, outgoing.request_key)
             if saved is not None:
+                _file_list_exchange(saved, identities.record)
                 return saved
             entry["request_key"] = outgoing.request_key
         entries = open_entries(production, identities)
@@ -2273,7 +2286,10 @@ def write_selected_item(selected: OpenItemRecord, production: QuestionScope, act
                 current = current_open_question(selected, action)
                 change(current.item, now)
                 save_history = None if history is None else lambda: history(path, current.item, now)
-                _ = _publish_question(replace(current, status="closed") if close else current, record_history=save_history)
+                saved = replace(current, status="closed") if close else current
+                _ = _publish_question(saved, record_history=save_history)
+            if action in ("answer", "withdraw"):
+                _file_list_exchange(saved, staff.snapshot())
             return current.item
 
         entries = legacy_entries(path)
@@ -2541,6 +2557,7 @@ def prepare_reply_record(record: QuestionRecord, text: str, who: str, *,
                 raise RegistrationFailure("reply", "The selected Question changed.")
             record_followup_reply(current.item, text, who, review_unavailable=unavailable)
             _ = _publish_question(current)
+        _file_list_exchange(current, identities.record)
         report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")
 
     return save

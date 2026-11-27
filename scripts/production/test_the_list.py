@@ -86,6 +86,7 @@ class TheListTests(unittest.TestCase):
         _ = os.environ.pop("CONF_DIR", None)
         self.list_config = self.root / ".claude/config/the_list.conf"
         self.list_config.parent.mkdir(parents=True)
+        _ = self.list_config.with_name("console.conf").write_text(f"page.list.owner={MORTY.id}\n")
         settings = {**LIST_TEXT_LIMITS, "series_run_limit": 730, "confirm_wait_minutes": 15}
         _ = self.list_config.write_text("".join(f"# whole: 1..\n{key}={limit}\n" for key, limit in settings.items()))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
@@ -2276,6 +2277,23 @@ the_list.fire_scheduled(timedelta(minutes=2))
         with self.assertRaisesRegex(the_list.ListError, "the next available number is L3"):
             _ = self.add(number=2)
         self.assertEqual(self.add().number, 3)
+
+    def test_configured_list_keeper_keeps_old_reservations(self) -> None:
+        self.assertEqual(self.add().number, 1)
+        with patch.object(record_store.NumberedRecords, "write", side_effect=OSError("Cannot publish the item")):
+            with self.assertRaisesRegex(OSError, "Cannot publish the item"):
+                _ = self.add()
+        config = self.list_config.with_name("console.conf")
+        _ = config.write_text(f"page.list.owner={BOB.id}\n")
+        with self.assertRaisesRegex(the_list.ListError, "only bob's List folder"):
+            _ = self.add()
+
+        result = self.command("add", "--title", "Check the new folder", "--owner", RUNNER.id, "--source", "morty")
+        self.assertEqual(result, (0, "L3\n", ""))
+        self.assertEqual(the_list.load(BOB.id, "L3").number, 3)
+
+        _ = config.write_text(f"page.list.owner={MORTY.id}\n")
+        self.assertEqual(self.add().number, 4)
 
     def test_producer_add_resolves_related_items_across_producers(self) -> None:
         foreign = self.add("Private prerequisite", changes={"producer": BOB.id})

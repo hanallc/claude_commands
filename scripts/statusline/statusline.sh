@@ -27,13 +27,14 @@ staff="${STAFF_FILE:-$HOME/.local/state/staff/staff.json}"
 labels="$HOME/.local/state/agent-notes/by-label.json"
 [ -r "$labels" ] || labels=/dev/null
 
-colors="$statusline/../../config/statusline.conf"
+config_dir="${CONF_DIR:-$statusline/../../config}"
+colors="$config_dir/statusline.conf"
 [ -r "$colors" ] || colors=/dev/null
 [ -z "${CONF_READ_LOG:-}" ] || [ "$colors" = /dev/null ] || conf_record statusline
 
 zone=${USER_ZONE:-}
 if [ -z "$zone" ]; then
-  zone_conf=${USER_ZONE_CONF:-$statusline/../../config/user_zone.conf}
+  zone_conf="$config_dir/user_zone.conf"
   zone_stem=${zone_conf##*/}
   [ -z "${CONF_READ_LOG:-}" ] || conf_record "${zone_stem%.conf}"
   {
@@ -112,7 +113,7 @@ if [ "${STATUSLINE_SYSTEM:-$(uname -s)}" = Linux ]; then
           and ($folder | type) == "string"
           and ((.workspace // {}) | type) == "object" then "s-" + $id else "" end),
       ([$id, $folder, $pwd, $staff, $runtime, $ENV.HOME, $ENV.FOR_YOU_ACTIONS_DIR, $ENV.REBUILD_NEEDS_DIR,
-        $ENV.SHOWRUNNER_STATE_DIR, $ENV.NOTIFIER_STATE_DIR, $ENV.CONF_DIR, $ENV.USER_ZONE, $ENV.USER_ZONE_CONF]
+        $ENV.SHOWRUNNER_STATE_DIR, $ENV.NOTIFIER_STATE_DIR, $ENV.CONF_DIR, $ENV.USER_ZONE]
         | tojson),
       ($raw + ".")
   ') || exit 1
@@ -127,9 +128,9 @@ if [ "${STATUSLINE_SYSTEM:-$(uname -s)}" = Linux ]; then
   else
     render_key=
   fi
-  printf '%s' "$payload" | STAFF_FILE="$staff" STATUSLINE_RENDER_KEY="$render_key" \
+  printf '%s' "$payload" | CONF_DIR="$config_dir" STAFF_FILE="$staff" STATUSLINE_RENDER_KEY="$render_key" \
     "$statusline/../lib/py" --isolated "$statusline/assignment.py" "$@"
   exit $?
 fi
 
-STAFF_FILE="$staff" exec "$statusline/../lib/py" --isolated "$statusline/assignment.py" "$@"
+CONF_DIR="$config_dir" STAFF_FILE="$staff" exec "$statusline/../lib/py" --isolated "$statusline/assignment.py" "$@"

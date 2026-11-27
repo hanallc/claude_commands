@@ -1,13 +1,29 @@
 """Tests for complete cells in tables that use native Markdown wrapping."""
 from __future__ import annotations
 
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import cast, override
 import unittest
+from unittest.mock import patch
 
 from scripts.lib import conf
 from scripts.production import claude_table_layout, display_cells
 
 
 class WrappedTableTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        directory = Path(self.enterContext(TemporaryDirectory()))
+        _ = (directory / "production.conf").write_text(
+            "# whole: 40..\nunits_table_floor_columns=120\n"
+            + "# whole: 1..4\nunits_table_cell_lines=4\n"
+            + "# whole: 2..\nunits_table_break_columns=30\n",
+            encoding="utf-8",
+        )
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(directory)})))
+
     def test_wrapped_rows_preserve_text_and_remove_only_empty_columns(self) -> None:
         headers = ("Unit", "Notes", "Workers", "Queued")
         for text in (
