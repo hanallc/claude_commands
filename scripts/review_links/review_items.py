@@ -1023,9 +1023,16 @@ def change_on_list(row: dict[str, str]) -> bool:
     return any(list_move_event(event) for event in review_events.decode(row.get('Review log', '')))
 
 
+def pending_list_move(item: ReviewItem) -> investigation.ListFilingMode | investigation.NoListMove:
+    source = item.source
+    if isinstance(source, InvestigationSource) and isinstance(pending := source.record.list_move, investigation.PendingListMove):
+        return pending.mode
+    return investigation.NoListMove.ABSENT
+
+
 def can_move_wait(item: ReviewItem) -> bool:
     return (item.type != ReviewType.FOR_YOU and item.state in (ReviewState.WAITING, ReviewState.VALIDATING)
-            and not on_list(item))
+            and not on_list(item) and pending_list_move(item) is investigation.NoListMove.ABSENT)
 
 
 def list_reply(item: ReviewItem) -> str:

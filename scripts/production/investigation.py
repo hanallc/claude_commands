@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from enum import Enum, StrEnum
 from importlib import import_module
 from pathlib import Path
-from typing import cast, override
+from typing import Literal, cast, override
 
 from scripts.console_text import check as console_text
 
@@ -95,6 +95,35 @@ class NoListDestination(Enum):
     ABSENT = "still on Review"
 
 
+class ListFilingMode(Enum):
+    NEW_REPORT = "new report"
+    MOVE_BUG = "move and close the old Bug"
+    MOVE_WAIT = "move and keep the native reply open"
+
+
+class NoListMove(Enum):
+    ABSENT = "no pending List move"
+
+
+LIST_MOVE_PENDING = "A move to the List is pending."
+
+
+@dataclass(frozen=True)
+class PendingListMove:
+    mode: Literal[ListFilingMode.MOVE_BUG, ListFilingMode.MOVE_WAIT]
+    destination: ListDestination | NoListDestination = NoListDestination.ABSENT
+
+
+def _read_list_move(fields: dict[str, str]) -> PendingListMove | NoListMove:
+    raw = fields.get("list_move", "")
+    if not raw:
+        return NoListMove.ABSENT
+    mode = ListFilingMode(raw)
+    if mode is ListFilingMode.NEW_REPORT:
+        raise InvestigationError("invalid pending List move")
+    return PendingListMove(mode, _read_list_destination(fields.get("list_move_destination", "")))
+
+
 class CliFilingOutput(StrEnum):
     PENDING = "awaiting native ID output"
     NONE = ""
@@ -122,6 +151,7 @@ class Investigation:
     list_destination: ListDestination | NoListDestination = NoListDestination.ABSENT
     purpose: InvestigationPurpose = InvestigationPurpose.INVESTIGATE
     cli_output: CliFilingOutput = CliFilingOutput.NONE
+    list_move: PendingListMove | NoListMove = NoListMove.ABSENT
 
     @property
     def belongs_on_list(self) -> bool:
@@ -328,7 +358,7 @@ def _load(store: Investigations, identity: str, path: Path, *, sources: list[Pat
                              review_events.waiting_why(fields.get("waiting_why", "")), kind,
                              submission, _read_list_destination(fields.get("list_destination", "")),
                              InvestigationPurpose(fields.get("purpose", InvestigationPurpose.INVESTIGATE)),
-                             CliFilingOutput(fields.get("cli_output", "")))
+                             CliFilingOutput(fields.get("cli_output", "")), _read_list_move(fields))
         if not item.title.strip() or record_store.has_line_break(item.title):
             raise ValueError("title must have one line")
         for name, value, required in (
@@ -381,6 +411,10 @@ def _save(store: Investigations, item: Investigation, path: Path,
     destination = item.list_destination
     if isinstance(destination, ListDestination):
         fields["list_destination"] = destination.encode()
+    if isinstance(pending := item.list_move, PendingListMove):
+        fields["list_move"] = pending.mode.value
+        if isinstance(pending.destination, ListDestination):
+            fields["list_move_destination"] = pending.destination.encode()
     if item.cli_output is CliFilingOutput.PENDING:
         fields["cli_output"] = item.cli_output
     body = f"{item.question}{ANSWER_SECTION}{item.answer}"
@@ -635,28 +669,37 @@ def _prepare_answer(store: Investigations, identity: str, text: str, question_id
     return save
 
 
-class ListFilingMode(Enum):
-    NEW_REPORT = "new report"
-    MOVE_BUG = "move and close the old Bug"
-    MOVE_WAIT = "move and keep the native reply open"
-
-
 def file_on_list(path: Path, write_list_item: Callable[[Investigation], ListDestination], *,
-                 mode: ListFilingMode = ListFilingMode.NEW_REPORT) -> Investigation:
-    """Keep the native evidence and commit the List destination under the source lock."""
+                 mode: ListFilingMode = ListFilingMode.NEW_REPORT, resume_move: bool = False) -> Investigation:
+    """Keep the move in its native record until its List row is verified."""
     store = _store(review_owner(path))
     with store.locked():
         item = read_review_record(path)
-        if isinstance(item.list_destination, ListDestination) or (mode is not ListFilingMode.NEW_REPORT and
-                                                                  item.state == InvestigationState.READ):
-            return item
-        if mode is ListFilingMode.MOVE_WAIT and item.state != InvestigationState.OPEN:
-            return item
-        destination = write_list_item(item)
-        if (mode is ListFilingMode.NEW_REPORT and item.purpose is InvestigationPurpose.LIST_INVESTIGATION
-                and isinstance(item.submission, new_item_dialog.NoReviewSubmission)):
-            item = replace(item, cli_output=CliFilingOutput.PENDING)
-        if mode is not ListFilingMode.NEW_REPORT:
+        pending = item.list_move
+        if isinstance(pending, PendingListMove):
+            if not resume_move or mode is not pending.mode:
+                raise InvestigationError(LIST_MOVE_PENDING)
+        else:
+            if isinstance(item.list_destination, ListDestination) or (mode is not ListFilingMode.NEW_REPORT and
+                                                                      item.state == InvestigationState.READ):
+                return item
+            if mode is ListFilingMode.MOVE_WAIT and item.state != InvestigationState.OPEN:
+                return item
+            if mode is not ListFilingMode.NEW_REPORT:
+                item = _save(store, replace(item, list_move=PendingListMove(mode)), path)
+
+        if mode is ListFilingMode.NEW_REPORT:
+            destination = write_list_item(item)
+            if (item.purpose is InvestigationPurpose.LIST_INVESTIGATION
+                    and isinstance(item.submission, new_item_dialog.NoReviewSubmission)):
+                item = replace(item, cli_output=CliFilingOutput.PENDING)
+            return _save(store, replace(item, list_destination=destination), path)
+
+        verify = cast(Callable[[Investigation, ListDestination], None],
+                      import_module("scripts.production.the_list").verify_investigation_move)
+        with record_store.list_destination_lock():
+            destination = write_list_item(item)
+            verify(item, destination)
             moment = datetime.now(timezone.utc)
             stamp = moment.isoformat()
             event = ReviewLog(moment, "nate", f"moved to List item {destination.number}")
@@ -664,7 +707,16 @@ def file_on_list(path: Path, write_list_item: Callable[[Investigation], ListDest
             if mode is ListFilingMode.MOVE_BUG:
                 item = replace(item, state=InvestigationState.READ, answered=item.answered or stamp, read=stamp,
                                purpose=InvestigationPurpose.MOVING_LEGACY_BUG)
-        return _save(store, replace(item, list_destination=destination), path)
+            return _save(store, replace(item, list_destination=destination, list_move=NoListMove.ABSENT), path)
+
+
+def reserve_move_destination(item: Investigation, destination: ListDestination) -> None:
+    """Save the selected List destination under the caller's source lock."""
+    pending = item.list_move
+    if isinstance(pending, PendingListMove) and pending.destination is NoListDestination.ABSENT:
+        store = _store(item.owner)
+        _ = _save(store, replace(item, list_move=replace(pending, destination=destination)),
+                  _record_path(store, item.id))
 
 
 def list_destination_has_submission(destination: ListDestination, scope: str) -> bool:
@@ -687,7 +739,13 @@ def list_evidence_record(key: str) -> Investigation:
     return load(staff.StaffId(owner), identity)
 
 
+def _require_no_list_move(item: Investigation) -> None:
+    if isinstance(item.list_move, PendingListMove):
+        raise InvestigationError(LIST_MOVE_PENDING)
+
+
 def _list_owns_review_actions(item: Investigation) -> bool:
+    _require_no_list_move(item)
     if item.belongs_on_list:
         return True
     if item.kind is not InvestigationKind.BUG:
@@ -704,6 +762,7 @@ def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
     with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
+        _require_no_list_move(item)
         if item.state == InvestigationState.READ:
             return item
         if _list_owns_review_actions(item):
@@ -789,6 +848,7 @@ def set_waiting_why(owner: staff.StaffId, identity: str, text: str) -> None:
     with store.locked():
         path = _record_path(store, identity)
         item = _load(store, identity, path)
+        _require_no_list_move(item)
         if item.state != InvestigationState.OPEN:
             raise InvestigationError("The item is not Waiting.")
         _ = _save(store, replace(item, waiting_why=reason), path)

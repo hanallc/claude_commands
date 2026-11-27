@@ -933,6 +933,29 @@ class NumberedRecords:
             raise self.error_type("the number is below the saved sequence")
         write_text_atomic(self.counter_path(), f"{number + 1}\n", new_file_mode=0o600)
 
+    def _allocation_only_counter(self) -> Path:
+        return self.folder() / ".list-allocation-only"
+
+    def has_allocation_only_sequence(self) -> bool:
+        sequence = self._saved_next_number(self.counter_path())
+        return bool(sequence and self._saved_next_number(self._allocation_only_counter()) == sequence)
+
+    def record_list_publication(self) -> None:
+        marker = self._allocation_only_counter()
+        if saved_path_exists(marker):
+            marker.unlink()
+            sync_folder(marker.parent)
+
+    def finish_exchange_number(self, number: int) -> None:
+        """Keep the batch eligibility of a counter used only for exchange reservations."""
+        counter = self._saved_next_number(self.counter_path())
+        marker = self._allocation_only_counter()
+        saved = self._saved_next_number(marker)
+        if (counter < number + 1 and not any(self.folder().glob("*.md"))
+                and (saved == number + 1 or saved == counter)):
+            write_text_atomic(marker, f"{number + 1}\n", new_file_mode=0o600)
+        self.finish_reserved_number(number)
+
     def finish_reserved_number(self, number: int) -> None:
         """Advance the saved keeper's counter for a durable reservation."""
         counter = self.counter_path()

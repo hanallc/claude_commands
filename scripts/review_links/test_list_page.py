@@ -1482,7 +1482,8 @@ if(example.filterOn){
         root = self.root / "reviews"
         with patch.object(list_page, "records", wraps=list_page.records) as read_records:
             markup = list_page.render(root, include_counts=False).decode()
-        read_records.assert_called_once_with(include_closed=True)
+        read_records.assert_called_once()
+        self.assertTrue(read_records.call_args.kwargs["include_closed"])
         self.assertEqual(markup.count(' data-linked-items>'), 1)
         panel = markup.split('data-number="494"', 1)[1].split('</tbody>', 1)[0]
         section = panel.split('<section class="item-links" data-linked-items>', 1)[1].split('</section>', 1)[0]
@@ -1504,6 +1505,83 @@ if(example.filterOn){
         for number, badge in zip(numbers, parsed.findall('ul/li/span'), strict=True):
             row = markup.split(f'data-number="{number}"', 1)[1].split('</tr>', 1)[0]
             self.assertIn(ElementTree.tostring(badge, encoding='unicode'), row)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_studio_resolves_saved_alias_keys_in_filters_and_across_refresh(self) -> None:
+        first = self.add("Open the first item", number=1)
+        filtered = self.add("Ask for a decision", the_list.ItemState.WAITING_FOR_NATE, number=2)
+        closed = self.add("Close this check", number=3)
+        link = self.add("Check the links", number=4)
+        _ = the_list.update(MORTY.id, link.id, {"related_to": (1, 2, 3)}, source="morty")
+        _ = the_list.close(MORTY.id, closed.id, "The check passed.", source="morty")
+        original = the_list.folder(MORTY.id)
+        alias = staff.StaffId("000-list-alias")
+        distinct = staff.StaffId("001-separate-list")
+        separate = the_list.folder(distinct)
+        separate.mkdir(parents=True)
+        _ = (separate / "L1.md").write_text((original / "L1.md").read_text().replace(first.title, "A separate item"))
+
+        root = self.root / "reviews"
+        initial = list_page.render(root, include_counts=False).decode()
+        alias_folder = the_list.folder(alias)
+        alias_folder.parent.mkdir(parents=True)
+        alias_folder.symlink_to(original, target_is_directory=True)
+        fresh = list_page.render(root, include_counts=False).decode()
+
+        def selected_rows(keeper: staff.StaffId) -> list[tuple[str, bool]]:
+            query = urlencode([("item", f"{keeper}/{filtered.id}"), ("key", f"{keeper}/{first.id}"),
+                               ("show", "working"), ("reveal", "1")])
+            markup = list_page.render(root, include_counts=False, query=query).decode()
+            rows = r'<tbody data-list-item data-key="([^"]+)"([^>]+)>'
+            return [(row[1], row[2].endswith(" hidden")) for row in re.finditer(rows, markup)]
+
+        selected = selected_rows(alias)
+        self.assertEqual(selected_rows(MORTY.id), selected)
+        self.assertIn((f"{alias}/{filtered.id}", False), selected)
+        self.assertIn((f"{distinct}/L1", True), selected)
+        self.assertEqual(sum(key.endswith("/L1") for key, _ in selected), 2)
+        closed_body = list_page.saved_action_state(alias, closed.id, include_detail=True)
+        steps = r'''
+ const [real,alias,distinct]=KEEPERS;
+ const item=(keeper,number)=>document.querySelector('[data-key="'+keeper+'/L'+number+'"]');
+ const target=number=>item(alias,number);
+ const clickLink=(keeper,number,reveal=false)=>{
+  const link=document.createElement('a');
+  link.dataset.recordJump='';
+  link.href='#item='+encodeURIComponent(keeper+'/L'+number)+(reveal ? '&reveal=1' : '');
+  const group=document.createElement('div');
+  group.dataset.linkedItems='';
+  group.append(link);
+  document.querySelector('[data-list]').append(group);
+  link.click();
+  group.remove();
+ };
+ check(recordIsOpen(item(real,4)),'The item is open before the alias becomes the displayed key.');
+ refreshMarkup=FRESH;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();await flush();
+ check(recordIsOpen(target(4)),'Refresh keeps the open item when its displayed keeper changes.');
+ clickLink(real,1);
+ check(recordIsOpen(target(1)) && !recordIsOpen(item(distinct,1)),'The saved alias opens only its physical row.');
+ show('working');
+ check(target(2).hidden,'The Working filter hides the target.');
+ clickLink(alias,2);
+ check(recordIsOpen(target(2)) && !target(2).hidden,'The displayed alias opens its filtered target.');
+ show('working');
+ check(target(2).hidden,'The Working filter hides the target.');
+ clickLink(real,2);
+ check(recordIsOpen(target(2)) && !target(2).hidden,'The saved alias opens its filtered target.');
+ itemSnapshots.set(target(3).dataset.key,CLOSED);
+ for(const keeper of [real,alias]){
+  clickLink(keeper,3,true);
+  await flush();
+  check(recordIsOpen(target(3)) && !target(3).hidden,'The closed link opens through '+keeper+'.');
+ }
+'''
+        steps = (steps.replace("KEEPERS", json.dumps([MORTY.id, alias, distinct]))
+                 .replace("FRESH", json.dumps(fresh).replace("</", "<\\/"))
+                 .replace("CLOSED", json.dumps(closed_body).replace("</", "<\\/")))
+        self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial, open_number=4)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_linked_items_open_and_refresh_with_the_page(self) -> None:

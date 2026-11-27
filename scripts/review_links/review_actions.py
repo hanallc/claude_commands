@@ -109,7 +109,7 @@ def migrate_report_words(item: review_items.ReviewItem) -> str:
     return item.title
 
 
-def move_wait_to_list(root: Path, item: review_items.ReviewItem, members: staff.StaffSnapshot
+def move_wait_to_list(root: Path, item: review_items.ReviewItem, members: staff.StaffSnapshot, resume_move: bool = False
                       ) -> investigation.ListDestination | investigation.NoListDestination:
     """File the current native wait while its source is locked."""
     original = item.source
@@ -119,7 +119,7 @@ def move_wait_to_list(root: Path, item: review_items.ReviewItem, members: staff.
                 record, the_list.ReportKind.BUG if record.kind is investigation.InvestigationKind.BUG
                 else the_list.ReportKind.INVESTIGATION, members, route=review_submissions.NoListFiling(),
                 reservation=the_list.NextNumber.AVAILABLE, source='moved from Review'),
-                mode=investigation.ListFilingMode.MOVE_WAIT)
+                mode=investigation.ListFilingMode.MOVE_WAIT, resume_move=resume_move)
         except FileNotFoundError:
             return investigation.NoListDestination.ABSENT
         return moved.list_destination
@@ -149,12 +149,13 @@ def move_wait_to_list(root: Path, item: review_items.ReviewItem, members: staff.
                           if kind is the_list.ReportKind.VALIDATION
                           and isinstance(current.source, review_items.ChangeSource)
                           else review_items.LegacyValidationLog.MOVE_MARKER)
+        report = the_list.ListReport(kind, current.key, migrate_report_words(current), validation_log=validation_log)
         destination = the_list.file_report(
-            current_route.keeper, the_list.ListReport(kind, current.key, migrate_report_words(current),
-                                              validation_log=validation_log),
+            current_route.keeper, report,
             ' '.join(current.title.split()), owner=current.owner or the_list.UnassignedOwner.NOT_RECORDED,
             producer=current_route.producer, unit=current_route.unit, source='moved from Review',
             state=the_list.ItemState.WORKING)
+        the_list.verify_report_destination(destination, report)
         if not the_list.same_destination(destination, expected):
             raise MovedReportNumberChanged(destination)
 
@@ -559,6 +560,8 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
     reservation = review_submissions.list_filing_reservation(saved)
     route_saved = record_store.saved_path_exists(reservation.with_name("list-filing.json"))
     route = review_submissions.list_filing_route(saved)
+    if isinstance(record, investigation.Investigation) and isinstance(record.list_move, investigation.PendingListMove):
+        raise investigation.InvestigationError(investigation.LIST_MOVE_PENDING)
     if isinstance(record, investigation.Investigation) and record.belongs_on_list:
         kind = the_list.investigation_report_kind(record)
         if isinstance(kind, the_list.ReportKind):
@@ -601,13 +604,14 @@ def _skip_submission_list_filing(
 ) -> None:
     with record_store.list_destination_lock():
         destination = the_list.review_fallback_destination(review_items.submission_review_key(saved))
-        if destination is investigation.NoListDestination.ABSENT:
-            reserved = the_list.review_reservation(reservation)
-            if isinstance(reserved, investigation.ListDestination):
-                if isinstance(route, review_submissions.ListFilingUnavailable) or record_store.saved_path_exists(
-                        the_list.folder(reserved.keeper) / f"L{reserved.number}.md"):
-                    raise the_list.ListError("The Review source still has a List reservation.")
-            review_submissions.skip_list_filing(saved, reason)
+        if isinstance(destination, investigation.ListDestination):
+            raise the_list.ListError("The Review source still has a List destination.")
+        reserved = the_list.review_reservation(reservation)
+        if isinstance(reserved, investigation.ListDestination):
+            if isinstance(route, review_submissions.ListFilingUnavailable) or record_store.saved_path_exists(
+                    the_list.folder(reserved.keeper) / f"L{reserved.number}.md"):
+                raise the_list.ListError("The Review source still has a List reservation.")
+        review_submissions.skip_list_filing(saved, reason)
 
 
 def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus, *,

@@ -2476,8 +2476,10 @@ The scan reads closed rows and supported legacy rows that lack a source key.
 Review moves, report filing, exchange filing, and migration apply also use `scan_list_records`.
 List scans and filing checks identify a row by its resolved List folder and number.
 Aliases share one row and one folder lock.
+The Studio maps alias keys to the displayed row for queries, saved links, and refreshes.
 Retries use the keeper saved with the reservation or receipt.
-Exchange filing reads the current links under the source lock before it selects a destination.
+A legacy number can use verified source evidence to recover a former keeper.
+A current link cannot replace the saved route. If it conflicts, filing and the first notice stay pending.
 The fallback preserves the route for recovery if the keeper returns before the claim.
 The pending delivery marker remains if row verification or fallback saving fails.
 A reply to the native question or a Studio follow-up changes the item from **Working** to **Answered**.
@@ -2541,7 +2543,11 @@ Review requires matching `.saved` receipts for the verified List exchanges that 
 Review hides a moved report only when its readable List row matches the source, report kind, and destination.
 Review counts and card refreshes use the same check as the table.
 Review keeps the source visible if the List row is unavailable or fails verification.
-A legacy Bug move saves its purpose and destination after the List write succeeds.
+An Investigation or Bug move saves its mode in the native record before it writes the List row.
+It saves the selected destination before it publishes the row.
+Review keeps the card visible and refuses actions while the move is pending.
+The move command resumes the saved mode and verifies the source, report kind, and destination.
+One native save records completion and clears the pending move.
 Older pending Bug moves stay visible in Review until verification succeeds.
 An Open Change with one verified slot answer on the List can move to the List when the answerer is unknown.
 A later slot change leaves the filed reply binding and answer text intact.
@@ -2551,6 +2557,9 @@ The writer rereads the source under its filing lock.
 The List allocator records the destination before it advances the counter.
 Allocation recovery saves the counter and the source reservation before it removes the journal.
 Fresh creation can recover allocation metadata without reading List rows.
+A durable marker identifies a counter that contains only exchange allocations.
+A rejected batch keeps that marker. A corrected batch can reserve new numbers but cannot reuse a reserved number.
+Publishing a row clears the marker so an initialized folder cannot accept a second batch.
 Source recovery checks the complete List before it writes the reserved row.
 The writer saves pending exchanges before it writes the List item.
 A new unread Review answer adds one log entry with its words, time, and author in the same save.

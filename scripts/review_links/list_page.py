@@ -24,7 +24,7 @@ from scripts.accounts import accounts
 from scripts.lib import conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import list_exchange
+from scripts.production import investigation, list_exchange
 from scripts.production import change_review, delivery_state, footer_counts, repeat_rule, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
@@ -236,6 +236,10 @@ class ListRecord(NamedTuple):
     item: the_list.ListItem
 
     @property
+    def destination(self) -> investigation.ListDestination:
+        return investigation.ListDestination(self.keeper, self.item.number)
+
+    @property
     def key(self) -> str:
         return f"{self.keeper}/{self.item.id}"
 
@@ -276,10 +280,11 @@ def top_priority_mark(shown: TopPriority, members: staff.StaffSnapshot, item: th
     return TopPriorityMark.TOP_ITEM if producer.top_item == staff.TopItem(item.number) else TopPriorityMark.MAKE_TOP
 
 
-def records(*, include_closed: bool = False, sources: list[Path] | None = None) -> list[ListRecord]:
+def records(*, include_closed: bool = False, sources: list[Path] | None = None,
+            aliases: dict[Path, list[staff.StaffId]] | None = None) -> list[ListRecord]:
     """Read the list folders even when a producer has no current staff row."""
     found = (ListRecord(row.keeper, row.item)
-             for row in the_list.display_list_records(include_closed=include_closed, sources=sources))
+             for row in the_list.display_list_records(include_closed=include_closed, sources=sources, aliases=aliases))
     return sorted(found, key=lambda entry: the_list.order(entry.item))
 
 
@@ -1204,11 +1209,11 @@ def item_links_html(entry: ListRecord, log: ItemLog, displayed_next_step: str) -
     return '<section class="item-links"><h3>Links</h3><ul>' + ''.join(blockers) + ''.join(links.values()) + '</ul></section>'
 
 
-def linked_items_html(entry: ListRecord, linked_records: Mapping[tuple[staff.StaffId, int], ListRecord]) -> str:
+def linked_items_html(entry: ListRecord, linked_records: Mapping[tuple[Path, int], ListRecord]) -> str:
     rows: list[str] = []
     closed = 0
     for number in sorted(entry.item.related_to):
-        linked = linked_records.get((entry.keeper, number))
+        linked = linked_records.get((the_list.list_folder_identity(entry.keeper), number))
         if linked is None:
             rows.append(f'<li>#{number} not found</li>')
             continue
@@ -2239,7 +2244,8 @@ class ListQuery:
     reveal: bool
 
     @classmethod
-    def read(cls, query: str, items: list[ListRecord], producers: set[the_list.ItemOwner]) -> ListQuery:
+    def read(cls, query: str, items: list[ListRecord], producers: set[the_list.ItemOwner],
+             aliases: Mapping[str, str]) -> ListQuery:
         fields = {name: values for name, values in parse_qs(query, keep_blank_values=True).items()
                   if name in record_table.LIST_QUERY_FIELDS}
 
@@ -2249,12 +2255,13 @@ class ListQuery:
         raw_show = first("show")
         if raw_show == UNREAD_FIELD:
             fields[UNREAD_FIELD] = [UNREAD_VALUE]
-        aliases = SHOW_ALIASES.get(raw_show, SHOW_ALIASES["*"])
-        show = aliases.get(first("state"), aliases.get("", raw_show))
+        show_aliases = SHOW_ALIASES.get(raw_show, SHOW_ALIASES["*"])
+        show = show_aliases.get(first("state"), show_aliases.get("", raw_show))
         owner = next((value for key in record_table.OWNER_QUERY_KEYS if (value := first(key))), "")
         producer = first("producer")
-        keys = frozenset(fields.get("key", ()))
-        item = first("item")
+        keys = frozenset(aliases.get(key, key) for key in fields.get("key", ()))
+        linked = first("item")
+        item = aliases.get(linked, linked)
         if keys and item:
             if any(entry.key == item for entry in items):
                 keys |= {item}
@@ -2339,15 +2346,21 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
-    snapshot = records(include_closed=True)
+    folder_aliases: dict[Path, list[staff.StaffId]] = {}
+    snapshot = records(include_closed=True, aliases=folder_aliases)
+    shared_folders = {keeper: keepers for keepers in folder_aliases.values() if len(keepers) > 1
+                      for keeper in keepers}
+    aliases = {f"{alias}/{entry.item.id}": entry.key for entry in snapshot
+               for alias in shared_folders.get(entry.keeper, ()) if alias != entry.keeper}
     closed = [entry for entry in snapshot if entry.item.state is the_list.ItemState.CLOSED
               and not (isinstance(entry.item.native_question, the_list.NativeQuestionItem)
                        and the_list.unread_answer_ids(entry.item))]
     hidden_closed_keys = {entry.key for entry in closed}
     items = [entry for entry in snapshot if entry.key not in hidden_closed_keys]
-    targets = {(entry.keeper, number) for entry in snapshot for number in entry.item.related_to}
-    linked_records = {(entry.keeper, entry.item.number): entry for entry in snapshot
-                      if (entry.keeper, entry.item.number) in targets}
+    targets = {(the_list.list_folder_identity(entry.keeper), number)
+               for entry in snapshot if entry.item.related_to for number in entry.item.related_to}
+    linked_records = {key: entry for entry in snapshot
+                      if targets and (key := the_list.destination_key(entry.destination)) in targets}
     if status == "standalone":
         status = change_page.DeliveryStatus(root)
     reviews: ReviewDisplay = {}
@@ -2372,7 +2385,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     deadline_attr = f' data-park-deadline="{park_deadline}"' if park_deadline is not None else ''
     secret = form_secret(root)
     producers = studio_page.producer_ids(members, (entry.item.producer for entry in items))
-    selection = ListQuery.read(query, items, producers)
+    selection = ListQuery.read(query, items, producers, aliases)
     chip_totals: dict[str, Counter[str]] = {facet.name: Counter() for facet in FILTER_FACETS}
     search = normalize_search_text(selection.words.strip(QUERY_WHITESPACE))
     owners: set[the_list.ItemOwner] = set()
@@ -2429,7 +2442,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         else:
             rows.append(row)
     for index, entry in enumerate(closed, start=len(items)):
-        if (entry.keeper, entry.item.number) in linked_records:
+        if the_list.destination_key(entry.destination) in linked_records:
             owner_cell, owner_sort, owner_search = owner_display(entry.item.owner)
             rows.append(item_rows(
                 entry, names, today, index, secret, {}, owner_cell=owner_cell, owner_sort=owner_sort,
@@ -2489,6 +2502,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' data-park-retry-seconds="{park_retry}"' + deadline_attr
                + f' data-undo-seconds="{undo_seconds}"'
                + f' {card_motion.attributes()}'
+               + f' data-item-aliases="{html.escape(json.dumps(aliases), quote=True)}"'
                + f' data-closed-keys="{html.escape(json.dumps([entry.key for entry in closed]), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
                + page_frame.title(studio_page.TITLE, "studio", SCRIPT_VERSION, frozen_controls=picture_row)
@@ -2806,7 +2820,10 @@ const chipFor=data=>{
   parked,data.unreadDelivery==='true',data.openQuestion==='true')];
 };
 let content=document.querySelector('[data-list]');
+const listAliases=new WeakMap();
+function resolveListKey(list,key){return listAliases.get(list)?.get(key) ?? key;}
 function decodeListKeys(list){
+ listAliases.set(list,new Map(Object.entries(JSON.parse(list.dataset.itemAliases || '{}'))));
  for(const row of list.querySelectorAll('[data-list-item][data-key*="%"]'))
   row.dataset.key=decodeURIComponent(row.dataset.key);
 }
@@ -3135,16 +3152,19 @@ const tableView=createRecordTable({content:()=>content,
  itemRevision:item=>item.dataset.detailRevision,
  retainedDetailSlot:'[data-list-review-links]',
  detailInstalled:installListDetail,
- hasKey:key=>{
+ resolveItem:key=>resolveListKey(content,key),
+ hasKey:raw=>{
+  const key=resolveListKey(content,raw);
   const row=rowIn(content,key);
   if(!closedKeys.has(key)) return Boolean(row);
   if(!row?.hasAttribute('data-linked-closed-item')) return false;
   const place=recordPlaceParams();
-  return place.get('item')===key && place.get('reveal')==='1';
+  return resolveListKey(content,place.get('item'))===key && place.get('reveal')==='1';
  },
  revealLinked:(data,{filters})=>linkRevealFields.some(([field,value,filter])=>
   (!filter || filters[filter]) && (data[field] || 'false')===value),
- missingItem:key=>{
+ missingItem:raw=>{
+  const key=resolveListKey(content,raw);
   const number=key.match(/\/L([1-9]\d*)$/)?.[1];
   if(!number) return '';
   return 'Item #'+number+(closedKeys.has(key) ? ' is closed' : ' is not on the List');
@@ -4132,6 +4152,7 @@ function presentReviewLinks(row,links){
   tableView.updateItemDetail(row,detail=>detail.querySelector('[data-list-review-links]').replaceChildren(...links.childNodes));
 }
 function rowIn(root,key){
+ key=resolveListKey(root,key);
  return root.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
 }
 function loadListCounts(){
@@ -4260,7 +4281,7 @@ function applyListSnapshot(fresh){
  bindListControls();tableView.replace();
  controls.scrollTop=filterScroll;
  const openItem=tableView.openItem;
- if(links && openItem?.dataset.key===key) presentReviewLinks(openItem,links);
+ if(links && openItem?.dataset.key===resolveListKey(content,key)) presentReviewLinks(openItem,links);
  tableView.restoreLog();
  if(field?.isConnected) field.focus({preventScroll:true});
  else if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});

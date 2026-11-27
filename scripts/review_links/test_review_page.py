@@ -5085,7 +5085,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 _ = the_list.move_review_bugs(staff.snapshot())
         partial, = the_list.records(keeper.id)
         self.assertEqual(partial.number, 1)
-        with self.assertRaisesRegex(investigation.InvestigationError, "Open the report on the List"):
+        with self.assertRaisesRegex(investigation.InvestigationError, "A move to the List is pending"):
             _ = investigation.mark_read(owner.id, old.id)
         during = review_page.build_snapshot(self.root)
         self.assertIn(key, during.records)
@@ -5133,28 +5133,115 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         path = investigation.review_record_path(native.owner, native.id)
         prior = path.read_bytes()
         key = review_items.investigation_record_key(native)
-        invalid = the_list.folder(keeper.id) / "L9.md"
-        invalid.parent.mkdir(parents=True)
-        _ = invalid.write_text("Invalid row.")
         members = staff.snapshot()
+        with patch.object(investigation, "_save", side_effect=OSError("The intent write stopped.")):
+            with self.assertRaisesRegex(OSError, "The intent write stopped"):
+                _ = the_list.move_review_bugs(members)
+        self.assertEqual(path.read_bytes(), prior)
+        self.assertEqual(the_list.records(keeper.id), [])
+
+        invalid = the_list.folder(keeper.id) / "L9.md"
+        invalid.parent.mkdir(parents=True, exist_ok=True)
+        _ = invalid.write_text("Invalid row.")
         with self.assertRaises(the_list.IncompleteListScan):
             _ = the_list.move_review_bugs(members)
-        self.assertEqual(path.read_bytes(), prior)
+        pending = investigation.PendingListMove(investigation.ListFilingMode.MOVE_BUG)
+        self.assertEqual(investigation.load(native.owner, native.id), replace(native, list_move=pending))
         self.assertIn(key, {item["key"] for item in review_page.build_snapshot(self.root).entries})
         invalid.unlink()
 
-        with patch.object(investigation, "_save", side_effect=OSError("The native write stopped.")):
-            with self.assertRaisesRegex(OSError, "The native write stopped"):
+        with patch.object(the_list, "_save", side_effect=OSError("The List write stopped.")):
+            with self.assertRaisesRegex(OSError, "The List write stopped"):
                 _ = the_list.move_review_bugs(members)
-        self.assertEqual(path.read_bytes(), prior)
-        self.assertIn(key, {item["key"] for item in review_page.build_snapshot(self.root).entries})
-        saved, = the_list.records(keeper.id)
-        destination, = the_list.move_review_bugs(members)
-        self.assertEqual(destination, investigation.ListDestination(keeper.id, saved.number))
-        self.assertEqual(the_list.records(keeper.id), [saved])
+        destination = investigation.ListDestination(keeper.id, 1)
+        self.assertEqual(investigation.load(native.owner, native.id),
+                         replace(native, list_move=replace(pending, destination=destination)))
+        self.assertEqual(the_list.records(keeper.id), [])
+        extra = the_list.add(keeper.id, "Keep another row", owner=native.owner, source="nate", changes={})
+        self.assertEqual(extra.number, 2)
+        self.assertEqual(the_list.move_review_bugs(members), [destination])
+        saved, other = the_list.records(keeper.id)
+        self.assertEqual((saved.number, other), (destination.number, extra))
         moved = investigation.load(native.owner, native.id)
         self.assertIs(moved.purpose, investigation.InvestigationPurpose.MOVING_LEGACY_BUG)
+        self.assertIs(moved.list_move, investigation.NoListMove.ABSENT)
         self.assertNotIn(key, {item["key"] for item in review_page.build_snapshot(self.root).entries})
+
+    def test_pending_bug_move_refuses_review_actions_until_its_list_row_is_repaired(self) -> None:
+        keeper = fixture_member("producer", name="morty")
+        native = investigation.file(self.fixture.unit.id, "Check the menu", "The last entry clips.",
+                                    waiting_why="The owner checks the menu.", kind=investigation.InvestigationKind.BUG)
+        with patch("scripts.review_links.answer_sources.file_saved_investigation"):
+            native = investigation.answer(native.owner, native.id, "Check the last entry.")
+        key = review_items.investigation_record_key(native)
+        members = staff.snapshot()
+        save = investigation._save  # pyright: ignore[reportPrivateUsage]
+
+        def fail_completion(store: investigation.Investigations, item: investigation.Investigation,
+                            path: Path) -> investigation.Investigation:
+            if isinstance(item.list_destination, investigation.ListDestination):
+                raise OSError("The completion write stopped.")
+            return save(store, item, path)
+
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        initial = cache.get()
+        request = self.card_body(initial, key, "read", "")
+        with patch.object(investigation, "_save", side_effect=fail_completion):
+            with self.assertRaisesRegex(OSError, "The completion write stopped"):
+                _ = the_list.move_review_bugs(members)
+        row, = the_list.records(keeper.id)
+        destination = investigation.ListDestination(keeper.id, row.number)
+        state = investigation.load(native.owner, native.id)
+        self.assertEqual(state.list_move, investigation.PendingListMove(investigation.ListFilingMode.MOVE_BUG, destination))
+        self.assertEqual(state.purpose, native.purpose)
+
+        path = the_list.folder(keeper.id) / f"{row.id}.md"
+        contents = path.read_bytes()
+        _ = path.write_bytes(b"Unreadable List row.")
+        fresh, card = cache.publish_record(initial, key, members=members)
+        assert isinstance(card, review_items.ReviewItem)
+        self.assertFalse(review_items.on_list(card))
+        self.assertIn(key, {entry["key"] for entry in fresh.entries})
+        self.assertIn(key, {entry["key"] for entry in review_page.build_snapshot(self.root).entries})
+        with self.assertRaisesRegex(review_items.ReviewRecordChanged, "A move to the List is pending"):
+            _ = review_page.submit(self.root, request, self.status, snapshot=fresh)
+        with self.assertRaisesRegex(investigation.InvestigationError, "A move to the List is pending"):
+            _ = investigation.mark_read(native.owner, native.id)
+        with self.assertRaisesRegex(investigation.InvestigationError, "A move to the List is pending"):
+            _ = review_actions.move_wait_to_list(self.root, card, members)
+        with self.assertRaises(the_list.IncompleteListScan):
+            _ = the_list.move_review_bugs(members)
+        self.assertEqual(investigation.load(native.owner, native.id), state)
+
+        _ = path.write_bytes(contents)
+        self.assertEqual(the_list.move_review_bugs(members), [destination])
+        self.assertEqual(the_list.records(keeper.id), [row])
+        closed = investigation.load(native.owner, native.id)
+        self.assertIs(closed.list_move, investigation.NoListMove.ABSENT)
+        self.assertIs(closed.state, investigation.InvestigationState.READ)
+        self.assertEqual([event.words for event in closed.log if review_items.list_move_event(event)], ["moved to List item 1"])
+
+    def test_pending_wait_move_resumes_after_the_owner_answers(self) -> None:
+        keeper = fixture_member("producer", name="morty")
+        native = investigation.file(self.fixture.unit.id, "Check startup", "Read the startup log.",
+                                    waiting_why="The owner checks the log.")
+        key = review_items.investigation_record_key(native)
+        members = staff.snapshot()
+        with patch.object(the_list, "verify_investigation_move", side_effect=OSError("The readback stopped.")):
+            with self.assertRaisesRegex(OSError, "The readback stopped"):
+                _ = the_list.move_review_waits(self.root, members)
+        row, = the_list.records(keeper.id)
+        _ = investigation.answer(native.owner, native.id, "The service started.")
+        pending = investigation.load(native.owner, native.id)
+        self.assertIs(pending.state, investigation.InvestigationState.ANSWER_READY)
+        self.assertIsInstance(pending.list_move, investigation.PendingListMove)
+        self.assertIn(key, {entry["key"] for entry in review_page.build_snapshot(self.root).entries})
+        self.assertEqual(the_list.move_review_waits(self.root, members), [investigation.ListDestination(keeper.id, row.number)])
+        done = investigation.load(native.owner, native.id)
+        self.assertIs(done.list_move, investigation.NoListMove.ABSENT)
+        self.assertIs(done.state, investigation.InvestigationState.ANSWER_READY)
+        self.assertEqual(done.answer, pending.answer)
 
     def test_review_displays_an_older_pending_bug_move(self) -> None:
         keeper = fixture_member("producer", name="morty")

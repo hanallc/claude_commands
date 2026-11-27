@@ -1303,6 +1303,8 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
     try:
         routing = (folder / "list-filing.json").read_text(encoding="utf-8")
     except FileNotFoundError:
+        if record_store.saved_path_exists(folder / "list-filing.json"):
+            raise
         return NoListFiling()
     fields = cast(object, json.loads(routing))
     if not isinstance(fields, dict):
@@ -1335,6 +1337,11 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
 def retry_list_filing_route(saved: SavedSubmission, unavailable: ListFilingUnavailable,
                             members: staff.StaffSnapshot) -> ListFilingRoute:
     """Resolve the assignee again and save the route before reserving a List number."""
+    if record_store.saved_path_exists(list_filing_reservation(saved)):
+        current = list_filing_route(saved)
+        if isinstance(current, dict):
+            return current
+        raise OSError(f"Cannot read the reserved List route for {saved.id}.")
     retry = unavailable.retry
     if isinstance(retry, PendingProducerFiling):
         route = _plan_producer_filing(retry, members)
