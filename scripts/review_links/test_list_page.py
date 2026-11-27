@@ -1305,7 +1305,7 @@ if(example.filterOn){
         self.assertIn('<span class="studio-name">dwight</span> <b>2</b>', tab)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the frozen Studio filters.")
-    def test_browser_studio_filters_and_table_header_follow_the_frozen_top(self) -> None:
+    def test_browser_studio_freezes_only_the_picture_tabs_and_search(self) -> None:
         for number in range(1, 25):
             _ = self.add(f"Check Studio item {number}", number=number)
         markup = list_page.render(self.root / "reviews", include_counts=False)
@@ -1324,28 +1324,29 @@ if(example.filterOn){
   frameElement.style.height='800px';
   const top=find('.page-top'), title=find('.page-heading');
   const heading=find('.list-table thead'), row=find('[data-number="20"] .list-row');
-  const controls=['.studio-tabs button','#list-search','#filter-owner-all','#filter-show-all','#list-unread'].map(find);
-  check(controls.every(control=>top.contains(control)), 'The shared frame contains all five Studio filters.');
+  const controls=['.studio-tabs button','#list-search'].map(find);
+  const scrolling=['#filter-owner-all','#filter-show-all','#list-unread'].map(find);
+  check(controls.every(control=>top.contains(control)) && scrolling.every(control=>!top.contains(control)),
+   'The frozen top contains the picture tabs and Search.');
   for(const width of [1440,390]){
    frameElement.style.width=width+'px';
    scrollTo({top:0,behavior:'instant'});
    await paint();
-   const first=box(row).top;
+   const first=box(row).top,headerStart=box(heading).top;
    for(const scroll of [700,980]){
     scrollTo({top:scroll,behavior:'instant'});
     await paint();
-    const bottom=box(width===1440 ? top : title).bottom;
     check(innerWidth===width && scrollY===scroll && Math.abs(box(row).top-first+scroll)<1,
      width+' px: the table rows scroll under the frame.');
-    check(Math.abs(box(heading).top-bottom)<1 && hit(heading.querySelector('button')),
-     width+' px: the table header touches the frozen top and accepts input.');
+    check(Math.abs(box(heading).top-headerStart+scroll)<1 && scrolling.every(control=>box(control).bottom<0),
+     width+' px: the Owner chips, Show chips, Unread only switch, and table header scroll with the rows.');
     check(width===1440 ? controls.every(hit) : controls.every(control=>box(control).bottom<0) && hit(title),
      width+' px: the desktop filters stay visible and the phone keeps only the title.');
    }
    row.scrollIntoView({block:'start',behavior:'instant'});
    await paint();
-   check(box(row).top>=box(heading).bottom-1 && hit(row.querySelector('.list-toggle')),
-    width+' px: scrolling a row into view clears the table header.');
+   check(box(row).top>=box(width===1440 ? top : title).bottom-1 && hit(row.querySelector('.list-toggle')),
+    width+' px: scrolling a row into view clears the frozen top.');
   }
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -1354,7 +1355,7 @@ if(example.filterOn){
         self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the short Studio layout.")
-    def test_browser_short_studio_keeps_two_rows_visible_and_filters_reachable(self) -> None:
+    def test_browser_short_studio_keeps_rows_and_filters_reachable(self) -> None:
         producers = tuple(staff.StaffRow(identity, "producer", name, staff.StaffRoot(), current_session=identity)
                           for identity, name in ((OWNER.id, "first"), (OTHER.id, "second")))
         members = staff.StaffSnapshot((MORTY, DWIGHT, *producers))
@@ -1379,22 +1380,23 @@ if(example.filterOn){
   const filters=document.querySelector('[data-page-top-controls]');
   const tabs=filters.querySelectorAll('.studio-tabs button');
   const search=filters.querySelector('#list-search');
-  const unread=filters.querySelector('#list-unread');
-  const heading=document.querySelector('.list-table thead');
-  const [first,second]=document.querySelectorAll('.list-table .list-row');
+  const first=document.querySelector('.list-table .list-row');
   check(innerWidth===800 && innerHeight===320 && tabs.length===5 && box(search).top>=box(tabs[0]).bottom,
    'Five Producer tabs put Search on its own line at 800 x 320 px.');
   check(filters.scrollHeight>filters.clientHeight,'The filters have their own scroll area.');
-  first.scrollIntoView({block:'start',behavior:'instant'});
-  await paint();
-  check(hit(heading.querySelector('button')) && box(first).top>=box(heading).bottom-1 && box(second).bottom<=innerHeight,
-   'The table header and two full rows fit below the frozen top: '+JSON.stringify([box(heading),box(first),box(second)]));
+  first.scrollIntoView({block:'start',behavior:'instant'});await paint();
+  check(box(first).top>=box(filters.closest('.page-top')).bottom-1 && hit(first.querySelector('.list-toggle')),
+   'The first row is reachable below the frozen top.');
   const pageScroll=scrollY;
-  for(const control of [search,filters.querySelector('#filter-owner-all'),filters.querySelector('#filter-show-all'),unread]){
+  search.focus();await paint();
+  check(document.activeElement===search && hit(search) && filters.scrollTop>0 && scrollY===pageScroll,
+   'Focus scrolls Search within the frozen top.');
+  for(const selector of ['#filter-owner-all','#filter-show-all','#list-unread']){
+   const control=document.querySelector(selector);
+   control.scrollIntoView({block:'start',behavior:'instant'});
    control.focus();await paint();
    check(document.activeElement===control && hit(control),'The filter takes focus and stays visible: '+control.id);
   }
-  check(filters.scrollTop>0 && scrollY===pageScroll,'Focus scrolls the filters within the frozen top.');
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
@@ -1407,13 +1409,16 @@ if(example.filterOn){
         for number in range(1, 13):
             _ = self.add(f"Check Studio item {number}")
         initial = list_page.render(root, include_counts=False).decode()
-        for number in range(13, 25):
-            _ = self.add(f"Check the result for team {number}", owner=staff.StaffId(f"delivery-team-{number}"))
+        identities = [staff.StaffId(str(uuid4())) for _ in range(13)]
+        producers = [staff.StaffRow(identity, "producer", f"Team {number}", staff.StaffRoot(), current_session=identity)
+                     for number, identity in enumerate(identities, start=1)]
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
+            member.to_json() for member in (MORTY, DWIGHT, OWNER, OTHER, *producers)]}))
         fresh = list_page.render(root, include_counts=False).decode()
         for offset in (2, -8):
             with self.subTest(offset=offset):
                 self.assert_studio_refresh_row_position(initial, fresh, offset, r'''
- check(later.ownerLines>earlier.ownerLines,'The fresh Owner chips add a line.');
+ check(later.picturesHeight>earlier.picturesHeight,'The fresh picture tabs add a line.');
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required to check refresh position.")
@@ -1427,20 +1432,19 @@ if(example.filterOn){
         self.assert_studio_refresh_row_position(initial, fresh, 2, r'''
  check(later.statusHeight>earlier.statusHeight && later.statusState==='Failed',
   'The fresh status shows the failure on more lines.');
- check(later.ownerLines===earlier.ownerLines,'The Owner chips keep their height.');
+ check(later.picturesHeight===earlier.picturesHeight,'The picture tabs keep their height.');
 ''')
 
     def assert_studio_refresh_row_position(self, initial: str, fresh: str, offset: int, verify_growth: str) -> None:
         steps = r'''
  const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
  const summary=()=>document.querySelector('[data-number="6"] .list-row');
- const header=()=>document.querySelector('.list-table thead').getBoundingClientRect();
+ const header=()=>document.querySelector('.page-top').getBoundingClientRect();
  const measure=()=>{
   const status=document.querySelector('[data-page-status]');
   return {headerBottom:header().bottom,row:summary().getBoundingClientRect(),statusState:status.dataset.state,
    statusHeight:status.getBoundingClientRect().height,
-   ownerLines:new Set([...document.querySelectorAll('[data-filter-row="owner"] button:not([hidden])')]
-    .map(chip=>chip.getBoundingClientRect().top)).size};
+   picturesHeight:document.querySelector('.studio-tabs').getBoundingClientRect().height};
  };
  await paint();
  summary().scrollIntoView({block:'start',behavior:'instant'});
@@ -2788,10 +2792,8 @@ frame.addEventListener('load',async()=>{
     const top=target.getBoundingClientRect().top;
     check(win.getComputedStyle(frozen).position==='sticky' && Math.abs(box.top)<1 &&
      banner.getBoundingClientRect().height>=60,'the tall status line stays in the frozen top');
-    const heading=doc.querySelector('.list-table thead').getBoundingClientRect();
-    const gap=top-heading.bottom;
-    check(Math.abs(heading.top-box.bottom)<=1 && Math.abs(gap-16)<=1,
-     'The row starts 16 px below the table header. Found '+gap+' px.');
+    const gap=top-box.bottom;
+    check(Math.abs(gap-16)<=1,'The row starts 16 px below the frozen top. Found '+gap+' px.');
    }
   }
   const expected=originalFilters.slice();
@@ -7008,8 +7010,7 @@ window.fetch=async(_path,options={})=>{
  row.querySelector('.list-toggle').scrollIntoView({block:'center',behavior:'instant'});
  row.querySelector('.list-toggle').click();
  unpark.focus({preventScroll:true});
- check(SHORT_VIEWPORT ? filter.getBoundingClientRect().bottom<0 : filter.getBoundingClientRect().top>=0,
-       'The Parked filter stays visible when the frame freezes it.');
+ check(filter.getBoundingClientRect().bottom<0,'The Parked filter scrolls out of view.');
  submit('unpark');
  finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
  await flush();

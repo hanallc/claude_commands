@@ -83,30 +83,13 @@ def tabs(chips: Iterable[record_table.Chip], selected: str) -> str:
 
 
 STYLE = '''<style>
-:root{scroll-padding-top:calc(var(--page-top-height,0px) + var(--studio-table-heading-height,0px))}
 [data-page-top-controls]{display:flow-root;margin-top:20px}
-[data-list]>.list-table{overflow:clip}
-[data-list]>.list-table thead{position:sticky;top:var(--page-top-height,0px);z-index:3;background:var(--card)}
-@media(max-width:960px){[data-list]>.list-table thead{background:var(--bg)}}
 @media(max-width:640px){[data-page-top-controls]{margin-top:0}}
 @media(width > 640px) and (height <= 500px){
 [data-page-top-controls]{max-height:max(44px,calc(100dvh - 17rem));overflow-y:auto}
 }
 @media(640px < width <= 960px) and (height <= 500px){
 [data-page-top-controls]{margin-top:8px}
-[data-list]>.list-table table{display:table}
-[data-list]>.list-table colgroup{display:table-column-group}
-[data-list]>.list-table thead{display:table-header-group}
-[data-list]>.list-table tbody:not([hidden]){display:table-row-group}
-[data-list]>.list-table tr:not([hidden]){display:table-row}
-[data-list]>.list-table [data-detail]>td{display:table-cell}
-[data-list]>.list-table .list-row td{display:table-cell;padding:3px 4px}
-[data-list]>.list-table [data-keeper-produces=true] .list-row td[data-label="Producer"]{display:table-cell}
-[data-list]>.list-table .list-row td:nth-child(2){text-align:left}
-[data-list]>.list-table :is(th,td) button{margin:0;padding-inline:4px}
-[data-list]>.list-table .list-row td[data-label]::before{content:none}
-[data-list]>.list-table .list-row td[data-label="Item"]{font-size:inherit}
-[data-list]>.list-table .list-eta-text{white-space:nowrap;overflow:hidden}
 }
 .studio-tab-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-bottom:12px}
 .studio-tab-row>.record-filter-words{margin-block:0}
