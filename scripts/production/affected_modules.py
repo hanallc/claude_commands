@@ -73,7 +73,7 @@ def git_output(repo: Path, *arguments: str) -> str:
 
 
 # Bump the extractor version whenever source-fact semantics change.
-CACHE_FORMAT_VERSION = 3
+CACHE_FORMAT_VERSION = 4
 EXTRACTOR_VERSION = 11
 FACT_CACHE_NAME = "affected-module-facts.sqlite"
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_.\-/]+")
@@ -139,11 +139,14 @@ class ScanCall:
     keywords: tuple[tuple[str, ScanPath | UnrootedPath], ...]
 
 
+type SourceBindings = tuple[tuple[str, ScanPath | UnrootedPath], ...]
+
+
 @dataclass(frozen=True)
 class ScanScope:
     name: str
     parameters: tuple[str, ...]
-    bindings: tuple[tuple[str, ScanPath | UnrootedPath], ...]
+    bindings: SourceBindings
     scans: tuple[ScanPattern, ...]
     calls: tuple[ScanCall, ...]
 
@@ -470,7 +473,7 @@ def decoded_scan_path(value: object) -> ScanPath | UnrootedPath:
     return ScanPath(origin, scan_strings(parts))
 
 
-def decoded_scan_scopes(value: object, encoded_paths: object) -> tuple[ScanScope, ...]:
+def decoded_scan_scopes(value: object, encoded_paths: object, encoded_bindings: object) -> tuple[ScanScope, ...]:
     if not isinstance(encoded_paths, list):
         raise ValueError("invalid scan paths")
     directories = tuple(decoded_scan_path(path) for path in cast(list[object], encoded_paths))
@@ -480,16 +483,23 @@ def decoded_scan_scopes(value: object, encoded_paths: object) -> tuple[ScanScope
             raise ValueError("invalid scan path index")
         return directories[index]
 
-    result: list[ScanScope] = []
-    for name, parameters, bindings, scans, calls in scan_rows(value, 5):
-        if not isinstance(name, str):
-            raise ValueError("invalid scan scope name")
+    if not isinstance(encoded_bindings, list):
+        raise ValueError("invalid scan bindings")
+    bindings: list[SourceBindings] = []
+    for encoded in cast(list[object], encoded_bindings):
         paths: list[tuple[str, ScanPath | UnrootedPath]] = []
-        for key, path in scan_rows(bindings, 2):
-            directory = directory_at(path)
+        for key, path in scan_rows(encoded, 2):
             if not isinstance(key, str):
                 raise ValueError("invalid scan binding")
-            paths.append((key, directory))
+            paths.append((key, directory_at(path)))
+        bindings.append(tuple(paths))
+
+    result: list[ScanScope] = []
+    for name, parameters, binding, scans, calls in scan_rows(value, 5):
+        if not isinstance(name, str):
+            raise ValueError("invalid scan scope name")
+        if type(binding) is not int or not 0 <= binding < len(bindings):
+            raise ValueError("invalid scan binding index")
         patterns: list[ScanPattern] = []
         for path, pattern, recursive in scan_rows(scans, 3):
             directory = directory_at(path)
@@ -506,26 +516,30 @@ def decoded_scan_scopes(value: object, encoded_paths: object) -> tuple[ScanScope
                     raise ValueError("invalid scan keyword")
                 named.append((key, directory_at(path)))
             invocations.append(ScanCall(target, tuple(directory_at(path) for path in cast(list[object], arguments)), tuple(named)))
-        result.append(ScanScope(name, scan_strings(parameters), tuple(paths), tuple(patterns), tuple(invocations)))
+        result.append(ScanScope(name, scan_strings(parameters), bindings[binding], tuple(patterns), tuple(invocations)))
     return tuple(result)
 
 
-def encoded_scans(scopes: tuple[ScanScope, ...]) -> tuple[list[object], list[object]]:
+def encoded_scans(scopes: tuple[ScanScope, ...]) -> tuple[list[object], list[object], list[object]]:
     # Store each scan path once per blob, including repeated call arguments.
     paths: dict[ScanPath | UnrootedPath, int] = {}
+    bindings: dict[SourceBindings, int] = {}
 
     def path_index(path: ScanPath | UnrootedPath) -> int:
         return paths.setdefault(path, len(paths))
 
     rows: list[object] = [
         [scope.name, scope.parameters,
-         [[name, path_index(path)] for name, path in scope.bindings],
+         bindings.setdefault(scope.bindings, len(bindings)),
          [[path_index(scan.directory), scan.pattern, scan.recursive] for scan in scope.scans],
          [[call.target, [path_index(path) for path in call.arguments],
            [[name, path_index(path)] for name, path in call.keywords]] for call in scope.calls]]
         for scope in scopes
     ]
-    return rows, [encoded_scan_path(path) for path in paths]
+    binding_rows: list[object] = []
+    for binding in bindings:
+        binding_rows.append([[name, path_index(path)] for name, path in binding])
+    return rows, [encoded_scan_path(path) for path in paths], binding_rows
 
 
 def decoded_facts(value: object) -> SourceFacts:
@@ -552,7 +566,7 @@ def decoded_facts(value: object) -> SourceFacts:
         decoded.append((level, module, tuple(cast(list[str], names))))
     syntax = InvalidPython(syntax_error) if isinstance(syntax_error, str) else ValidPython()
     return SourceFacts(tuple(decoded), frozenset(cast(list[str], tokens)), frozenset(cast(list[str], config_reads)),
-                       syntax, decoded_scan_scopes(row.get("scan_scopes"), row.get("scan_paths")))
+                       syntax, decoded_scan_scopes(row.get("scan_scopes"), row.get("scan_paths"), row.get("scan_bindings")))
 
 
 def read_fact_cache(path: Path) -> dict[str, SourceFacts] | None:
@@ -586,10 +600,10 @@ def fact_digest(blob: str, payload: bytes) -> bytes:
 
 
 def fact_row(blob: str, facts: SourceFacts) -> tuple[str, bytes, bytes]:
-    scopes, paths = encoded_scans(facts.scan_scopes)
+    scopes, paths, bindings = encoded_scans(facts.scan_scopes)
     payload = json.dumps({"imports": facts.imports, "tokens": sorted(facts.tokens),
                           "config_reads": sorted(facts.config_reads),
-                          "scan_scopes": scopes, "scan_paths": paths,
+                          "scan_scopes": scopes, "scan_paths": paths, "scan_bindings": bindings,
                           "syntax_error": facts.syntax.message if isinstance(facts.syntax, InvalidPython) else None},
                          separators=(",", ":")).encode("utf-8")
     return blob, payload, fact_digest(blob, payload)

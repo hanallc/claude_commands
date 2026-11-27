@@ -680,6 +680,38 @@ FILES = collect(Path(__file__).parent)
                 compared = [call.args[-2] for call in git.call_args_list if call.args[1] == "diff"]
                 self.assertEqual(len(compared), len(set(compared)))
 
+    def test_cached_scopes_share_identical_binding_tuples(self) -> None:
+        facts = affected.extract_facts("""
+ROOT = Path(__file__).parent
+
+def left():
+    return ROOT.glob("left")
+
+def right():
+    return ROOT.rglob("right")
+
+def shadow(root):
+    ROOT = root
+    return ROOT.glob("shadow")
+""", "fixture.py")
+        _, payload, _ = affected.fact_row("blob", facts)
+        row = cast(dict[str, object], json.loads(payload))
+        self.assertIsInstance(row["scan_bindings"], list)
+        self.assertEqual(len(cast(list[object], row["scan_bindings"])), 2)
+        decoded = affected.decoded_facts(row)
+        self.assertEqual(decoded, facts)
+        module, left, right, shadow = decoded.scan_scopes
+        self.assertIs(module.bindings, left.bindings)
+        self.assertIs(left.bindings, right.bindings)
+        self.assertIsNot(shadow.bindings, left.bindings)
+
+        scope_rows = cast(list[list[object]], row["scan_scopes"])
+        for index in (-1, 2, True, "0"):
+            with self.subTest(index=index):
+                scope_rows[0][2] = index
+                with self.assertRaisesRegex(ValueError, "invalid scan binding index"):
+                    _ = affected.decoded_facts(row)
+
     def test_cached_and_uncached_graphs_are_equal(self) -> None:
         sources = {
             "scripts/component/__init__.py": "VALUE = 1\n",
@@ -749,7 +781,7 @@ FILES = collect(Path(__file__).parent)
                 if condition in {"old format", "old extractor", "bad digest", "bad payload"}:
                     with closing(sqlite3.connect(cache)) as database, database:
                         if condition == "old format":
-                            _ = database.execute("UPDATE cache_version SET format = -1")
+                            _ = database.execute("UPDATE cache_version SET format = ?", (affected.CACHE_FORMAT_VERSION - 1,))
                         elif condition == "old extractor":
                             _ = database.execute("UPDATE cache_version SET extractor = -1")
                         elif condition == "bad digest":
