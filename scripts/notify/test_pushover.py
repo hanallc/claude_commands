@@ -401,6 +401,21 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(silence.read_kept(), [])
         self.assertEqual(posted, [footed("The old notice.", "legacy-owner", "none (free text)")])
 
+    def test_silence_release_logs_the_action_from_an_older_priority_zero_push(self) -> None:
+        header = "Action: In a terminal on natedev, run github-warmup"
+        message = header + "\nWhy: GitHub credentials are cold.\nNext run: Tue 11-24 00:53 PST."
+        push: silence.KeptPush = {"source": "nightly", "priority": "0", "title": "Nightly check did not run",
+            "message": message, "detail": "", "key": "", "text_id": "nightly.not_run"}
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        self.silence_on()
+        self.assertIsInstance(silence.keep_here(push), silence.Kept)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post)), 0)
+        form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
+        self.assertEqual(form["message"], [footed(message, "nightly", "nightly.not_run")])
+        self.assertEqual(self.log_lines()[-1]["priority"], "0")
+        self.assertEqual(self.log_lines()[-1]["header"], header)
+
     def test_silence_drops_old_restart_failure_without_resume_values(self) -> None:
         push: silence.KeptPush = {"source": "shutdown", "priority": "0", "title": "Claude coding work remains stopped",
             "message": "Action: In the Claude session named natedev on the natedev computer, run /agents restart claude4.\n"

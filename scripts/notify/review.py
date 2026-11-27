@@ -43,7 +43,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.file_lock import LockAvailability, LockResult, exclusive, probe_existing_exclusive, take_exclusive
 
 from scripts.notify.user_action import (LEGACY_NO_ACTION_LINE, ActionRequired, NoActionRequired, UserAction,
-                         action_conflicts, notification_body, notification_header, notification_message, parse_user_action,
+                         action_conflicts, notification_body, notification_header, notification_message, parse_user_action, read_notification,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
 
 if TYPE_CHECKING:
@@ -1648,7 +1648,8 @@ def best_version(draft: Draft, outcome: ReviewOutcome) -> Draft:
     return draft
 
 
-def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "", *, header: bool = True) -> None:
+def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "", *, header: bool = True,
+                 reply: bool = False) -> None:
     verdict = "send"
     failed: list[str] = []
     if isinstance(outcome, Unreviewed):
@@ -1666,7 +1667,7 @@ def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "", *, heade
     print(f"{stamp + ' ' if stamp else ''}{verdict}; failed rules: {', '.join(failed) or 'none'}")
     if version.title:
         print(version.title)
-    message = notification_message(version.action, version.body, version.session, header=header)
+    message = version.body if reply else notification_message(version.action, version.body, version.session, header=header)
     if message:
         print(message)
     if isinstance(outcome, (Rewritten, Questions, Unreviewed, Failed, Withheld)):
@@ -1693,8 +1694,7 @@ def replay(limit: int = 0) -> int:
             message = _text(record, "message")
             priority = _text(record, "priority")
             header = _text(record, "header") if "header" in record else None
-            template = _text(record, "template") if "template" in record else ""
-            action, body, session = push_texts.read_saved_message(message, header, priority, template)
+            action, body, session = read_notification(message, header)
             draft = Draft(_text(record, "source"), priority,
                           _text(record, "title"), action, body, False, session)
             stamp = _text(record, "time")
@@ -1820,7 +1820,7 @@ def sample(paths: list[Path], limit: int = 20, *, since: datetime | None = None,
     for reply in selected:
         draft = Draft("review.sample", "0", "", NoActionRequired(), reply.text, False)
         outcome = _review(draft, False, runner, reply.context, timeout_seconds=timeout_seconds)
-        print_review(draft, outcome, reply.context.date.isoformat())
+        print_review(draft, outcome, reply.context.date.isoformat(), reply=True)
         log_review(draft, outcome, sample=reply.context)
         if isinstance(outcome, Unreviewed):
             unreviewed += 1

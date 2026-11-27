@@ -122,9 +122,8 @@ def notification_message(action: UserAction, body: str, session: NotificationSes
     return f"{lines}\n{body}" if body else lines
 
 
-def read_notification(message: str, header: str | None, *, action_expected: bool = False
-                      ) -> tuple[UserAction, str, NotificationSession]:
-    """Read a saved message using its header or the action required by its record."""
+def read_notification(message: str, header: str | None) -> tuple[UserAction, str, NotificationSession]:
+    """Read the saved header or parse the first lines of a legacy message."""
     if header is not None:
         if not header:
             return NoActionRequired(), message, NO_SESSION_LINE
@@ -137,7 +136,7 @@ def read_notification(message: str, header: str | None, *, action_expected: bool
     if line.removesuffix("\r") == LEGACY_NO_ACTION_LINE:
         action = NoActionRequired()
         return action, notification_body(action, text), session
-    if action_expected and line.startswith("Action: "):
+    if line.startswith("Action: "):
         return ActionRequired(line.removeprefix("Action: ")), body, session
     return NoActionRequired(), message, NO_SESSION_LINE
 

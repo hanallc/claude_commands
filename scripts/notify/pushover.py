@@ -66,7 +66,7 @@ from scripts.notify.push_catalog import (NATE_ADHOC_TEXT_ID, PAID_CREDIT_ACTION_
                                          remaining_credit_accounts)
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused,
                          ActionRequired, ActionUnstated, UserAction, notification_body, notification_header,
-                         notification_message, parse_user_action, refused_at,
+                         notification_message, parse_user_action, read_notification, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
 from scripts.whoami import token_expiry
 
@@ -674,7 +674,7 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     text_id = push["text_id"]
     reason = ""
     title = push["title"]
-    action, body, session = push_texts.read_saved_message(push["message"], push.get("header"), push["priority"], text_id)
+    action, body, session = read_notification(push["message"], push.get("header"))
     if text_id and not any(entry.id == text_id for entry in push_texts.catalog()):
         reason = f"retired template {text_id}"
     else:
@@ -727,7 +727,7 @@ def post_message(source: str, priority: str, title: str, message: str,
         log(source, priority, title, message, f"{REFUSED_BEFORE_SENDING}: no sender" + suffix)
         print(f"pushover: {REFUSED_BEFORE_SENDING}: no sender. Name the sender with --source NAME.", file=sys.stderr)
         return 2
-    action, body, session = push_texts.read_saved_message(message, header, priority, text_id)
+    action, body, session = read_notification(message, header)
     limit = phone_message_limit(source, text_id)
     message = notification_message(action, body, session)[:limit].rstrip()
     sent_header = notification_header(action, session)[:len(message)]

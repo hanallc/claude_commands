@@ -18,7 +18,7 @@ from scripts.message import session_send
 from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 
 from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
-                         NoSessionLine, NO_SESSION_LINE, SessionLine, notification_message, read_notification)
+                         NoSessionLine, NO_SESSION_LINE, SessionLine, notification_message)
 
 Need = Literal["note", "decision", "blocked"]
 REVIEWED_FILE = Path(__file__).with_name("push_texts_reviewed.json")
@@ -205,15 +205,6 @@ def render(id: str, **values: str) -> RenderedPush:
         if entry.id == id:
             return render_entry(entry, values)
     raise ValueError(f"unknown push text id: {id}")
-
-
-def read_saved_message(message: str, header: str | None, priority: str, text_id: str
-                       ) -> tuple[UserAction, str, NotificationSession]:
-    """Use priority or a required template action when an older record has no header field."""
-    action_expected = header is None and (priority in ("1", "2") or (bool(text_id) and any(
-        entry.id == text_id and isinstance(entry.action, ActionTemplate) and not entry.action.omit_when_empty
-        for entry in catalog())))
-    return read_notification(message, header, action_expected=action_expected)
 
 
 def listing(entries: tuple[PushText, ...]) -> str:
