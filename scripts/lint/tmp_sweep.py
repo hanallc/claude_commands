@@ -630,13 +630,12 @@ def _user_task(path: str, user: int) -> UserTask | UserProcessStatus:
         return UserProcessStatus.UNREADABLE
 
 
-def _surviving_tasks(leader: UserTask, user: int) -> Iterator[UserTask | UserProcessStatus]:
-    pid = os.path.basename(leader.path)
+def _thread_entries(leader: os.DirEntry[str]) -> Iterator[os.DirEntry[str] | UserProcessStatus]:
     try:
         with os.scandir(os.path.join(leader.path, "task")) as entries:
             for entry in entries:
-                if entry.name.isdecimal() and entry.name != pid:
-                    yield _user_task(entry.path, user)
+                if entry.name.isdecimal() and entry.name != leader.name:
+                    yield entry
     except (FileNotFoundError, ProcessLookupError):
         if _task_still_exists(leader.path):
             yield UserProcessStatus.UNREADABLE
@@ -846,7 +845,7 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
                   ) -> ProcessUsesKnown | ProcessUsesUnavailable:
     """Read matching paths from live processes and report incomplete reads.
 
-    Skip a thread when a complete leader read covers its paths.
+    Read the leader before comparing its threads or reading their status.
     Ignore processes that end during the scan.
     Stop at the first confirmed use per process when the caller checks one folder.
     """
@@ -894,16 +893,17 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
         if not isinstance(leader, UserTask) or (strict and not leader.owned_by_user):
             continue
         threaded = leader.has_other_threads()
-        other_tasks = _surviving_tasks(leader, user) if threaded else ()
+        threads = _thread_entries(entry) if threaded else ()
         read_shared_paths = True
-        leader_paths_read = False
-        for task in chain((leader,), other_tasks):
+        compare_threads = False
+        for task in chain((leader,), threads):
+            if isinstance(task, os.DirEntry):
+                if compare_threads and _shares_leader_paths(pid, int(task.name)):
+                    continue
+                task = _user_task(task.path, user)
             if task is UserProcessStatus.UNREADABLE:
                 incomplete.add(pid)
             if not isinstance(task, UserTask) or task.exited or (strict and not task.owned_by_user):
-                continue
-            if (task is not leader and live_proc and leader_paths_read and ignored_fds == NO_IGNORED_FDS
-                    and _shares_leader_paths(pid, int(os.path.basename(task.path)))):
                 continue
             start_ticks = -1
             if strict and not threaded and not stop_after_first_use:
@@ -915,7 +915,7 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
                                              found=found, unreadable=unreadable, read_shared_paths=read_shared_paths,
                                              stop_after_first_use=stop_after_first_use)
             if task is leader:
-                leader_paths_read = not read_errors
+                compare_threads = live_proc and not read_errors and not ignored_fds
             read_shared_paths = False
             if (start_ticks >= 0 and not read_errors and len(found) == first_path + 1
                     and found[first_path][2] == WORKS_IN):

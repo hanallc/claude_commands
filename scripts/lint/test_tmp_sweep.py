@@ -1358,14 +1358,18 @@ thread.join()
     def test_process_scan_skips_a_thread_that_shares_both_resources(self) -> None:
         pid, tid, held = self.start_thread("shared")
         leader = f"{tmp_sweep.PROC_DIR}/{pid}"
+        thread = f"{leader}/task/{tid}"
+        read_status = tmp_sweep._user_task  # pyright: ignore[reportPrivateUsage]
         read_paths = tmp_sweep._read_process_paths  # pyright: ignore[reportPrivateUsage]
-        with mock.patch.object(tmp_sweep, "_read_process_paths", wraps=read_paths) as read:
+        with (mock.patch.object(tmp_sweep, "_user_task", wraps=read_status) as status,
+              mock.patch.object(tmp_sweep, "_read_process_paths", wraps=read_paths) as paths):
             uses = tmp_sweep.process_paths(tmp_sweep.PROC_DIR, str(held.parent))
         assert isinstance(uses, tmp_sweep.ProcessUsesKnown)
         self.assertEqual(uses.paths.count((str(held), pid, tmp_sweep.HOLDS_FILE)), 1)
-        paths_read = {cast(str, call.args[0]) for call in read.call_args_list}
-        self.assertIn(leader, paths_read)
-        self.assertNotIn(f"{leader}/task/{tid}", paths_read)
+        for read in (status, paths):
+            paths_read = {cast(str, call.args[0]) for call in read.call_args_list}
+            self.assertIn(leader, paths_read)
+            self.assertNotIn(thread, paths_read)
 
 
 class ScratchRootTests(TmpSweepCase):

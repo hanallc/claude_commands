@@ -153,6 +153,7 @@ Migration scans the sources together and checks each source again before source 
 Linux migration uses `process_paths` to scan each live process and its threads.
 On the live `/proc`, the scan can skip a thread after it reads the leader without errors or ignored descriptors.
 It skips the thread only when `kcmp` confirms that it shares the leader's descriptor table and filesystem state.
+The comparison runs before the scan reads the thread's status.
 The scan reads the other threads if the leader has exited or the comparison fails.
 After `EACCES`, the scan checks the owner of the working directory link in `/proc`.
 It also checks whether the process has a permitted capability the caller lacks.
