@@ -256,6 +256,7 @@ class NoPageRequest(StrEnum):
 class QuestionRequestReceipt:
     request: PageRequest
     question_id: str
+    followup: bool = False
 
 
 class UnparkNoChangeReason(StrEnum):
@@ -2010,7 +2011,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
             fields["origin"] = content.origin
         return {"feedback": fields}
     if isinstance(content, QuestionRequestReceipt):
-        return {"receipt": {**_request_fields(content.request), "question_id": _question_id(content.question_id)}}
+        return {"receipt": {**_request_fields(content.request), "question_id": _question_id(content.question_id),
+                            **({"followup": True} if content.followup else {})}}
     if isinstance(content, UnparkNoChangeReceipt):
         return {"receipt": {**_request_fields(content.request), "unpark_no_change": content.reason.value}}
     return {"receipt": _request_fields(content)}
@@ -2778,6 +2780,7 @@ class QuestionMove(Enum):
     NATE_ANSWER = "nate answers"
     WITHDRAW = "withdraw"
     REPLY = "receive a reply"
+    FOLLOW_UP = "ask a follow-up"
     READ = "mark read"
     ASKER_CLOSE = "asker closes"
     OTHER = "ordinary item action"
@@ -2794,6 +2797,7 @@ _QUESTION_TRANSITIONS: frozenset[QuestionTransition] = frozenset({
     (QuestionItemKind.FROM_NATE, ItemState.CLOSED, QuestionMove.REPLY, ItemState.ANSWERED),
     (QuestionItemKind.FROM_NATE, ItemState.CLOSED, QuestionMove.FILE, ItemState.ANSWERED),
     *((kind, ItemState.WORKING, QuestionMove.REPLY, ItemState.ANSWERED) for kind in QuestionItemKind),
+    *((kind, ItemState.ANSWERED, QuestionMove.FOLLOW_UP, ItemState.WORKING) for kind in QuestionItemKind),
     *((QuestionItemKind.TO_NATE, state, QuestionMove.FILE, target)
       for state in (ItemState.NEW, ItemState.WAITING_FOR_NATE, ItemState.WORKING, ItemState.ANSWERED)
       for target in (ItemState.WAITING_FOR_NATE, ItemState.WORKING, ItemState.CLOSED)),
@@ -5020,6 +5024,14 @@ def has_open_question(item: ListItem) -> bool:
     return any(question.answer is None for question in item.questions)
 
 
+def has_open_followup(item: ListItem) -> bool:
+    if item.state is not ItemState.WORKING or item.question_kind is NoQuestionItem.ORDINARY:
+        return False
+    pending = {question.question_id for question in item.questions if question.answer is None}
+    return bool(pending) and any(isinstance(entry.what, QuestionRequestReceipt)
+                                 and entry.what.followup and entry.what.question_id in pending for entry in item.log)
+
+
 def answerable_asks(item: ListItem, members: staff.StaffSnapshot) -> tuple[Ask, ...]:
     """Find the open asks that nate can answer: the item is open and the ask's target has a staff row.
 
@@ -5102,7 +5114,10 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
         received = PageRequest(request, ReportVerdict.WORKS if action == "works" else action,
                                words, form_words, parked_until)
         if action == "question":
-            return QuestionRequestReceipt(received, _question_id(fields.get("question_id")))
+            followup = fields.get("followup", False)
+            if not isinstance(followup, bool):
+                raise ListError("invalid List question receipt")
+            return QuestionRequestReceipt(received, _question_id(fields.get("question_id")), followup)
         if "unpark_no_change" in fields:
             reason = fields["unpark_no_change"]
             if reason not in (UnparkNoChangeReason.EXPIRED, UnparkNoChangeReason.NO_ACTIVE_PARKING):
@@ -5237,6 +5252,7 @@ ListQuestionSignature = NewType("ListQuestionSignature", str)
 class ListQuestionReceiver:
     recipient: staff.StaffId | question_record.KeeperForUnavailableProducer
     name: str
+    followup: bool = False
 
     @property
     def identity(self) -> staff.StaffId:
@@ -5245,7 +5261,9 @@ class ListQuestionReceiver:
     @property
     def signature(self) -> ListQuestionSignature:
         fallback = self.recipient.producer if isinstance(self.recipient, question_record.KeeperForUnavailableProducer) else ""
-        return ListQuestionSignature(hashlib.sha256(json.dumps((self.identity, self.name, fallback)).encode()).hexdigest())
+        route = (self.identity, self.name, fallback)
+        signed = (*route, "followup") if self.followup else route
+        return ListQuestionSignature(hashlib.sha256(json.dumps(signed).encode()).hexdigest())
 
 
 @dataclass(frozen=True)
@@ -5254,6 +5272,7 @@ class _ListQuestionStore:
     ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
     answerer: _QuestionAnswerer | NoQuestionAnswerer = NoQuestionAnswerer.ABSENT
     ask_recipient: staff.StaffId | ListQuestionRoute = ListQuestionRoute.CURRENT
+    followup: bool = False
 
     def questions(self, item: str) -> tuple[question_record.Question, ...]:
         current = load(self.keeper, item)
@@ -5279,7 +5298,11 @@ class _ListQuestionStore:
         self.save_request(replace(current, questions=(*current.questions, question)), self.ask_request, question)
 
     def save_request(self, item: ListItem, request: PageRequest, question: question_record.Question) -> None:
-        receipt = ItemChange(now(), QuestionRequestReceipt(request, question.question_id), PAGE_SOURCE)
+        moment = now()
+        if self.followup and item.state is ItemState.ANSWERED:
+            item = replace(item, log=(*item.log, ItemChange(moment, MarkedRead(), PAGE_SOURCE)))
+            item = _move_question(item, QuestionMove.FOLLOW_UP, ItemState.WORKING, moment)
+        receipt = ItemChange(moment, QuestionRequestReceipt(request, question.question_id, self.followup), PAGE_SOURCE)
         _ = _save_page_request(_store(self.keeper), self.keeper, replace(item, log=(*item.log, receipt)), request)
 
     def require_answerer(self, current: ListItem, question_id: str) -> _QuestionAnswerer:
@@ -5329,6 +5352,9 @@ class ListQuestionRouting:
 
     def receiver(self, keeper: staff.StaffId, producer: staff.StaffId) -> ListQuestionReceiver:
         return self.name_recipient(self._recipient(keeper, producer))
+
+    def followup_receiver(self, owner: staff.StaffId) -> ListQuestionReceiver:
+        return replace(self.name_recipient(owner), followup=True)
 
     def name_recipient(self, recipient: staff.StaffId | question_record.KeeperForUnavailableProducer
                        ) -> ListQuestionReceiver:
@@ -5380,7 +5406,8 @@ def _prepared_question_receiver(path: Path, request: PageRequest, routing: ListQ
 
 def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
                  status: change_page.DeliveryStatus, *,
-                 shown: ListQuestionSignature | ListQuestionRoute = ListQuestionRoute.CURRENT
+                 shown: ListQuestionSignature | ListQuestionRoute = ListQuestionRoute.CURRENT,
+                 seen: UnreadUpdate | NoUnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT
                  ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     """Check the shown recipient and save the question before delivery."""
     if request.action != "question" or not request.words.strip() or len(request.words) > 10000:
@@ -5409,14 +5436,25 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
             return delivery
         routing = ListQuestionRouting(staff.snapshot())
         prepared = _prepared_question_receiver(preparation, request, routing)
-        receiver = routing.receiver(keeper, item.producer) if prepared is ListQuestionRoute.CURRENT else prepared
+        followup = isinstance(item.question_kind, QuestionItemKind) and item.state is ItemState.ANSWERED
+        if followup:
+            if isinstance(item.owner, UnassignedOwner):
+                raise question_record.AnswerRefused("The question has no owner for your words.")
+            if seen is not ReadCurrentUpdate.CURRENT and unread_update(item) != seen:
+                raise question_record.AnswerRefused("The question changed. Check it again before sending.")
+            current = routing.followup_receiver(item.owner)
+        else:
+            current = routing.receiver(keeper, item.producer)
+        receiver = current if prepared is ListQuestionRoute.CURRENT else replace(prepared, followup=followup)
+        if followup and receiver.identity != current.identity:
+            raise question_record.AnswerRefused("The question recipient changed. Check it again before sending.")
         _require_question_receiver(shown, receiver)
-        questions = _ListQuestionStore(keeper, request, ask_recipient=receiver.identity)
+        questions = _ListQuestionStore(keeper, request, ask_recipient=receiver.identity, followup=followup)
         open_question = next((question for question in item.questions if question.answer is None
                               and question.words == request.words and question.recipient_id(keeper) == receiver.identity), None)
         if open_question is not None:
             questions.save_request(item, request, open_question)
-        elif item.question_kind is not NoQuestionItem.ORDINARY and item.state is not ItemState.WORKING:
+        elif item.question_kind is not NoQuestionItem.ORDINARY and item.state is not ItemState.WORKING and not followup:
             raise ListError("Ask the question while the item is Working.")
         elif prepared is ListQuestionRoute.CURRENT:
             record = {"request": _request_fields(request), "receiver_name": receiver.name,

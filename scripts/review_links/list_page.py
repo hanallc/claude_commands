@@ -210,10 +210,12 @@ SHOW_ALIASES = show_aliases()
 
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
               unread_delivery: bool = False, unread_answer: bool = False, open_ask: bool = False,
-              report: bool = False, question_item: bool = False) -> ListChip:
+              report: bool = False, question_item: bool = False, open_followup: bool = False) -> ListChip:
     """Find the one status chip for this item."""
     if question_item and (state is the_list.ItemState.ANSWERED or unread_answer):
         return ListChip.ANSWERS
+    if open_followup:
+        return ListChip.QUESTIONS
     if state is the_list.ItemState.SCHEDULED:
         return ListChip.SCHEDULED
     if state == the_list.ItemState.REPAIRED:
@@ -574,23 +576,25 @@ def item_log(record: ListRecord, today: datetime, names: staff_names.StaffNames,
     for question in item.questions:
         answer = question.answer
         identity = question.question_id
-        if answer is None or identity in unread_answers:
+        if item.question_kind is the_list.NoQuestionItem.ORDINARY and (answer is None or identity in unread_answers):
             continue
         asked = datetime.fromisoformat(question.asked_at).astimezone(UTC)
         question_body = " " + html.escape(identity) + log_source_html("nate", names)
-        answer_entry = answer_entries.get(identity)
-        answered = answer_entry.time if answer_entry is not None else datetime.fromisoformat(answer.answered_at).astimezone(UTC)
-        source = (the_list.source_without_clock(answer_entry.source) if answer_entry is not None
-                  else question.recipient_id(record.keeper))
-        answer_body = log_source_html(source, names)
         rows.append((asked, log_row(f"{identity}-asked", asked,
                                    question_body + item_text_html(question.words, paragraphs=True), today,
                                    question="Question")))
-        rows.append((answered, log_row(f"{identity}-answered", answered,
-                                       answer_body + item_text_html(answer.text, paragraphs=True), today,
-                                       question="Answer")))
+        if answer is not None:
+            answer_entry = answer_entries.get(identity)
+            answered = (answer_entry.time if answer_entry is not None
+                        else datetime.fromisoformat(answer.answered_at).astimezone(UTC))
+            source = (the_list.source_without_clock(answer_entry.source) if answer_entry is not None
+                      else question.recipient_id(record.keeper))
+            answer_body = log_source_html(source, names)
+            rows.append((answered, log_row(f"{identity}-answered", answered,
+                                           answer_body + item_text_html(answer.text, paragraphs=True), today,
+                                           question="Answer")))
     rows.reverse()
-    if answers.difference(unread_answers):
+    if answers.difference(unread_answers) or (item.questions and item.question_kind is not the_list.NoQuestionItem.ORDINARY):
         rows.sort(key=lambda row: row[0], reverse=True)
     return ItemLog(''.join(markup for _, markup in rows), url_candidates)
 
@@ -775,13 +779,18 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
                   mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
     question = the_list.question_item(entry.item) is not the_list.NoQuestionItem.ORDINARY
     if question and entry.item.state is the_list.ItemState.ANSWERED:
-        receiver = html.escape(owner_name(members, entry.item.owner), quote=True)
+        owner = entry.item.owner
+        receiver = html.escape(owner_name(members, owner), quote=True)
         label = f"Your words for {receiver}"
-        return ('<form method="post" data-feedback-form data-question-read>'
-                + signed_form_fields(entry, secret) + '<input type="hidden" name="until" value="">'
+        route = None if isinstance(owner, the_list.UnassignedOwner) else routing.followup_receiver(owner)
+        ask = (page_frame.send_button("Ask question", page_frame.SendTo(route.name),
+                                      'name="action" value="question" disabled') if route is not None else '')
+        signature = route.signature if route is not None else the_list.ListQuestionRoute.CURRENT
+        return (f'<form method="post" data-feedback-form data-question-read data-read-receiver="{receiver}">'
+                + signed_form_fields(entry, secret, ask_signature=signature) + '<input type="hidden" name="until" value="">'
                 + f'<textarea name="words" rows="4" maxlength="10000" placeholder="{label}" aria-label="{label}"></textarea>'
                 + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
-                + '<button name="action" value="read">Mark read</button></div></form>')
+                + ask + '<button name="action" value="read">Mark read</button></div></form>')
     read = ('<button name="action" value="read">Mark read</button>'
             if (not question and isinstance(entry.item.unread_since, datetime)
                 or the_list.question_can_mark_read(entry.item, unread_answers)) else '')
@@ -908,7 +917,8 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
     for question in item.questions:
         answer = question.answer
         identity = html.escape(question.question_id)
-        if answer is not None and question.question_id not in unread_answers:
+        unread = question.question_id in unread_answers
+        if answer is not None and not unread and item.question_kind is the_list.NoQuestionItem.ORDINARY:
             continue
         pending = answer is None and question.question_id not in failed
         waiting = " — waiting for an answer" if pending else ""
@@ -917,14 +927,17 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
         if answer is None:
             body += change_page.question_failure_html(question.question_id in failed)
         else:
-            body += ('<h3>Answer <span class="question-unread">Unread</span></h3>'
+            marker = ' <span class="question-unread">Unread</span>' if unread else ''
+            body += (f'<h3>Answer{marker}</h3>'
                      + question_time_html(answer.answered_at, today) + f'<p>{item_text_html(answer.text)}</p>')
         sections.append(body + '</section>')
     return ''.join(sections)
 
 
-def filed_exchange_sections(item: the_list.ListItem, today: datetime, names: staff_names.StaffNames) -> str:
+def filed_exchange_sections(item: the_list.ListItem, today: datetime, names: staff_names.StaffNames,
+                            unread_answers: frozenset[the_list.UnreadAnswerId]) -> str:
     returned = {entry.what.identity for entry in item.log if isinstance(entry.what, the_list.ReturnedAnswer)}
+    native = item.question_kind is not the_list.NoQuestionItem.ORDINARY
     sections: list[str] = []
     for exchange in item.filed_exchanges:
         if exchange.source is list_exchange.Source.LIST:
@@ -936,13 +949,14 @@ def filed_exchange_sections(item: the_list.ListItem, today: datetime, names: sta
         if (item.state is not the_list.ItemState.CLOSED and answer is list_exchange.QuestionWithoutAnswer.OPEN
                 and exchange.direction is list_exchange.Direction.QUESTION_TO_NATE):
             body += '<p>' + review_card_link(exchange.source_key, "Answer question", studio_question=True) + '</p>'
-        if (isinstance(answer, list_exchange.ExchangeAnswer)
-                and the_list.ReturnedAnswerId(exchange.source_key, exchange.exchange_id) not in returned):
+        identity = the_list.ReturnedAnswerId(exchange.source_key, exchange.exchange_id)
+        if isinstance(answer, list_exchange.ExchangeAnswer) and (native or identity not in returned):
             actor = exchange.answerer
             answerer = html.escape(actor.name) if isinstance(actor, list_exchange.RecordedAnswerer) else names.html(actor, owner_name(names.members, staff.StaffId(actor)))
             answered = time_html(answer.time, today) if isinstance(answer.time, datetime) else ""
             unread = (' <span class="question-unread">Unread</span>'
-                      if item.state is not the_list.ItemState.CLOSED and answer.read is list_exchange.AnswerRead.UNREAD
+                      if item.state is not the_list.ItemState.CLOSED
+                      and (identity in unread_answers if native else answer.read is list_exchange.AnswerRead.UNREAD)
                       else "")
             body += f'<h3>Answer from {answerer}{unread}</h3>{answered}<p>{item_text_html(answer.text)}</p>'
         sections.append('<section class="page-question">' + body + '</section>')
@@ -1240,7 +1254,7 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
     report = review_page.list_report_details(item.report) if isinstance(item.report, the_list.ListReport) else ''
     links = item_links_html(entry, log, progress.next_step)
     return ('<div class="list-panel"><div>' + report + asks + '<div class="list-item-fields">' + fields
-            + '</div>' + linked_items + links + filed_exchange_sections(item, today, names)
+            + '</div>' + linked_items + links + filed_exchange_sections(item, today, names, unread_answers)
             + '<div data-list-item-content>' + sections + '</div>'
             + '</div>' + record_table.log_panel(log_id, log.markup) + '</div>')
 
@@ -1394,11 +1408,13 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     parking = (the_list.ParkUntilDelivered.DELIVERED.value
                if item.parked_until is the_list.ParkUntilDelivered.DELIVERED else str(parked).lower())
     key = entry.key
+    open_followup = the_list.has_open_followup(item)
     attributes = {
         "key": key, "number": str(item.number), "owner": str(item.owner), "producer": item.producer,
         "keeper-produces": str(item.producer == entry.keeper).lower(), "state": item.state.value,
         "unread": str(unread).lower(), "parked": parking, "waiting-for-answer": str(waiting).lower(),
         "open-question": str(open_question).lower(), "unread-delivery": str(the_list.unread_delivery(item)).lower(),
+        "open-followup": str(open_followup).lower(),
         "unread-answer": str(bool(unread_answers)).lower(), "open-ask": str(open_ask).lower(),
         "title": search_text.title, "owner-name": search_text.owner, "request-words": search_text.request,
         "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False),
@@ -1430,7 +1446,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     state = state_badge(item.state)
     if stamp := report_state_time(item, today):
         state += '<small data-list-state-time>' + stamp + '</small>'
-    if open_question:
+    if open_question and not open_followup:
         state += producer_answering_note(names)
     state += check_row_html(item.next_check, today, parked=parked or scheduled)
     if scheduled:
@@ -1540,6 +1556,7 @@ class SavedActionState(TypedDict):
     check_html: str
     waiting_for_answer: str
     open_question: str
+    open_followup: NotRequired[str]
     open_ask: str
     unread_delivery: NotRequired[str]
     unread_answer: NotRequired[str]
@@ -1602,6 +1619,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
                                "check_html": check_row_html(item.next_check, local_today, parked=parked or scheduled),
                                "waiting_for_answer": str(waiting).lower(),
                                "open_question": str(open_question).lower(),
+                               "open_followup": str(the_list.has_open_followup(item)).lower(),
                                "open_ask": str(open_ask).lower(),
                                "unread_delivery": str(the_list.unread_delivery(item)).lower(),
                                "unread_answer": str(bool(unread_answers)).lower()}
@@ -1712,7 +1730,8 @@ def _replay_ask(keeper: staff.StaffId, item: the_list.ListItem, receipt: the_lis
 
 
 def _submit_ask(keeper: staff.StaffId, identity: str, request: the_list.PageRequest,
-                status: change_page.DeliveryStatus, shown: the_list.ListQuestionSignature | the_list.ListQuestionRoute
+                status: change_page.DeliveryStatus, shown: the_list.ListQuestionSignature | the_list.ListQuestionRoute,
+                seen: the_list.UnreadUpdate | the_list.NoUnreadUpdate
                 ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     """Serialize the receipt check and submission of List Ask requests."""
     with exclusive(the_list.folder(keeper) / f".{identity}.ask.lock"):
@@ -1721,7 +1740,7 @@ def _submit_ask(keeper: staff.StaffId, identity: str, request: the_list.PageRequ
                         if entry.source == the_list.PAGE_SOURCE and isinstance(entry.what, the_list.QuestionRequestReceipt)
                         and entry.what.request.request == request.request), None)
         if receipt is None:
-            return the_list.ask_question(keeper, identity, request, status, shown=shown)
+            return the_list.ask_question(keeper, identity, request, status, shown=shown, seen=seen)
         if receipt.request != request:
             raise the_list.ListError("this request already has a different action or words")
         return _replay_ask(keeper, item, receipt, status)
@@ -1861,7 +1880,7 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
             raise question_record.AnswerRefused("Ask the question after the item starts.")
         status = change_page.DeliveryStatus(root) if status is None else status
         question = _submit_ask(keeper, identity, the_list.PageRequest(request, "question", words), status,
-                               prefix.ask_signature)
+                               prefix.ask_signature, prefix.seen_update)
         if isinstance(question, change_page.MessageDelivery):
             _mark_seen_update_read(keeper, item, prefix.seen_update)
             return ListQuestionDelivery(question, status)
@@ -2406,6 +2425,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         unread_answers = the_list.unread_answer_ids(entry.item)
         open_ask = bool(the_list.answerable_asks(entry.item, members))
         chip = list_chip(entry.item.state, parked=parked, open_question=open_question, open_ask=open_ask,
+                         open_followup=the_list.has_open_followup(entry.item),
                          report=isinstance(entry.item.report, the_list.ListReport),
                          question_item=the_list.question_item(entry.item) is not the_list.NoQuestionItem.ORDINARY,
                          unread_delivery=the_list.unread_delivery(entry.item), unread_answer=bool(unread_answers))
@@ -2799,6 +2819,7 @@ const questionNeedsRead=data=>data.questionItem!==undefined &&
 const chipFor=data=>{
  if(data.undoPending==='true' || data.sendHeld!==undefined) return;
  if(questionNeedsRead(data)) return 'answers';
+ if(data.openFollowup==='true') return 'questions';
  if(data.state==='Closed') return;
  if(data.state==='Repaired') return 'needs-me';
  if(data.state==='Scheduled') return 'scheduled';
@@ -3613,9 +3634,10 @@ function bindFeedbackForm(form){
     }else note?.remove();
    }
    if(['true','false'].includes(result.open_question)) item.dataset.openQuestion=result.open_question;
+   if(['true','false'].includes(result.open_followup)) item.dataset.openFollowup=result.open_followup;
    if(['true','false'].includes(result.open_ask)) item.dataset.openAsk=result.open_ask;
    const questionNote=item.querySelector('[data-open-question-note]');
-   if(item.dataset.openQuestion==='true'){
+   if(item.dataset.openQuestion==='true' && item.dataset.openFollowup!=='true'){
     if(!questionNote) state.after(content.querySelector('[data-producer-answering-template]').content.cloneNode(true));
    }else questionNote?.remove();
    if(typeof result.check_html==='string'){
@@ -3660,7 +3682,10 @@ function bindFeedbackForm(form){
     notFixed.disabled=!canReject || Boolean(form.dataset.sending) || repairRequests.sending(key) ||
      (!retryRepair && !normalizeRepairWords(words.value));
    }
-   if(!tell) return;
+   if(!tell){
+    if(ask) ask.disabled=Boolean(form.dataset.sending) || !words.value.trim();
+    return;
+   }
    const retry=matching('tell');
    const name=retry?.receiver ?? signed.receiver;
    const askRetry=matching('question','');
@@ -3752,7 +3777,8 @@ function bindFeedbackForm(form){
    const rejectsRepair=action==='not works';
    const usesWords=action==='tell' || action==='question' || rejectsRepair;
    const saveAction=changesParking || action==='read' || action==='remove' || action==='works';
-   const receiver=sendReceiver(submitter ?? tell);
+   const readReceiver=questionRead && words.value.trim() ? form.dataset.readReceiver : null;
+   const receiver=readReceiver ?? sendReceiver(submitter ?? tell);
    const heldSave=saveAction && content.dataset.undoEnabled==='true';
    const asksQuestion=action==='question';
    const retryRepair=rejectsRepair && Boolean(repairRequests.get(key));
@@ -3869,7 +3895,7 @@ function bindFeedbackForm(form){
     }
     const options={method:'POST',body:data,signal:parkingReceipt ? listRequestSignal() : undefined};
     const response=await (action==='works' || usesWords || heldSave
-     ? hold.post(actionPath,options,saveAction ? null : receiver)
+     ? hold.post(actionPath,options,saveAction ? readReceiver ?? null : receiver)
      : fetch(actionPath,options));
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parkingReceipt && action!=='remove'));
     if(!parkingReceipt) saved=response.ok && !questionRead;

@@ -2892,6 +2892,9 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  item.querySelector('.list-toggle').click();await paint();
  const form=recordDetails(item).querySelector('[data-question-read]'),words=form.elements.words;
  const submit=form.querySelector('[value="read"]');
+ const ask=form.querySelector('[value="question"]');
+ check(ask.disabled && !submit.disabled,'Only Ask question needs words.');
+ check(ask.textContent==='Ask question' && sendReceiver(ask)==='sdlc','Ask question shows the assignee.');
  document.querySelector('[data-list]').dataset.undoSeconds='0';
  const originalFetch=window.fetch.bind(window);
  let posts=0;
@@ -2902,6 +2905,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
   return Promise.resolve(Response.json({words_saved:true,item_state:'Closed',unread:'false',detail_closed:true}));
  };
  words.value='I will use that width.';words.dispatchEvent(new Event('input',{bubbles:true}));
+ check(!ask.disabled,'Words enable Ask question.');
  submit.click();
  await until(()=>form.querySelector('[data-send-status]').textContent.includes('unconfirmed'));
  check(words.value==='I will use that width.','An unconfirmed save keeps the draft.');

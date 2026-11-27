@@ -6958,6 +6958,61 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(sum(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Closed"
                                  for entry in closed.log), 1)
 
+    def test_studio_asks_two_followups_on_the_same_answered_item(self) -> None:
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        item = self.working_studio_question(keeper.id, owner.id)
+        server_status = self.server.delivery_status
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
+        marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
+        with (patch.object(change_page, "send_question", return_value=question_outcome()) as send,
+              redirect_stdout(StringIO())):
+            initial_words = "Which layout fits?"
+            initial = the_list.PageRequest(uuid4().hex, "question", initial_words)
+            change_page.deliver(the_list.ask_question(keeper.id, item.id, initial, server_status), server_status)
+            answers = ("Use a wide layout.", "Use 800 pixels.", "Use 600 pixels on a phone.")
+            questions = (initial_words, "Which width fits?", "What fits on a phone?")
+            for index, answer in enumerate(answers):
+                answerer = keeper if index == 0 else owner
+                with patch.object(staff, "caller_identity", return_value=answerer.current_session):
+                    self.assertEqual(the_list.main(["answer", item.id, "--question", f"Q{index + 1}", "--text", answer]), 0)
+                answered = the_list.load(keeper.id, item.id)
+                self.assertIs(answered.state, the_list.ItemState.ANSWERED)
+                self.assertEqual(self.list_filter_markup("?show=answers")[0], [str(item.number)])
+                if index + 1 == len(questions):
+                    break
+                route = the_list.ListQuestionRouting(staff.snapshot()).followup_receiver(owner.id)
+                request, token = list_page.signed_item_request(list_page.ListRecord(keeper.id, answered),
+                    list_page.form_secret(self.root), ask_signature=route.signature)
+                body = urlencode({"keeper": keeper.id, "id": item.id, "request": request, "token": token,
+                                  "action": "question", "words": questions[index + 1], "until": ""}).encode()
+                status, hold, fields = self.held_http("POST", studio_page.PAGE_PATH, body, headers=marked)
+                self.assertEqual((status, hold), (202, "held"), fields)
+                endpoint = f"{send_hold.HOLD_PATH}/{fields['hold']}"
+                self.assertEqual(the_list.load(keeper.id, item.id), answered)
+                if index == 0:
+                    self.assertEqual(self.held_http("POST", endpoint + "/undo")[0], 200)
+                    self.assertEqual(the_list.load(keeper.id, item.id), answered)
+                    status, _, fields = self.held_http("POST", studio_page.PAGE_PATH, body, headers=marked)
+                    self.assertEqual(status, 202, fields)
+                    endpoint = f"{send_hold.HOLD_PATH}/{fields['hold']}"
+                self.assertEqual(self.held_http("POST", endpoint + "/send")[0], 200)
+                status, _, saved = self.held_http("GET", endpoint)
+                self.assertEqual((status, saved.get("open_followup")), (200, "true"), saved)
+                self.assertEqual(self.list_filter_markup("?show=answers")[0], [])
+                self.assertEqual(self.list_filter_markup("?show=questions")[0], [str(item.number)])
+                self.assertEqual(send.call_args.args[0], owner.id)
+            self.assertEqual(send.call_count, 3)
+        saved_item, = the_list.records(keeper.id)
+        self.assertEqual(saved_item.id, item.id)
+        detail = list_page.action_state(keeper.id, saved_item, status=server_status, include_detail=True).get("detail_html", "")
+        positions = [detail.index(words, detail.index('data-question="Q1"'))
+                     for exchange in zip(questions, answers, strict=True) for words in exchange]
+        self.assertEqual(positions, sorted(positions))
+        for index in range(1, 4):
+            self.assertIn(f'data-log-index="Q{index}-answered"', detail)
+
     def test_studio_question_moves_to_answered_after_unlink(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="layout-owner")
