@@ -2008,7 +2008,7 @@ async function inspect(){
  const waitingTop=waitingRow.getBoundingClientRect().top;
  check(dialog.open && waitingCard.querySelector('[data-key="'+waitingKey+'"][data-state="Waiting"]'),
   'The summary opens the linked Waiting card.');
- check(heading()==='L113 · Check the linked reviews that are waiting',
+ check(heading()==='Item 113 · Check the linked reviews that are waiting',
   'The window heading names the item number and title.');
  check(win.recordIsOpen(waitingRow),'The summary opens its item behind the window.');
  check(waitingCard.querySelector('.review-box-meta').textContent.includes('The owner checks the error.'),
@@ -2037,7 +2037,7 @@ async function inspect(){
  check(shortBody.scrollHeight<=shortBody.clientHeight,'The short card fits without scrolling.');
  check(!done.querySelector('[data-review-body] section').getClientRects().length,'The empty check section is hidden.');
  check(!done.querySelector('[data-review-index]'),'The dialog loads one card.');
- check(heading()==='L111 · Check the linked reviews','Each review ID opens under the same item heading.');
+ check(heading()==='Item 111 · Check the linked reviews','Each review ID opens under the same item heading.');
  check(win.recordIsOpen(row()),'The Review dialog leaves the List row expanded.');
  const close=dialog.querySelector('button');
  done.body.tabIndex=-1;done.body.focus();
@@ -2571,7 +2571,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  for(const link of evidence.slice(0,2)){
   const card=await open(link);
   check(card.querySelector('.review-box')?.dataset.key===KEY,'Evidence opens the linked review card.');
-  check(dialog.querySelector('h2').textContent==='L1 · Check the evidence','The window names the source item.');
+  check(dialog.querySelector('h2').textContent==='Item 1 · Check the evidence','The window names the source item.');
   close();
   check(document.activeElement===link,'Close returns focus to the Evidence link.');
  }
