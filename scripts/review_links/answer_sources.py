@@ -1578,7 +1578,8 @@ class NoExchangeFiling(StrEnum):
 
 
 def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadExchanges, *,
-                question_filing: the_list.QuestionFiling = the_list.QuestionFiling.LIVE
+                question_filing: the_list.QuestionFiling = the_list.QuestionFiling.LIVE,
+                submission_question: the_list.NativeQuestionItem | the_list.NoQuestionItem = the_list.NoQuestionItem.ORDINARY
                 ) -> investigation.ListDestination | NoExchangeFiling:
     """Read the current source under its filing lock before saving to the List."""
     planned = plan.exchanges[0]
@@ -1620,7 +1621,8 @@ def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadEx
         try:
             conflicts: frozenset[str] = current.conflicting_ids if isinstance(current, AcceptedExchanges) else frozenset()
             return the_list.file_exchanges(source, exchanges, title, linked=link, owner=owner, members=members,
-                                           question_filing=question_filing, unresolved_reply_ids=conflicts)
+                                           question_filing=question_filing, unresolved_reply_ids=conflicts,
+                                           submission_question=submission_question)
         except the_list.ConflictingExchangeReplies:
             return NoExchangeFiling.SOURCE_NO_LONGER_ELIGIBLE
 
@@ -1669,12 +1671,11 @@ def file_saved_submission(scoped: new_item_dialog.ScopedSubmissionKey, members: 
         file_saved_review(review_items.submission_item(saved, members), members)
 
 
-def file_list_submission_question(saved: review_submissions.SavedSubmission, destination: investigation.ListDestination,
+def file_list_submission_question(record: update_registration.QuestionRecord,
+                                  origin: the_list.NativeQuestionItem, destination: investigation.ListDestination,
                                   members: staff.StaffSnapshot) -> None:
     """File the question under the recipient locks before the first notice."""
-    record = saved.record
-    assert isinstance(record, update_registration.QuestionRecord)
-    key = f"submission/question/{saved.request_id}"
+    key = origin.source_key
     links = (destination,)
     zone = user_zone()
 
@@ -1683,10 +1684,10 @@ def file_list_submission_question(saved: review_submissions.SavedSubmission, des
 
     filed = the_list.load(destination.keeper, f"L{destination.number}").filed_exchanges
     for plan in _plans(reload(), ((destination, exchange) for exchange in filed)):
-        if isinstance(file_source(plan, members, reload), investigation.ListDestination):
+        if file_source(plan, members, reload, submission_question=origin) == destination:
             return
-    if saved.awaiting_reply:
-        raise OSError(f"Cannot file the open question {saved.id} on the List.")
+    if update_registration.pending_review_reply(record):
+        raise OSError(f"Cannot file the open question on L{destination.number}.")
 
 
 def file_saved_investigation(record: investigation.Investigation) -> None:
@@ -1821,6 +1822,13 @@ def main() -> int:
     if args.apply and args.command != "migrate":
         parser.error("--apply requires migrate")
     members = staff.snapshot()
+    if args.apply:
+        for keeper in list_page.list_keepers():
+            try:
+                the_list.convert_legacy_question_sources(keeper)
+            except (OSError, ValueError) as error:
+                print(f"List question conversion for {keeper}: {error}", file=sys.stderr)
+                return 1
     inventory = read_exchanges(change_routing.review_root(), members=members)
     if args.command == "migrate":
         return migrate(inventory, members, apply=args.apply)

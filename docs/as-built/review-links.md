@@ -2273,18 +2273,22 @@ Closed staff questions without a saved answer stay outside the migration.
 #### Question items in the Studio
 
 The List saves the question kind and native source key when it files a question item.
-For an old item, the List checks the original link before it saves the source key.
+Conversion resolves the original source of a legacy question and saves its key.
+The loader reports a question item without a saved source key as a conversion error.
 Replies on Changes, Bugs, and Investigations keep the ordinary List workflow.
 A question to Nate starts in **Waiting for nate** and appears under **Questions**.
 **Answer question** opens the answer window in the item.
 After Nate answers, the item shows **Working** until the asker closes it.
 The asker can use `the_list close` while that question is **Working**.
 A question Nate sends from **New item** starts in **Working**.
-Send and restart recovery file the question before they claim the first notice.
+Send and restart recovery file the question with the stable request key from the locked submission.
+They read the saved List item and verify its question source before they claim the first notice.
+The pending delivery marker remains if the saved item cannot confirm that source.
 A reply to the native question or a Studio follow-up changes the item from **Working** to **Answered**.
-A reply to another linked question puts the **Working** item under **Answers**.
-**Mark read** clears that reply and keeps the item **Working**.
-The **Answers** filter includes parked **Answered** items.
+An unread reply puts a question item under **Answers** in every state, including **Closed** and **Waiting for nate**.
+Only **Mark read** clears a reply mark.
+The reply mark stays when Nate answers the original question or the asker closes it.
+The **Answers** filter includes parked question items with an unread reply.
 An **Answered** item shows the words box and **Mark read** even when another question awaits a reply.
 **Mark read** saves any words beside the button for delivery to the question owner.
 It closes Nate's own question with “Read by nate” or returns a question to Nate to **Working**.
@@ -2343,7 +2347,7 @@ The writer rereads the source under its filing lock.
 The List allocator records the destination before it advances the counter.
 The writer saves pending exchanges before it writes the List item.
 A new unread Review answer adds one log entry with its words, time, and author in the same save.
-The Studio shows **New answer** under **Answers** for a question item.
+The Studio shows **New answer** under **Answers** while the reply mark remains.
 An ordinary item uses **Needs me**.
 Mark read clears the mark and keeps the log entry.
 A reply to a question asked on the List keeps its existing route.

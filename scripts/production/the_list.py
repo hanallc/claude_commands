@@ -737,8 +737,16 @@ class ListItem:
     def question_kind(self) -> QuestionItemKind | NoQuestionItem:
         return self.native_question.kind if isinstance(self.native_question, NativeQuestionItem) else self.native_question
 
+    @property
+    def unread_at(self) -> Timestamp:
+        if isinstance(self.native_question, NativeQuestionItem) and self.unread_since is NoTimestamp.UNSET:
+            return max((change.time for change in _unread_question_replies(self)), default=NoTimestamp.UNSET)
+        return self.unread_since
+
     def __post_init__(self) -> None:
         if self.state != ItemState.CLOSED or not isinstance(self.unread_since, datetime):
+            return
+        if isinstance(self.native_question, NativeQuestionItem) and next(_unread_question_replies(self), None) is not None:
             return
         # A Closed item can have an unread answer after its last close.
         for entry in reversed(self.log):
@@ -2137,55 +2145,65 @@ def _read_native_question(fields: dict[str, str], exchanges: tuple[list_exchange
         if "question_source_key" in fields:
             raise ListError("A question source needs a question kind.")
         return NoQuestionItem.ORDINARY
-    kind = QuestionItemKind(fields["question_kind"])
-    origins = {origin for origin in _native_question_origins(exchanges) if origin.kind is kind}
-    if "question_source_key" in fields:
-        origins &= {NativeQuestionItem(kind, fields["question_source_key"])}
-    if len(origins) != 1:
-        raise ListError("The question item needs one native source.")
-    return origins.pop()
+    if "question_source_key" not in fields:
+        raise ListError("Convert the question item to save its source key.")
+    origin = NativeQuestionItem(QuestionItemKind(fields["question_kind"]), fields["question_source_key"])
+    if not any(exchange.source_key == origin.source_key and native_question_kind(exchange) is origin.kind
+               for exchange in exchanges):
+        raise ListError("The saved question source does not match a filed exchange.")
+    return origin
+
+
+def _decode_item(store: record_store.NumberedRecords, fields: dict[str, str], body: str,
+                 exchanges: tuple[list_exchange.FiledExchange, ...],
+                 origin: NativeQuestionItem | NoQuestionItem) -> ListItem:
+    marker = "## Next step\n\n"
+    if not body.startswith(marker):
+        raise ListError("missing Next step section")
+    body = body[len(marker):]
+    texts: list[str] = []
+    for key, name in (("next_step", "Latest status"), ("latest_status", "Evidence"),
+                      ("evidence", "Done when"), ("done_when", "Log")):
+        text, body = record_store.split_section(body, int(fields[key + "_length"]), name)
+        texts.append(text)
+    log_lines = body.removesuffix("\n").split("\n") if body else []
+    number = int(fields["number"])
+    legacy_allowance = cache(series_run_limit)
+    schedule = _read_schedule(cast(object, json.loads(fields.get("schedule", "null"))), legacy_allowance)
+
+    def read_log_schedule(raw: object) -> Schedule:
+        return _read_schedule(raw, lambda: schedule.run_allowance if isinstance(schedule, ScheduledSeries) else legacy_allowance())
+
+    changes = tuple(_read_log_line(line.removesuffix("\r"), number, read_log_schedule) for line in log_lines)
+    return ListItem(number, fields["title"],
+                    UnassignedOwner(fields["owner"]) if fields["owner"] in UnassignedOwner else staff.StaffId(fields["owner"]),
+                    staff.StaffId(fields.get("producer", store.owner)),
+                    fields["unit"], _item_state(fields["state"]), next_check_value(fields["next_check"]),
+                    _read_eta(fields["eta"], fields["eta_kind"]),
+                    time_value(fields["unread_since"]), parking_value(fields["parked_until"]),
+                    _dependencies(cast(object, json.loads(fields["blocked_by"]))),
+                    _related(cast(object, json.loads(fields["related_to"]))), _requester(fields["requested_by"]),
+                    time_value(fields["opened"]), time_value(fields["updated"]), time_value(fields["closed"]),
+                    fields["closing_words"], texts[0], texts[1], texts[2], texts[3], changes,
+                    _review_keys(cast(object, json.loads(fields.get("reviews", "[]")))),
+                    delivery_state.read_list_questions(fields.get("questions", "[]")), schedule,
+                    _read_run_deliveries(fields), list_draft.read_list_draft(fields),
+                    _read_asks(fields.get("asks", "[]")), _read_report(fields.get("report", "")),
+                    exchanges, origin)
+
+
+def _checked_item(identity: str, item: ListItem) -> ListItem:
+    if item.id != identity or not item.log:
+        raise ListError("the item number must match its path and the log must not be empty")
+    _validate(item)
+    return item
 
 
 def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[str, str], body: str) -> ListItem:
     try:
-        marker = "## Next step\n\n"
-        if not body.startswith(marker):
-            raise ListError("missing Next step section")
-        body = body[len(marker):]
-        texts: list[str] = []
-        for key, name in (("next_step", "Latest status"), ("latest_status", "Evidence"),
-                          ("evidence", "Done when"), ("done_when", "Log")):
-            text, body = record_store.split_section(body, int(fields[key + "_length"]), name)
-            texts.append(text)
-        log_lines = body.removesuffix("\n").split("\n") if body else []
-        number = int(fields["number"])
-        legacy_allowance = cache(series_run_limit)
-        schedule = _read_schedule(cast(object, json.loads(fields.get("schedule", "null"))), legacy_allowance)
-
-        def read_log_schedule(raw: object) -> Schedule:
-            return _read_schedule(raw, lambda: schedule.run_allowance if isinstance(schedule, ScheduledSeries) else legacy_allowance())
-
-        changes = tuple(_read_log_line(line.removesuffix("\r"), number, read_log_schedule) for line in log_lines)
         exchanges = list_exchange.decode(fields.get("filed_exchanges", "[]"))
-        item = ListItem(number, fields["title"],
-                        UnassignedOwner(fields["owner"]) if fields["owner"] in UnassignedOwner else staff.StaffId(fields["owner"]),
-                        staff.StaffId(fields.get("producer", store.owner)),
-                        fields["unit"], _item_state(fields["state"]), next_check_value(fields["next_check"]),
-                        _read_eta(fields["eta"], fields["eta_kind"]),
-                        time_value(fields["unread_since"]), parking_value(fields["parked_until"]),
-                        _dependencies(cast(object, json.loads(fields["blocked_by"]))),
-                        _related(cast(object, json.loads(fields["related_to"]))), _requester(fields["requested_by"]),
-                        time_value(fields["opened"]), time_value(fields["updated"]), time_value(fields["closed"]),
-                        fields["closing_words"], texts[0], texts[1], texts[2], texts[3], changes,
-                        _review_keys(cast(object, json.loads(fields.get("reviews", "[]")))),
-                        delivery_state.read_list_questions(fields.get("questions", "[]")), schedule,
-                        _read_run_deliveries(fields), list_draft.read_list_draft(fields),
-                        _read_asks(fields.get("asks", "[]")), _read_report(fields.get("report", "")),
-                        exchanges, _read_native_question(fields, exchanges))
-        if item.id != identity or not changes:
-            raise ListError("the item number must match its path and the log must not be empty")
-        _validate(item)
-        return item
+        origin = _read_native_question(fields, exchanges)
+        return _checked_item(identity, _decode_item(store, fields, body, exchanges, origin))
     except (ValueError, KeyError, TypeError) as error:
         raise store.invalid(identity, error) from None
 
@@ -2580,15 +2598,17 @@ def _move_question(item: ListItem, move: QuestionMove, state: ItemState, moment:
     _require_question_move(item, move, state)
     if state is item.state:
         return item
+    replies_unread = move is not QuestionMove.READ and bool(unread_answer_ids(item))
     if state is ItemState.CLOSED:
         event = FieldChange("Closed", {"closing_words": closing_words})
         item = replace(item, state=state, closed=moment, closing_words=closing_words,
-                       unread_since=NoTimestamp.UNSET, parked_until=NoTimestamp.UNSET)
+                       unread_since=item.unread_since if replies_unread else NoTimestamp.UNSET,
+                       parked_until=NoTimestamp.UNSET)
     else:
         event = FieldChange("Updated", {"state": state})
         unread = (moment if state in (ItemState.WAITING_FOR_NATE, ItemState.ANSWERED)
                   and not isinstance(item.unread_since, datetime) else item.unread_since)
-        if state is ItemState.WORKING:
+        if state is ItemState.WORKING and not replies_unread:
             unread = NoTimestamp.UNSET
         item = replace(item, state=state, closed=NoTimestamp.UNSET, closing_words="", unread_since=unread)
     return replace(item, updated=max(moment, item.updated), log=(*item.log, ItemChange(moment, event, source)))
@@ -2629,8 +2649,8 @@ def _acknowledged_exchanges(item: ListItem) -> frozenset[ReturnedAnswerId]:
                      if isinstance(entry.what, ReturnedAnswer) and entry.what.identity not in unread)
 
 
-def _file_question_kind(item: ListItem, before: ListItem, filing: QuestionFiling) -> ListItem:
-    origin = _legacy_question_origin(item)
+def _file_question_kind(item: ListItem, before: ListItem, filing: QuestionFiling,
+                        origin: NativeQuestionItem | NoQuestionItem) -> ListItem:
     if not isinstance(origin, NativeQuestionItem):
         return item
     item = replace(item, native_question=origin)
@@ -2653,7 +2673,7 @@ def project_question_migration(item: ListItem, exchanges: tuple[list_exchange.Fi
         item = _with_filed_exchanges(item, exchanges, QuestionFiling.HISTORY)
     origin = item.native_question
     if origin is NoQuestionItem.ORDINARY:
-        return _file_question_kind(item, item, QuestionFiling.HISTORY)
+        return _file_question_kind(item, item, QuestionFiling.HISTORY, _legacy_question_origin(item))
     if (origin.kind is QuestionItemKind.FROM_NATE and item.state is ItemState.CLOSED
             and any(isinstance(answer, str) or answer.source_key == origin.source_key for answer in unread_answer_ids(item))):
         return _move_question(item, QuestionMove.FILE, ItemState.ANSWERED, now())
@@ -2661,7 +2681,8 @@ def project_question_migration(item: ListItem, exchanges: tuple[list_exchange.Fi
 
 
 def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.FiledExchange, ...],
-                          filing: QuestionFiling) -> ListItem:
+                          filing: QuestionFiling,
+                          submission_question: NativeQuestionItem | NoQuestionItem = NoQuestionItem.ORDINARY) -> ListItem:
     saved = {(exchange.source_key, exchange.exchange_id): exchange for exchange in item.filed_exchanges}
     returns: list[ItemChange] = []
     for exchange in exchanges:
@@ -2686,7 +2707,9 @@ def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.FiledEx
         changed = replace(changed, log=(*item.log, *returns), updated=max(item.updated, latest), unread_since=unread_since)
     origin = item.native_question
     if origin is NoQuestionItem.ORDINARY:
-        return _file_question_kind(changed, item, filing)
+        origin = (_legacy_question_origin(changed) if submission_question is NoQuestionItem.ORDINARY
+                  else submission_question)
+        return _file_question_kind(changed, item, filing, origin)
     native = question_item_exchanges(changed)
     if not any(exchange.source_key == origin.source_key for exchange in exchanges):
         return changed
@@ -2863,7 +2886,8 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
                    linked: investigation.ListDestination | NextNumber,
                    owner: staff.StaffId, members: staff.StaffSnapshot,
                    question_filing: QuestionFiling = QuestionFiling.LIVE,
-                   unresolved_reply_ids: frozenset[str] = _NO_UNRESOLVED_REPLIES) -> investigation.ListDestination:
+                   unresolved_reply_ids: frozenset[str] = _NO_UNRESOLVED_REPLIES,
+                   submission_question: NativeQuestionItem | NoQuestionItem = NoQuestionItem.ORDINARY) -> investigation.ListDestination:
     """Save one source and publish its receipt after the List row is durable."""
     key, reservation = source.key, source.reservation
     if not exchanges or any(exchange.source_key != key for exchange in exchanges):
@@ -2910,6 +2934,10 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
         candidate = tuple(exchange for exchange in candidate if exchange.exchange_id not in conflicts)
         if not candidate:
             raise ConflictingExchangeReplies("The exchanges claim the same reply.")
+        if isinstance(submission_question, NativeQuestionItem):
+            if (item is None or item.native_question not in (NoQuestionItem.ORDINARY, submission_question)
+                    or submission_question not in _native_question_origins(candidate)):
+                raise ListError(f"{identity}: the filed question does not match the submission source.")
         disputed_pending = tuple(exchange for exchange in pending if exchange.exchange_id in conflicts)
         staged = (*candidate, *disputed_pending)
         safe_history = tuple(exchange for exchange in history if exchange.exchange_id not in conflicts)
@@ -2920,7 +2948,7 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
             item = _save_new_exchanges(store, destination.number, title, owner, report_route(owner, members),
                                        candidate, question_filing)
         else:
-            item = _save_linked_exchanges(store, item, candidate, question_filing)
+            item = _save_linked_exchanges(store, item, candidate, question_filing, submission_question)
         saved = tuple(exchange for exchange in item.filed_exchanges if exchange.source_key == key)
         confirmed = confirmed_exchanges(key, destination, saved)
         receipted = tuple(exchange for exchange in saved if exchange.exchange_id not in conflicts or exchange in confirmed)
@@ -2936,8 +2964,9 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
 
 
 def _save_linked_exchanges(store: record_store.NumberedRecords, item: ListItem,
-                          exchanges: tuple[list_exchange.FiledExchange, ...], filing: QuestionFiling) -> ListItem:
-    changed = _with_filed_exchanges(item, exchanges, filing)
+                          exchanges: tuple[list_exchange.FiledExchange, ...], filing: QuestionFiling,
+                          submission_question: NativeQuestionItem | NoQuestionItem) -> ListItem:
+    changed = _with_filed_exchanges(item, exchanges, filing, submission_question)
     if changed != item:
         with record_store.keep_file_on_error(store.path(item.id)):
             _save(store, changed)
@@ -2954,6 +2983,29 @@ def _save_new_exchanges(store: record_store.NumberedRecords, number: int, title:
     with record_store.keep_file_on_error(store.path(item.id)):
         _save(store, item)
     return item
+
+
+def convert_legacy_question_sources(keeper: staff.StaffId) -> None:
+    """Resolve the original source of each question that lacks a saved key."""
+    store = _store(keeper)
+    paths = tuple(store.folder().glob("L*.md"))
+    if not paths:
+        return
+    with store.locked():
+        for path in paths:
+            identity = path.stem
+            fields, body = store.read(identity)
+            if "question_kind" not in fields or "question_source_key" in fields:
+                continue
+            exchanges = list_exchange.decode(fields.get("filed_exchanges", "[]"))
+            item = _decode_item(store, fields, body, exchanges, NoQuestionItem.ORDINARY)
+            origin = _legacy_question_origin(item)
+            if not isinstance(origin, NativeQuestionItem) or origin.kind != QuestionItemKind(fields["question_kind"]):
+                raise ListError(f"{identity}: cannot resolve the original question source.")
+            fields["question_source_key"] = origin.source_key
+            _ = _read_item(store, identity, fields, body)
+            with record_store.keep_file_on_error(path):
+                store.write(identity, fields, body)
 
 
 def migrate_question_item(keeper: staff.StaffId, identity: str) -> None:
@@ -3203,7 +3255,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             changed = _settle_run_confirmations(changed, moment)
         entries: list[ItemChange] = []
         schedule_changed = _schedule_fields(item.schedule) != _schedule_fields(changed.schedule)
-        if changed != item or schedule_changed:
+        reads_question = question_move is QuestionMove.READ and isinstance(item.native_question, NativeQuestionItem)
+        if changed != item or schedule_changed or reads_question:
             event = what(changed) if callable(what) else what
             if isinstance(event, FieldChange) and schedule_changed:
                 log_fields: LogFields = {**event.fields, "schedule": changed.schedule}
@@ -3216,7 +3269,10 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             if follow is not None:
                 entries.extend(follow(item, changed, moment))
             stays_unread = unread(changed) if callable(unread) else unread
-            changed = replace(changed, updated=moment, unread_since=moment if stays_unread else NoTimestamp.UNSET)
+            keep_reply_update = (not reads_question and isinstance(item.native_question, NativeQuestionItem)
+                                 and bool(unread_answer_ids(item)))
+            unread_since = moment if stays_unread else item.unread_since if keep_reply_update else NoTimestamp.UNSET
+            changed = replace(changed, updated=moment, unread_since=unread_since)
             if (isinstance(event, FieldChange) and event.action == "Updated"
                     and event.fields.get("state") == ItemState.DELIVERED
                     and changed.parked_until is ParkUntilDelivered.DELIVERED):
@@ -4314,11 +4370,12 @@ def _is_tell_move(log: tuple[ItemChange, ...], index: int) -> bool:
 
 def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
     """Keep an update identity stable when page feedback adds log entries."""
-    if not isinstance(item.unread_since, datetime):
+    since = item.unread_at
+    if not isinstance(since, datetime):
         return NoUnreadUpdate.ABSENT
     changes = [(index, entry.time.isoformat(), _unread_log_content(entry.what), entry.source) for index, entry in enumerate(item.log)
                if not (_own_page_entry(entry) or _is_tell_move(item.log, index))]
-    text = json.dumps((item.unread_since.isoformat(), changes), ensure_ascii=False)
+    text = json.dumps((since.isoformat(), changes), ensure_ascii=False)
     return UnreadUpdate(hashlib.sha256(text.encode()).hexdigest())
 
 
@@ -4350,11 +4407,23 @@ def _unread_changes(item: ListItem, *, include_park_receipts: bool = False) -> G
             return
 
 
+def _unread_question_replies(item: ListItem) -> Iterator[ItemChange]:
+    for change in reversed(item.log):
+        if change.source == _IMAGE_ANSWER_SOURCE:
+            continue
+        if isinstance(change.what, MarkedRead) or change.what == "Marked read":
+            return
+        if isinstance(change.what, (QuestionAnswered, ReturnedAnswer)):
+            yield change
+
+
 def unread_answer_ids(item: ListItem) -> frozenset[UnreadAnswerId]:
-    """Find unread answers after accounting for parking actions."""
+    """Find replies that still need acknowledgment."""
+    question = isinstance(item.native_question, NativeQuestionItem)
     read_times: list[datetime] = []
     answers: set[UnreadAnswerId] = set()
-    for change in _unread_changes(item, include_park_receipts=True):
+    changes = _unread_question_replies(item) if question else _unread_changes(item, include_park_receipts=True)
+    for change in changes:
         content = change.what
         if isinstance(content, (QuestionAnswered, ReturnedAnswer)):
             if question_path.answer_is_unread(change.time, read_times):
@@ -4371,9 +4440,9 @@ def _clear_unread(item: ListItem) -> ListItem:
 
 
 def question_can_mark_read(item: ListItem, unread_answers: frozenset[UnreadAnswerId]) -> bool:
-    """Allow acknowledgment of answers while the native question is open."""
+    """Allow acknowledgment of a reply in every question state."""
     return (item.question_kind is not NoQuestionItem.ORDINARY
-            and (item.state is ItemState.ANSWERED or item.state is ItemState.WORKING and bool(unread_answers)))
+            and (item.state is ItemState.ANSWERED or bool(unread_answers)))
 
 
 def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
@@ -4399,7 +4468,7 @@ def mark_read_edit(keeper: staff.StaffId, identity: str, *, source: str,
                 if isinstance(item.owner, UnassignedOwner):
                     raise ListError("The question has no owner for your words.")
                 console_text.require(page_request.words, "list field", refusal=ListError)
-            if item.state is ItemState.WORKING:
+            if item.state is not ItemState.ANSWERED:
                 return _clear_unread(item)
             state = ItemState.WORKING if item.question_kind is QuestionItemKind.TO_NATE else ItemState.CLOSED
             return _move_question(item, QuestionMove.READ, state, moment, source, closing_words="Read by nate")
@@ -4471,6 +4540,8 @@ def give_go(keeper: staff.StaffId, identity: str, ask_id: str, go_id: str, *, so
 
     def stays_unread(changed: ListItem) -> bool:
         # Another open ask or an unread change other than an ask or a Go keeps the item unread.
+        if isinstance(changed.native_question, NativeQuestionItem) and unread_answer_ids(changed):
+            return True
         return bool(answerable_asks(changed, staff.snapshot())) or any(
             not isinstance(change.what, (AskOpened, GoGiven)) for change in _unread_changes(changed))
 

@@ -1796,6 +1796,48 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(notice["rows"], [item.id])
         self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
 
+    def test_restart_defers_the_studio_notice_until_the_saved_question_returns(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        backup = self.root / "question-backup.md"
+        save_row = the_list._save  # pyright: ignore[reportPrivateUsage]
+
+        def remove_question_after_save(store: record_store.NumberedRecords, item: the_list.ListItem) -> None:
+            save_row(store, item)
+            _ = saved.path.rename(backup)
+
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO())):
+            with patch.object(the_list, "_save", side_effect=remove_question_after_save):
+                response = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(response.status, 503, response.body)
+            item, = the_list.records(keeper.id)
+            self.assertIs(item.native_question, the_list.NoQuestionItem.ORDINARY)
+            self.assertFalse(saved.path.exists())
+            pending, = review_submissions.pending_initial_deliveries(case.root)
+            restarted = change_page.DeliveryStatus(case.root)
+            with patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim:
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                claim.assert_not_called()
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(read_new_item_notices(log), [])
+            _ = backup.rename(saved.path)
+            with patch.object(the_list, "_submitted_question_origin", side_effect=AssertionError("Use the locked request.")):
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        typed, = the_list.records(keeper.id)
+        self.assertEqual(typed.id, item.id)
+        self.assertEqual(typed.native_question, the_list.NativeQuestionItem(
+            the_list.QuestionItemKind.FROM_NATE, f"submission/question/{pending.address.request_id}"))
+        self.assertEqual(len(read_new_item_notices(log)), 1)
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
     def check_list_notice_recovery(self, *, stop_before_row: bool, retire_producer: bool = False,
                                    authority_unavailable: bool = False, answered_marker: bool = False) -> None:
         case = self.review_fixture()

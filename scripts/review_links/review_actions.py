@@ -492,23 +492,32 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
         review_submissions.skip_list_filing(saved, str(error))
         return
     if isinstance(record, update_registration.QuestionRecord):
+        if not saved.path.is_file():
+            raise OSError(f"Cannot find the saved question {saved.id}.")
+        origin = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE,
+                                             f"submission/question/{saved.request_id}")
         destination = investigation.ListDestination(route["keeper"], number)
-        file_question = cast(Callable[[review_submissions.SavedSubmission, investigation.ListDestination,
+        file_question = cast(Callable[[update_registration.QuestionRecord, the_list.NativeQuestionItem,
+                                       investigation.ListDestination,
                                        staff.StaffSnapshot], None],
                              import_module("scripts.review_links.answer_sources").file_list_submission_question)
-        file_question(saved, destination, staff.snapshot())
+        file_question(record, origin, destination, staff.snapshot())
+        if the_list.load(destination.keeper, f"L{number}").native_question != origin:
+            raise OSError(f"Cannot confirm the question source for L{number}.")
 
 
 def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus,
                                claims: ExitStack, *, words: str = "", evidence_page: str = ""
                                ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
-    # Finish the List row under the recipient locks before taking the delivery lock.
-    ensure_submission_list_item(address)
+    if address.kind is not new_item_dialog.SubmissionKind.QUESTION:
+        ensure_submission_list_item(address)
 
     with status.locked(), review_submissions.submission_for_delivery(address) as located:
         if isinstance(located, review_submissions.NoNativeSubmission):
             return change_page.NoMessageDelivery()
         saved = located.saved()
+        if address.kind is new_item_dialog.SubmissionKind.QUESTION:
+            _ensure_list_filing(saved)
         if not saved.awaiting_reply:
             review_submissions.clear_initial_delivery(address)
             return change_page.NoMessageDelivery()
