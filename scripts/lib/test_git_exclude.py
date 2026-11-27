@@ -109,7 +109,7 @@ class GitExcludeTests(UnitConfigFixture):
                          "projects/sample/session.jsonl", "projects/sample/session/tool-results/result.txt",
                          "sessions/session.json", "state/session/session.json", "history.jsonl",
                          "file-history/session/file", "session-env/session/file", "shell-snapshots/shell.sh",
-                         "paste-cache/file", "uploads/file", "config/showrunners.json", "config/accounts.lock",
+                         "paste-cache/file", "uploads/file", "config/showrunners.json",
                          "config/models.conf.tmp"):
             with self.subTest(path=relative):
                 if relative == notes:
@@ -117,3 +117,5 @@ class GitExcludeTests(UnitConfigFixture):
                     ensure_exact_excluded(self.worktree, notes)
                     self.assertIn("/" + notes, self.exclude.read_text().splitlines())
                 require_untracked_ignored(self.worktree, relative)
+        with self.assertRaisesRegex(ExcludeRefused, "not ignored"):
+            require_untracked_ignored(self.worktree, "config/accounts.lock")

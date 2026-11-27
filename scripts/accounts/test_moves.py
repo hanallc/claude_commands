@@ -354,8 +354,8 @@ class MoveJournalTests(unittest.TestCase):
         notes.mkdir(parents=True)
         _ = (notes / "claude2.md").write_text("---\nlogin: source@example.invalid\n---\n")
         _ = (notes / "claude3.md").write_text("---\nlogin: later@example.invalid\n---\n")
-        configuration = self.home / ".claude/config/accounts.json"
-        configuration.parent.mkdir(parents=True)
+        configuration = worker_names.migrated_accounts_state(self.home).file
+        configuration.parent.mkdir(parents=True, exist_ok=True)
         _ = configuration.write_text(json.dumps({"home_cutovers": [{"at": "2026-10-14T00:00:00Z",
             "label": "claude3", "login": "later@example.invalid"}]}))
         record = self.home / ".local/state/shutdown/session.json"
@@ -394,7 +394,7 @@ class MoveJournalTests(unittest.TestCase):
         self.assertEqual(roles.read_bytes(), role_bytes)
 
     def test_codex_home_cutover_resolves_only_earlier_moves_and_never_uses_claude_evidence(self) -> None:
-        configuration = self.home / ".claude/config/accounts.json"
+        configuration = worker_names.legacy_accounts_state(self.home).file
         configuration.parent.mkdir(parents=True)
         evidence = {"home_cutovers": [
             {"at": "2026-10-12T00:00:00Z", "label": "claude4", "login": "claude@example.invalid"},
@@ -430,6 +430,10 @@ class MoveJournalTests(unittest.TestCase):
             self.assertEqual(unresolved.home, home)
         self.assertEqual(path.read_text(), original)
         self.assertEqual(configuration.read_bytes(), config_before)
+        migrated = worker_names.migrate_accounts_state()
+        self.assertEqual(moves.read_journal(), loaded)
+        self.assertEqual(migrated.file.read_bytes(), config_before)
+        self.assertFalse(configuration.exists())
 
     def test_codex_home_spelling_without_a_cutover_remains_unresolved_despite_todays_login(self) -> None:
         path = moves.store_file()

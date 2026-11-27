@@ -39,7 +39,7 @@ from scripts.whoami import account
 from scripts.whoami import usage_store
 from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import read_note
-from scripts.accounts import accounts, moves, next_moves, role_map
+from scripts.accounts import accounts, moves, next_moves, role_map, worker_names
 from scripts.production import showrunners
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 
@@ -202,9 +202,9 @@ class QuotaReminderFixture(unittest.TestCase):
 
     def prepare_files(self) -> None:
         """Write the immutable starting account and registry documents."""
-        (self.root / ".claude/config").mkdir(parents=True)
-        _ = (self.root / ".claude/config/accounts.json").write_text(
-            json.dumps({"workers": "codex1"}))
+        state = worker_names.migrated_accounts_state(self.root)
+        state.file.parent.mkdir(parents=True)
+        _ = state.file.write_text(json.dumps({"workers": "codex1"}))
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "someone@example.com"}}))
         codex_home = self.root / ".codex"
         codex_home.mkdir()

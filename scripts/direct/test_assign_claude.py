@@ -16,6 +16,7 @@ from unittest.mock import patch
 from scripts.whoami.account_test_support import write_codex_auth
 from typing import ClassVar, cast
 
+from scripts.accounts import worker_names
 from scripts.direct import assign_claude_test_support as support
 from scripts.lib.test_models_registry import RegistryReadProbe
 from scripts.lib import models_registry, process_group, process_start, unit_runs
@@ -29,9 +30,9 @@ from scripts.production.cli_fixture import process_boundary
 
 def configure_pane_account(home: Path, notes: Path) -> None:
     """Give the child command a signed-in private worker account."""
-    configuration = home / ".claude/config"
-    configuration.mkdir(parents=True, exist_ok=True)
-    _ = (configuration / "accounts.json").write_text(json.dumps({"workers": "codex1"}))
+    state = worker_names.migrated_accounts_state(home)
+    state.file.parent.mkdir(parents=True, exist_ok=True)
+    _ = state.file.write_text(json.dumps({"workers": "codex1"}))
     notes.mkdir(parents=True, exist_ok=True)
     _ = (notes / "codex1.md").write_text("---\nlogin: worker@example.invalid\n---\n")
     account = home / ".codex"

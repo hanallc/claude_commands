@@ -204,14 +204,22 @@ Status, launch, and preview reads never create a selection.
 | State | Location |
 | --- | --- |
 | Claude groups | `~/.local/state/accounts/groups.json` |
-| Worker selection | `~/.claude/config/accounts.json` |
+| Worker selection and local cutovers | `~/.local/state/accounts/accounts.json` |
+| Account state lock | `~/.local/state/accounts/accounts.lock` |
 | Role change history | `~/.local/state/accounts/roles.jsonl` |
 | Peer role-map cache | `~/.local/state/accounts/role_map_cache.json` |
 | Ordered account moves | `~/.local/state/accounts/next_moves.json` |
 
 All role readers and writers use `role_map.py`.
 A command reuses one map observation.
+A local command reads the map again when the account state path changes.
 Mac writes use the shared SSH transport to natedev.
+
+On each machine, `accounts.py migrate-accounts-state` moves the full local document under the old lock.
+Run it after both machines update and restart the processes that read the account state.
+Until the command publishes the new path, the old document and lock remain active.
+The command creates an empty document when the old file is absent.
+After publication, the command removes the old lock.
 The authority locks the selection and history together.
 A failed transaction restores the prior selection and history length.
 A failed peer write never creates an independent local choice.

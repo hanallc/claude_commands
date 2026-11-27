@@ -79,8 +79,17 @@ def _is_number(value: str) -> bool:
         return False
 
 
+_UNTRACKED_RUNTIME_RULE = "untracked runtime file"
+
+
 def check_format(root: Path, files: Sequence[Path]) -> list[Violation]:
     violations = [Violation(path, 0, "format", path.name) for path in files if path.suffix != ".conf"]
+    tracked = set(files)
+    for path in sorted((root / "config").rglob("*")):
+        if path.suffix in {".json", ".lock"} and path.is_file():
+            relative = path.relative_to(root)
+            if relative not in tracked:
+                violations.append(Violation(relative, 0, _UNTRACKED_RUNTIME_RULE, relative.name))
     for path, lines in _conf_lines(root, files):
         for number, line in enumerate(lines, start=1):
             if _without_comment(line) and not _is_section(line):
@@ -889,20 +898,31 @@ def _code_problems(root: Path, files: Sequence[Path]) -> Iterator[str]:
         yield "literal: several inventory rows classify the same constant"
 
 
+class _TrackedFormFiles(NamedTuple):
+    config: list[Path]
+    code: list[Path]
+
+
+def _tracked_form_files(root: Path) -> _TrackedFormFiles:
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z", "config/", "scripts/"], cwd=root, check=True, capture_output=True,
+        text=True, timeout=TEST_HANG_GUARD_SECS,
+    )
+    paths = tracked.stdout.split("\0")
+    return _TrackedFormFiles(
+        [Path(path) for path in paths if path.startswith("config/")],
+        [Path(path) for path in paths if path.startswith("scripts/")],
+    )
+
+
 class ConfigFormTests(unittest.TestCase):
     def test_repository_form(self) -> None:
         root = Path(__file__).resolve().parents[2]
-        tracked = subprocess.run(
-            ["git", "ls-files", "-z", "config/", "scripts/"], cwd=root, check=True, capture_output=True,
-            text=True, timeout=TEST_HANG_GUARD_SECS,
-        )
-        tracked_files = tracked.stdout.split("\0")
-        files = [Path(path) for path in tracked_files if path.startswith("config/")]
-        code_files = [Path(path) for path in tracked_files if path.startswith("scripts/")]
-
+        files, code_files = _tracked_form_files(root)
         # Collect violations before applying exceptions. This also finds stale exceptions.
         format_violations = check_format(root, files)
-        suffix_violations = [violation for violation in format_violations if violation.line_number == 0]
+        suffix_violations = [violation for violation in format_violations
+                             if violation.line_number == 0 and violation.rule == "format"]
         row_violations = [violation for violation in format_violations if violation.line_number != 0]
         key_violations = check_key_form(root, files)
         all_violations = (
@@ -914,7 +934,8 @@ class ConfigFormTests(unittest.TestCase):
             ("blank line", check_blank_lines(root, files), exceptions.BLANK_LINE_FILES),
         )
         covered: set[Violation] = set()
-        problems: list[str] = []
+        problems = [violation.diagnostic() for violation in format_violations
+                    if violation.rule == _UNTRACKED_RUNTIME_RULE]
         for rule, violations, allowed_files in all_violations:
             for entry in allowed_files:
                 path = Path(entry.path)
@@ -947,10 +968,34 @@ class ConfigFormTests(unittest.TestCase):
         if problems:
             self.fail("\n".join(problems))
 
+    def test_repository_format_reports_untracked_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            _ = subprocess.run(["git", "init", "-q"], cwd=root, check=True, timeout=TEST_HANG_GUARD_SECS)
+            config = root / "config"
+            config.mkdir()
+            _ = (config / "data.json").write_text("{}\n", encoding="utf-8")
+            _ = subprocess.run(
+                ["git", "add", "-f", "config/data.json"], cwd=root, check=True, timeout=TEST_HANG_GUARD_SECS,
+            )
+            _ = (config / "x.json").write_text("{}\n", encoding="utf-8")
+            (config / "x.lock").touch()
+            expected = [
+                Violation(Path("config/data.json"), 0, "format", "data.json"),
+                Violation(Path("config/x.json"), 0, "untracked runtime file", "x.json"),
+                Violation(Path("config/x.lock"), 0, "untracked runtime file", "x.lock"),
+            ]
+            with self.subTest(ignored=False):
+                self.assertEqual(check_format(root, _tracked_form_files(root).config), expected)
+            _ = (root / ".gitignore").write_text("/config/x.json\n/config/x.lock\n", encoding="utf-8")
+            with self.subTest(ignored=True):
+                self.assertEqual(check_format(root, _tracked_form_files(root).config), expected)
+
     def test_planted_violations(self) -> None:
         large_number_row = f"amount={'9' * 310}"
         cases = (
             (check_format, "bad.ini", "value=text\n", 0, "format", "bad.ini"),
+            (check_format, "runtime.lock", "", 0, "untracked runtime file", "runtime.lock"),
             (check_format, "example.conf", "marker: done\n", 1, "format", "marker: done"),
             (check_key_form, "example.conf", "# Setting\nfeature.BadName=value\n", 2,
              "key form", "feature.BadName=value"),
@@ -1017,7 +1062,7 @@ class ConfigFormTests(unittest.TestCase):
                 path = Path("scripts" if Path(name).suffix in {".py", ".sh"} else "config") / name
                 (root / path).parent.mkdir()
                 _ = (root / path).write_text(source, encoding="utf-8")
-                files = [path]
+                files = [] if rule == _UNTRACKED_RUNTIME_RULE else [path]
                 if path.suffix == ".conf" and check is not check_format:
                     data = path.with_suffix(".md")
                     _ = (root / data).write_text(source, encoding="utf-8")

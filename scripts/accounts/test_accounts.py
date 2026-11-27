@@ -2031,19 +2031,21 @@ class AccountsTests(unittest.TestCase):
         history = accounts.roles_history_file()
         original = json.dumps({"role": "seats", "label": "codex1"}) + "\n"
         _ = history.write_text(original)
-        config = self.root / "selected-config" / "accounts.json"
+        state = worker_names.migrated_accounts_state(self.home)
+        state.file.parent.mkdir(parents=True, exist_ok=True)
+        _ = state.file.write_text("{}\n")
         flock = fcntl.flock
 
         def acquire_without_waiting(descriptor: int, operation: int) -> None:
             flock(descriptor, operation | fcntl.LOCK_NB)
 
-        with patch.object(worker_names, "accounts_config_file", return_value=config):
-            with worker_names.roles_lock():
-                with patch.object(fcntl, "flock", side_effect=acquire_without_waiting):
-                    with self.assertRaises(BlockingIOError):
-                        _ = worker_names.role_history_lines(history)
-                self.assertEqual(history.read_text(), original)
-            lines = worker_names.role_history_lines(history)
+        with worker_names.roles_lock() as locked:
+            self.assertEqual(locked, state)
+            with patch.object(fcntl, "flock", side_effect=acquire_without_waiting):
+                with self.assertRaises(BlockingIOError):
+                    _ = worker_names.role_history_lines(history)
+            self.assertEqual(history.read_text(), original)
+        lines = worker_names.role_history_lines(history)
         self.assertEqual(json.loads(lines[0])["role"], "workers")
 
     def test_exec_default_removes_inherited_config_directory_and_oauth_token(self) -> None:
@@ -5229,11 +5231,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             ),
             encoding="utf-8",
         )
-        config_dir = self.main_dir / "config"
-        _ = config_dir.mkdir()
-        _ = (config_dir / "accounts.json").write_text(
-            json.dumps({"unit": "claude2"}), encoding="utf-8"
-        )
+        state = worker_names.migrated_accounts_state(self.home)
+        state.file.parent.mkdir(parents=True, exist_ok=True)
+        _ = state.file.write_text(json.dumps({"unit": "claude2"}), encoding="utf-8")
 
         with (
             patch.object(account, "claude_account", return_value=None),

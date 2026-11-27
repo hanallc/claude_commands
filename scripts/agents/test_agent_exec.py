@@ -23,7 +23,7 @@ from scripts.message import sessions
 from scripts.production.staff_test_support import (
     build_fixture_sessions, fixture_runtime_id, isolated_staff_file, source_environment, unit_membership,
 )
-from scripts.accounts import accounts
+from scripts.accounts import accounts, worker_names
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.lint.memory_test_support import config_environment
 from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
@@ -58,7 +58,7 @@ class CodexCliLauncherTests(NixFixture):
         self.workers = self.home / ".codex7"
         self.workers.mkdir()
         write_codex_auth(self.workers, login)
-        selection = self.home / ".claude/config/accounts.json"
+        selection = worker_names.migrated_accounts_state(self.home).file
         selection.parent.mkdir(parents=True)
         _ = selection.write_text('{"workers": "codex1"}')
         registry = write_registry(Path(self.env["CONF_DIR"]) / "models.conf", {
@@ -212,7 +212,7 @@ class ClaudeLauncherTests(unittest.TestCase):
         workers = self.home / ".codex1"
         workers.mkdir()
         write_codex_auth(workers, "cli@example.invalid")
-        selection = accounts.accounts_config_file()
+        selection = worker_names.migrated_accounts_state(self.home).file
         selection.parent.mkdir(parents=True, exist_ok=True)
         _ = selection.write_text('{"workers":"codex1"}')
         binary = self.home / "bin/codex"

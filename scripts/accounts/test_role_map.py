@@ -10,18 +10,23 @@ import socket
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
+from threading import Event
 from typing import Self, cast, override
 from unittest.mock import Mock, patch
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts.move_test_support import write_claude_move_credentials
-from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
+from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map, worker_names
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.agents.test_support import write_machine_config
+from scripts.lib import atomic_file
+from scripts.lib.file_lock import LockAvailability, probe_existing_exclusive
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.whoami import agent_accounts
 
 send_role_map_command = role_map.ssh_role_map
@@ -101,7 +106,7 @@ class RoleMapTests(unittest.TestCase):
                 role_map.DEFAULT_WORKERS_CLAUDE_ACCOUNT, "Codex recovered",
                 RoleMapReadTime.now(timezone.utc).isoformat()))
             self.assertIsInstance(role_map.read_role_map().workers_claude, role_map.DefaultWorkersClaudeAccount)
-        server_config = self.server_home / ".claude/config/accounts.json"
+        server_config = worker_names.migrated_accounts_state(self.server_home).file
         self.assertNotIn("workers_claude", cast(dict[str, object], json.loads(server_config.read_text())))
 
     def test_stale_transition_metadata_reports_anomalies_and_keeps_the_account(self) -> None:
@@ -216,9 +221,167 @@ class RoleMapTests(unittest.TestCase):
         group_file = home / ".local/state/accounts/groups.json"
         group_file.parent.mkdir(parents=True, exist_ok=True)
         _ = group_file.write_text(json.dumps(groups))
-        config = home / ".claude/config/accounts.json"
+        config = worker_names.migrated_accounts_state(home).file
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text(json.dumps({"workers": workers}))
+
+    def test_workers_read_and_write_the_locked_state_before_and_after_the_move(self) -> None:
+        legacy = worker_names.legacy_accounts_state(self.home)
+        migrated = worker_names.migrated_accounts_state(self.home)
+        legacy.file.parent.mkdir(parents=True)
+        evidence = {"home_cutovers": [{"label": "codex1", "at": "2026-10-16T12:00:00Z"}]}
+        _ = legacy.file.write_text(json.dumps({"workers": "codex1", **evidence}))
+        write = role_map._atomic_write  # pyright: ignore[reportPrivateUsage]
+
+        with patch.object(socket, "gethostname", return_value="natedev"):
+            for state, label in ((legacy, "codex3"), (migrated, "codex1")):
+                with self.subTest(state=type(state).__name__):
+                    if state == migrated:
+                        original = legacy.file.read_bytes()
+                        self.assertEqual(self.cli("migrate-accounts-state"), (0, f"{migrated.file}\n", ""))
+                        self.assertEqual(migrated.file.read_bytes(), original)
+                        self.assertEqual(role_map.read_role_map().workers, "codex3")
+                        self.assertFalse(legacy.file.exists())
+                        self.assertFalse(legacy.lock.exists())
+
+                    def write_under_lock(path: Path, contents: str) -> None:
+                        self.assertEqual(path, state.file)
+                        self.assertIs(probe_existing_exclusive(state.lock), LockAvailability.HELD)
+                        write(path, contents)
+
+                    change = role_map.RoleMapChange("workers", label, "fixture", RoleMapReadTime.now(timezone.utc).isoformat())
+                    with patch.object(role_map, "_atomic_write", side_effect=write_under_lock) as write_state:
+                        role_map.write_role_map(change)
+                    write_state.assert_called_once()
+                    self.assertEqual(role_map.read_role_map().workers, label)
+                    self.assertEqual(json.loads(state.file.read_text()), {"workers": label, **evidence})
+            self.assertEqual(self.cli("migrate-accounts-state"), (0, f"{migrated.file}\n", ""))
+        self.assertFalse(legacy.lock.exists())
+
+    def test_a_migration_retry_syncs_the_destination_after_a_rename(self) -> None:
+        legacy = worker_names.legacy_accounts_state(self.home)
+        migrated = worker_names.migrated_accounts_state(self.home)
+        legacy.file.parent.mkdir(parents=True)
+        original = b'{"workers":"codex1"}\n'
+        _ = legacy.file.write_bytes(original)
+
+        with patch.object(atomic_file, "sync_folder", side_effect=OSError("fixture sync failed")) as sync:
+            code, output, error = self.cli("migrate-accounts-state")
+            self.assertEqual((code, output), (1, ""))
+            self.assertIn("fixture sync failed", error)
+            sync.assert_called_once_with(migrated.file.parent)
+        self.assertFalse(legacy.file.exists())
+        self.assertEqual(migrated.file.read_bytes(), original)
+        self.assertTrue(legacy.lock.exists())
+
+        with patch.object(atomic_file, "sync_folder", wraps=atomic_file.sync_folder) as sync:
+            self.assertEqual(self.cli("migrate-accounts-state"), (0, f"{migrated.file}\n", ""))
+            sync.assert_any_call(migrated.file.parent)
+        self.assertEqual(migrated.file.read_bytes(), original)
+        self.assertFalse(legacy.lock.exists())
+
+    def test_a_waiting_writer_retries_with_the_new_lock_and_file(self) -> None:
+        legacy = worker_names.legacy_accounts_state(self.home)
+        migrated = worker_names.migrated_accounts_state(self.home)
+        legacy.file.parent.mkdir(parents=True)
+        _ = legacy.file.write_text('{"workers":"codex1"}')
+        legacy.lock.touch()
+        inode = legacy.lock.stat().st_ino
+        waiting = Event()
+        flock, rename = fcntl.flock, Path.rename
+        change = role_map.RoleMapChange("workers", "codex3", "fixture", RoleMapReadTime.now(timezone.utc).isoformat())
+        writes: list[Future[None]] = []
+
+        def report_contention(descriptor: int, operation: int) -> None:
+            if operation == fcntl.LOCK_EX and os.fstat(descriptor).st_ino == inode:
+                try:
+                    flock(descriptor, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    waiting.set()
+                else:
+                    return
+            flock(descriptor, operation)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            def move_after_contention(path: Path, target: Path) -> Path:
+                writes.append(executor.submit(role_map.write_role_map, change))
+                self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS))
+                return rename(path, target)
+
+            with (patch.object(socket, "gethostname", return_value="natedev"),
+                  patch.object(fcntl, "flock", side_effect=report_contention),
+                  patch.object(Path, "rename", autospec=True, side_effect=move_after_contention)):
+                self.assertEqual(self.cli("migrate-accounts-state"), (0, f"{migrated.file}\n", ""))
+                write, = writes
+                write.result(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(json.loads(migrated.file.read_text()), {"workers": "codex3"})
+        self.assertTrue(migrated.lock.exists())
+        self.assertFalse(legacy.file.exists())
+        self.assertFalse(legacy.lock.exists())
+
+    def test_a_reader_retries_when_the_move_removes_its_selected_file(self) -> None:
+        legacy = worker_names.legacy_accounts_state(self.home)
+        migrated = worker_names.migrated_accounts_state(self.home)
+        legacy.file.parent.mkdir(parents=True)
+        _ = legacy.file.write_text('{"workers":"codex3"}')
+        read = Path.read_text
+
+        def read_after_move(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == legacy.file:
+                self.assertEqual(worker_names.migrate_accounts_state(), migrated)
+                self.assertFalse(path.exists())
+            return read(path, encoding=encoding, errors=errors)
+
+        with (patch.object(socket, "gethostname", return_value="natedev"),
+              patch.object(Path, "read_text", autospec=True, side_effect=read_after_move)):
+            self.assertEqual(role_map.read_role_map().workers, "codex3")
+
+    def test_an_old_lock_open_after_the_move_does_not_keep_the_old_lock(self) -> None:
+        legacy = worker_names.legacy_accounts_state(self.home)
+        migrated = worker_names.migrated_accounts_state(self.home)
+        legacy.file.parent.mkdir(parents=True)
+        _ = legacy.file.write_text('{"workers":"codex1"}')
+        opened_after_move = False
+        open_file = os.open
+
+        def open_after_move(path: Path, flags: int, mode: int = 0o777) -> int:
+            nonlocal opened_after_move
+            if path == legacy.lock and not opened_after_move:
+                opened_after_move = True
+                self.assertEqual(worker_names.migrate_accounts_state(), migrated)
+                self.assertFalse(legacy.lock.exists())
+            return open_file(path, flags, mode)
+
+        with patch.object(os, "open", side_effect=open_after_move):
+            with worker_names.roles_lock() as locked:
+                self.assertEqual(locked, migrated)
+                self.assertIs(probe_existing_exclusive(migrated.lock), LockAvailability.HELD)
+        self.assertTrue(opened_after_move)
+        self.assertFalse(legacy.lock.exists())
+
+    def test_a_move_without_an_old_file_refreshes_cached_readers_and_routes_late_writers(self) -> None:
+        legacy = worker_names.legacy_accounts_state(self.home)
+        migrated = worker_names.migrated_accounts_state(self.home)
+        self.assertFalse(legacy.file.exists())
+
+        @role_map.role_map_command
+        def read_across_move() -> None:
+            self.assertEqual(role_map.read_role_map().workers, "")
+            self.assertEqual(self.cli("migrate-accounts-state"), (0, f"{migrated.file}\n", ""))
+            self.assertEqual(migrated.file.read_text(), "{}\n")
+            self.assertEqual(role_map.read_role_map().workers, "")
+
+        with (patch.object(socket, "gethostname", return_value="natedev"),
+              patch.object(worker_names, "read_accounts_document", wraps=worker_names.read_accounts_document) as read):
+            read_across_move()
+            self.assertEqual(read.call_count, 2)
+            role_map.write_role_map(role_map.RoleMapChange(
+                "workers", "codex3", "fixture", RoleMapReadTime.now(timezone.utc).isoformat()))
+            self.assertEqual(role_map.read_role_map().workers, "codex3")
+        self.assertEqual(json.loads(migrated.file.read_text()), {"workers": "codex3"})
+        self.assertTrue(migrated.lock.exists())
+        self.assertFalse(legacy.file.exists())
+        self.assertFalse(legacy.lock.exists())
 
     def files(self, home: Path) -> dict[str, bytes]:
         return {str(path.relative_to(home)): path.read_bytes()
@@ -491,7 +654,7 @@ class RoleMapTests(unittest.TestCase):
             role_map.write_role_map(change)
         self.assertEqual(ssh.call_count, 1)
         self.assertEqual(self.files(self.home), before)
-        config = self.server_home / ".claude/config/accounts.json"
+        config = worker_names.migrated_accounts_state(self.server_home).file
         self.assertEqual(json.loads(config.read_text()), {"workers": "codex3"})
         groups = self.server_home / ".local/state/accounts/groups.json"
         self.assertEqual(json.loads(groups.read_text()), {"units": "claude2", "showrunners": "claude1"})
@@ -534,7 +697,7 @@ class RoleMapTests(unittest.TestCase):
             self.assertEqual(self.cli("set-role", "workers", "codex3"), (0, "", ""))
         self.assertEqual(ssh.call_count, 1)
         self.assertEqual(self.files(self.home), before)
-        config = self.server_home / ".claude/config/accounts.json"
+        config = worker_names.migrated_accounts_state(self.server_home).file
         self.assertEqual(json.loads(config.read_text()), {"workers": "codex3"})
         entries = (self.server_home / ".local/state/accounts/roles.jsonl").read_text().splitlines()
         self.assertEqual(len(entries), 1)
@@ -745,7 +908,7 @@ class RoleMapTests(unittest.TestCase):
 
     def test_unset_workers_role_refuses_instead_of_resolving_a_default_home(self) -> None:
         self.seed(self.server_home, groups={})
-        _ = (self.server_home / ".claude/config/accounts.json").write_text("{}")
+        _ = worker_names.migrated_accounts_state(self.server_home).file.write_text("{}")
         with (patch.object(role_map, "ssh_role_map", side_effect=self.remote),
               patch.object(agent_accounts, "codex_account_home",
                            side_effect=AssertionError("unset workers must not choose a home"))):

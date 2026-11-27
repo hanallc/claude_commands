@@ -595,7 +595,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - One rate factor read per ETA report: two reads differ only during a live tune, and the next render is consistent.
 - A `worker.py` guard for an oversize `<key>.<host>` row: the cause is conf host-row limits, held as an add-on.
 
-### Phase 14 — Runtime state out of config  · status: todo
+### Phase 14 — Runtime state out of config  · status: done
 **Depends on:** Phase 13
 
 #### Work Order

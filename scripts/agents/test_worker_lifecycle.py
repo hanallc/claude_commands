@@ -285,7 +285,7 @@ class FixtureHomeSafetyTests(unittest.TestCase):
                         fixture_support.select_fixture_workers(real, notes=real / "rust/hanadocs/agents")
                     with self.assertRaises(AssertionError) as changed:
                         fixture_support.assert_real_codex_unchanged()
-                    for name in (".codex/auth.json", ".claude/config/accounts.json",
+                    for name in (".codex/auth.json", ".local/state/accounts/accounts.json",
                                  "rust/hanadocs/agents/codex9.md"):
                         self.assertIn(str(real / name), str(changed.exception))
         # Check an account directory created after import.

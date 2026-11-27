@@ -2751,7 +2751,7 @@ def resolve_history_label(label: str, at: str, *, login: str = "") -> ResolvedHi
         if isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == tool:
             return ResolvedHistoryLabel(parsed.label)
     try:
-        rows = read_json_object(accounts_config_file()).get("home_cutovers", [])
+        rows = worker_names.read_accounts_document().get("home_cutovers", [])
         stamp = datetime.fromisoformat(at)
         if stamp.tzinfo is None or not isinstance(rows, list):
             return HistoricalAccountUnresolved()
@@ -7402,6 +7402,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action")
     _ = commands.add_parser("trust", help="trust configured folders in every Claude home")
+    _ = commands.add_parser("migrate-accounts-state", help="move the local account document to the state folder")
     _ = commands.add_parser("role-map-read")
     _ = commands.add_parser("completion-plan-read")
     _ = commands.add_parser("session-counts-read")
@@ -7536,6 +7537,13 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
                 os.close(options.counts_lock)
         if options.action == "trust":
             return trust_accounts()
+        if options.action == "migrate-accounts-state":
+            try:
+                state = worker_names.migrate_accounts_state()
+            except OSError as error:
+                raise AccountsError(f"accounts: cannot migrate account state: {error}") from error
+            print(state.file)
+            return 0
         if options.action in ("next-read", "next-write"):
             if not role_map.is_role_map_host():
                 raise AccountsError("accounts: account moves belong on natedev")

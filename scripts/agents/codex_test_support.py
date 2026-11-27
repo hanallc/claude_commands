@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import override, cast, final
 from unittest.mock import patch
 
-from scripts.accounts import role_map
+from scripts.accounts import role_map, worker_names
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.test_models_registry import write_registry
@@ -46,7 +46,8 @@ def fixture_write_metadata(home: Path) -> dict[Path, tuple[int, int]]:
     """
     paths = [root / "auth.json" for root in home.glob(".codex*") if root.is_dir()]
     # note_file.notes_dir's production default, anchored to passwd home rather than HOME.
-    paths.extend((home / ".claude/config/accounts.json", home / "rust/hanadocs/agents/codex9.md"))
+    paths.extend((worker_names.legacy_accounts_state(home).file, worker_names.migrated_accounts_state(home).file,
+                  home / "rust/hanadocs/agents/codex9.md"))
     metadata: dict[Path, tuple[int, int]] = {}
     for path in paths:
         try:
@@ -233,9 +234,9 @@ def select_fixture_workers(home: Path, *, notes: Path) -> None:
     """Give fake-server tests an explicit selection backed by a synthetic sign-in."""
     default = home / ".codex"
     auth = default / "auth.json"
-    config = home / ".claude/config/accounts.json"
+    config = worker_names.migrated_accounts_state(home).file
     for source, path in (("fixture home", home), ("fixture sign-in", auth),
-                         ("fixture note", notes / "codex9.md"), ("fixture account config", config)):
+                         ("fixture note", notes / "codex9.md"), ("fixture account state", config)):
         refuse_real_home(path, source)
     default.mkdir(exist_ok=True)
     login = "codex-fixture@example.invalid"

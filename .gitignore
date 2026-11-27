@@ -19,9 +19,6 @@
 !config/
 !config/**
 /config/showrunners.json
-/config/showrunners.lock
-/config/accounts.json
-/config/accounts.lock
 /config/models.conf.*
 !docs/
 !docs/**
