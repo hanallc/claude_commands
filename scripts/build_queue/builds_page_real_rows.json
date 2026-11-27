@@ -309,6 +309,75 @@
     }
    ],
    "key": "97ee36b8e63e901e8e76787f"
+  },
+  {
+   "name": "natemerge: test all",
+   "title": {
+    "unit": "natemerge",
+    "step": "test all"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "natemerge"
+    },
+    {
+     "kind": "text",
+     "text": ": test all"
+    }
+   ],
+   "showrunner": "natedev",
+   "unit": "natemerge",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "natemerge",
+   "worker": "",
+   "caller": "natemerge",
+   "between_steps": false,
+   "state": "",
+   "pid": 920004,
+   "detail": "natemerge",
+   "used": 1.3243598937988281,
+   "counted": 2.4803619384765625,
+   "reserved": 1.1560020446777344,
+   "started_at": 199800,
+   "progress": {
+    "kind": "RowProgress",
+    "phase": "testing",
+    "done": 16,
+    "total": 896,
+    "percent": 1.7857142857142858,
+    "unit": "modules"
+   },
+   "queued": true,
+   "keep_text": "",
+   "group": "",
+   "ci": false,
+   "parts": [],
+   "need": 2.4803619384765625,
+   "need_part": true,
+   "runs_on": "natedev only",
+   "targets": [
+    "natedev"
+   ],
+   "because": "mac-linux: the target is busy · aws: the daily spending limit is reached",
+   "mac_text": "",
+   "call": "merge_gate.py --checkout . --tests-only",
+   "about": "Runs every test module",
+   "changes": "no branch",
+   "machine": "natedev",
+   "vcpus": 32,
+   "tokens": 12,
+   "priority_text": "queue priority: natemerge (the user's bump: natemerge merge tests first while AWS holds the account)",
+   "priority_entries": [
+    {
+     "unit": "natemerge",
+     "why": "the user's bump: natemerge merge tests first while AWS holds the account",
+     "set_at": -169703.9164853096,
+     "set_by": "506b6872-03cb-4a1a-9465-fbd9cf88975e"
+    }
+   ],
+   "key": "gate-proof-running"
   }
  ],
  "waiters": [
@@ -929,6 +998,151 @@
     "movable": false
    },
    "key": "746e7ae92e2db4499798807f"
+  },
+  {
+   "name": "phases: test affected",
+   "title": {
+    "unit": "phases",
+    "step": "test affected"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "phases"
+    },
+    {
+     "kind": "text",
+     "text": ": test affected"
+    }
+   ],
+   "showrunner": "sdlc",
+   "unit": "phases",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "phases",
+   "worker": "",
+   "caller": "phases",
+   "pid": 920001,
+   "detail": "phases",
+   "need": 4.408962249755859,
+   "since": 199600,
+   "reason": "behind #1 · head cables: nextest needs 12.2 GiB",
+   "fits": true,
+   "place": 13,
+   "free": 10.394727325066924,
+   "why": "its turn",
+   "call": "targeted_test.py --repo . --affected",
+   "runs_on": "natedev only",
+   "targets": [
+    "natedev"
+   ],
+   "because": "mac-linux: requested by the caller · aws: requested by the caller",
+   "mac_text": "",
+   "about": "Runs the test modules that the change affects",
+   "changes": "no branch",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "gate-proof-caller",
+    "movable": false
+   },
+   "key": "gate-proof-caller"
+  },
+  {
+   "name": "natest: test affected",
+   "title": {
+    "unit": "natest",
+    "step": "test affected"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "natest"
+    },
+    {
+     "kind": "text",
+     "text": ": test affected"
+    }
+   ],
+   "showrunner": "builds",
+   "unit": "natest",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "natest",
+   "worker": "",
+   "caller": "natest",
+   "pid": 920002,
+   "detail": "natest",
+   "need": 4.408962249755859,
+   "since": 199610,
+   "reason": "behind #1 · head cables: nextest needs 12.2 GiB",
+   "fits": true,
+   "place": 14,
+   "free": 10.394727325066924,
+   "why": "its turn",
+   "call": "gate.py --affected",
+   "runs_on": "natedev or mac-linux",
+   "targets": [
+    "natedev",
+    "mac-linux"
+   ],
+   "because": "aws: cloud gates are off (cloud_gate.conf enabled=off)",
+   "mac_text": "",
+   "about": "Runs the test modules that the change affects",
+   "changes": "no branch",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "gate-proof-aws-off",
+    "movable": false
+   },
+   "key": "gate-proof-aws-off"
+  },
+  {
+   "name": "unit-board: test affected",
+   "title": {
+    "unit": "unit-board",
+    "step": "test affected"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "unit-board"
+    },
+    {
+     "kind": "text",
+     "text": ": test affected"
+    }
+   ],
+   "showrunner": "sdlc",
+   "unit": "unit-board",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "unit-board",
+   "worker": "",
+   "caller": "unit-board",
+   "pid": 920003,
+   "detail": "unit-board",
+   "need": 4.408962249755859,
+   "since": 199620,
+   "reason": "waiting for mac-linux",
+   "fits": false,
+   "place": 15,
+   "free": 10.394727325066924,
+   "why": "target",
+   "call": "targeted_test.py --checkout '{tree}'",
+   "runs_on": "mac-linux",
+   "targets": [
+    "mac-linux"
+   ],
+   "because": "natedev: requested by the caller · mac-linux: the target is busy · aws: requested by the caller",
+   "mac_text": "",
+   "about": "Runs the test modules that the change affects",
+   "changes": "no branch",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "gate-proof-guest-wait",
+    "movable": false
+   },
+   "key": "gate-proof-guest-wait"
   }
  ]
 }

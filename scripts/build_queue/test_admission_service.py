@@ -1843,6 +1843,44 @@ class StateCheckTests(unittest.TestCase):
             self.assertEqual(record.trace_sampling, wire.ScopeTraceSampling())
             self.assertEqual(record, fixture.server.reservations[request.episode])
 
+    def test_gate_targets_read_in_both_wire_and_state_versions(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        targets = placement.GateTargets(("natedev",), (("mac-linux", "off"), ("aws", "off")))
+        current_fields = codec.snapshot_fields
+
+        def fields_before_gate_targets(schema: type) -> dict[str, object]:
+            fields = current_fields(schema)
+            if schema is wire.Identity:
+                return {name: kind for name, kind in fields.items() if name != "gate_targets"}
+            return fields
+
+        with AdmissionFixture() as fixture:
+            plain = fixture.request()
+            placement_call = placement_request(fixture)
+            for old in (plain, placement_call):
+                new = replace(old, identity=replace(old.identity, gate_targets=targets))
+                legacy_message = wire.encode_request(old)
+                self.assertNotIn('"gate_targets"', legacy_message)
+                self.assertEqual(wire.parse_request(legacy_message), old)
+                new_message = wire.encode_request(new)
+                self.assertEqual(wire.parse_request(new_message), new)
+                with mock.patch.object(codec, "snapshot_fields", side_effect=fields_before_gate_targets):
+                    self.assertEqual(wire.parse_request(new_message), old)
+
+            old_state = service.ServiceState({}, {}, {}, records.ReadyToStart(),
+                placement_requests={placement_call.episode: placement_call})
+            new_call = replace(placement_call, identity=replace(placement_call.identity, gate_targets=targets))
+            new_state = replace(old_state, placement_requests={placement_call.episode: new_call})
+            path = fixture.state_dir / "state.json"
+            legacy_state = wire.encode_record(old_state).replace(',"gate_targets":null', "")
+            write_text_atomic(path, legacy_state)
+            self.assertEqual(service.read_state(fixture.state_dir), old_state)
+            write_text_atomic(path, wire.encode_record(new_state))
+            self.assertEqual(service.read_state(fixture.state_dir), new_state)
+            with mock.patch.object(codec, "snapshot_fields", side_effect=fields_before_gate_targets):
+                self.assertEqual(service.read_state(fixture.state_dir), old_state)
+
     def test_state_check_reads_current_state_and_refuses_an_old_placement_shape(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3273,6 +3311,84 @@ class ProcessRunEvidenceTests(unittest.TestCase):
 
 
 class ReplyPublicationTests(unittest.TestCase):
+    def test_the_parent_row_shows_nested_gate_targets_until_the_wrapper_closes(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(os.getppid(), "123")
+            write_process(fixture.proc.path, os.getpid(), parent=owner.pid)
+            request = fixture.request(need=0, owner=owner)
+            grant = only_admitted(fixture.server.handle_request(request))
+            parent_reason = "the gate uses its parent reservation"
+            targets = placement.GateTargets((), (("mac-linux", parent_reason), ("aws", parent_reason)))
+            report = status_wire.ParentGateTargets(grant.reservation, targets)
+
+            def selection() -> placement.GateTargets | None:
+                _ = fixture.server.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                row, = (row for row in reply.reading.view.running if row.pid == owner.pid)
+                self.assertEqual(row.step, request.identity.step)
+                return row.gate_targets
+
+            self.assertIsNone(selection())
+            peer = fixture.connect(report)
+            self.assertEqual(peer.replies(), [wire.Ok()])
+            self.assertEqual(selection(), targets)
+            peer.close()
+            fixture.server.run_once(0)
+            self.assertIsNone(selection())
+
+    def test_nested_gate_replaces_the_parent_placement_candidates_until_it_closes(self) -> None:
+        from scripts.build_queue import memory_feed
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, local_candidate, mac_linux_and_natedev_request, mac_linux_candidate, register_scaler,
+        )
+
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            owner = fixture.fixture_owner(os.getppid(), "123")
+            write_process(fixture.proc.path, os.getpid(), parent=owner.pid)
+            candidates = (local_candidate(fixture), mac_linux_candidate(), register_scaler(fixture))
+            request = replace(request,
+                owner=placement.SubmittingOwner(fixture.server.host, owner.pid, owner.start_time),
+                run=wire.RunIdentity(owner.pid, owner.start_time),
+                constraints=replace(request.constraints, candidates=candidates),
+                identity=replace(request.identity,
+                    gate_targets=placement.GateTargets(("natedev", "mac-linux", "claude-aws"), ())))
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            key = fixture.server.current_assignments[request.episode]
+            saved = fixture.server.assignments[key]
+            parent_candidates = tuple(placement.CandidateEligibility(candidate.destination, placement.AllowedHost())
+                                      for candidate in candidates)
+            fixture.server.assignments[key] = replace(saved, placement_candidates=parent_candidates)
+            reason = "the gate uses its parent reservation"
+            targets = placement.GateTargets(("natedev",), (("mac-linux", reason), ("aws", reason)))
+
+            def row() -> records.RunningStep:
+                _ = fixture.server.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                running, = (step for step in reply.reading.view.running if step.pid == owner.pid)
+                explained, = (entry.step for entry in reply.reading.explanation.running if entry.step.pid == owner.pid)
+                self.assertEqual(running.gate_targets, explained.gate_targets)
+                self.assertEqual(running.placement_candidates, explained.placement_candidates)
+                return running
+
+            self.assertEqual(row().placement_candidates, parent_candidates)
+            peer = fixture.connect(status_wire.ParentGateTargets(granted.grant.reservation, targets))
+            self.assertEqual(peer.replies(), [wire.Ok()])
+            nested = row()
+            notes = memory_feed.gate_placement_notes(nested)
+            assert notes is not None
+            self.assertEqual(notes.get("because"), f"mac-linux: {reason} · aws: {reason}")
+            self.assertEqual(notes["targets"], ["natedev"])
+            self.assertEqual(nested.placement_candidates, ())
+            peer.close()
+            fixture.server.run_once(0)
+            restored = row()
+            self.assertEqual(restored.placement_candidates, parent_candidates)
+            self.assertEqual(restored.gate_targets, request.identity.gate_targets)
+
     def test_view_captures_granted_local_reservations_and_verify_owners(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request(need=0, step="test")
@@ -5219,6 +5335,32 @@ class ReadingAlertTests(unittest.TestCase):
 
 
 class PlacementRestartTests(unittest.TestCase):
+    def test_plain_gate_targets_reach_waiting_and_running_rows_after_restart(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            plain = fixture.request()
+            targets = placement.GateTargets(("natedev",), (("mac-linux", "off"), ("aws", "off")))
+            request = replace(plain, identity=replace(plain.identity, job=StepJob("test-all"), gate_targets=targets))
+            self.assertIsInstance(fixture.connect(request).replies()[0], wire.Wait)
+
+            waiting, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(waiting, wire.ViewReply)
+            row, = waiting.reading.view.waiting
+            self.assertEqual(row.gate_targets, targets)
+
+            fixture.free(60 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            self.assertIsInstance(fixture.server.ledger[request.episode].reply, wire.Admitted)
+            fixture.restart()
+            _ = fixture.run_pass()
+            running, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(running, wire.ViewReply)
+            admitted, = (step for step in running.reading.view.running if step.pid == request.owner.pid)
+            self.assertEqual(admitted.gate_targets, targets)
+
     def test_first_view_after_restart_uses_the_snapshot_while_a_probe_succeeds_slowly(self) -> None:
         from scripts.build_queue import placement
         from scripts.build_queue.test_placement import PlacementFixture, placement_request
@@ -5290,6 +5432,9 @@ class PlacementRestartTests(unittest.TestCase):
                     self.assertIsInstance(reply, wire.Wait)
                 pending = placement_request(fixture, since=fixture.clock.now() - 25)
                 consumed = placement_request(fixture, since=fixture.clock.now() - 10)
+                targets = placement.GateTargets(("mac",), tuple((machine, placement.GATE_CALLER_EXCLUSION)
+                    for machine in placement.GATE_MACHINES), caller_supplied=True)
+                consumed = replace(consumed, identity=replace(consumed.identity, gate_targets=targets))
                 _ = publish_candidate(fixture, pending)
                 pending_assignment = assignment_for(fixture, pending)
                 consumed_assignment = assignment_for(fixture, consumed)
@@ -5301,6 +5446,7 @@ class PlacementRestartTests(unittest.TestCase):
                 waiters = {episode: fixture.server.waiters[episode].request for episode in (local.episode, cloud.episode)}
                 fixture.restart()
                 self.assertEqual(fixture.server.places, positions)
+                self.assertEqual(fixture.server.placement_requests[consumed.episode].identity.gate_targets, targets)
                 for message in legacy_messages:
                     reply, = fixture.connect(message).replies()
                     self.assertIsInstance(reply, wire.Wait)
@@ -5313,6 +5459,10 @@ class PlacementRestartTests(unittest.TestCase):
                 self.assertEqual(saved.assignment, consumed_assignment)
                 self.assertIsInstance(saved.state, placement.CurrentAssignment)
                 self.assertIsInstance(saved.permission, placement.PermissionConsumed)
+                reply, = fixture.connect(wire.ViewRequest()).replies()
+                assert isinstance(reply, wire.ViewReply)
+                projected, = (step for step in reply.reading.view.running if step.assignment_target == "mac")
+                self.assertEqual(projected.gate_targets, targets)
                 status, = fixture.server.handle_request(consume)
                 self.assertIsInstance(status, wire.DispatchStatus)
                 assert isinstance(status, wire.DispatchStatus)
@@ -5335,6 +5485,9 @@ class CloudAdmissionTests(unittest.TestCase):
                     for _ in range(16):
                         _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
                 request = aws_gate_request(fixture, enabled=cause != "off", daily_room=cause != "daily")
+                targets = placement.GateTargets(("claude-aws",), (("natedev", placement.GATE_CALLER_EXCLUSION),
+                    ("mac-linux", placement.GATE_CALLER_EXCLUSION)), caller_supplied=True)
+                request = replace(request, identity=replace(request.identity, gate_targets=targets))
                 if cause == "absent":
                     _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=natedev\n")
                 directory = fixture.root / "queue-target-state"
@@ -5349,6 +5502,10 @@ class CloudAdmissionTests(unittest.TestCase):
                         self.assertEqual(reply.assignment.destination.target, "claude-aws")
                         self.assertEqual(fixture.server.current_assignments[request.episode],
                             execution_identity.attempt_key(request.episode, reply.assignment.attempt))
+                        view, = fixture.connect(wire.ViewRequest()).replies()
+                        assert isinstance(view, wire.ViewReply)
+                        running, = (step for step in view.reading.view.running if step.assignment_target == "claude-aws")
+                        self.assertEqual(running.gate_targets, targets)
                     else:
                         self.assertNotIsInstance(reply, wire.Assignment)
                         self.assertNotIn(request.episode, fixture.server.current_assignments)

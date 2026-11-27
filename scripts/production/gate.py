@@ -3611,20 +3611,26 @@ class GateAssignmentRefused(GateRefused):
     """The gate could not verify the placement supplied by the caller."""
 
 
-def gate_placement_targets(args: GateArguments, source: Path) -> tuple[str, ...]:
+DIRECT_GATE_TARGETS_ONLY = "direct gates require natedev or mac-linux"
+
+
+def gate_placement_targets(args: GateArguments, source: Path) -> placement.GateTargets:
     """Limit direct gates to natedev and Mac Linux."""
+    from scripts.build_targets.gate_targets import natedev_only_reason
+
     requested = first_step.gate_targets(args.command, source)
-    if not requested:
-        return ()
+    if not requested.names:
+        return requested
     flag = gate_natedev_only_flag(args.command)
     if flag is not None:
-        if "natedev" not in requested:
-            raise GateAssignmentRefused(f"gate.py {flag} runs only on natedev")
-        return ("natedev",)
-    targets = tuple(name for name in requested if name in ("natedev", "mac-linux"))
+        reason = natedev_only_reason(flag)
+        if "natedev" not in requested.names:
+            raise GateAssignmentRefused(reason)
+        return requested.restrict(("natedev",), reason)
+    targets = tuple(name for name in requested.names if name in ("natedev", "mac-linux"))
     if not targets:
-        raise GateAssignmentRefused("Direct gates require natedev or mac-linux")
-    return targets
+        raise GateAssignmentRefused(DIRECT_GATE_TARGETS_ONLY.capitalize())
+    return requested.restrict(targets, DIRECT_GATE_TARGETS_ONLY)
 
 
 @contextmanager
@@ -3637,7 +3643,7 @@ def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> 
         yield "natedev"
         return
     targets = gate_placement_targets(args, source)
-    if not targets:
+    if not targets.names:
         yield "natedev"
         return
     with gate_cleanup_scope() as cleanup:
@@ -3646,7 +3652,7 @@ def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> 
         if not isinstance(grant, first_step.GatePlacement):
             raise GateAssignmentRefused("The queue returned no gate placement")
         assignment = grant.grant.assignment
-        if assignment.destination.target not in targets:
+        if assignment.destination.target not in targets.names:
             raise GateAssignmentRefused("The queue returned a target outside the gate request")
         admitted.handoff(source)
         mode = SuiteMode.TARGETED if args.affected else SuiteMode.GATE
@@ -4259,12 +4265,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py {words}", file=sys.stderr, flush=True)
             return 1
         target = checked_gate_target(args)
-        if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
-                and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
-            target = "natedev"
-        checkpoint = not (args.affected or args.tests_only or args.nightly or args.promote_only)
-        with unwind_gate_on_sigterm() if not checkpoint else nullcontext():
-            return run_gate_command(args, target)
+        with ExitStack() as scope:
+            if isinstance(target, NoGateAssignment):
+                if args.promote_only:
+                    target = "natedev"
+                elif args.modules and isinstance(parent := outer_reservation(match_cpu_pool=True), OuterReservation):
+                    scope.enter_context(first_step.report_parent_gate_targets(parent))
+                    target = "natedev"
+            checkpoint = not (args.affected or args.tests_only or args.nightly or args.promote_only)
+            with unwind_gate_on_sigterm() if not checkpoint else nullcontext():
+                return run_gate_command(args, target)
     except GatePlacementIncomplete as error:
         print(error, file=sys.stderr, flush=True)
         return error.status

@@ -5,6 +5,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 import os
+from socket import AF_UNIX, SOCK_STREAM, socket
 from pathlib import Path
 import subprocess
 import sys
@@ -20,7 +21,9 @@ from scripts.direct.step_selection import Pinned
 from scripts.lib import build_folders, conf
 from scripts.lib.build_copies import CopyQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
-from scripts.build_queue.admission_wire import KnownPlacementStatus, read_assignment
+from scripts.build_queue.admission_wire import (
+    DEFAULT_ADMISSION_SOCKET, KnownPlacementStatus, ParentGateTargets, read_assignment,
+)
 from scripts.build_queue.placement import MAC_LINUX_START_UNCONFIRMED
 from scripts.lib.build_steps import (
     CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS,
@@ -185,7 +188,8 @@ def _placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGrant
 
 
 def _program_request(command: Sequence[str], source: Path, owner: wire.Owner,
-                     position: CopyQueuePosition, run: wire.RunIdentity) -> queue_place.RefreshedRequest:
+                     position: CopyQueuePosition, run: wire.RunIdentity,
+                     targets: placement.GateTargets | None = None) -> queue_place.RefreshedRequest:
     program = parse_command_program(command)
     script, script_arguments = ('', ()) if isinstance(program, OtherCommand) else program
     affected = script == 'targeted_test.py' or '--affected' in script_arguments
@@ -213,13 +217,14 @@ def _program_request(command: Sequence[str], source: Path, owner: wire.Owner,
             break
     def refresh() -> wire.AdmitRequest:
         request = client.step_request(arguments, str(source), owner, position.since, '', position.episode, profile, run=run)
-        return replace(request, identity=replace(request.identity, job=job, what=what))
+        return replace(request, identity=replace(request.identity, job=job, what=what, gate_targets=targets))
     return queue_place.RefreshedRequest(refresh)
 
 
 def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
-                   position: CopyQueuePosition, run: wire.RunIdentity) -> wire.Admitted:
-    program = _program_request(command, source, owner, position, run)
+                   position: CopyQueuePosition, run: wire.RunIdentity,
+                   targets: placement.GateTargets | None = None) -> wire.Admitted:
+    program = _program_request(command, source, owner, position, run, targets)
     unit = ''
     def refresh() -> wire.AdmitRequest:
         nonlocal unit
@@ -344,18 +349,20 @@ def gate_module_mode_error(*, has_modules: bool, tests_only: bool, affected: boo
     return ""
 
 
-def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> tuple[str, ...]:
+def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> placement.GateTargets:
     """Read the caller's gate targets or the source repository's default."""
     if command_program(command) not in GATE_SCRIPTS:
-        return ()
-    from scripts.build_targets.gate_targets import NoEnabledTarget, eligible_gate_targets, uses_parent_reservation
+        return placement.GateTargets((), ())
+    from scripts.build_targets.gate_targets import (
+        NoEnabledTarget, caller_gate_targets, eligible_gate_targets, uses_parent_reservation,
+    )
 
     arguments = tuple(command)
     if uses_parent_reservation(arguments):
-        return ()
+        return placement.GateTargets((), ())
     names = requested or os.environ.get('BUILDLOG_GATE_TARGETS', '')
     if names:
-        return tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
+        return caller_gate_targets(tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip()))))
 
     selected = eligible_gate_targets(source, arguments)
     if isinstance(selected, NoEnabledTarget):
@@ -363,17 +370,44 @@ def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> t
     return selected
 
 
-def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...],
+@contextmanager
+def report_parent_gate_targets(parent: client.OuterReservation) -> Generator[None]:
+    """Publish the targets while the gate runs under its parent reservation."""
+    from scripts.build_targets.gate_targets import PARENT_RESERVATION
+
+    marker = os.environ.get(client.RESERVED_STEP_ENV, "").split("\t")
+    with ExitStack() as scope:
+        if len(marker) >= 3 and marker[0] == parent.reservation:
+            _, _, _, *resources = marker
+            path = ((resources[0] or DEFAULT_ADMISSION_SOCKET) if resources
+                    else str(wire.admission_socket_path()))
+            try:
+                connection = scope.enter_context(socket(AF_UNIX, SOCK_STREAM))
+                connection.settimeout(records.read_memory_config(report=False).query_timeout_seconds)
+                connection.connect(str(path))
+                targets = placement.GateTargets((), ()).restrict(("natedev",), PARENT_RESERVATION)
+                request = ParentGateTargets(parent.reservation, targets)
+                connection.sendall(wire.encode_request(request).encode())
+                with connection.makefile("rb") as stream:
+                    if not isinstance(wire.parse_reply(stream.readline()), wire.Ok):
+                        scope.close()
+            except (OSError, ValueError, conf.Unusable):
+                scope.close()
+        yield
+
+
+def _gate_request(command: Sequence[str], source: Path, targets: placement.GateTargets,
                   owner: wire.Owner, position: CopyQueuePosition, run: wire.RunIdentity,
                   sidecar: Path) -> wire.PlacementRequest:
-    from scripts.build_targets.gate_targets import natedev_only_flag, scaler_candidate
+    from scripts.build_targets.gate_targets import natedev_only_flag, natedev_only_reason, scaler_candidate
 
     arguments = tuple(command)
     flag = natedev_only_flag(arguments)
     if flag is not None:
-        if "natedev" not in targets:
-            raise FirstStepRefused(f"gate.py {flag} runs only on natedev")
-        targets = ("natedev",)
+        reason = natedev_only_reason(flag)
+        if "natedev" not in targets.names:
+            raise FirstStepRefused(reason)
+        targets = targets.restrict(("natedev",), reason)
     local = replace(_program_request(command, source, owner, position, run).refresh(), sidecar=str(sidecar),
                     trace_sampling=wire.ProcessTreeTraceSampling())
     tree_key = treekey.tree_key(str(source))
@@ -384,7 +418,7 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
     registry = conf.read("build_targets")
     configured = target_config.read_registered_targets(purpose=target_config.RegistryRead.PLACEMENT,
                                                         configuration=registry)
-    ordered_names = dict.fromkeys((*(target.name for target in configured if target.name in targets), *targets))
+    ordered_names = dict.fromkeys((*(target.name for target in configured if target.name in targets.names), *targets.names))
     builder = client.placement_constraint_builder()
     scalers = {target.name: target for target in configured if isinstance(target, target_config.ScalerTarget)}
     candidates: list[placement.PlacementCandidate] = []
@@ -400,9 +434,11 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
         candidates.extend(named)
     constraints = placement.PlacementConstraints(source_key, arguments, str(source), '', session,
         tuple(candidates), command_kind='final')
-    route = target_config.PinnedTarget(targets[0]) if len(targets) == 1 else target_config.ANY_ELIGIBLE_TARGET
+    has_scaler = any(candidate.destination.provider == "scaler" for candidate in candidates)
+    exclusions = tuple((machine, reason) for machine, reason in targets.exclusions if machine != "aws" or not has_scaler)
+    identity = replace(local.identity, gate_targets=replace(targets, names=tuple(ordered_names), exclusions=exclusions))
     return wire.PlacementRequest(position.episode, placement.SubmittingOwner(store.host_name(), owner.pid, owner.start_time),
-        position.since, local.profile, constraints, identity=local.identity, run=local.run, route=route,
+        position.since, local.profile, constraints, identity=identity, run=local.run, route=target_config.ANY_ELIGIBLE_TARGET,
         local=queue_place.local_context(local))
 
 
@@ -442,28 +478,30 @@ def checked_gate_assignment(command: Sequence[str], source: Path, file: Path, ta
 
 @contextmanager
 def admitted_run(command: Sequence[str], source: Path, *,
-                 targets: tuple[str, ...] = (), place_unnamed_gate: bool = True) -> Generator[FirstStepAdmission]:
+                 targets: placement.GateTargets | tuple[str, ...] | None = None,
+                 place_unnamed_gate: bool = True) -> Generator[FirstStepAdmission]:
     """Admit the first step before any caller takes or prepares a copy."""
     gate = command_program(command) in GATE_SCRIPTS
-    if targets and not gate:
+    from scripts.build_targets.gate_targets import caller_gate_targets, is_claude_gate_source, natedev_only_flag
+
+    selection = caller_gate_targets(targets) if isinstance(targets, tuple) else targets
+    names = selection.names if selection is not None else ()
+    if names and not gate:
         raise FirstStepRefused('named gate targets require a gate command')
     inherited = os.environ.get('BUILDLOG_PLACEMENT_FILE') if gate else None
     if inherited is not None:
         try:
             file = Path(inherited)
-            grant = checked_gate_assignment(command, source, file, targets)
+            grant = checked_gate_assignment(command, source, file, names)
         except (OSError, ValueError, wire.AdmissionUnavailable) as error:
             raise FirstStepRefused(str(error)) from error
         assignment = grant.assignment
         yield FirstStepAdmission(CopyQueuePosition(assignment.episode, assignment.since), InheritedGatePlacement(grant), file)
         return
-    gate_selection = targets
-    if gate and place_unnamed_gate and not gate_selection:
-        from scripts.build_targets.gate_targets import is_claude_gate_source, natedev_only_flag
-
-        gate_selection = gate_targets(command, source)
-        if not gate_selection and natedev_only_flag(tuple(command)) is not None and is_claude_gate_source(source):
-            gate_selection = ('natedev',)
+    if gate and place_unnamed_gate and not names:
+        selection = gate_targets(command, source)
+        if not selection.names and natedev_only_flag(tuple(command)) is not None and is_claude_gate_source(source):
+            selection = replace(selection, names=("natedev",))
     start = records.process_start_time(os.getpid())
     if start is None:
         raise FirstStepRefused('the command has no live process identity')
@@ -493,12 +531,12 @@ def admitted_run(command: Sequence[str], source: Path, *,
             if isinstance(verify, VerifyCommand):
                 request = _verify_request(verify, source, folder, owner, position)
                 grant = _placement_grant(request)
-            elif gate_selection:
-                gate_request = _gate_request(command, source, gate_selection, owner, position, run,
+            elif selection is not None and selection.names:
+                gate_request = _gate_request(command, source, selection, owner, position, run,
                                              folder / 'placement.cgroup')
                 grant = OwnedGatePlacement(_placement_grant(gate_request), gate_request)
             else:
-                grant = _program_grant(command, source, owner, position, run)
+                grant = _program_grant(command, source, owner, position, run, selection if gate else None)
             admitted = FirstStepAdmission(position, grant, assignment_file)
             try:
                 if isinstance(grant, OwnedGatePlacement):
