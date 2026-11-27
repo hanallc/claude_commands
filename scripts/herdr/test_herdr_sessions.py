@@ -1069,6 +1069,20 @@ class StandaloneLaunchTests(unittest.TestCase):
                 self.assertEqual(start[start.index("--") + 1:],
                                  [*expected, "--resume", identity, "-n", "producer"])
 
+    def test_resume_standalone_session_has_no_role_window(self) -> None:
+        identity = fixture_runtime_id("registered-session")
+        _ = staff.create_session("solo", identity, staff.SessionLaunchFolder("natedev", self.root),
+                                 staff.SessionHome(self.root / "home/.claude"))
+        _ = write_registry(Path(os.environ["MODELS_CONFIG_FILE"]), {"compact_windows": {"session": "300000"}})
+        self.destination()
+
+        code, errors = self.call("resume", "solo", "--session-id", identity, "--cwd", str(self.root))
+
+        self.assertEqual(code, 0, errors)
+        start, = self.agent_starts()
+        self.assertEqual(start[start.index("--") + 1:], ["--resume", identity, "-n", "solo"])
+        self.assertEqual(errors, "")
+
     def test_resume_keeps_the_model_when_the_unit_window_is_unavailable(self) -> None:
         unit = unit_membership("sdlc", "resume-window")
         registry = Path(os.environ["MODELS_CONFIG_FILE"])

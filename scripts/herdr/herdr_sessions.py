@@ -188,7 +188,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
         if member is not None or values.keys() & pane_launch.MODEL_FLAGS:
             configuration = models_registry.optional_launch_snapshot(prepared.env)
             prepared = replace(prepared, model_configuration=configuration)
-            if member is not None:
+            if member is not None and member.kind != "session":
                 claude_arguments.extend(models_registry.compact_window_arguments(
                     member.kind, session_id=options.session_id, configuration=configuration))
         claude_arguments.extend(["--resume", options.session_id, "-n", name])
