@@ -2,15 +2,13 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
-import re
 import sys
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast, overload
@@ -117,149 +115,6 @@ def retain_implicit_claude_home(entry: CurrentLaunch, environment: Mapping[str, 
     if saved_kind(entry) == "claude" and "CLAUDE_CONFIG_DIR" not in environment and home.is_absolute():
         entry["implicit_claude_home"] = str(home)
         entry["config_dir"] = str(ImplicitClaudeHome(home).config_dir)
-
-
-class WorkerResumeUnavailable(ValueError):
-    """The worker has no complete specification for an exact resume."""
-
-
-@dataclass(frozen=True)
-class WorkerResumeSpec:
-    """Keep the inputs to one worker resume."""
-
-    kind: Literal["claude", "codex"]
-    session: str
-    directory: Path
-    arguments: tuple[str, ...]
-    home_mode: Literal["implicit", "explicit"]
-    environment: Mapping[str, str]
-    unset_environment: frozenset[str]
-
-    @property
-    def account_variable(self) -> str:
-        return "CLAUDE_CONFIG_DIR" if self.kind == "claude" else "CODEX_HOME"
-
-    @property
-    def account_home(self) -> Path:
-        if self.home_mode == "implicit":
-            return Path(self.environment["HOME"]) / ("." + self.kind)
-        return Path(self.environment[self.account_variable])
-
-    def with_berth_session(self, session: str) -> WorkerResumeSpec:
-        environment = dict(self.environment)
-        if session:
-            environment[BERTH_SESSION_ENV] = session
-            unset = self.unset_environment - {BERTH_SESSION_ENV}
-        else:
-            _ = environment.pop(BERTH_SESSION_ENV, None)
-            unset = self.unset_environment | {BERTH_SESSION_ENV}
-        return replace(self, environment=environment, unset_environment=unset)
-
-    def with_account(self, environment: Mapping[str, str]) -> WorkerResumeSpec:
-        return replace(self, home_mode="explicit", environment={**self.environment, **environment},
-                       unset_environment=self.unset_environment - environment.keys())
-
-    def validate(self) -> None:
-        account = self.account_variable
-        prefix = "resume" if self.kind == "codex" else "--resume"
-        names = self.environment.keys() | self.unset_environment
-        if (not self.session or not self.directory.is_absolute()
-                or self.arguments[:2] != (prefix, self.session)
-                or any("\0" in arg for arg in self.arguments)
-                or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in names)
-                or any("\0" in value for value in self.environment.values())
-                or not Path(self.environment.get("HOME", "")).is_absolute()
-                or self.environment.keys() & self.unset_environment
-                or (self.home_mode == "implicit" and account not in self.unset_environment)
-                or (self.home_mode == "explicit" and not Path(self.environment.get(account, "")).is_absolute())):
-            raise WorkerResumeUnavailable("the saved worker resume specification is incomplete")
-
-
-def worker_resume_spec(kind: Literal["claude", "codex"], session: str, directory: Path, arguments: Sequence[str],
-                       environment: Mapping[str, str], unset: frozenset[str]) -> WorkerResumeSpec:
-    """Save the resume command separately from the initial launch command."""
-    prefix = ("resume" if kind == "codex" else "--resume", session)
-    if tuple(arguments[:2]) != prefix:
-        folder = ("--cd", str(directory)) if kind == "codex" else ()
-        arguments = (*prefix, *folder, *arguments)
-    account = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"
-    mode: Literal["implicit", "explicit"] = "explicit" if account in environment else "implicit"
-    return WorkerResumeSpec(kind, session, directory, tuple(arguments), mode, dict(environment),
-                            (unset | {account}) - environment.keys())
-
-
-def _worker_resume_path(directory: Path, session: str) -> Path:
-    return directory / "worker-resume" / (hashlib.sha256(session.encode()).hexdigest() + ".json")
-
-
-def worker_resume_pending(directory: Path, session: str) -> bool:
-    return _worker_resume_path(directory, session).with_suffix(".pending").exists()
-
-
-def begin_worker_resume(directory: Path, previous: WorkerResumeSpec) -> None:
-    """Record that the next worker process needs verification."""
-    path = _worker_resume_path(directory, previous.session)
-    with locked(path):
-        if read_worker_resume(directory, previous.session) != previous:
-            raise WorkerResumeUnavailable("the saved worker resume specification changed before launch")
-        atomic_file.write_text_atomic(path.with_suffix(".pending"), "", new_file_mode=0o600)
-
-
-def read_worker_resume(directory: Path, session: str) -> WorkerResumeSpec | None:
-    """Read the versioned specification for this native conversation."""
-    path = _worker_resume_path(directory, session)
-    try:
-        data = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except FileNotFoundError:
-        return None
-    except ValueError as error:
-        raise WorkerResumeUnavailable("the saved worker resume specification is unreadable") from error
-    if not isinstance(data, dict):
-        raise WorkerResumeUnavailable("the saved worker resume specification is incomplete")
-    fields = cast(dict[str, object], data)
-    if fields.get("unavailable") is True:
-        raise WorkerResumeUnavailable("credential values prevent a complete saved worker resume specification")
-    kind, home_mode = fields.get("kind"), fields.get("home_mode")
-    cwd, args = fields.get("directory"), fields.get("arguments")
-    values, removals = fields.get("environment"), fields.get("unset_environment")
-    if (fields.get("version") != 1 or fields.get("session") != session
-            or kind not in ("claude", "codex") or home_mode not in ("implicit", "explicit")
-            or not isinstance(cwd, str) or not isinstance(args, list)
-            or not isinstance(values, dict) or not isinstance(removals, list)):
-        raise WorkerResumeUnavailable("the saved worker resume specification is incomplete")
-    if (not all(isinstance(arg, str) for arg in cast(list[object], args))
-            or not all(isinstance(name, str) for name in cast(list[object], removals))
-            or not all(isinstance(name, str) and isinstance(value, str)
-                       for name, value in cast(dict[object, object], values).items())):
-        raise WorkerResumeUnavailable("the saved worker resume specification is incomplete")
-    spec = WorkerResumeSpec(kind, session, Path(cwd), tuple(cast(list[str], args)),
-                            home_mode, cast(dict[str, str], values),
-                            frozenset(cast(list[str], removals)))
-    spec.validate()
-    return spec
-
-
-def save_worker_resume(directory: Path, spec: WorkerResumeSpec, *, previous: WorkerResumeSpec | None = None) -> None:
-    """Replace the specification only after the caller proves the worker launch."""
-    path = _worker_resume_path(directory, spec.session)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # The account folder supplies credentials. Never save credential environment values.
-    credentials = any(re.search(r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|CREDENTIALS|AUTHORIZATION|COOKIE|PAT)(?:_|$)", name)
-                      and not name.endswith(("_FILE", "_PATH", "_DIR")) for name in spec.environment)
-    if credentials:
-        if previous is not None:
-            raise WorkerResumeUnavailable("the worker environment contains credentials")
-        data: dict[str, object] = {"version": 1, "session": spec.session, "unavailable": True}
-    else:
-        spec.validate()
-        data = {"version": 1, "session": spec.session, "kind": spec.kind, "directory": str(spec.directory),
-                "arguments": spec.arguments, "home_mode": spec.home_mode, "environment": dict(spec.environment),
-                "unset_environment": sorted(spec.unset_environment)}
-    with locked(path):
-        if previous is not None and read_worker_resume(directory, spec.session) != previous:
-            raise WorkerResumeUnavailable("the saved worker resume specification changed during launch")
-        atomic_file.write_text_atomic(path, json.dumps(data, sort_keys=True) + "\n", new_file_mode=0o600)
-        path.with_suffix(".pending").unlink(missing_ok=True)
 
 
 class CurrentProcessEvidence(Protocol):

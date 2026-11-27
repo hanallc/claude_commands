@@ -2962,7 +2962,7 @@ def _worker_berth_matches(opened: worker_panes.OpenWorker, expected: str) -> boo
     process = _client().native_pane_process(opened.pane, backend.family, herdr.PROGRAM_TIMEOUT_SECONDS)
     if process.current_identity != opened.row.current_session:
         raise ValueError("The continuation target changed during the process read")
-    return process.environment.get(pane_launch.BERTH_SESSION_ENV, "") == expected
+    return process.environment.get(pane_launch.BERTH_SESSION_ENV) == expected
 
 
 def _detached_resume_context(row: staff.StaffRow, directories: Iterable[Path]) -> str:
@@ -3504,19 +3504,12 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     start = worker_panes.start_or_resume
                     rebind = False
                     berth_session = ""
-                    if not isinstance(state, worker_panes.OpenWorker) or not isinstance(plan.step, UnsubmittedAssignment):
+                    if isinstance(state, worker_panes.OpenWorker) and not isinstance(plan.step, UnsubmittedAssignment):
                         phase_fields = unit_runs.read_run_fields(plan.phase_run or run)
                         phase = worker_panes.worker_phase(phase_fields, current_holder, state.row, current_record)
                         berth_session = worker_panes.phase_berth_session(current_holder, phase)
-                        directory = pane_launch.record_directory()
-                        if isinstance(state, worker_panes.OpenWorker):
-                            rebind = (pane_launch.worker_resume_pending(directory, state.row.current_session)
-                                      or bool(berth_session and not _worker_berth_matches(state, berth_session)))
-                        elif (pane_launch.read_worker_resume(directory, state.row.current_session) is not None
-                              or berth_session and not isinstance(plan.step, UnsubmittedAssignment)):
-                            start = partial(start, phase=phase, continuation=state,
-                                            refresh_claude_turn=isinstance(plan.step, UnsubmittedAssignment))
-                        if isinstance(state, worker_panes.OpenWorker) and rebind:
+                        rebind = bool(berth_session and not _worker_berth_matches(state, berth_session))
+                        if rebind:
                             if not state.status.idle:
                                 failed(state.row, "The worker must be idle to correct the berth key")
                                 continue

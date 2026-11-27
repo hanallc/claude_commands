@@ -1823,68 +1823,6 @@ def _enrolled_showrunner_worker(row: staff.StaffRow, record: staff.StaffSnapshot
     return isinstance(enrolled_worker_owner(owner), EnrolledPaths)
 
 
-def _resume_saved_worker(row: StaffRow, previous: pane_launch.WorkerResumeSpec, berth_session: str, run: Path,
-                         tab: herdr.TabSession | SessionNotFound, names: LaunchNames, client: herdr.Herdr, *,
-                         to: str, why: str, requester: str, keep_workers: bool) -> ResumeResult:
-    from scripts.agents import detached_runs
-    from scripts.herdr import worker_panes
-    from scripts.production import worker
-
-    began = monotonic()
-    identity = row.current_session
-    kind = previous.kind
-    spec = previous.with_berth_session(berth_session)
-    source = spec.account_home
-    source_label = (agent_accounts.codex_home_role_label(source) if kind == "codex"
-                    else accounts.claude_config_label(source))
-    label = source_label
-    if to:
-        selected = member_account.resume_account(kind, row, to=to)
-        if isinstance(selected, accounts.CodexWorkersAccount):
-            target, label = selected.home, selected.label
-            values = {"CODEX_HOME": str(target)}
-        else:
-            target, label = selected.dir, selected.label
-            values = account_reader.named_account_environment(target)
-        if target != source:
-            spec = spec.with_account(values)
-    spec.validate()
-    space = herdr.row_workspace(row, names.tab_record, row.name)
-    if isinstance(tab, SessionNotFound):
-        retained = client.saved_row_tab(str(row.id), row.name, space, record=names.tab_record)
-        if isinstance(retained, herdr.OwnPaneNotAtShell):
-            return ResumeFailed(identity, str(retained))
-        destination = retained if isinstance(retained, herdr.ExistingPane) else herdr.NewTab(space, row.name)
-    else:
-        observed = client.pane_row(tab.pane_id)
-        if isinstance(observed, herdr.NoPane) or not (terminal := observed.get("terminal_id")):
-            return ResumeFailed(identity, "the worker resume terminal is unavailable")
-        destination = herdr.ExistingPane(tab.pane_id, terminal)
-    if isinstance(destination, herdr.ExistingPane) and not isinstance(client.pane_activity(destination.pane), herdr.PaneAtShell):
-        return ResumeFailed(identity, "the worker resume pane is not at its shell")
-    directory = pane_launch.record_directory()
-    pane_launch.begin_worker_resume(directory, previous)
-    launched = herdr.launch_worker_resume(client, destination, spec,
-        int(operation_deadline.remaining(conf.read("shutdown").number("start_seconds")) * 1000), agent=row.name)
-    pane_launch.save_worker_resume(directory, spec, previous=previous)
-    if not keep_workers:
-        own = worker.own_pass(row, names.tab_record, run=worker_panes.DispatchRun(run))
-        detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
-        if isinstance(own, worker.UnsubmittedAssignment):
-            message = launcher_prompt(row.id, own.dispatch_id, own.command)
-            if detached:
-                message += "\n" + detached
-        elif isinstance(own, BusyPass) or detached:
-            message = resume_message(why, move=AccountMove(source_label, label) if source_label != label else NO_ACCOUNT_MOVE,
-                                     own_pass=own, unit=row, detached=detached)
-        else:
-            message = ""
-        if message:
-            client.prompt(launched.pane, message, target=identity)
-        _watch_resume(identity, launched.pane, label, launched, requester, why, kind=kind)
-    return ClaudeUp(identity, launched.pane, label, monotonic() - began)
-
-
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
                  names: LaunchNames, keep_workers: bool = False,
                  client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
@@ -1962,9 +1900,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         pane_id = tab.pane_id if isinstance(tab, herdr.TabSession) else ""
         running = running_on_account(identity, pane_id, kind=kind)
         if not isinstance(running, sessions.SessionNotLive):
-            if (row is not None and row.kind == "worker" and isinstance(running, ClaudeUp)
-                    and pane_launch.worker_resume_pending(pane_launch.record_directory(), identity)):
-                return ResumeFailed(identity, "the worker replacement still needs verification")
             if row is not None and isinstance(running, ClaudeUp) and isinstance(running.pid, int) and running.account != "unknown account":
                 member_account.repair_home(row, kind, running.pid)
             return running
@@ -1981,24 +1916,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         mode = worker_mode() if row is not None and not keep_workers else NO_WORKERS
         if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
             return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")
-        worker_run: Path | None = None
-        if row is not None and row.kind == "worker":
-            from scripts.herdr import worker_panes
-
-            worker_run = worker_panes.worker_run(row, record=names.tab_record)
-            previous = pane_launch.read_worker_resume(pane_launch.record_directory(), identity)
-            berth_session = ""
-            if (parent := names.tab_record.parent_of(row)) is not None:
-                phase = worker_panes.worker_phase(unit_runs.read_run_fields(worker_run), parent, row, names.tab_record)
-                berth_session = worker_panes.phase_berth_session(parent, phase)
-            if previous is not None:
-                if previous.kind != kind or not previous.directory.is_dir():
-                    return ResumeFailed(identity, "the saved worker resume backend or directory changed")
-                if entry is not None and not _enrolled_showrunner_worker(row, names.tab_record):
-                    return _resume_saved_worker(row, previous, berth_session, worker_run, tab, names, client,
-                                                to=to or "", why=why, requester=requester, keep_workers=keep_workers)
-            elif berth_session or (entry is not None and pane_launch.BERTH_SESSION_ENV in entry["environment"]):
-                return ResumeFailed(identity, "the worker has no saved resume specification")
         if row is None and entry is None:
             return SessionNotFound(session)
         if row is not None and (entry is None or _enrolled_showrunner_worker(row, names.tab_record)):
@@ -2057,6 +1974,21 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         else:
             _ = entry.pop("config_dir", None)
         unset_environment = herdr.NO_ENVIRONMENT_REMOVALS
+        worker_run: Path | None = None
+        if row is not None and row.kind == "worker":
+            from scripts.herdr import worker_panes
+
+            worker_run = worker_panes.worker_run(row, record=names.tab_record)
+            berth_key = pane_launch.BERTH_SESSION_ENV
+            _ = entry["environment"].pop(berth_key, None)
+            parent = names.tab_record.parent_of(row)
+            if parent is not None:
+                phase = worker_panes.worker_phase(unit_runs.read_run_fields(worker_run), parent, row, names.tab_record)
+                berth_session = worker_panes.phase_berth_session(parent, phase)
+                if berth_session:
+                    entry["environment"][berth_key] = berth_session
+            if berth_key not in entry["environment"]:
+                unset_environment = frozenset({berth_key})
         if row is not None and row.kind == "producer" and not (
                 isinstance(tab, herdr.TabSession) and os.environ.get("HERDR_SESSION") == client.session
                 and os.environ.get("HERDR_PANE_ID") == tab.pane_id):
@@ -2202,11 +2134,10 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
 
 
 def _watch_resume(identity: str, pane: str, account: str,
-                  started: herdr.AgentLaunched | sessions.LiveSessionProcess, requester: str, why: str, *,
-                  kind: str = "codex") -> None:
+                  started: herdr.AgentLaunched | sessions.LiveSessionProcess, requester: str, why: str) -> None:
     try:
         if isinstance(started, herdr.AgentLaunched):
-            observed = running_on_account(identity, pane, kind=kind)
+            observed = running_on_account(identity, pane, kind="codex")
             if not isinstance(observed, ClaudeUp) or not isinstance(observed.pid, int):
                 raise OSError(observed.reason if isinstance(observed, ResumeFailed) else "process id is unavailable")
             pid = observed.pid
