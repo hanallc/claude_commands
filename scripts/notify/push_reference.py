@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
+from scripts.production import record_store
+
 
 class KeptPushDropped(int):
     """A successful release removed a push without phone delivery."""
@@ -55,11 +57,12 @@ class QuestionOpening:
 
 
 def read_question(path: Path) -> QuestionOpening:
-    """Read the question frontmatter without changing the record."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as error:
-        raise ValueError(f"cannot read question record {path}: {error}") from error
+    """Read committed Question frontmatter without waiting for a writer."""
+    with record_store.record_number_lock(record_store.RecordKind.QUESTION, wait=False):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise ValueError(f"cannot read question record {path}: {error}") from error
     lines = text.splitlines()
     if not lines or lines[0] != "---" or "---" not in lines[1:]:
         raise ValueError(f"not a question record: {path}")

@@ -449,9 +449,13 @@ def close(key: str) -> bool:
         if isinstance(held, NoHeld):
             return False
         if isinstance(held, HeldMessage) and held.outcome == "sent" and held.need == "blocked":
+            reference = held.reference if isinstance(held, RegisteredHold) else push_reference.NO_REFERENCE
+            arguments = (["question-push-clear", JOB, user_key(key), json.dumps(reference)]
+                         if reference["kind"] == "question"
+                         else ["retire", "--to", "user", "--from", JOB, "--key", user_key(key)])
             try:
-                done = subprocess.run(session_send.send_argv("retire", "--to", "user", "--from", JOB,
-                                       "--key", user_key(key), send_script=SEND), capture_output=True, text=True, check=False, timeout=60)
+                done = subprocess.run(session_send.send_argv(*arguments, send_script=SEND),
+                                      capture_output=True, text=True, check=False, timeout=60)
                 problem = "" if done.returncode == 0 else (
                     failure_detail(done, lines=1)).replace("\n", "; ")
             except (OSError, subprocess.TimeoutExpired) as error:

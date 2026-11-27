@@ -28,7 +28,7 @@ from scripts.notify import review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
 from scripts.notify import question_pushes
-from scripts.message import send
+from scripts.message import escalate, send
 from scripts.notify import silence
 from scripts.notify.test_review import FakeReviewer, verdict, with_footer
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
@@ -399,7 +399,7 @@ class PushoverTests(unittest.TestCase):
             queued = send.queue_path(send.USER)
             queued.parent.mkdir(parents=True)
             row = {"time": "now", "from": push["source"], "to": send.USER, "key": push["key"],
-                   "summary": "", "text": "Details", "reason": "fixture copy"}
+                   "summary": "", "text": "Details", "reason": "fixture copy", "reference": reference}
             unrelated = {**row, "from": "different sender"}
             _ = queued.write_text(json.dumps(row) + "\n" + json.dumps(unrelated) + "\n")
             question_pushes.answer_saved(path)
@@ -410,6 +410,129 @@ class PushoverTests(unittest.TestCase):
         self.assertFalse(binding_path.exists())
         self.assertEqual(send.read_queue(queued), [unrelated])
         self.assertEqual(posts, [pushover.API_URL, pushover.CANCEL_URL.format(tag=pushover.push_tag(expected.tag_key))])
+
+    def test_old_question_retire_paths_preserve_the_new_opening(self) -> None:
+        path = self.keys.parent / "question.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"old"}\n---\n')
+        old = push_reference.QuestionReference(kind="question", path=str(path), since="old")
+        new = push_reference.QuestionReference(kind="question", path=str(path), since="new")
+        key = escalate.user_key("choice")
+        source = escalate.JOB
+        queue = send.queue_path(send.USER)
+        queue.parent.mkdir(parents=True)
+        old_row = {"time": "now", "from": source, "to": send.USER, "key": key, "summary": "", "text": "Details",
+                   "reason": "fixture", "reference": old}
+        new_row = {**old_row, "reference": new}
+        unbound_row = {field: value for field, value in old_row.items() if field != "reference"}
+        old_kept: silence.KeptPush = {"source": source, "key": key, "priority": "0", "title": "Choose",
+            "message": "Details", "detail": "", "text_id": "decision.choices", "reference": old}
+        new_kept: silence.KeptPush = {**old_kept, "reference": new}
+
+        def keep_copies() -> None:
+            _ = queue.write_text("".join(json.dumps(row) + "\n" for row in [old_row, new_row, unbound_row]))
+            _ = silence.kept_file().write_text("".join(json.dumps(row) + "\n" for row in [old_kept, new_kept]))
+
+        def run_send(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                code = send.main(argv[2:])
+            return subprocess.CompletedProcess(argv, code, output.getvalue(), errors.getvalue())
+
+        with (mock.patch.object(escalate, "STATE", self.keys.parent / "escalate"),
+              mock.patch.object(escalate, "schedule"),
+              mock.patch.object(send, "cancel_user_push", return_value=(0, "cancelled")) as cancel,
+              mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.keys.parent / "notifier")})):
+            push = push_texts.render("alert.blocked", sender=source, title="Choose the layout",
+                                     body="Choose a layout.", action="Select a layout")
+            self.assertTrue(escalate.hold("choice", push, question=str(path)))
+            held = escalate.read(escalate.held_path("choice"))
+            assert isinstance(held, escalate.RegisteredHold)
+            escalate.write(escalate.held_path("choice"), replace(held, outcome="sent"))
+            with silence.locked():
+                binding = question_pushes.bind_locked(source, key, old, emergency=True)
+            _ = path.write_text(path.read_text().replace('"old"', '"new"'))
+            keep_copies()
+            self.assertEqual(question_pushes.drain(), 0)
+            self.assertEqual(send.read_queue(queue), [new_row, unbound_row])
+            self.assertEqual(silence.read_kept(), [new_kept])
+            cancel.assert_called_once_with(source, binding.tag_key, exact_tag=True)
+            with silence.locked():
+                newer = question_pushes.bind_locked(source, key, new, emergency=True)
+
+            keep_copies()
+            self.assertEqual(send.retire_recorded_question(source, key, old)[0], 0)
+            self.assertEqual(send.read_queue(queue), [new_row, unbound_row])
+            self.assertEqual(silence.read_kept(), [new_kept])
+            keep_copies()
+            with mock.patch.object(subprocess, "run", side_effect=run_send):
+                self.assertTrue(escalate.close("choice"))
+            self.assertEqual(send.read_queue(queue), [new_row, unbound_row])
+            self.assertEqual(silence.read_kept(), [new_kept])
+            self.assertEqual(question_pushes.read_binding(question_pushes.binding_path(source, key)), newer)
+            self.assertEqual(cancel.call_count, 1)
+
+    def test_unbound_push_does_not_wait_for_question_cancellation(self) -> None:
+        path = self.keys.parent / "question.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        with silence.locked():
+            binding = question_pushes.bind_locked("drawer", "same key", reference, emergency=True)
+        push: silence.KeptPush = {"source": binding.source, "key": binding.key, "priority": "2", "title": "Alert",
+            "message": "Details", "detail": "", "text_id": "alert.blocked"}
+        with mock.patch.object(send, "cancel_user_push", return_value=(3, "cancel failed")) as cancel:
+            post = mock.Mock(return_value=(200, b'{"status":1}'))
+            self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+            post.assert_called_once()
+            cancel.assert_not_called()
+        self.assertEqual(question_pushes.read_binding(question_pushes.binding_path(binding.source, binding.key)), binding)
+
+    def test_question_retry_gives_the_next_binding_a_turn_after_timeout(self) -> None:
+        path = self.keys.parent / "question.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        local = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        remote: push_reference.QuestionReference = {**local, "machine": "mac"}
+        with silence.locked():
+            with mock.patch.object(question_pushes, "opening", return_value=push_reference.QuestionOpening("open", "opening")):
+                _ = question_pushes.bind_locked("a", "key", remote, emergency=False)
+            _ = question_pushes.bind_locked("z", "key", local, emergency=False)
+        _ = path.write_text(path.read_text().replace("status: open", "status: closed"))
+        clock = 0.0
+
+        def time_out(argv: list[str], *, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal clock
+            self.assertEqual(argv[0], "ssh")
+            clock += timeout
+            raise subprocess.TimeoutExpired(argv, timeout)
+
+        with (mock.patch.object(time, "monotonic", side_effect=lambda: clock),
+              mock.patch.object(subprocess, "run", side_effect=time_out) as ssh,
+              mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.keys.parent / "notifier")})):
+            self.assertEqual(question_pushes.drain(), 1)
+            self.assertTrue(question_pushes.binding_path("z", "key").exists())
+            self.assertEqual(question_pushes.drain(), 1)
+            self.assertFalse(question_pushes.binding_path("z", "key").exists())
+            self.assertTrue(question_pushes.binding_path("a", "key").exists())
+            self.assertEqual(ssh.call_count, 2)
+
+    def test_closed_legacy_question_drops_its_kept_copy_without_a_binding(self) -> None:
+        path = self.keys.parent / "question.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: closed\nregistration: {"since":"opening"}\n---\n')
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        push: silence.KeptPush = {"source": "drawer", "key": "same key", "priority": "0", "title": "Choose",
+            "message": "Details", "detail": "", "text_id": "decision.choices", "reference": reference}
+        unrelated: silence.KeptPush = {**push, "reference": push_reference.NO_REFERENCE}
+        self.silence_on()
+        with (mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.keys.parent / "notifier")}),
+              mock.patch.object(send, "cancel_user_push", side_effect=AssertionError("legacy kept copy cancelled")),
+              mock.patch.object(subprocess, "run", side_effect=AssertionError("remote call"))):
+            for answer in (True, False):
+                with self.subTest(answer=answer):
+                    _ = silence.kept_file().write_text(json.dumps(push) + "\n" + json.dumps(unrelated) + "\n")
+                    if answer:
+                        question_pushes.answer_saved(path)
+                    else:
+                        self.assertEqual(question_pushes.drain(), 0)
+                    self.assertEqual(silence.read_kept(), [unrelated])
+        self.assertFalse(question_pushes.binding_path(push["source"], push["key"]).exists())
 
     def test_failed_drop_log_preserves_the_full_drop_on_stderr_and_removes_the_push(self) -> None:
         path = self.keys.parent / "question-closed.md"

@@ -609,8 +609,7 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
     reference = push.get("reference", push_reference.NO_REFERENCE)
     if reference["kind"] == "question" and not push["key"]:
         push = {**push, "key": "question:" + reference["path"]}
-    if push["key"] and (reference["kind"] == "question"
-                       or question_pushes.binding_path(push["source"], push["key"]).exists()):
+    if reference["kind"] == "question":
         try:
             if _can_keep(push):
                 _ = silence.end_if_past(deliver=lambda kept: post_kept(kept, keys_file, post))
@@ -714,9 +713,12 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
         if reference["kind"] == "question":
             binding_path = question_pushes.binding_path(push["source"], push["key"])
             try:
-                binding = question_pushes.read_binding(binding_path)
-                reason = ("push replaced" if binding is not None and binding.reference != reference
-                          else question_pushes.settled(reference))
+                current = question_pushes.read_binding(binding_path)
+                if current is not None and current.reference == reference:
+                    binding = current
+                reason = question_pushes.settled(reference)
+            except BlockingIOError:
+                return 1
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 log(push["source"], push["priority"], push["title"], push["message"],
                     f"anomaly: question record {reference['path']}: {error}",
