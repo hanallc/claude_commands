@@ -6792,6 +6792,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
     def test_keyed_review_can_retry_when_the_deadline_precedes_the_queue_write(self) -> None:
         written: list[dict[str, object]] = []
+        attempted: list[dict[str, object]] = []
 
         def daemon(connection: socket.socket) -> None:
             initialize = receive_frame(connection)
@@ -6809,29 +6810,35 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         recipient.socket.parent.mkdir(parents=True, exist_ok=True)
         row = self.daemon_row("thread-one")
         args = ["--here", "--to", "codex:thread-one", "--from", "test", "--text", "hello",
-                "--key", "review:before-write", "--recipient-key", "stable-staff",
-                "--review-delivery", "--repeat-minutes", "60"]
+                "--key", "review:before-write", "--review-delivery", "--repeat-minutes", "60"]
+        started = datetime(2026, 11, 19, 6, 12, 59, tzinfo=timezone.utc)
         call = codex_daemon._DaemonClient.call  # pyright: ignore[reportPrivateUsage]
 
         def expire(client: codex_daemon._DaemonClient, method: str, params: dict[str, object]  # pyright: ignore[reportPrivateUsage]
                    ) -> dict[str, object]:
             if method == "thread/queue/add":
+                attempted.append(params)
                 with mock.patch("scripts.message.codex_daemon._WebSocket._prepare_operation", side_effect=TimeoutError):
                     return call(client, method, params)
             return call(client, method, params)
 
         with (FakeDaemon(recipient.socket, daemon, repeat=True),
+              mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}),
               mock.patch.object(roster, "roster", return_value=self.recipient_roster([row], []))):
             first = io.StringIO()
             with (mock.patch("scripts.message.codex_daemon._DaemonClient.call", autospec=True, side_effect=expire),
+                  mock.patch.object(send, "now", return_value=started),
                   redirect_stdout(first)):
                 self.assertEqual(send.main(args), 3)
             self.assertTrue(first.getvalue().startswith("FAILED: timed out after "))
             self.assertEqual(written, [])
-            with redirect_stdout(io.StringIO()):
+            with (mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)),
+                  redirect_stdout(io.StringIO())):
                 self.assertEqual(send.main(args), 0)
                 self.assertEqual(send.main(args), 0)
         self.assertEqual(len(written), 1)
+        self.assertEqual(attempted, [written[0]["params"]])
+        self.assertNotIn("codex_requests", send.read_key_states()["review:before-write"])
 
     def test_keyed_review_reuses_the_daemon_message_id_after_a_queue_timeout(self) -> None:
         requests: list[dict[str, object]] = []
@@ -6857,19 +6864,41 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         args = ["--here", "--to", "codex:thread-one", "--from", "test", "--text", "hello",
                 "--timeout", "0.5", "--key", "review:codex", "--recipient-key", "stable-staff",
                 "--review-delivery", "--repeat-minutes", "60"]
+        started = datetime(2026, 11, 19, 6, 12, 59, tzinfo=timezone.utc)
         recipient.socket.parent.mkdir(parents=True, exist_ok=True)
         with (FakeDaemon(recipient.socket, daemon, repeat=True),
+              mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}),
               mock.patch.object(roster, "roster", return_value=self.recipient_roster([row], []))):
             first = io.StringIO()
-            with redirect_stdout(first):
+            with mock.patch.object(send, "now", return_value=started), redirect_stdout(first):
                 self.assertEqual(send.main(args), 5)
             self.assertIn("PENDING: Codex queue acceptance is unconfirmed", first.getvalue())
-            with redirect_stdout(io.StringIO()):
+            with (mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)),
+                  redirect_stdout(io.StringIO())):
                 self.assertEqual(send.main(args), 0)
                 self.assertEqual(send.main(args), 0)
         self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0]["input"], [
+            {"type": "text", "text": "hello\nSender native id: unavailable\nSent: 01:12 EST"},
+        ])
         self.assertEqual(requests[0], requests[1])
         self.assertEqual(len(accepted), 1)
+        self.assertNotIn("codex_requests", send.read_key_states()["review:codex"])
+
+    def test_once_per_key_codex_queue_saves_acceptance_before_removing_the_request(self) -> None:
+        row = self.daemon_row("thread-one")
+        options = local_options([
+            "--to", "codex:thread-one", "--from", "test", "--text", "hello",
+            "--key", "once:codex", "--once-per-key",
+        ])
+        with (mock.patch.object(roster, "roster", return_value=self.recipient_roster([row], [])),
+              mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue):
+            with (mock.patch.object(send, "record_once", side_effect=OSError("The send stopped")),
+                  self.assertRaisesRegex(OSError, "The send stopped")):
+                _ = send.send(options)
+            self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+        queue.assert_called_once()
+        self.assertNotIn("codex_requests", send.read_key_states()["once:codex"])
 
     def test_local_roster_is_read_once_for_every_roster_address_and_bare_name(self) -> None:
         self.staff_member("thread-one", "thread-one")

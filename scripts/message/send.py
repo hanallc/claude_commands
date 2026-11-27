@@ -473,6 +473,7 @@ class KeyState(TypedDict):
     # Map each recipient to its claim time. A failed send releases its claim.
     last: dict[str, str]
     pending: NotRequired[dict[str, str | PendingDelivery]]
+    codex_requests: NotRequired[dict[str, str]]
     acknowledged: NotRequired[str]
     clearing: NotRequired[Emergency]
     clearings: NotRequired[dict[str, Emergency]]
@@ -2517,6 +2518,8 @@ def _forget_delivery(key: str, to: str, at: datetime | None, *, push: PushIdenti
             _ = state["pending"].pop(slot, None)
             if not state["pending"]:
                 del state["pending"]
+        if state.get("codex_requests"):
+            return
         if not state["last"] and not any(field in state for field in (
                 "acknowledged", "once_accepted", "once_confirmed", "once_remote", "once_delivery_interrupted",
                 "clearing", "clearings")):
@@ -4696,6 +4699,29 @@ def _postmaster_recipient(attempt: RelayAttempt, records: list[sessions.SessionR
     return postmaster.RecipientNotInRegistry()
 
 
+def codex_request_slot(review_recipient: str, thread_id: str) -> str:
+    return json.dumps((review_recipient, thread_id))
+
+
+def finish_codex_request(key: str, review_recipient: str, thread_id: str, at: datetime, *, once: bool) -> None:
+    """Discard the saved payload once this attempt has a durable acceptance."""
+    try:
+        with key_states() as states:
+            state = states.get(key)
+            if state is None or state["last"].get(review_recipient) != at.isoformat():
+                return
+            if review_recipient in state.get("pending", {}) or "codex_requests" not in state:
+                return
+            if once:
+                state["once_accepted"] = True
+            requests = state["codex_requests"]
+            _ = requests.pop(codex_request_slot(review_recipient, thread_id), None)
+            if not requests:
+                del state["codex_requests"]
+    except OSError as error:
+        repeat_guard.warn(f"could not finish the accepted Codex queue request: {error}")
+
+
 def deliver_codex(
     message: Message,
     recipient: CodexSessionRecipient | CodexPaneRecipient,
@@ -4704,14 +4730,13 @@ def deliver_codex(
     selection: RecipientSelection,
     review_recipient: str = "",
 ) -> Result:
-    text = agent_text(message)
     if isinstance(selection, FixedStaffLookup):
         current = _current_staff_session(selection, ExpectedStaffSession(recipient.thread_id))
         if isinstance(current, RecipientLookupFailed):
             return Result("failed", current.reason)
     if isinstance(recipient, CodexPaneRecipient):
         try:
-            _prompt_pane(recipient.place, text, target=recipient.thread_id, timeout=timeout)
+            _prompt_pane(recipient.place, agent_text(message), target=recipient.thread_id, timeout=timeout)
             return Result("sent", f"{recipient.address} at {recipient.place.session}:{recipient.place.pane}")
         except (herdr_types.HerdrFailure, OSError) as error:
             if message.once_per_key:
@@ -4719,10 +4744,21 @@ def deliver_codex(
             return Result("failed", str(error))
     if (message.review_delivery or message.once_per_key) and message.key is not None:
         digest = hashlib.sha256(json.dumps((message.key, review_recipient)).encode()).hexdigest()
+        slot = codex_request_slot(review_recipient, recipient.thread_id)
+        try:
+            # Save the rendered payload before the queue can accept it.
+            with key_states() as states:
+                state = states.setdefault(message.key, {"last": {}})
+                requests = state.setdefault("codex_requests", {})
+                if slot not in requests:
+                    requests[slot] = agent_text(message)
+                text = requests[slot]
+        except OSError as error:
+            return Result("failed", f"could not save the Codex queue request: {error}")
         queued = codex_daemon.queue(recipient.daemon, recipient.thread_id, text, timeout=timeout,
                                    message_id=f"message-review-{digest}")
     else:
-        queued = codex_daemon.queue(recipient.daemon, recipient.thread_id, text, timeout=timeout)
+        queued = codex_daemon.queue(recipient.daemon, recipient.thread_id, agent_text(message), timeout=timeout)
     if isinstance(queued, codex_daemon.QueueUnconfirmed):
         return UncertainRelayDelivery("failed", queued.reason)
     if isinstance(queued, codex_daemon.Queued):
@@ -6433,6 +6469,9 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         reported_to = result.receiver
     if not options.no_accounting:
         log(replace(message, to=reported_to), result, started, log_route)
+    if (result.outcome == "sent" and key is not None and isinstance(route, CodexSessionRecipient)
+            and (message.review_delivery or message.once_per_key)):
+        finish_codex_request(key, stable.value, route.thread_id, started, once=message.once_per_key)
     if options.report_recipient:
         print("SEND_RECIPIENT: " + (result.receiver or reported_to), file=sys.stderr)
     if isinstance(review_route, review_hold.ReleasedMessages) and review_route.held and not review_route.messages:
