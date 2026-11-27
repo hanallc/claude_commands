@@ -540,7 +540,7 @@ class DetachedRunsTests(unittest.TestCase):
                 popen.assert_not_called()
                 self.assertFalse((self.session / detached_runs.DETACHED_RUNS_DIR).exists())
                 self.assertEqual(errors.getvalue().splitlines(), [
-                    "detached_runs: Start with systemd-run --scope or systemd-run --user --scope. "
+                    "detached_runs: Start with systemd-run --scope --collect or systemd-run --user --scope --collect. "
                     + "Use the exact option names in that order.",
                 ])
 
