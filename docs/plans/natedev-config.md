@@ -293,6 +293,8 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Settled (natedev 02:16 PST 11-27):** `/default_models` set-service-tier keeps working for the `cli` function. `_agents_set_service_tier` in `scripts/agents/models_config.sh` (line 1126) writes the `cli.conf` row `<task>.codex.service_tier` through the `/tune` path, for every `cli` task when no subtask is named. `inherit` removes the row. Keep the function, subtask and all-functions forms. The new key merges under this working name; natedev names it to nate after the merge. The removal of `[cli.options] codex_service_tier` rides the P807 go. Test each form and `inherit` through `default_models.sh`.
 
+**Service tier rows (architect after Phase 14):** `live_settings.stage_save` changes the value of a row that exists. A first `service_tier` setting must create its row, and `inherit` must remove it. Add a create and a remove operation to the `/tune` path in `scripts/lib/live_settings.py` and `scripts/lib/waiting_rows.py`, with named states for set and inherit (no bare `None`). Test publication and replay for a create, a remove and the all-functions form through `/default_models`.
+
 **Files:**
 - `config/cli.conf` — new
 - `config/models.conf` — `[cli.*]` sections removed
@@ -301,10 +303,11 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `scripts/lib/config_form_exceptions_test_support.py` — the `TAIL_BYTES` row removed
 - `commands/default_models.md`, `commands/build/hand_made.md`, `config/README.md`
 - `scripts/agents/test_models_config.sh`, `scripts/agents/test_models_conf_publish.py` — the writer tests: the CLI rows in `/default_models` and the mixed model replacement
+- `scripts/lib/live_settings.py`, `scripts/lib/waiting_rows.py`, `scripts/lib/test_waiting_rows.py` — row create and remove for the service tier
 - `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/production/test_hand_made.py`, `scripts/production/test_hand_made_guest.py`, `scripts/production/test_hand_made_limit.py`, `scripts/production/test_hand_made_mac.py`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`
 
 **Workers:** 2 writers — the launcher side and the hand made side.
-- `impl` — `config/cli.conf`, `config/models.conf`, `scripts/lib/models_registry.py`, `scripts/agents/models_config.sh`, `scripts/agents/default_models.sh`, `scripts/cli_agent/cli_agent.sh`, `commands/default_models.md`, `config/README.md`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/test_models_config.sh`, `scripts/agents/test_models_conf_publish.py`; hub: `config/cli.conf` (both sides read it)
+- `impl` — `config/cli.conf`, `config/models.conf`, `scripts/lib/models_registry.py`, `scripts/agents/models_config.sh`, `scripts/agents/default_models.sh`, `scripts/cli_agent/cli_agent.sh`, `commands/default_models.md`, `config/README.md`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/test_models_config.sh`, `scripts/agents/test_models_conf_publish.py`, `scripts/lib/live_settings.py`, `scripts/lib/waiting_rows.py`, `scripts/lib/test_waiting_rows.py`; hub: `config/cli.conf` (both sides read it)
 - `test` opens as impl — `scripts/production/hand_made.py`, `scripts/production/hand_made_limit.py`, `scripts/production/hand_made_guest.py`, `scripts/lib/config_form_exceptions_test_support.py`, `commands/build/hand_made.md`, `scripts/production/test_hand_made*.py`
 
 **State:** none
@@ -315,6 +318,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - Git recovery never falls back to a committed agent value that fails the current check.
 - Phase 5 put `registry_path` in `scripts/lib/registry_rows.py`. `models_registry` re-exports it. It checks `MODELS_CONFIG_FILE`, then `CONF_DIR/models.conf`, then `$HOME/.claude/config/models.conf`. Preserve the launch snapshot and worker pin. The unittest and shell test entry points clear inherited pins before tests select their fixtures.
 - `conf._agent_limit` reads `CONF_DIR/models.conf`, but `registry_path` honors the worker pin. A CLI model check must read the same catalog as the launch: resolve it through `registry_rows.registry_path`. Test conflicting catalogs (pin and `CONF_DIR`) through both the Python and the shell CLI paths. If `launch_settings` gains a configuration parameter, use the existing `FreshLaunchConfiguration` state, not `None`.
+- `models_registry.check_agent_value(registry, ...)` (line 224) reads the catalog file again, while `launch_settings()` can take a captured registry. A CLI model check validates against the same snapshot the launch uses. Test it: replace the catalog file after the capture; the check and the launch still agree (architect after Phase 14).
 - Phase 1 rules: a blank line between blocks; the limit line directly above the key.
 - Phase 1: the registry writers apply `registry_rows.space_groups(text)` to the whole text on each write (`registry_rows.replay`, `models_registry._publish`, `save_registry`). A blank line stays between a key row and the next comment or section after the `[cli.*]` removal.
 - Phase 1: `write_live` and `stage_save` call `live_settings.editable_setting`, which first refuses a value that `str.splitlines()` splits (`live_settings.check_value_line`). The `/default_models` cli write gets the same refusal.
@@ -338,7 +342,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Spec:**
 
-0. **Wait.** nate gave the go for all four moves on 11-24 at 07:50 PST (Questions page); the 35 working names stand. Start only after Phases 1 and 2 (the rules and checks) and item 229 are on main (item 229 changes `scripts/maintenance/herdr_upkeep.py`). Merge main first.
+0. **Wait.** nate gave the go for all four moves on 11-24 at 07:50 PST (Questions page); the 35 working names stand. Start only after Phases 1 and 2 (the rules and checks) are on main. Item 229 (it changes `scripts/maintenance/herdr_upkeep.py`) was on main by 11-27. Merge main first.
 1. **Moves**, values byte for byte. A TOML table becomes a dotted prefix, so the full name `<stem>.<table>.<key>` stays the same:
    - `config/herdr_upkeep.toml` → `config/herdr_upkeep.conf`: `job.interval_seconds=120`, `job.timeout_seconds=60`.
    - `config/session_retries.toml` → `config/session_retries.conf`: `registry_reads=4`, `registry_delay_seconds=0.1`.
@@ -349,7 +353,8 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
    - `scripts/maintenance/herdr_upkeep.py` (line 28) → `conf.read("herdr_upkeep")`; remove `HERDR_UPKEEP_CONFIG`.
    - `scripts/maintenance/settings.py` (line 88) → `conf.read("agent_notes")`; remove `AGENT_NOTES_JOB_CONFIG`. The notes timer reads values on each pass; keep that. Keep the separate failure paths: `part_cadence()` reads one part, `settings()` reports an invalid part through `InvalidPartSchedule` while other parts run, and `usage_only_intervals()` stays independent. Test that an unusable part leaves unrelated work eligible. The agent-notes lane owns the shared `job_config_fixture` in `scripts/maintenance/test_vault_save.py` and its users in `test_vault_commit.py` and `test_agent_notes_job.py`.
    - `scripts/message/session_records.py` (line 100) → `conf.read("session_retries")`.
-   - `scripts/accounts/accounts.py` (line 874) → `conf.read("accounts").value("trust.folders", str, allow_blank=True)`. Map an empty value to no folders. Split a nonempty value on `:`. Keep today's handling of a bad part: `_trusted_folders` (line 887) prints `accounts: anomaly: trust folder is not an absolute path` and skips a part that is empty or not absolute after `~` expansion; it refuses nothing. Add no new refusal (nate's rule of 11-05). Keep the tests of `~/other trees` (`test_accounts.py` line 3087) and the empty list (line 3244).
+   - `scripts/accounts/accounts.py` (line 875) → `conf.read("accounts").value("trust.folders", str, allow_blank=True)`. Map an empty value to no folders. Split a nonempty value on `:`. Keep today's handling of a bad part: `_trusted_folders` (line 887) prints `accounts: anomaly: trust folder is not an absolute path` and skips a part that is empty or not absolute after `~` expansion; it refuses nothing. Add no new refusal (nate's rule of 11-05). Keep the tests of `~/other trees` (`test_accounts.py` line 3087) and the empty list (line 3244). Keep the test that `trust` and `setup` read one configuration before they take the home locks. `conf.py` (line 477) strips text after ` #`, so a folder path that holds ` #` cannot be stored in the row. The live value `~/worktrees` holds none; say so in the reply, and test that the moved row reads the same folders as the TOML file.
+   - `config/gate.conf` `scan_roots` (line 35) maps `maintenance/test_vault_commit.py` to `config/agent_notes.toml`. With that file gone, `declared_scan_roots()` refuses the gate configuration. Change the path to `config/agent_notes.conf`, and prove that a change to that file selects `test_vault_commit.py` (architect after Phase 14).
 4. **Tests** write `CONF_DIR` fixtures with `write_config_fixture`.
 5. Delete the four TOML files. Remove their rows from the format, reader and variable allow lists in `scripts/lib/config_form_exceptions_test_support.py`.
 6. **README.** Replace the TOML descriptions of these files with `.conf` sections.
@@ -362,17 +367,19 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `scripts/maintenance/settings.py`, `scripts/maintenance/test_agent_notes_job.py`, `scripts/maintenance/test_*.py` — the agent notes reader, and the tests that set `AGENT_NOTES_JOB_CONFIG`
 - `scripts/message/session_records.py`, `scripts/message/test_session_records.py`
 - `scripts/whoami/test_agent_notes.py`, `scripts/accounts/test_refusal_watch.py` — they set `AGENT_NOTES_JOB_CONFIG`
-- `scripts/accounts/accounts.py`, `scripts/accounts/home_test_support.py`, `scripts/production/unit_status_test_support.py`
+- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py`, `scripts/accounts/home_test_support.py`, `scripts/production/unit_status_test_support.py`
+- `config/gate.conf` — the `test_vault_commit.py` scan path
 - `scripts/lib/config_form_exceptions_test_support.py`, `config/README.md`
 
 **Workers:** 2 writers — split by file pair.
-- `impl` — the `agent_notes` and `herdr_upkeep` files and their readers and tests, with the agent notes fixtures in `scripts/whoami/test_agent_notes.py` and `scripts/accounts/test_refusal_watch.py`; hub: `scripts/lib/config_form_exceptions_test_support.py` (this slot owns every edit to it; the other slot sends its row removals here)
-- `test` opens as impl — the `session_retries` and `accounts` files, readers and tests. Own `scripts/production/unit_status_test_support.py`, `scripts/accounts/home_test_support.py`, the trust fixtures, and `config/README.md`.
+- `impl` — the `agent_notes` and `herdr_upkeep` files and their readers and tests, `config/gate.conf`, with the agent notes fixtures in `scripts/whoami/test_agent_notes.py` and `scripts/accounts/test_refusal_watch.py`; hub: `scripts/lib/config_form_exceptions_test_support.py` (this slot owns every edit to it; the other slot sends its row removals here)
+- `test` opens as impl — the `session_retries` and `accounts` files, readers and tests. Own `scripts/accounts/test_accounts.py`, `scripts/production/unit_status_test_support.py`, `scripts/accounts/home_test_support.py`, the trust fixtures, and `config/README.md`.
 
 **State:** none
 
 **Constraints from prior phases:**
 - Phase 3 put the four TOML files on the format allow list, their four readers on the reader allow list, and `HERDR_UPKEEP_CONFIG` and `AGENT_NOTES_JOB_CONFIG` on the variable allow list, under "TOML tunables to .conf".
+- Phase 14 moved `accounts.json` out of `config/` and changed `scripts/accounts/worker_names.py`, `role_map.py` and `accounts.py` (`resolve_history_label`, `migrate-accounts-state`). The `trust.folders` edit at line 875 does not touch those parts. `test_config_form.py` now fails on an untracked `.json` or `.lock` file in `config/`.
 - Phase 2 and Phase 1 rules apply: a limit line directly above each number key; a blank line between blocks.
 
 **Acceptance gate:**
@@ -393,22 +400,24 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Spec:**
 
 0. **Wait.** nate gave the go for all four moves on 11-24 at 07:50 PST (Questions page); the 35 working names stand. Start only after Phases 1 and 2 (the rules and checks) are on main.
-1. **Files:** `config/build_admission.conf` (`[disk]`, `[memory]`), `config/build_folders.conf` (9 sections), `config/build_steps.conf` (5), `config/gate_rename_deploy.conf` (1), `config/copies.conf` (`[copies]`, `[allow-list]`), `config/design_roles.conf` (`[ownership]`, `[roles]`), `config/lint.conf` (4). Replace each `[section]` line with a plain group comment line, `# <section>`, with a blank line above it.
+1. **Files:** `config/build_admission.conf` (`[disk]`, `[memory]`), `config/build_folders.conf` (8 sections), `config/build_steps.conf` (4), `config/gate_rename_deploy.conf` (1), `config/copies.conf` (`[copies]`, `[allow-list]`), `config/design_roles.conf` (`[ownership]`, `[roles]`), `config/lint.conf` (4). Replace each `[section]` line with a plain group comment line, `# <section>`, with a blank line above it.
 2. **Key names stay.** On the plan base no key repeats across sections in any of these files, so every key keeps its name. If a reader needs the section as part of the key, that is a rename: stop that file and report it to the director. No rename merges without nate's go.
 3. **Readers first.** Confirm how each reader reads its file. Candidates from a plan-base scan (confirm each): `scripts/build_queue/admission_service.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/limits_view.py`, `scripts/lint/memory_admit.py`, `scripts/worktree/worktrees.py`, `scripts/astra/design_roles.py`, `scripts/herdr/worker_panes.py`, `scripts/buildlog/rust_release.py`, `scripts/build_targets/build_targets.py`, `scripts/buildlog/report.py`, `scripts/mac_test/eligibility.py`, `scripts/history/rounds.py`, `scripts/style/style_plan.py`. Keep readers that already use `conf` in the before-and-after proof. Convert each remaining section-aware reader. Cover `authority_request`, `_allow_new_roles`, and the `authority` CLI branch in `scripts/astra/design_roles.py`.
-4. **design_roles.** `scripts/astra/design_roles.py` uses `configparser`. It changes to `conf.read("design_roles")` keys `host` and `new_open`. `host` keeps both uses: routing and the local authority check. Read `host` with `HostOverride.IGNORED` at both uses, so a `host.<machine>` row cannot change the authority. Test that both uses give the same authority when the fixture has a host override row. `new_open` gets the limit line `# one of: true, false`; the code reads `true` as open. Today `getboolean(..., fallback=True)` (line 825) also accepts `yes`, `on` and `1` and opens when the key is missing; after the change a missing or other value is a `conf.read` refusal, with Git recovery, like every key (rule 7: no default in code). The live value is `true`, so behavior stays the same. Remove `DESIGN_ROLES_CONFIG`; tests use `CONF_DIR`, and `scripts/astra/design_role_test_support.py` writes the fixture.
+4. **design_roles.** `scripts/astra/design_roles.py` uses `configparser`. It changes to `conf.read("design_roles")` keys `host` and `new_open`. `host` keeps both uses: routing and the local authority check. Read `host` with `HostOverride.IGNORED` at both uses, so a `host.<machine>` row cannot change the authority. Test that both uses give the same authority when the fixture has a host override row. `new_open` gets the limit line `# one of: true, false`; the code reads `true` as open. Today `getboolean(..., fallback=True)` (line 825) also accepts `yes`, `on` and `1` and opens when the key is missing; after the change a missing or other value is a `conf.read` refusal, with Git recovery, like every key (rule 7: no default in code). The live value is `true`, so behavior stays the same. Test a legacy spelling (`new_open=yes`) and a missing key: each takes the `conf.read` refusal path with Git recovery, not the old open fallback. Remove `DESIGN_ROLES_CONFIG`; tests use `CONF_DIR`, and `scripts/astra/design_role_test_support.py` writes the fixture.
 5. **Proof.** Before the change, a script reads every key of each file with `conf.read` and with each section-aware reader, and saves the values. After the change the same script gives the same values.
 6. Remove the seven files from the sections allow list. Replace the `design_roles.py` reader row with a `PERMANENT` row for `designer.md` only: line 710 still reads `config/design_roles/designer.md` as data. Remove `DESIGN_ROLES_CONFIG` from `VARIABLE_EXCEPTIONS`.
 7. **README.** Update the sections of `config/README.md` that show these files with `[section]` lines (for example `## lint.conf`).
+8. **Diagnostics.** `scripts/build_queue/queue_place.py` (line 642) names `build_admission.conf [memory]` in its refusal. Name the key without the section.
 
 **Files:**
 - `config/build_admission.conf`, `config/build_folders.conf`, `config/build_steps.conf`, `config/lint.conf` — group comments; their section-aware readers from Spec item 3 and their tests also change
 - `config/gate_rename_deploy.conf`, `config/copies.conf`, `config/design_roles.conf`
 - `scripts/astra/design_roles.py`, `scripts/astra/test_design_roles.py`, `scripts/astra/test_design_roles_sources.py`, `scripts/astra/design_role_test_support.py`, `scripts/herdr/worker_panes.py`
+- `scripts/build_queue/queue_place.py` — the `[memory]` diagnostic
 - `scripts/lib/config_form_exceptions_test_support.py`, `config/README.md`
 
 **Workers:** 2 writers — split by file group.
-- `impl` — `config/build_admission.conf`, `config/build_folders.conf`, `config/build_steps.conf`, `config/lint.conf` and their readers and tests
+- `impl` — `config/build_admission.conf`, `config/build_folders.conf`, `config/build_steps.conf`, `config/lint.conf` and their readers and tests, with the `scripts/build_queue/queue_place.py` diagnostic
 - `test` opens as impl — `config/gate_rename_deploy.conf`, `config/copies.conf`, `config/design_roles.conf`, `scripts/astra/design_roles.py`, `scripts/astra/design_role_test_support.py`, `scripts/herdr/worker_panes.py` and their tests, `config/README.md`; hub: `scripts/lib/config_form_exceptions_test_support.py` (this slot owns every edit to it; the other slot sends its row removals here)
 
 **State:** none
@@ -440,7 +449,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 2. **Comments.** Put a comment line above each key block that has none. It says what the keys control; read the reader code to say it. Keep one blank line between blocks (rule 12).
 3. **Limits.** Put a `# whole: A..B` or `# range: A..B` line directly above each key whose value is a number. Put `# one of: a, b` above a key whose reader accepts a closed set of words. The limit states what the reader accepts today; read its checks. When the reader checks nothing, use the limit the code needs to work, for example `# whole: 1..` for a count, and name each such choice in the reply. Every live value passes its limit.
 4. **No key or value changes.** `git diff -U0 -- config/` adds only comment lines and blank lines. A limit line on an existing wait-time key states today's check; it adds no key and no name (Delegation Context wait-limit invariant).
-5. **models.conf.** The comments go above the registry blocks. The registry writers (`scripts/lib/registry_rows.py`, `scripts/lib/models_registry.py`) and `scripts/agents/sync_codex_catalog.sh` must keep them. Run a registry write and the catalog sync on a fixture with the new comments, then run `check_comment_limits` on the output. If a writer drops a comment, fix that writer and add that run as a test row.
+5. **models.conf.** The comments go above the registry blocks. The registry writers (`scripts/lib/registry_rows.py`, `scripts/lib/models_registry.py`) and `scripts/agents/sync_codex_catalog.sh` must keep them. Run a registry write and the catalog sync on a fixture with the new comments, then run `check_comment_limits` on the output. The catalog sync fixture adds a model, so the sync publishes a change. If a writer drops a comment, fix that writer and add that run as a test row.
 6. Remove each `COMMENT_LIMIT_FILES` row as its file passes. At the end remove `COMMENT_LIMIT_FILES`; the comment and limit rule of `test_repository_form` takes no exceptions.
 
 **Files:**
@@ -596,56 +605,30 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - A `worker.py` guard for an oversize `<key>.<host>` row: the cause is conf host-row limits, held as an add-on.
 
 ### Phase 14 — Runtime state out of config  · status: done
-**Depends on:** Phase 13
 
-#### Work Order
+#### As-built
 
-**Goal:** `config/accounts.json` and `config/accounts.lock` live under `~/.local/state/`, every reader and writer uses the new paths on natedev and the Mac, no live process uses an old path after the switch, and the form test refuses an untracked runtime file in `config/`.
-
-**Spec:**
-
-1. **Paths.** `accounts.json` and `accounts.lock` go to `~/.local/state/accounts/`. No code uses `config/showrunners.lock`: `scripts/production/showrunners.py` keeps its state under `scripts/lib/showrunner_state.state_root()`. Remove the `/config/showrunners.lock` line from `.gitignore`, and delete a stale `config/showrunners.lock` on each machine in the live check. If the area already keeps state in another `~/.local/state/` folder, use that folder and name it in the reply.
-2. **Readers and writers.** Find each with `grep -rln 'accounts\.json\|accounts\.lock\|showrunners\.lock' scripts`. On the plan base, `accounts.json` appears in `scripts/accounts/worker_names.py`, `scripts/whoami/quota_alert_test_support.py` and `scripts/agents/codex_test_support.py`; `scripts/accounts/worker_names.py` owns `accounts_config_file()` and `roles_lock()`. Use their shared path resolution for each reader and writer.
-3. **Switch.** At no time may two live processes use different paths for the same lock or state file. A process started before the merge reads the old path without the new lock (`_local_role_map`), and it reads a missing file as an empty role map. So the file moves only after no such process runs:
-   1. One function gives the live state path: the new path when it exists, else the old path. The lock follows the live file: `config/accounts.lock` while the old file is live, the new lock after. After the code takes a lock, it checks that its file is still the live one; if not, it releases the lock and resolves the path again.
-   2. The move is one command in `scripts/accounts/accounts.py`. The live check runs it after both machines pull and every long-lived process that reads accounts restarts. Under the old lock it renames the old file to the new path, then deletes `config/accounts.lock`.
-   3. A reader that caches the role map reads it again when the live path changes.
-
-   4. Resolve the path inside the locks. `scripts/accounts/role_map.py` picks the writer path before it takes `_groups_lock()` and `worker_names.roles_lock()` (line 639), so a writer that waits during the move keeps the old path. The lock-free read in `_local_role_map()` (line 457) can pick the old path, lose the rename race and return an empty role map. Resolve the writer path after the locks are taken. A lock-free read that finds no file resolves the live path again before it reads the file as missing.
-   5. A machine with no old file still needs a completion mark. The move command creates the new file (an empty role map document) when the old file is absent, so the new path is live on every machine. The shared resolver returns a named state, `LegacyAccountsState` or `MigratedAccountsState`, with its matched state file and lock path. Test a late reader and a late writer on a machine that had no old file.
-
-   Tests: the same worker account selection before and after the move; before the move a write takes the old lock and writes the old path; after the move a write takes the new lock and writes the new path; a writer that waits on the old lock during the move resolves the new path after it; a lock-free read that loses the rename race returns the moved role map; a late process that opens the old lock path after the move does not make `config/accounts.lock` live again.
-4. **Cleanup.** After the switch, no old file stays in `config/`. Remove `/config/accounts.json` (line 23 on the plan base) and `/config/accounts.lock` (line 24) from `.gitignore` when nothing writes them.
-5. **Format rule.** The form test's format check also fails on a `.json` or `.lock` runtime file in `config/` on disk that is not tracked. Test: a fixture Git checkout with an untracked `config/x.json` and `config/x.lock`; the repository check finds both by itself, with no path given by the test. The scan also finds such a file when `.gitignore` names it.
-6. **Live check.** The two machines read accounts state in two ways. The Mac reads worker selection from natedev (`ssh_role_map`) or its saved cache. Historical account resolution reads the machine-local `home_cutovers` of `accounts.json` (`scripts/accounts/accounts.py:2754`). So the move takes the full local document on each machine where it exists. After the merge and the Mac pull, the director checks on natedev and the Mac that the accounts table reads, the worker account selection is unchanged (remote selection on the Mac), a historical account label resolves as before, and no `config/accounts.json`, `config/accounts.lock` or `config/showrunners.lock` remains.
+- `accounts.json` and `accounts.lock` live in `~/.local/state/accounts/` after the move. `worker_names.accounts_state()` returns `MigratedAccountsState` when the new file exists, else `LegacyAccountsState` (`~/.claude/config/accounts.json` and its lock). `accounts_config_file()` returns the state's file.
+- `worker_names.roles_lock()` locks the live state's lock, checks that the state did not change, and yields the `AccountsState` it locked; on a change it releases and resolves again. A late opener of the old lock deletes the old lock file after the move. `role_map.write_role_map` and `_write_workers_claude_route` take the path from that state, inside the locks.
+- `worker_names.read_accounts_document()` is the lock-free read; on a missing file it resolves the state again and reads the moved file. `role_map._local_role_map` and `accounts.resolve_history_label` use it. `CommandRoleMap.local_state` holds the state of a cached map; a changed state reads the map again.
+- `accounts.py migrate-accounts-state` runs the move under the old lock: it renames the old file, or writes `{}` when no old file exists, syncs the new folder (also on a rerun), then deletes `config/accounts.lock`. It prints the new path. When both files exist it refuses with `accounts: cannot migrate account state: Both account state files exist: ...` and keeps both.
+- `.gitignore` has no `/config/accounts.json`, `/config/accounts.lock` or `/config/showrunners.lock` row. `test_git_exclude.py` expects `config/accounts.lock` not ignored.
+- `test_config_form.py` `check_format` scans `config/` on disk and reports each `.json` or `.lock` file that `git ls-files` does not list, ignored or not (rule `untracked runtime file`). `test_repository_form` reports these with no exception list.
 
 **Files:**
-- `scripts/accounts/accounts.py`, `scripts/accounts/worker_names.py` — the new paths; their tests also change
-- `scripts/accounts/role_map.py`, `scripts/accounts/test_role_map.py` — the path resolved inside the locks, and the race tests
-- `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/codex_test_support.py`
-- `scripts/agents/test_agent_exec.py`, `scripts/agents/test_worker_lifecycle.py`, `scripts/direct/test_assign_claude.py` — account state fixtures; keep an old-path fixture for the migration test
-- `.gitignore`
-- `scripts/lib/test_config_form.py`, `scripts/lib/config_form_exceptions_test_support.py`
-- `docs/accounts.md`, `docs/as-built/accounts.md` — the new state paths
+- `scripts/accounts/worker_names.py`, `scripts/accounts/role_map.py`, `scripts/accounts/accounts.py` — state resolver, locks, move command
+- `scripts/accounts/test_role_map.py`, `scripts/accounts/test_accounts.py`, `scripts/accounts/test_moves.py` — move, race and rerun tests
+- `scripts/agents/codex_test_support.py`, `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_worker_lifecycle.py`, `scripts/direct/test_assign_claude.py` — fixtures on the new path
+- `scripts/lib/test_config_form.py`, `scripts/lib/test_git_exclude.py`, `.gitignore`
+- `docs/accounts.md`, `docs/as-built/accounts.md`
 
-**Workers:** 2 writers — the account state switch and the format rule.
-- `impl` — `accounts.json` and `accounts.lock`: `scripts/accounts/` files (with `role_map.py`), the test support files, the account state fixtures in `scripts/agents/test_agent_exec.py`, `scripts/agents/test_worker_lifecycle.py` and `scripts/direct/test_assign_claude.py`, `.gitignore`, `docs/accounts.md`, `docs/as-built/accounts.md`
-- `test` opens as impl — the untracked runtime file rule and its fixture checkout in `scripts/lib/test_config_form.py`; hub: `scripts/lib/config_form_exceptions_test_support.py` (`impl` messages this slot for a row)
+**Gotchas:**
+- Until the move runs on a machine, its `~/.claude/config/accounts.json` is untracked and not ignored, and `test_repository_form` fails in that checkout. Run the move soon after the pull.
+- The live check is open: after the merge, both machines pull and restart long-lived account readers, then run `accounts.py migrate-accounts-state`, check the accounts table, worker selection (remote on the Mac) and one historical label, and delete a stale `config/showrunners.lock`. A "Both account state files exist" refusal stops the check: ask which document is current.
 
-**State:** moves `accounts.json` and `accounts.lock` on natedev and the Mac; deletes a stale `config/showrunners.lock`.
-
-**Constraints from prior phases:**
-- Phase 7 moves `config/accounts.toml` `[trust] folders` to `config/accounts.conf` `trust.folders`. Phase 7 has nate's go (11-24) and waits for Phases 1 and 2 and item 229 on main; this phase does not depend on it. If Phase 7 is not done when this phase starts, `trust.folders` is still in `config/accounts.toml`. If both phases run at the same time, they share `scripts/accounts/accounts.py`: the director gives that file to one phase at a time.
-- Phase 1 format check reads tracked files only; Spec item 5 adds the untracked runtime file case. `check_format(root, files)` judges only the paths it gets, and `test_repository_form` passes `git ls-files -z config/`. The untracked case needs its own file list from the `config/` folder on disk, and its own planted row in `test_planted_violations`.
-- Phase 13 removed the `config/the_list.conf` absent-file case from the stale-row loop of `test_repository_form`. That loop now reports every file exception that matches no violation. Phase 13 also removed `_PRODUCTION_BATCH` from `scripts/lib/config_form_exceptions_test_support.py`.
-
-**Acceptance gate:**
-- The account tests pass, including the switch tests of Spec item 3.
-- `test_config_form.py` passes, and the fixture checkout with untracked `config/x.json` and `config/x.lock` fails the format check twice.
-- This phase adds no `.conf` keys. The named fixture tests prove each path, format or runtime state change. The director reads each `CONF_DIR` fixture of each changed reader, shell and subprocess fixtures included.
-- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
-- basedpyright reports zero errors and zero warnings on each changed Python file.
-- The live check of Spec item 6 passes on both machines.
+**Ruled out:**
+- A cleanup of an old lock left by an interrupted late opener: a rerun of the move deletes it.
+- A guard for a symlinked `accounts.json`: the live files are regular files, and every writer replaces the file atomically.
 
 ### Phase 15 — Context deferral rules to the common form  · status: todo
 **Depends on:** Phase 4
@@ -661,7 +644,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 2. **Patterns.** The `action`, `marker`, `state`, `later` and `exclude` rows move with their comments, in order and byte for byte, to the data file `config/context_deferral_patterns.txt` (rule 10). Each line is `<kind>: <regular expression>`; a kind can repeat.
 3. **Reader.** `scripts/hooks/stop-context-deferral.py` (line 44 reads `conf.path("context_deferral")` by hand) reads `window` with `conf.read("context_deferral").whole("window")` at use. It parses the pattern file as data from the same folder (`conf.directory()`), so a test sets both with `CONF_DIR`. The hook runs on each stop: time it before and after, and name the added cost in the reply.
    - **Config faults.** Today any failure permits the stop (`main` at line 123). A `window` that `conf.read` recovers from the committed file applies, as for every conf key. An unusable `window` or an unreadable pattern file permits the stop, as today. Test each case.
-   - **Duplicate rows.** Today two `window` rows permit the stop (`test_invalid_entries_allow_the_stop_without_output`). The common parser keeps the first value, so `whole("window")` alone would block the same stop. Keep today's behavior: the hook treats a duplicate `window` row as a config fault and permits the stop, while a single valid `window` recovered from Git still applies. Keep that test.
+   - **Duplicate rows.** Today two `window` rows permit the stop (`test_invalid_entries_allow_the_stop_without_output`). The common parser keeps the first value, so `whole("window")` alone would block the same stop. Keep today's behavior: the hook treats a duplicate `window` row as a config fault and permits the stop, while a single valid `window` recovered from Git still applies. Keep that test. Find the duplicate in the same read that gives `window`. A config fault permits the stop with no output: the `conf.read` diagnostic must not reach stderr (`test_invalid_entries_allow_the_stop_without_output` asserts empty output). The test lane adds a case where a single committed `window` recovered from Git still blocks the stop (architect after Phase 14).
 4. **Allow lists.** Remove the `FORMAT_FILES` row of `config/context_deferral.conf`. Replace the `stop-context-deferral.py` reader row with a `PERMANENT` row that reads `context_deferral_patterns.txt` as data. Add `config/context_deferral_patterns.txt` to `DATA_FILES`.
 5. **README.** Update the `## context_deferral.conf` section of `config/README.md` (line 159), and name the data file.
 6. **Tests.** `scripts/hooks/test_stop_context_deferral.py` writes `context_deferral.conf` with `write_config_fixture` and a pattern file in `CONF_DIR`. The same transcripts give the same decisions before and after.
