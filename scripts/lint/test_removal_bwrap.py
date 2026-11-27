@@ -15,6 +15,7 @@ import time
 import unittest
 
 from scripts.lib import removal_guard
+from scripts.lib.conf_reads import CONF_READ_LOG, CONF_SHIFT_READ_LOG
 from scripts.lib.removal_bwrap_test_support import LINUX_CHECKOUT, BuildMount, RemovalSandbox
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import floor_claims
@@ -162,10 +163,15 @@ assert result.removed > 0, result
         old_time = time.time() - 3 * 86_400
         for path in (idle_target, *idle_target.rglob("*")):
             os.utime(path, (old_time, old_time), follow_symlinks=False)
+        command = [bwrap, "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev"]
+        for name in (CONF_READ_LOG, CONF_SHIFT_READ_LOG):
+            log = os.environ.get(name)
+            if log:
+                log_folder = str((checkout / log).parent)
+                command.extend(["--bind", log_folder, log_folder])
         # Restore the fixture when the private /dev hides a fixture under /dev/shm.
-        command = [bwrap, "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev",
-                   "--proc", "/proc", "--ro-bind", str(base), str(base), "--bind", str(mirror), str(mirror),
-                   "--ro-bind", str(source), str(mounted), "--", sys.executable, "-B", "-c", program]
+        command.extend(["--proc", "/proc", "--ro-bind", str(base), str(base), "--bind", str(mirror), str(mirror),
+                        "--ro-bind", str(source), str(mounted), "--", sys.executable, "-B", "-c", program])
         result = subprocess.run(command, cwd=checkout, env={
             **os.environ, **environment, "HOME": str(home), "PYTHONPATH": str(checkout),
             "CLAUDE_DISABLE_DATACLASS_CODE_CACHE": "1",
