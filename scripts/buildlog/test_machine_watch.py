@@ -16,7 +16,7 @@ from unittest import mock
 
 from scripts.aws_target import hana_box, hana_placement
 from scripts.build_targets import target_config, targets
-from scripts.build_targets.target_config import Target
+from scripts.build_targets.target_config import SshTarget, Target
 from scripts.buildlog import cli, mac_idle, mac_idle_alert, machine_facts, machine_watch, sample
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
 from scripts.buildlog.test_index import use_test_log
@@ -81,7 +81,8 @@ class MachineWatchTests(NotificationGuardedTestCase):
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILD_HOLD_DIR": str(self.root / "holds"),
         }))
-        _ = write_config_fixture(config / "build_targets.conf", "enabled.mac-linux=on\n")
+        _ = write_config_fixture(config / "build_targets.conf",
+                                 "enabled.mac-linux=on\nnotices.mac=on\nnotices.mac-linux=on\n")
         _ = write_config_fixture(config / "mac_test.conf", "offload=on\n")
         for stem in ("mac_linux", "hana_aws", "cloud_gate", "lint"):
             _ = write_config_fixture(config / f"{stem}.conf")
@@ -200,6 +201,19 @@ class MachineWatchTests(NotificationGuardedTestCase):
                 else:
                     self.assertEqual(self.option("--key"), f"machine-watch-{name}-{int(START)}")
                     self.assertIn(f"{name} has run no work for {int(notice // 60)} min", self.texts[-1])
+
+    def test_each_push_target_has_a_stored_notices_key(self) -> None:
+        config = Path(__file__).resolve().parents[2] / "config"
+        stored = conf.settings((config / "build_targets.conf").read_text(encoding="utf-8"))
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            push_targets = {
+                target.name for target in machine_watch.machines()
+                if isinstance(target, SshTarget) and machine_watch.notice_kind(
+                    machine_watch.transport_for(target), machine_watch.Unusable("no answer"),
+                ) is machine_watch.NoticeKind.PUSH
+            }
+        self.assertLessEqual({"mac", "mac-linux"}, push_targets)
+        self.assertEqual({f"notices.{name}" for name in push_targets} - stored.keys(), set())
 
     def test_notices_off_stops_only_the_named_machine_push(self) -> None:
         _ = write_config_fixture(self.root / "config/build_targets.conf", "notices.mac=off\n")
