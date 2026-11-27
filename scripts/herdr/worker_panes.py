@@ -158,8 +158,12 @@ class HolderRun(Enum):
     CURRENT = "holder's run"
 
 
-def dispatch_run_fields(parent: StaffId, run: Path) -> dict[str, object] | AdmissionRefused:
+def dispatch_run_fields(parent: StaffId, run: Path, *, record: staff.StaffSnapshot) -> dict[str, object] | AdmissionRefused:
     fields = unit_runs.read_run_fields(run)
+    try:
+        _ = pass_recorder.resolve_run_owner(run, fields, record)
+    except (ValueError, staff.StaffUnreadable) as error:
+        return AdmissionRefused(str(error))
     if fields.get(unit_runs.OWNER_FIELD) != parent:
         return AdmissionRefused(f"{run}: the run is not owned by {parent}")
     return fields
@@ -1690,11 +1694,30 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                 if policy.sandbox != READ_ONLY_SANDBOX or policy.permission != "plan":
                     return AdmissionRefused("showrunner review requires a read-only launch policy")
                 policy = replace(policy, tools=ToolAccess.SHOWRUNNER_REVIEW)
-            fields = dispatch_run_fields(parent, run) if isinstance(dispatch_run, DispatchRun) else unit_runs.read_run_fields(run)
+            fields = (dispatch_run_fields(parent, run, record=record) if isinstance(dispatch_run, DispatchRun)
+                      else unit_runs.read_run_fields(run))
             if isinstance(fields, AdmissionRefused):
                 return fields
             if unit_runs.terminal_run(fields):
                 return AdmissionRefused(f"{run}: the run has ended dispatch admission")
+            if isinstance(dispatch_run, DispatchRun):
+                try:
+                    path = pass_recorder.recorder_lock_path(run)
+                    if isinstance(paths, EnrolledPaths):
+                        worker = cast(progress_history.RunArtifactFactory, cast(object,
+                            import_module("scripts.production.worker")))
+                        recorder = operations.enter_context(worker.CompletionArtifacts(owner, run).append(path))
+                    else:
+                        recorder = operations.enter_context(path.open("a+", encoding="utf-8"))
+                    # Keep the worker lock while holding the recorder lock. Finish-run probes the worker lock without waiting.
+                    fcntl.flock(recorder.fileno(), fcntl.LOCK_SH)
+                    fields = dispatch_run_fields(parent, run, record=staff.snapshot())
+                except (OSError, ValueError, staff.StaffUnreadable) as error:
+                    return AdmissionRefused(str(error))
+                if isinstance(fields, AdmissionRefused):
+                    return fields
+                if unit_runs.terminal_run(fields):
+                    return AdmissionRefused(f"{run}: the run has ended dispatch admission")
             allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
                 worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
             target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
@@ -1746,7 +1769,7 @@ def unpublished_cleanup_text(result: UnpublishedWorker) -> str:
 
 
 def _uses_dispatch_run(process: herdr.NativeAgentProcess, run: Path) -> bool:
-    directory = process.environment.get("UNIT_RUN_DIR")
+    directory = process.environment.get("UNIT_RUN_DIR") or process.environment.get("PLAN_DELEGATE_BOARD_DIR")
     return bool(directory and Path(directory).is_absolute() and Path(directory).resolve() == run.resolve())
 
 
@@ -1859,6 +1882,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         dispatch = worker_dispatch_state(current.row, worker_run(current.row, record=record), lock)
         if passed.get("kind") != role and isinstance(dispatch, DispatchHoldsWorker):
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, dispatch.blocker)
+        changing_run = False
         if not switching:
             matches = _live_policy(current, policy, client, same_role=keep_model and passed.get("kind") == role)
             if isinstance(matches, UncertainWorker):
@@ -1892,13 +1916,14 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 _layout(owner.id, evidence)
                 return current
             changing_run = explicit and not same_run
-            if changing_run and not current.status.idle:
-                return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, f"agent state is {current.status.value}")
-            proof = LegacyPassCloseProof.RESTART_REPLY if changing_run else LegacyPassCloseProof.DISPATCH_DONE
-            closable = can_close(current, lock=lock, legacy_proof=proof)
-            if isinstance(closable, Kept):
-                return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
-    if switching and current is not None:
+        if ((explicit and current.status is herdr.AgentStatus.WORKING)
+                or (changing_run and not current.status.idle)):
+            return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, f"agent state is {current.status.value}")
+        proof = LegacyPassCloseProof.RESTART_REPLY if changing_run else LegacyPassCloseProof.DISPATCH_DONE
+        closable = can_close(current, lock=lock, legacy_proof=proof)
+        if isinstance(closable, Kept):
+            return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
+    elif switching and current is not None:
         closable = can_close(current, lock=lock)
         if isinstance(closable, Kept):
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)

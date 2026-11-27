@@ -2364,6 +2364,88 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.fixture.world.launches, [])
         self.assertEqual(self.agent.submitted, [])
 
+    def test_explicit_start_keeps_working_worker_on_policy_and_family_changes(self) -> None:
+        for family in ("codex", "claude"):
+            with self.subTest(family=family), ExitStack() as cleanup:
+                case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
+                opened = case.opened()
+                case.fixture.completed_dispatch(opened.row, "impl")
+                world = case.fixture.world
+                world.locations[opened.pane]["agent_status"] = "working"
+                run = case.run_dir.with_name("other-run")
+                run.mkdir()
+                _ = (run / unit_runs.STATE_FILE).write_bytes((case.run_dir / unit_runs.STATE_FILE).read_bytes())
+                policy = worker_panes.launch_policy("review", family="claude" if family == "claude" else "codex")
+                result = worker_panes.start_or_resume(case.fixture.parent.id, staff.WorkerName.parse(opened.row.name),
+                    "review", policy=policy, dispatch_run=worker_panes.DispatchRun(run))
+
+                self.assertEqual(result, worker_panes.StartRefused(worker_panes.StartRefusal.BUSY_ROLE_CHANGE,
+                    "agent state is working"))
+                self.assertEqual(world.stops, [])
+                self.assertEqual(world.closed, [])
+                self.assertEqual(len(world.launches), 1)
+
+    def test_explicit_start_refuses_conflicting_saved_owner_and_staff_pointer(self) -> None:
+        parent = self.fixture.parent
+        other = fixture_member("unit", name="other-unit", parent=parent.parent)
+        _ = staff.clear_run(parent.id, self.run_dir)
+        _ = staff.set_run(other.id, staff.OpenRun(self.run_dir))
+
+        result = worker_panes.start_or_resume(parent.id, staff.WorkerName.parse("impl"), "impl",
+            dispatch_run=worker_panes.DispatchRun(self.run_dir))
+
+        self.assertIsInstance(result, worker_panes.AdmissionRefused)
+        assert isinstance(result, worker_panes.AdmissionRefused)
+        self.assertIn(f"saved owner {parent.name} conflicts with the run pointer of {other.name}", result.reason)
+        self.assertEqual(self.fixture.world.launches, [])
+
+    def test_explicit_start_serializes_pane_launch_with_run_end(self) -> None:
+        parent = self.fixture.parent
+        run = self.run_dir
+        name = staff.WorkerName.parse("impl")
+        request = progress_history.RunEndRequested("completed")
+        launch = cast(Callable[..., herdr.AgentLaunched], herdr.launch_prepared_agent)
+
+        def launch_during_finish(*args: object, **kwargs: object) -> herdr.AgentLaunched:
+            with file_lock.exclusive(pass_recorder.recorder_lock_path(run), wait=False) as recorder:
+                finish_can_write = recorder is file_lock.LockResult.ACQUIRED
+            if finish_can_write:
+                _ = progress_history.end_run(run, request)
+            self.assertFalse(unit_runs.terminal_run(unit_runs.read_run_fields(run)))
+            return launch(*args, **kwargs)
+
+        with worker_panes.worker_lock(parent.id, name) as hold:
+            assert isinstance(hold, worker_panes.WorkerLockHold)
+            with patch.object(herdr, "launch_prepared_agent", side_effect=launch_during_finish):
+                opened = worker_panes.start_or_resume(parent.id, name, "impl", lock=hold,
+                    dispatch_run=worker_panes.DispatchRun(run))
+            self.assertIsInstance(opened, worker_panes.OpenWorker)
+            pending = progress_history.end_run(run, request)
+            self.assertIsInstance(pending, unit_runs.RunExecutionBlocker)
+            assert isinstance(pending, unit_runs.RunExecutionBlocker)
+            self.assertIn("a worker operation is in progress", pending.reason)
+
+        refused = worker_panes.start_or_resume(parent.id, staff.WorkerName.parse("test"), "test",
+            dispatch_run=worker_panes.DispatchRun(run))
+        self.assertIsInstance(refused, worker_panes.AdmissionRefused)
+        assert isinstance(refused, worker_panes.AdmissionRefused)
+        self.assertIn("the run has ended dispatch admission", refused.reason)
+        self.assertEqual(len(self.fixture.world.launches), 1)
+
+    def test_explicit_start_reuses_a_worker_with_the_legacy_run_variable(self) -> None:
+        opened = self.opened()
+        world = self.fixture.world
+        pid = world.foreground[opened.pane][0]
+        environment = world.processes[pid].environment
+        environment["PLAN_DELEGATE_BOARD_DIR"] = environment.pop("UNIT_RUN_DIR")
+
+        reused = worker_panes.start_or_resume(self.fixture.parent.id, staff.WorkerName.parse(opened.row.name),
+            "impl", dispatch_run=worker_panes.DispatchRun(self.run_dir))
+
+        self.assertIsInstance(reused, worker_panes.OpenWorker)
+        self.assertEqual(world.foreground[opened.pane][0], pid)
+        self.assertEqual(len(world.launches), 1)
+
     def test_launched_agent_reads_the_kept_launch_settings(self) -> None:
         row = fixture_worker("called-agent", self.fixture.parent.id)
         codex = pane_launch.launch("w1:p9", str(row.current_session), str(self.fixture.root), {},

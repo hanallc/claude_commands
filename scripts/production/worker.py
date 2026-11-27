@@ -1765,7 +1765,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if isinstance(selection, ExitCode):
             return selection
         matched = selection.action
-        fields = worker_panes.dispatch_run_fields(parent, session_dir)
+        fields = worker_panes.dispatch_run_fields(parent, session_dir, record=record)
         if isinstance(fields, worker_panes.AdmissionRefused):
             return startup_result(name, fields)
         if (unit_runs.terminal_run(fields)
@@ -2516,7 +2516,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         if not enrolled and not name and role in ("impl", "fix", "review", "test"):
             needs_team = not any(isinstance(worker_panes.dispatch_role(row), str) for row in rows)
         if needs_team:
-            fields = worker_panes.dispatch_run_fields(parent, session_dir)
+            fields = worker_panes.dispatch_run_fields(parent, session_dir, record=record)
             if isinstance(fields, worker_panes.AdmissionRefused):
                 return startup_result(WorkerName.parse(role), fields)
             if unit_runs.terminal_run(fields):
