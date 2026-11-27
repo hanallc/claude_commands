@@ -1097,6 +1097,19 @@ class WorkerPaneTests(StaffTestCase):
         link.symlink_to(foreign / unit_runs.STATE_FILE)
         self.assertEqual(worker_panes.worker_run(result.row), first)
 
+    def test_worker_admission_keeps_the_parent_run_when_no_run_is_supplied(self) -> None:
+        first = self.worker_run("a-first", "unit", self.parent.current_session, director_run=True)
+        supplied = self.worker_run("z-supplied", "unit", self.parent.current_session)
+        for name, value, expected in (("implicit", "", first), ("explicit", str(supplied), supplied)):
+            with (self.subTest(supplied=value),
+                  patch.dict(os.environ, {"UNIT_RUN_DIR": value, "PLAN_DELEGATE_BOARD_DIR": ""})):
+                opened = self.start(name)
+                self.assertIsInstance(opened, worker_panes.OpenWorker)
+                assert isinstance(opened, worker_panes.OpenWorker)
+                self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(expected))
+                directories = worker_panes.worker_run_directories(staff.snapshot())
+                self.assertEqual(directories.by_worker[opened.row.id][0], expected)
+
     def test_worker_run_checks_the_recorded_dispatch_with_the_supplied_staff(self) -> None:
         row = self.worker("before-rename")
         _ = self.recorded_dispatch(row, "completed", at=20)

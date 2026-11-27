@@ -842,12 +842,12 @@ def worker_run(member: staff.StaffRow, *,
 
 
 def _parent_runs(parent: staff.StaffRow, held: list[str]) -> list[str]:
-    """Order the parent's open run, its held runs, then a supplied run that it owns."""
+    """Put an owned supplied run before the parent's open and held runs."""
     runs = list(dict.fromkeys((str(parent.run.path), *held))) if isinstance(parent.run, staff.OpenRun) else held
     if supplied := unit_runs.environ("RUN_DIR"):
         fields = worker_lifecycle.read_json_object(Path(supplied) / recorder_state.STATE_FILENAME)
         if fields.get(unit_runs.OWNER_FIELD) == parent.id:
-            runs = list(dict.fromkeys((*runs, supplied)))
+            runs = list(dict.fromkeys((supplied, *runs)))
     return runs
 
 
