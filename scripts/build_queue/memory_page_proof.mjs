@@ -82,8 +82,10 @@ const guestTipProof = previousPage === '--guest-tip';
 const standingProof = previousPage === '--standing-orders';
 const killShot = previousPage === '--kill-shot';
 const killControlProof = previousPage === '--kill-control';
+const killCellProof = previousPage === '--kill-cell' ? comparison : undefined;
+const killStripProof = previousPage === '--kill-strip';
 const killBothShot = previousPage === '--kill-both-shot';
-const killProof = killShot || killControlProof || killBothShot;
+const killProof = killShot || killControlProof || killBothShot || killCellProof || killStripProof;
 const focusedProof = verifyCallProof || buildToolsProof || ciServicesProof || queueDragProof || queueRowsProof || guestTipProof
   || standingProof || outsideQueueProof || killProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
@@ -455,7 +457,7 @@ try {
     recipient_name:'test',step:'nextest',
     message:killMessage('nextest', 2637799)};
   const killedResult = {reference:killRef,step:'check',pid:killOffer.pid,stop:'Stopped',delivery:'Message sent',
-    time:killTime,recipient_role:'worker',recipient_name:'impl3'};
+    time:killTime,recipient_role:'worker',recipient_name:'impl3',kill_number:1};
   const killToken = 'fixture-token';
   const killRefreshSeconds = 17;
   const stoppingResult = {...killedResult,stop:'Stopping',delivery:''};
@@ -468,12 +470,21 @@ try {
     message:killMessage(row.command, row.pid),
   }]));
   const outsideStopped = {reference:outsideRef,step:outsideRow?.command,pid:outsideRow?.pid,
-    stop:'Stopped',delivery:'Message sent',time:killTime,recipient_role:'worker',recipient_name:outsideRow?.owner};
+    stop:'Stopped',delivery:'Message sent',time:killTime,recipient_role:'worker',recipient_name:outsideRow?.owner,
+    kill_number:2};
   let killPost;
   let killPostReply;
   let killResults = [];
+  let retainedKillResults = [];
+  let killReadReferences = new Set();
+  let killReadFailed = false;
+  let killReadCount = 0;
+  let killRowListed = true;
+  let killOfferAvailable = true;
   let submittedItem;
   let queueFixture = null;
+  let queuePost;
+  let queuePostCount = 0;
   let unnamedPlace = -1;
   let confirmedQueueLine = null;
   const undoAnchors = new Map();
@@ -485,7 +496,7 @@ try {
   const fixtureMoveLine = reading => {
     const members = reading.waiters.filter(row => row.move).map(row => row.move);
     if (unnamedPlace >= 0) members.splice(unnamedPlace, 0, unnamed);
-    return {revision:reading.move_revision, members, kept_runs:[]};
+    return {revision:reading.move_revision, members, kept_runs:(reading.held_places ?? []).map(row => row.key)};
   };
   const server = createServer(async (req, res) => {
     if (req.url.split('?', 1)[0] === '/console/review/new-item') {
@@ -519,11 +530,13 @@ try {
       let body = '';
       for await (const part of req) body += part;
       const request = JSON.parse(body);
+      queuePost = request;
+      queuePostCount++;
       const {revision, row_id, destination} = request;
       const rows = queueFixture.waiters;
       const ordered = rows.filter(row => row.move);
       const {members} = fixtureMoveLine(queueFixture);
-      const line = () => ({revision:queueFixture.move_revision, members, kept_runs:[]});
+      const line = () => ({...fixtureMoveLine(queueFixture), members});
       if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
       const undo = request.kind === 'QueueUndoRequest';
       if (!undo) assert.equal(request.kind, 'QueueMoveRequest');
@@ -552,7 +565,7 @@ try {
       confirmedQueueLine = line();
       return json(200, {line:confirmedQueueLine});
     }
-    if (req.url === killPath) {
+    if (req.url === killPath || req.url.startsWith(killPath + '?')) {
       res.setHeader('Content-Type','application/json');
       if (!killProof) {
         res.writeHead(403).end('{}');
@@ -566,23 +579,45 @@ try {
         req.on('data', part => fields.push(part));
         req.on('end', () => {
           killPost = Object.fromEntries(new URLSearchParams(fields.join('')));
-          killPostReply = (reason, accepted) => {
-            if (reason) {
-              res.writeHead(409).end(JSON.stringify({reason}));
+          killPostReply = outcome => {
+            if (outcome instanceof Error) {
+              res.end('{');
               return;
             }
-            const result = accepted ?? (killPost.reference === outsideRef
-              ? {...outsideStopped,stop:'Stopping',delivery:''} : stoppingResult);
-            killResults = [result];
-            res.end(JSON.stringify({result}));
+            if (typeof outcome === 'string') {
+              res.writeHead(409).end(JSON.stringify({reason:outcome}));
+              return;
+            }
+            res.end(JSON.stringify({result:outcome}));
           };
           server.emit('kill-post');
         });
       } else {
+        killReadCount++;
+        if (killReadFailed) {
+          res.writeHead(503).end('{}');
+          return;
+        }
         const offers = {[killRef]:killOffer, ...(killShot ? {} : outsideOffers)};
         if (killBothShot) offers[researchRef] = researchOffer;
-        for (const result of killResults) if (result.stop !== 'Stop unconfirmed') delete offers[result.reference];
-        res.end(JSON.stringify({token:killToken,offers,results:killResults,refresh_seconds:killRefreshSeconds}));
+        const query = new URL(req.url, 'http://localhost').searchParams;
+        killReadReferences = new Set(query.getAll('reference'));
+        const listed = [
+          ...servedReading.walk,
+          ...servedReading.outside_queue,
+        ].flatMap(row => row.kill_ref ? [row.kill_ref] : []);
+        const localIndex = listed.indexOf(killRef);
+        if (!killRowListed && localIndex >= 0) listed.splice(localIndex, 1);
+        const results = [...killResults,
+          ...retainedKillResults.filter(result => listed.includes(result.reference)
+            && !killResults.some(current => current.reference === result.reference))];
+        for (const result of results) if (result.stop !== 'Stop unconfirmed') delete offers[result.reference];
+        if (!killRowListed || !killOfferAvailable) delete offers[killRef];
+        for (const [reference, offer] of Object.entries(offers)) {
+          offers[reference] = {...offer, kill_number:results.find(result => result.reference === reference)?.kill_number ?? 0};
+        }
+        const outside = servedReading.outside_queue.flatMap(row => row.kill_ref ? [row.kill_ref] : []);
+        res.end(JSON.stringify({token:killToken,listed,outside,offers,results,refresh_seconds:killRefreshSeconds}));
       }
       return;
     }
@@ -591,9 +626,17 @@ try {
     let reading = servedReading;
     if (isData && reading.move_revision?.startsWith('fixture')) {
       const move_line = fixtureMoveLine(reading);
-      const places = new Map(move_line.members.map((member, index) => [member.row_id, index + 1]));
+      let keptBefore = 0;
+      const places = new Map(move_line.members.map((member, index) => {
+        keptBefore = Math.max(keptBefore, member.kept_before ?? 0);
+        return [member.row_id, index + 1 + keptBefore];
+      }));
+      const held_places = (reading.held_places ?? []).map((row, index) => {
+        const after = move_line.members.findIndex(member => member.kept_before > index);
+        return {...row, position:(after < 0 ? move_line.members.length : after) + index + 1};
+      });
       reading = {...reading, move_line, waiters:reading.waiters.map(row =>
-        row.move ? {...row, place:places.get(row.move.row_id)} : row)};
+        row.move ? {...row, place:places.get(row.move.row_id)} : row), held_places};
     }
     res.end(isData ? JSON.stringify(reading) : isReport ? JSON.stringify(awsCostShots ? servedReading.report : base.report)
       : req.url === '/before.html' ? beforePage : req.url === '/swap-before.html' ? swapBeforePage : page);
@@ -719,8 +762,151 @@ try {
           servedReading = {...(killBothShot ? readings.outside_queue : base),
             psi:{some:0,full:0}, pressure:'none',
             walk:[other,local], waiters:[], queued_priority_units:[], outside_queue:killShot ? [] : outsideRows};
+          await call('Page.addScriptToEvaluateOnNewDocument', {source:`(() => {
+            const add = EventTarget.prototype.addEventListener;
+            window.killReplies = [];
+            EventTarget.prototype.addEventListener = function(type, listener, options) {
+              if (type === 'submit' && this.id === 'kill-form') {
+                return add.call(this, type, event => {
+                  window.killSubmit = listener(event);
+                  window.killReplies.push(window.killSubmit);
+                }, options);
+              }
+              return add.call(this, type, listener, options);
+            };
+          })()`});
           await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1200,deviceScaleFactor:1,mobile:false});
-          await navigate('memory_live.html');
+          if (!killStripProof) await navigate('memory_live.html');
+          if (killCellProof || killStripProof) {
+            const checkCell = async name => {
+              const [row, column] = name;
+              const refusal = 'The run or its stop route changed.';
+              const unavailable = 'Kill is not available for this run yet';
+              const pending = ['Stopping', false, ''];
+              const failed = [`Not stopped: ${refusal}`, true, ''];
+              const oldRecord = {...outsideStopped, kill_number:1, stop:'Stop unconfirmed', reason:'The stop is unconfirmed.'};
+              const newRecord = {...killedResult, kill_number:1};
+              const retry = name === 'D2-retry';
+              const reference = row === 'C' || retry ? outsideRef : killRef;
+              const cell = `document.querySelector('td[data-kill-ref="${reference}"]')`;
+              const read = () => evaluate('refreshKill()');
+              const display = () => evaluate(`(() => {
+                const cell = ${cell};
+                const label = cell.closest('tr').querySelector('.kill-state');
+                return [label?.textContent ?? '', !!cell.querySelector('.kill-run'), cell.title];
+              })()`);
+              const submit = async () => {
+                await evaluate(`${cell}.querySelector('.kill-run').click()`);
+                const started = new Promise(resolve => server.once('kill-post', resolve));
+                await evaluate(`(() => { document.querySelector('#kill-submit').click(); })()`);
+                await started;
+                return killPostReply;
+              };
+              if (row === 'C') killResults = [oldRecord];
+              await read();
+              if (retry) {
+                const firstReply = await submit();
+                killResults = [oldRecord];
+                await read();
+                assert.deepEqual(await display(), [`Not stopped: ${oldRecord.reason}`, true, '']);
+                const secondReply = await submit();
+                assert.deepEqual(await display(), pending);
+                await read();
+                const readsBeforeLateReply = killReadCount;
+                firstReply(new Error('Fixture could not return a complete reply.'));
+                await evaluate('window.killReplies[0]');
+                assert.deepEqual(await display(), pending);
+                assert.equal(killReadCount, readsBeforeLateReply);
+                killResults = [{...outsideStopped, stop:'Stopping',delivery:''}];
+                await read();
+                assert.deepEqual(await display(), pending);
+                secondReply(killResults[0]);
+                await evaluate('window.killReplies[1]');
+                return;
+              }
+              if (name === 'B1') {
+                const answer = await submit();
+                answer(refusal);
+                await evaluate('window.killSubmit');
+                killRowListed = false;
+                await read();
+                killRowListed = true;
+              }
+              if (column !== '1') {
+                await submit();
+                if (column === '3') {
+                  if (row === 'D') killResults = [newRecord];
+                  killPostReply(name === 'B3' ? new Error('Fixture could not return a complete reply.') : refusal);
+                  await evaluate('window.killSubmit');
+                  if (row === 'B') await evaluate('renderReading(latest)');
+                  if (row === 'A') assert.deepEqual(await display(), failed, 'A3 before the failed GET');
+                }
+              }
+              if (row === 'A') killReadFailed = true;
+              if (row === 'D') killResults = [newRecord];
+              if (name === 'B3-no-offer') killOfferAvailable = false;
+              await read();
+              const expected = {
+                A1:['', false, unavailable], A2:['', false, unavailable], A3:['', false, unavailable],
+                B1:['', true, ''], B2:pending, B3:['Not stopped: The request failed.', true, ''],
+                'B3-no-offer':[failed[0], false, unavailable],
+                C1:[`Not stopped: ${oldRecord.reason}`, true, ''], C2:pending, C3:failed,
+                D1:[`Killed by you at ${killTime} · worker impl3 informed`, false, ''],
+                D2:[`Killed by you at ${killTime} · worker impl3 informed`, false, ''],
+                D3:[`Killed by you at ${killTime} · worker impl3 informed`, false, ''],
+              };
+              const shown = await display();
+              assert.deepEqual(shown, expected[name], name);
+              if (killStripProof) return {reference, cell, label:shown[0], column};
+              if (name === 'B2') assert.equal(killPost.kill_number, '0');
+              if (name === 'C2') {
+                assert.equal(killPost.kill_number, '1');
+                killResults = [{...outsideStopped, stop:'Stopping',delivery:''}];
+                await read();
+                assert.deepEqual(await display(), pending);
+                killPostReply(refusal);
+                await evaluate('window.killSubmit');
+                assert.deepEqual(await display(), pending, 'The saved Stopping record survives a late POST error.');
+              } else if (column === '2') {
+                killPostReply(stoppingResult);
+                await evaluate('window.killSubmit');
+              }
+            };
+            if (killStripProof) {
+              const cells = ['B2','B3','C1','C2','C3','D1','D2','D3'];
+              const actual = {}, expected = {};
+              const readStrip = () => evaluate("document.querySelector('#kill-results').textContent");
+              for (const name of cells) {
+                killResults = [];
+                killOfferAvailable = true;
+                await navigate('memory_live.html');
+                const {reference, cell, label, column} = await checkCell(name);
+                const table = reference === outsideRef ? 'outside_queue' : 'walk';
+                await evaluate(`renderReading({...latest, ${table}:latest.${table}.filter(row => row.kill_ref !== '${reference}')})`);
+                await evaluate('refreshKill()');
+                assert.equal(await evaluate(cell), null, name);
+                const details = killResults[0] ?? killOffer;
+                expected[name] = `${details.step} (pid ${details.pid}) · ${label}`;
+                actual[name] = await readStrip();
+                if (name[0] === 'B') {
+                  killOfferAvailable = false;
+                  await evaluate('refreshKill()');
+                  expected[`${name} without offer`] = label;
+                  actual[`${name} without offer`] = await readStrip();
+                }
+                if (column === '2') {
+                  killPostReply(stoppingResult);
+                  await evaluate('window.killSubmit');
+                }
+              }
+              assert.deepEqual(actual, expected);
+              console.log(JSON.stringify({pass:true, cells}));
+            } else {
+              await checkCell(killCellProof);
+              console.log(JSON.stringify({pass:true, cell:killCellProof}));
+            }
+            break browserProof;
+          }
           if (killBothShot) {
             const width = 1600;
             const height = await evaluate(`(async () => {
@@ -825,26 +1011,39 @@ try {
               await refreshKill();
               return document.querySelector('.kill-state').textContent;
             })()`),`Killed by you at ${killTime} · Message pending`);
+            const recordChecks = {};
+            const checkRecord = async (name, reference, state) => {
+              await evaluate('refreshKill()');
+              recordChecks[name] = [killReadReferences.has(reference), await state()];
+            };
+            const nextKillPost = () => killPostReply ? Promise.resolve(killPost)
+              : new Promise(resolve => server.once('kill-post', () => resolve(killPost)));
+            let observedPost = 0;
             killResults = [];
-            await evaluate(`refreshKill()`);
-            await evaluate(`document.querySelector('#kill-submit').click()`);
-            assert.equal(await evaluate(`document.querySelector('.kill-state').textContent`),'Stopping');
-            // Remove the fixture row while the action is pending.
-            await evaluate(`renderReading({...latest,walk:latest.walk.filter(row => !row.kill_ref)})`);
-            assert.match(await evaluate(`document.querySelector('#kill-results').textContent`),/Stopping/);
-            const received = await new Promise(resolve => {
-              if (killPostReply) resolve(killPost);
-              else server.once('kill-post', () => resolve(killPost));
-            });
-            assert.deepEqual(received,{reference:killRef,token:killToken,handle:killOffer.handle,
-              words:'Start it again after 21:50.'});
-            killPostReply();
+            await evaluate('refreshKill()');
+            const firstPost = observedPost++;
+            const firstState = "document.querySelector('.walk-table .kill-state')?.textContent";
+            const stripState = () => evaluate("document.querySelector('#kill-results').textContent");
+            const firstStoppingText = `${killOffer.step} (pid ${killOffer.pid}) · Stopping`;
+            assert.equal(await evaluate(`(() => {
+              document.querySelector('#kill-submit').click();
+              return ${firstState};
+            })()`), 'Stopping');
+            assert.deepEqual(await nextKillPost(), {reference:killRef,token:killToken,handle:killOffer.handle,
+              words:'Start it again after 21:50.',kill_number:'0'});
+            await checkRecord('first Kill before save',killRef,() => evaluate(firstState));
+            await evaluate('renderReading({...latest,walk:latest.walk.filter(row => !row.kill_ref)})');
+            assert.equal(await stripState(), firstStoppingText);
+            killResults = [stoppingResult];
+            await checkRecord('first saved Kill',killRef,stripState);
+            killPostReply(stoppingResult);
+            await evaluate(`window.killReplies[${firstPost}]`);
             servedReading = {...servedReading,walk:servedReading.walk.filter(row => !row.kill_ref)};
             const refresh = await evaluate(`(async () => {
               await refreshKill();
               return {interval:killRefreshSeconds,text:document.querySelector('#kill-results').textContent};
             })()`);
-            assert.deepEqual(refresh,{interval:killRefreshSeconds,text:'check (pid 2712994) · Stopping'});
+            assert.deepEqual(refresh,{interval:killRefreshSeconds,text:firstStoppingText});
             killResults = [killedResult];
             const returned = await evaluate(`(async () => {
               await tick();
@@ -861,7 +1060,7 @@ try {
                 refreshKill = read;
               }
             })()`);
-            assert.deepEqual(returned,{early:'check (pid 2712994) · Stopping',
+            assert.deepEqual(returned,{early:firstStoppingText,
               finished:`check (pid 2712994) · Killed by you at ${killTime} · worker impl3 informed`});
             assert.ok(outsideRef, 'The outside feed must publish a Kill reference for a registered owner.');
             killResults = [];
@@ -892,40 +1091,84 @@ try {
             const outsideState = () => evaluate(`document.querySelector('[data-kill-ref="${outsideRef}"]')
               ?.closest('tr').querySelector('.kill-state')?.textContent`);
             const submitOutside = async () => {
-              await evaluate("document.querySelector('#kill-submit').click()");
+              killPost = killPostReply = undefined;
+              const index = observedPost++;
+              const number = killResults.find(result => result.reference === outsideRef)?.kill_number ?? 0;
+              const closed = await evaluate(`new Promise(resolve => {
+                const dialog = document.querySelector('#kill-dialog');
+                dialog.addEventListener('close', () => resolve(true), {once:true});
+                document.querySelector('#kill-submit').click();
+                if (dialog.open) resolve(false);
+              })`);
+              assert.equal(closed,true,'The Kill submit must close the dialog.');
               assert.equal(await outsideState(),'Stopping');
-              const request = await new Promise(resolve => {
-                if (killPostReply) resolve(killPost);
-                else server.once('kill-post', () => resolve(killPost));
-              });
-              assert.deepEqual(request,{reference:outsideRef,token:killToken,handle:outsideOffers[outsideRef].handle,words:''});
+              assert.deepEqual(await nextKillPost(),
+                {reference:outsideRef,token:killToken,handle:outsideOffers[outsideRef].handle,words:'',
+                  kill_number:String(number)});
+              return {answer:killPostReply, read:() => evaluate(`window.killReplies[${index}]`)};
             };
-            await submitOutside();
-            killPostReply('The run or its stop route changed.');
-            await evaluate(`(async () => {
-              while (pendingKills.size) await new Promise(resolve => setTimeout(resolve, 10));
-              await refreshKill();
-              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
-            })()`);
+            const openOutsideKill = () => evaluate(`document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click()`);
+            const refusal = await submitOutside();
+            refusal.answer('The run or its stop route changed.');
+            await refusal.read();
+            await evaluate('refreshKill()');
             assert.equal(await outsideState(),'Not stopped: The run or its stop route changed.');
-            killPost = killPostReply = undefined;
-            await submitOutside();
-            killPostReply(undefined, {...outsideStopped,stop:'Stop unconfirmed',delivery:'',
-              reason:'Still running after Kill: pid 8105'});
-            await evaluate(`(async () => {
-              while (pendingKills.size) await new Promise(resolve => setTimeout(resolve, 10));
-              await refreshKill();
-              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
-            })()`);
+            await openOutsideKill();
+
+            const first = await submitOutside();
+            const survived = {...outsideStopped,kill_number:1,stop:'Stop unconfirmed',delivery:'',
+              reason:'Still running after Kill: pid 8105'};
+            killResults = [survived];
+            first.answer(survived);
+            await first.read();
+            await evaluate('refreshKill()');
             assert.equal(await outsideState(),'Not stopped: Still running after Kill: pid 8105');
-            killPost = killPostReply = undefined;
-            await submitOutside();
-            killPostReply();
+            await openOutsideKill();
+
+            const second = await submitOutside();
+            assert.equal(await outsideState(),'Stopping');
             await evaluate('refreshKill()');
             assert.equal(await outsideState(),'Stopping');
-            killResults = [outsideStopped];
+            const secondStopping = {...outsideStopped,stop:'Stopping',delivery:''};
+            killResults = [secondStopping];
+            await checkRecord('saved retry',outsideRef,outsideState);
+            const unconfirmed = {...secondStopping,stop:'Stop unconfirmed',reason:'The stop is unconfirmed.'};
+            killResults = [unconfirmed];
+            await checkRecord('unconfirmed with POST open',outsideRef,outsideState);
+            await openOutsideKill();
+
+            const third = await submitOutside();
+            const retryStopped = {...outsideStopped,kill_number:3};
+            const retryStopping = {...retryStopped,stop:'Stopping',delivery:''};
+            killResults = [retryStopping];
             await evaluate('refreshKill()');
-            assert.equal(await outsideState(),`Killed by you at ${killTime} · worker test informed`);
+            second.answer('The request failed.');
+            await second.read();
+            assert.equal(await outsideState(),'Stopping','The earlier POST reply must leave the retry visible.');
+
+            killResults = [];
+            retainedKillResults = [retryStopped];
+            await checkRecord('first read after expiry',outsideRef,outsideState);
+            retainedKillResults = [unconfirmed];
+            killResults = [retryStopped];
+            await checkRecord('newer result with POST open',outsideRef,outsideState);
+            retainedKillResults = [retryStopped];
+            killResults = [];
+            await checkRecord('normal GET empty after result',outsideRef,outsideState);
+            third.answer(retryStopped);
+            await third.read();
+            await checkRecord('read after POST reply',outsideRef,outsideState);
+            const stoppedText = `Killed by you at ${killTime} · worker test informed`;
+            assert.deepEqual(recordChecks, {
+              'first Kill before save':[false, 'Stopping'],
+              'first saved Kill':[false, firstStoppingText],
+              'saved retry':[false, 'Stopping'],
+              'unconfirmed with POST open':[false, 'Not stopped: The stop is unconfirmed.'],
+              'first read after expiry':[false, stoppedText],
+              'newer result with POST open':[false, stoppedText],
+              'normal GET empty after result':[false, stoppedText],
+              'read after POST reply':[false, stoppedText],
+            });
             servedReading = {...servedReading,outside_queue:outsideRows.filter(row => row.kill_ref !== outsideRef)};
             await evaluate('(async () => { window.render = renderReading; await pageRefresh.refresh(true); })()');
             assert.equal(await outsideState(),undefined);
@@ -1659,6 +1902,7 @@ try {
           await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
         }
         await checkQueueDrag(navigate, evaluate, call);
+        await checkLongQueueDrag(navigate, evaluate, call);
         if (queueDragProof) {
           console.log(JSON.stringify({shot:join(folder, 'drag-dark.png')}));
           break browserProof;
@@ -1873,6 +2117,133 @@ try {
         }
         queueFixture = null;
         servedReading = base;
+      }
+
+      async function checkLongQueueDrag(navigate, evaluate, call) {
+        const restoreSize = await evaluate('({width:innerWidth, height:innerHeight})');
+        const resize = size => call('Emulation.setDeviceMetricsOverride', {...size, deviceScaleFactor:1, mobile:false});
+        await resize({width:1440, height:800});
+        const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
+        const moving = 'drag-25';
+        const head = {kind:'QueueHeadDrop'};
+        const point = selector => evaluate(`(() => {
+          const row = document.querySelector(${JSON.stringify(selector)});
+          if (!row) return null;
+          const box = row.getBoundingClientRect();
+          return {x:box.left + box.width/2, y:box.top + box.height/2};
+        })()`);
+        const grip = id => point(`.queue-grip[data-move-id="${id}"]`);
+        const mouse = (type, position) => call('Input.dispatchMouseEvent', {
+          type, ...position, button:'left', buttons:type === 'mouseReleased' ? 0 : 1, clickCount:1,
+        });
+        const start = async (held, align = 'center', id = moving) => {
+          unnamedPlace = -1;
+          queuePost = null;
+          queuePostCount = 0;
+          queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture-long',
+            held_places:[{kind:'held', key:'drag-held', unit:'held',
+              position:held, kept_until:'12:00 UTC', targets:['natedev']}],
+            waiters:Array.from({length:27}, (_, index) => {
+              const unit = `drag-${index + 1}`;
+              return {...template, key:unit, unit, detail:unit, name:'test affected', title:{unit, step:'test affected'},
+                machine:'natedev', move:{row_id:unit, kept_before:Number(index + 1 >= held)}};
+            })};
+          servedReading = queueFixture;
+          await navigate('memory_live.html');
+          await waitForMoveHandle(evaluate, id);
+          assert.equal(await movingPlace(id), '26');
+          await evaluate(`document.querySelector('.queue-grip[data-move-id="${id}"]')
+            .scrollIntoView({block:'${align}'}); true`);
+          await mouse('mousePressed', await grip(id));
+        };
+        const showQueueTop = () =>
+          evaluate("document.querySelector('#walk .queue-title').scrollIntoView({block:'start'}); true");
+        const placeCell = (id = moving) => `tr[data-tip="wait:${id}"] .place`;
+        const movingPlace = id => evaluate(`document.querySelector(${JSON.stringify(placeCell(id))}).textContent`);
+        const release = async position => {
+          await mouse('mouseReleased', position);
+          const message = await evaluate(`new Promise(resolve => {
+            const status = document.querySelector('#queue-status');
+            if (!queueSending) return resolve(status.textContent);
+            const observer = new MutationObserver(() => {
+              if (!queueSending) { observer.disconnect(); resolve(status.textContent); }
+            });
+            observer.observe(status, {childList:true});
+          })`);
+          return {destination:queuePost?.destination ?? null, message};
+        };
+
+        const edgeRow = 'drag-26';
+        await start(27, 'end', edgeRow);
+        const edge = {x:(await grip(edgeRow)).x, y:2};
+        assert.ok(await evaluate(`document.elementFromPoint(${edge.x}, ${edge.y}).closest('.page-top') !== null`));
+        const before = await evaluate('scrollY');
+        await mouse('mouseMoved', edge);
+        const edgePreview = await evaluate(`new Promise(resolve => {
+          const start = performance.now();
+          function check() {
+            const destination = queueDrag.destination;
+            if (destination?.kind !== 'QueueHeadDrop' && performance.now() - start < 3000) {
+              requestAnimationFrame(check);
+              return;
+            }
+            resolve({scrolled:scrollY < ${before}, destination,
+              overHeader:document.elementFromPoint(${edge.x}, ${edge.y}).closest('.page-top') !== null,
+              place:document.querySelector(${JSON.stringify(placeCell(edgeRow))}).textContent});
+          }
+          requestAnimationFrame(check);
+        })`);
+        const edgeDrop = {destination:(await release(edge)).destination, posts:queuePostCount};
+
+        await start(1);
+        await mouse('mouseMoved', await grip('drag-24'));
+        assert.equal(await movingPlace(), '25');
+        const back = await grip('drag-24');
+        await mouse('mouseMoved', back);
+        assert.equal(await movingPlace(), '26');
+        const startDrop = await release(back);
+
+        await start(1);
+        await showQueueTop();
+        await mouse('mouseMoved', await grip('drag-1'));
+        assert.equal(await movingPlace(), '2');
+        const heldDrop = await release(await point('tr.held .place'));
+
+        await start(1);
+        await showQueueTop();
+        await mouse('mouseMoved', await grip('drag-1'));
+        await evaluate(`(() => {
+          const original = window.setTimeout;
+          window.setTimeout = (callback, delay, ...args) => {
+            if (delay !== queueAccess.highlight_seconds * 1000) return original(callback, delay, ...args);
+            window.setTimeout = original;
+            window.expireQueueMessage = () => callback(...args);
+          };
+          return true;
+        })()`);
+        const outsideDrop = await release({x:1, y:400});
+        const cancelNotice = await evaluate(`(() => {
+          const feedback = document.querySelector('#queue-feedback');
+          const {top, bottom, height} = feedback.getBoundingClientRect();
+          const visible = height > 0 && top >= 0 && bottom <= innerHeight;
+          const usesHighlightDelay = Boolean(window.expireQueueMessage);
+          window.expireQueueMessage?.();
+          return {visible, usesHighlightDelay, hidden:feedback.hidden, text:document.querySelector('#queue-status').textContent};
+        })()`);
+        const result = {
+          edgePreview, edgeDrop, startDrop, heldDrop:heldDrop.destination, outsideDrop, cancelNotice,
+        };
+        if (queueDragProof) console.log(JSON.stringify(result));
+        assert.deepEqual(result, {
+          edgePreview:{scrolled:true, destination:head, overHeader:true, place:'1'},
+          edgeDrop:{destination:head, posts:1},
+          startDrop:{destination:null, message:''}, heldDrop:head,
+          outsideDrop:{destination:null, message:'Not moved. Release the row inside the list.'},
+          cancelNotice:{visible:true, usesHighlightDelay:true, hidden:true, text:''},
+        });
+        queueFixture = null;
+        servedReading = base;
+        await resize(restoreSize);
       }
 
       async function checkHeadcounts(navigate, evaluate, call) {
