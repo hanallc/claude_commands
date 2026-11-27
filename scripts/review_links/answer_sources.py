@@ -44,28 +44,39 @@ class NoQuestionReservation(StrEnum):
     ABSENT = "no List reservation for the submitted question"
 
 
-class ListAllocation(StrEnum):
-    ALLOWED = "a new List item can be allocated"
-    EXISTING_ONLY = "the question needs its saved List item"
+class QuestionRoute(StrEnum):
+    ORDINARY = "use the ordinary linked exchange route"
+    NEW = "the question can use a new List item"
+    UNRESOLVED = "the question needs a verified List destination"
 
 
 @dataclass(frozen=True)
-class SubmittedQuestionLinks:
-    origin: the_list.NativeQuestionItem
-    keys: tuple[str, ...]
-    reservation: investigation.ListDestination | NoQuestionReservation
-    allocation: ListAllocation
+class ResolvedQuestionDestination:
+    destination: investigation.ListDestination
+    origin: the_list.NativeQuestionItem | the_list.NoQuestionItem
+    reserved_new_item: bool = False
 
 
 @dataclass(frozen=True)
 class Exchange(list_exchange.Exchange):
     list_links: tuple[ListLink, ...]
-    question_origin: the_list.NativeQuestionItem | the_list.NoQuestionItem = field(
-        default=the_list.NoQuestionItem.ORDINARY, kw_only=True)
-    list_allocation: ListAllocation = field(default=ListAllocation.ALLOWED, kw_only=True)
+    question_route: ResolvedQuestionDestination | QuestionRoute = field(default=QuestionRoute.ORDINARY, kw_only=True)
+
+    @property
+    def question_origin(self) -> the_list.NativeQuestionItem | the_list.NoQuestionItem:
+        route = self.question_route
+        return route.origin if isinstance(route, ResolvedQuestionDestination) else the_list.NoQuestionItem.ORDINARY
 
 
 type ReloadExchanges = Callable[[], Iterable[Exchange]]
+
+
+@dataclass(frozen=True)
+class KeylessQuestionMigration:
+    destination: investigation.ListDestination
+    row: the_list.KeylessQuestionItem
+    resolve: Callable[[the_list.KeylessQuestionItem], the_list.NativeQuestionItem | the_list.NoQuestionItem]
+    origin: the_list.NativeQuestionItem | the_list.NoQuestionItem
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,7 @@ class ExchangeInventory:
     filed: tuple[tuple[investigation.ListDestination, list_exchange.FiledExchange], ...] = ()
     reload: dict[str, ReloadExchanges] = field(default_factory=dict, compare=False)
     unresolved: tuple[tuple[str, int], ...] = ()
+    keyless: tuple[KeylessQuestionMigration, ...] = field(default=(), compare=False)
 
 
 def _read_state(answered: datetime | TimeNotRecorded, read_times: Iterable[datetime],
@@ -1372,16 +1384,22 @@ def _completed_feedback_reply(source: review_items.ChangeSource, slot: review_it
 _REVIEW_SOURCE_KINDS = (*review_items.QUESTION_TYPES, *review_items.INVESTIGATION_TYPES,
                        review_items.ReviewType.PROPOSAL, review_items.ReviewType.CHANGE, review_items.ReviewType.EFFICIENCY)
 
-type ReviewListLinks = dict[str, list[list_page.ListRecord]]
+@dataclass
+class ReviewListLinks:
+    current: dict[str, list[list_page.ListRecord]] = field(default_factory=lambda: defaultdict(list))
+    created: dict[str, list[list_page.ListRecord]] = field(default_factory=lambda: defaultdict(list))
+    keyless: dict[investigation.ListDestination, the_list.KeylessQuestionItem] = field(default_factory=dict)
+    filed_sources: set[str] = field(default_factory=set)
 
 
 def _reload_review(root: Path, item: review_items.ReviewItem, members: staff.StaffSnapshot,
-                   links: ReviewListLinks, zone: ZoneInfo) -> Iterable[Exchange]:
+                   links: ReviewListLinks, zone: ZoneInfo, *, filing: the_list.QuestionFiling) -> Iterable[Exchange]:
     try:
         current = review_items.read_current(root, item, members, include_filed=True)
     except review_items.ReviewRecordMissing:
         return ()
-    return _review_item_exchanges(current, links, zone, members, the_list.exchange_history(_review_source_key(current)))
+    return _review_item_exchanges(current, links, zone, members, the_list.exchange_history(_review_source_key(current)),
+                                  filing=filing)
 
 
 def _review_source_key(item: review_items.ReviewItem) -> str:
@@ -1397,38 +1415,33 @@ def _review_source_key(item: review_items.ReviewItem) -> str:
 def _review_item_exchanges(item: review_items.ReviewItem, links: ReviewListLinks,
                            zone: ZoneInfo, members: staff.StaffSnapshot,
                            history: tuple[list_exchange.FiledExchange, ...] = (),
-                           unresolved: list[tuple[str, int]] | None = None) -> AcceptedExchanges:
+                           unresolved: list[tuple[str, int]] | None = None, *,
+                           filing: the_list.QuestionFiling = the_list.QuestionFiling.LIVE) -> AcceptedExchanges:
     source = item.source
-    destinations = list(_linked_destinations(links, (item.key,)))
+    destinations = list(_linked_destinations(links.current, (item.key,)))
     if (isinstance(source, review_items.InvestigationSource)
             and isinstance(destination := source.record.list_destination, investigation.ListDestination)
             and destination not in destinations):
         destinations.append(destination)
     key = _review_source_key(item)
     if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
-        return _native_question_exchanges(source.record, key, links, zone, members, history, unresolved)
+        return _native_question_exchanges(source.record, key, links, zone, members, history, unresolved, filing=filing)
     return ExchangeVerifier(item, zone, members, history).resolve(key, tuple(destinations), unresolved)
 
 
 def _native_question_exchanges(record: update_registration.QuestionRecord, key: str, links: ReviewListLinks,
                                zone: ZoneInfo, members: staff.StaffSnapshot,
                                history: tuple[list_exchange.FiledExchange, ...] = (),
-                               unresolved: list[tuple[str, int]] | None = None) -> AcceptedExchanges:
-    evidence = _submitted_question_links(record)
-    if isinstance(evidence, new_item_dialog.NoReviewSubmission):
-        direct = _linked_destinations(links, (review_items.question_record_key(record),))
+                               unresolved: list[tuple[str, int]] | None = None, *,
+                               filing: the_list.QuestionFiling = the_list.QuestionFiling.LIVE) -> AcceptedExchanges:
+    if not isinstance(review_submissions.native_origin(record), new_item_dialog.ReviewSubmission):
+        direct = _linked_destinations(links.current, (review_items.question_record_key(record),))
         return ExchangeVerifier(record, zone, members, history).resolve(key, direct, unresolved)
-    destinations = _linked_destinations(links, evidence.keys)
-    origin: the_list.NativeQuestionItem | the_list.NoQuestionItem = the_list.NoQuestionItem.ORDINARY
-    if isinstance(evidence.reservation, investigation.ListDestination):
-        destinations = tuple(dict.fromkeys((*destinations, evidence.reservation)))
-        origin = evidence.origin
-    elif any(the_list.original_question_link(entry.item) in evidence.keys
-             for review_key in evidence.keys for entry in links.get(review_key, ())):
-        origin = evidence.origin
+    origin = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, key)
+    route = resolve_legacy_question_destination(origin, links, record=record, filing=filing)
+    destinations = (route.destination,) if isinstance(route, ResolvedQuestionDestination) else ()
     accepted = ExchangeVerifier(record, zone, members, history).resolve(key, destinations, unresolved)
-    return replace(accepted, exchanges=tuple(replace(exchange, question_origin=origin,
-                                                     list_allocation=evidence.allocation) for exchange in accepted))
+    return replace(accepted, exchanges=tuple(replace(exchange, question_route=route) for exchange in accepted))
 
 
 def _question_reservation(folder: Path, request_id: str) -> investigation.ListDestination | NoQuestionReservation:
@@ -1471,39 +1484,88 @@ def _moved_question_link(path: Path, record: update_registration.QuestionRecord,
     return ""
 
 
-def _submitted_question_links(record: update_registration.QuestionRecord
-                              ) -> SubmittedQuestionLinks | new_item_dialog.NoReviewSubmission:
-    submission = review_submissions.native_origin(record)
-    if not isinstance(submission, new_item_dialog.ReviewSubmission):
-        return submission
-    request_id = submission.request_id
-    kind = new_item_dialog.SubmissionKind.QUESTION
-    origin = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, f"submission/question/{request_id}")
-    physical = review_items.question_record_key(record)
-    scoped = new_item_dialog.submission_key(kind, record.owner, record.item.get("review_id", ""), request_id)
-    keys = (physical, scoped)
-    folder = review_submissions.image_folder(submission).parent
-    reservation = _question_reservation(folder, request_id)
-    if isinstance(reservation, investigation.ListDestination):
-        return SubmittedQuestionLinks(origin, keys, reservation, ListAllocation.EXISTING_ONLY)
+class NativeQuestionRecord(StrEnum):
+    ABSENT = "no native Review record for this question"
+
+
+def resolve_legacy_question_destination(
+    origin: the_list.NativeQuestionItem, links: ReviewListLinks, *,
+    record: update_registration.QuestionRecord | NativeQuestionRecord = NativeQuestionRecord.ABSENT,
+    filing: the_list.QuestionFiling = the_list.QuestionFiling.HISTORY,
+) -> ResolvedQuestionDestination | QuestionRoute:
+    """Resolve the original List destination from durable question records."""
+    request = origin.source_key.removeprefix("submission/question/")
+    folder: Path | None = None
+    if origin.kind is the_list.QuestionItemKind.FROM_NATE:
+        try:
+            folder = review_submissions._request_folder(request)  # pyright: ignore[reportPrivateUsage]
+            reserved = _question_reservation(folder, request)
+        except (OSError, ValueError):
+            return QuestionRoute.UNRESOLVED
+        if isinstance(reserved, investigation.ListDestination):
+            return ResolvedQuestionDestination(reserved, origin)
+
     try:
-        recipient = new_item_dialog.request_recipient(kind, request_id)
-    except new_item_dialog.SubmissionError:
-        return SubmittedQuestionLinks(origin, keys, reservation, ListAllocation.ALLOWED)
-    moved = folder / "moved.json"
-    try:
-        original = _moved_question_link(moved, record, review_submissions.SubmissionAddress(kind, recipient, request_id),
-                                        submission.request_digest)
-        if original:
-            return SubmittedQuestionLinks(origin, (original, scoped), reservation, ListAllocation.EXISTING_ONLY)
-        receipt = review_submissions._read_request_file(folder / "receipt.json", folder.name)  # pyright: ignore[reportPrivateUsage]
+        exchange = the_list.exchange_reservation(origin.source_key)
     except (OSError, ValueError):
-        return SubmittedQuestionLinks(origin, (), reservation, ListAllocation.EXISTING_ONLY)
-    if moved.exists() or (folder / "move.json").exists() or recipient != record.owner or (
-            isinstance(receipt, review_submissions.NativeSubmissionDestination)
-            and (receipt.original_path != receipt.path or receipt.original_path.name != record.path.name)):
-        return SubmittedQuestionLinks(origin, (), reservation, ListAllocation.EXISTING_ONLY)
-    return SubmittedQuestionLinks(origin, keys, reservation, ListAllocation.ALLOWED)
+        return QuestionRoute.UNRESOLVED
+    if isinstance(exchange, the_list.ExchangeDestination) and exchange.reserved_new_item:
+        return ResolvedQuestionDestination(exchange.destination, origin, reserved_new_item=True)
+
+    keys = (origin.source_key,)
+    if isinstance(record, update_registration.QuestionRecord):
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        keys = (*keys, review_items.question_record_key(record),
+                new_item_dialog.submission_key(kind, record.owner, record.item.get("review_id", ""), request))
+    created = _linked_destinations(links.created, keys)
+    if created:
+        if len(created) != 1:
+            return QuestionRoute.UNRESOLVED
+        return ResolvedQuestionDestination(created[0], origin)
+
+    transferred = False
+    has_receipt = False
+    if folder is not None:
+        has_receipt = any((folder / name).exists() for name in ("receipt.json", "pending.json", "move.json", "moved.json"))
+        transferred = (folder / "moved.json").exists() or (folder / "move.json").exists()
+        if isinstance(record, update_registration.QuestionRecord):
+            submission = review_submissions.native_origin(record)
+            if isinstance(submission, new_item_dialog.ReviewSubmission):
+                try:
+                    recipient = new_item_dialog.request_recipient(new_item_dialog.SubmissionKind.QUESTION, request)
+                except new_item_dialog.SubmissionError:
+                    recipient = record.owner
+                transferred = transferred or recipient != record.owner
+                if (folder / "moved.json").is_file():
+                    address = review_submissions.SubmissionAddress(new_item_dialog.SubmissionKind.QUESTION, recipient, request)
+                    try:
+                        original = _moved_question_link(folder / "moved.json", record, address, submission.request_digest)
+                    except (OSError, ValueError):
+                        return QuestionRoute.UNRESOLVED
+                    if original:
+                        created = _linked_destinations(links.created, (original,))
+                        original_rows = created or _linked_destinations(links.current, (original,))
+                        if len(original_rows) == 1:
+                            primary = origin if created else the_list.NoQuestionItem.ORDINARY
+                            return ResolvedQuestionDestination(original_rows[0], primary)
+                try:
+                    receipt = review_submissions._read_request_file(folder / "receipt.json", folder.name)  # pyright: ignore[reportPrivateUsage]
+                except (OSError, ValueError):
+                    return QuestionRoute.UNRESOLVED
+                if isinstance(receipt, review_submissions.NativeSubmissionDestination):
+                    transferred = transferred or (receipt.original_path != receipt.path
+                                                   or receipt.original_path.name != record.path.name)
+
+    if isinstance(exchange, the_list.ExchangeDestination):
+        return ResolvedQuestionDestination(exchange.destination, the_list.NoQuestionItem.ORDINARY)
+    if transferred or (has_receipt and filing is the_list.QuestionFiling.HISTORY):
+        return QuestionRoute.UNRESOLVED
+    if origin.source_key in links.filed_sources or the_list.exchange_filing_started(origin.source_key):
+        return QuestionRoute.UNRESOLVED
+    current = _linked_destinations(links.current, keys)
+    if len(current) == 1:
+        return ResolvedQuestionDestination(current[0], the_list.NoQuestionItem.ORDINARY)
+    return QuestionRoute.UNRESOLVED if current else QuestionRoute.NEW
 
 
 def _list_exchanges(entry: list_page.ListRecord, members: staff.StaffSnapshot, zone: ZoneInfo) -> Iterator[Exchange]:
@@ -1601,10 +1663,9 @@ def read_exchanges(root: Path, *, members: staff.StaffSnapshot) -> ExchangeInven
 
 def _read_exchanges(root: Path, members: staff.StaffSnapshot, zone: ZoneInfo,
                     reviews: Iterable[review_items.ReviewItem]) -> ExchangeInventory:
-    entries = list_page.records(include_closed=True)
+    entries, links = _migration_list_records()
     list_items: set[investigation.ListDestination] = set()
     keepers: dict[int, list[staff.StaffId]] = defaultdict(list)
-    links = _list_review_links(entries)
     for entry in entries:
         item = entry.item
         destination = investigation.ListDestination(entry.keeper, item.number)
@@ -1618,14 +1679,28 @@ def _read_exchanges(root: Path, members: staff.StaffSnapshot, zone: ZoneInfo,
     exchanges: list[Exchange] = []
     unresolved: list[tuple[str, int]] = []
     reload: dict[str, ReloadExchanges] = {}
+    reviews = tuple(reviews)
+    review_questions = {_review_source_key(item): item.source.record for item in reviews
+                        if isinstance(item.source, (review_items.QuestionSource, review_items.UnownedQuestionSource))}
+    keyless: list[KeylessQuestionMigration] = []
+    for destination, row in links.keyless.items():
+        resolve = partial(_keyless_question_origin, destination, links, review_questions)
+        keyless.append(KeylessQuestionMigration(destination, row, resolve, resolve(row)))
+    unresolved_rows = {migration.destination for migration in keyless if migration.origin is the_list.NoQuestionItem.ORDINARY}
+    blocked = {origin.source_key for destination in unresolved_rows for origin in links.keyless[destination].candidate_origins}
     for item in reviews:
         key = _review_source_key(item)
         history = the_list.combine_exchange_history(tuple(previous.get(key, ())), the_list.pending_exchanges(key))
-        candidates = tuple(_review_item_exchanges(item, links, zone, members, history, unresolved))
+        candidates = tuple(_review_item_exchanges(item, links, zone, members, history, unresolved,
+                                                  filing=the_list.QuestionFiling.HISTORY))
         if candidates:
-            reload[key] = partial(_reload_review, root, item, members, links, zone)
+            if key in blocked or any(link in unresolved_rows for exchange in candidates for link in exchange.list_links):
+                candidates = tuple(replace(exchange, question_route=QuestionRoute.UNRESOLVED) for exchange in candidates)
+            reload[key] = partial(_reload_review, root, item, members, links, zone, filing=the_list.QuestionFiling.HISTORY)
             exchanges.extend(candidates)
     for entry in entries:
+        if investigation.ListDestination(entry.keeper, entry.item.number) in unresolved_rows:
+            continue
         candidates = tuple(_list_exchanges(entry, members, zone))
         if candidates:
             reload[candidates[0].source_key] = partial(_reload_list, entry.keeper, entry.item.id, members, zone)
@@ -1636,7 +1711,7 @@ def _read_exchanges(root: Path, members: staff.StaffSnapshot, zone: ZoneInfo,
             reload[candidates[0].source_key] = partial(_reload_picture, root, record["id"], keepers, zone)
             exchanges.extend(candidates)
     ordered = sorted(exchanges, key=lambda exchange: (exchange.source, exchange.source_key, exchange.exchange_id))
-    return ExchangeInventory(tuple(ordered), frozenset(list_items), filed, reload, tuple(sorted(unresolved)))
+    return ExchangeInventory(tuple(ordered), frozenset(list_items), filed, reload, tuple(sorted(unresolved)), tuple(keyless))
 
 
 def _count(inventory: ExchangeInventory) -> Iterator[str]:
@@ -1675,8 +1750,7 @@ class FilingPlan:
 
     @property
     def unresolved_question_destination(self) -> bool:
-        return (self.exchanges[0].list_allocation is ListAllocation.EXISTING_ONLY
-                and (len(self.destinations) != 1 or not isinstance(self.destinations[0], investigation.ListDestination)))
+        return self.exchanges[0].question_route is QuestionRoute.UNRESOLVED
 
 
 def _plans(exchanges: Iterable[Exchange], filed: Iterable[tuple[investigation.ListDestination, list_exchange.FiledExchange]]
@@ -1689,13 +1763,20 @@ def _plans(exchanges: Iterable[Exchange], filed: Iterable[tuple[investigation.Li
         if _eligible(exchange) or exchange.source_key in existing:
             groups[exchange.source_key].append(exchange)
     for key, group in groups.items():
-        links = tuple(dict.fromkeys(link for exchange in group for link in exchange.list_links))
-        destinations = tuple(dict.fromkeys((*links, *existing[key])))
+        route = group[0].question_route
+        if isinstance(route, ResolvedQuestionDestination):
+            destinations: tuple[ListLink, ...] = (route.destination,)
+        elif route is QuestionRoute.ORDINARY:
+            links = tuple(dict.fromkeys(link for exchange in group for link in exchange.list_links))
+            destinations = tuple(dict.fromkeys((*links, *existing[key])))
+        else:
+            destinations = ()
         yield FilingPlan(tuple(group), destinations, bool(existing[key]))
 
 
 class NoExchangeFiling(StrEnum):
     SOURCE_NO_LONGER_ELIGIBLE = "The source no longer has eligible exchanges."
+    UNRESOLVED_QUESTION = "The question has no verified List destination."
 
 
 def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadExchanges, *,
@@ -1719,10 +1800,17 @@ def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadEx
             return NoExchangeFiling.SOURCE_NO_LONGER_ELIGIBLE
         first = next((exchange for exchange in exchanges if exchange.direction is Direction.QUESTION_TO_NATE),
                      exchanges[0])
-        destinations = tuple(dict.fromkeys((*plan.destinations, *(link for exchange in exchanges
-                                                                 for link in exchange.list_links))))
-        if not destinations and first.list_allocation is ListAllocation.EXISTING_ONLY:
-            raise the_list.ListError("The transferred question has no verified List destination.")
+        route = first.question_route
+        if (plan.unresolved_question_destination or route is QuestionRoute.UNRESOLVED
+                or (isinstance(planned.question_route, ResolvedQuestionDestination) and route is QuestionRoute.NEW)):
+            return NoExchangeFiling.UNRESOLVED_QUESTION
+        if isinstance(route, ResolvedQuestionDestination):
+            destinations: tuple[ListLink, ...] = (route.destination,)
+        elif route is QuestionRoute.ORDINARY:
+            destinations = tuple(dict.fromkeys((*plan.destinations, *(link for exchange in exchanges
+                                                                     for link in exchange.list_links))))
+        else:
+            destinations = ()
         if len(destinations) > 1 or any(isinstance(link, LegacyListLink) for link in destinations):
             raise the_list.ListError("The source has no unique List destination.")
         link = destinations[0] if destinations else the_list.NextNumber.AVAILABLE
@@ -1741,7 +1829,8 @@ def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadEx
         if not first.question.strip():
             raise the_list.ListError("The source question has no text.")
         title = review_submissions.submission_title(first.question)
-        if submission_question is the_list.NoQuestionItem.ORDINARY:
+        if submission_question is the_list.NoQuestionItem.ORDINARY and not (
+                isinstance(route, ResolvedQuestionDestination) and route.reserved_new_item):
             submission_question = first.question_origin
         try:
             conflicts: frozenset[str] = current.conflicting_ids if isinstance(current, AcceptedExchanges) else frozenset()
@@ -1757,25 +1846,60 @@ def _file_live(reload: ReloadExchanges, entries: Iterable[list_page.ListRecord],
     filed = ((investigation.ListDestination(entry.keeper, entry.item.number), exchange)
              for entry in entries for exchange in entry.item.filed_exchanges)
     for plan in _plans(reload(), filed):
+        key = plan.exchanges[0].source_key
         try:
-            _ = file_source(plan, members, reload)
+            result = file_source(plan, members, reload)
         except (OSError, ValueError) as error:
-            key = plan.exchanges[0].source_key
             print(f"List exchange {key}: {error}", file=sys.stderr)
+        else:
+            if result is NoExchangeFiling.UNRESOLVED_QUESTION:
+                print(f"List exchange {key}: {result}", file=sys.stderr)
 
 
 def _list_review_links(entries: Iterable[list_page.ListRecord]) -> ReviewListLinks:
-    links: ReviewListLinks = defaultdict(list)
+    links = ReviewListLinks()
     for entry in entries:
+        links.filed_sources.update(exchange.source_key for exchange in entry.item.filed_exchanges)
         keys = set(entry.item.reviews)
         if isinstance(entry.item.report, the_list.ListReport):
             keys.add(entry.item.report.evidence_key)
         for key in keys:
-            links[key].append(entry)
+            links.current[key].append(entry)
+        if key := the_list.original_question_link(entry.item):
+            links.created[key].append(entry)
+            if isinstance(origin := the_list.question_origin_from_link(key), the_list.NativeQuestionItem):
+                links.created[origin.source_key].append(entry)
     return links
 
 
-def _linked_destinations(links: ReviewListLinks, keys: Iterable[str]) -> tuple[investigation.ListDestination, ...]:
+def _migration_list_records() -> tuple[list[list_page.ListRecord], ReviewListLinks]:
+    entries: list[list_page.ListRecord] = []
+    keyless: dict[investigation.ListDestination, the_list.KeylessQuestionItem] = {}
+    for keeper in list_page.list_keepers():
+        for row in the_list.question_migration_records(keeper):
+            if isinstance(row, the_list.KeylessQuestionItem):
+                keyless[investigation.ListDestination(keeper, row.item.number)] = row
+                row = row.item
+            entries.append(list_page.ListRecord(keeper, row))
+    links = _list_review_links(entries)
+    links.keyless.update(keyless)
+    return entries, links
+
+
+def _keyless_question_origin(destination: investigation.ListDestination, links: ReviewListLinks,
+                             records: dict[str, update_registration.QuestionRecord], row: the_list.KeylessQuestionItem
+                             ) -> the_list.NativeQuestionItem | the_list.NoQuestionItem:
+    origins: set[the_list.NativeQuestionItem] = set()
+    for origin in row.candidate_origins:
+        route = resolve_legacy_question_destination(origin, links,
+            record=records.get(origin.source_key, NativeQuestionRecord.ABSENT))
+        if isinstance(route, ResolvedQuestionDestination) and route.destination == destination and route.origin == origin:
+            origins.add(origin)
+    return next(iter(origins)) if len(origins) == 1 else the_list.NoQuestionItem.ORDINARY
+
+
+def _linked_destinations(links: dict[str, list[list_page.ListRecord]],
+                         keys: Iterable[str]) -> tuple[investigation.ListDestination, ...]:
     return tuple(dict.fromkeys(investigation.ListDestination(entry.keeper, entry.item.number)
                                for key in keys for entry in links.get(key, ())))
 
@@ -1837,11 +1961,12 @@ def file_saved_review(item: review_items.ReviewItem, members: staff.StaffSnapsho
                       root: Path | None = None) -> None:
     zone = user_zone()
     history = the_list.exchange_history(_review_source_key(item))
-    if not tuple(_review_item_exchanges(item, {}, zone, members, history)):
+    if not tuple(_review_item_exchanges(item, ReviewListLinks(), zone, members, history)):
         return
     entries = list_page.records(include_closed=True)
     linked = _list_review_links(entries)
-    _file_live(partial(_reload_review, root or change_routing.review_root(), item, members, linked, zone),
+    _file_live(partial(_reload_review, root or change_routing.review_root(), item, members, linked, zone,
+                       filing=the_list.QuestionFiling.LIVE),
                entries, members)
 
 
@@ -1906,11 +2031,21 @@ def _unresolved_lines(inventory: ExchangeInventory) -> Iterator[str]:
         yield f"  {key}: {count}"
 
 
-def unresolved_question_lines(plans: Iterable[FilingPlan]) -> Iterator[str]:
-    keys = sorted({plan.exchanges[0].source_key for plan in plans if plan.unresolved_question_destination})
-    yield f"Unresolved question destinations: {len(keys)}"
-    for key in keys:
+def unresolved_question_lines(keys: Iterable[str], keyless: Iterable[KeylessQuestionMigration]) -> Iterator[str]:
+    unresolved = set(keys)
+    rows: list[str] = []
+    for migration in keyless:
+        location = migration.destination
+        identity = f"{location.keeper}/L{location.number}"
+        rows.append(identity)
+        unresolved.update(origin.source_key for origin in migration.row.candidate_origins)
+        if not migration.row.candidate_origins:
+            unresolved.add(identity)
+    yield f"Unresolved question destinations: {len(unresolved)}"
+    for key in sorted(unresolved):
         yield f"  {key}: no verified List destination"
+    for row in sorted(rows):
+        yield f"  {row}: cannot resolve the original question source"
 
 
 def migrate(inventory: ExchangeInventory, members: staff.StaffSnapshot, *, apply: bool) -> int:
@@ -1920,12 +2055,30 @@ def migrate(inventory: ExchangeInventory, members: staff.StaffSnapshot, *, apply
     saved = {exchange for (key, destination), group in groups.items()
              for exchange in the_list.confirmed_exchanges(key, destination, group)}
     failures = 0
-    unresolved: list[FilingPlan] = []
+    unresolved: set[str] = set()
+    unresolved_rows: list[KeylessQuestionMigration] = []
+    for migration in inventory.keyless:
+        destination = migration.destination
+        if not apply:
+            if migration.origin is the_list.NoQuestionItem.ORDINARY:
+                unresolved_rows.append(migration)
+            continue
+        try:
+            if the_list.convert_legacy_question_source(destination.keeper, f"L{destination.number}", migration.resolve):
+                continue
+        except (OSError, ValueError) as error:
+            failures += 1
+            print(f"List question conversion for {destination.keeper}/L{destination.number}: {error}", file=sys.stderr)
+        unresolved_rows.append(migration)
+    blocked_rows = {migration.destination for migration in unresolved_rows}
+    blocked_keys = {origin.source_key for migration in unresolved_rows for origin in migration.row.candidate_origins}
     for source in Source:
         plans: list[FilingPlan] = []
         for plan in _plans((exchange for exchange in inventory.exchanges if exchange.source is source), inventory.filed):
-            if plan.unresolved_question_destination:
-                unresolved.append(plan)
+            key = plan.exchanges[0].source_key
+            if (plan.unresolved_question_destination or key in blocked_keys
+                    or any(destination in blocked_rows for destination in plan.destinations)):
+                unresolved.add(key)
             else:
                 plans.append(plan)
         pending = tuple(plan for plan in plans if not all(list_exchange.FiledExchange.from_exchange(exchange) in saved for exchange in plan.exchanges))
@@ -1944,9 +2097,14 @@ def migrate(inventory: ExchangeInventory, members: staff.StaffSnapshot, *, apply
             else:
                 if isinstance(link, investigation.ListDestination):
                     print(f"  {key} -> {link.keeper}/L{link.number}")
+                elif link is NoExchangeFiling.UNRESOLVED_QUESTION:
+                    unresolved.add(key)
     if apply:
-        for entry in list_page.records(include_closed=True):
+        entries, links = _migration_list_records()
+        for entry in entries:
             item = entry.item
+            if investigation.ListDestination(entry.keeper, item.number) in links.keyless:
+                continue
             if the_list.project_question_migration(item) != item:
                 try:
                     the_list.migrate_question_item(entry.keeper, item.id)
@@ -1955,7 +2113,7 @@ def migrate(inventory: ExchangeInventory, members: staff.StaffSnapshot, *, apply
                     print(f"  {entry.keeper}/{item.id}: {error}", file=sys.stderr)
     for line in _unresolved_lines(inventory):
         print(line)
-    for line in unresolved_question_lines(unresolved):
+    for line in unresolved_question_lines(unresolved, unresolved_rows):
         print(line)
     return int(bool(failures))
 
@@ -1977,23 +2135,6 @@ def main() -> int:
     zone = user_zone()
     reviews = review_items.read(root, members=members, kinds=_REVIEW_SOURCE_KINDS, zone=zone,
                                 sources=[], include_filed=True)
-    if args.apply:
-        reserved: dict[staff.StaffId, dict[int, set[the_list.NativeQuestionItem]]] = defaultdict(lambda: defaultdict(set))
-        question_links: dict[str, set[the_list.NativeQuestionItem]] = defaultdict(set)
-        for item in reviews:
-            if isinstance(item.source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
-                if not isinstance(evidence := _submitted_question_links(item.source.record), SubmittedQuestionLinks):
-                    continue
-                if isinstance(destination := evidence.reservation, investigation.ListDestination):
-                    reserved[destination.keeper][destination.number].add(evidence.origin)
-                for key in evidence.keys:
-                    question_links[key].add(evidence.origin)
-        for keeper in list_page.list_keepers():
-            try:
-                the_list.convert_legacy_question_sources(keeper, reservations=reserved[keeper], question_links=question_links)
-            except (OSError, ValueError) as error:
-                print(f"List question conversion for {keeper}: {error}", file=sys.stderr)
-                return 1
     inventory = _read_exchanges(root, members, zone, reviews)
     if args.command == "migrate":
         return migrate(inventory, members, apply=args.apply)

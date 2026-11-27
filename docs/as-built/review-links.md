@@ -2415,12 +2415,15 @@ Closed staff questions without a saved answer stay outside the migration.
 #### Question items in the Studio
 
 The List saves the question kind and native source key when it files a question item.
-After an owner transfer, migration uses the List reservation for the submitted question's request ID.
-Without a reservation, migration verifies the move receipt against the current question and finds the original List link.
-Migration saves the unique destination before allocation and records the native source key on the List item.
-Migration reports the question as unresolved if neither proof identifies its original List item.
-An unresolved transfer cannot allocate a List number.
-The loader reports a question item without a saved source key as a conversion error.
+Planning, keyless conversion, and apply use the same rules to find the original List item.
+
+1. Use the saved List reservation first, even if other items link to the question.
+2. Use the original request link in the creation log if there is no reservation.
+3. Use the original List link from a verified move receipt if the creation log gives no destination.
+4. Report the question as unresolved if it has destination history and these checks give no unique destination.
+5. Permit a new List number only for a question without destination history.
+
+Apply reports unresolved keyless rows and continues with other rows.
 Replies on Changes, Bugs, and Investigations keep the ordinary List workflow.
 A question to Nate starts in **Waiting for nate** and appears under **Questions**.
 **Answer question** opens the answer window in the item.
@@ -2484,7 +2487,7 @@ A verified exchange keeps its filed ID.
 New anonymous log exchanges use a digest of the prompt, its time, and the reply event.
 Verified Feedback replies remain in Review outside the unresolved question count.
 The preview reports each unresolved reply source and its reply count.
-The preview and migration log also list transferred questions without a verified List destination.
+The preview and migration log also list unresolved question destinations and keyless rows.
 Review keeps an Investigation or native Question visible while an outgoing question needs action in Review.
 Review also keeps the card visible while a reply remains unresolved.
 Review requires matching `.saved` receipts for the verified List exchanges that cover the question and replies.
