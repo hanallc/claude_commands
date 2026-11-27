@@ -27,7 +27,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
-                          "message": "No action needed.\nThe build passed.", "detail": "", "key": "", "text_id": ""}
+                          "message": "The build passed.", "detail": "", "key": "", "text_id": ""}
 
 
 class SilenceTests(unittest.TestCase):

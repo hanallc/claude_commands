@@ -64,8 +64,9 @@ from scripts.notify import silence
 from scripts.notify import decision_priority
 from scripts.notify.push_catalog import (NATE_ADHOC_TEXT_ID, PAID_CREDIT_ACTION_PREFIX, RESTART_FAILED_TEXT_ID,
                                          remaining_credit_accounts)
-from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
-                         ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
+from scripts.notify.user_action import (FIX, LEGACY_NO_ACTION_LINE, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused,
+                         ActionRequired, ActionUnstated, NoActionRequired, UserAction, notification_header,
+                         notification_message, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
 from scripts.whoami import token_expiry
 
@@ -381,14 +382,15 @@ def parse(argv: list[str]) -> Arguments | None:
 
 def trimmed_body(action: UserAction, message: str, session: NotificationSession = NO_SESSION_LINE,
                  *, header: bool = True) -> str:
-    body_limit = max(MESSAGE_MAX - len(first_line(action, session)) - 1, 0) if header else MESSAGE_MAX
+    lines = notification_header(action, session) if header else ""
+    body_limit = max(MESSAGE_MAX - len(lines) - bool(lines), 0)
     return message[:body_limit]
 
 
 def posted_message(action: UserAction, message: str, session: NotificationSession = NO_SESSION_LINE,
                    *, header: bool = True) -> str:
     body = trimmed_body(action, message, session, header=header)
-    return f"{first_line(action, session)}\n{body}" if header else body
+    return notification_message(action, body, session, header=header)
 
 
 def refuse(source: str, priority: str, title: str, message: str, reason: str) -> int:
@@ -422,7 +424,8 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     if isinstance(action, ActionRequired) and len(action.text) > action_limit:
         return refuse(source, priority, title, message,
                       f"--action may hold at most {action_limit} characters")
-    if len(first_line(action, arguments["session"])) + 1 > MESSAGE_MAX:
+    lines = notification_header(action, arguments["session"])
+    if len(lines) + bool(lines) > MESSAGE_MAX:
         return refuse(source, priority, title, message, "Session and action exceed the message limit")
     action_priority = {"blocked": 2, "decision": 1, "note": 0}[arguments["need"]]
     match refused_at(action, action_priority):
@@ -527,8 +530,9 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     if code == 0 and not registered_text and isinstance(outcome, (review.Rewritten, review.Questions)):
         print("pushover: sent as rewritten:")
         print(version.title)
-        print(first_line(version.action, version.session))
-        print(version.body)
+        message = notification_message(version.action, version.body, version.session, header=header)
+        if message:
+            print(message)
     return code
 
 
@@ -716,7 +720,13 @@ def post_message(source: str, priority: str, title: str, message: str,
         log(source, priority, title, message, f"{REFUSED_BEFORE_SENDING}: no sender" + suffix)
         print(f"pushover: {REFUSED_BEFORE_SENDING}: no sender. Name the sender with --source NAME.", file=sys.stderr)
         return 2
-    message = message[:phone_message_limit(source, text_id)].rstrip() + _phone_footer(sender, text_id)
+    session, body = split_session(message)
+    line, _, remaining = body.partition("\n")
+    if line == LEGACY_NO_ACTION_LINE:
+        message = notification_message(NoActionRequired(), remaining, session)
+    message = message[:phone_message_limit(source, text_id)].rstrip()
+    footer = _phone_footer(sender, text_id)
+    message = message + footer if message else footer.lstrip("\n")
     keys = read_keys(keys_file)
     if keys is None:
         outcome = f"{REFUSED_BEFORE_SENDING}: keys missing"

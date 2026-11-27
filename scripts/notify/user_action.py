@@ -12,6 +12,7 @@ from dataclasses import dataclass
 FIX = ('Say what the user does with --action "<what they do>", or pass '
        "--no-action when nothing is needed (priority 0 only).")
 REFUSED_BEFORE_SENDING = "refused before sending"
+LEGACY_NO_ACTION_LINE = "No action needed."
 
 _PLACEHOLDERS = frozenset(("none", "n/a", "nothing", "no action", "-"))
 
@@ -90,11 +91,20 @@ def split_session(message: str) -> tuple[NotificationSession, str]:
     return NO_SESSION_LINE, message
 
 
-def first_line(action: UserAction, session: NotificationSession = NO_SESSION_LINE) -> str:
-    """The notification header, with its session when stated."""
+def notification_header(action: UserAction, session: NotificationSession = NO_SESSION_LINE) -> str:
+    """Return the session and action lines when present."""
     if isinstance(action, ActionRequired):
         return session_prefix(session) + f"Action: {action.text}"
-    return session_prefix(session) + "No action needed."
+    return session_prefix(session).removesuffix("\n")
+
+
+def notification_message(action: UserAction, body: str, session: NotificationSession = NO_SESSION_LINE,
+                         *, header: bool = True) -> str:
+    """Join the header and body when both are present."""
+    lines = notification_header(action, session) if header else ""
+    if not lines:
+        return body.lstrip("\r\n")
+    return f"{lines}\n{body}" if body else lines
 
 
 # A literal thing to type in a body: "type" or "type:" and its text, or a "! <command>" shell escape.
