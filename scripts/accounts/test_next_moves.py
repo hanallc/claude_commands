@@ -718,3 +718,22 @@ class NextMovesTests(unittest.TestCase):
         self.assertEqual(rate.points_per_hour, 12.0)
         self.assertEqual(hold, next_moves.ResolvedHold(math.ceil(pace_minutes / rate.points_per_hour),
                                                       next_moves.PaceEstimate(rate.points_per_hour)))
+
+    def test_half_point_hold_uses_the_default_for_a_zero_page_rate(self) -> None:
+        lookback, default = 60, 48
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\nhold_default_minutes={default}\n")
+        settings = conf.read("accounts")
+        reset = NOW + timedelta(weeks=1, minutes=-6)
+        status = self.save_weekly_pace_reading(60, reset)
+        row = accounts.StatusRow("claude1", "claude", status.folder, status.login, (), 60, reset,
+                                 accounts.StatusUnavailable(), "", False, NOW, agent_accounts.UsageReadOutcome.OK,
+                                 accounts.StatusUnavailable(), stored_weekly_reset=reset)
+        history = [run_out.Reading(NOW - timedelta(minutes=5), 40), run_out.Reading(NOW, 40)]
+        with (patch.object(accounts, "account_statuses", return_value=[status]),
+              patch.object(run_out, "read_readings", return_value={"claude1": history})):
+            inputs = accounts.read_account_usage_rate_inputs((row,), NOW, account_config=settings, role_arrivals=())
+            rate = accounts.account_usage_rate("claude1", NOW, account_config=settings, inputs=inputs)
+            hold = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW, account_config=settings)
+        assert isinstance(rate, run_out.PartialWindowRate)
+        self.assertEqual(rate.points_per_hour, 0)
+        self.assertEqual(hold, next_moves.ResolvedHold(default, next_moves.NoUsablePace()))

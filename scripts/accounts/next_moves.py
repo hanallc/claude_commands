@@ -152,7 +152,8 @@ def account_pace(label: str, now: datetime, *,
                  account_config: conf.ConfigRead) -> PaceEstimate | NoUsablePace:
     reader = cast(AccountUsageRateReader, cast(object, import_module("scripts.accounts.accounts")))
     rate = reader.account_usage_rate(label, now, account_config=account_config)
-    if isinstance(rate, run_out.NoUsageRate):
+    # The page can show a zero rate; the hold uses the default for it.
+    if isinstance(rate, run_out.NoUsageRate) or rate.points_per_hour <= 0:
         return NoUsablePace()
     return PaceEstimate(rate.points_per_hour)
 

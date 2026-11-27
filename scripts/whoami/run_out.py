@@ -323,9 +323,7 @@ def page_usage_rate(label: str, current: Reading | WeeklyReadingUnavailable, now
     if isinstance(current, Reading) and since <= current.at <= now and 0 <= current.used_percent <= 100:
         partial_readings[current.at] = current
     partial = _observed_usage(sorted(partial_readings.values()), since)
-    if isinstance(partial, ObservedUsage) and (partial.points > 0 or isinstance(prior, LastKnownRate)):
-        return PartialWindowRate(since, partial, lookback, prior)
-    return prior
+    return PartialWindowRate(since, partial, lookback, prior) if isinstance(partial, ObservedUsage) else prior
 
 
 @dataclass(frozen=True)
