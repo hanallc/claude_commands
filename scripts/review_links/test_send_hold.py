@@ -29,7 +29,7 @@ class Replays:
         self.sent: list[tuple[str, dict[str, str], bytes]] = []
         self.done: threading.Event = threading.Event()
 
-    def __call__(self, path: str, headers: Mapping[str, str], body: bytes) -> HeldResponse:
+    def __call__(self, path: str, headers: Mapping[str, str], body: bytes, _ticket: str) -> HeldResponse:
         self.sent.append((path, dict(headers), body))
         self.done.set()
         return OK
@@ -151,7 +151,7 @@ class HoldsTests(unittest.TestCase):
     def test_a_stop_waits_for_a_running_replay_and_no_replay_starts_after_it(self) -> None:
         started, finish, calls = threading.Event(), threading.Event(), list[str]()
 
-        def slow(path: str, _headers: Mapping[str, str], _body: bytes) -> HeldResponse:
+        def slow(path: str, _headers: Mapping[str, str], _body: bytes, _ticket: str) -> HeldResponse:
             calls.append(path)
             started.set()
             _ = finish.wait(5)
@@ -213,7 +213,7 @@ class HoldsTests(unittest.TestCase):
         self.assertIs(holds.result("1" * 24, wait=0), HoldState.MISSING)
 
     def test_a_failed_replay_gives_a_503_result(self) -> None:
-        def refused(_path: str, _headers: Mapping[str, str], _body: bytes) -> HeldResponse:
+        def refused(_path: str, _headers: Mapping[str, str], _body: bytes, _ticket: str) -> HeldResponse:
             raise ConnectionRefusedError("refused")
 
         holds = Holds(self.folder, refused)

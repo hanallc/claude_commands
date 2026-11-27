@@ -1647,6 +1647,7 @@ function bindDraft(dialog, fresh = false) {
   const options = {method: 'POST', headers: {'Content-Type': 'application/json'},
                    body: JSON.stringify(payload), keepalive};
   const response = await (hold ? heldFetch(endpoint, options, receiver, undefined, receipt) : fetch(endpoint, options));
+  if (!hold && receipt) await showImmediateSendReceipt(response, receipt);
   return responseData(response, 'Could not send this item.');
  }
 
@@ -2386,22 +2387,22 @@ function bindDraft(dialog, fresh = false) {
    awaitingEarlierSend = true;
    storeListDraft();
    usedPreview = Boolean(item.capture_key && !item.defer_capture);
-   const sendItem = () => {
+   const sendItem = hold => {
     posted = true;
     if (usedPreview && captureSession?.image?.key === item.capture_key) captureSession.sent = true;
     const receiver = !hadEarlierSend && recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
-    return post({...item, token}, {hold: true, receiver: receiver || undefined,
+    return post({...item, token}, {hold, receiver: receiver || undefined,
                                  receipt: item.kind === 'scheduled' ? scheduledReceipt : undefined});
    };
    let result;
    try {
-    result = await sendItem();
+    result = await sendItem(!hadEarlierSend);
    } catch (failure) {
     if ((onList && item.kind !== 'scheduled') || !failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);
     setOptions(fresh);
     if (!pendingPayload() && selectedRecipient !== item.recipient_id) throw failure;
-    result = await sendItem();
+    result = await sendItem(false);
    }
    const expectedId = item.kind === 'scheduled' ? /^L[1-9][0-9]*$/ : /^[QPI][1-9][0-9]*$/;
    if (typeof result.id !== 'string' || !expectedId.test(result.id)) {

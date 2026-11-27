@@ -1084,11 +1084,11 @@ function showSendReceipt(toast,text,message,remove){
  toast.dataset.sendUndoReceipt='';text.textContent=message;toast.hidden=false;
  fadeSendToast(toast,{duration:6000,easing:'linear',fill:'forwards'}).finished.then(remove,remove);
 }
-async function showImmediateReceipt(request,response,receipt){
- if(!receipt || !response.ok || request.closed) return;
+async function showImmediateSendReceipt(response,receipt,isClosed=()=>false){
+ if(!receipt || !response.ok || isClosed()) return;
  const result=await response.clone().json().catch(()=>null);
  const message=sendReceiptText(response,result,receipt);
- if(!message || request.closed) return;
+ if(!message || isClosed()) return;
  const {toast,text}=sendToast();
  showSendReceipt(toast,text,message,()=>toast.remove());
 }
@@ -1186,7 +1186,7 @@ async function heldFetch(url,init={},receiver,onHold,receipt){
  });
  if(first.headers.get('X-Send-Hold')!=='held'){
   if(!(first.status>=500)) request.finish();
-  if(receipt) await showImmediateReceipt(request,first,receipt);
+  if(receipt) await showImmediateSendReceipt(first,receipt,()=>request.closed);
   return first;
  }
  const {hold,seconds}=await first.json();
@@ -1205,7 +1205,7 @@ async function heldFetch(url,init={},receiver,onHold,receipt){
    if(response.headers.get('X-Send-Hold')!=='pending'){
     if(response.status!==404 || !request.expired()) request.finish();
     if(typeof undo==='function') await undo(response);
-    else if(receipt) await showImmediateReceipt(request,response,receipt);
+    else if(receipt) await showImmediateSendReceipt(response,receipt,()=>request.closed);
     return response;
    }
   }catch(error){
@@ -1227,6 +1227,7 @@ function sendActionReceiver(form,data){
  return JSON.parse(form.dataset.sendLabels || '{}')[verdict];
 }
 window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendActionReceiver=sendActionReceiver;
+window.showImmediateSendReceipt=showImmediateSendReceipt;
 })();
 '''
 

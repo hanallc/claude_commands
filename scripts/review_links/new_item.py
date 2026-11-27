@@ -537,9 +537,9 @@ def _mapped_producer(member: staff.StaffRow, members: staff.StaffSnapshot) -> pr
     return mapped
 
 
-def _checked_schedule(words: str) -> Scheduled:
+def _checked_schedule(words: str, *, now: datetime) -> Scheduled:
     try:
-        return read_schedule(words, now=the_list.now(), zone=user_zone())
+        return read_schedule(words, now=now, zone=user_zone())
     except (ValueError, OverflowError) as error:
         raise FilingRefused(FilingRefusal.INVALID_SCHEDULE, str(error)) from error
 
@@ -568,10 +568,15 @@ class ScheduledFiling:
                             new_item_draft_id=new_item_draft_id, before_save=before_save)
 
 
+class ScheduleClock(StrEnum):
+    AT_FILING = "validate the start at filing"
+
+
 def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff.StaffSnapshot, *,
-                      producer: staff.StaffRow | None = None) -> ScheduledFiling:
+                      producer: staff.StaffRow | None = None,
+                      sent_at: datetime | ScheduleClock = ScheduleClock.AT_FILING) -> ScheduledFiling:
     """Check the schedule, owner and producer before the List write."""
-    schedule = _checked_schedule(words)
+    schedule = _checked_schedule(words, now=the_list.now() if sent_at is ScheduleClock.AT_FILING else sent_at)
     if isinstance(assignee, str):
         member, mapped = _assignment(assignee, members)
         try:
@@ -589,7 +594,7 @@ def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff
             raise FilingRefused(FilingRefusal.UNAVAILABLE_PRODUCER, str(error)) from error
     keeper = the_list.producer_id(members, "morty")
     run = schedule.first if isinstance(schedule, the_list.ScheduledSeries) else schedule
-    if run.start.astimezone(UTC) <= the_list.now():
+    if sent_at is ScheduleClock.AT_FILING and run.start.astimezone(UTC) <= the_list.now():
         raise FilingRefused(FilingRefusal.INVALID_SCHEDULE, "The start must be in the future.")
     assignment = assignment_receipt(new_item_dialog.SCHEDULED_KIND, member, mapped, members, this_session=False)
     return ScheduledFiling(keeper, member, mapped.producer.id, schedule, assignment, schedule_lines(schedule))
@@ -652,7 +657,8 @@ def refuse_scheduled_draft_reuse(request_id: str) -> None:
     review_submissions.refuse_scheduled_draft_reuse(request_id, load_list_draft=_load_list_draft)
 
 
-def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_submissions.ListItemDestination:
+def submit_scheduled(request: new_item_dialog.ScheduledSubmission, *,
+                     sent_at: datetime | ScheduleClock = ScheduleClock.AT_FILING) -> review_submissions.ListItemDestination:
     """File a browser Schedule and recover its receipt and notices on Retry."""
     fields: list[object] = [request.page, request.recipient_id, request.words]
     if request.producer_route:
@@ -668,7 +674,7 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_sub
                 raise new_item_dialog.SubmissionError("Pick a producer.")
             producer = recipient if request.producer_route else None
             owner = review_submissions.assigned_member(request.assignment, recipient, members)
-            filing = prepare_scheduled(owner, request.words, members, producer=producer)
+            filing = prepare_scheduled(owner, request.words, members, producer=producer, sent_at=sent_at)
             notices, warning = _assignment_notices(filing.title, filing.producer, filing.keeper, owner, members)
             claim = review_submissions.ListDraftClaim(digest, filing.keeper, filing.assignment, filing.readback, notices, warning)
             draft = review_submissions.NewItemDraft(request.request_id, claim)
@@ -749,7 +755,7 @@ def main(arguments: list[str] | None = None) -> int:
         if args.item_type == new_item_dialog.SCHEDULED_KIND:
             words = f"{args.description} {args.extra}"
             if args.preview:
-                _say_schedule(schedule_lines(_checked_schedule(words)))
+                _say_schedule(schedule_lines(_checked_schedule(words, now=the_list.now())))
             else:
                 members = staff.snapshot()
                 filing = prepare_scheduled(args.assignee, words, members)

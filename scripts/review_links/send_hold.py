@@ -19,9 +19,10 @@ import time
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -29,6 +30,7 @@ HOLD_PATH = "/send-hold"
 HOLD_HEADER = "X-Undo-Hold"
 REQUEST_HEADER = "X-Undo-Request"
 REPLAY_HEADER = "X-Undo-Replay"
+REPLAY_TICKET_HEADER = "X-Undo-Replay-Ticket"
 HOLD_FOLDER = ".review-link-holds"
 # The request headers that a replay needs. The handlers read the body, its type, and the origin checks.
 REPLAY_HEADERS = frozenset(("content-type", "origin", "host", "accept"))
@@ -41,7 +43,7 @@ RESULT_WAIT_SECONDS = 25.0
 REPLAY_TIMEOUT_SECONDS = 300.0
 MAY_HAVE_LEFT = "The send may have left. Check before you send again."
 
-Replay = Callable[[str, Mapping[str, str], bytes], "HeldResponse"]
+Replay = Callable[[str, Mapping[str, str], bytes, str], "HeldResponse"]
 
 
 class PendingFile(TypedDict):
@@ -50,6 +52,7 @@ class PendingFile(TypedDict):
     headers: dict[str, str]
     body: str
     due: float
+    started_at: NotRequired[float]
 
 
 class ReleasedFile(TypedDict):
@@ -143,6 +146,7 @@ class Holds:
         self._lock: threading.Condition = threading.Condition()
         self._timers: dict[str, threading.Timer] = {}
         self._releasing: set[str] = set()
+        self._replay_starts: dict[str, datetime] = {}
         # Results that the server could not write; the page reads them from memory.
         self._failed: dict[str, HeldResponse] = {}
         self._answering: int = 0
@@ -202,10 +206,11 @@ class Holds:
         hold_id = request_id or new_hold_id()
         if not valid_hold_id(hold_id):
             raise ValueError("Invalid hold id")
+        started_at = time.time()
         saved: PendingFile = {
             "state": "pending", "path": path, "body": base64.b64encode(body).decode("ascii"),
             "headers": {name: value for name, value in headers.items() if name.lower() in REPLAY_HEADERS},
-            "due": time.time() + seconds + RELEASE_GRACE_SECONDS}
+            "started_at": started_at, "due": started_at + seconds + RELEASE_GRACE_SECONDS}
         with self._lock:
             if hold_id in self._releasing or hold_id in self._failed:
                 return {"hold": hold_id, "seconds": 0}
@@ -289,26 +294,44 @@ class Holds:
                 self._releasing.discard(hold_id)
                 self._lock.notify_all()
 
+    def replay_started_at(self, ticket: str, *, received_at: datetime) -> datetime:
+        """Get the server's Send time for an active replay."""
+        if not ticket:
+            return received_at
+        with self._lock:
+            return self._replay_starts.get(ticket, received_at)
+
     def _send(self, hold_id: str) -> None:
         try:
-            saved = cast(PendingFile, json.loads(self._file(hold_id).read_text(encoding="utf-8")))
+            path = self._file(hold_id)
+            saved = cast(PendingFile, json.loads(path.read_text(encoding="utf-8")))
             body = base64.b64decode(saved["body"])
+            # Older pending files record the Send time in their file timestamp.
+            started_at = saved["started_at"] if "started_at" in saved else path.stat().st_mtime
+            sent_at = datetime.fromtimestamp(started_at, UTC)
             # A server that stops during the replay finds this result, and never sends the request again.
             self._write(hold_id, released_file(failed(MAY_HAVE_LEFT)))
-        except (OSError, ValueError, KeyError, TypeError) as error:
+        except (OSError, OverflowError, ValueError, KeyError, TypeError) as error:
             # A pending file left here would leave with the next server, after the page said it failed.
             print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
             self._file(hold_id).unlink(missing_ok=True)
             with self._lock:
                 self._failed[hold_id] = failed(f"The held send failed: {error}")
             return
+        # Only the replay request receives this ticket. The browser receives the hold ID.
+        ticket = new_hold_id()
+        with self._lock:
+            self._replay_starts[ticket] = sent_at
         try:
-            response = self._replay(saved["path"], saved["headers"], body)
+            response = self._replay(saved["path"], saved["headers"], body, ticket)
         except TimeoutError:
             # The handler can still finish after the replay stops waiting.
             response = failed(MAY_HAVE_LEFT)
         except (OSError, http.client.HTTPException, ValueError) as error:
             response = failed(f"The held send failed: {error}")
+        finally:
+            with self._lock:
+                del self._replay_starts[ticket]
         try:
             self._write(hold_id, released_file(response))
         except OSError as error:
@@ -392,13 +415,14 @@ class Holds:
 
 def replay_to(address: str, port: int) -> Replay:
     """Return a replay that posts a saved send to this server through its own bound address."""
-    def replay(path: str, headers: Mapping[str, str], body: bytes) -> HeldResponse:
+    def replay(path: str, headers: Mapping[str, str], body: bytes, ticket: str) -> HeldResponse:
         connection = http.client.HTTPConnection(address, port, timeout=REPLAY_TIMEOUT_SECONDS)
         try:
             connection.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
             for name, value in headers.items():
                 connection.putheader(name, value)
             connection.putheader(REPLAY_HEADER, "1")
+            connection.putheader(REPLAY_TICKET_HEADER, ticket)
             connection.putheader("Content-Length", str(len(body)))
             connection.endheaders(body)
             answer = connection.getresponse()

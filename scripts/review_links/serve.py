@@ -1982,9 +1982,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
     def scheduled_item_post(self, server: ReviewLinksServer, request: new_item_dialog.ScheduledSubmission) -> None:
         """File or recover a Scheduled item under the shared draft lock."""
+        sent_at = server.send_holds.replay_started_at(self.headers.get(send_hold.REPLAY_TICKET_HEADER, ""),
+                                                      received_at=the_list.now())
         try:
             with server.list_store_access(), server.staff_read_scope():
-                saved = new_item.submit_scheduled(request)
+                saved = new_item.submit_scheduled(request, sent_at=sent_at)
         except review_submissions.DraftAlreadyFiled as error:
             self.new_item_saved({"id": error.id}, error.id, True)
             return

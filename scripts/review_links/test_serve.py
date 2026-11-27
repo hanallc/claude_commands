@@ -1194,6 +1194,39 @@ class ReviewLinksServerTests(unittest.TestCase):
                          (409, {"outcome": "already sent"}))
         self.assertEqual(self.held_http("HEAD", f"{send_hold.HOLD_PATH}/{hold_id}")[0], 405)
 
+    def test_a_held_schedule_accepts_a_start_that_was_future_at_send(self) -> None:
+        case = self.review_fixture()
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        start = datetime(2099, 11, 30, 9, tzinfo=timezone.utc)
+        current = start - timedelta(seconds=5)
+        request = {"token": self.server.new_item_token, "kind": "scheduled", "page": "list",
+                   "page_recipient": "producer", "request_id": "s1-" + uuid4().hex,
+                   "recipient_id": morty.id, "assignee_id": case.fixture.unit.id,
+                   "words": "Check the Scheduled item. Start 2099-11-30T09:00Z."}
+        body = json.dumps(request).encode()
+        with (patch.object(send_hold, "time", Mock(wraps=time, time=lambda: current.timestamp())),
+              patch.object(the_list, "now", side_effect=lambda: current)):
+            status, hold, fields = self.held_http("POST", review_page.NEW_ITEM_PATH, body,
+                                                  headers={send_hold.HOLD_HEADER: "1"})
+            self.assertEqual((status, hold, fields["seconds"]), (202, "held", 10), fields)
+            held_path = f"{send_hold.HOLD_PATH}/{fields['hold']}"
+            self.assertEqual(the_list.records(morty.id), [])
+            current += timedelta(seconds=11)
+            self.assertEqual(self.held_http("POST", held_path + "/send")[0], 200)
+            status, _, fields = self.held_http("GET", held_path)
+            self.assertEqual(status, 200, fields)
+            item, = the_list.records(morty.id)
+            self.assertEqual(item.id, fields["id"])
+            self.assertIsInstance(item.schedule, the_list.ScheduledRun)
+            assert isinstance(item.schedule, the_list.ScheduledRun)
+            self.assertEqual(item.schedule.start, start)
+            late = json.dumps({**request, "request_id": "s1-" + uuid4().hex}).encode()
+            headers = {send_hold.REPLAY_HEADER: "1", send_hold.REPLAY_TICKET_HEADER: held_path.rsplit("/", 1)[-1]}
+            status, _, fields = self.held_http("POST", review_page.NEW_ITEM_PATH, late, headers=headers)
+            self.assertEqual((status, fields.get("error")), (400, "The start must be in the future."))
+            self.assertEqual(the_list.records(morty.id), [item])
+
     def test_a_closed_page_sends_a_held_new_item_at_once(self) -> None:
         case, other, body = self.held_new_item()
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
