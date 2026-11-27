@@ -30,6 +30,7 @@ from scripts.production import census, display_cells, land_queue, land_runs, liv
 from scripts.accounts import session_state
 from scripts.lib import conf, unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
+from scripts.message import send as message_send
 from scripts.production import showrunners
 from scripts.production import unit_lookup
 from scripts.production import session_staff, unit_config
@@ -498,19 +499,24 @@ class UnitPhasesTests(unittest.TestCase):
             return subprocess.CompletedProcess([], 0, "", "")
 
         def capacity_stop() -> subprocess.CompletedProcess[str]:
+            from scripts.whoami import quota_state
+
             output, errors = io.StringIO(), io.StringIO()
             opened = worker_panes.OpenWorker(worker, "pane-1", "terminal-1", herdr.AgentStatus.WORKING)
             closed = worker_panes.ClosedWorker(worker)
             arguments = ["stop"]
-            with (patch.object(session_staff, "pane_parents", return_value=[member]),
+            with (patch.object(quota_state, "no_worker_mode", return_value=True),
+                  patch.object(session_staff, "pane_parents", return_value=[member]),
                   patch.object(worker_panes, "observe_parents", return_value={member.id: [opened]}),
                   patch.object(worker_panes, "observe", side_effect=[[opened], [closed]]) as observed,
+                  patch.object(worker_panes, "observe_worker", return_value=closed),
+                  patch.object(worker_panes, "close", return_value=worker_panes.Closed()),
                   patch.object(worker_panes, "parent_run_index", return_value={member.current_session: [str(run)]}),
-                  patch.object(worker_panes, "worker_lock", return_value=contextlib.nullcontext()),
                   patch.object(herdr, "Herdr"), patch.object(herdr, "shared_session", return_value="fixture"),
                   patch.object(restart, "stop_row", return_value=True) as stop_row,
                   patch.object(detached_runs, "live_runs_for_staff", return_value=[]),
                   patch.object(worker_panes, "forget_restart"),
+                  patch.object(message_send, "send", return_value=message_send.Result("sent", "fixture")),
                   patch.object(worker_capacity, "_send", return_value=True) as send,
                   patch.object(showrunners, "load_settings_from", return_value={"faults_to": "fixture-faults"}),
                   contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors)):
@@ -746,6 +752,25 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertIn(("Now", "Readable board (board)", expected),
                                   detail_rows(rendered, "roles"))
                     self.assertNotIn("— working", rendered)
+
+    def test_board_shows_active_run_as_built_worker_work(self) -> None:
+        member = self.member("document")
+        worker = census_worker("writer", member.id)
+        events: list[dict[str, object]] = [
+            self.phase_event("phase_finished", "1", status="completed"),
+            {"event_type": "pass_started", "phase_id": "as-built", "phase_title": "Run as-built",
+             "phase_instance_id": "", "pass_instance_id": "writer", "pass_kind": "impl", "worker_id": worker.staff_id},
+        ]
+        plan = typed_record(self.root / "plan.md", "done")
+        _ = self.write_run(member, "document", [("1", "Delivery 1")], events)
+
+        rendered = self.blocks([member], {member.name: plan}, workers=[worker])
+
+        self.assertIn("**document** — working", rendered)
+        self.assertIn(("Now", "Run as-built", "Implementation worker runs it"), detail_rows(rendered, member.name))
+        events.append({"event_type": "pass_finished", "phase_id": "as-built", "pass_instance_id": "writer"})
+        _ = self.write_run(member, "document", [("1", "Delivery 1")], events)
+        self.assertNotIn("Run as-built", self.blocks([member], {member.name: plan}, workers=[worker]))
 
     def test_task_is_the_newest_open_activity_before_the_open_pass(self) -> None:
         member = self.member("activity")
@@ -2837,7 +2862,7 @@ class UnitPhasesTests(unittest.TestCase):
         config = self.root / "config"
         config.mkdir()
         _ = write_config_fixture(config / "production.conf",
-                                 "UNIT_ANOMALIES_TO=fixture-director\nunits_anomaly_repeat_minutes=60\n")
+                                 "unit_anomalies_to=fixture-director\nunits_anomaly_repeat_minutes=60\n")
         def observed(*, record: staff.StaffSnapshot, running: object = None) -> tuple[session_staff.LabeledSession, ...]:
             self.assertEqual(record.by_id(member.id), member)
             self.assertIsNone(running)

@@ -21,11 +21,12 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
 
+from scripts.agents import remote
 from scripts.direct import recorder_state
 from scripts.lib import conf_reads, transcripts, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
@@ -195,6 +196,9 @@ ARMED_REVIEW_KEY = "early_review"
 # A phase closed by finish-phase takes no more passes, its plan review's included.
 CLOSED_PHASE_RULE = ("A finished phase takes no more passes: run its plan review before its finish-phase "
                      + "(docs/direct/phase_end.md, step 3 before step 5).")
+AS_BUILT_PHASE = "as-built"
+AS_BUILT_TITLE = "Run as-built"
+AS_BUILT_OPEN_RUN_REQUIRED = "Run as-built requires an open run."
 
 
 class AgentIdentity(TypedDict):
@@ -637,6 +641,10 @@ def pass_phase_instance(record: dict[str, object]) -> str:
     return string(phase.get("instance_id")) if phase is not None else ""
 
 
+def is_as_built_pass(record: dict[str, object]) -> bool:
+    return (object_dict(record.get("phase")) or {}).get("id") == AS_BUILT_PHASE
+
+
 def phase_stamp(phase: dict[str, object]) -> dict[str, object]:
     """The fields a pass carries to name the phase it was opened in."""
     return {
@@ -790,7 +798,7 @@ class LedgerRepairCause(TypedDict):
 
 
 class LaunchCheck(TypedDict):
-    """A launch checked against its open phase and prompt before any pass starts."""
+    """The phase name and prompt check for a launch."""
 
     phase_id: str
     phase_title: str
@@ -831,7 +839,9 @@ def _launch_check(
     fix_cause: str | LedgerRepairCause = optional_arg(args, "fix_cause").strip()
     if arg_string(args, "pass_kind") == "fix":
         instance = string(phase.get("instance_id"))
-        for path in (session_dir / "findings_state.json", session_dir / f"findings_state-{instance}.json"):
+        ledgers = (() if phase.get("id") == AS_BUILT_PHASE
+                   else (session_dir / "findings_state.json", session_dir / f"findings_state-{instance}.json"))
+        for path in ledgers:
             try:
                 ledger = json_object(path.read_text(encoding="utf-8"))
             except FileNotFoundError:
@@ -862,29 +872,57 @@ def _launch_check(
             "prompt_phase_line": prompt_phase_line, "fix_cause": fix_cause}
 
 
-def _checked_launch(
-    args: argparse.Namespace, state: dict[str, object], session_dir: Path,
-) -> tuple[dict[str, object], LaunchCheck]:
-    """Validate a named open phase and its launch without changing any pass."""
+def require_launch_admission(args: argparse.Namespace, state: dict[str, object], session_dir: Path) -> None:
+    """Check whether the run still permits this slot to launch."""
+    if unit_runs.terminal_run(state):
+        raise SystemExit(f"{session_dir}: the run has ended dispatch admission")
+    helper = string(state.get(unit_runs.PRIVATE_HELPER_SLOT))
+    slot = optional_arg(args, "team_slot") if hasattr(args, "team_slot") else _team_slot()
+    if helper and slot != helper:
+        raise SystemExit(f"{session_dir}: only {helper} can dispatch in this private helper run")
+
+
+def launch_phase(
+    args: argparse.Namespace, state: dict[str, object], session_dir: Path, membership: staff.StaffSnapshot,
+    refuse: Callable[[dict[str, object], argparse.Namespace, str], NoReturn],
+) -> dict[str, object]:
+    """Select the phase or as-built work for an admitted launch."""
     phase_id = optional_arg(args, "phase_id")
+    if phase_id == AS_BUILT_PHASE and ("status" in state or not unit_runs.run_is_open(session_dir, record=membership)):
+        refuse(state, args, AS_BUILT_OPEN_RUN_REQUIRED)
+    require_launch_admission(args, state, session_dir)
     if not phase_id:
         _ = recorder_state.only_open_phase(state)
-        _launch_refused(state, args, "Missing phase: --phase-id is required for a recorded run")
+        refuse(state, args, "Missing phase: --phase-id is required for a recorded run")
+    if phase_id == AS_BUILT_PHASE:
+        if recorder_state.open_phases(state):
+            open_ids = ", ".join(recorder_state.open_phase_ids(state)) or "unknown"
+            refuse(state, args, f"Run as-built requires no open phases. Open phases: {open_ids}.")
+        return {"id": AS_BUILT_PHASE, "title": AS_BUILT_TITLE}
     phase = open_phase_named(state, phase_id)
     if phase is None:
         open_ids = ", ".join(recorder_state.open_phase_ids(state)) or "none"
-        _launch_refused(state, args, f"Phase {phase_id} is not open; open phases: {open_ids}. {CLOSED_PHASE_RULE}")
+        refuse(state, args, f"Phase {phase_id} is not open; open phases: {open_ids}. {CLOSED_PHASE_RULE}")
+    return phase
+
+
+def _checked_launch(
+    args: argparse.Namespace, state: dict[str, object], session_dir: Path, membership: staff.StaffSnapshot,
+) -> tuple[dict[str, object], LaunchCheck]:
+    """Check the launch without changing any pass or phase."""
+    phase = launch_phase(args, state, session_dir, membership, _launch_refused)
     return phase, _launch_check(args, state, phase, session_dir)
 
 
 def _check_launch(args: argparse.Namespace) -> None:
     session_dir = argument_session_dir(args)
     try:
-        state = read_state(session_dir)
+        membership = staff.initial_snapshot()
+        state = read_state(session_dir, record=membership)
     except staff.StaffUnreadable as error:
         print(f"staff: {arg_string(args, 'pass_kind')}: not opened: {error}", file=sys.stderr)
         raise SystemExit(3) from error
-    phase, launch_check = _checked_launch(args, state, session_dir)
+    phase, launch_check = _checked_launch(args, state, session_dir, membership)
     if optional_arg(args, "lens") == "ux":
         event = record_event(state, "launch_checked", now_epoch(), phase_record=phase)
         event.update(launch_check=launch_check, pass_kind=arg_string(args, "pass_kind"),
@@ -931,6 +969,8 @@ def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                     dispatch_owned: bool, prompt_source: Path | bytes,
                     ) -> MatchedDispatch | NoMatchedDispatch | ActiveDispatchPromptConflict:
     if active is None or pass_phase_instance(active) != string(phase.get("instance_id")):
+        return NoMatchedDispatch()
+    if phase.get("id") == AS_BUILT_PHASE and not is_as_built_pass(active):
         return NoMatchedDispatch()
     if active.get("kind", "") != fields.get("kind", ""):
         return NoMatchedDispatch()
@@ -1018,6 +1058,7 @@ def validate_dispatch_selection(state: dict[str, object], selection: DispatchSel
                                 slot: str, phase: str) -> None:
     current_phase = open_phase_named(state, phase)
     if (slot != selection.slot or phase != selection.phase_id
+            or (phase == AS_BUILT_PHASE and ("status" in state or recorder_state.open_phases(state)))
             or string((current_phase or {}).get("instance_id")) != selection.phase_instance_id
             or dispatch_predecessor(pass_slots(state), slot) != selection.predecessor):
         raise DispatchSelectionChanged(f"Slot {slot} or phase {phase} changed during dispatch")
@@ -1056,7 +1097,7 @@ def start_pass(args: argparse.Namespace,
     if isinstance(selection, DispatchSelection):
         validate_dispatch_selection(state, selection, team_slot, optional_arg(args, "phase_id"))
     # Name the phase when more than one phase is open.
-    phase, launch_check = _checked_launch(args, state, session_dir)
+    phase, launch_check = _checked_launch(args, state, session_dir, membership)
     launcher_pid = arg_integer(args, "launcher_pid", os.getppid())
     early_id = optional_arg(args, "early_review_pass_id")
     dispatch_fields: dict[str, object] = {
@@ -1132,6 +1173,8 @@ def start_pass(args: argparse.Namespace,
     if status_file:
         current_pass["assign_status_file"] = status_file
     slots = pass_slots(state)
+    if previous := slots.get(team_slot):
+        retain_replaced_pass(state, previous)
     slots[team_slot] = current_pass
     write_state(session_dir, state)
     worker_id = staff.StaffId(optional_arg(args, "worker_id"))
@@ -1212,7 +1255,8 @@ def dispatch_delivery(passed: dict[str, object]) -> DispatchDelivery:
         line=string(fields.get("line")), completion_id=string(fields.get("completion_id")),
         reply_file=string(fields.get("reply_file")), early_ready=string(fields.get("early_ready")),
         actions=CompletionActions(
-            summary_file=string(actions.get("summary_file")), status_file=string(actions.get("status_file")),
+            summary_file=string(actions.get("summary_file")),
+            status_file=string(passed.get("assign_status_file")) or string(actions.get("status_file")),
             report_file=string(actions.get("report_file")), style_directory=string(actions.get("style_directory")),
             end_worker=actions.get("end_worker") is True, held_role=string(actions.get("held_role")),
             resolve_fix=actions.get("resolve_fix") is True, review_pass=int(number(actions.get("review_pass"), 1)),
@@ -1220,9 +1264,20 @@ def dispatch_delivery(passed: dict[str, object]) -> DispatchDelivery:
     )
 
 
+def assignment_status_file(passed: dict[str, object]) -> str:
+    """Read the status file path recorded for the assignment."""
+    return string(passed.get("assign_status_file")) or dispatch_delivery(passed).actions.status_file
+
+
 def worker_artifact(path: Path, slot: str, worker: str) -> Path:
     """Keep artifacts with the worker selected for the recorded slot."""
     return path.with_name(worker + path.name.removeprefix(slot)) if path.name.startswith(slot + "_") else path
+
+
+class StoppedReplyDisposition(StrEnum):
+    PENDING = "pending"
+    SAVED = "saved"
+    ENDED_WITHOUT_DONE = "ended without DONE"
 
 
 @dataclass(frozen=True)
@@ -1238,6 +1293,7 @@ class HookCompletion:
     finished: bool = False
     recording_done: bool = False
     sender_native_id: str = ""
+    stopped_reply: StoppedReplyDisposition = StoppedReplyDisposition.PENDING
     pending_diagnostics: tuple[str, ...] = ()
 
 
@@ -1250,11 +1306,35 @@ def hook_completion(passed: dict[str, object]) -> HookCompletion | NoHookComplet
     if fields is None:
         return NoHookCompletion.UNRECORDED
     details = fields.get("details", [])
+    disposition = next((value for value in StoppedReplyDisposition if value.value == fields.get("stopped_reply")),
+                       StoppedReplyDisposition.PENDING)
     return HookCompletion(string(fields.get("outcome")), string(fields.get("reply_file")),
         tuple(str(item) for item in cast(list[object], details)) if isinstance(details, list) else (),
         fields.get("actions_done") is True, fields.get("pane_closed") is True,
         fields.get("role_released") is True, fields.get("finished") is True, fields.get("recording_done") is True,
-        string(fields.get("sender_native_id")), tuple(string_list(fields.get("pending_diagnostics"))))
+        string(fields.get("sender_native_id")), disposition, tuple(string_list(fields.get("pending_diagnostics"))))
+
+
+def retained_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
+    records = object_dict(state.get("finishing_passes")) or {}
+    return {instance: passed for instance, value in records.items()
+            if (passed := object_dict(value)) is not None}
+
+
+def retain_replaced_pass(state: dict[str, object], passed: dict[str, object]) -> None:
+    """Keep the pass available until its completion actions finish."""
+    instance = string(passed.get("instance_id"))
+    completion = hook_completion(passed)
+    if isinstance(completion, HookCompletion):
+        pending = not completion.finished
+    else:
+        delivery = dispatch_delivery(passed)
+        pending = (delivery.actions.finish_run or bool(delivery.line)
+                   or (passed.get("dispatch_kind") == "astra" and passed.get("kind") == "astra-reviewer"))
+    if instance and pending:
+        retained = retained_passes(state)
+        retained[instance] = passed
+        state["finishing_passes"] = retained
 
 
 @dataclass(frozen=True)
@@ -1300,6 +1380,8 @@ def _finish_pass(args: argparse.Namespace) -> CanceledWorkerPass | NoCanceledPan
     if instance_id := optional_arg(args, "pass_instance_id"):
         if current.get("instance_id") != instance_id:
             return NoCanceledPane.NONE
+    if status == "canceled" and (status_file := assignment_status_file(current)):
+        write_text_atomic(Path(status_file), "error\n")
     closed = close_slot_pass(session_dir, state, slot, status, now_epoch())
     if orphaned and not closed:
         raise SystemExit(
@@ -1412,16 +1494,61 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_run_owner(session_dir: Path, state: dict[str, object], record: staff.StaffSnapshot, *,
+                      starting_director: str = "") -> staff.StaffRow | unit_runs.RunOwnerUnrecorded:
+    folder = session_dir.resolve()
+    owners = [row for row in record.rows if row.kind in ("unit", "showrunner")
+              and isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == folder]
+    if len(owners) > 1:
+        raise ValueError(f"{session_dir}: more than one staff member owns the run")
+    saved = unit_runs.run_owner(state, record)
+    if owners:
+        if isinstance(saved, staff.StaffRow) and saved.id != owners[0].id:
+            raise ValueError(f"{session_dir}: saved owner {saved.name} conflicts with the run pointer of {owners[0].name}")
+        return owners[0]
+    if isinstance(saved, staff.StaffRow) or not starting_director:
+        return saved
+    caller = record.owner_of(starting_director)
+    return caller if caller is not None and caller.kind in ("unit", "showrunner") else saved
+
+
+def read_run_owner(session_dir: Path, *, starting_director: str = "") -> staff.StaffRow | unit_runs.RunOwnerUnrecorded:
+    """Resolve the run owner before either caller writes an artifact."""
+    try:
+        state = recorder_state.read_state(state_path(session_dir))
+    except FileNotFoundError:
+        state = {}
+    owner = resolve_run_owner(session_dir, state, staff.initial_snapshot(), starting_director=starting_director)
+    if isinstance(owner, staff.StaffRow) and owner.kind == "showrunner" and isinstance(
+            owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        if owner.doc.machine != remote.local_machine():
+            raise ValueError(f"{owner.name}: the staff document is on {owner.doc.machine}")
+    return owner
+
+
+def require_ordinary_review_run(session_dir: Path) -> None:
+    """Refuse the alternate launcher before any artifacts exist."""
+    owner = read_run_owner(session_dir)
+    if isinstance(owner, staff.StaffRow) and owner.kind == "showrunner" and isinstance(
+            owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        if staff.declares_merge_checkout(owner.doc.path.read_text(encoding="utf-8").splitlines()):
+            raise ValueError(f"{owner.name}: enrolled showrunners must use the assigned review launcher")
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
     handler = cast(Callable[[argparse.Namespace], object], args.handler)
     session_dir = argument_session_dir(args)
-    session_dir.mkdir(parents=True, exist_ok=True)
     try:
+        require_ordinary_review_run(session_dir)
+        session_dir.mkdir(parents=True, exist_ok=True)
         with recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            result = handler(args)
-    except recorder_state.OldRecorderState as error:
+            try:
+                result = handler(args)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except (OSError, ValueError, recorder_state.OldRecorderState, staff.StaffRefused) as error:
         raise SystemExit(str(error)) from error
 
     if isinstance(result, CanceledWorkerPass):

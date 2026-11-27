@@ -24,9 +24,13 @@ from typing import Never, cast, override
 from unittest import mock
 from contextlib import AbstractContextManager, chdir, nullcontext, redirect_stdout
 
+from scripts.buildlog.store import host_name
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
+from scripts.lib.build_copies_test_support import write_private_build_roots
+from scripts.lib.boot_identity import boot_identity
+from scripts.lib.process_start import Started, process_start
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, FixtureConfigValues, config_environment, write_config_fixture
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 
 
@@ -940,6 +944,7 @@ class BuildFolderTests(unittest.TestCase):
             + "patterns.legacy-stable={purpose}\nnames.repository_key_length=8\n"
             + "patterns.tool={purpose}{suffix}\npatterns.named={showrunner}-{unit}/{work}-{purpose}\n"
             + "prefixes.verify-hold=verify-hold.{owner}.\nprefixes.admit-test=admit-test-\n")
+        write_private_build_roots(config / "build_folders.conf", private, host_name())
         _ = write_config_fixture(config / "scratch.conf", "suffix_length=6\n")
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -1315,6 +1320,52 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.assertEqual(json.loads(lease.read_text())["pid"], os.getpid())
         self.assertEqual(folders.build_folder_state(path), "held")
 
+    def test_gate_suite_lease_records_the_owner_and_directory_identity(self) -> None:
+        samestat = os.path.samestat
+        checked: list[Path] = []
+
+        def check_order(created: os.stat_result, current: os.stat_result) -> bool:
+            if stat.S_ISDIR(current.st_mode):
+                for entry in self.root.glob("g-*"):
+                    if samestat(current, entry.stat()):
+                        read_owner.assert_any_call(os.getpid())
+                        checked.append(entry)
+            return samestat(created, current)
+
+        with (mock.patch("scripts.lib.process_start.process_start", wraps=process_start) as read_owner,
+              mock.patch.object(os.path, "samestat", side_effect=check_order)):
+            request = folders.GateSuiteFolder("g-", folders.ExplicitBuildParent(self.root))
+            with folders.temporary_build_folder(request) as path:
+                self.assertIn(path, checked)
+                status = path.stat()
+                start = process_start(os.getpid())
+                assert isinstance(start, Started)
+                lease = folders.lease_path(path)
+                fields = cast(dict[str, object], json.loads(lease.read_text()))
+                self.assertEqual(fields["pid"], os.getpid())
+                self.assertEqual(fields["process_start"], start.start)
+                if sys.platform == "darwin":
+                    self.assertNotIn("boot_id", fields)
+                else:
+                    self.assertEqual(fields["boot_id"], boot_identity())
+                self.assertEqual(fields["device"], status.st_dev)
+                self.assertEqual(fields["inode"], status.st_ino)
+        self.assertFalse(path.exists())
+        self.assertFalse(lease.exists())
+
+    def test_legacy_lease_keeps_its_pid_based_owner_state(self) -> None:
+        request = folders.UniqueBuildFolder("old-gate-", folders.ExplicitBuildParent(self.root))
+        path = folders.create_build_folder(request)
+        _release_folder(path)
+        fields = cast(dict[str, object], json.loads(folders.lease_path(path).read_text()))
+        self.assertTrue({"process_start", "boot_id", "device", "inode"}.isdisjoint(fields))
+        with folders.folder_removal_lease(path, wait=False) as lease:
+            assert isinstance(lease, folders.HeldFolderRemovalLease)
+            self.assertIs(lease.owner_state(), folders.LeaseOwnerState.ACTIVE)
+            with mock.patch.object(os, "kill", side_effect=ProcessLookupError) as kill:
+                self.assertIs(lease.owner_state(), folders.LeaseOwnerState.ENDED)
+                kill.assert_called_once_with(os.getpid(), 0)
+
     def test_tool_lock_files_do_not_keep_a_temporary_folder(self) -> None:
         with folders.temporary_build_folder(folders.UniqueBuildFolder("rust-project-")) as path:
             cargo = path / "Cargo.lock"
@@ -1542,10 +1593,18 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
             self.assertEqual(folders.build_folder_state(path), "free")
         self.assertGreaterEqual(len(attempts), 2)
 
+    def run_lock_probe(self, probe: str, event: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+        try:
+            return process_group.run_process_group([sys.executable, "-c", probe, *arguments],
+                                                   timeout=TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            self.fail(f"The lock probe did not finish {event}.")
+
     @unittest.skipUnless(hasattr(os, "fork"), "fork is unavailable")
     def test_fork_inside_nested_contexts_keeps_each_inherited_lock(self) -> None:
         probe = """import os, pathlib, signal
 from scripts.lib import build_folders as f
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 root = pathlib.Path(os.environ['TMPDIR'])
 read, write = os.pipe()
 outer_spec = f.BuildFolderSpec(kind='target', parent=root, suffix_length=0, purpose='outer')
@@ -1556,7 +1615,8 @@ with f.temporary_build_folder(outer_spec) as outer:
             assert shared == outer
         child = os.fork()
         if child == 0:
-            signal.alarm(3)
+            os.close(write)
+            signal.alarm(TEST_HANG_GUARD_SECS)
             assert os.read(read, 1) == b'x'
             assert outer.is_dir() and inner.is_dir()
             assert f.build_folder_state(outer) == f.build_folder_state(inner) == 'held'
@@ -1570,12 +1630,12 @@ assert outer.is_dir() and inner.is_dir()
 assert f.build_folder_state(outer) == f.build_folder_state(inner) == 'held'
 os.write(write, b'x')
 _, status = os.waitpid(child, 0)
-assert os.waitstatus_to_exitcode(status) == 0, status
+assert os.waitstatus_to_exitcode(status) == 0, ('nested lock child exit', status)
 assert not outer.exists() and not inner.exists()
 assert f.build_folder_state(outer) == f.build_folder_state(inner) == 'free'
 print('nested')
 """
-        result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=6)
+        result = self.run_lock_probe(probe, "after releasing both nested locks")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "nested\n")
 
@@ -1676,7 +1736,7 @@ print('free')
 """
         for stage in ("lock", "fstat", "lease", "mkdir", "publish", "removal", "folder_removed", "lease_removed", "lock_removed"):
             with self.subTest(stage=stage):
-                result = subprocess.run([sys.executable, "-c", probe, stage], capture_output=True, text=True, timeout=4)
+                result = self.run_lock_probe(probe, f"after interrupting allocation at {stage}", stage)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "free\n")
 
@@ -1697,6 +1757,7 @@ print('free')
         probe = """import fcntl, os, pathlib, signal
 from unittest import mock
 from scripts.lib import build_folders as f
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 root = pathlib.Path(os.environ['TMPDIR'])
 path = root / 'fork-lock'
 read, write = os.pipe()
@@ -1707,7 +1768,8 @@ def fork_after_lock(fd, mode):
     if not child and mode == fcntl.LOCK_SH | fcntl.LOCK_NB:
         pid = os.fork()
         if pid == 0:
-            signal.alarm(3)
+            os.close(write)
+            signal.alarm(TEST_HANG_GUARD_SECS)
             assert os.read(read, 1) == b'x'
             assert path.is_dir() and f.build_folder_state(path) == 'held'
             os.close(fd)
@@ -1721,11 +1783,11 @@ getattr(f, '_release_build_folder')(path)
 assert path.is_dir() and f.build_folder_state(path) == 'held'
 os.write(write, b'x')
 _, status = os.waitpid(child[0], 0)
-assert os.waitstatus_to_exitcode(status) == 0, status
+assert os.waitstatus_to_exitcode(status) == 0, ('inherited lock child exit', status)
 assert path.is_dir() and f.build_folder_state(path) == 'free'
 print('inherited')
 """
-        result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=6)
+        result = self.run_lock_probe(probe, "after releasing the inherited lock")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "inherited\n")
 
@@ -1734,6 +1796,7 @@ print('inherited')
         probe = """import fcntl, os, pathlib, signal, threading
 from unittest import mock
 from scripts.lib import build_folders as f
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 root = pathlib.Path(os.environ['TMPDIR'])
 path = root / 'main-allocation'
 reached, resume = threading.Event(), threading.Event()
@@ -1749,13 +1812,14 @@ def pause_mkdir(name, mode=0o777, *, dir_fd=None):
     result = mkdir(name, mode, dir_fd=dir_fd)
     if name == path.name and dir_fd is not None:
         reached.set()
-        assert resume.wait(4)
+        assert resume.wait(TEST_HANG_GUARD_SECS), 'the fork worker did not release allocation'
     return result
 def fork_from_worker():
-    assert reached.wait(2)
+    assert reached.wait(TEST_HANG_GUARD_SECS), 'the allocator did not create the folder'
     child = os.fork()
     if child == 0:
-        signal.alarm(3)
+        os.close(write)
+        signal.alarm(TEST_HANG_GUARD_SECS)
         assert signal.getsignal(signal.SIGINT) == signal.default_int_handler
         try:
             os.kill(os.getpid(), signal.SIGINT)
@@ -1777,12 +1841,13 @@ with mock.patch.object(fcntl, 'flock', side_effect=record_lock), mock.patch.obje
     assert f.create_build_folder(f.StableOwnerFolder(path.name, f.ExplicitBuildParent(root))) == path
 getattr(f, '_release_build_folder')(path)
 os.write(write, b'x')
-worker.join(4)
-assert not worker.is_alive() and status == [0], status
+worker.join(TEST_HANG_GUARD_SECS)
+assert not worker.is_alive(), 'the fork worker did not return the child exit status'
+assert status == [0], status
 assert path.is_dir() and f.build_folder_state(path) == 'free'
 print('signals')
 """
-        result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=6)
+        result = self.run_lock_probe(probe, "after checking the fork child's signal handler")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "signals\n")
 
@@ -1805,14 +1870,14 @@ print('signals')
                         raise
                     if threading.current_thread().name.startswith("probe") and mode == fcntl.LOCK_EX | fcntl.LOCK_NB:
                         reached.set()
-                        if not release.wait(3):
-                            raise AssertionError("the maker did not meet the query")
+                        if not release.wait(TEST_HANG_GUARD_SECS):
+                            raise AssertionError(f"The {operation} did not release the lock query.")
 
                 with ThreadPoolExecutor(max_workers=1, thread_name_prefix="probe") as workers:
                     with mock.patch("fcntl.flock", side_effect=pause_probe):
                         query = workers.submit(folders.build_folder_state, path)
                         try:
-                            self.assertTrue(reached.wait(3))
+                            self.assertTrue(reached.wait(TEST_HANG_GUARD_SECS), "The lock query did not start.")
                             if operation == "maker":
                                 made = folders.create_build_folder(folders.StableOwnerFolder(path.name, folders.ExplicitBuildParent(self.root)))
                                 self.assertEqual(made, path)
@@ -1824,7 +1889,8 @@ print('signals')
                                 self.assertFalse(path.with_name(path.name + ".lease.json").exists())
                         finally:
                             release.set()
-                        self.assertEqual(query.result(timeout=3), "free")
+                        guard = LauncherHangGuard("The build folder state query")
+                        self.assertEqual(guard.result(query), "free")
 
     def test_hard_linked_lock_and_lease_keep_the_unrelated_file_intact(self) -> None:
         for suffix in (".lock", ".lease.json"):
@@ -2713,6 +2779,7 @@ assert not loaded, loaded
         original = config.read_text()
         fallback = self.root / "fallback/build_folders.conf"
         _ = write_config_fixture(fallback, "prefixes.verify-hold=verify-hold.{owner}.\n", template="build_folders")
+        write_private_build_roots(fallback, self.root.parent, host_name())
         config.unlink()
         original_path = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
 

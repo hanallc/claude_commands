@@ -14,6 +14,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.test_verify_lint_judgment import VerifyLintJudgmentFixture
 from scripts.direct.test_verify_lint_scope import assert_clippy_calls
 from scripts.direct.verify_lint_scope_test_support import GIT_STUB
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -49,7 +50,7 @@ class VerifyLintScopeTests(VerifyLintJudgmentFixture):
             self.assertEqual(slot.repository, repository)
             self.assertEqual(slot.use, service.PendingVerifyGrants(frozenset({release.reservation})))
             config = self.root / "build_admission.conf"
-            _ = config.write_text(config.read_text() + f"\nmax_runs.{fixture.server.host}.{repository}=0\n")
+            _ = config.write_text(config.read_text() + f"\nmax_runs.{conf.host_key_name(fixture.server.host)}.{repository}=0\n")
             requests.clear()
 
             result = self.verify("lint", "sample")

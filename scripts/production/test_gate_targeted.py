@@ -64,8 +64,8 @@ import sys
 original_exit = argparse.ArgumentParser.exit
 
 def checked_exit(parser, status=0, message=None):
-    from scripts.production import gate
-    print("gate module identity:", gate is sys.modules["__main__"])
+    from scripts.production import gate, merge_gate
+    print("gate module identity:", gate is merge_gate is sys.modules["__main__"])
     original_exit(parser, status, message)
 
 argparse.ArgumentParser.exit = checked_exit
@@ -80,7 +80,7 @@ argparse.ArgumentParser.exit = checked_exit
             self.assertIn("--affected", result.stdout)
 
     def test_a_targeted_run_with_no_session_names_the_worktree_owner(self) -> None:
-        # An affected gate with no session names the owner of its queue requests.
+        # targeted_test under systemd, or with no session, still names who started its queue requests.
         observed: list[dict[str, str]] = []
 
         def suites(_repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
@@ -139,7 +139,10 @@ argparse.ArgumentParser.exit = checked_exit
             starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
             self.assertEqual(starts, [("hooks", "test_first.py")])
             self.assertIn(f"affected: 1 of {self.module_count} modules (base {base[:12]}, ", result.stdout)
-            self.assertIn("), 1 changed files\nhooks/test_first.py\n", result.stdout)
+            seconds = r"[0-9]+\.[0-9] s"
+            self.assertRegex(result.stdout, rf"\), 1 changed files, selected in {seconds} "
+                             + rf"\(cache \d+ hits, (\d+) misses; read {seconds}, extract \1 files {seconds}, "
+                             + rf"graph {seconds}, other {seconds}; lock taken(?:, published)?\)\nhooks/test_first\.py\n")
             self.assertIn("message: skipped (not affected)", result.stdout)
             self.assertNotIn("tests reused from", result.stdout)
         self.assertEqual([record["kind"] for record in self.pass_records()], ["full", "affected", "affected"])

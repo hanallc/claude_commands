@@ -14,9 +14,13 @@ from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_
 
 
 SOURCE = Path(__file__).resolve().parents[2]
-# Child fixtures can model a direct launch inside an outer gate module.
-STANDALONE_TEST_STARTUP = """import sys
-sys.modules["_devtools_python_startup"]._descends_from_gate_module = lambda: False
+WITHOUT_GATE_ANCESTRY = """import sys
+startup = sys.modules["_devtools_python_startup"]
+startup._descends_from_gate_module = lambda: False
+"""
+# Model a launch outside a gate and outside an existing direct test scope.
+STANDALONE_TEST_STARTUP = WITHOUT_GATE_ANCESTRY + """
+startup._direct_test_scope_enforces_deadline = lambda unit: False
 """
 
 
@@ -137,7 +141,7 @@ def direct_test_fixture_environment(root: Path, *, seconds: int | None = None) -
                                  f"# whole: 1..\ndirect_test.time_limit_seconds={seconds}\n")
     environment = {**os.environ, "TMPDIR": str(root), "CONF_DIR": str(config),
                    "XDG_CACHE_HOME": str(root / "cache"), "CLAUDE_PYTHON": sys.executable}
-    for name in ("GATE_PARENT_PID", "DEVTOOLS_GATE_PARENT_SOURCE_FD",
+    for name in ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID", "DEVTOOLS_GATE_PARENT_SOURCE_FD",
                  "TEST_TIMES_OUT", RUN_FOLDER_ENV):
         _ = environment.pop(name, None)
     return environment

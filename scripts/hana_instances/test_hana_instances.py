@@ -380,6 +380,10 @@ class HanaInstancesTests(unittest.TestCase):
         process = self.proc / "202"
         process.mkdir()
         (process / "cwd").symlink_to(checkout / "work")
+        (process / "root").symlink_to("/")
+        (process / "exe").symlink_to(sys.executable)
+        (process / "fd").mkdir()
+        _ = (process / "maps").write_text("")
         _ = (process / "status").write_text(f"Uid:\t{os.geteuid()}\t{os.geteuid()}\nState:\tS\nThreads:\t1\n")
         caller = self.proc / "self"
         caller.mkdir()

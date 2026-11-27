@@ -11,11 +11,13 @@ argument-hint: "[resume]"
 
 <MergeIdentity>
 Read your unit's staff row and its showrunner's staff row.
-A merge unit serves its showrunner's production and each production attached below that showrunner.
+Serve your showrunner's production and descendants that have no closer serving merge unit.
 The order names the production whose repo holds the checkpoint.
 For each order, read that production's document from its showrunner's staff `doc`.
-Use that production's merge branch, showrunner checkout, merge tests, push, promote, and land-order policy.
-Use the unit's staff parent for the production log and review ledger.
+Use the exact staff document for the merge branch, gate commands, and publication policy.
+For an enrolled production, use its integration checkout for Git, locks, and receipts.
+Use the showrunner checkout for legacy productions.
+Resolve the production LOG and review ledger through the unit's staff parent.
 The merge unit type grants no push authority.
 Apply only the cited contracts from `commands/unit/direct.md`; do not enter its phase loop.
 
@@ -32,8 +34,7 @@ Apply <MergeCheckpoint/>, <CIPoint/>, and <PromoteMain/> from `commands/showrunn
 Direct phase modes grant no merge authority.
 Use the unit's staff `worktree` for the director and worker checkout.
 Use that checkout's current branch as the staging branch.
-Read the publication checkout and branch from the order's document: its merge branch and showrunner checkout lines.
-Read publication destinations from that document.
+Keep each order's recorded batch path and receipt paths during recovery.
 Read current staff paths again after a move or rename.
 The worker's `--cwd` does not replace a wrapper's publication checkout.
 Promotion follows each production's declared destinations.
@@ -123,12 +124,12 @@ Other <WorkerRuns/> cancellation rules apply after rollout.
 | --- | --- |
 | sdlc `land.sh`, `land_mac_ok.sh`, `queue_runner.sh` | Retained merge worker |
 | `merge_checkpoint.py --production sdlc` | Merge worker |
-| `gate.py --checkout . --tests-only` | Gate worker |
-| Hana gate scripts through `copies.py run --commit <sha>` | Gate worker at the recorded commit |
+| `merge_gate.py --checkout . --tests-only` | Gate worker |
+| Hana gate scripts through `copies.py run --repo <integration> --commit <sha>` | Gate worker at the recorded commit |
 | `verify.sh check`, `test`, `lint` | Gate worker |
 | `cargo fmt`, `cargo test`, `cargo nextest` | Gate worker under the production's existing build rules |
 | Cargo release builds | Build worker under the production's existing build rules |
-| `smoke_launch.sh` and other production smoke scripts | Gate worker |
+| `smoke_launch.sh` and other production smoke scripts | Gate worker in an item 143 test copy at the exact tip |
 | `demo_mac.zsh`, `demo_natedev.zsh` | Separate build workers |
 | `gh run watch` and CI collection | CI worker |
 | Merge, fetch, push, and promotion commands, including compound shells | Merge worker |
@@ -140,9 +141,23 @@ Other <WorkerRuns/> cancellation rules apply after rollout.
 
 These destinations describe jobs, not new worker roles.
 Existing wrappers retain their production rules.
+Run Hana smoke with `copies.py run --repo <integration> --commit <sha> -- bash <absolute-smoke-script> . <sha> <absolute-log>`.
 </MergeDispatch>
 
 ## Gates
+
+<BehaviorCheck>
+Before a land, run `scripts/lib/py scripts/production/behavior_check.py run --repo CHECKOUT --base BASE --commit COMMIT --production OWNER`.
+Use the fetched destination tip for BASE and the exact commit to push for COMMIT.
+If the review starts, collect its reply with the same command when it completes.
+The check clears verified requests that follow Nate's newest words.
+Departures, uncertainty, and unverified requests need a question.
+On "Nate was not asked", send the printed finding to the unit named in `Ask UNIT (phase PHASE)`.
+If the check prints a commit instead, send the finding to its author.
+The unit writes the question template JSON and runs the same check with `--question FILE`.
+Start one choice with `Yes (the change goes in` and the other with `No (the change stays out`.
+Wait for exit 0 before the land.
+</BehaviorCheck>
 
 <MergeGates>
 Dispatch the production's gate commands against the exact staged commit.

@@ -49,6 +49,8 @@ Standalone named module tests use the same default targets as full gates.
 Direct gates can use natedev or `mac-linux`.
 The prepared gate wrappers can also use AWS when the queue grants an AWS assignment.
 Named module tests on `mac-linux` use `run.time_limit_seconds` for each module and the full run.
+The controller writes a gate record for a full-suite guest request in the `mac-linux` folder of Buildlog.
+The record includes module times and Mac load at the start and end.
 A nested named gate reuses its live parent reservation on natedev.
 Copy wrappers apply this rule before target overrides.
 Promotion without tests uses natedev.
@@ -800,7 +802,7 @@ Remote launch signals use `find_mac_runner_pid` and the rules in [Mac step offlo
 
 ## Cargo token ownership and wait holders
 
-`config/direct.conf` supplies `VERIFY_TOKEN_HOLD_SECONDS` and `VERIFY_TOKEN_RENEW_SECONDS`.
+`config/direct.conf` supplies `verify_token_hold_seconds` and `verify_token_renew_seconds`.
 The shipped values are 3600 and 60 seconds.
 The renewal interval cannot exceed one third of the lease.
 `start_token_renewer` and `stop_token_renewer` maintain one renewer while a step command runs.

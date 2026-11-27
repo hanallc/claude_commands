@@ -61,7 +61,7 @@ An empty override value also selects those helpers.
 Other callers use `$HOME/.claude/scripts`.
 This rule covers admission, hold, target, release wait, detached run, recipient registration, and unit retirement helpers.
 Test fixtures create no helper links in the real home.
-`gate.py` already runs from the installed copy; its hold reader remains unchanged.
+`merge_gate.py` already runs from the installed copy; its hold reader remains unchanged.
 
 Service waiters retain `repository_name` separately from `step`.
 Reservations retain `repo` separately from `step`.
@@ -256,6 +256,17 @@ A kept Mac claim is not busy, because the next claim takes it over.
 Before this, a dead copy's kept claim held the Mac with no work until the claim watcher released it after 15 idle minutes.
 The service also freed the dead copy's placement only when the claim watcher released the claim. On 2026-11-14 this held the Mac with no hana step for 16 minutes.
 Other temporary Mac refusals delay that destination for 180 seconds.
+A missing or stale `mac-linux` reading returns `EvidenceNeeded`.
+Placement waits before it considers any later candidate.
+A reading taken before the last backoff failure is also stale.
+The queue allows 30 seconds for the reading, including time spent in the reader's queue.
+The SSH probe shares the same 30-second limit across its connection attempts.
+The guest main probe and the background end check share the `mac-linux` backoff.
+A connection failure starts the backoff for `mac_test.unreachable_backoff_s` seconds.
+Both checks skip SSH during the backoff.
+The first good guest answer clears the backoff.
+The queue holds the slot until it gets the exact end proof.
+The usual queue pass and client poll still apply after the reading or deadline.
 A current `mac-linux` assignment of another episode makes the guest busy.
 The guest gate consumes its launch permission before the guest run starts, so its assignment stays current while the gate runs.
 A guest gate that took no run sends its claim failure after the gate process ends, and the queue closes the attempt with the guest delay.
@@ -532,6 +543,12 @@ A failed query raises `AdmissionUnavailable` within the query bound. Commands pr
 The Builds page shows the saved Mac idle alert first, in red.
 The feed reads it through `mac_idle.view_alert_line()`, which also checks the live Mac state, and sends its text in `mac_idle_alert`.
 An empty value hides the alert on the page.
+`scripts/buildlog/machine_watch.py` reads `notices.<machine>` in `build_targets.conf` when it prepares a phone push for a machine that does not answer.
+Set `notices.mac=off` to suppress that push for the Mac.
+The default is `on`.
+`off` stops a new push only. A push that was already sent can repeat until its alert clears.
+The Builds page continues to use the saved alert.
+
 The Build limits section shows one facts line under each machine heading, in `<div class="build-limit-facts">` below the state.
 The feed reads `machine_facts.read_facts(machine_facts.state_path())` once per render and passes it to `limits_view.build_limits(..., facts=)`.
 `limits_view.facts_line()` writes each line into `MachineLimits.facts` with the `facts_*` words in `PAGE_WORDS`.
@@ -1262,7 +1279,7 @@ A first checker failure or explicit refusal stops at once. A launch deadline app
 A zero launch limit refuses its first hold and accepts an immediate grant.
 The leave hook runs during held waits and returns `LeftQueue` when another machine can start the step.
 
-`detached_runs.py start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to the worker.
+`detached_runs.py start` checks for a live twin before it applies `config/detached_runs.conf` `live_run_limit` to the worker.
 The launcher accepts `--kind python-tests` before `--` and defaults to `detect`.
 It records the kind and creates the scope `detached-<kind>-<run-id>.scope` when systemd is available.
 The scope name omits the worker suffix from the run ID.
@@ -1323,6 +1340,19 @@ SIGTERM uses its default action and can leave cleanup for the next start or serv
 Python's default SIGINT raises `KeyboardInterrupt` and runs the existing cleanup blocks.
 `defer_cleanup_signals` retains its signal mask during normal cleanup.
 It uses `pthread_sigmask` and installs no handler.
+
+### Tests outside the queue
+
+The Builds page lists live commands above the direct test CPU limit.
+It scans agent and detached scopes and excludes session launchers, agents, bare shells, and queued work.
+It also excludes commands with waiting or admitted descendants in a separate scope.
+The table shows Command, Owner, Pid, Age, Current CPU, and CPU total.
+An empty table shows “No test runs outside the queue now.”
+
+Current CPU shows a whole percent from the change in live process CPU between readings.
+The first reading shows a dash.
+CPU total shows whole seconds from live process CPU and the root command's reaped child CPU.
+Detached scopes use the cgroup CPU counter for both readings.
 
 ### Startup, cut-over, and rollback
 
@@ -1763,7 +1793,7 @@ They also register the nearest command agent when its recipient key differs from
 It checks the command first, then each ancestor in order.
 At each process, `CODEX_THREAD_ID` gives the key `codex:<thread>` before `CLAUDE_CODE_SESSION_ID` gives a Claude session key.
 The cycle keeps both recipients without adding a field.
-The enforcer does not signal `verify.sh` or `gate.py` without a call id.
+The enforcer does not signal `verify.sh`, `targeted_test.py`, or `merge_gate.py` without a call id.
 Each waits at its own hold gate.
 With a call id, the record decides.
 Verify routes eligible steps to the Mac and waits for other steps.
@@ -1797,10 +1827,10 @@ Runs shorter than one pass can finish first, so call guards refuse those starts.
 **Build call guard.** `settings.json` installs `scripts/hooks/pre-tool-use-build-hold-guard.sh` for Bash PreToolUse. 
 The Bash front reads stdin once.
 It starts no Python when the hold directory has no entry.
-It also starts no Python when the input contains neither `cargo` nor `gate.py`.
+It also starts no Python when the input has none of `cargo`, `merge_gate`, or `targeted_test`.
  An unreadable hold path also starts the decision reader. Otherwise it passes the same input to `pre-tool-use-build-hold-guard.py` and relays its output and status. The guard refuses raw building `cargo` verbs (including short forms and `+toolchain`) while a non-holder natedev hold applies; removal ends that holder’s hold. All `verify.sh` calls pass, with or without a step record: verify routes eligible steps to the Mac during the hold and waits for other steps. Non-building calls pass. The Python guard checks the command through `tool_call_text.py`, checks for a hold entry, then imports `scripts/build_hold/hold_applies.py` in the same process. The helper uses `target_state(local_target())`, `natedev_holds` and `caller_holds_only_own()`. The sole in-force holder may build. Other sessions see `natedev builds are held by <holder>. Keep working, writes included. Use verify.sh: eligible steps go to the Mac; other steps wait. Raw cargo and gate jobs must wait for the hold to end.` Only in-force holders are named, with `holder_text`. The helper exits 0 with that refusal on stdout, 1 silently when builds may run, or 2 with a read error on stderr. The guard denies hold read errors and any other exception in its decision path with a one-line reason that names the failed read. Only an explicit allow decision permits a build; no wait is registered.
 The cargo verbs include `mend` and `miri`; the guard does not match `verify.sh` step names or options.
-The guard also refuses `gate.py` in every mode under the same hold decision.
+The guard also refuses `merge_gate.py` and `targeted_test.py` in every mode under the same hold decision.
 This applies to direct calls and calls through Python or `lib/py`.
 The refusal tells the caller to run after the hold ends.
 Quoted mentions and written examples pass.
@@ -2172,6 +2202,69 @@ After all violations, the call exits 2 with no Cargo call except `metadata`.
 `verify.sh example-test` exits 2 before any work.
 It prints `verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).`.
 
+### Stop a Builds run
+
+The Running table offers **Kill this run** for a verified natedev Cargo run with a detached run record.
+The confirmation shows the row, process tree, progress, and recorded caller.
+The server identifies the caller from the reservation's session ID and the current staff record.
+
+1. The feed publishes an opaque reference for each eligible reservation.
+2. The console supplies a handle if the detached record has `completion_after_slice_cleanup` and the server verifies the stop route.
+3. The server checks the handle and reads the run record when the operator confirms.
+4. The server reports **Run already ended** if the record shows completion or is missing on that read.
+5. If the record shows an active run, the server saves the accepted request, notice and verified stop route.
+6. The server requests the stop through `detached_runs.stop_command` with the record path and reason.
+7. The server saves **Stopped** before it sends the keyed notice.
+
+The detached helper stages the reason and the pass cancellation before TERM.
+A detached run with a saved slice uses `builds-detached-<id>.slice`.
+The helper checks `cgroup.events` for `populated 0` to confirm that the slice is empty.
+The supervisor sets `completion_after_slice_cleanup` when it publishes its process identity.
+It writes the completion stamp after the run slice is empty.
+Without the field, the page shows **Kill is not available for this run yet**.
+The supervisor finishes the record after the slice is empty.
+If the supervisor exits before it finishes the record, the normal reaper owns the result.
+Kill recovery asks the reaper to check the selected record.
+The reaper checks the saved supervisor PID and start time and confirms pending hold stops.
+It preserves the saved exit status and checks for a newer run of the same command.
+The page shows **Stopping** until the record confirms the stop.
+The server confirms the saved slice is empty before it sends the notice.
+If the detached record changes identity, the server saves **Stop unconfirmed**.
+The detached helper keeps the original run record until the server acknowledges its stop notice.
+If the server saved **Stopped**, it resumes only pending delivery.
+The server retains a verified handle for two `page_refresh_seconds` intervals.
+If the live row disappears, the retained handle can report an already ended run.
+The Tests outside the queue table offers **Kill this run** for local commands with a verified starter and stop path.
+The confirmation shows the command, PID, age, and starter.
+The server checks the handle against the current reading when the operator confirms.
+A command with a detached record uses the detached stop path and its slice check.
+For other commands, the server opens a pidfd and checks the PID and start time before it sends any signal.
+The server scans parent IDs to find descendants. It sends TERM to each process through its own pidfd.
+It keeps the identities of descendants that reparent during the stop.
+After the grace period, it sends KILL through the pidfds of processes that remain.
+The server saves **Stopped** only when the last scan finds no live process in the observed tree.
+The scan can miss a child that starts and reparents between readings.
+If a process remains, the result names its PID.
+If the server restarts during the stop, it saves **Stop unconfirmed**.
+The page shows **Stopping** while the command is still present in the reading.
+The row leaves the table when the feed no longer lists the command.
+If the stop fails, the row shows **Not stopped** and the reason.
+The control returns if the server still verifies the command.
+The server sends the keyed notice and the operator's words to the starter after it confirms the stop.
+Verify still has no Kill action because it creates only step scopes.
+The server retries pending actions during its existing maintenance cycle.
+It retries an unclear delivery result with the saved key.
+A queued or kept message appears as **Message queued**.
+The server supplies the first line of the notice.
+The operator can add words in the confirmation.
+The row shows **Stopping** while the run record shows an accepted stop is pending.
+**Message sent**, **Message queued**, and **Message failed** describe the delivery result.
+The page checks results at `page_refresh_seconds` intervals.
+The result stays visible outside the table when the row leaves.
+The page shows finished results for two refresh intervals.
+Gate, merge, remote, CI, service, and unowned rows show the unavailable tip on the PID.
+The targeted gate cleanup reaps module leaders and has no confirmation for all descendants.
+
 ## Invariants
 
 - Every compiling step and every BRP launch passes the memory gate before it starts. Sweep, `cargo fmt` and `taplo` steps never wait on it, so the disk floor is never held by memory.
@@ -2462,7 +2555,6 @@ On 2026-11-21, Nate asked to “show the showrunner (in its color)” at 19:13.
 At 19:17 he changed the row start to “only show the unit (and the showrunner in small text under)”.
 The Builds page uses the same staff colors in the row and its hover.
 Rows without a unit show their plain name and leave the small text and `Step` empty.
-This includes Build tools, unowned Mac builds, compiler cache, unowned processes, and CI.
 The small text is empty when the showrunner is the same name as the unit.
 `Step` shows the step only when the feed's `title.unit` names a unit. When the step text is the unit, the feed sends an empty `title.unit`, so `Step` stays empty and the unit does not show twice.
 `queueRowLabels` gives the row start, the small text, and the `Step` and `Verify` cells from one place.
@@ -2502,7 +2594,7 @@ The page fits and positions the open hover again after a feed refresh.
 The AWS progress record has no working path.
 The CI summary and hand-made Mac Linux runs have no `Folder` field.
 The hover lists the other machines that the step named under `Named targets`.
-A waiting row's `Machine` cell shows one dim icon for each machine that can take the step, in the feed's order.
+A waiting row's `Machine` cell shows one icon at half opacity for each machine that can take the step, in the feed's order.
 A waiting CI step has one target: the host machine, where the CI runners run (`memory_feed.ci_target_notes`). The running CI row shows the same machine.
 Its hover names those machines in words under `Runs on`, after the `Waits for` reason.
 A machine with no icon shows its name as text in its machine color.
@@ -2535,10 +2627,11 @@ The wait ends at the next line, which reports the tokens taken.
 The admission reading stores it in the running step's `measured.counter`.
 A row without a counter shows `—`.
 Local builds, gate runs, and cloud rows use their recorded counters.
-hana CI currently has no admission counter.
-The Running table shows hana CI only when a recorded runner has a busy job.
-Idle or unreadable runners have no separate Running row.
-Their memory remains in the taken total, the cap, and the summary tooltip.
+Running lists admitted Hana CI Cargo steps.
+Running has no Build tools row or CI service row.
+The Build tools part of the memory bar includes the CI service memory.
+Its tooltip shows one line per running runner service.
+The taken total and cap include the CI service memory.
 Waiting rows use `#` in the first column for their queue place.
 Both sections use the same column widths.
 The table is always beside the chart, and each step uses one row at every pane width.
@@ -2639,8 +2732,15 @@ A readable counter adds a Progress row.
 A failed or old reading replaces the Mac run rows with one short `Mac builds` status.
 The feed log retains raw errors; the page shows only the status and reading age.
 CI runner records supply the `hana CI` owner for their Running and Waiting steps.
-The aggregate running CI row also shows Unit `hana CI`.
-The feed compares the step's recorded runner unit with the runner records, not page text.
+The feed matches each step's recorded runner unit to the CI runner records.
+The feed reads runner and Cargo scope membership before it reads the process table.
+It reads anonymous RAM only from live runner processes outside admitted Cargo process trees and scopes.
+The Build tools bar, page cap, and taken total use the saved CI charge from admission.
+The runner lines divide the saved charge in proportion to their live readings.
+If the service processes exit during a sample, the feed can reuse the last good reading for two samples.
+A persistent failure shows the runner name and the existing `unavailable` value.
+If a reading is missing, the known readings stay within the saved charge.
+Other build tools includes any part of the saved CI charge that the runner lines do not cover.
 The terminal queue view shows a `machine` column after `min` and before `pid`.
 The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
 A narrow view omits the machine column before it reduces name space.

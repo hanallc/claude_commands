@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 from dataclasses import replace
@@ -287,7 +288,7 @@ class BerthHookTests(unittest.TestCase):
                 code, written = self.backstop()
                 self.assertEqual(code, 0)
                 if case == "another reservation mapped":
-                    self.assertIn("a sibling phase's reservation holds every changed path", written)
+                    self.assertIn(f"the reservation is not mapped to a session: {RESERVATION}", written)
                     self.assertEqual(self.state(), AWAITING)
                 else:
                     self.assertIn(f"Active, reservation {RESERVATION}", written)
@@ -316,7 +317,7 @@ class BerthHookTests(unittest.TestCase):
         _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
         code, written = self.backstop()
         self.assertEqual(code, 0)
-        self.assertIn("still awaiting first touch", written)
+        self.assertIn(f"the reservation is not mapped to a session: {RESERVATION}", written)
         self.assertEqual(self.state(), AWAITING)
 
     def test_a_siblings_different_reservation_does_not_block_the_directors_reservation(self) -> None:
@@ -729,6 +730,45 @@ class BerthHookTests(unittest.TestCase):
             {"argv": ["check", "src/lib.rs", "--json"], "cwd": str(self.repo), "session": f"{DIRECTOR}.phase-15"},
             {"argv": ["check", "src/lib.rs", "--json"], "cwd": str(other), "session": f"{DIRECTOR}.phase-16"},
         ])
+
+    def test_first_touch_checks_under_the_phase_lock(self) -> None:
+        directory = phase_reservation.phase_directory(self.session_dir, "15")
+        lock_path = directory / (phase_reservation.BASELINE_FILE + ".lock")
+        check = phase_reservation.check
+
+        def check_locked(root: Path, paths: list[str], session: str) -> phase_reservation.CheckAnswer:
+            with lock_path.open("a") as contender, self.assertRaises(BlockingIOError):
+                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return check(root, paths, session)
+
+        decide = cast(Callable[[str], int], runpy.run_path(str(HOOK))["decide"])
+        payload = json.dumps({"tool_name": "apply_patch", "cwd": str(self.repo), "tool_input": {
+            "command": patch_text("*** Update File: src/lib.rs")}})
+        with mock.patch.dict(os.environ, self.environment, clear=True), mock.patch.object(phase_reservation, "check", check_locked):
+            self.assertEqual(decide(payload), 0)
+        self.assertEqual(self.state()["kind"], phase_reservation.ACTIVE)
+
+    def test_first_touch_refuses_a_checkout_that_moves_after_attribution(self) -> None:
+        directory = phase_reservation.phase_directory(self.session_dir, "15")
+        other = self.make_phase_worktree("15")
+        attribute = phase_reservation.attribute
+
+        def move_after_attribution(phases: list[phase_reservation.OpenPhase], paths: list[str], root: Path
+                                   ) -> phase_reservation.Attribution | phase_reservation.NoOpenPhaseHere:
+            attributed = attribute(phases, paths, root)
+            _ = (directory / phase_reservation.WORKTREE_FILE).write_text(f"{other}\n")
+            return attributed
+
+        decide = cast(Callable[[str], int], runpy.run_path(str(HOOK))["decide"])
+        payload = json.dumps({"tool_name": "apply_patch", "cwd": str(self.repo), "tool_input": {
+            "command": patch_text("*** Update File: src/lib.rs")}})
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment, clear=True), contextlib.redirect_stdout(output), \
+                mock.patch.object(phase_reservation, "attribute", side_effect=move_after_attribution):
+            self.assertEqual(decide(payload), 0)
+        self.assertIn(f"Phase 15 now uses {other}.", output.getvalue())
+        self.assertEqual(self.berth_calls(), [])
+        self.assertEqual(self.state(), AWAITING)
 
     def test_edit_outside_all_claimed_phase_worktrees_checks_the_bare_session(self) -> None:
         other = self.make_phase_worktree("15")

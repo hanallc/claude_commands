@@ -151,6 +151,7 @@ from scripts.herdr.place import HerdrPlace
 from scripts.agents import remote as machine_routes
 from scripts.herdr import herdr_types, message_proof as _message_proof
 from scripts.lib import process_group
+from scripts.message.address import CODEX_PREFIX, SESSION_PREFIX, SOCKET_PREFIX, STAFF_PREFIX, USER as USER, WORKER_PREFIX
 from scripts.production import session_staff, staff, unit_lookup, unit_names
 from scripts.lib import conf, models_registry, process_start
 from scripts.lib.atomic_file import write_bytes_atomic
@@ -194,7 +195,6 @@ from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefus
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message"
 CLAUDE = Path.home() / ".local" / "bin" / "claude"
 SESSIONS = Path.home() / ".claude" / "sessions"
-USER = "user"
 USER_CHANNEL = Path(__file__).resolve().parent.parent / "notify" / "pushover.py"
 # On the remote host: its own interpreter shim and copy of this script.
 REMOTE = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py"'
@@ -241,19 +241,10 @@ SESSION_TEMPLATES = {
     PAID_CREDITS_QUEUED_TEXT: ("an account now spends paid credits and the user queued a workers move; workers wait for"
                                + " the move, never go to Claude. " + PAID_CREDITS_QUEUED_CALL),
     NEEDS_GO_TEXT: "a session is stopped until the user types a go in its pane. " + NEEDS_GO_CALL,
-    rca.STARTED_TEXT: ("a unit starts to fix the cause of a permission stop or refusal. Sent by rca.py start;"
-                       + " sessions run rca.py, not this: " + rca.CALL + " start <id> --owner <unit>"),
-    rca.FIXED_TEXT: ("the fix merged; that permission does not stop or refuse the session again. Sent by rca.py fixed;"
-                     + " sessions run rca.py, not this: " + rca.CALL
-                     + ' fixed <id> --cause "<cause>" --fix "<fix>" --commit <sha>'),
-    rca.REWRITTEN_TEXT: ("the push review's rewrite of a fixed text it refused twice. Sent by rca.py fixed;"
-                         + " sessions run rca.py, not this."),
     "nate.adhoc": "an update the user asked for with /nate adhoc; see /nate.",
 }
 AUTO_MODE_REPORT = re.compile(r"\bauto[\s-]mode\b", re.IGNORECASE)
 AUTO_MODE_REFUSAL = re.compile(r"\b(refused|denied|stopped)\b", re.IGNORECASE)
-# The rca.py pushes describe permission stops or refusals. A cause can name an auto-mode refusal.
-RCA_TEXTS = frozenset({rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT})
 AUTO_MODE_HELD = ("not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: "
                   + AUTO_MODE_CALL)
 PERMISSION_MODE = "auto"
@@ -3177,12 +3168,12 @@ def _staff_recipient_match(
     """Match staff references and resolve unit aliases when requested."""
     from scripts.message import roster
 
-    if target.startswith("staff:"):
-        return _checked_staff_recipient(target, membership.by_id(staff.StaffId(target[6:])))
-    if target.startswith("session:"):
-        return _checked_staff_recipient(target, _conversation_staff_owner(target[8:], membership))
+    if target.startswith(STAFF_PREFIX):
+        return _checked_staff_recipient(target, membership.by_id(staff.StaffId(target.removeprefix(STAFF_PREFIX))))
+    if target.startswith(SESSION_PREFIX):
+        return _checked_staff_recipient(target, _conversation_staff_owner(target.removeprefix(SESSION_PREFIX), membership))
     reference = target
-    if target.startswith("worker:"):
+    if target.startswith(WORKER_PREFIX):
         for entry in observed:
             if isinstance(entry.reach, roster.Messageable) and entry.reach.address == target:
                 if isinstance(entry.thread, roster.CodexThread):
@@ -3190,7 +3181,7 @@ def _staff_recipient_match(
                 elif isinstance(entry.session, roster.ClaudeSession):
                     reference = entry.session.session_id
         if reference == target:
-            path = target.removeprefix("worker:")
+            path = target.removeprefix(WORKER_PREFIX)
             if len(path.split("/")) == 2:
                 sender = _sender_staff_row(membership)
                 ancestor = sender if isinstance(sender, staff.StaffRow) else None
@@ -3201,19 +3192,19 @@ def _staff_recipient_match(
             member = membership.by_path(path)
             if member is not None and member.kind == "worker":
                 return member
-    if target.startswith("uds:"):
+    if target.startswith(SOCKET_PREFIX):
         record = next((record for record in records
                        if f"uds:{record['messagingSocketPath']}" == target), None)
         if record is not None:
             return _checked_staff_recipient(target, _conversation_staff_owner(record["sessionId"], membership))
         reference = socket_sender(target, {})
-    elif target.startswith("codex:"):
-        reference = target[6:]
+    elif target.startswith(CODEX_PREFIX):
+        reference = target.removeprefix(CODEX_PREFIX)
     identity = staff.StaffId(reference)
     member = membership.rows_by_id.get(identity) or membership.by_current_session(reference)
     if member is not None:
         return member
-    if target.startswith(("codex:", "worker:")) or not reference:
+    if target.startswith((CODEX_PREFIX, WORKER_PREFIX)) or not reference:
         return _checked_staff_recipient(target, membership.by_id(identity)) if reference else NoStaffRecipient()
 
     def normalized_name(value: str) -> str:
@@ -5037,7 +5028,7 @@ def wrong_template(options: Options, shown: str) -> str | None:
     if options.to != USER or options.user_asked:
         return None
     registered_text = bool(options.text_id) and not push_texts.agent_written(options.text_id)
-    if options.text_id != AUTO_MODE_TEXT and options.text_id not in RCA_TEXTS and reports_auto_mode_refusal(shown):
+    if options.text_id != AUTO_MODE_TEXT and reports_auto_mode_refusal(shown):
         return AUTO_MODE_HELD
     if not registered_text and PAID_CREDITS_REPORT.search(shown) is not None:
         return PAID_CREDITS_HELD
@@ -6297,7 +6288,7 @@ def repeat_notice_owner(sender: str) -> str:
     """Follow staff parents to the sender's showrunner."""
     membership = staff.snapshot()
     member = resolve_staff_recipient(sender, membership)
-    if isinstance(member, NoStaffRecipient) or isinstance(member, staff.StaffRow) and member.kind == "producer":
+    if isinstance(member, NoStaffRecipient) or isinstance(member, staff.StaffRow) and member.kind in ("producer", "session"):
         return rca.owner_address("")
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)
@@ -6355,7 +6346,7 @@ def main(argv: list[str]) -> int:
         _ = Path(marker).write_text("real sender refused\n")
         print("REFUSED: real scripts/message/send.py is forbidden in tests", file=sys.stderr)
         return 1
-    user_target = "--to=user" in argv or any(left == "--to" and right == USER for left, right in zip(argv, argv[1:]))
+    user_target = f"--to={USER}" in argv or any(left == "--to" and right == USER for left, right in zip(argv, argv[1:]))
     has_template = "--text-id" in argv or any(value.startswith("--text-id=") and value != "--text-id=" for value in argv)
     if user_target and not has_template and argv[:1] != ["retire"]:
         print("REFUSED: " + push_texts.TEMPLATE_REQUIRED)

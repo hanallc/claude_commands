@@ -26,7 +26,7 @@ log='natedev/logs/YYYY-MM/<record-id>.log.gz'
 zcat "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/$log"
 ```
 
-`GATE_FAILURE_LOG_KIB` in `config/test_times.conf` limits the saved tail to 64 KiB by default.
+`gate_failure_log_kib` in `config/test_times.conf` limits the saved tail to 64 KiB by default.
 The writer reads this setting for each record that has failed attempts.
 The first line states how many bytes the writer cut from the start.
 That line is outside the limit.
@@ -56,7 +56,7 @@ buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modu
 
 `show.py top` ranks live gate modules by median CPU time.
 It keeps passed, unrestarted attempts from the selected host, checkout and time window.
-Each module uses one attempt per run, up to `TOP_RUNS`.
+Each module uses one attempt per run, up to `top_runs`.
 The commit time of the merge base with `origin/main` orders the runs.
 The newest start time breaks ties.
 Runs with unknown commit times fill any remaining places.
@@ -148,8 +148,12 @@ On status 80, `copies.py run` requests settlement.
 For Mac Linux, the wrapper needs a no-run report before it requests a replacement.
 The wrapper writes the replacement assignment to the same file and runs the gate on the assigned machine.
 After a prelaunch refusal, another attempt on the same guest requires a fresh availability reading.
+When the queue needs a guest reading, it waits before it considers later machines in registry order.
+The first eligible machine in that order takes the run.
+A busy, blocked, off, or unreachable guest lets placement consider the next machine immediately.
 An eligible named machine can take the run while the guest is in backoff.
-A fresh reading that still excludes the guest keeps it out of placement.
+The queue waits at most 30 seconds for the reading.
+The next queue pass uses the result or treats the guest as unreachable.
 If placement fails, the wrapper reports `Gate placement blocked`.
 A confirmed test failure gives status 1.
 A gate command in Merge tests uses `copies.py run --commit <sha>` with the prepared merge commit.
@@ -408,6 +412,7 @@ The inner gate command always has one `--repo '{tree}'` option for the prepared 
 This option replaces any `--repo` or `--checkout` options from the direct call.
 The gate requires a handoff from `copies.py run` or `copies.py gate-step` before it starts placement or tests.
 `./scripts/lib/py -m scripts.production.gate` accepts the same options.
+The former `merge_gate.py` and `targeted_test.py` entry points remain available until their removal.
 `build_steps.command_job` reads these command forms for the memory feed and copy lease names.
 It names integration, promotion, nightly tests, all tests, affected tests, or selected modules from the arguments.
 Targeted tests select modules by direct imports, file tokens, changed test modules, and folders of changed Python source files.
@@ -420,13 +425,32 @@ Merge and tests-only runs skip basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
 The queue reservation and the runner governor use separate configuration keys.
 Gate startup checks recovery records for dead gate processes across checkouts.
-A `--tests-only` gate runs its cleanup before it exits on SIGTERM.
+Checkpoint runs use the default SIGTERM disposition so the next gate can recover their rollback records.
+Other gate modes run cleanup before SIGTERM exits when the default handler is active.
+The cleanup scope covers suite setup and any CPU pool that the caller opens separately.
+The gate preserves an existing SIGTERM handler.
+The gate defers SIGTERM until suite folder cleanup and the recovery record update finish.
+After cleanup, the gate exits with SIGTERM.
+The nightly skips its build folder sweep when SIGTERM stops the gate.
 Successful recovery removes a record if it names no retained folders.
 Recovery reports retained folders for manual removal and keeps their finished record.
 The scanner skips finished records on later runs.
 If recovery refuses a record from another checkout, the gate reports its path and reason on stderr.
 Each gate process reports a refused record once.
 The gate keeps that record and checks the remaining records.
+
+Run `./scripts/lib/py -m scripts.test_times.gate_record [ROOT]` from the checkout to read the suite folder report.
+The command reads direct suite folders with leases under ROOT or the configured gate root.
+It prints one JSON line per folder and leaves the files unchanged.
+The join uses the path, PID, process start, and boot identity.
+The report checks the lease owners before it reads the log.
+It reads only complete lines.
+If a log shrinks or changes identity during the scan, the command reports the change and exits with status 1.
+A change to an unfinished tail also stops the report.
+A matching start without an end shows `running` if the current process matches the lease owner.
+Otherwise, a matching start without an end shows `killed`.
+A missing start, incomplete owner identity, or changed directory identity shows `no record`.
+Use kernel or earlyoom logs to identify the cause of a `killed` outcome.
 A recovery refusal in the gate's own checkout stops the gate.
 A clean tree with a recorded full pass on this host reuses its test modules.
 Test modules use `builds.slice` scopes when available.
@@ -487,6 +511,7 @@ See [Mac gate cleanup](mac-test-offload.md#mac-gate-cleanup) for the queue callb
 
 Run `gate.py --affected` through `copies.py run` from the unit worktree root.
 Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
+`scripts/production/targeted_test.py` passes its arguments to `gate.py --affected`.
 `SuiteMode.TARGETED` enables selection and takes the `test-affected` admission step.
 `SuiteMode.GATE` runs all modules and takes the `gate` step.
 Both modes accept `--full` because existing repository callers use it.
@@ -505,7 +530,7 @@ A dirty checkout writes up to 50 `dirty_paths` and the total `dirty_path_count`.
 The runner prints the path count.
 This record changes no selection and refuses no run.
 
-### The gate: `scripts/production/gate.py`
+### The gate: `scripts/production/merge_gate.py`
 
 **Invocation.** `gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
 The six merge flags are required for a checkpoint merge.
@@ -534,6 +559,10 @@ A failed module can run once more alone.
 A named run on natedev has no time limit.
 On `mac-linux`, `run.time_limit_seconds` limits each module and the full run.
 Named runs on natedev or `mac-linux` create no gate record.
+For a full-suite request on `mac-linux`, the controller records both passing and failing guest results.
+It saves module times and Mac load readings in `${BUILDLOG_DIR:-~/.local/state/buildlog}/mac-linux/YYYY-MM.jsonl`.
+It saves failing module output in `mac-linux/logs/YYYY-MM/` under the same Buildlog root.
+The guest record omits the vCPU count, so the shared time-limit history skips it.
 The controller imports a `gate_run` record for a completed prepared named gate on AWS.
 Named runs create no pass certificate or passed-tree entry.
 The merge checkpoint uses this form to verify a failed module on its base. See [showrunner automation](showrunner-automation.md).
@@ -559,7 +588,11 @@ A refusal prints `REFUSED: <reason>` to stderr and exits 1.
 **Run, then check before push.** `run_suites` runs. Then `settings.json` at HEAD must match the approved blob prefix (`--settings-blob`, an 8–40 hex hash), and `origin/main` must be an ancestor of HEAD. Only then does the gate push the merge branch and print `Pushed <branch>: <short hash>`.
 A checkpoint rerun accepts its own recorded merge only for the same checkpoint, exact merge commit and original parents, with the remote branch still an ancestor of its base; it reruns the gate checks and pushes that commit, using a separate push recovery record rather than the test pass ledger.
 
-**Red, errors and signals.** Any exception after the merge, including red suites and `KeyboardInterrupt`, goes to `rollback_merge(repo, baseline)`. It aborts an in-progress merge and runs `git reset --keep <merge HEAD before the merge>`. If tracked files changed during the gate block that reset, it restores them to the merge tree and retries once; if the retry also fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`. `rollback_signals()` turns SIGTERM and SIGHUP into `GateRefused`, so they roll back the same way; SIGINT arrives as `KeyboardInterrupt`.
+**Red, errors and signals.** A red suite or an error after the merge calls `rollback_merge(repo, baseline)`.
+It aborts an in-progress merge and runs `git reset --keep <merge HEAD before the merge>`.
+If tracked changes block the reset, it restores the affected files to the merge tree and tries once more.
+If the reset still fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`.
+After SIGTERM or `KeyboardInterrupt`, the gate keeps the pending rollback for recovery.
 
 **Build holds.** SharedMachine waits before jobs, merging, and promotion while another session's natedev hold applies.
 The gate uses `build_targets.caller_holds_only_own`, so the sole holder runs at once.
@@ -628,11 +661,19 @@ A passing full gate run removes the marker. An unreadable marker also requires t
 
 The selection reads three record kinds from the caller's build log: config reads, folder scans and content reads.
 Each kind comes from the newest full, non-aborted gate that recorded it.
+The selection skips records from `mac-linux`.
 A changed config file selects each module that reads it in its source or in its config read record. A module with no record is selected.
 The targeted gate keeps the caller's build log, and it writes its own gate record there. Each test module has its own private build log.
 Only a direct test run (`start_test_run`) moves an unset `BUILDLOG_DIR` into its run folder.
 
-Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files`.
+Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files, selected in S s`.
+The same line gives cache hits, cache misses, part times, and the cache lock result.
+A hit uses cached facts. A miss counts before the source read.
+The extraction count records each source file that starts extraction.
+The counts include current and base graph lookups when selection builds both graphs.
+The times show cache read, extraction, graph build, and other work in seconds to one decimal place.
+Extraction time includes source reads for both graphs.
+The lock result shows when selection publishes facts or reads the old snapshot with the lock busy.
 It prints module names when ten or fewer modules are selected.
 A full run prints `full suite: <reason>` and repeats the reason in the final `Gate tests:` summary.
 An untouched suite prints `skipped (not affected)`.
@@ -640,7 +681,7 @@ A selection of zero modules passes.
 Affected passes record `kind: affected` and never replace the full base.
 Types, admission, isolated reruns, and later checks on the merge keep their existing behavior.
 
-**Nightly.** `gate.py --nightly --merge-branch B [--production <showrunner name>] [--checkout DIR]` fetches `origin/B`.
+**Nightly.** `merge_gate.py --nightly --merge-branch B [--production <showrunner name>] [--checkout DIR]` fetches `origin/B`.
 It uses the production's standing checkout through `copies.standing(owner, repo, copies.CommittedSource(commit))`.
 It runs all test modules and basedpyright over `NIGHTLY_TYPE_DIRS`, which names `scripts` and includes hooks.
 The 03:00 timer calls this path.
@@ -658,7 +699,7 @@ The gate reads `nightly_result_push` and `nightly_result_modules` from `config/g
 `nightly_result_push=off` disables all nightly result pushes. The default is `on`.
 `nightly_result_modules=8` limits the failed test modules named before `and N more`.
 A push failure does not change the gate result, marker or showrunner notice.
-A run that never reaches gate.py sends no push unless the timer script sends one.
+A run that never reaches merge_gate.py sends no push unless the timer script sends one.
 The checkout retains its ignored build files and holds the copies busy lock during the run.
 The caller's local branches, HEAD and edits stay unchanged.
 Git disables terminal credential prompts and uses SSH batch mode.
@@ -691,7 +732,7 @@ The record holds the branch, tree, finish time, failure lines, receipt time, ass
 The receipt time records successful delivery to the production owner.
 An unconfirmed notice keeps its receipt state empty.
 When a result needs manual assignment, the notice names the failed test files and includes the result ID.
-After assignment, run `gate.py nightly-assigned --result ID --unit UNIT`.
+After assignment, run `merge_gate.py nightly-assigned --result ID --unit UNIT`.
 The command accepts a unit director of any production.
 `UNIT` accepts the staff ID, a `<production>/<unit>` path, or the name of an sdlc unit.
 The command confirms receipt if the original notice has no delivery confirmation.
@@ -702,7 +743,7 @@ Both automatic and manual assignment send a user push.
 The push names the assignee when the receipt is confirmed.
 If automatic assignment has no confirmed receipt, the push shows the nightly result without a receipt time.
 An unassigned red result never sends a user push.
-`gate.py nightly-check` alerts the production owner when an unassigned result reaches its deadline.
+`merge_gate.py nightly-check` alerts the production owner when an unassigned result reaches its deadline.
 The alert repeats once in each later deadline window until the fix is assigned.
 `nightly_assign_minutes=30` sets that window in `config/gate.conf`.
 The alert uses the key `merge-gate-nightly-unassigned:<id>` and names the `nightly-assigned` command.
@@ -722,7 +763,7 @@ Without a calling session, the gate finds the registered production for the merg
 `--production <showrunner name>` can name the production explicitly.
 A failed delivery prints its cause. A test failure keeps its marker after a failed delivery.
 
-**Suite runner** (`run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, *, source="tests-only", full=False, mode=SuiteMode.GATE, machine=SharedMachine()) -> GateRun`):
+**Suite runner** (`run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, *, source="tests-only", full=False, mode=SuiteMode.MERGE_GATE, machine=SharedMachine()) -> GateRun`):
 
 `SharedMachine` is the default and keeps the existing shared scheduling behavior.
 `HoldExemptNamedModuleMachine` uses shared scheduling and skips the build hold.
@@ -788,9 +829,29 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 - **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
 - Each attempt has its own `TMPDIR` in a numbered folder such as `m0001`.
   The parent holds the gate lease and uses a `g-*` name for a gate or a `t-*` name for affected tests.
+  The gate reads the owner identity before it masks signals for allocation.
+  The gate checks the new directory identity before it records the owner and directory in the lease.
+  The lease records the owner PID, directory device, and inode.
+  It includes the process start and, on Linux, the boot identity when the gate can read them.
+  Lease readers continue to accept older records.
+  After it writes the lease, the gate appends a `gate_folder_start` line to the local host log.
+  The line contains the folder path, lease owner identity, commit SHA, branch, and step.
+  The `gate_run` line adds the same owner identity, `suite_folders`, and `end`.
+  Checkpoint runs keep the default SIGTERM disposition so recovery keeps the rollback record.
+  If SIGTERM starts cleanup, the gate records a `sigterm` end.
+  The gate defers SIGTERM, SIGINT, and SIGHUP until it marks the end write complete.
+  If a stop signal interrupts end setup, the gate writes the same end as the abort path.
+  SIGTERM records `sigterm`. SIGINT and SIGHUP record `red`.
+  The gate uses a `gate_folder_end` line if it cannot append a complete `gate_run` line.
+  A sync error after a complete append leaves the `gate_run` line as the only end.
+  The end is `normal`, `red`, or `sigterm`.
+  Log errors report to stderr and preserve the gate verdict.
+  If the fallback end write also fails, the gate reports the original error once.
+  The timing index continues to accept older run lines and skips the folder event lines.
   Both modes use the configured gate root for top-level runs.
   If that root contains the calling module folder, the nested gate uses the module folder as its parent.
   The outer gate removes the nested gate files when it removes the module folder.
+
   The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
   At the first unittest load or run, the bootstrap disables bytecode writes for the test.
@@ -1108,7 +1169,7 @@ New files can be selected.
 `copies.standing` supplies an isolated checkout of `origin/main`.
 The command applies the patch with `git apply --3way`.
 It runs the direct tests for changed Python files and imports each changed module.
-The check uses `gate.test_module_environment` and its tripwires.
+The check uses `merge_gate.test_module_environment` and its tripwires.
 An empty helper module can pass discovery; a failed package import cannot.
 The fast check uses no full gate run or queue admission.
 `config/fast_track.conf` supplies the size, file, time, push-attempt, and refused-path limits.
@@ -1230,7 +1291,7 @@ The cloud guest bootstrap supplies its own root after a fresh clone.
 Blender uses its own interpreter and sets `PYTHONPATH` explicitly.
 
 `update_registration.state_block` imports `merged_checkpoints` in its body.
-This keeps `scripts.production.merge_checkpoint` and `scripts.production.gate` out of each `scripts.statusline.counts_row` start, which costs 0.1 to 0.2 s of CPU when they load.
+This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_gate` out of each `scripts.statusline.counts_row` start, which costs 0.1 to 0.2 s of CPU when they load.
 
 **Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `assign.sh` run.
 
@@ -1241,14 +1302,14 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.gate` o
 | Override | File | Production default | How tests use it |
 |---|---|---|---|
 | `UNIT_EARLY_POLL_SECS` | `scripts/direct/review.sh` | `5` (s) | `0.01`; unset-default test sees one `sleep 5` |
-| `UNIT_WORKER_POLL_SECS` | `scripts/direct/claude_worker.py` (worker polls) | `CLAUDE_WORKER_POLL_SECS=15` (s), from `config/direct.conf` | `0.01` |
+| `UNIT_WORKER_POLL_SECS` | `scripts/direct/claude_worker.py` (worker polls) | `claude_worker_poll_secs=15` (s), from `config/direct.conf` | `0.01` |
 | `UNIT_TOKEN_CLOCK_FILE` | `scripts/direct/verify.sh` | unset → `$SECONDS` | a file the test advances; unset-default test measures from `$SECONDS` |
 | `UNIT_SYNC_WRITES` | `progress_history.py`, `findings.py` | `1` (fsync) | `0`; each has a test with it unset |
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/eligibility.py` | `10` s | small or large per case; invalid values fall back to 10 |
 | `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | every run root: each `/session/<name>/run`, then `/tmp/claude/unit` and `/tmp/claude/delegate` | a temp dir |
-| `GATE_STATE_DIR`, `GATE_PYTHON`, `GATE_BASEDPYRIGHT`, `GATE_UV` | `gate.py` | `~/.local/state/gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
+| `GATE_STATE_DIR`, `GATE_PYTHON`, `GATE_BASEDPYRIGHT`, `GATE_UV` | `merge_gate.py` | `~/.local/state/gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
 
 The build hold reader finds the run owner through `StaffRow.run`.
 Tests use a private `STAFF_FILE` and private run folders.

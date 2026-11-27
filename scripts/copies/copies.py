@@ -9,7 +9,7 @@ except FileNotFoundError:
 import argparse
 import ast
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,7 +38,7 @@ from uuid import UUID
 
 from scripts.lib import (
     build_copies, build_folder_lock, build_folders, cancellation, conf, copy_record, file_lock, git_index, git_rescue,
-    process_start, scratch, session_folder,
+    process_group, process_start, scratch, session_folder,
 )
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
@@ -51,7 +51,7 @@ from scripts.buildlog import treekey
 from scripts.lib.build_copies import CopyGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    GATE_SCRIPTS,
+    GATE_SCRIPTS, MERGE_GATE_PROGRAMS,
     OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, command_program,
     parse_command_program, read_step_names, verify_command,
 )
@@ -1580,9 +1580,9 @@ def gate_command_source_check(command: Sequence[str], *,
         return None
     script, arguments = program
     launcher = Path(script)
-    if launcher.name not in GATE_SCRIPTS:
+    if launcher.name not in MERGE_GATE_PROGRAMS:
         return None
-    relative = Path(GATE_SCRIPT)
+    relative = Path(GATE_SCRIPT).with_name(launcher.name)
     launcher_checkout = None
     if launcher.is_absolute():
         from scripts.lib.python_startup.sitecustomize import checkout_root
@@ -1599,7 +1599,7 @@ def gate_command_source_check(command: Sequence[str], *,
         path = parser_root / GATE_SCRIPT
         if path.resolve() != path:
             raise CopyError(f"Use the regular {GATE_SCRIPT} file in {parser_root}.")
-        if launcher_checkout is None:
+        if launcher_checkout is None and launcher.name == "gate.py":
             expanded = [part.replace("{tree}", str(source)) for part in command] if numbered_copy else command
             if not first_step.canonical_gate_command(expanded, source):
                 return
@@ -2852,7 +2852,7 @@ def run_prepared_gate(command: Sequence[str], *, cwd: Path, descriptors: tuple[i
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
     program = parse_command_program(command)
-    if not isinstance(program, OtherCommand) and program[0] in GATE_SCRIPTS:
+    if not isinstance(program, OtherCommand) and program[0] in MERGE_GATE_PROGRAMS:
         arguments = program[1]
         if "-h" not in arguments and "--help" not in arguments:
             error = first_step.gate_module_mode_error(
@@ -3191,6 +3191,48 @@ def receive_metadata(tree: Path, args: CopyArguments) -> None:
     authority.unlink(missing_ok=True)
 
 
+def receiver_channel_closed(channel: int, lifetime: int) -> bool:
+    """Watch for channel closure until the inherited pipe reaches EOF."""
+    mode = os.fstat(channel).st_mode
+    if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)):
+        return False
+    if sys.platform == "darwin":
+        with closing(select.kqueue()) as queue:
+            # The write filter on a read-only pipe reports EOF.
+            channel_filter = select.KQ_FILTER_WRITE if stat.S_ISFIFO(mode) else select.KQ_FILTER_READ
+            incoming = select.kevent(channel, channel_filter, select.KQ_EV_ADD | select.KQ_EV_CLEAR)
+            completion = select.kevent(lifetime, select.KQ_FILTER_READ, select.KQ_EV_ADD | select.KQ_EV_CLEAR)
+            _ = queue.control([incoming, completion], 0)
+            while True:
+                closed = {event.ident for event in queue.control(None, 2) if event.flags & select.KQ_EV_EOF}
+                if closed:
+                    return channel in closed
+    events = select.poll()
+    events.register(channel, select.POLLRDHUP)
+    events.register(lifetime, select.POLLHUP)
+    return any(descriptor == channel for descriptor, _ in events.poll())
+
+
+def run_mirror_receiver(command: list[str], descriptors: tuple[int, ...], environment: dict[str, str]) -> int:
+    """Keep the mirror lease through cleanup of the receiver group."""
+    reading, writing = os.pipe()
+    with os.fdopen(reading, "rb", buffering=0) as lifetime, os.fdopen(writing, "wb") as inherited:
+        with subprocess.Popen(command, pass_fds=(*descriptors, writing), env=environment, process_group=0) as child:
+            group = child.pid
+            inherited.close()
+            disconnected = True
+            try:
+                disconnected = receiver_channel_closed(0, reading)
+            finally:
+                if disconnected:
+                    # Keep the leader PID until after the signal, so the group ID cannot be reused.
+                    with suppress(ProcessLookupError):
+                        process_group.send_process_group(group, signal.SIGKILL)
+                # Every inherited pipe writer must close before the lease can end.
+                _ = lifetime.read(1)
+            return child.wait()
+
+
 def mirror_run(args: CopyArguments) -> int:
     tree = floor_claims.mirror_local_path(args.path)
     with local_mirror_lease(tree, args.session, create_tree=args.action != "mirror-receive"):
@@ -3207,8 +3249,9 @@ def mirror_run(args: CopyArguments) -> int:
         if args.action == "mirror-use":
             descriptors = tuple(dict.fromkeys((*descriptors, *floor_claims.inherited_mirror_descriptors())))
         environment = {**os.environ, floor_claims.MIRROR_LEASE_FDS: ",".join(map(str, descriptors))}
-        answer = subprocess.run(command, pass_fds=descriptors, env=environment)
-        return answer.returncode
+        if args.action == "mirror-receive":
+            return run_mirror_receiver(command, descriptors, environment)
+        return subprocess.run(command, pass_fds=descriptors, env=environment).returncode
 
 
 class CopyParser(argparse.ArgumentParser):

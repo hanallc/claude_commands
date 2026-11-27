@@ -1,7 +1,7 @@
 """Test the memory trace boundary with private files and fixed times."""
 from __future__ import annotations
 
-from collections.abc import Buffer
+from collections.abc import Buffer, Iterator
 from dataclasses import replace
 from functools import cached_property
 from io import BytesIO, FileIO
@@ -21,7 +21,7 @@ DAY_MS = 86_400_000
 NOW_MS = 10 * DAY_MS
 POLICY = traces.MemoryTracePolicy(2, 120, 8192, 2, 3, 1024, final_replay_bytes=100000,
                                   scope_loss_grace_seconds=9, seal_retry_count=4,
-                                  max_pending_commands=12, shutdown_timeout_seconds=3)
+                                  max_pending_commands=12, general_trace_share_percent=50, shutdown_timeout_seconds=3)
 POLICY_SETTINGS = (
     "sample.seconds=2\n"
     "sample.max_per_run=120\n"
@@ -33,6 +33,7 @@ POLICY_SETTINGS = (
     "seal.scope_loss_grace_seconds=9\n"
     "seal.retry_count=4\n"
     "worker.max_pending_commands=12\n"
+    "worker.general_trace_share_percent=50\n"
     "worker.shutdown_timeout_seconds=3\n"
 )
 ARGV = ("cargo", "nextest", "run", "--bin", "hana", "--profile", "ci",
@@ -74,6 +75,25 @@ class MemoryTraceTests(unittest.TestCase):
         _ = writer.append(traces.TestSample(test_ms, 3))
         return writer.seal(traces.TraceEnd(ended_at_ms, elapsed_ms, status, coverage))
 
+    def test_peak_lookup_stops_when_it_finds_the_requested_reservations(self) -> None:
+        _ = self.finished("first")
+        _ = self.finished("second")
+        archive = self.root / "finished"
+        other = archive / ("f" * 64)
+        iterdir = Path.iterdir
+
+        def entries(path: Path) -> Iterator[Path]:
+            if path == archive:
+                yield archive / KEY
+                yield other
+            elif path == other:
+                self.fail("Peak lookup scanned another folder after it found both reservations.")
+            else:
+                yield from iterdir(path)
+
+        with mock.patch.object(Path, "iterdir", entries):
+            self.assertEqual(self.store.peaks_for({"first", "second"}), {"first": 5, "second": 5})
+
     def test_policy_uses_the_shared_reader_with_injected_settings(self) -> None:
         stored = POLICY_SETTINGS
         path = self.root / "fixture.conf"
@@ -83,7 +103,8 @@ class MemoryTraceTests(unittest.TestCase):
                              ("feed.past_run_max_age_days", "-1"), ("seal.replay_bytes", "0"),
                              ("seal.replay_bytes", "1048577"), ("seal.scope_loss_grace_seconds", "61"),
                              ("seal.retry_count", "-1"), ("seal.retry_count", "11"),
-                             ("worker.max_pending_commands", "0"), ("worker.shutdown_timeout_seconds", "61")):
+                             ("worker.max_pending_commands", "0"), ("worker.shutdown_timeout_seconds", "61"),
+                             ("worker.general_trace_share_percent", "-1"), ("worker.general_trace_share_percent", "101")):
             with self.subTest(key=key, invalid=invalid):
                 config = "".join(f"{key}={invalid}\n" if line.startswith(f"{key}=") else line
                                  for line in stored.splitlines(keepends=True))

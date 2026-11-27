@@ -26,7 +26,7 @@ from importlib import import_module
 from pathlib import Path
 import sys
 import tempfile
-from threading import Lock
+from threading import Lock, Thread, current_thread
 import time
 from typing import TYPE_CHECKING, Literal, Protocol, cast, final, overload, override
 
@@ -239,6 +239,48 @@ class UniqueBuildFolder:
     """The request holds the prefix and parent for a unique build folder."""
     prefix: str
     parent: BuildFolderParent = InheritedTemporaryParent()
+
+
+@dataclass(frozen=True)
+class _NoGateBootIdentity:
+    """The gate has no boot identity to publish."""
+
+
+@dataclass(frozen=True)
+class _GateSuiteOwner:
+    """Identify the process that requests a gate suite folder."""
+
+    pid: int
+    start: process_start.ProcessStart
+    boot: str | _NoGateBootIdentity
+
+    @classmethod
+    def current(cls) -> _GateSuiteOwner:
+        pid = os.getpid()
+        start = process_start.process_start(pid)
+        if sys.platform == "darwin":
+            return cls(pid, start, _NoGateBootIdentity())
+        try:
+            return cls(pid, start, boot_identity())
+        except (OSError, ValueError):
+            return cls(pid, start, _NoGateBootIdentity())
+
+    def publish(self, path: Path, directory: int, folder: os.stat_result) -> None:
+        fields = _read_folder_lease(path, directory)
+        fields.update(pid=self.pid, device=folder.st_dev, inode=folder.st_ino)
+        if isinstance(self.start, process_start.Started):
+            fields["process_start"] = self.start.start
+        if isinstance(self.boot, str):
+            fields["boot_id"] = self.boot
+        _publish_lease(path, directory, fields)
+
+
+@final
+@dataclass(frozen=True)
+class GateSuiteFolder(UniqueBuildFolder):
+    """Read the owner identity before allocating a gate suite folder."""
+
+    owner: _GateSuiteOwner = field(default_factory=_GateSuiteOwner.current, init=False)
 
 
 @dataclass(frozen=True)
@@ -826,6 +868,7 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
 
 
 _locks: dict[int, Path] = {}
+_lock_owners: dict[int, Thread] = {}
 _inherited_build_locks: ContextVar[tuple[int, ...]] = ContextVar('inherited_build_locks', default=())
 
 def _probe_timing(*, wait: bool = True, settings: ConfigRead | None = None) -> build_folder_lock.ProbeTiming:
@@ -879,8 +922,20 @@ def build_folder_lock_fd(path: Path) -> int:
 
 
 def held_build_folder_descriptors() -> tuple[int, ...]:
-    """Retain all build locks in source and command subprocesses."""
-    return (*_inherited_build_locks.get(), *_locks)
+    """Pass inherited locks and locks that this thread holds to child processes."""
+    owner = current_thread()
+    owned = (descriptor for descriptor, thread in _lock_owners.copy().items() if thread is owner)
+    return (*_inherited_build_locks.get(), *owned)
+
+
+def _register_build_lock(descriptor: int, path: Path) -> None:
+    _locks[descriptor] = path
+    _lock_owners[descriptor] = current_thread()
+
+
+def _forget_build_lock(descriptor: int) -> None:
+    _ = _lock_owners.pop(descriptor, None)
+    _ = _locks.pop(descriptor, None)
 
 
 @contextmanager
@@ -902,7 +957,7 @@ def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
     if _locks.get(descriptor) != path:
         return
     try:
-        _ = _locks.pop(descriptor, None)
+        _forget_build_lock(descriptor)
     finally:
         # Closing preserves a child's inherited hold on the same lock.
         os.close(descriptor)
@@ -1082,6 +1137,12 @@ def _read_folder_lease(path: Path, directory: int, *, allow_empty: bool = False)
 def folder_lease_fields(path: Path) -> dict[str, object]:
     """Read lease fields for a status display."""
     with build_folder_lock.folder_parent(path, build_root(), create=False) as directory:
+        return _read_folder_lease(path, directory)
+
+
+def gate_folder_lease_fields(path: Path, root: Path) -> dict[str, object]:
+    """Read a lease under the gate root without acquiring a removal lock."""
+    with build_folder_lock.folder_parent(path, root, create=False) as directory:
         return _read_folder_lease(path, directory)
 
 
@@ -2028,6 +2089,10 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                             if not stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
                                 raise
                     allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                    if isinstance(original, GateSuiteFolder):
+                        if made_inode is None or not stat.S_ISDIR(allocated.st_mode) or not os.path.samestat(made_inode, allocated):
+                            raise OSError(errno.ESTALE, "the gate suite folder changed during allocation", str(path))
+                        original.owner.publish(path, directory, allocated)
                     if isinstance(original, (LinkedEditableRepository, RemoteEditableRepository)):
 
                         if isinstance(original, LinkedEditableRepository):
@@ -2074,13 +2139,13 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     if made_inode is not None and callable(on_create):
                         on_create(path, made_inode)
                     os.set_inheritable(descriptor, True)
-                    _locks[descriptor] = path
+                    _register_build_lock(descriptor, path)
                     if isinstance(request, _TemporaryFolderRequest):
                         _ = request.cleanup.callback(_finish_temporary, path, directory, allocated,
                                                      descriptor=descriptor, temporary=not stable)
                     return path
                 except BaseException:
-                    _ = _locks.pop(descriptor, None)
+                    _forget_build_lock(descriptor)
                     if isinstance(original, LinkedEditableRepository) or spec.kind == "copy":
                         if allocated is not None:
                             print(f"kept for a manual removal list: {path} (build_folders, checkout setup failed)",
@@ -2502,8 +2567,8 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
             if created:
                 _unlink_transient_lock(lease)
             return KeptCopyRemovalLease()
-        _ = opened.callback(_locks.pop, descriptor, None)
-        _locks[descriptor] = path
+        _ = opened.callback(_forget_build_lock, descriptor)
+        _register_build_lock(descriptor, path)
         _ = stack.enter_context(opened.pop_all())
     return lease
 

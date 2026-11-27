@@ -48,11 +48,12 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.message import session_records, session_send
-from scripts.agents import member_account, pane_record, producer_creation, remote, shutdown_record
+from scripts.agents import member_account, pane_record, producer_creation, remote, shutdown_record, worker_lifecycle
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.production import staff
+from scripts.production.production_doc import EnrolledPaths, ProductionPathsError
 from scripts.lib.resume_message import (
     AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS, WorkersHeld, launcher_prompt, worker_mode,
     ResumeWorkers as ResumeWorkers,
@@ -73,6 +74,7 @@ from scripts.message import sessions
 from scripts.agents.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
+    from scripts.accounts.unit_watchdog import RestartFailureNotice
     from scripts.agents.restart import StopReadArguments
     from scripts.herdr import worker_panes
     from scripts.notify.push_texts import RenderedPush
@@ -167,7 +169,7 @@ def _pending_producer_opening(name: str, saved: dict[str, object]) -> PendingPro
 
 
 def producer_folder(name: str) -> Path:
-    root = conf.read_or_repository("staff").text("PRODUCER_FOLDER_ROOT")
+    root = conf.read_or_repository("staff").text("producer_folder_root")
     return Path(root).expanduser() / name
 
 
@@ -178,7 +180,7 @@ def _producer_start_request(row: StaffRow) -> ProducerFirstStart:
 
 def _reserve_producer_pane(request: ProducerFirstStart, kind: Literal["claude", "codex"], home: Path,
                            client: herdr.Herdr) -> PendingProducerAdmission:
-    workspace = conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
+    workspace = conf.read_or_repository("staff").text("producer_workspace")
     environment = account_reader.named_account_environment(home) if kind == "claude" else {"CODEX_HOME": str(home)}
     prepared = herdr.prepare_agent_environment(str(request.folder), environment)
     if isinstance(prepared, nix_env.Refused):
@@ -492,7 +494,7 @@ def _confirm_producer_opening(request: ProducerFirstStart, opening: PendingProdu
                 raise OSError(reason(cursor.readability))
             proof = client.submit_opening_prompt(pending.pane, herdr.OpeningPrompt(
                 text, transcript, cursor=cursor, resend_once=resend),
-                opening.since, int(conf.read("shutdown").number("START_SECONDS") * 1000))
+                opening.since, int(conf.read("shutdown").number("start_seconds") * 1000))
             if isinstance(proof, herdr.PromptNotSubmitted):
                 state = cursor.readability
                 raise OSError(reason(state) if isinstance(state, UnprovedCodexRollout) and not resend else proof.reason)
@@ -631,7 +633,7 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
             client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + shell_setup], terminal=pending.terminal)
             outcome = herdr.start_agent(client.session, pending.pane, kind,
                 trust_arguments(kind, str(request.folder), arguments), herdr.NoOpeningPrompt(),
-                int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=request.name)
+                int(conf.read("shutdown").number("start_seconds") * 1000), agent=request.name)
             if isinstance(outcome, herdr.PromptNotSubmitted):
                 raise OSError(outcome.reason)
         entry = client.producer_admission_launch(pending.pane, kind)
@@ -1095,7 +1097,7 @@ def _retire_prompt(session_id: str) -> None:
 
 
 def stop_grace_seconds() -> float:
-    return float(conf.read("shutdown").text("STOP_GRACE_SECONDS"))
+    return float(conf.read("shutdown").text("stop_grace_seconds"))
 
 
 def stop_target(session: str, *, strict: bool = False) -> str | SessionNotFound | StopFailed:
@@ -1159,7 +1161,7 @@ def _stop(session: str, kind: str = "", *,
     signal_pid = 0
     try:
         settings = conf.read("shutdown")
-        stop_grace, kill_grace = stop_grace_seconds(), float(settings.text("KILL_GRACE_SECONDS"))
+        stop_grace, kill_grace = stop_grace_seconds(), float(settings.text("kill_grace_seconds"))
         attempt = _move_stop_target.get()
         pinned = attempt.target if isinstance(attempt, MoveStopAttempt) else attempt
         if isinstance(pinned, MoveStopTarget):
@@ -1258,7 +1260,6 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
                       keep_running: frozenset[StaffId] = NO_WORKERS_TO_KEEP_RUNNING,
                       failures: dict[StaffId, str] | None = None) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
-    from scripts.agents import worker_lifecycle
     from scripts.herdr import worker_panes
     from scripts.agents import restart
 
@@ -1326,6 +1327,10 @@ def _pane_environment(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
     unset = ["HERDR_TAB_ID", "STAFF_ID", "STAFF_OPERATION_FD", "PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY",
              *sorted(key for key in os.environ.keys() | entry["environment"].keys() if key.startswith("STAFF_ROW_FD_"))]
     environment = {key: value for key, value in entry["environment"].items() if key not in unset}
+    implicit = pane_launch.implicit_claude_home(entry)
+    if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+        unset.append("CLAUDE_CONFIG_DIR")
+        environment = implicit.environment(environment)
     environment = {**environment, "HERDR_PANE_ID": tab.pane_id,
                    "HERDR_WORKSPACE_ID": pane["workspace_id"], "RELAUNCH_PROMPT_DELIVERY": "pane"}
     return unset, environment
@@ -1347,9 +1352,11 @@ def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, ac
     """Build the account command for a shell in another pane."""
     unset, environment = _pane_environment(tab, entry)
     kind = pane_launch.saved_kind(entry)
+    implicit = pane_launch.implicit_claude_home(entry)
     if kind == "claude":
-        home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
-        herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
+        trust = (herdr.ClaudeTrustFile(implicit.settings_file) if isinstance(implicit, pane_launch.ImplicitClaudeHome)
+                 else Path(environment.get("CLAUDE_CONFIG_DIR") or _launch_home(entry).path))
+        herdr.trust_claude_launch(Path(entry["cwd"]), trust)
     program = [sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account]
     if kind == "codex":
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
@@ -1369,13 +1376,18 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
     environment.update(pane_environment)
     for key in unset:
         _ = environment.pop(key, None)
+    implicit = pane_launch.implicit_claude_home(entry)
     if kind == "claude":
-        prepared = accounts.prepare_claude_launch(account, resume=True)
-        for key in prepared.remove:
-            _ = environment.pop(key, None)
-        environment.update(prepared.variables)
-        home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
-        herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            _ = environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            herdr.trust_claude_launch(Path(entry["cwd"]), herdr.ClaudeTrustFile(implicit.settings_file))
+        else:
+            prepared = accounts.prepare_claude_launch(account, resume=True)
+            for key in prepared.remove:
+                _ = environment.pop(key, None)
+            environment.update(prepared.variables)
+            home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
+            herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
     else:
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
     program = agent_program.resolve_program(kind, environment=environment)
@@ -1389,7 +1401,8 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
     row = staff.initial_snapshot().by_member_reference(entry["session_id"])
     if row is not None and isinstance(row.exited, staff.Exited):
         _ = staff.resume(str(row.id))
-    selected_home = staff.SessionHome(Path(environment["CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR"]).absolute())
+    selected_home = (staff.SessionHome(implicit.config_dir) if isinstance(implicit, pane_launch.ImplicitClaudeHome)
+                     else staff.SessionHome(Path(environment["CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR"]).absolute()))
     if row is not None and row.home != selected_home:
         try:
             _ = staff.set_home(row.id, selected_home)
@@ -1409,11 +1422,11 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
         raise
 
 
-def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
+def wait_for_native_session(client: herdr.Herdr, pane: str, deadline: float, *, kind: Literal["claude", "codex"]) -> str:
     """Wait for the pane to expose its native identity within the start deadline."""
     while True:
         try:
-            return client.native_session(pane, "claude", operation_deadline.remaining(max(0.001, deadline - monotonic())))
+            return client.native_session(pane, kind, operation_deadline.remaining(max(0.001, deadline - monotonic())))
         except (OSError, ValueError, subprocess.SubprocessError, herdr_types.HerdrFailure):
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -1421,13 +1434,39 @@ def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
             time.sleep(operation_deadline.remaining(min(0.5, remaining)))
 
 
+def _resume_liveness(identity: str, *, deadline: float = math.inf
+                     ) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
+    """Give a concurrent registry write another chance before a resume fails."""
+    live = (sessions.session_liveness(identity) if deadline == math.inf
+            else sessions.session_liveness(identity, deadline=deadline))
+    if isinstance(live, sessions.SessionLivenessUnknown) and live.unreadable_registry:
+        deadline = worker_lifecycle.effective_deadline(deadline)
+        delay = sessions.retry_policy().registry_delay_seconds
+        if monotonic() + delay >= deadline:
+            return live
+        time.sleep(delay)
+        if monotonic() >= deadline:
+            return live
+        try:
+            registry = sessions.read_registry(for_session=identity, deadline=deadline)
+        except session_records.RegistryReadExpired as error:
+            if not error.registry.entries:
+                return live
+            observed = sessions.session_liveness(identity, registry=error.registry)
+            return observed if isinstance(observed, sessions.LiveSessionProcess) else live
+        except TimeoutError:
+            return live
+        return sessions.session_liveness(identity, registry=registry)
+    return live
+
+
 def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, account: str, message: str) -> sessions.LiveSessionProcess:
     """Run the account command in the session's own pane, with one resume message."""
     client = herdr.Herdr(herdr.shared_session())
     command = _pane_command(tab, entry, account)
     settings = conf.read("shutdown")
-    start_seconds = settings.number("START_SECONDS")
-    _ = settings.number("STAY_SECONDS")
+    start_seconds = settings.number("start_seconds")
+    _ = settings.number("stay_seconds")
     home = str(_launch_home(entry).path)
     transcript = herdr.SessionTranscript(Path(home), entry["session_id"])
     cursor: herdr.TranscriptCursor | herdr.UnspecifiedPromptTranscript = herdr.UnspecifiedPromptTranscript()
@@ -1439,20 +1478,22 @@ def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, a
         cursor.since = launched_at
     operation_deadline.check()
     client.run_in_pane(tab.pane_id, command)
-    deadline = monotonic() + operation_deadline.remaining(start_seconds)
-    live = sessions.session_liveness(entry["session_id"])
-    while isinstance(live, sessions.SessionNotLive):
+    deadline = worker_lifecycle.effective_deadline(monotonic() + start_seconds)
+    while monotonic() < deadline:
+        live = _resume_liveness(entry["session_id"], deadline=deadline)
+        if not isinstance(live, sessions.SessionNotLive):
+            break
         remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise herdr_types.HerdrFailure("never started")
-        time.sleep(operation_deadline.remaining(min(0.5, remaining)))
-        live = sessions.session_liveness(entry["session_id"])
+        if remaining > 0:
+            time.sleep(min(0.5, remaining))
+    else:
+        raise herdr_types.HerdrFailure("never started")
     if isinstance(live, sessions.SessionLivenessUnknown):
         raise herdr_types.HerdrFailure(live.reason)
     if not message:
         return live
     try:
-        identity = _prompt_identity(client, tab.pane_id, deadline)
+        identity = wait_for_native_session(client, tab.pane_id, deadline, kind="claude")
     except (OSError, ValueError, subprocess.SubprocessError, herdr_types.HerdrFailure) as error:
         print(f"{entry['session_id']}: prompt identity anomaly: {error}", file=sys.stderr)
         return live
@@ -1535,7 +1576,7 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude", cap
         if not observed.pids:
             return ResumeFailed(identity, "live Codex thread has no process account proof")
         return _codex_running_on_account(identity, pane_id, observed.pids[0], capture_generation)
-    live = sessions.session_liveness(identity)
+    live = sessions.session_liveness(identity) if capture_generation else _resume_liveness(identity)
     if isinstance(live, sessions.SessionNotLive):
         return live
     if isinstance(live, sessions.SessionLivenessUnknown):
@@ -1557,6 +1598,8 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude", cap
 
 def member_machine(member: StaffRow) -> str:
     """Return the member's recorded machine, or an empty string when unknown."""
+    if isinstance(member.launch_folder, staff.SessionLaunchFolder):
+        return member.launch_folder.machine
     location = member.worktree if isinstance(member.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else member.doc
     if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc)):
         return location.machine
@@ -1582,7 +1625,7 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
         try:
             locks.enter_context(herdr.reboot_lock())
             settings = conf.read("shutdown")
-            for key in ("START_SECONDS", "STAY_SECONDS"):
+            for key in ("start_seconds", "stay_seconds"):
                 _ = settings.number(key)
         except (conf.Unusable, herdr.RebootLockBusy) as error:
             return ResumeFailed(session, str(error))
@@ -1672,7 +1715,9 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
         member = matches[0]
         machine = member_machine(member)
         if machine and machine != remote.local_machine():
-            return ResumeFailed(session, f"session is on {machine}")
+            route = remote.machine_alias(machine)
+            if not isinstance(route, remote.MachineAlias) or route.alias != remote.this_machine():
+                return ResumeFailed(session, f"session is on {machine}")
         if member.kind == "producer":
             try:
                 saved = producer_creation.read_record(producer_creation.record_path(member.name))
@@ -1731,14 +1776,18 @@ def heal_account_trust(
     return trust
 
 
-def _unit_resume_owner(production: str, unit: str, record: StaffSnapshot) -> unit_lookup.UnitOwner:
+def _unit_resume_owner(production: str, unit: StaffRow, record: StaffSnapshot) -> unit_lookup.UnitOwner:
     """Read the unit again while only non-agent holders block its pane."""
     from scripts.production import unit_lookup
 
-    owner = unit_lookup.checked_unit(production, unit, record=record)
+    def observe() -> unit_lookup.UnitOwner:
+        registry = sessions.read_registry(for_session=unit.current_session, deadline=worker_lifecycle.effective_deadline())
+        return unit_lookup.checked_unit(production, unit.name, record=record, registry=registry)
+
+    owner = observe()
     if not isinstance(owner, unit_lookup.NonAgentPaneHolders):
         return owner
-    seconds = conf.read("shutdown").number("HOLDER_EXIT_SECONDS")
+    seconds = conf.read("shutdown").number("holder_exit_seconds")
     deadline = monotonic() + operation_deadline.remaining(seconds)
     wait = Event()
     while isinstance(owner, unit_lookup.NonAgentPaneHolders):
@@ -1748,12 +1797,26 @@ def _unit_resume_owner(production: str, unit: str, record: StaffSnapshot) -> uni
         _ = wait.wait(min(herdr.PANE_POLL_SECONDS, remaining))
         if monotonic() >= deadline:
             break
-        with operation_deadline.within(deadline):
-            observed = unit_lookup.checked_unit(production, unit, record=record)
+        try:
+            with operation_deadline.within(deadline):
+                observed = observe()
+        except TimeoutError:
+            break
         if monotonic() >= deadline:
             break
         owner = observed
     return owner
+
+
+def _enrolled_showrunner_worker(row: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
+    if row.kind != "worker":
+        return False
+    owner = record.parent_of(row)
+    if owner is None or owner.kind != "showrunner":
+        return False
+    from scripts.herdr.worker_panes import enrolled_worker_owner
+
+    return isinstance(enrolled_worker_owner(owner), EnrolledPaths)
 
 
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
@@ -1839,7 +1902,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if row is not None and row.kind == "unit" and (parent := names.tab_record.parent_of(row)) is not None:
             from scripts.production import unit_lookup
 
-            match _unit_resume_owner(parent.name, row.name, names.tab_record):
+            match _unit_resume_owner(parent.name, row, names.tab_record):
                 case unit_lookup.UnknownUnit(reason=reason):
                     return ResumeFailed(identity, reason)
                 case unit_lookup.ProvedLiveUnit():
@@ -1849,9 +1912,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         mode = worker_mode() if row is not None and not keep_workers else NO_WORKERS
         if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
             return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")
-        if entry is None:
-            if row is None:
-                return SessionNotFound(session)
+        if row is None and entry is None:
+            return SessionNotFound(session)
+        if row is not None and (entry is None or _enrolled_showrunner_worker(row, names.tab_record)):
             from scripts.agents import restart
 
             if keep_workers:
@@ -1863,6 +1926,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if isinstance(result, ClaudeUp):
                 return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
             return ResumeFailed(identity, "session did not start") if isinstance(result, sessions.SessionNotLive) else result
+        assert entry is not None
         from scripts.worktree import worktrees
 
         entry = entry.copy()
@@ -1877,14 +1941,21 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         else:
             print(f"anomaly: {identity}: session home is unknown; select the normal account", file=sys.stderr)
         selected = member_account.resume_account(kind, row if row is not None else SESSION_WITHOUT_STAFF_ROW, to=to or "")
+        implicit = member_account.implicit_claude_resume(
+            row if row is not None else SESSION_WITHOUT_STAFF_ROW, entry, to or "")
         copied_from = ""
         if isinstance(selected, accounts.CodexWorkersAccount):
             target_dir, label = selected.home, selected.label
             account_environment = {"CODEX_HOME": str(target_dir)}
         else:
             target_dir, label = selected.dir, selected.label
-            account_environment = account_reader.named_account_environment(target_dir)
-        entry["environment"] = {**entry["environment"], **account_environment}
+            account_environment = ({} if isinstance(implicit, pane_launch.ImplicitClaudeHome)
+                                   else account_reader.named_account_environment(target_dir))
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            entry["environment"] = implicit.environment(entry["environment"])
+        else:
+            _ = entry.pop("implicit_claude_home", None)
+            entry["environment"] = {**entry["environment"], **account_environment}
         if row is not None and row.kind == "producer":
             expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
             entry["environment"] = expectation.environment(entry["environment"])
@@ -1982,7 +2053,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             attempt_pane = tab.pane_id
             launched = herdr.launch_prepared_agent(client.session, herdr.ExistingPane(tab.pane_id, ""), prepared, kind,
                 trust_arguments(kind, entry["cwd"], resume_arguments(entry)), herdr.NoOpeningPrompt(),
-                int(operation_deadline.remaining(conf.read("shutdown").number("START_SECONDS")) * 1000),
+                int(operation_deadline.remaining(conf.read("shutdown").number("start_seconds")) * 1000),
                 agent=entry["name"] or identity, client=client)
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
                 raise herdr_types.HerdrFailure(launched.outcome.reason)
@@ -1990,7 +2061,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 client.prompt(tab.pane_id, message, target=identity)
             started = launched
         else:
-            live = sessions.session_liveness(identity)
+            live = _resume_liveness(identity)
             if isinstance(live, sessions.SessionLivenessUnknown):
                 raise herdr_types.HerdrFailure(live.reason)
             if isinstance(live, sessions.SessionNotLive):
@@ -2025,7 +2096,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if not _move_resume.get():
             _watch_resume(identity, tab.pane_id, label, started, requester, why)
         return ClaudeUp(identity, tab.pane_id, label, monotonic() - began, copied_from)
-    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, ProductionPathsError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         if original is not None and attempt_pane:
             try:
                 cleanup_client = herdr.Herdr(herdr.shared_session())
@@ -2187,7 +2258,7 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
                 requester: str = "", why: str = "") -> str:
     """Observe the started generation after the command returns; recovery belongs to the watchdog."""
     settings = conf.read("shutdown")
-    stay_seconds = settings.number("STAY_SECONDS")
+    stay_seconds = settings.number("stay_seconds")
     began = monotonic()
     while _same_process(pid, generation):
         remaining = stay_seconds - (monotonic() - began)
@@ -2198,12 +2269,12 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
                        generation=generation)
 
 
-def _send_move_push(push: RenderedPush, key: str) -> None:
+def _send_move_push(push: RenderedPush, key: str) -> bool:
     from scripts.message import send_budget, send_result
     from scripts.notify import push_texts, review
 
     try:
-        window = conf.read("shutdown").whole("MOVE_ALERT_REPEAT_MINUTES")
+        window = conf.read("shutdown").whole("move_alert_repeat_minutes")
         limit = review.user_send_seconds()
         command = push_texts.user_send_argv(push, key=key, timeout=limit)
         command.extend(("--repeat-minutes", str(window)))
@@ -2211,11 +2282,23 @@ def _send_move_push(push: RenderedPush, key: str) -> None:
                               timeout=send_budget.user_seconds(limit))
     except (OSError, ValueError, subprocess.SubprocessError):
         print("shutdown: could not send the move result", file=sys.stderr)
-        return
+        return False
     result = send_result.send_outcome(done.returncode, done.stdout)
     if not (isinstance(result, send_result.ConfirmedSendOutcome) and
             result.header.outcome in ("sent", "skipped", "kept", "replaced")):
         print("shutdown: the sender did not confirm the move result", file=sys.stderr)
+        return False
+    return True
+
+
+def send_restart_failure(identity: str, notice: RestartFailureNotice) -> bool:
+    from scripts.notify.push_texts import render
+
+    account = notice["account"]
+    generation = notice["generation"]
+    key = sha256(f"{identity}\0{account}\0{generation}".encode()).hexdigest()
+    return _send_move_push(render("shutdown.restart_failed", account=account, session=notice["session"],
+                                  identity=identity, reference=notice["reference"]), f"resume-ended:{key}")
 
 
 def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, requester: str = "",
@@ -2223,7 +2306,6 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     """Build one actionable outcome for the showrunner, user push and stay log."""
     from scripts.production import showrunners, staff_sources
     from scripts.accounts import unit_watchdog
-    from scripts.notify.push_texts import render
 
     try:
         record = staff.snapshot()
@@ -2231,18 +2313,27 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
         print(f"{identity}: staff anomaly: {error}", file=sys.stderr)
         record = staff.StaffSnapshot(())
     row = record.by_current_session(identity)
-    entry = pane_record.read(herdr.shared_session()).get(pane)
+    entries = pane_record.read(herdr.shared_session())
+    entry = entries.get(pane)
     entry = entry if entry and (pane_launch.reference_id(entry) == identity
         or row is not None and record.by_member_reference(pane_launch.reference_id(entry)) == row) else None
     environment = entry["environment"] if entry else {}
-    name = row.name if row is not None else str(entry.get("name", "")) if entry else ""
-    name = name or identity
+    session_name = row.name if row is not None else str(entry.get("name", "")) if entry else ""
+    name = session_name or identity
     unit = row.name if row is not None and row.kind == "unit" else ""
+    notice = None
+    if not _move_resume.get() and environment.get(PROBE_ENV) != "1":
+        unique = bool(session_name) and len(pane_launch.named_references(session_name, record, entries)) == 1
+        reserved = any(session_name == producer.name for producer in record.retired_producers)
+        reference = session_name if unique and not reserved else identity
+        notice = unit_watchdog.RestartFailureNotice(account=account, generation=generation,
+                                                    session=session_name, reference=reference)
+    exited = unit_watchdog.ExitRecovery(identity, notice)
     if unit:
         try:
-            recovery = unit_watchdog.run(datetime.now(timezone.utc), dry_run=False)
+            recovery = unit_watchdog.run(datetime.now(timezone.utc), dry_run=False, exited=exited)
             next_step = "; ".join(recovery) if recovery else "watchdog reported no recovery action"
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             next_step = f"watchdog could not recover it: {error}"
     else:
         command = "agents resume " + shlex.join([name, "--to", account, "--why", why or "retry after early exit"])
@@ -2255,11 +2346,8 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
             print(showrunners.tell(name, f"resume-ended-{identity}-{uuid4().hex}", cause, sender="shutdown"))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"{identity}: could not tell showrunner: {error}")
-    if not _move_resume.get() and environment.get(PROBE_ENV) != "1":
-        key = sha256(f"{identity}\0{account}\0{generation}".encode()).hexdigest()
-        _send_move_push(render("shutdown.restart_failed", account=account, machine=remote.local_machine(),
-                               stopped=(row.name if row is not None else str(entry.get("name", "")) if entry else "") or "one session",
-                               cause=cause), f"resume-ended:{key}")
+    if notice is not None and not exited.managed:
+        _ = send_restart_failure(identity, notice)
     return cause
 
 
@@ -2334,7 +2422,7 @@ def _confirm_move_start(result: ClaudeUp, requester: str, why: str) -> ClaudeUp 
         failure = _early_exit(identity, result.pane_id, result.account, 0.0,
                               requester=requester, why=why, failure=reason)
         return ResumeFailed(identity, failure)
-    live = sessions.session_liveness(identity)
+    live = _resume_liveness(identity)
     failure = (_check_stay(identity, result.pane_id, result.account, live.pid,
                            sessions.process_start(live.pid) or "", requester, why)
                if isinstance(live, sessions.LiveSessionProcess) else
@@ -2464,11 +2552,11 @@ def _end_user_claims(held: Mapping[str, RowHeld]) -> None:
 
 def _hung_holder_seconds(settings: conf.ConfigRead) -> float:
     """Limit the wait for a holder that is hung: one stop and one start of a restart, a resume or a move."""
-    stop = (settings.whole("STOP_GRACE_SECONDS") + settings.whole("KILL_GRACE_SECONDS")
-            + settings.whole("MOVE_STOP_MARGIN_SECONDS"))
-    upkeep = settings.number("UPKEEP_ROW_WAIT_SECONDS") + settings.number("RESTART_RECORD_LOCK_SECONDS")
-    start = (settings.number("HOLDER_EXIT_SECONDS") + settings.number("OWN_PANE_SHELL_SECONDS")
-             + settings.number("START_SECONDS") + settings.number("OPENING_PROMPT_SECONDS") + settings.number("STAY_SECONDS"))
+    stop = (settings.whole("stop_grace_seconds") + settings.whole("kill_grace_seconds")
+            + settings.whole("move_stop_margin_seconds"))
+    upkeep = settings.number("upkeep_row_wait_seconds") + settings.number("restart_record_lock_seconds")
+    start = (settings.number("holder_exit_seconds") + settings.number("own_pane_shell_seconds")
+             + settings.number("start_seconds") + settings.number("opening_prompt_seconds") + settings.number("stay_seconds"))
     return stop + upkeep + start
 
 
@@ -2610,7 +2698,7 @@ def _alert_pending_moves(batch: MoveBatch, entries: Mapping[str, pane_record.Pan
         push = render(push.id, **(push.values | {"body":
             f"{len(names)} sessions did not finish their move {destination}. "
             + f"Read the pending list on {machine} with `{moves.MOVE_COMMAND} result`."}))
-    _send_move_push(push, f"account-move:{group}:{batch.target}")
+    _ = _send_move_push(push, f"account-move:{group}:{batch.target}")
 
 
 def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: int = 0,

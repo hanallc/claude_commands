@@ -81,10 +81,10 @@ The gate reads findings, so a failed command needs a finding before it affects c
 `dispatch --covers` must include every gating open finding that remains in the phase.
 
 `config/direct.conf` supplies the required thresholds.
-`ROUTING_FROM_ROUND=4` requires evidence for retained findings.
+`routing_from_round=4` requires evidence for retained findings.
 The kept categories are `regression`, `broken`, `gate`, and an explicit `ruling`.
 Other missing criteria or work outside those categories go to an owned follow-up.
-`ASTRA_AFTER_FAILED_FIXES=2` requires a new Astra approach after two failed fixes.
+`astra_after_failed_fixes=2` requires a new Astra approach after two failed fixes.
 A gating open finding also needs that review from repair round four.
 The Astra record applies to its current fix-attempt count.
 An unavailable review can be recorded with its reason.
@@ -238,7 +238,7 @@ Other pushers release their holds before tests, validation, Mac pulls, and CI wa
 | `merge_checkpoint.promote_local_checkout` | Main fetch, fast-forward, and eligible push. |
 | `models_registry.store_registry` | Main publication, including fetch, row replay, commit, and push retries. It takes the main lock before the registry lock. |
 | `main_publish.ready` and `main_publish.push` | Separate short holds for preparation and publication. |
-| `gate.promote` | Fetch, ancestry checks, fast-forward, and push after the hold and release waits. |
+| `merge_gate.promote` | Fetch, ancestry checks, fast-forward, and push after the hold and release waits. |
 | `production_lifecycle.promote_main` | Fetch, main checks, and direct or local promotion after CI checks. |
 | `push_direct.sh` | Main publication checks and push through the shell entry. |
 | `restore_unreleased.sh` | Main push through the shell entry after changelog edits and commit. |

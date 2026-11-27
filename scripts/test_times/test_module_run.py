@@ -9,6 +9,7 @@ from contextlib import ExitStack, redirect_stderr
 from io import StringIO
 from dataclasses import dataclass
 import errno
+from itertools import product
 import json
 import math
 import os
@@ -853,6 +854,7 @@ class Reads(unittest.TestCase):
         from pathlib import Path
         module = Path(os.environ['TMPDIR'])
         self.assertNotIn('GATE_PARENT_PID', os.environ)
+        self.assertNotIn('MERGE_GATE_PARENT_PID', os.environ)
         self.assertNotIn('MERGE_GATE_MODULE_DIR', os.environ)
         paths = [Path(os.environ[name]) for name in ('SCRATCH_ROOT', 'ASTRA_REVIEW_DIR', 'CONF_READ_LOG')]
         scratch, review, config_log = paths
@@ -1329,8 +1331,9 @@ class ModuleProcessCleanupTests(unittest.TestCase):
         from scripts.lib import build_folders
 
         cases = ("standalone", "unleased TMPDIR", "gate")
-        for runner_case in cases:
-            with self.subTest(runner=runner_case), ExitStack() as cleanup:
+        parent_names = ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID")
+        for runner_case, parent_name in product(cases, parent_names):
+            with self.subTest(runner=runner_case, parent_name=parent_name), ExitStack() as cleanup:
                 root = Path(cleanup.enter_context(tempfile.TemporaryDirectory())).resolve()
                 processes = OwnedTestProcesses()
                 environment = processes.environment(direct_test_fixture_environment(root))
@@ -1363,7 +1366,10 @@ class ParentDeath(unittest.TestCase):
                 repository = RUNNER.parents[2]
                 log = root / "runner.log"
                 shim = repository / "scripts/lib/py"
-                arguments = [str(shim), str(RUNNER), str(root), case.name]
+                entry = ("import os, sys; "
+                         + "name = sys.argv.pop(1); os.environ[name] = os.environ.pop('GATE_PARENT_PID'); "
+                         + "os.execv(sys.argv[1], sys.argv[1:])")
+                arguments = [str(shim), "-c", entry, parent_name, str(shim), str(RUNNER), str(root), case.name]
                 source = f"""import os, sys
 from pathlib import Path
 from scripts.production import gate

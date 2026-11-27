@@ -251,13 +251,22 @@ def _resume_arguments(entry: pane_launch.NativePaneLaunch, *,
             arguments.extend(("--model", entry["model"]))
         arguments.extend(entry.get("codex_policy", []))
         return arguments
-    arguments = ["--resume", entry["session_id"]]
-    if entry["name"]:
-        arguments.extend(("-n", entry["name"]))
-    if entry["remote_control"]:
-        arguments.extend(("--remote-control", entry["name"]) if entry["name"] else ("--remote-control",))
-    arguments.extend(claude_settings.arguments())
-    for directory in entry.get("plugin_directories", []):
+    return claude_conversation_arguments(entry["session_id"], entry["name"], claude_settings,
+        entry.get("plugin_directories", []), remote_control=entry["remote_control"])
+
+
+def claude_conversation_arguments(session: str, name: str, settings: ClaudeResumeSettings,
+                                  plugins: Sequence[str], *, remote_control: bool, fork: bool = False) -> list[str]:
+    """Build the common Claude arguments for resume and fork."""
+    arguments = ["--resume", session]
+    if fork:
+        arguments.append("--fork-session")
+    if name:
+        arguments.extend(("-n", name))
+    if remote_control:
+        arguments.extend(("--remote-control", name) if name else ("--remote-control",))
+    arguments.extend(settings.arguments())
+    for directory in plugins:
         arguments.extend(("--plugin-dir", directory))
     arguments.extend(("--settings", '{"disableAgentView": true}'))
     return arguments
@@ -315,7 +324,8 @@ def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> d
             same_conversation = previous["session_id"] == launch["session_id"]
         if same_conversation:
             environment.update({key: value for key, value in previous["environment"].items()
-                                if key in herdr_types.NATIVE_ID_MARKS or _needed(key)})
+                                if key != pane_launch.BERTH_SESSION_ENV
+                                and (key in herdr_types.NATIVE_ID_MARKS or _needed(key))})
     environment.update(launch["environment"])
     current = launch.copy()
     current["environment"] = environment
@@ -388,14 +398,18 @@ def _needed(name: str) -> bool:
 
 def _environment(parts: Sequence[bytes]) -> dict[str, str]:
     pairs = (os.fsdecode(part).partition("=") for part in parts if b"=" in part)
-    return {key: value for key, _, value in pairs if _needed(key)}
+    return {key: value for key, _, value in pairs if _captured_launch_variable(key)}
+
+
+def _captured_launch_variable(name: str) -> bool:
+    return name == "HOME" or _needed(name)
 
 
 def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     # Imported here: the Linux hook never needs the account module.
     from scripts.whoami.account import kern_procargs2, procargs2_parts
 
-    parts = procargs2_parts(kern_procargs2(pid), _needed)
+    parts = procargs2_parts(kern_procargs2(pid), _captured_launch_variable)
     return list(parts.arguments), parts.environment
 
 

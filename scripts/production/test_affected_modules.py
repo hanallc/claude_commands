@@ -2,17 +2,24 @@
 from __future__ import annotations
 
 import ast
+from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime
+import fcntl
 import json
 import os
 from pathlib import Path
+import posixpath
 import subprocess
 import sqlite3
 import tempfile
 import unittest
 from typing import cast, override
 from unittest import mock
+from weakref import ref
 
+from scripts.buildlog import index as buildlog_index
+from scripts.mac_test.eligibility import MAC_LINUX_TARGET
 from scripts.production import affected_modules as affected
 from scripts.test_times.gate_record_test_support import gate_run
 
@@ -80,6 +87,9 @@ class AffectedModulesTests(unittest.TestCase):
 
     def cache_dir(self) -> Path:
         return self.repo / ".git" / "gate-state"
+
+    def cache_file(self) -> Path:
+        return self.cache_dir() / affected.FACT_CACHE_NAME
 
     def test_config_selection_uses_the_newest_full_record_and_direct_names(self) -> None:
         self.write("config/limits.conf", "value=one\n")
@@ -174,6 +184,146 @@ class AffectedModulesTests(unittest.TestCase):
                     self.write(path, "from scripts.production import staff\n" if label == "added accessor" else "changed\n")
                 _ = self.commit()
                 self.assertEqual(tuple(module.name for module in self.selection().modules), expected)
+
+    def test_extraction_preserves_import_order_and_lexical_scan_scope(self) -> None:
+        facts = affected.extract_facts("""
+if enabled:
+    import deep as renamed
+import shallow
+from scripts.lib import conf
+ROOT = Path(__file__).parent
+
+@capture(ROOT.glob("decorator"))
+def scan(root=ROOT.glob("default")):
+    nested = lambda: ROOT.glob("lambda")
+    outer(root, lambda: check("ls-files"))
+    def child():
+        return ROOT.glob("child")
+
+def scan(root):
+    outer(root, lambda: check("ls-files"))
+    conf.read("nested_setting")
+shutil.copytree(factory() / "config", destination)
+""", "fixture.py")
+        self.assertEqual(facts.imports, ((0, "shallow", ()), (0, "scripts.lib", ("conf",)), (0, "deep", ())))
+        self.assertEqual(facts.config_reads, frozenset({"*", "nested_setting"}))
+        root = affected.ScanPath(affected.SourceFileRoot(), ("..",))
+        parameter = affected.ScanPath(affected.ParameterRoot("root"))
+        self.assertEqual(tuple((scope.name, scope.parameters, scope.scans) for scope in facts.scan_scopes), (
+            ("", (), ()),
+            ("scan", ("root",), (affected.ScanPattern(parameter, "*", True),)),
+            ("scan.child", (), (affected.ScanPattern(root, "child", False),)),
+        ))
+
+    def test_deep_defaults_keep_facts_and_select_the_config_reader(self) -> None:
+        template = ('from scripts.lib import conf\n'
+                    + 'def read(value={negations}conf.read("deep_setting")):\n'
+                    + '    return value\n')
+        path = "scripts/checks/test_reader.py"
+        shallow = template.format(negations="not ")
+        expected = affected.extract_facts(shallow, path)
+        self.assertEqual(expected.config_reads, frozenset({"deep_setting"}))
+        self.add_test("checks/test_reader.py", shallow)
+        for depth in (988, 1800):
+            with self.subTest(depth=depth):
+                source = template.format(negations="not " * depth)
+                self.assertEqual(affected.extract_facts(source, path), expected)
+                self.write(path, source)
+                self.write("config/deep_setting.conf", "value=before\n")
+                self.certify()
+                self.write("config/deep_setting.conf", "value=after\n")
+                _ = self.commit()
+                self.assertEqual(self.selection().modules, (self.repo / path,))
+
+    def test_extraction_releases_ast_nodes(self) -> None:
+        original_parse = ast.parse
+        functions: list[ref[ast.expr]] = []
+
+        def parse(text: str, *, filename: str) -> ast.Module:
+            tree = original_parse(text, filename=filename)
+            statement = tree.body[0]
+            assert isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+            functions.append(ref(statement.value.func))
+            return tree
+
+        with mock.patch.object(ast, "parse", new=parse):
+            _ = affected.extract_facts('read("settings")', "fixture.py")
+            self.assertIsNone(functions[0]())
+
+    def test_copytree_config_detection_applies_to_the_source(self) -> None:
+        facts = affected.extract_facts('shutil.copytree(source, destination / "config")', "fixture.py")
+        self.assertEqual(facts.config_reads, frozenset())
+
+    def test_scan_graph_reuses_shared_acyclic_calls(self) -> None:
+        caller = "scripts/checks/test_caller.py"
+        helper = "scripts/lib/audit.py"
+        leaf = "scripts/lib/leaf.py"
+        facts = {
+            caller: affected.extract_facts("""
+from pathlib import Path
+from scripts.lib import audit
+ROOT = Path(__file__).parent
+
+def shared(folder):
+    return (folder / "marker").glob("*.txt")
+
+def first():
+    return shared(ROOT)
+
+def second():
+    return shared(folder=ROOT)
+
+def different():
+    return shared(ROOT / "other")
+
+def cycle_a(folder):
+    cycle_b(folder / "a")
+    return folder.glob("*.a")
+
+def cycle_b(folder):
+    cycle_a(folder / "b")
+    return folder.glob("*.b")
+
+def from_a():
+    return cycle_a(ROOT)
+
+def from_b():
+    return cycle_b(ROOT)
+
+FILES = audit.collect(ROOT)
+""", caller),
+            helper: affected.extract_facts("""
+from pathlib import Path
+from scripts.lib import leaf
+
+def collect(folder):
+    leaf.deep(folder)
+    return folder.glob("*.remote")
+
+FILES = collect(Path(__file__).parent)
+""", helper),
+            leaf: affected.extract_facts('def deep(folder):\n    return folder.glob("*.deep")\n', leaf),
+        }
+        normalize = posixpath.normpath
+        marker_calls: list[str] = []
+
+        def count_marker_paths(path: str | bytes) -> str | bytes:
+            if isinstance(path, str) and path.endswith("/marker"):
+                marker_calls.append(path)
+            return normalize(path)
+
+        with mock.patch.object(posixpath, "normpath", count_marker_paths):
+            scans = affected.repository_scan_graph(self.repo, facts, {})
+        self.assertEqual(scans, {
+            caller: frozenset(affected.RepositoryScan(folder, pattern, False) for folder, pattern in (
+                ("scripts/checks/marker", "*.txt"), ("scripts/checks/other/marker", "*.txt"),
+                ("scripts/checks", "*.remote"), ("scripts/checks", "*.a"), ("scripts/checks", "*.b"),
+                ("scripts/checks/a", "*.b"), ("scripts/checks/b", "*.a"),
+            )),
+            helper: frozenset(affected.RepositoryScan("scripts/lib", pattern, False) for pattern in ("*.remote", "*.deep")),
+            leaf: frozenset(),
+        })
+        self.assertEqual(len(marker_calls), 2)
 
     def test_source_audits_select_changed_file_kinds_without_scan_records(self) -> None:
         scans = (
@@ -353,6 +503,67 @@ class AffectedModulesTests(unittest.TestCase):
                 _ = self.commit()
                 self.assertEqual(tuple(module.name for module in self.selection().modules), expected)
 
+    def test_module_history_uses_run_id_lookups(self) -> None:
+        query = affected.MODULE_HISTORY_SQL
+        old_query = (
+            "WITH latest AS (SELECT "
+            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
+            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
+            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
+            + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
+            + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
+            + "CASE WHEN run_id = content_gate THEN content_reads END FROM gate_modules CROSS JOIN latest "
+            + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate ORDER BY suite, module, attempt"
+        )
+        with closing(sqlite3.connect(":memory:")) as connection:
+            for statement in buildlog_index.schema_statements():
+                _ = connection.execute(statement)
+            plan = cast(list[tuple[int, int, int, str]],
+                        connection.execute("EXPLAIN QUERY PLAN " + query, (MAC_LINUX_TARGET,)).fetchall())
+            details = [row[3] for row in plan]
+            self.assertIn("SEARCH gate_modules USING INDEX sqlite_autoindex_gate_modules_1 (run_id=?)", details)
+            self.assertFalse(any(detail.startswith("SCAN gate_modules") for detail in details), details)
+
+            _ = connection.executemany("INSERT INTO gate_runs (id, started_at, selection, aborted) VALUES (?, ?, ?, ?)", (
+                ("shared", "2026-01-01", "full", 0),
+                ("folder", "2026-01-02", "full", 0),
+                ("older-tie", "2026-01-03", "full", 0),
+                ("winner-tie", "2026-01-03", "full", 0),
+                ("null", "2026-01-04", "full", 0),
+                ("aborted", "2026-01-05", "full", 1),
+                ("affected", "2026-01-06", "affected", 0),
+            ))
+            insert = ("INSERT INTO gate_modules (run_id, suite, module, attempt, config_reads, folder_scans, "
+                      + "content_reads) VALUES (?, 'checks', 'test_reader.py', ?, ?, ?, ?)")
+            _ = connection.execute(insert, ("shared", 1, '["shared"]', '[]', '["assets/x"]'))
+            shared = cast(list[tuple[object, ...]], connection.execute(query, (MAC_LINUX_TARGET,)).fetchall())
+            self.assertCountEqual(shared, cast(list[tuple[object, ...]], connection.execute(old_query).fetchall()))
+            self.assertEqual(shared, [("checks", "test_reader.py", '["shared"]', '[]', '["assets/x"]')])
+
+            _ = connection.executemany(insert, (
+                ("folder", 1, None, '["assets"]', None),
+                ("older-tie", 1, '["loser"]', None, None),
+                ("winner-tie", 1, '[]', None, None),
+                ("winner-tie", 2, '["retry"]', None, None),
+                ("null", 1, None, None, None),
+                ("aborted", 1, '[]', '[]', '[]'),
+                ("affected", 1, '[]', '[]', '[]'),
+            ))
+            separate = cast(list[tuple[object, ...]], connection.execute(query, (MAC_LINUX_TARGET,)).fetchall())
+            self.assertCountEqual(separate, cast(list[tuple[object, ...]], connection.execute(old_query).fetchall()))
+            self.assertCountEqual(separate, [
+                ("checks", "test_reader.py", None, None, '["assets/x"]'),
+                ("checks", "test_reader.py", None, '["assets"]', None),
+                ("checks", "test_reader.py", '[]', None, None),
+                ("checks", "test_reader.py", '["retry"]', None, None),
+            ])
+
     def test_folder_and_config_records_use_independent_latest_full_gates(self) -> None:
         self.write("config/limits.conf", "value=one\n")
         self.write("assets/kept.txt", "base\n")
@@ -381,6 +592,22 @@ class AffectedModulesTests(unittest.TestCase):
             self.write("assets/new.txt", "added\n")
             self.assertEqual({module.name for module in self.selection().modules},
                              {"test_config.py", "test_folder.py", "test_unrecorded.py"})
+
+    def test_newer_guest_gate_does_not_supply_module_reads(self) -> None:
+        module = {"suite": "checks", "module": "test_reader.py", "attempt": 1}
+        run = {**gate_run(), "kind": "gate_run", "v": 1, "id": "full", "host": "mac",
+               "selection": "full", "aborted": False, "started_at": "2026-01-01T00:00:00Z",
+               "modules": [{**module, "config_reads": ["limits"], "folder_scans": ["assets"],
+                            "content_reads": ["docs/index.md"]}]}
+        self.write(".git/buildlog/mac/fixture.jsonl", json.dumps(run) + "\n")
+        expected = affected.latest_module_reads()
+        self.assertEqual(set(expected), {"scripts/checks/test_reader.py"})
+
+        guest_module: dict[str, object] = {**module, "config_reads": [], "folder_scans": [], "content_reads": []}
+        guest: dict[str, object] = {**run, "id": "guest-full", "host": "mac-linux", "source": "mac-linux",
+                                    "started_at": "2026-01-02T00:00:00Z", "modules": [guest_module]}
+        self.write(".git/buildlog/mac-linux/2026-01.jsonl", json.dumps(guest) + "\n")
+        self.assertEqual(affected.latest_module_reads(), expected)
 
     def test_landing_bases_exclude_changes_that_already_passed_the_gate(self) -> None:
         self.write("scripts/landed/subject.py", "VALUE = 1\n")
@@ -506,6 +733,38 @@ class AffectedModulesTests(unittest.TestCase):
                 compared = [call.args[-2] for call in git.call_args_list if call.args[1] == "diff"]
                 self.assertEqual(len(compared), len(set(compared)))
 
+    def test_cached_scopes_share_identical_binding_tuples(self) -> None:
+        facts = affected.extract_facts("""
+ROOT = Path(__file__).parent
+
+def left():
+    return ROOT.glob("left")
+
+def right():
+    return ROOT.rglob("right")
+
+def shadow(root):
+    ROOT = root
+    return ROOT.glob("shadow")
+""", "fixture.py")
+        _, payload, _ = affected.fact_row("blob", facts)
+        row = cast(dict[str, object], json.loads(payload))
+        self.assertIsInstance(row["scan_bindings"], list)
+        self.assertEqual(len(cast(list[object], row["scan_bindings"])), 2)
+        decoded = affected.decoded_facts(row)
+        self.assertEqual(decoded, facts)
+        module, left, right, shadow = decoded.scan_scopes
+        self.assertIs(module.bindings, left.bindings)
+        self.assertIs(left.bindings, right.bindings)
+        self.assertIsNot(shadow.bindings, left.bindings)
+
+        scope_rows = cast(list[list[object]], row["scan_scopes"])
+        for index in (-1, 2, True, "0"):
+            with self.subTest(index=index):
+                scope_rows[0][2] = index
+                with self.assertRaisesRegex(ValueError, "invalid scan binding index"):
+                    _ = affected.decoded_facts(row)
+
     def test_cached_and_uncached_graphs_are_equal(self) -> None:
         sources = {
             "scripts/component/__init__.py": "VALUE = 1\n",
@@ -528,28 +787,203 @@ class AffectedModulesTests(unittest.TestCase):
         self.write("scripts/component/test_subject.py", "VALUE = 20\n")
         _ = self.commit()
         _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
+        old_blob = self.git("rev-parse", "HEAD:scripts/component/test_subject.py")
         self.write("scripts/component/test_subject.py", "VALUE = 21\n")
         _ = self.commit()
-        with mock.patch.object(ast, "parse", wraps=ast.parse) as parse:
+        new_blob = self.git("rev-parse", "HEAD:scripts/component/test_subject.py")
+        with closing(sqlite3.connect(self.cache_file())) as database, database:
+            _ = database.executescript("""
+                CREATE TABLE writes (operation TEXT, blob TEXT);
+                CREATE TRIGGER log_insert AFTER INSERT ON facts BEGIN
+                    INSERT INTO writes VALUES ('insert', new.blob);
+                END;
+                CREATE TRIGGER log_update AFTER UPDATE ON facts BEGIN
+                    INSERT INTO writes VALUES ('update', new.blob);
+                END;
+                CREATE TRIGGER log_delete AFTER DELETE ON facts BEGIN
+                    INSERT INTO writes VALUES ('delete', old.blob);
+                END;
+                """)
+        with (mock.patch.object(ast, "parse", wraps=ast.parse) as parse,
+              mock.patch.object(affected, "fact_row", wraps=affected.fact_row) as encode):
             actual = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
         self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list],
                          ["scripts/component/test_subject.py"])
+        self.assertEqual([call.args[0] for call in encode.call_args_list], [new_blob])
+        with closing(sqlite3.connect(self.cache_file())) as database:
+            writes = cast(list[tuple[str, str]], database.execute("SELECT operation, blob FROM writes").fetchall())
+        self.assertCountEqual(writes, [("insert", new_blob), ("delete", old_blob)])
         self.assertEqual(actual, affected.dependency_graph(self.repo))
 
-    def test_invalid_cache_rebuilds_without_changing_the_graph(self) -> None:
-        expected = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
-        cache = self.cache_dir() / "affected-module-facts.json"
-        for contents in ("broken json", "[]",
-                         json.dumps({"format": -1, "extractor": affected.EXTRACTOR_VERSION, "blobs": {}}),
-                         json.dumps({"format": affected.CACHE_FORMAT_VERSION, "extractor": -1, "blobs": {}}),
-                         json.dumps({"format": affected.CACHE_FORMAT_VERSION, "extractor": affected.EXTRACTOR_VERSION,
-                                     "blobs": {"bad": {"imports": None, "tokens": []}}})):
-            with self.subTest(contents=contents):
-                _ = cache.write_text(contents)
+    def test_invalid_cache_rebuilds_without_changing_selection(self) -> None:
+        self.write("scripts/subject.py", "VALUE = 1\n")
+        self.add_test("checks/test_reader.py", "from scripts import subject\n")
+        self.certify()
+        self.write("scripts/subject.py", "VALUE = 2\n")
+        _ = self.commit()
+        expected = self.selection()
+        self.assertEqual(expected.modules, (self.repo / "scripts/checks/test_reader.py",))
+        cache = self.cache_file()
+        legacy = cache.with_suffix(".json")
+        legacy.parent.mkdir(parents=True)
+        _ = legacy.write_text("legacy cache")
+        for condition in ("cold", "warm", "file damage", "old format", "old extractor", "bad digest", "bad payload"):
+            with self.subTest(condition=condition):
+                if condition == "file damage":
+                    _ = cache.write_bytes(b"broken database")
+                if condition in {"old format", "old extractor", "bad digest", "bad payload"}:
+                    with closing(sqlite3.connect(cache)) as database, database:
+                        if condition == "old format":
+                            _ = database.execute("UPDATE cache_version SET format = ?", (affected.CACHE_FORMAT_VERSION - 1,))
+                        elif condition == "old extractor":
+                            _ = database.execute("UPDATE cache_version SET extractor = -1")
+                        elif condition == "bad digest":
+                            _ = database.execute("UPDATE facts SET digest = X'00'")
+                        else:
+                            payload = b'{"imports": null, "tokens": []}'
+                            blob = self.git("rev-parse", "HEAD:scripts/subject.py")
+                            _ = database.execute("UPDATE facts SET payload = ?, digest = ? WHERE blob = ?",
+                                                 (payload, affected.fact_digest(blob, payload), blob))
                 with mock.patch.object(ast, "parse", wraps=ast.parse) as parse:
-                    actual = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
-                self.assertGreater(parse.call_count, 0)
+                    actual = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+                self.assertEqual(parse.call_count, 0 if condition == "warm" else 3)
                 self.assertEqual(actual, expected)
+                self.assertIsNotNone(affected.read_fact_cache(cache))
+                self.assertEqual(legacy.read_text(), "legacy cache")
+
+    def test_busy_cache_reads_published_facts_without_writing(self) -> None:
+        subject = "scripts/subject.py"
+        self.write(subject, "VALUE = 1\n")
+        self.add_test("checks/test_reader.py", "from scripts import subject\n")
+        self.certify()
+        _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
+        self.write(subject, "VALUE = 2\n")
+        _ = self.commit()
+        expected = self.selection()
+        before = self.cache_file().read_bytes()
+        graph_for_files = affected.graph_for_files
+
+        def interleave(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
+                       cached: dict[str, affected.SourceFacts], *, worktree: bool,
+                       run: affected.SelectionRun | None = None) -> affected.SourceGraph:
+            with (mock.patch.object(affected, "graph_for_files", graph_for_files),
+                  mock.patch.object(ast, "parse", wraps=ast.parse) as parse,
+                  mock.patch.object(affected, "write_fact_cache", wraps=affected.write_fact_cache) as write,
+                  mock.patch.object(fcntl, "flock", wraps=fcntl.flock) as lock):
+                reader = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+            self.assertEqual(reader, expected)
+            assert isinstance(reader.run, affected.SelectionRun)
+            self.assertIs(reader.run.lock, affected.FactCacheLock.BUSY_SNAPSHOT)
+            self.assertEqual((reader.run.cache_hits, reader.run.cache_misses), (11, 1))
+            self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list], [subject])
+            attempts = [call for call in lock.call_args_list if call.args[1] == fcntl.LOCK_EX | fcntl.LOCK_NB]
+            self.assertEqual(len(attempts), 1)
+            write.assert_not_called()
+            self.assertEqual(self.cache_file().read_bytes(), before)
+            return graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree, run=run)
+
+        with mock.patch.object(affected, "graph_for_files", side_effect=interleave) as graph:
+            writer = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        graph.assert_called_once()
+        self.assertEqual(writer, expected)
+        assert isinstance(writer.run, affected.SelectionRun)
+        self.assertIs(writer.run.lock, affected.FactCacheLock.PUBLISHED)
+        facts = affected.read_fact_cache(self.cache_file())
+        self.assertIsNotNone(facts)
+        assert facts is not None
+        self.assertIn(self.git("rev-parse", f"HEAD:{subject}"), facts)
+
+    def test_selection_run_counts_cold_and_warm_facts(self) -> None:
+        self.add_test("checks/test_reader.py", "VALUE = 1\n")
+        self.certify()
+        self.write("scripts/checks/test_reader.py", "VALUE = 2\n")
+        _ = self.commit()
+        cold = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        warm = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        self.assertIsInstance(cold, affected.AffectedSelection)
+        self.assertEqual(warm, cold)
+        assert isinstance(cold.run, affected.SelectionRun) and isinstance(warm.run, affected.SelectionRun)
+        self.assertEqual((cold.run.cache_hits, cold.run.cache_misses), (9, 2))
+        self.assertEqual(cold.run.extracted_files, 2)
+        self.assertIs(cold.run.lock, affected.FactCacheLock.PUBLISHED)
+        self.assertEqual((warm.run.cache_hits, warm.run.cache_misses), (11, 0))
+        self.assertIs(warm.run.lock, affected.FactCacheLock.TAKEN)
+        self.assertEqual(warm.run.extracted_files, 0)
+        self.assertEqual(warm.run.extraction_s, 0)
+        for run in (cold.run, warm.run):
+            self.assertGreaterEqual(run.cache_read_s, 0)
+            self.assertGreaterEqual(run.graph_s, 0)
+            self.assertGreaterEqual(run.other_s, 0)
+
+    def test_invalid_source_reads_count_misses_before_extraction(self) -> None:
+        invalid = self.repo / "scripts/broken.py"
+        _ = invalid.write_bytes(b"\xff")
+        self.certify()
+        current = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        invalid.unlink()
+        _ = self.commit()
+        historical = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        for result, extracted in ((current, 0), (historical, 1)):
+            assert isinstance(result, affected.FullSuite)
+            self.assertIn("utf-8", result.reason)
+            assert isinstance(result.run, affected.SelectionRun)
+            self.assertEqual(result.run.extracted_files, extracted)
+            self.assertEqual(result.run.cache_misses, extracted + 1)
+
+    def test_source_reads_in_both_graphs_count_as_extraction_time(self) -> None:
+        current = "scripts/current.py"
+        historical = "scripts/historical.py"
+        self.write(historical, "VALUE = 2\n")
+        self.certify()
+        (self.repo / historical).unlink()
+        self.write(current, "VALUE = 3\n")
+        _ = self.commit()
+        now = 0.0
+        read_text = Path.read_text
+        blob_texts = affected.blob_texts
+
+        def clock() -> float:
+            return now
+
+        def read_current(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            nonlocal now
+            if path == self.repo / current:
+                now += 20.0
+            return read_text(path, encoding=encoding, errors=errors)
+
+        def read_historical(repo: Path, blobs: set[str]) -> dict[str, str]:
+            nonlocal now
+            now += 40.0
+            return blob_texts(repo, blobs)
+
+        with (mock.patch.object(affected, "monotonic", side_effect=clock),
+              mock.patch.object(Path, "read_text", autospec=True, side_effect=read_current),
+              mock.patch.object(affected, "blob_texts", side_effect=read_historical)):
+            result = affected.select_affected(self.repo, self.base, self.modules, set())
+
+        assert isinstance(result, affected.AffectedSelection)
+        assert isinstance(result.run, affected.SelectionRun)
+        self.assertEqual(result.run.extraction_s, 60.0)
+        self.assertEqual(result.run.graph_s, 0.0)
+        self.assertEqual(result.run.total_s, 60.0)
+
+    def test_cache_cleanup_error_after_replacement_keeps_publication_result(self) -> None:
+        run = affected.SelectionRun(lock=affected.FactCacheLock.TAKEN)
+        cache_path = self.cache_file()
+        cache_path.parent.mkdir()
+        facts = {"example": affected.extract_facts("VALUE = 1\n", "example.py")}
+        cache = affected.FactCache(facts, cache_path, run=run)
+
+        class FailingCleanup(tempfile.TemporaryDirectory[str]):
+            @override
+            def cleanup(self) -> None:
+                super().cleanup()
+                raise OSError("cleanup failed")
+
+        with mock.patch.object(tempfile, "TemporaryDirectory", FailingCleanup):
+            cache.retain(set(facts))
+        self.assertIs(run.lock, affected.FactCacheLock.PUBLISHED)
+        self.assertEqual(affected.read_fact_cache(cache_path), facts)
 
     def test_deleted_blob_is_pruned_and_new_targets_resolve_cached_facts(self) -> None:
         self.write("scripts/component/test_caller.py", "import test_future_subject\n")
@@ -569,7 +1003,10 @@ class AffectedModulesTests(unittest.TestCase):
         with mock.patch.object(ast, "parse", side_effect=AssertionError("unchanged source parsed")):
             graph, _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
         self.assertEqual(graph["scripts/component/test_caller.py"], set())
-        self.assertNotIn(blob, affected.read_fact_cache(self.cache_dir() / "affected-module-facts.json"))
+        facts = affected.read_fact_cache(self.cache_file())
+        self.assertIsNotNone(facts)
+        assert facts is not None
+        self.assertNotIn(blob, facts)
 
     def test_shared_blob_resolves_relative_imports_from_each_current_path(self) -> None:
         for component in ("first", "second"):
@@ -916,6 +1353,170 @@ class AffectedModulesTests(unittest.TestCase):
                          ("scripts/component/deleted.py", "scripts/component/new.py", "scripts/component/old.py",
                           "scripts/component/renamed.py", "scripts/component/subject.py"))
 
+    def test_deletion_uses_base_imports_without_a_base_scan_graph(self) -> None:
+        self.write("scripts/component/deleted.py", "VALUE = 1\n")
+        self.add_test("checks/test_reader.py", "import scripts.component.deleted\n")
+        self.certify()
+        (self.repo / "scripts/component/deleted.py").unlink()
+        _ = self.commit()
+        with mock.patch.object(affected, "repository_scan_graph", wraps=affected.repository_scan_graph) as scans:
+            self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_reader.py",))
+        scans.assert_called_once()
+
+        graph_for_files = affected.graph_for_files
+
+        def without_base_imports(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
+                                 cached: dict[str, affected.SourceFacts], *, worktree: bool,
+                                 run: affected.SelectionRun | None = None) -> affected.SourceGraph:
+            graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree, run=run)
+            return graph if worktree else replace(graph, imports={})
+
+        with mock.patch.object(affected, "graph_for_files", side_effect=without_base_imports):
+            self.assertEqual(self.selection().modules, ())
+
+    def test_unresolved_absolute_scan_paths_require_the_full_suite(self) -> None:
+        source = "scripts/component/subject.py"
+        invalid_path = str(self.repo / "bad") + "\0"
+        for historical in (False, True):
+            with self.subTest(historical=historical):
+                self.write(source, "from pathlib import Path\n"
+                           + (f"FILES = Path({invalid_path!r}).glob('*.txt')\n" if historical
+                              else f"ignored(Path({invalid_path!r}))\n"))
+                if historical:
+                    self.certify()
+                    (self.repo / source).unlink()
+                _ = self.commit()
+                result = affected.select_affected(self.repo, self.base, self.modules, set())
+                self.assertIsInstance(result, affected.FullSuite)
+                assert isinstance(result, affected.FullSuite)
+                self.assertIn("embedded null", result.reason)
+
+    def test_deep_scan_call_chain_preserves_the_full_suite_fallback(self) -> None:
+        source = "scripts/component/subject.py"
+        invalid_path = str(self.repo / "bad") + "\0"
+        chain = "".join(f"def hop_{index}():\n    hop_{index + 1}()\n" for index in range(983))
+        self.write(source, "from pathlib import Path\n" + chain
+                   + f"def hop_983():\n    ignored(Path({invalid_path!r}))\n")
+        _ = self.commit()
+        for historical in (False, True):
+            with self.subTest(historical=historical):
+                if historical:
+                    self.certify()
+                    (self.repo / source).unlink()
+                    _ = self.commit()
+                result = affected.select_affected(self.repo, self.base, self.modules, set())
+                self.assertIsInstance(result, affected.FullSuite)
+                assert isinstance(result, affected.FullSuite)
+                self.assertIn("embedded null", result.reason)
+
+    def test_deep_scan_call_chain_resolves_the_leaf_scan(self) -> None:
+        self.write("assets/subject.txt", "before\n")
+        chain = "".join(f"def hop_{index}(root):\n    hop_{index + 1}(root)\n" for index in range(983))
+        self.write("scripts/component/subject.py", chain
+                   + "def hop_983(root):\n    return list((root / 'assets').glob('*.txt'))\n")
+        self.add_test("checks/test_reader.py", "from pathlib import Path\n"
+                      + "from scripts.component.subject import hop_0\n"
+                      + "hop_0(Path(__file__).resolve().parents[2])\n")
+        self.certify()
+        self.write("assets/subject.txt", "after\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_reader.py",))
+
+    def test_deep_imported_binding_chain_preserves_the_full_suite_fallback(self) -> None:
+        source = "scripts/component/subject.py"
+        invalid_path = str(self.repo / "bad") + "\0"
+        for index in range(982):
+            self.write(f"scripts/component/hop_{index}.py",
+                       f"from scripts.component.hop_{index + 1} import ROOT as NEXT\n" + "ROOT = NEXT\n")
+        self.write("scripts/component/hop_982.py", "from pathlib import Path\n" + f"ROOT = Path({invalid_path!r})\n")
+        self.write(source, "from scripts.component.hop_0 import ROOT\n" + "FILES = ROOT.glob('*.txt')\n")
+        _ = self.commit()
+        for historical in (False, True):
+            with self.subTest(historical=historical):
+                if historical:
+                    self.certify()
+                    (self.repo / source).unlink()
+                    _ = self.commit()
+                result = affected.select_affected(self.repo, self.base, self.modules, set())
+                self.assertIsInstance(result, affected.FullSuite)
+                assert isinstance(result, affected.FullSuite)
+                self.assertIn("embedded null", result.reason)
+
+    def test_imported_binding_cycle_preserves_candidate_order(self) -> None:
+        reader = "scripts/component/subject.py"
+        sources = {
+            reader: "from scripts.component.roots import ROOT\n" + "FILES = ROOT.glob('*.txt')\n",
+            "scripts/component/roots.py": "from scripts.component.roots import ROOT as NEXT\n"
+            + "ROOT = NEXT / 'nested'\n",
+            "scripts/component/roots/__init__.py": "from pathlib import Path\n"
+            + "ROOT = Path(__file__).parents[3] / 'assets'\n",
+        }
+        facts = {path: affected.extract_facts(text, path) for path, text in sources.items()}
+        scans = affected.repository_scan_graph(self.repo, facts, {})
+        self.assertEqual(scans[reader], frozenset({affected.RepositoryScan("assets/nested", "*.txt", False)}))
+
+    def test_cached_duplicate_scope_names_keep_every_scan_root(self) -> None:
+        self.write("assets/subject.md", "before\n")
+        self.add_test("checks/test_reader.py", "from pathlib import Path\n"
+                      + "ROOT = Path(__file__).resolve().parents[2]\n"
+                      + "FILES = list((ROOT / 'assets').glob('*.md'))\n")
+        self.certify()
+        self.write("assets/subject.md", "after\n")
+        _ = self.commit()
+        expected = self.selection()
+        self.assertEqual(expected.modules, (self.repo / "scripts/checks/test_reader.py",))
+        _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
+        cache_path = self.cache_file()
+        cache = affected.read_fact_cache(cache_path)
+        assert cache is not None
+        blob = self.git("rev-parse", "HEAD:scripts/checks/test_reader.py")
+        facts = cache[blob]
+        cache[blob] = replace(facts, scan_scopes=(*facts.scan_scopes, affected.ScanScope("", (), (), (), ())))
+        self.assertTrue(affected.write_fact_cache(cache_path, cache, None, set(cache)))
+        with mock.patch.object(ast, "parse", side_effect=AssertionError("warm cache parsed source")):
+            result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        self.assertEqual(result, expected)
+
+    def test_invalid_historical_test_still_requires_a_full_suite(self) -> None:
+        self.add_test("checks/test_deleted.py", "broken (\n")
+        self.certify()
+        deleted = self.repo / "scripts/checks/test_deleted.py"
+        deleted.unlink()
+        self.modules.remove(deleted)
+        _ = self.commit()
+        result = affected.select_affected(self.repo, self.base, self.modules, set())
+        self.assertIsInstance(result, affected.FullSuite)
+        assert isinstance(result, affected.FullSuite)
+        self.assertIn("scripts/checks/test_deleted.py", result.reason)
+        assert isinstance(result.run, affected.SelectionRun)
+        self.assertGreater(result.run.cache_misses, 0)
+        self.assertGreaterEqual(result.run.graph_s, 0)
+
+    def test_optimized_selection_matches_baseline(self) -> None:
+        self.write("scripts/component/deleted.py", "VALUE = 1\n")
+        self.write("scripts/shared.py", "VALUE = 1\n")
+        self.add_test("checks/test_scans.py", "from pathlib import Path\n"
+                      + "def scan(root):\n    return (root / 'assets').rglob('*.txt')\n"
+                      + "FILES = scan(Path(__file__).parents[2])\n")
+        self.add_test("checks/test_shared.py", "from scripts import shared\n")
+        self.add_test("checks/test_historical.py", "import scripts.component.deleted\n")
+        self.add_test("checks/test_unrelated.py", "VALUE = 1\n")
+        self.certify()
+        files = tuple(f"assets/data-{number:03}.txt" for number in range(298))
+        for path in files:
+            self.write(path, "fixture\n")
+        self.write("scripts/shared.py", "VALUE = 2\n")
+        (self.repo / "scripts/component/deleted.py").unlink()
+        _ = self.commit()
+        expected = affected.AffectedSelection(
+            self.base, (*files, "scripts/component/deleted.py", "scripts/shared.py"),
+            tuple(self.repo / f"scripts/checks/test_{name}.py" for name in ("scans", "shared", "historical")),
+        )
+        for cache in ("cold", "warm"):
+            with self.subTest(cache=cache):
+                self.assertEqual(affected.select_affected(self.repo, self.base, self.modules, set(),
+                                                          state_dir=self.cache_dir()), expected)
+
     def test_removed_python_sources_reuse_both_graphs_without_parsing_or_cache_writes(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
         self.add_test("checks/test_deleted.py", "import scripts.component.subject\n")
@@ -942,6 +1543,7 @@ class AffectedModulesTests(unittest.TestCase):
         expected = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo),
                                             state_dir=self.cache_dir())
         self.assertIsInstance(expected, affected.AffectedSelection)
+        published = self.cache_file().read_bytes()
         self.write("scripts/checks/test_dirty.py", "VALUE = 2\n")
         with mock.patch.object(affected, "write_fact_cache", wraps=affected.write_fact_cache) as write:
             result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo),
@@ -950,6 +1552,7 @@ class AffectedModulesTests(unittest.TestCase):
         assert isinstance(result, affected.AffectedSelection)
         self.assertEqual([path.name for path in result.modules], ["test_dirty.py"])
         write.assert_not_called()
+        self.assertEqual(self.cache_file().read_bytes(), published)
 
     def test_invalid_non_test_python_sources_still_select_their_importers(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")

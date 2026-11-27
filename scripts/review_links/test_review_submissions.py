@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import fcntl
 import hashlib
 import inspect
 import json
@@ -19,19 +20,24 @@ from dataclasses import asdict, replace
 from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from threading import Event
 from typing import TextIO, cast, final, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.agents import pane_record
 from scripts.agents.remote import local_machine
 from scripts.lib import atomic_file, conf, urgency
+from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.production import change_review, investigation, next_item, production_lifecycle, proposal_issue, proposals_folder, record_store, session_staff, showrunners, staff, tidy_wrapped, update_registration
+from scripts.notify import review
+from scripts.production import change_review, investigation, next_item, production_admission, production_lifecycle, proposal_issue, proposals_folder, record_store, session_staff, showrunners, staff, tidy_wrapped, update_registration
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.review_links import change_browser, change_page, image_store, new_item_dialog, question_record, reply_tokens, review_actions, review_events, review_items, review_page, review_submissions as submissions
 
 OWNER = staff.StaffId("builds-staff")
@@ -61,8 +67,8 @@ EVIDENCE = submissions.BuildStepEvidence(
          submissions.TipDetail("Run 18 · Test shard 2 of 4")))
 
 
-def identify_fixture_image(extension: str, data: bytes) -> subprocess.CompletedProcess[bytes]:
-    if data != base64.b64decode(PNG):
+def identify_fixture_image(extension: str, path: Path) -> subprocess.CompletedProcess[bytes]:
+    if path.read_bytes() != base64.b64decode(PNG):
         raise AssertionError("Add the image to the test fixtures.")
     return subprocess.CompletedProcess(["identify", extension], 0, stdout=b"PNG\n")
 
@@ -84,6 +90,7 @@ class ReviewSubmissionTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.issues = self.root / "issues"
         self.doc = self.root / "production.md"
@@ -147,6 +154,47 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(row.log[-1].words, 'Answer: '+answer)
         self.assertEqual(row.response, submissions.QuestionResponse(payload.words, answer, row.log[-1].time))
 
+    def test_scoped_review_replies_release_recipient_locks_and_recheck_the_record(self) -> None:
+        words = "Use the desktop layout."
+        for kind in submissions.SubmissionKind:
+            with self.subTest(kind=kind):
+                saved = submissions.submit(request(kind))
+                token = saved.reply_token
+
+                def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+                    lock = investigation.state_root() / "investigation-locks" / (OWNER + ".lock")
+                    with lock.open("r") as handle:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if kind == submissions.SubmissionKind.PROPOSAL:
+                        digest = hashlib.sha256(str(saved.path.resolve()).encode()).hexdigest()[:32]
+                        issue_lock = Path.home() / ".local/state/proposal-issue/locks" / f"proposal-issue-{digest}.lock"
+                        issue_lock.parent.mkdir(parents=True, exist_ok=True)
+                        with issue_lock.open("a") as handle:
+                            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with submissions.scoped_submission(new_item_dialog.read_submission_key(saved.key)) as located:
+                        match located.record:
+                            case update_registration.QuestionRecord() as record:
+                                update_registration.set_waiting_why(record, "Check the second layout.")
+                            case Issue() as issue:
+                                _ = proposal_issue.record_review(issue.path, "Check the second layout.",
+                                                                 review_events.KeepMark(), date.today())
+                            case investigation.Investigation() as record:
+                                investigation.set_waiting_why(record.owner, record.id, "Check the second layout.")
+                    return review.QuestionAccepted(words)
+
+                with patch.object(review, "review_question", side_effect=read_draft) as reader:
+                    with self.assertRaisesRegex(submissions.SubmissionError, "selected .* changed"):
+                        _ = submissions.answer(saved.key, words, token)
+                reader.assert_called_once()
+                self.assertNotIn(words, saved.path.read_text())
+                self.assertIn("Check the second layout.", saved.path.read_text())
+
+                with patch.object(review, "review_question", return_value=review.QuestionAccepted(words)) as reader:
+                    self.assertTrue(submissions.answer(saved.key, words, token))
+                    self.assertFalse(submissions.answer(saved.key, words, token))
+                reader.assert_called_once()
+                self.assertIn(words, saved.path.read_text())
+
     def test_four_kinds_use_their_native_stores_and_ids(self) -> None:
         expected = ("Q1", "P1", "I1", "I2")
         for number, (kind, identity) in enumerate(zip(submissions.SubmissionKind, expected, strict=True), 1):
@@ -185,11 +233,12 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertIn(investigation.folder(OWNER), sources)
         self.assertIn(investigation.folder(OWNER) / "I2.md", sources)
 
-    def test_producer_uses_its_questions_and_requires_a_proposal_folder(self) -> None:
+    def test_producer_uses_its_default_and_configured_stores(self) -> None:
         question = submissions.submit(request(submissions.SubmissionKind.QUESTION, recipient=PRODUCER))
         payload = request(submissions.SubmissionKind.PROPOSAL, "proposal", recipient=PRODUCER)
-        with self.assertRaisesRegex(submissions.SubmissionError, "native proposal folder"):
-            _ = submissions.submit(payload)
+        default_proposal = submissions.submit(payload)
+        self.assertEqual((default_proposal.id, default_proposal.path.parent),
+                         ("P1", self.root / "state" / PRODUCER / "proposals"))
         self.assertEqual(question.id, "Q1")
         row = self.identities.record.by_id(PRODUCER)
         assert row is not None
@@ -203,16 +252,17 @@ class ReviewSubmissionTests(unittest.TestCase):
         producer = replace(row, doc=staff.LiveDoc(local_machine(), producer_doc))
         producer_staff = staff.StaffSnapshot((producer,))
         with patch.object(staff, 'snapshot', return_value=producer_staff):
-            proposal = submissions.submit(payload, members=producer_staff)
-        self.assertEqual(proposal.id, "P1")
-        self.assertIsInstance(proposal_issue.find_review_proposal(vault, PRODUCER, new_item_dialog.ByItemId("P1")), Issue)
+            configured = request(submissions.SubmissionKind.PROPOSAL, "configured-proposal", recipient=PRODUCER)
+            proposal = submissions.submit(configured, members=producer_staff)
+        self.assertEqual((proposal.id, proposal.path.parent), ("P2", vault))
+        self.assertIsInstance(proposal_issue.find_review_proposal(vault, PRODUCER, new_item_dialog.ByItemId("P2")), Issue)
 
-    def test_proposal_folder_is_absent_for_a_producer_directory(self) -> None:
+    def test_proposal_folder_defaults_to_local_state_for_a_producer_directory(self) -> None:
         directory = self.root / "brain"
         directory.mkdir()
         producer = replace(self.members.rows[1], doc=staff.LiveDoc(local_machine(), directory))
         self.assertEqual(submissions.proposal_folder(producer, self.members),
-                         submissions.NoNativeFolder(submissions.SubmissionKind.PROPOSAL))
+                         self.root / "state" / PRODUCER / "proposals")
 
     def test_concurrent_retries_reuse_the_id_for_the_same_request(self) -> None:
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -224,6 +274,30 @@ class ReviewSubmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
                 _ = submissions.submit(different)
         self.assertEqual([item.id for item in investigation.records(OWNER)], ["I1"])
+
+    def test_a_notice_change_is_not_an_exact_retry(self) -> None:
+        original = request(submissions.SubmissionKind.INVESTIGATION)
+        feedback = replace(original, notice=new_item_dialog.SubmissionNotice("feedback"))
+        standard = submissions.submit(feedback)
+        self.assertEqual(submissions.submit(feedback).key, standard.key)
+        with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
+            _ = submissions.submit(original)
+
+        legacy = replace(feedback, request_id="r2-" + "a" * 32)
+        first_legacy = submissions.submit(legacy)
+        changed_legacy = submissions.submit(replace(legacy, notice=new_item_dialog.SubmissionNotice("efficiency")))
+        self.assertNotEqual(changed_legacy.key, first_legacy.key)
+        self.assertEqual(submissions.submit(legacy).key, first_legacy.key)
+
+        browser = replace(feedback, request_id="r6-" + "b" * 32)
+        first_browser = submissions.submit(browser)
+        retry = submissions.submit(browser)
+        self.assertEqual(retry.key, first_browser.key)
+        self.assertNotIsInstance(retry, submissions.EditedSubmission)
+        changed_browser = submissions.submit(replace(browser, notice=new_item_dialog.SubmissionNotice("feedback", True)))
+        self.assertIsInstance(changed_browser, submissions.EditedSubmission)
+        self.assertEqual(changed_browser.key, first_browser.key)
+        self.assertEqual(changed_browser.details.notice, browser.notice)
 
     def test_concurrent_draft_sends_reuse_each_recipient_item(self) -> None:
         first = replace(request(), request_id="r2-" + "a" * 32)
@@ -358,9 +432,10 @@ class ReviewSubmissionTests(unittest.TestCase):
         image, = (folder / "images").glob("*/image.png")
         before = image.stat()
         self.assertEqual(image.read_bytes(), base64.b64decode(PNG))
+        delivery = submissions.InitialDelivery()
         with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
-            _ = submissions.submit(replace(payload, words="Different words"))
-        saved = submissions.submit(payload)
+            _ = submissions.submit(replace(payload, words="Different words"), initial_delivery=delivery)
+        saved = submissions.submit(payload, initial_delivery=delivery)
         self.assertEqual(saved.id, "I2")
         self.assertEqual(len(saved.details.images), 1)
         self.assertEqual(image.stat().st_ino, before.st_ino)
@@ -504,9 +579,14 @@ class ReviewSubmissionTests(unittest.TestCase):
             self.assertEqual(reply_tokens.derive(second.details.reply_proof), original_token)
             self.assertEqual(mac_key.read_bytes(), original_key)
         self.assertEqual(reply_tokens.derive(proof), token)
+
+        def accept(_key: review.QuestionKey, draft: str, **_kwargs: object) -> review.QuestionAccepted:
+            return review.QuestionAccepted(draft)
+
         for kind in submissions.SubmissionKind:
-            with self.subTest(kind=kind):
+            with (self.subTest(kind=kind), patch.object(review, "review_question", side_effect=accept) as reader):
                 first = submissions.submit(request(kind, kind))
+                reader.reset_mock()
                 proof = first.details.reply_proof
                 token = reply_tokens.derive(proof)
                 self.assertEqual(token, first.reply_token)
@@ -520,6 +600,7 @@ class ReviewSubmissionTests(unittest.TestCase):
                     self.assertFalse(change_page.answer_item(first.key, "An answer", token, status))
                     with self.assertRaisesRegex(question_record.AnswerRefused, "no longer accepts"):
                         _ = change_page.answer_item(first.key, "New answer", token, status)
+                reader.assert_called_once()
                 match kind:
                     case submissions.SubmissionKind.QUESTION:
                         answered, = self.questions()
@@ -628,13 +709,15 @@ class ReviewSubmissionTests(unittest.TestCase):
 
     def test_f003_proposal_requires_the_recipients_native_folder(self) -> None:
         eligible = {option["id"]: option["proposal"] for option in submissions.recipient_options(self.members)}
-        self.assertEqual(eligible, {OWNER: True, PRODUCER: False})
+        self.assertEqual(eligible, {OWNER: True, PRODUCER: True})
         _ = self.doc.write_text("# Builds\n> **Status: PRODUCTION — running.**\n")
         with self.assertRaisesRegex(submissions.SubmissionError, "native proposal folder"):
             _ = submissions.submit(request(submissions.SubmissionKind.PROPOSAL))
         self.assertFalse((self.root / "rust" / "hanadocs" / "issues").exists())
         eligible = {option["id"]: option["proposal"] for option in submissions.recipient_options(self.members)}
-        self.assertEqual(eligible, {OWNER: False, PRODUCER: False})
+        self.assertEqual(eligible, {OWNER: False, PRODUCER: True})
+        saved = submissions.submit(request(submissions.SubmissionKind.PROPOSAL, recipient=PRODUCER))
+        self.assertEqual(saved.path.parent, self.root / "state" / PRODUCER / "proposals")
 
     def test_f004_lookup_requires_one_selector(self) -> None:
         for lookup in (update_registration.find_review_question_in_folder, proposal_issue.find_review_proposal):
@@ -745,7 +828,7 @@ class ReviewSubmissionTests(unittest.TestCase):
             self.assertEqual(submissions.submit(payload), saved)
         self.assertEqual(saved.path.parent, self.issues)
         receipt = cast(dict[str, str], json.loads((submissions.image_folder(saved).parent / "receipt.json").read_text()))
-        self.assertEqual(receipt, {"id": "P1", "kind": "proposal", "recipient": OWNER,
+        self.assertEqual(receipt, {"destination": "native", "id": "P1", "kind": "proposal", "recipient": OWNER,
                                    "path": str(saved.path), "original_path": str(saved.path),
                                    "payload_hash": saved.payload_hash})
         self.assertEqual(list(new_folder.glob("*.md")), [])
@@ -788,19 +871,23 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(saved.id, "P1")
 
     def test_f012_retry_uses_the_native_path_after_wrap_moves_the_document(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, fixture_git_environment(self.root), clear=True)))
         active_doc = self.root / "docs" / "productions" / self.doc.name
         active_doc.parent.mkdir(parents=True)
         _ = active_doc.write_text(self.doc.read_text().replace(str(self.issues), "issues"))
         row = self.members.by_id(OWNER)
         assert row is not None
-        row = replace(row, doc=staff.LiveDoc(local_machine(), active_doc))
+        identity = staff.native_id(fixture_runtime_id("review-wrap-recovery"))
+        row = replace(row, id=identity, current_session=identity, doc=staff.LiveDoc(local_machine(), active_doc))
         active = staff.StaffSnapshot((row,))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=active))
+        _ = self.enterContext(patch.object(staff, "authority_snapshot", return_value=active))
+        _ = production_admission.capture_rollout_inventory([identity])
         production = read_production(row)
         native_folder = proposals_folder.issues_folder(active_doc)
         assert native_folder is not None
-        with patch.object(staff, "snapshot", return_value=active):
-            payload = replace(request(submissions.SubmissionKind.PROPOSAL), images=(IMAGE,))
-            saved = submissions.submit(payload)
+        payload = replace(request(submissions.SubmissionKind.PROPOSAL, recipient=identity), images=(IMAGE,))
+        saved = submissions.submit(payload)
         _ = active_doc.write_text(active_doc.read_text().replace("— running.**", "— wrapped.**"))
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
         _ = subprocess.run(["git", "-C", str(self.root), "add", "--", str(active_doc)], check=True)
@@ -814,17 +901,18 @@ class ReviewSubmissionTests(unittest.TestCase):
         wrapped_row = replace(row, doc=staff.WrappedDoc(local_machine(),
             self.root / "docs" / "archive" / self.root.name / row.name / active_doc.name))
         assert isinstance(wrapped_row.doc, staff.WrappedDoc)
-        with (patch.object(staff, "snapshot", return_value=active),
-              patch.object(staff, "set_doc", side_effect=OSError("Stop before the wrap commit.")) as set_doc,
+        with (patch.object(staff, "set_doc", side_effect=OSError("Stop before the wrap commit.")) as set_doc,
               patch.object(production_lifecycle, "checkout_ready", return_value=production_lifecycle.PlanLanded("fixture-tip")),
               patch.object(production_lifecycle, "merged_checkpoints", return_value=()),
               patch.object(production_lifecycle, "checked", side_effect=wrap_command)):
             with self.assertRaisesRegex(OSError, "Stop before the wrap commit"):
                 _ = production_lifecycle.wrap(production, active_doc.read_text().splitlines(), True,
                                               production_lifecycle.VerdictMissing(), production_lifecycle.VerdictMissing(), ())
-            set_doc.assert_called_once_with(OWNER, wrapped_row.doc)
+            set_doc.assert_called_once_with(identity, wrapped_row.doc, expected=row.doc)
         self.assertFalse(active_doc.exists())
         self.assertTrue(wrapped_row.doc.path.is_file())
+        text = wrapped_row.doc.path.read_text().replace("- **Proposals:** `issues`", "- **Proposals:** `new-issues`")
+        _ = wrapped_row.doc.path.write_text(text)
         self.assertNotEqual(proposals_folder.issues_folder(wrapped_row.doc.path), native_folder)
         self.assertEqual(submissions.submit(payload, members=staff.StaffSnapshot((wrapped_row,))), saved)
         self.assertEqual(saved.path.parent, native_folder.resolve())
@@ -1251,7 +1339,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         def fail_first_sync(path: Path) -> None:
             if path == self.issues and self.proposals() and not published.is_set():
                 published.set()
-                if not roll_back.wait(5):
+                if not roll_back.wait(TEST_HANG_GUARD_SECS):
                     raise AssertionError("The test did not release the first Send.")
                 raise OSError("Native publication failed.")
             sync_folder(path)
@@ -1272,15 +1360,19 @@ class ReviewSubmissionTests(unittest.TestCase):
               ThreadPoolExecutor(max_workers=2) as executor):
             first = executor.submit(submissions.submit, payload)
             try:
-                self.assertTrue(published.wait(5))
+                self.assertTrue(published.wait(TEST_HANG_GUARD_SECS), "the first Send did not publish the proposal")
                 second = executor.submit(retry)
-                self.assertEqual(retry_state.get(timeout=5), "request lock")
+                try:
+                    state = retry_state.get(timeout=TEST_HANG_GUARD_SECS)
+                except Empty:
+                    self.fail("the retry did not request the recipient lock")
+                self.assertEqual(state, "request lock")
                 self.assertFalse((folder / "receipt.json").exists())
             finally:
                 roll_back.set()
             with self.assertRaisesRegex(OSError, "Native publication failed"):
-                _ = first.result(timeout=5)
-            saved = second.result(timeout=5)
+                _ = LauncherHangGuard("first Send rollback").result(first)
+            saved = LauncherHangGuard("retry after rollback").result(second)
         self.assertEqual(saved.id, "P2")
         self.assertEqual(self.proposals()[0].path, saved.path)
         self.assertTrue((folder / "receipt.json").is_file())
@@ -2247,10 +2339,13 @@ class ReviewSubmissionTests(unittest.TestCase):
         archive = moved.parent / 'archive' / '2026'
         archive.mkdir(parents=True)
         archived = moved.rename(archive / moved.name)
-        with patch.object(investigation, 'review_record_paths', wraps=investigation.review_record_paths) as search:
+        with (patch.object(investigation, 'review_record_paths', wraps=investigation.review_record_paths) as search,
+              patch.object(review, "review_question", return_value=review.QuestionAccepted("Answer in the archive"))):
             self.assertTrue(submissions.answer(saved.key, 'Answer in the archive', token, members=wrapped))
+            self.assertEqual(search.call_args_list, [((PRODUCER,), {"strict": True})] * 2)
+            search.reset_mock()
             retry = submissions.submit(payload, members=wrapped)
-        self.assertEqual(search.call_args_list, [((PRODUCER,), {"strict": True})] * 2)
+            search.assert_called_once_with(PRODUCER, strict=True)
         self.assertEqual((retry.id, retry.owner, retry.path), (saved.id, PRODUCER, archived))
         self.assertEqual((retry.key, retry.reply_token), (saved.key, ""))
         self.assertTrue(new_item_dialog.matches_reply_token(retry.details, token))

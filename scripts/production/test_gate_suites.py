@@ -16,7 +16,7 @@ import select
 from types import SimpleNamespace
 from dataclasses import replace
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from collections.abc import Generator
 from unittest import mock
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records, placement
@@ -25,10 +25,11 @@ from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.release_waiter import LocalReleaseEvents
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import affected_modules, checkpoint_gate, gate
+from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.copies import copies
 from scripts.lib import git_index, process_group
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.test_times import gate_record
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
@@ -38,6 +39,12 @@ from scripts.production.test_gate_default_placement import placed
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    @override
+    def setUp(self) -> None:
+        environment = {**fixture_git_environment(self.fixture_root.parent), "GIT_CONFIG_SYSTEM": os.devnull}
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
+        super().setUp()
+
     @gate_suites("hooks")
     def test_finished_local_job_wins_when_polling_crosses_the_deadline(self) -> None:
         # The queue admission wait comes before the time limit starts.
@@ -297,10 +304,10 @@ class MergeGateSuitesTests(GateSuitesFixture):
                         self.assertEqual(output.getvalue().splitlines().count("full suite: no certified base"), 1)
                     else:
                         self.assertEqual(selected.paths, ("scripts/hooks/test_first.py",))
-                        self.assertIn("affected: 1 of 2 modules", output.getvalue())
+                        self.assertRegex(output.getvalue(), r"affected: 1 of 2 modules[^\n]+\(cache \d+ hits, \d+ misses;")
                 else:
                     self.assertEqual(routed, [])
-                    self.assertIn("affected: 0 of 2 modules", output.getvalue())
+                    self.assertRegex(output.getvalue(), r"affected: 0 of 2 modules[^\n]+\(cache \d+ hits, \d+ misses;")
                     self.assertIn("(none)", output.getvalue())
                 self.assertEqual(self.module_events(), [])
                 if decline:
@@ -1010,8 +1017,8 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(gate, "start_gate_job", side_effect=start_module),
               mock.patch.object(gate, "finish_gate_job", side_effect=finish_module),
               contextlib.redirect_stdout(output)):
-            code = gate.main(["--affected", "--repo", str(self.checkout),
-                              "--module", "lib/test_first.py", "--module", "lib/test_second.py"])
+            code = targeted_test.main(["--repo", str(self.checkout),
+                                       "--module", "lib/test_first.py", "--module", "lib/test_second.py"])
         self.assertEqual(code, 0, output.getvalue())
         admit.assert_called_once()
         self.assertEqual(len(reservations), 2)
@@ -1068,14 +1075,14 @@ patch.object(gate, "shared_cpu_pool", side_effect=AssertionError("child requeste
         self.assertIn("--module needs --tests-only", errors.getvalue())
 
     def test_gate_commands_refuse_abbreviated_options(self) -> None:
-        for arguments, short in (
-            (["--tests-on", "--full"], "--tests-on"),
-            (["--affected", "--ful"], "--ful"),
+        for main, arguments, short in (
+            (gate.main, ["--tests-on", "--full"], "--tests-on"),
+            (targeted_test.main, ["--ful"], "--ful"),
         ):
-            with (self.subTest(arguments=arguments),
+            with (self.subTest(command=main.__module__),
                   mock.patch.object(gate, "run_tests_only") as run,
                   contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as refusal):
-                _ = gate.main(arguments)
+                _ = main(arguments)
             self.assertEqual(refusal.exception.code, 2)
             self.assertIn(f"unrecognized arguments: {short}", errors.getvalue())
             run.assert_not_called()
@@ -1290,7 +1297,7 @@ class ChildImports(unittest.TestCase):
                         for path in caller_log.rglob("*")
                         if path.is_file() and path != caller_log / "keep"
                         for line in path.read_text().splitlines()]
-        self.assertEqual([record.get("kind") for record in gate_records], ["gate_run"])
+        self.assertEqual([record.get("kind") for record in gate_records], ["gate_folder_start", "gate_run"])
         self.assertEqual((caller_log / "keep").read_text(), "caller log")
         self.assertEqual(list((caller_log / "admission").glob("*.reservation")), [])
         self.assertEqual(list((caller_log / "admission").glob("*.waiting")), [])

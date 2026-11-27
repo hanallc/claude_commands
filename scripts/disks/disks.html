@@ -124,6 +124,7 @@ tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
 <body>
 <main>
   __PAGE_TITLE__
+  <p class="action-failure" id="measure-failure" role="alert" hidden></p>
   <div class="grid" id="drives"></div>
   <div class="grid" id="cards">
     <section class="card" id="sessions" hidden></section>
@@ -144,7 +145,7 @@ const INFO = icon("M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20M12 16v-4M12 8h.01");
 // Use the shared style and controls for session tooltips.
 const stepTip = (() => {
 __STEP_TIP_SCRIPT__
-  return {field, staffTitle, tipRowsHtml, hoverTips, roleName};
+  return {field, staffTitle, tipRowsHtml, hoverTips, staffName};
 })();
 
 function size(bytes) {
@@ -358,7 +359,7 @@ function sessionRows(report, keepBytes, limit) {
   };
   const state = row => row.state === "ended" ? '<span class="tag go">ended</span>'
     : `<span class="dim">${row.state === "running" ? "running" : "—"}</span>`;
-  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${stepTip.roleName(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
+  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${stepTip.staffName(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
     + `<td class="share">${row.size && largest ? `<i style="width:${(100 * row.size / largest).toFixed(1)}%"></i>` : ""}</td>`
     + `<td class="held">${held(row)}</td><td>${state(row)}</td></tr>`;
   const {shown, smaller} = sessionsAtLeast(report, limit);
@@ -519,7 +520,8 @@ function driveView(card) {
   return next => {
     drive = next;
     if (!drive.tree) {
-      card.innerHTML = headHtml(drive) + `<p class="problem">No folder sizes: ${esc(drive.error || "the measure gave no folders")}.</p>`;
+      card.innerHTML = headHtml(drive) + '<p class="problem" role="status" hidden></p>';
+      showActionFailure(card.querySelector(".problem"), `No folder sizes: ${drive.error || "the measure gave no folders"}.`);
       slider = null;
       return;
     }
@@ -676,14 +678,15 @@ function show(next) {
   if (data) render(); else { renderCards(); }
 }
 
-function setMeasuring(value,failure='') {
+function setMeasuring(value) {
   clearTimeout(measureTimer);
   measuring=value;
   document.getElementById("measure-now").disabled=Boolean(measuring);
-  pageRefresh.setStatus(measuring ? 'Measuring…' : '',failure);
+  pageRefresh.setBusy(measuring ? 'Measuring…' : '');
   if(measuring) measureTimer=setTimeout(()=>{
     pageRefresh.abandon();
-    setMeasuring(null,"The measure did not finish.");
+    setMeasuring(null);
+    showActionFailure(measureFailure, "The measure did not finish.");
   },settings.wait_seconds*1000);
 }
 
@@ -698,6 +701,8 @@ async function askMeasure(current,force=false) {
   const answer=await response.json();
   if(!current()) return;
   if(!response.ok) throw new Error(answer.reason || `HTTP ${response.status}`);
+  showActionFailure(measureFailure);
+  if(answer.staff_names) globalThis.staffNames?.set(answer.staff_names);
   sessionReport=answer.sessions || null;renderCards();
   if(force) measuring.target=answer.target;
   else if(answer.state!=="current" && !measuring)
@@ -707,19 +712,25 @@ async function askMeasure(current,force=false) {
 async function loadDisks(supersede=false,current=()=>true){
   await readData(current);
   if(!current()) return;
-  let failure='';
   try{if(!measuring) await askMeasure(current);}
-  catch(error){if(!data) throw error;failure=error.message;}
+  catch(error){
+    if(!current()) return;
+    if(!data) throw error;
+    showActionFailure(measureFailure,error.message);
+  }
   if(!current()) return;
   if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,answeredAt:Date.now()/1000,
-   busy:measuring ? 'Measuring…' : '',failure};
+   busy:measuring ? 'Measuring…' : ''};
 }
 const updateSessions = sessionsView(document.getElementById("sessions"));
 stepTip.hoverTips(document.getElementById("tip"), tipFor, fitSessionTip);
 __PAGE_REFRESH_SCRIPT__
+__ACTION_STATUS_SCRIPT__
 const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds);
+const measureFailure=document.getElementById("measure-failure");
 document.getElementById("measure-now").addEventListener("click",async()=>{
  if(measuring) return;
+ showActionFailure(measureFailure);
  pageRefresh.abandon();
  const press={since:Date.now()/1000,target:null};
  setMeasuring(press);
@@ -727,7 +738,11 @@ document.getElementById("measure-now").addEventListener("click",async()=>{
   await askMeasure(()=>measuring===press,true);
   if(measuring===press) await pageRefresh.refresh(true);
  }catch(error){
-  if(measuring===press){pageRefresh.abandon();setMeasuring(null,error.message);}
+  if(measuring===press){
+   pageRefresh.abandon();
+   setMeasuring(null);
+   showActionFailure(measureFailure,error.message);
+  }
  }
 });
 void pageRefresh.refresh();

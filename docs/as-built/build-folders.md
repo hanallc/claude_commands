@@ -281,3 +281,167 @@ The recheck uses the supplied scan and leaves the copy and its files in place.
 The unused inventory and the removal checks continue to treat the kept copy as in use after a clear result.
 
 See [Repository copies](copies.md) for the copy commands and [Worktrees](worktrees.md) for worktree removal.
+
+## Cleanup of places outside the model
+
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/disks/cleanup_old_folders.py` to list old places outside the model.
+On natedev, Nate runs the list by hand with sudo first.
+
+```sh
+sudo "$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"
+```
+
+With sudo, the parent checks processes of all users. Any unreadable process blocks removal.
+The parent starts only `setpriv`. The SSH child reads the time limit after it changes to the caller's user.
+The child uses `SUDO_UID` and `SUDO_GID` for all writes and removals.
+It starts with no supplementary groups or capabilities. The command refuses a root run without the sudo identity.
+The sudo list shows each gate folder that would move to disk. It shows the count and size of those folders.
+Review the list. When it has approved moves, it ends with three lines.
+The first gives the count and size of the folders that would move, for example `5 folders, 0.07 GiB, would move from memory to disk.`
+Then it prints `To move these folders, run:` and the complete sudo command.
+Copy the command to move the approved folders.
+Use the standard cleanup command for other removal rows.
+The command reads the configured places from `config/disks.conf`.
+The standard list approves removal only for places named by the cleanup settings and their side files.
+Other places found by the scans show `list only: no setting names it`.
+Each row shows the place, the machine, the size when measured, and the result of the checks.
+On natedev it also reads the Mac list over SSH. When SSH fails, the command shows the first error line if available.
+The Mac slot folder is list-only. Bob handles its removal by hand.
+`/build/sccache` is a shared tool cache from the system configuration. The cleanup lists it and keeps it.
+
+The command lists each direct entry under `roots.gate`.
+The list shows `t-` and `targeted-test-` rows first.
+A row includes its lock and lease files and shows its kind, size, newest modification time, lease state, and live use.
+The newest time includes the lock and lease files.
+If the command cannot read the gate root, it shows one kept row for that root and lists the other places.
+The standard list keeps a gate row that contains a `.git` file or folder at any depth.
+It also keeps a bare repository that it identifies by name.
+The standard list shows `holds a Git repository; manual review` for these rows.
+The sudo list can approve a move for a gate folder of a known kind.
+A `.git` file can move if its `gitdir` points inside the folder or to a missing path.
+An existing path outside the folder keeps the row for review.
+A `gitdir` with a `.` or `..` component or a symbolic link inside the folder also keeps the row.
+It keeps folders with an `objects/info/alternates` file at any depth and shows `Git alternates; manual review`.
+The target is `/build/claude/resources/shm-moved/<entry name>`. The child refuses an existing target.
+The sudo caller must own the source entries and the target parent.
+The child copies the folder and its lock and lease files into a staging folder with mode `0700`.
+It preserves modes, times, and hard links.
+It copies symbolic links as links. It copies FIFOs without opening them.
+A socket, device, or read-only directory keeps the source in place.
+The child compares the paths, types, sizes, file hashes, and link targets.
+The child renames the verified folder to the target first. It then renames the lock and lease files.
+If publication fails, the child returns the paths it published to staging.
+The child verifies the published copy again.
+The removal guard compares the proof's final path with the target on the approved list.
+It walks the source and runs the final live-use scan.
+It checks the published tree's path, identity, and entry stamps.
+It checks the copied side files just before it removes the source.
+The copy proof permits removal of the source only.
+The standard removal guard removes the lock and lease files after the source is gone.
+Cleanup can miss a write by a process with the same user ID between the entry's last check and source removal.
+A copy error keeps the source and the copy.
+The gate check uses file names and runs no Git commands.
+The command keeps other rows whose Git directory, registration, alternates, or local origin use the gate root's filesystem.
+These rows show `Git data in the gate root; manual review`.
+The command keeps every folder with a `run.json` recovery record.
+It keeps unknown entries, top-level links, mounts, and folders in use.
+It keeps orphan side files and entries with unreadable evidence.
+Without sudo, the process scan checks only the current user.
+On natedev, the parent uses `/proc` to check thread paths.
+It checks the working directory, root directory, executable, open files, and file mappings.
+If it finds a reference to the gate filesystem through a path outside the gate root, it keeps every gate row.
+The list shows `gate root open through another path; live use not provable`.
+The command keeps a row if any entry belongs to another user.
+It also keeps a row if the lease start identity is invalid.
+A folder that passes the checks shows `would remove if named` when `cleanup.dead` does not name it.
+The summary first shows the combined count and GiB of `t-` and `targeted-test-` rows that would remove if named.
+It then shows the count and GiB by kind and result.
+It also shows the count and GiB for each reason it keeps a row.
+
+On natedev, the list finds `.saved-target-*` folders directly in `~/rust`.
+It also checks `~/worktrees` and its subfolders to a depth of three for saved targets.
+It checks each saved target for use and verifies the inner `target` folder.
+The check accepts known Cargo, cargo-mend, rust-analyzer, Hana test, and nextest output.
+The check reads known cargo-mend executable links without following them.
+The check reads every entry under `target`.
+It checks the entry type for each known name and requires regular files for output pairs.
+Unknown output, other links, or extra entries beside `target` keep the folder for review.
+Each configured `/build/p-*` row includes its `.lease.json` and `.lock` files.
+The Mac row for `~/worktrees/claude-prioritize-index-refresh` also includes these files.
+The command keeps the folder and both files if the lease PID is alive.
+Cleanup takes the folder lock without waiting before it removes the folder.
+The removal guard checks the held lock again before deleting each side file.
+It removes the lease file before the lock file.
+
+On natedev, the command also lists old `p-*` folders and old places directly under `~/worktrees`.
+The command reads a link's target text before it checks whether the target exists.
+It keeps links into protected paths without reading those targets.
+For a live target, the command keeps the link if a process uses it in `PWD` or a staff row names it.
+Other `PWD` read errors and staff record errors keep live links.
+Removal unlinks the checked link and leaves its target in place.
+Side files with an existing base entry stay with that entry.
+Orphan side files are list-only. Their rows show lease or lock problems.
+Discovered real folders outside the model are list-only unless a cleanup setting names them.
+The list names the process and its staff row when it finds use.
+For other real folders, it shows the Git branch, dirty file count, and unpushed commit count when available.
+
+The list checks each path, its identity, and mounts. It keeps model folders for known repositories and their parents.
+The list keeps folders with open files, a live lease, or a held lock. It also checks leases in child folders.
+The command reads `/proc` when it is available. Otherwise it uses `lsof`.
+Each machine checks processes of the user that runs the command.
+The list header names the local user and says it does not check other users' processes.
+An incomplete process scan keeps configured folders, worktree links, and orphan side files.
+Missing file descriptor or environment data keeps the scan incomplete while the process still exists.
+The list header and keep reason name each unreadable process by PID and command.
+The list shows whether a Git checkout is dirty, its unpushed commit count, and whether it has a stash.
+The command reads the checkout's Git config as text before it runs Git.
+It keeps a checkout with an include and does not run Git on it.
+The command checks Git metadata without following links. It keeps a row for review if the metadata contains a link.
+Git pointers must stay within the row and its named registration.
+Git skips system and global config during cleanup, including when it saves a checkout.
+Cleanup disables Git hooks, file monitoring, and configured ignore and attributes files.
+A local Git config value that names a protected path keeps the row for review.
+Cleanup checks that Git uses the row path as its worktree root before it runs Git status.
+The list keeps bare repositories, folders with nested Git metadata, and clones with no local source.
+The list shows a clone's local origin and keeps the clone if another repository uses its Git objects.
+The digest covers the rows, Git state, and stash reflog commit IDs.
+Cleanup skips `~/rust/hanadocs`, `/build/cargo`, and `/build/old-*` before it reads their folders or Git metadata.
+On natedev, setup reads the names in `/build` and checks each protected entry without following links.
+It stops if a protected entry is a link or is not a directory.
+The child checks files, runs Git, and removes approved rows inside a `bwrap` mount namespace.
+The namespace puts an empty, read-only filesystem over each existing protected folder.
+If `bwrap` cannot set up the namespace, the command stops before the scan.
+The child checks the names in `/build` before and after the scan. It refuses the list if a protected name has no mask.
+The child checks those names again before it starts Git or calls the removal guard.
+The parent reads the process table. It compares mapped paths and link targets as bytes.
+It checks the descriptors, working directory, and root of each live task.
+For a single folder, it stops checking a process when it finds a use of that folder.
+An unreadable task makes the process scan incomplete. The scan skips tasks and descriptors that disappear before the read.
+It checks each path as printed and without a trailing ` (deleted)`.
+It checks every combination of literal `\012` and newline for each of those paths.
+More than four `\012` sequences in one path make the process scan incomplete.
+The temporary sweep, build sweep, and cleanup use the same rules to decode process paths.
+Both sweeps keep entries when the process scan is incomplete.
+The parent calls the Mac over SSH, checks the digest, and prints the list.
+The table quotes folder paths, sidecar names, and Git paths. A list-only row also shows any scan error.
+Only Nate runs the command with `--go <digest>` by hand. Use sudo on natedev for the gate moves.
+No timer, service, hook, or session runs it.
+The command checks the fresh list against the digest. The Mac checks its own part of the list before removal.
+The removal guard checks every approved entry under the folder locks before the first deletion.
+After this check, the child requests a fresh process check with the locks held. It keeps the row if use is found or the scan is incomplete.
+The process check includes the Git registration. It also counts processes that name a path in `PWD`.
+It removes the `.git` entry after the other checkout entries.
+The child checks side files again with the lock held before it removes them.
+It keeps the side files if a process uses one or the scan is incomplete.
+If removal stops after a deletion, the command lists each entry it deleted.
+The child sends each removal result at once. The parent prints each result even if the child stops during a later removal.
+It saves a registered linked worktree to `refs/rescue` in its source repository.
+It checks the stash reflog again after the save.
+The list and removal both keep a Git-locked worktree.
+The guard removes only the approved worktree entries and the selected worktree's registration.
+The list names the registration under the source repository's `.git/worktrees/`. The digest covers that path.
+It saves a clone and pushes the saved commit and its unpublished branches to `refs/rescue/<place>/` in the local origin.
+The command checks those refs in the origin. It keeps the clone if any save, push, or check fails.
+The clone check reads Git object alternates under `~/rust`, `~/worktrees`, and the configured build root.
+It skips absent rows before it resolves repository paths.
+The check reads the immediate children of `~/rust`. It scans the other two roots to seven levels.

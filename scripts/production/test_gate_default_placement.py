@@ -7,6 +7,7 @@ from dataclasses import replace
 import io
 import os
 from pathlib import Path
+import runpy
 import shlex
 import signal
 import subprocess
@@ -80,7 +81,12 @@ def run_aws_handoff_fixture(arguments: list[str], mode: gate.SuiteMode) -> None:
           mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
           mock.patch.object(first_step, "admitted_run") as admit,
           mock.patch.object(gate, "run_tests_only", return_value=0) as run):
-        assert gate.main() == 0
+        if Path(sys.argv[0]).name == "merge_gate.py":
+            with unittest.TestCase().assertRaises(SystemExit) as status:
+                _ = runpy.run_path(str(REPOSITORY / "scripts/production/merge_gate.py"), run_name="__main__")
+            assert status.exception.code == 0
+        else:
+            assert gate.main() == 0
     admit.assert_not_called()
     run.assert_called_once()
     args, actual_mode, target = cast(tuple[gate.GateArguments, gate.SuiteMode, gate.GateTarget], run.call_args.args)
@@ -102,6 +108,7 @@ def run_held_direct_gate(ready: Path, arguments: list[str]) -> int:
     # The tests-only route still has a legacy SIGTERM handler. Test owner exit without it.
     with (mock.patch.object(gate, 'unwind_gate_on_sigterm', nullcontext),
           mock.patch.object(gate, 'run_tests_only', side_effect=hold),
+          mock.patch.object(gate, 'gate_production', return_value=ready.parent),
           mock.patch.object(gate, 'merge_checkpoint', side_effect=hold_placed),
           mock.patch.object(gate, 'nightly', side_effect=hold_placed),
           mock.patch.object(gate, '_nightly_unit', return_value='fixture'),
@@ -222,6 +229,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                       mock.patch.object(gate, 'current_gate_placement',
                                         side_effect=[gate.NO_GATE_ASSIGNMENT, placed('natedev')]),
                       mock.patch.object(gate, 'run_tests_only', side_effect=interrupt),
+                      mock.patch.object(gate, 'gate_production', return_value=Path.cwd()),
                       mock.patch.object(gate, 'merge_checkpoint', side_effect=interrupt_placed),
                       mock.patch.object(gate, 'nightly', side_effect=interrupt_placed),
                       mock.patch.object(gate, '_nightly_unit', return_value='fixture'),
@@ -292,23 +300,23 @@ class GateDefaultPlacementTests(unittest.TestCase):
             cancel.assert_called_once()
 
     def test_gate_step_hands_off_its_aws_assignment(self) -> None:
-        self.check_gate_step_aws_handoff("--tests-only", gate.SuiteMode.GATE)
+        self.check_gate_step_aws_handoff("gate.py")
 
-    def test_gate_step_hands_off_its_aws_assignment_in_affected_mode(self) -> None:
-        self.check_gate_step_aws_handoff("--affected", gate.SuiteMode.TARGETED)
+    def test_gate_step_hands_off_its_aws_assignment_to_merge_gate(self) -> None:
+        self.check_gate_step_aws_handoff("merge_gate.py")
 
-    def check_gate_step_aws_handoff(self, flag: str, mode: gate.SuiteMode) -> None:
+    def check_gate_step_aws_handoff(self, entrypoint: str) -> None:
         with TemporaryDirectory() as folder:
             source = Path(folder).resolve()
-            script = Path("scripts/production/gate.py")
-            arguments = [flag, "--repo", str(source)]
+            script = Path("scripts/production") / entrypoint
+            arguments = ["--tests-only", "--repo", str(source)]
             command = [sys.executable, "-B", str(script), *arguments]
             (source / script).parent.mkdir(parents=True)
             _ = (source / script).write_text(dedent(f"""\
                 from scripts.production.gate import SuiteMode
                 from scripts.production.test_gate_default_placement import run_aws_handoff_fixture
 
-                run_aws_handoff_fixture({arguments!r}, SuiteMode.{mode.name})
+                run_aws_handoff_fixture({arguments!r}, SuiteMode.GATE)
                 """))
             assignment = placed("aws")
             admitted = inherited_admission(assignment)
@@ -437,6 +445,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                       mock.patch.object(gate, 'current_gate_placement',
                                         side_effect=[gate.NO_GATE_ASSIGNMENT, placed('natedev')]),
                       mock.patch.object(gate, 'run_tests_only', side_effect=run),
+                      mock.patch.object(gate, 'gate_production', return_value=Path.cwd()),
                       mock.patch.object(gate, 'merge_checkpoint', side_effect=merge),
                       mock.patch.object(gate, 'test_run_folder', return_value=nullcontext()),
                       mock.patch.object(scratch, 'copy_lock', return_value=nullcontext()),

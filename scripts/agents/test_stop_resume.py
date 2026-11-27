@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from enum import Enum
 from functools import partial
+from hashlib import sha256
 from pathlib import Path
 from threading import Barrier, Lock, local
 from typing import Literal, Never, cast, final, override
@@ -99,8 +100,10 @@ class ProducerAdmissionWorld:
         return self.pane
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
-                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
-        del name, timeout_ms
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *,
+                    publication: herdr.LaunchPublicationTiming = herdr.LaunchPublicationTiming.ON_START,
+                    ) -> herdr.PromptSubmissionNotRequired:
+        del name, timeout_ms, publication
         self.openings.append(opening)
         if kind != self.kind or pane != self.pane:
             raise AssertionError("unexpected producer launch")
@@ -130,7 +133,7 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
         case.setUp()
         world = ProducerAdmissionWorld(case, kind)
         staff_configuration = case.root / "configuration/staff.conf"
-        _ = write_config_fixture(staff_configuration, f"PRODUCER_FOLDER_ROOT={world.folder.parent}\n")
+        _ = write_config_fixture(staff_configuration, f"producer_folder_root={world.folder.parent}\n")
         configuration = case.root / "configuration/models.conf"
         _ = write_registry(configuration, {"producers": {"dwight": kind + (":opus:high" if kind == "claude" else ":gpt-test:high")}}, update=True)
         result = case.client.result
@@ -1106,17 +1109,17 @@ class StopResumeTests(unittest.TestCase):
     def test_shutdown_uses_committed_values_and_keeps_the_recovery_warning(self) -> None:
         config = self.root / "committed-config"
         path = config / "shutdown.conf"
-        atomic_file.write_text_atomic(path, "# range: 5e-324..\nSTOP_GRACE_SECONDS=.2\n# range: 5e-324..\nKILL_GRACE_SECONDS=.3\n")
+        atomic_file.write_text_atomic(path, "# range: 5e-324..\nstop_grace_seconds=.2\n# range: 5e-324..\nkill_grace_seconds=.3\n")
         for args in (("init", "-q"), ("add", "shutdown.conf"),
                      ("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "settings")):
             _ = subprocess.run(["git", "-C", str(config), *args], capture_output=True, check=True)
-        atomic_file.write_text_atomic(path, "# range: 5e-324..\nSTOP_GRACE_SECONDS=bad\n# range: 5e-324..\nKILL_GRACE_SECONDS=.3\n")
+        atomic_file.write_text_atomic(path, "# range: 5e-324..\nstop_grace_seconds=bad\n# range: 5e-324..\nkill_grace_seconds=.3\n")
         self.process.side_effect = self.alive_until_kill
         self.live.return_value = sessions.LiveSessionProcess(123)
         with patch.dict(os.environ, {"CONF_DIR": str(config)}), redirect_stderr(io.StringIO()) as warnings:
             result = stop_resume.stop(self.entry["session_id"])
         self.assertIsInstance(result, stop_resume.Stopped)
-        self.assertIn("STOP_GRACE_SECONDS='bad'", warnings.getvalue())
+        self.assertIn("stop_grace_seconds='bad'", warnings.getvalue())
         self.assertAlmostEqual(self.clock.elapsed, .2)
 
     def test_worker_stops_share_the_outer_deadline_concurrently(self) -> None:
@@ -1125,7 +1128,7 @@ class StopResumeTests(unittest.TestCase):
                                    current_session=staff.StaffId(f"native-{i}")) for i in range(3))
         states = [worker_panes.OpenWorker(row, row.name, row.name, herdr.AgentStatus.WORKING) for row in rows]
         config = self.root / "config"
-        atomic_file.write_text_atomic(config / "shutdown.conf", "# range: 5e-324..\nSTOP_GRACE_SECONDS=.25\n# range: 5e-324..\nKILL_GRACE_SECONDS=.5\n")
+        atomic_file.write_text_atomic(config / "shutdown.conf", "# range: 5e-324..\nstop_grace_seconds=.25\n# range: 5e-324..\nkill_grace_seconds=.5\n")
         joined = Barrier(3)
         def stop(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
             del row, client
@@ -1151,7 +1154,7 @@ class StopResumeTests(unittest.TestCase):
             self.clock.elapsed = 0
             config = self.root / "config"
             atomic_file.write_text_atomic(config / "shutdown.conf",
-                f"# range: 5e-324..\nSTOP_GRACE_SECONDS={stop_grace}\n# range: 5e-324..\nKILL_GRACE_SECONDS={kill_grace}\n")
+                f"# range: 5e-324..\nstop_grace_seconds={stop_grace}\n# range: 5e-324..\nkill_grace_seconds={kill_grace}\n")
             def read(identity: str, _kind: str = "") -> herdr.LiveConversation:
                 self.advance(10)
                 _ = joined.wait(timeout=5)
@@ -1245,14 +1248,17 @@ class StopResumeTests(unittest.TestCase):
 
     def test_unusable_shutdown_values_send_no_signal_or_start(self) -> None:
         config = self.root / "config"
-        for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "START_SECONDS", "STAY_SECONDS"):
-            values = {name: "1" for name in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "START_SECONDS", "STAY_SECONDS")}
+        for key in ("stop_grace_seconds", "kill_grace_seconds", "start_seconds", "stay_seconds"):
+            values = {name: "1" for name in ("stop_grace_seconds", "kill_grace_seconds", "start_seconds", "stay_seconds")}
             values[key] = "0"
             atomic_file.write_text_atomic(config / "shutdown.conf", "\n".join(f"# range: 5e-324..\n{name}={value}" for name, value in values.items()))
             with (self.subTest(key=key), patch.dict(os.environ, {"CONF_DIR": str(config)}),
                   patch.object(stop_resume, "_signal_process") as send,
                   patch.object(stop_resume, "_start_session") as start):
-                result = stop_resume.stop(self.entry["session_id"]) if "GRACE" in key else stop_resume.resume(self.entry["session_id"])
+                if key.endswith("_grace_seconds"):
+                    result = stop_resume.stop(self.entry["session_id"])
+                else:
+                    result = stop_resume.resume(self.entry["session_id"])
             self.assertIsInstance(result, (stop_resume.StopFailed, stop_resume.ResumeFailed))
             self.assertIn(key, str(result))
             self.assertIn(str(config / "shutdown.conf"), str(result))
@@ -2082,6 +2088,18 @@ class StopResumeTests(unittest.TestCase):
         self.start.assert_not_called()
         self.kill.assert_not_called()
 
+    def test_resume_accepts_the_configured_alias_for_the_local_machine(self) -> None:
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
+            current_session=identity, worktree=staff.PresentWorktree("mac", self.root),
+            unit_type=staff.UnitDetails("direct"))
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(remote, "local_machine", return_value="Nates-MacBook-Pro-2023"),
+              patch.object(remote, "this_machine", return_value="mac")):
+            result = stop_resume.resume(str(row.id))
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.start.assert_called_once()
+
     def test_codex_record_uses_workers_home_without_claude_trust(self) -> None:
         _ = write_registry(self.root / "configuration/models.conf", {"producers": {"alpha": "codex:gpt-test:high"}}, update=True)
         identity = self.entry["session_id"]
@@ -2751,8 +2769,8 @@ class StopResumeTests(unittest.TestCase):
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             _ = write_config_fixture(configuration / source.name)
         write_machine_config(configuration)
-        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
-        _ = write_config_fixture(configuration / "shutdown.conf", "START_SECONDS=20\nSTOP_GRACE_SECONDS=2\n")
+        _ = write_config_fixture(configuration / "staff.conf", "producer_workspace=producers\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", "start_seconds=20\nstop_grace_seconds=2\n")
         _ = write_registry(configuration / "models.conf", {"producers": {
             "alpha": "claude:opus:max", "renamed-alpha": "claude:opus:max",
             "TEST-account-home": "claude:opus:max", "row-name": "claude:opus:max",
@@ -2848,10 +2866,10 @@ class StopResumeTests(unittest.TestCase):
     def advance(self, seconds: float) -> None:
         self.clock.elapsed += seconds
 
-    def observe(self, session: str, registry: sessions.RegistryRead | None = None
+    def observe(self, session: str, registry: sessions.RegistryRead | None = None, *, deadline: float = math.inf
                 ) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
         if registry is not None:
-            return session_records.session_liveness(session, registry=registry)
+            return session_records.session_liveness(session, registry=registry, deadline=deadline)
         return sessions.LiveSessionProcess(456) if session in self.launched else cast(
             sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown, self.live(session))
 
@@ -3175,6 +3193,37 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(result, stop_resume.ResumeFailed(row.current_session, "pane list denied"))
         self.start.assert_not_called()
 
+    def test_stopped_unit_resumes_when_an_unreadable_record_belongs_to_another_session(self) -> None:
+        parent = fixture_member("showrunner", name="unit-owner")
+        row = fixture_member("unit", name="alpha", parent=parent.id, runtime_id=self.entry["session_id"],
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        place = herdr.HerdrPlace("agents", self.entry["pane_id"])
+        shell = herdr.HerdrProcess(998042, place, {"CLAUDE_CODE_SESSION_ID": row.current_session},
+                                   "zsh", str(self.root))
+        directory = sessions.sessions_dir()
+        other = directory / "4242.json"
+        contents = json.dumps({"pid": 4242, "sessionId": fixture_runtime_id("other-session"), "procStart": "generation-1"})
+        _ = other.write_text(contents)
+
+        def start(*_command: str) -> str:
+            _ = (directory / "456.json").write_text(json.dumps({
+                "pid": 456, "sessionId": row.current_session, "procStart": "generation-1",
+                "name": row.name, "messagingSocketPath": "", "updatedAt": 2,
+            }))
+            return ""
+
+        self.start.side_effect = start
+        with (patch.object(time, "monotonic", lambda: self.clock.elapsed),
+              patch.object(sessions, "session_liveness", session_records.session_liveness),
+              patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+              patch.object(herdr, "herdr_processes", return_value=[shell])):
+            result = stop_resume.resume(str(row.id), to="claude4")
+        self.assertIsInstance(result, stop_resume.ClaudeUp, result)
+        assert isinstance(result, stop_resume.ClaudeUp)
+        self.assertEqual((result.pane_id, result.session_id, result.account), (place.pane, row.current_session, "claude4"))
+        self.assertEqual(other.read_text(), contents)
+        self.start.assert_called_once()
+
     def test_stopped_unit_resumes_in_its_pane_with_a_detached_holder(self) -> None:
         from scripts.production.fake_unit_host import process
 
@@ -3207,7 +3256,7 @@ class StopResumeTests(unittest.TestCase):
         ancestry = herdr.ProcessAncestry({holder: shell}, {shell: 34816, holder: 34816})
         shell_process = herdr.HerdrProcess(shell, place, {"CLAUDE_CODE_SESSION_ID": row.current_session},
                                           "zsh", str(self.root), ancestry)
-        _ = write_config_fixture(self.root / "configuration/shutdown.conf", "HOLDER_EXIT_SECONDS=.25\n")
+        _ = write_config_fixture(self.root / "configuration/shutdown.conf", "holder_exit_seconds=.25\n")
         for command, runs_agent, exits_after_wait, expected_wait in (
                 ("node", True, False, 0.0),
                 ("python3", False, False, 0.25),
@@ -5022,6 +5071,129 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(len(self.client.prompts), 1)
         self.assertEqual(errors.getvalue(), "")
 
+    def test_resume_rereads_another_sessions_registry_write(self) -> None:
+        directory = sessions.sessions_dir()
+        rewriting = directory / "4242.json"
+        _ = rewriting.write_text("{")
+        other = fixture_runtime_id("another registry session")
+        _ = (directory / "4243.json").write_text(json.dumps({
+            "pid": 4243, "sessionId": other, "procStart": "generation-1",
+        }))
+        finished = json.dumps({"pid": 4242, "sessionId": other, "procStart": "generation-1",
+                               "name": "other", "messagingSocketPath": "", "updatedAt": 1})
+        policy = sessions.retry_policy()
+        read_text = Path.read_text
+        reads = 0
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            nonlocal reads
+            if path == rewriting:
+                reads += 1
+                if reads == policy.registry_reads + 1:
+                    _ = rewriting.write_text(finished)
+            return read_text(path, encoding=encoding, errors=errors)
+
+        identity = self.entry["session_id"]
+
+        def start(*_command: str) -> str:
+            _ = (directory / "456.json").write_text(json.dumps({
+                "pid": 456, "sessionId": identity, "procStart": "generation-1",
+                "name": "alpha", "messagingSocketPath": "", "updatedAt": 2,
+            }))
+            return ""
+
+        self.start.side_effect = start
+        with (patch.object(time, "monotonic", lambda: self.clock.elapsed),
+              patch.object(Path, "read_text", read),
+              patch.object(sessions, "session_liveness", session_records.session_liveness)):
+            result = stop_resume.resume("alpha", why="maintenance")
+        self.assertEqual(result, stop_resume.ClaudeUp(identity, "w1:p2", "claude3"))
+        self.assertGreater(reads, policy.registry_reads)
+        self.start.assert_called_once()
+
+    def test_resume_refuses_an_unreadable_possible_target_record(self) -> None:
+        identity = self.entry["session_id"]
+        path = sessions.sessions_dir() / "4242.json"
+        for contents in ("{", json.dumps({"pid": 4242, "sessionId": identity, "procStart": "generation-1"})):
+            with (self.subTest(contents=contents),
+                  patch.object(sessions, "session_liveness", session_records.session_liveness)):
+                _ = path.write_text(contents)
+                result = stop_resume.resume("alpha", why="maintenance")
+                self.assertEqual(result, stop_resume.ResumeFailed(identity, f"session registry unreadable: {path}"))
+        self.start.assert_not_called()
+
+    def test_resume_keeps_the_first_registry_error_when_the_retry_reaches_the_deadline(self) -> None:
+        identity = self.entry["session_id"]
+        first_file = sessions.sessions_dir() / "4242.json"
+        reason = f"session registry unreadable: {first_file}"
+        _ = first_file.write_text("{")
+        first = sessions.SessionLivenessUnknown(reason, (first_file,))
+        policy = sessions.SessionRetryPolicy(4, 0.125)
+        for limit, extra_delay, reads in ((0.125, 0.0, 0), (0.25, 0.125, 0), (0.25, 0.0, 1)):
+            self.clock.elapsed = 0
+
+            def sleep(delay: float) -> None:
+                self.advance(delay + extra_delay)
+
+            with (self.subTest(limit=limit, extra_delay=extra_delay),
+                  patch.object(time, "monotonic", lambda: self.clock.elapsed),
+                  patch.object(time, "sleep", side_effect=sleep),
+                  operation_deadline.within(limit),
+                  patch.object(sessions, "session_liveness", return_value=first) as observe,
+                  patch.object(sessions, "retry_policy", return_value=policy),
+                  patch.object(session_records, "retry_policy", return_value=policy),
+                  patch.object(sessions, "read_registry", wraps=sessions.read_registry) as read):
+                result = stop_resume.resume("alpha")
+            self.assertEqual(result, stop_resume.ResumeFailed(identity, reason))
+            observe.assert_called_once_with(identity)
+            self.assertEqual(read.call_count, reads)
+            self.assertLessEqual(self.clock.elapsed, limit)
+        self.start.assert_not_called()
+
+    def test_resume_keeps_the_first_registry_error_when_startup_cannot_fit_a_retry(self) -> None:
+        identity = self.entry["session_id"]
+        unreadable = sessions.sessions_dir() / "4242.json"
+        reason = f"session registry unreadable: {unreadable}"
+        _ = write_config_fixture(self.root / "configuration/shutdown.conf", "start_seconds=0.625\nstop_grace_seconds=2\n")
+        read_text = Path.read_text
+        for poll_first, registry_reads in ((False, 1), (False, 4), (True, 1), (True, 4)):
+            self.clock.elapsed = 0
+            self.launched.clear()
+            unreadable.unlink(missing_ok=True)
+            reads = 0
+
+            def start(*_command: str) -> str:
+                if not poll_first:
+                    _ = unreadable.write_text("{")
+                return ""
+
+            def sleep(delay: float) -> None:
+                if poll_first and self.clock.elapsed == 0 and delay == 0.5:
+                    _ = unreadable.write_text("{")
+                self.advance(delay)
+
+            def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                nonlocal reads
+                if path == unreadable:
+                    reads += 1
+                return read_text(path, encoding=encoding, errors=errors)
+
+            self.start.side_effect = start
+            policy = sessions.SessionRetryPolicy(registry_reads, 0.75)
+            with (self.subTest(poll_first=poll_first, registry_reads=registry_reads),
+                  patch.object(time, "monotonic", lambda: self.clock.elapsed),
+                  patch.object(time, "sleep", side_effect=sleep),
+                  patch.object(Path, "read_text", read),
+                  patch.object(sessions, "session_liveness", session_records.session_liveness),
+                  patch.object(sessions, "retry_policy", return_value=policy),
+                  patch.object(session_records, "retry_policy", return_value=policy),
+                  patch.object(sessions, "read_registry", wraps=sessions.read_registry) as retry):
+                result = stop_resume.resume("alpha")
+                self.assertEqual(result, stop_resume.ResumeFailed(identity, reason))
+                self.assertEqual(reads, 1)
+                self.assertEqual(self.clock.elapsed, 0.5 if poll_first else 0)
+                retry.assert_not_called()
+
     def test_resume_reports_identity_failure_once_at_the_deadline(self) -> None:
         errors = io.StringIO()
         identity = staff.StaffId(self.entry["session_id"])
@@ -5035,7 +5207,7 @@ class StopResumeTests(unittest.TestCase):
             result = stop_resume.resume("alpha", why="maintenance")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         self.assertGreater(observed.call_count, 1)
-        self.assertEqual(self.clock.elapsed, conf.read("shutdown").number("START_SECONDS"))
+        self.assertEqual(self.clock.elapsed, conf.read("shutdown").number("start_seconds"))
         self.assertEqual(self.client.prompts, [])
         self.assertEqual(errors.getvalue().splitlines(), [
             f"{self.entry['session_id']}: prompt identity anomaly: registry unavailable"])
@@ -5233,6 +5405,23 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.client.closed, [])
         self.assertEqual(self.client.started, [])
 
+    def test_resume_standalone_claude_preserves_its_implicit_home(self) -> None:
+        home = self.root / "source-home"
+        home.mkdir()
+        session = self.entry["session_id"]
+        row = staff.create_session("alpha", session, staff.SessionLaunchFolder(remote.local_machine(), self.root),
+                                   staff.SessionHome(home / ".claude"))
+        entry = pane_record.launch("w1:p2", session, str(self.root), {"HOME": str(home)}, ["claude", "-n", "alpha"])
+        pane_record.write("agents", entry)
+        resumed = stop_resume.resume("alpha", why="maintenance")
+        self.assertIsInstance(resumed, stop_resume.ClaudeUp, resumed)
+        command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+        self.assertIn(f"HOME={home}", command)
+        self.assertEqual(command[command.index("CLAUDE_CONFIG_DIR") - 1], "-u")
+        self.assertFalse(any(part.startswith("CLAUDE_CONFIG_DIR=") for part in command))
+        self.assertEqual(command[command.index("exec") + 1], "claude")
+        self.assertIsInstance(herdr.claude_trust(self.root, home / ".claude.json"), herdr.Trusted)
+        self.assertEqual(staff.snapshot().by_id(row.id), row)
 
     def test_resume_launches_in_the_saved_move_destination(self) -> None:
         from scripts.worktree import worktrees
@@ -5275,7 +5464,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_resume_returns_before_the_stay_window_and_detaches_its_generation(self) -> None:
         result = stop_resume.resume("alpha", why="maintenance")
-        self.assertLess(self.clock.elapsed, conf.read("shutdown").number("STAY_SECONDS"))
+        self.assertLess(self.clock.elapsed, conf.read("shutdown").number("stay_seconds"))
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         arguments = cast(list[str], self.detach.call_args.args[0])
         self.assertEqual(arguments[:3], ["stay", "--session", "019b3a40-4250-7000-8000-000000000102"])
@@ -5299,39 +5488,86 @@ class StopResumeTests(unittest.TestCase):
             result, log = self.run_stay_child()
         self.assertEqual(result, 1)
         self.assertIn("stopped 0.6 s", log)
-        self.assertLess(self.clock.elapsed, conf.read("shutdown").number("STAY_SECONDS"))
+        self.assertLess(self.clock.elapsed, conf.read("shutdown").number("stay_seconds"))
         push.assert_called_once()
-        self.assertTrue(cast(str, push.call_args.args[1]).startswith("resume-ended:"))
+        key = sha256("\0".join([self.entry["session_id"], "claude3", "generation-1"]).encode()).hexdigest()
+        text, actual_key = cast(tuple[RenderedPush, str], push.call_args.args)
+        self.assertEqual(actual_key, f"resume-ended:{key}")
+        self.assertEqual(text.title, "alpha did not start on claude3")
+        self.assertEqual(text.message, "Action: In the natedev session, run: /agents resume alpha --to claude3")
         self.start.assert_not_called()
 
-    def test_early_exit_tells_showrunner_pushes_except_probe_and_enters_watchdog(self) -> None:
+    def test_early_exit_tells_showrunner_and_pushes_on_unsuccessful_unit_recovery(self) -> None:
         from scripts.production import showrunners, staff_sources
         from scripts.accounts import unit_watchdog
         identity = staff.StaffId(self.entry["session_id"])
         owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity, unit_type=staff.UnitDetails("direct"))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))))
-        for probe in (False, True):
-            for outcome in ("watchdog: alpha restarted on claude3",
-                            "watchdog: alpha: folder no longer exists; restore dropped"):
-                with self.subTest(probe=probe, outcome=outcome):
-                    self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1" if probe else "0"
-                    pane_record.write("agents", self.entry)
-                    with (patch.object(staff_sources, "unit_parent", return_value=staff_sources.UnitProduction("demo", str(self.root / "production.md"))),
-                          patch.object(showrunners, "tell", return_value="told demo") as tell,
-                          patch.object(stop_resume, "_send_move_push") as push,
-                          patch.object(unit_watchdog, "run", return_value=[outcome]) as recovery):
-                        result, log = self.run_stay_child(requester="other")
-                        self.assertEqual(result, 1)
-                        tell.assert_called_once()
-                        self.assertEqual(tell.call_args.args[0], "demo")
-                        line = cast(str, tell.call_args.args[2])
-                        self.assertEqual(line, f"alpha stopped 0.6 s after its move or resume to claude3; {outcome}")
-                        self.assertIn(line, log)
-                        self.assertEqual(push.call_count, 0 if probe else 1)
-                        if not probe:
-                            self.assertEqual(cast(RenderedPush, push.call_args.args[0]).values["cause"], line)
-                        recovery.assert_called_once()
-                    self.clock.elapsed = 0.0
+        cases = [
+            (False, "watchdog: alpha: restarted on claude3", None, True),
+            (False, "watchdog: alpha was down since 06:05 AST; restarted on claude4", None, True),
+            (False, "watchdog: alpha-other: restarted on claude3", None, False),
+            (False, "watchdog: demo/alpha: restart failed", None, False),
+            (False, "watchdog: alpha was down since 06:05 AST; restarted on claude4; "
+             + "retry from claude3's pane launch", None, True),
+            (False, "", None, True),
+            (False, "", None, False),
+            (False, "", herdr_types.HerdrFailure("unreadable state"), False),
+            (False, "", herdr_types.HerdrFailure("incomplete discovery"), True),
+            (True, "", None, False),
+            (True, "watchdog: demo/alpha: restart failed", None, False),
+        ]
+        for probe, outcome, error, managed in cases:
+            def run_watchdog(_now: datetime, *, dry_run: bool, exited: unit_watchdog.ExitRecovery) -> list[str]:
+                self.assertFalse(dry_run)
+                self.assertEqual(exited.identity, identity)
+                self.assertEqual(exited.notice is None, probe)
+                exited.managed = managed
+                if error is not None:
+                    raise error
+                return [outcome] if outcome else []
+
+            with self.subTest(probe=probe, outcome=outcome, error=error, managed=managed):
+                self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1" if probe else "0"
+                pane_record.write("agents", self.entry)
+                with (patch.object(staff_sources, "unit_parent", return_value=staff_sources.UnitProduction("demo", str(self.root / "production.md"))),
+                      patch.object(showrunners, "tell", return_value="told demo") as tell,
+                      patch.object(stop_resume, "_send_move_push") as push,
+                      patch.object(unit_watchdog, "run", side_effect=run_watchdog) as recovery):
+                    result, log = self.run_stay_child(requester="other")
+                self.assertEqual(result, 1)
+                recovery.assert_called_once()
+                next_step = outcome or ("watchdog reported no recovery action" if error is None else
+                                        f"watchdog could not recover it: {error}")
+                line = f"alpha stopped 0.6 s after its move or resume to claude3; {next_step}"
+                tell.assert_called_once()
+                self.assertEqual(tell.call_args.args[0], "demo")
+                self.assertEqual(tell.call_args.args[2], line)
+                self.assertIn(line, log)
+                self.assertEqual(push.call_count, int(not probe and not managed))
+                if not probe and not managed:
+                    self.assertEqual(cast(RenderedPush, push.call_args.args[0]).title, "alpha did not start on claude3")
+                self.clock.elapsed = 0.0
+
+    def test_early_exit_uses_the_session_id_for_units_with_the_same_name(self) -> None:
+        from scripts.accounts import unit_watchdog
+
+        identity = staff.StaffId(self.entry["session_id"])
+        owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity, unit_type=staff.UnitDetails("direct"))
+        other = staff.native_id(fixture_runtime_id("other-alpha"))
+        other_owner = replace(owner, id=other, current_session=other,
+                              parent=staff.ReportsTo(staff.native_id(fixture_runtime_id("other-parent"))))
+        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner, other_owner))),
+              patch.object(staff_sources, "unit_parent", return_value=staff_sources.UnitProduction("demo", str(self.root / "production.md"))),
+              patch.object(showrunners, "tell"),
+              patch.object(stop_resume, "_send_move_push") as push,
+              patch.object(unit_watchdog, "run", return_value=["watchdog: alpha: restarted on claude3"])):
+            result, _log = self.run_stay_child()
+        self.assertEqual(result, 1)
+        push.assert_called_once()
+        text = cast(RenderedPush, push.call_args.args[0])
+        self.assertEqual(text.title, "alpha did not start on claude3")
+        self.assertEqual(text.message, f"Action: In the natedev session, run: /agents resume {identity} --to claude3")
 
     def test_named_probe_reports_rounded_time_account_retry_and_shutdown_sender(self) -> None:
         from scripts.production import showrunners
@@ -5365,7 +5601,20 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(line, "019b3a40-4250-7000-8000-000000000102 stopped 0.6 s after its move or resume to claude3; resume it: "
                          + "agents resume 019b3a40-4250-7000-8000-000000000102 --to claude3 --why 'usage limit'")
         self.assertIn(line, log)
-        self.assertEqual(cast(RenderedPush, push.call_args.args[0]).values["cause"], line)
+        push.assert_called_once()
+        text = cast(RenderedPush, push.call_args.args[0])
+        self.assertEqual(text.title, "A session did not start on claude3")
+        self.assertEqual(text.message, "Action: In the natedev session, run: "
+                         + "/agents resume 019b3a40-4250-7000-8000-000000000102 --to claude3")
+
+    def test_restart_failure_push_command_parses_a_dash_name_and_account_with_space(self) -> None:
+        push = render("shutdown.restart_failed", session="--help", identity=self.entry["session_id"], account="claude 4")
+        arguments = shlex.split(push.message.partition("/agents ")[2])
+        with patch.object(shutdown, "_lifecycle", return_value=0) as lifecycle:
+            self.assertEqual(shutdown.main(arguments), 0)
+        lifecycle.assert_called_once()
+        options = cast(shutdown.CommandLine, lifecycle.call_args.args[0])
+        self.assertEqual((options.session, options.to), ("--help", "claude 4"))
 
     def test_no_requester_or_unit_never_tells_showrunners_and_only_pushes_non_probes(self) -> None:
         from scripts.production import showrunners
@@ -6189,7 +6438,7 @@ class StopResumeTests(unittest.TestCase):
 
         def send(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             self.assertEqual(command[command.index("--repeat-minutes") + 1],
-                             str(conf.read("shutdown").whole("MOVE_ALERT_REPEAT_MINUTES")))
+                             str(conf.read("shutdown").whole("move_alert_repeat_minutes")))
             action = next(argument.removeprefix("action=") for argument in command if argument.startswith("action="))
             self.assertLessEqual(len(action), pushover.ACTION_TEXT_MAX)
             key = command[command.index("--key") + 1]
@@ -6703,7 +6952,7 @@ class MoveNowTests(unittest.TestCase):
         configuration = self.root / "config"
         environment = config_environment(configuration)
         environment.update(HOME=str(self.root), STAFF_FILE=str(self.root / "staff.json"), HERDR_BIN=MISSING_HERDR_BIN)
-        _ = write_config_fixture(configuration / "shutdown.conf", "MOVE_STOP_MARGIN_SECONDS=3\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", "move_stop_margin_seconds=3\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
         self.moved = []

@@ -28,7 +28,7 @@ from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAU
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
-from scripts.lib import build_folders, copy_record, nix_env, process_start, scratch, session_folder
+from scripts.lib import build_folders, conf, copy_record, nix_env, process_start, scratch, session_folder
 from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
@@ -165,7 +165,8 @@ prefixes.admit-sock=admit-sock-
 prefixes.copies-index=copies-index-
 roots.system=/tmp
 roots.temporary=${TMPDIR}/builds
-""" + f"roots.scratch={self.base / 'scratch'}\nroots.scratch.{host_name()}={self.base / 'scratch'}\n")
+""" + f"roots.scratch={self.base / 'scratch'}\n"
+            + f"roots.scratch.{conf.local_host_key_name()}={self.base / 'scratch'}\n")
         _ = write_config_fixture(configuration / "scratch.conf", f"""\
 default_life_seconds=86400
 record_lock_attempts=3
@@ -2513,12 +2514,12 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(result.stderr, direct_errors.getvalue())
         self.assertEqual(result.stderr, "REFUSED: 'Bad!': owner must match [a-z0-9][a-z0-9_-]*\n")
 
-    def test_run_checks_the_absolute_gate_parser_against_the_snapshot(self) -> None:
+    def test_run_checks_the_absolute_merge_gate_parser_against_the_snapshot(self) -> None:
         _ = self.commit_gate_script("""\
             def check_prepared_gate_source(arguments, parser, source):
                 parser.error("The snapshot parser ran")
             """)
-        launcher = Path(__file__).resolve().parents[1] / "production/gate.py"
+        launcher = Path(__file__).resolve().parents[1] / "production/merge_gate.py"
         arguments = ("--checkout", "{tree}", "--tests-only", "--module", "copies/test_copies.py")
         with mock.patch.object(first_step, "admitted_run",
                                side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit:

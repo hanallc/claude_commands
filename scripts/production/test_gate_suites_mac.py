@@ -35,7 +35,7 @@ from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_RE
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, mac_gate
-from scripts.production import mac_gate_process, gate
+from scripts.production import mac_gate_process, gate, targeted_test
 from scripts.copies import copies
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import MacGateCancellation, ModuleCoverage, SuiteMode, TreeSelection
@@ -507,7 +507,7 @@ class MacGateSuitesTests(GateSuitesFixture):
     def test_a_merge_gate_leaves_an_unused_reservation_to_its_caller(self) -> None:
         argv = ["--repo", str(self.checkout), "--merge-branch", "integration", "--unit-branch", "unit-phase",
                 "--checkpoint", "checkpoint", "--previous-checkpoint", "previous", "--unit", "fixture",
-                "--phase", "phase-2"]
+                "--phase", "phase-2", "--production", "quiet"]
         waits: list[placement.AssignmentState] = []
         with placement_fixture.PlacementFixture() as queue, mock.patch.dict(os.environ):
             def wait_until_free() -> None:
@@ -518,6 +518,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 reply, admitted = self.hand_off_a_natedev_gate(queue, ("natedev", "mac-linux"))
                 owner = build_hold.ProcessIdentity(reply.assignment.owner.pid, reply.assignment.owner.start_time)
                 with (mock.patch.object(build_hold, "caller_processes", return_value=frozenset({owner})),
+                      mock.patch.dict(os.environ, {"STAFF_FILE": self.environment["STAFF_FILE"]}),
                       mock.patch.object(gate, "gate_job_from_process",
                                         return_value=gate_job_for_command(["gate.py", *argv])),
                       mock.patch.object(gate.BuildHoldWait, "wait_until_free", side_effect=wait_until_free),
@@ -625,7 +626,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                                      assignment=assignment)
         output = self.output.getvalue()
         self.assertEqual(output.count("affected: "), 1, output)
-        self.assertIn("affected: 1 of 2 modules (base ", output)
+        self.assertRegex(output, r"affected: 1 of 2 modules \(base [^\n]+\(cache \d+ hits, \d+ misses;")
         self.cloud_route.assert_not_called()
         local.assert_not_called()
 
@@ -1033,13 +1034,13 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.cloud_route.assert_not_called()
 
     @gate_suites("lib")
-    def test_unassigned_affected_cli_runs_the_whole_selection_locally(self) -> None:
+    def test_unassigned_targeted_test_cli_runs_the_whole_selection_locally(self) -> None:
         self.exclude_modules(LIB_FIRST)
         self.commit_one_affected_module(LIB_FIRST)
         with (mock.patch.dict(os.environ, {"BUILDLOG_PREPARED_COPY": str(self.checkout)}),
               mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(mac_linux, "route") as guest):
-            status = gate.main(["--affected", "--repo", str(self.checkout)])
+            status = targeted_test.main(["--repo", str(self.checkout)])
         self.assertEqual(status, 0, self.output.getvalue())
         self.assert_modules_started(LIB_FIRST)
         guest.assert_not_called()
@@ -1069,7 +1070,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertIs(cast(object, self.cloud_route.call_args.kwargs["mode"]), SuiteMode.GATE)
 
     @gate_suites("lib")
-    def test_affected_cli_sends_the_whole_selection_to_the_cloud(self) -> None:
+    def test_targeted_test_cli_sends_the_whole_selection_to_the_cloud(self) -> None:
         self.exclude_modules(LIB_FIRST)
         jobs = (gate.GateJobResult("lib", "test_first.py", 0, 1, ""),
                 gate.GateJobResult("lib", "test_second.py", 0, 1, ""))
@@ -1081,7 +1082,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                                           "BUILDLOG_PREPARED_COPY": str(self.checkout)}),
               mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(gate, "run_suites") as local):
-            status = gate.main(["--affected", "--repo", str(self.checkout)])
+            status = targeted_test.main(["--repo", str(self.checkout)])
         self.assertEqual(status, 0, self.output.getvalue())
         self.assert_targeted_cloud_selection(LIB_FIRST, LIB_SECOND, gate_job=StepJob("test-affected"))
         local.assert_not_called()
@@ -1383,7 +1384,7 @@ class MacGateSuitesTests(GateSuitesFixture):
             run = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED,
                                        target=self.aws_assignment())
         self.assertTrue(run.passed, self.output.getvalue())
-        self.assertIn("affected: 2 of 3 modules", self.output.getvalue())
+        self.assertRegex(self.output.getvalue(), r"affected: 2 of 3 modules[^\n]+\(cache \d+ hits, \d+ misses;")
         self.assert_targeted_cloud_selection(HOOKS, MESSAGE)
         self.assertEqual(self.module_events(), [])
         self.assertEqual(run.jobs[:2], jobs)
