@@ -577,10 +577,11 @@ cmd_tick() {
     launch_job "send-repeat-notices-$$-$RANDOM" "${drain_command[@]}" || log_error "repeat drain launcher unavailable"
 
   fi
-  local question_pushes=${NOTIFY_STATE_DIR:-$HOME/.local/state/notify}/question-pushes
+  local notify_state=${NOTIFY_STATE_DIR:-$HOME/.local/state/notify}
   if [[ -z ${NOTIFIER_STATE_DIR:-} || -n ${NOTIFY_STATE_DIR:-} ]]; then
+    local question_pushes=$notify_state/question-pushes
     local -a bindings=("$question_pushes"/*.json(N))
-    if (( ${#bindings} )); then
+    if (( ${#bindings} )) || [[ -s $notify_state/silence-kept.jsonl ]]; then
       question_push_drain
     fi
   fi

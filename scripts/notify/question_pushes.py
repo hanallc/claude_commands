@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import time
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime
 from importlib import import_module
@@ -93,25 +94,27 @@ def settled(reference: push_reference.QuestionReference) -> str:
 
 def retire_locked(path: Path, binding: Binding) -> str:
     """Retire the current binding under the silence lock."""
-    transport = cast(RetirementTransport, cast(object, import_module("scripts.message.send")))
-    result = transport.retire_question_copies(binding)
+    result = retire_copies(binding)
     path.unlink()
     return result
 
 
-def bind_locked(source: str, key: str, reference: push_reference.PushReference, *, emergency: bool) -> Binding | None:
+def retire_copies(binding: Binding) -> str:
+    transport = cast(RetirementTransport, cast(object, import_module("scripts.message.send")))
+    return transport.retire_question_copies(binding)
+
+
+def bind_locked(source: str, key: str, reference: push_reference.QuestionReference, *, emergency: bool) -> Binding:
     """Record the active binding before the caller keeps or posts the push."""
     path = binding_path(source, key)
     previous = read_binding(path)
-    if reference["kind"] == "question" and (reason := settled(reference)):
+    if reason := settled(reference):
         raise SettledQuestion(reason)
     if previous is not None and previous.reference != reference:
         _ = retire_locked(path, previous)
         previous = None
-        if reference["kind"] == "question" and (reason := settled(reference)):
+        if reason := settled(reference):
             raise SettledQuestion(reason)
-    if reference["kind"] != "question":
-        return None
     bound = Binding(source, key, reference, emergency or (previous is not None and previous.emergency))
     if bound != previous:
         write_text_atomic(path, json.dumps({"source": source, "key": key, "reference": reference,
@@ -124,9 +127,9 @@ def retire_matching(source: str, key: str, reference: push_reference.QuestionRef
     path = binding_path(source, key)
     with silence.locked():
         binding = read_binding(path)
-        if binding is None or binding.reference != reference:
-            return "no matching Question push"
-        return retire_locked(path, binding)
+        if binding is not None and binding.reference == reference:
+            return retire_locked(path, binding)
+        return retire_copies(Binding(source, key, reference, False))
 
 
 def report(line: str) -> None:
@@ -140,36 +143,75 @@ def report(line: str) -> None:
 
 
 def drain(question: Path | None = None) -> int:
-    """Resolve current bindings on the notification owner and retry failed retirements."""
-    if silence.on_mac() or not directory().exists():
+    """Retire current bindings and old kept copies on the notification owner."""
+    if silence.on_mac() or not (directory().is_dir() or silence.kept_file().exists()):
         return 0
     selected = str(question.resolve()) if question is not None else None
-    deadline: float | None = None
     failed = 0
+
+    def wanted(reference: push_reference.QuestionReference) -> bool:
+        return selected is None or (reference["path"] == selected and reference.get("machine") != "mac")
+
+    pending: dict[str, tuple[Binding, Path | None]] = {}
     for path in sorted(directory().glob("*.json")):
+        try:
+            binding = read_binding(path)
+            if binding is not None and wanted(binding.reference):
+                pending[binding.tag_key] = (binding, path)
+        except (OSError, ValueError) as error:
+            report(f"Question push state unavailable. {path.name}: {error}")
+            failed = 1
+    try:
+        for push in silence.read_kept(strict=True):
+            reference = push.get("reference", push_reference.NO_REFERENCE)
+            if reference["kind"] == "question" and wanted(reference):
+                binding = Binding(push["source"], push["key"], reference, False)
+                _ = pending.setdefault(binding.tag_key, (binding, None))
+    except (OSError, ValueError) as error:
+        report(f"Cannot read kept Question pushes. {error}")
+        failed = 1
+    if not pending:
+        return failed
+
+    cursor = directory() / "retry-cursor"
+    entries = sorted(pending)
+    if question is None:
+        try:
+            turn = bisect_right(entries, cursor.read_text(encoding="utf-8"))
+            entries = entries[turn:] + entries[:turn]
+        except FileNotFoundError:
+            pass
+    deadline = time.monotonic() + conf.read("send").number("user_cancel_timeout")
+    last_checked: str | None = None
+    for key in entries:
+        if time.monotonic() >= deadline:
+            break
+        observed, path = pending[key]
         terminal = question is not None
         try:
-            observed = read_binding(path)
-            if observed is None or (selected is not None and (
-                    observed.reference["path"] != selected or observed.reference.get("machine") == "mac")):
-                continue
-            if deadline is None:
-                deadline = time.monotonic() + conf.read("send").number("user_cancel_timeout")
-            if time.monotonic() >= deadline:
-                break
             with silence.locked(nonblocking=True), operation_deadline.within(deadline):
-                current = read_binding(path)
-                if current is None or current != observed:
+                last_checked = key
+                current = read_binding(path or binding_path(observed.source, observed.key))
+                if (path is not None and current != observed
+                        or path is None and current is not None and current.reference == observed.reference):
                     continue
-                if settled(current.reference):
-                    terminal = True
-                    report(retire_locked(path, current))
+                if not settled(observed.reference):
+                    continue
+                terminal = True
+                if path is not None:
+                    report(retire_locked(path, observed))
+                else:
+                    dropped = silence.drop_locked(observed.source, observed.key, observed.reference)
+                    if dropped:
+                        report(f"retired {dropped} kept copies for {observed.source} / {observed.key}")
         except BlockingIOError:
             continue
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             message = "Answer saved. Push retirement pending." if terminal else "Question push state unavailable."
-            report(f"{message} {path.name}: {error}")
+            report(f"{message} {observed.reference['path']}: {error}")
             failed = 1
+    if question is None and last_checked is not None:
+        write_text_atomic(cursor, last_checked)
     return failed
 
 
