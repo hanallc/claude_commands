@@ -1837,7 +1837,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 return DispatchSubmission.SUBMITTED
         if isinstance(started, StartAtDispatch):
             before = rows_before_launch()
-            current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy, run=session_dir)
+            current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
             arm_launch_cleanup(cleanup, before, current_start)
         else:
             if not started.row.reports_to(parent) or not hold.owns(started.row):
