@@ -1088,7 +1088,12 @@ The move uses the Issue reader for Questions and Proposals.
 It uses the numbered record reader for Investigations and Bugs.
 The move scans the vaults in `staff.producer_folder_root` and `issue_score.vault_root`.
 It also scans the native state stores, the stores in the local folder registry, and both archive layouts.
-After you restore an external or former store, run this command with its root.
+For local production documents, the move uses the same store lookup as the Question reader.
+This lookup finds current stores and former stores in Git history and production backups.
+The lookup skips document and backup history when the production document's folder is absent.
+When Git reports no repository, the lookup skips history for that Git query.
+A discovery read error stops the move and reports the input path.
+For a restored store outside these locations, run this command with its root.
 
 ```sh
 scripts/lib/py -m scripts.review_links.review_submissions move-reply-proofs --root <folder>

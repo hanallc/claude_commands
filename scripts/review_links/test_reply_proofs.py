@@ -3,18 +3,332 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 import unittest
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
+from dataclasses import dataclass, field, replace
+from io import StringIO
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
+from uuid import uuid4
 
-from scripts.lib import atomic_file
-from scripts.production import record_store, staff
-from scripts.review_links import reply_proofs, reply_tokens
+from scripts.agents.remote import local_machine
+from scripts.lib import atomic_file, conf
+from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.production import record_store, staff, test_record_store, update_registration
+from scripts.production.production_doc import production_backup_checkout
+from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY
+from scripts.review_links import reply_proofs, reply_tokens, review_link, review_page, review_submissions, test_review_submissions
+
+
+@dataclass(frozen=True)
+class ArchivedLegacyQuestion:
+    submission: review_submissions.SavedSubmission = field(repr=False)
+    path: Path
+    clean: bytes = field(repr=False)
+    document: Path
+    backup: Path
 
 
 class ReplyProofTests(unittest.TestCase):
+    def _archive_legacy_question_in_former_store(self, *, local_checkout: bool = False) -> ArchivedLegacyQuestion:
+        case = set_up_fixture(self.addCleanup, test_review_submissions.ReviewSubmissionTests())
+        git = test_record_store.NumberedRecordsTests().git
+        document_folder = case.doc.parent
+        if local_checkout:
+            document_folder = case.root / "production-checkout"
+            document_folder.mkdir()
+            _ = git(document_folder, "init", "-b", "main")
+        document = case.doc.rename(document_folder / "production-live.md")
+        owner = case.members.by_id(test_review_submissions.OWNER)
+        assert owner is not None
+        owner_id = staff.StaffId(str(uuid4()))
+        owner = replace(owner, id=owner_id, current_session=owner_id, doc=staff.LiveDoc(local_machine(), document))
+        members = staff.StaffSnapshot((owner,))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
+        self.enterContext(staff.supplied_snapshot(members))
+        self.enterContext(patch.dict(os.environ, {
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "STAFF_FILE": str(case.root / "staff.json"),
+        }))
+        _ = staff.record_path().write_text(members.encode())
+        self.assertEqual(staff.local_snapshot(), members)
+
+        saved = review_submissions.submit(test_review_submissions.request(
+            review_submissions.SubmissionKind.QUESTION, recipient=owner.id))
+        clean = saved.path.read_bytes()
+        _ = case.put_proof_in_old_note(saved)
+        archive = case.issues / "archive"
+        archive.mkdir()
+        note = saved.path.rename(archive / saved.path.name)
+        shutil.rmtree(record_store.state_root() / "review-folders")
+
+        backup = production_backup_checkout(owner.id)
+        backup_doc = backup / BACKUP_DOCUMENT_DIRECTORY / document.name
+        backup_doc.parent.mkdir(parents=True)
+        _ = git(backup, "init", "-b", "main")
+        live_text = document.read_text()
+        _ = backup_doc.write_text(live_text)
+        _ = git(backup, "add", str(backup_doc))
+        _ = git(backup, "commit", "-m", "Set the former store.")
+        current = live_text.replace(str(case.issues), str(case.root / "current-issues"))
+        _ = document.write_text(current)
+        _ = backup_doc.write_text(current)
+        _ = git(backup, "add", str(backup_doc))
+        _ = git(backup, "commit", "-m", "Set the current store.")
+
+        record, = update_registration.question_records_for_document(
+            document, update_registration.QuestionStaff.for_record(members), strict=True)
+        self.assertEqual(record.path, note)
+        return ArchivedLegacyQuestion(saved, note, clean, document, backup)
+
+    def _assert_scan_refuses_path(self, path: Path) -> None:
+        with self.subTest(entry="dry run"):
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors:
+                self.assertEqual(review_submissions.main(["move-reply-proofs", "--dry-run"]), 1)
+            self.assertTrue(str(path) in errors.getvalue())
+        with self.subTest(entry="startup"):
+            with self.assertRaises(OSError) as refusal:
+                cache = review_page.ReviewSnapshotCache(review_link.review_root(), start_worker=False, initialize_on_start=True)
+                self.addCleanup(cache.close)
+            self.assertTrue(str(path) in str(refusal.exception))
+
+    def test_dry_run_and_startup_name_the_unreadable_staff_record(self) -> None:
+        question = self._archive_legacy_question_in_former_store()
+        legacy = question.path.read_bytes()
+        record = staff.record_path()
+        _ = record.write_text("[]")
+
+        self._assert_scan_refuses_path(record)
+        self.assertTrue(question.path.read_bytes() == legacy)
+        self.assertFalse(reply_proofs.move_journal_path().exists())
+
+    def test_dry_run_and_startup_name_the_unreadable_former_store_archive(self) -> None:
+        question = self._archive_legacy_question_in_former_store()
+        legacy = question.path.read_bytes()
+        archive = question.path.parent
+        scandir = os.scandir
+
+        def deny_archive(folder: str | os.PathLike[str]) -> AbstractContextManager[Iterator[os.DirEntry[str]]]:
+            if folder == archive:
+                raise PermissionError("Cannot open the archive.")
+            return scandir(folder)
+
+        with patch.object(os, "scandir", side_effect=deny_archive):
+            self._assert_scan_refuses_path(archive)
+        self.assertTrue(question.path.read_bytes() == legacy)
+        self.assertFalse(reply_proofs.move_journal_path().exists())
+
+    def _assert_move_skips_archived_question(self, question: ArchivedLegacyQuestion) -> None:
+        legacy = question.path.read_bytes()
+        move = review_submissions.LocalProofMove(review_link.review_root())
+        self.assertEqual(review_submissions.move_reply_proofs(move, dry_run=True), (0, 0))
+        cache = review_page.ReviewSnapshotCache(move.review_root, start_worker=False, initialize_on_start=True)
+        self.addCleanup(cache.close)
+        self.assertTrue(question.path.read_bytes() == legacy)
+        self.assertFalse(reply_proofs.move_journal_path().exists())
+        saved = question.submission
+        self.assertFalse(reply_proofs.path_for(saved.details.proof_identity(saved.id)).exists())
+
+    def test_dry_run_and_startup_skip_a_backup_when_git_finds_no_repository(self) -> None:
+        question = self._archive_legacy_question_in_former_store()
+        (question.backup / ".git" / "HEAD").unlink()
+        self._assert_move_skips_archived_question(question)
+
+    def test_dry_run_and_startup_name_the_backup_when_git_log_fails(self) -> None:
+        question = self._archive_legacy_question_in_former_store()
+        legacy = question.path.read_bytes()
+        git = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def fail_backup_log(args: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if args[:3] == ["git", "-C", str(question.backup)] and "log" in args:
+                raise OSError("Cannot read the backup history.")
+            return git(args, **options)
+
+        with patch.object(subprocess, "run", side_effect=fail_backup_log):
+            self._assert_scan_refuses_path(question.backup)
+        self.assertTrue(question.path.read_bytes() == legacy)
+        self.assertFalse(reply_proofs.move_journal_path().exists())
+
+    def test_dry_run_and_startup_name_the_unreadable_production_document(self) -> None:
+        question = self._archive_legacy_question_in_former_store()
+        _ = question.document.write_bytes(b"\xff")
+        self._assert_scan_refuses_path(question.document)
+
+    def test_dry_run_and_startup_reach_backup_when_git_skips_damaged_checkout(self) -> None:
+        question = self._archive_legacy_question_in_former_store(local_checkout=True)
+        (question.document.parent / ".git" / "HEAD").unlink()
+        legacy = question.path.read_bytes()
+        move = review_submissions.LocalProofMove(review_link.review_root())
+        self.assertEqual(review_submissions.move_reply_proofs(move, dry_run=True), (1, 2))
+        self.assertTrue(question.path.read_bytes() == legacy)
+        self._assert_startup_moves_archived_question(question, legacy)
+
+    def test_dry_run_and_startup_name_the_invalid_document_rename_record(self) -> None:
+        question = self._archive_legacy_question_in_former_store(local_checkout=True)
+        owner, = staff.local_snapshot().rows
+        history = question.document.parent / ".git" / f"production-document-paths-{owner.id}.json"
+        _ = history.write_text("{}")
+        self._assert_scan_refuses_path(history)
+
+    def test_dry_run_and_startup_name_the_invalid_folder_registry(self) -> None:
+        _ = self._archive_legacy_question_in_former_store()
+        registry = record_store.state_root() / "review-folders" / "former" / "question.json"
+        registry.parent.mkdir(parents=True)
+        _ = registry.write_text("{}")
+        self._assert_scan_refuses_path(registry)
+
+    def test_dry_run_and_startup_name_the_unreadable_vault_configuration(self) -> None:
+        _ = self._archive_legacy_question_in_former_store()
+        config = conf.path("issue_score")
+        _ = config.write_bytes(b"\xff")
+        self._assert_scan_refuses_path(config)
+
+    def test_dry_run_and_startup_name_the_unreadable_state_folder(self) -> None:
+        _ = self._archive_legacy_question_in_former_store()
+        state = record_store.state_root()
+        folder = state / "review-folders"
+        folder.mkdir()
+        scandir = os.scandir
+
+        def deny_registry(path: str | os.PathLike[str]) -> AbstractContextManager[Iterator[os.DirEntry[str]]]:
+            if Path(path) == folder:
+                raise PermissionError("Cannot open the folder registry.")
+            return scandir(path)
+
+        with patch.object(os, "scandir", side_effect=deny_registry):
+            self._assert_scan_refuses_path(folder)
+
+    def test_dry_run_and_startup_name_the_invalid_pending_transfer(self) -> None:
+        question = self._archive_legacy_question_in_former_store()
+        transfer = review_submissions.image_folder(question.submission).parent / "move.json"
+        transfer.parent.mkdir(parents=True, exist_ok=True)
+        _ = transfer.write_text("[]")
+        self._assert_scan_refuses_path(transfer)
+
+    def test_dry_run_and_startup_skip_history_when_document_folder_is_absent(self) -> None:
+        question = self._archive_legacy_question_in_former_store(local_checkout=True)
+        shutil.rmtree(question.document.parent)
+        self._assert_move_skips_archived_question(question)
+
+    def test_move_uses_the_enclosing_git_checkout_for_production_history(self) -> None:
+        question = self._archive_legacy_question_in_former_store(local_checkout=True)
+        checkout = question.document.parent
+        notes = checkout / "notes"
+        notes.mkdir()
+        (notes / "objects").mkdir()
+        (notes / "refs").mkdir()
+        document = question.document.rename(notes / question.document.name)
+        tracked = notes / "production.md"
+        current = document.read_text()
+        former = question.path.parent.parent
+        _ = tracked.write_text(f"- **Proposals:** `{former}`\n")
+        git = test_record_store.NumberedRecordsTests().git
+        _ = git(checkout, "add", str(tracked))
+        _ = git(checkout, "commit", "-m", "Set the former store.")
+        _ = tracked.write_text(current)
+        _ = git(checkout, "add", str(tracked))
+        _ = git(checkout, "commit", "-m", "Set the current store.")
+        shutil.rmtree(question.backup)
+
+        owner, = staff.local_snapshot().rows
+        owner = replace(owner, doc=staff.LiveDoc(local_machine(), document))
+        members = staff.StaffSnapshot((owner,))
+        _ = staff.record_path().write_text(members.encode())
+        record, = update_registration.question_records_for_document(
+            document, update_registration.QuestionStaff.for_record(members), strict=True)
+        self.assertEqual(record.path, question.path)
+
+        legacy = question.path.read_bytes()
+        move = review_submissions.LocalProofMove(review_link.review_root())
+        self.assertEqual(review_submissions.move_reply_proofs(move, dry_run=True), (1, 2))
+        self.assertTrue(question.path.read_bytes() == legacy)
+        cache = review_page.ReviewSnapshotCache(move.review_root, start_worker=False, initialize_on_start=True)
+        self.addCleanup(cache.close)
+        self.assertTrue(question.path.read_bytes() == question.clean)
+
+    def test_move_matches_reader_when_git_excludes_production_checkout(self) -> None:
+        question = self._archive_legacy_question_in_former_store(local_checkout=True)
+        ceiling = question.document.parent / "ceiling"
+        notes = ceiling / "notes"
+        notes.mkdir(parents=True)
+        document = question.document.rename(notes / question.document.name)
+        owner, = staff.local_snapshot().rows
+        owner = replace(owner, doc=staff.LiveDoc(local_machine(), document))
+        members = staff.StaffSnapshot((owner,))
+        _ = staff.record_path().write_text(members.encode())
+
+        saved, note = question.submission, question.path
+        legacy = note.read_bytes()
+        proof_path = reply_proofs.path_for(saved.details.proof_identity(saved.id))
+        move = review_submissions.LocalProofMove(review_link.review_root())
+        kind = record_store.RecordKind.QUESTION
+
+        with patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(ceiling)}):
+            lookup = subprocess.run(["git", "-C", str(notes), "rev-parse", "--show-toplevel"],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(lookup.returncode, 0)
+            self.assertTrue("not a git repository" in lookup.stderr)
+            roots = record_store.known_folders(kind, owner.id, document=document, strict=True)
+            self.assertIn(question.path.parent.parent, roots)
+            record, = update_registration.question_records_for_document(
+                document, update_registration.QuestionStaff.for_record(members), strict=True)
+            self.assertEqual(record.path, question.path)
+            self.assertEqual(roots, record_store.known_folders(kind, owner.id, document=document, review_scan=True))
+            self.assertEqual(review_submissions.move_reply_proofs(move, dry_run=True), (1, 2))
+            self.assertTrue(note.read_bytes() == legacy)
+            self.assertFalse(proof_path.exists())
+            self.assertFalse(reply_proofs.move_journal_path().parent.exists())
+            self._assert_startup_moves_archived_question(question, legacy)
+
+    def _assert_startup_moves_archived_question(self, question: ArchivedLegacyQuestion, legacy: bytes) -> None:
+        saved, note = question.submission, question.path
+        proof = saved.details.reply_proof
+        token = saved.reply_token
+        self.assertTrue(bool(token))
+        identity = saved.details.proof_identity(saved.id)
+        proof_path = reply_proofs.path_for(identity)
+        move = review_submissions.LocalProofMove(review_link.review_root())
+        cache = review_page.ReviewSnapshotCache(move.review_root, start_worker=False, initialize_on_start=True)
+        self.addCleanup(cache.close)
+        self.assertTrue(note.read_bytes() == question.clean)
+        self.assertTrue(reply_proofs.read(identity).reply == proof)
+        self.assertEqual(proof_path.stat().st_mode & 0o777, 0o600)
+        backup_parent = reply_proofs.move_journal_path().parent
+        backup_copy, = backup_parent.glob(f"*/{note.relative_to(note.anchor)}")
+        backup_dir = backup_parent / backup_copy.relative_to(backup_parent).parts[0]
+        self.assertEqual(backup_dir.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(backup_copy.read_bytes() == legacy)
+        self.assertEqual(reply_proofs.read_move_report(), {note: ("reply_token_sha256", "reply_token_nonce")})
+        self.assertEqual(review_submissions.move_reply_proofs(move, dry_run=False), (0, 0))
+        self.assertTrue(review_submissions.answer(saved.key, "Restored reply", token, members=staff.local_snapshot()))
+
+    def test_startup_moves_a_question_from_a_store_in_production_backup_history(self) -> None:
+        question = self._archive_legacy_question_in_former_store()
+        saved, note = question.submission, question.path
+        legacy = note.read_bytes()
+        proof_path = reply_proofs.path_for(saved.details.proof_identity(saved.id))
+        move = review_submissions.LocalProofMove(review_link.review_root())
+        self.assertEqual(review_submissions.move_reply_proofs(move, dry_run=True), (1, 2))
+        self.assertTrue(note.read_bytes() == legacy)
+        self.assertFalse(proof_path.exists())
+        self.assertFalse(reply_proofs.move_journal_path().parent.exists())
+
+        corrupt = legacy.rsplit(b"\n---\n", 1)[0]
+        _ = note.write_bytes(corrupt)
+        with self.assertRaisesRegex(OSError, re.escape(str(note))):
+            _ = review_submissions.move_reply_proofs(move, dry_run=True)
+        with self.assertRaisesRegex(OSError, re.escape(str(note))):
+            _ = review_page.ReviewSnapshotCache(move.review_root, start_worker=False, initialize_on_start=True)
+        self.assertTrue(note.read_bytes() == corrupt)
+        _ = note.write_bytes(legacy)
+
+        self._assert_startup_moves_archived_question(question, legacy)
+
     def test_move_writes_each_of_200_journal_lines_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
