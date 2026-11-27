@@ -304,6 +304,8 @@ If that checkout's `objects/pack` folder is a symbolic link into a numbered copy
 Removal then breaks the outside checkout.
 Only a hand-made link of a Git metadata file or folder makes these cases. No Git command makes them.
 
+Known limit: the build root lookup opens the root to read it (`build_folders._build_root_path`). A build root without read access is refused, also at mirror receive.
+
 Automatic owner cleanup for these temporary folders takes the exclusive claim lock without waiting.
 Cleanup keeps the folder and lease record if a reader holds the lock or the borrower check cannot confirm that the folder is unused.
 Cleanup also keeps review-only temporary folders.

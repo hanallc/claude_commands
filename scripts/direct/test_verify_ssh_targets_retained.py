@@ -41,6 +41,11 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
     def test_mac_post_fetch_cleanup_timeout_preserves_the_failed_verdict(self) -> None:
         self.check_lost_mac("post-fetch-cleanup-timeout", status=42)
 
+    def test_per_unit_mac_post_fetch_cleanup_timeout_keeps_the_start_fence(self) -> None:
+        settings = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
+        _ = write_config_fixture(settings, "forms.build.mac=per-unit\n")
+        self.check_lost_mac("post-fetch-cleanup-timeout", status=42)
+
     def test_mac_check_cleanup_timeout_preserves_the_failed_verdict(self) -> None:
         self.check_lost_mac("cleanup-stream-timeout", status=42, command="check")
 
@@ -106,7 +111,7 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
         claim, = controls.claims("mac")
         identity = claim_state.claim_identity(claim.record)
         journal = claim_state.claim_pending_start(controls.claim_paths("mac"), claim.path, claim.record)
-        self.assertEqual(journal.is_file(), mode != "post-fetch-cleanup-timeout")
+        self.assertTrue(journal.is_file(), "The start fence still needs clearance")
 
         _ = self.admission.run_pass()
         with self.admission.loop_turn():
@@ -305,7 +310,9 @@ with mock.patch.object(process_identity, "process_start", return_value=process_i
         self.assertEqual(cleanup["result_type"], "BusyMacDecline")
         self.assertEqual(cleanup["adopted_claim_ids"], [old_claim_id])
         self.assertNotIn(old_claim_id, cleanup["remaining_claim_ids"])
-        self.assertEqual(run["actions"], ["claim:0", "probe", "source-copy", "run", "release"])
+        # The release confirms fence settlement after the fixed folder holder closes.
+        self.assertEqual(run["actions"], ["claim:0", "probe", "source-copy", "run", "release", "cleanup"])
+        self.assertEqual(run["remaining_claim_ids"], [])
         self.assertEqual(run["result_type"], "PassedOnMac")
         self.assertEqual(len(run["entry_claim_ids"]), 1)
         self.assertNotIn(old_claim_id, run["entry_claim_ids"])

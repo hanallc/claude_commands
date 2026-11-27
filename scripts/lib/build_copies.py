@@ -502,7 +502,8 @@ def _check_unused_folder(path: Path, root: Path, *, numbered: bool, snapshot: Bo
         if not build_folders.may_remove_build_path(path) or not build_folders.may_remove_folder_tree(*roots):
             raise BuildFolderInUse(f"{path}: the folder or a mount is protected")
         inspect = _busy_mark_check(path, copy, probes)
-        child = build_folders.hold_child_leases(path, probes, wait=False, check_owners=True,
+        rules = build_folders.FixedFolderRemovalRules.read()
+        child = build_folders.hold_child_leases(path, probes, rules=rules, wait=False, check_owners=True,
                                                review_temporary=not numbered, inspect=inspect)
         if isinstance(child, build_folders.RemovalLockHeld):
             raise BuildFolderInUse(f"{child.lock}: a lease lock or owner is active")

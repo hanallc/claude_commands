@@ -1831,8 +1831,8 @@ def mkdir_step(name, mode=0o777, *, dir_fd=None):
         interrupt()
         return result
     return mkdir(name, mode, dir_fd=dir_fd)
-def lease_step(*args):
-    lease(*args)
+def lease_step(*args, **kwargs):
+    lease(*args, **kwargs)
     interrupt()
 def fstat_step(fd):
     inode = fstat(fd)
@@ -3076,7 +3076,7 @@ os._exit(0)
                 parent.mkdir(exist_ok=True)
                 child = parent / ("sync" if nested else "late-child")
                 request = folders.StableOwnerFolder(child.name, folders.ExplicitBuildParent(parent))
-                scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+                scan = cast(Callable[..., object], folders.hold_child_leases_at)
 
                 def allocate_after_scan(path: Path, *args: object, **kwargs: object) -> object:
                     result = scan(path, *args, **kwargs)
@@ -3085,7 +3085,7 @@ os._exit(0)
                         self.addCleanup(_release_folder, made)
                     return result
 
-                with mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_after_scan):
+                with mock.patch.object(folders, "hold_child_leases_at", side_effect=allocate_after_scan):
                     folders.sweep_temporary_build_folders(self.root, wait=False)
                 self.assertTrue(outer.is_dir())
                 self.assertTrue(child.is_dir())
@@ -3095,7 +3095,7 @@ os._exit(0)
     def test_staging_prevents_allocation_from_a_relative_temporary_parent(self) -> None:
         target = folders.create_build_folder(folders.UniqueBuildFolder("outer-"))
         _release_folder(target)
-        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+        scan = cast(Callable[..., object], folders.hold_child_leases_at)
         allocated: list[Path] = []
         attempts: list[Path] = []
 
@@ -3114,7 +3114,7 @@ os._exit(0)
             return result
 
         with (chdir(target), mock.patch.dict(os.environ, {"TMPDIR": "."}),
-              mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_after_scan)):
+              mock.patch.object(folders, "hold_child_leases_at", side_effect=allocate_after_scan)):
             folders.sweep_temporary_build_folders(self.root, wait=False)
 
         self.assertEqual(len(attempts), 1)
@@ -3159,7 +3159,7 @@ os._exit(0)
         _release_folder(target)
         request = folders.StableOwnerFolder("sibling", folders.ExplicitBuildParent(self.root))
         sibling = self.root / "sibling"
-        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+        scan = cast(Callable[..., object], folders.hold_child_leases_at)
 
         def allocate_sibling(path: Path, *args: object, **kwargs: object) -> object:
             result = scan(path, *args, **kwargs)
@@ -3172,7 +3172,7 @@ os._exit(0)
                     self.addCleanup(_release_folder, child)
             return result
 
-        with mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_sibling):
+        with mock.patch.object(folders, "hold_child_leases_at", side_effect=allocate_sibling):
             folders.sweep_temporary_build_folders(self.root, wait=False)
         self.assertTrue(sibling.is_dir())
         self.assertEqual(folders.build_folder_state(sibling), "held")
@@ -3182,7 +3182,7 @@ os._exit(0)
     def test_a_sweep_keeps_the_hidden_tree_when_the_original_path_is_taken(self) -> None:
         target = folders.create_build_folder(folders.UniqueBuildFolder("occupied-"))
         _release_folder(target)
-        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+        scan = cast(Callable[..., object], folders.hold_child_leases_at)
 
         def fill_original_path(path: Path, *args: object, **kwargs: object) -> object:
             if path != target:
@@ -3200,7 +3200,7 @@ os._exit(0)
                 build_folder_lock.mark_lock(lock)
             return result
 
-        with (mock.patch.object(folders, "_hold_child_leases", side_effect=reserve_late_child),
+        with (mock.patch.object(folders, "hold_child_leases_at", side_effect=reserve_late_child),
               mock.patch("sys.stderr", new_callable=io.StringIO) as report):
             folders.sweep_temporary_build_folders(self.root, wait=False)
         hidden_trees = [item for item in self.root.glob(".removing-*") if item.is_dir()]
@@ -3381,7 +3381,7 @@ os._exit(0)
             scratch.STYLE_TARGET_NAME, folders.ExplicitBuildParent(path)))
         _release_folder(target)
         (target / scratch.STYLE_LOCK_NAME).touch()
-        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+        scan = cast(Callable[..., object], folders.hold_child_leases_at)
         child = target / "late"
 
         def allocate_after_scan(folder: Path, *args: object, **kwargs: object) -> object:
@@ -3397,7 +3397,7 @@ os._exit(0)
             if not isinstance(locks, sweep.TargetLocksAcquired):
                 self.fail(f"the style lock was held: {locks}")
             self.addCleanup(sweep.release, locks.held)
-        with mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_after_scan):
+        with mock.patch.object(folders, "hold_child_leases_at", side_effect=allocate_after_scan):
             folders.sweep_temporary_build_folders(path, wait=False)
         self.assertTrue(child.is_dir())
         _release_folder(child)
