@@ -5034,7 +5034,7 @@ def _stored_claude_rate_rows(now: datetime, account_config: conf.ConfigRead,
                 groups = group_accounts()
         except role_map.RoleMapUnavailable:
             groups = GroupAccounts()
-        directories, _ = _claude_role_directories(groups)
+        directories = _claude_role_directories(groups, report_problem=lambda _problem: None)
     return tuple(
         replace(_status_row(status, usage.get(usage_store.key("Claude", status.login)), now, (),
                             account_config=account_config),
@@ -6263,9 +6263,9 @@ def _status_workers_account() -> CodexWorkersAccount:
     return selected_workers
 
 
-def _claude_role_directories(groups: GroupAccounts) -> tuple[dict[ClaudeGroup, Path], list[AccountsError | str]]:
+def _claude_role_directories(groups: GroupAccounts, *,
+                             report_problem: Callable[[AccountsError | str], None]) -> dict[ClaudeGroup, Path]:
     directories: dict[ClaudeGroup, Path] = {}
-    problems: list[AccountsError | str] = []
     for group in CLAUDE_GROUPS:
         if group == "producers" and group not in groups:
             if "showrunners" in directories:
@@ -6273,13 +6273,13 @@ def _claude_role_directories(groups: GroupAccounts) -> tuple[dict[ClaudeGroup, P
             continue
         label = group_label(groups, group)
         if isinstance(label, GroupNotConfigured):
-            problems.append(f"accounts: {group} has no account; run accounts.py move {group} <claudeN>")
+            report_problem(f"accounts: {group} has no account; run accounts.py move {group} <claudeN>")
         elif _label_is(label, "claude"):
             try:
                 directories[group] = _claude_role_selection(group, label).dir
             except AccountsError as error:
-                problems.append(error)
-    return directories, problems
+                report_problem(error)
+    return directories
 
 
 def _read_status(source: UsageSource, *, detail: bool, include_models: bool = False,
@@ -6328,11 +6328,13 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
             _observe_status_problem(_role_problem(error, tuple(str(note_file.note_path(status.label)) for status in [*statuses, *codex])))
         groups = GroupAccounts()
         codex = [replace(status, role=NO_VALUE) for status in codex]
-    group_directories, directory_problems = _claude_role_directories(groups)
-    for problem in directory_problems:
+
+    def report_role_problem(problem: AccountsError | str) -> None:
         role_problems.append(problem)
         paths = tuple(str(note_file.note_path(status.label)) for status in statuses) if isinstance(problem, AccountsError) else ()
         _observe_status_problem(_role_problem(problem, paths))
+
+    group_directories = _claude_role_directories(groups, report_problem=report_role_problem)
     all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
     rows = tuple(
         replace(row, roles=(status.role,) if status.role in (CODEX_ROLE, "spare") else (),

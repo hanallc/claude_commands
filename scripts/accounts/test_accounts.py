@@ -6176,12 +6176,15 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual((code, error), (0, ""))
         host_history, mac_history = self.root / "host-pace.jsonl", self.root / "mac-pace.jsonl"
         at = datetime.now(timezone.utc)
+        left = 7
+        store_usage("Claude", "target@example.invalid", usage_store.StoredUsage(weekly=usage_store.StoredWindow(
+            left=left, at=at.isoformat(), resets=(at + timedelta(days=4)).isoformat())))
         clock = self.enterContext(patch.object(next_moves, "datetime", wraps=datetime))
         cast(MagicMock, clock.now).return_value = at
         for path, per_hour in ((host_history, 1), (mac_history, 6)):
             _ = path.write_text("\n".join(json.dumps({"account": "claude2",
                 "at": (at - timedelta(minutes=180 - index * 10)).isoformat(),
-                "remaining": 10 - index * per_hour / 6}) for index in range(19)))
+                "remaining": left + (18 - index) * per_hour / 6}) for index in range(19)))
         with patch.object(run_out, "READINGS_LOG", host_history):
             code, host_output, error = self.run_cli("next", "list")
         self.assertEqual((code, error), (0, ""))
