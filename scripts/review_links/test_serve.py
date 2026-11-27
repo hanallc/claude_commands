@@ -1918,6 +1918,86 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIsInstance(row.report, the_list.ListReport)
         self.assertIs(row.native_question, the_list.NoQuestionItem.ORDINARY)
 
+    def test_studio_rechecks_an_unavailable_question_route_after_the_keeper_returns(self) -> None:
+        self.check_studio_question_route_recovery(save_fallback=False)
+
+    def test_studio_rechecks_a_skipped_question_route_before_the_first_claim(self) -> None:
+        self.check_studio_question_route_recovery(save_fallback=True)
+
+    def check_studio_question_route_recovery(self, *, save_fallback: bool) -> None:
+        case = self.review_fixture()
+        keeper = fixture_member("producer", name="recovering-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        owner = fixture_member("producer", name="layout-owner")
+        _ = staff.set_producer_retirement(keeper.id, staff.RetiredProducer("claude:sonnet:high"))
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.ListFilingUnavailable)
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        before = saved.path.read_bytes()
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()),
+              patch.object(restarted, "write_slots", side_effect=OSError("The notice claim stopped.")) as claim):
+            if save_fallback:
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                claim.assert_called_once()
+                self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.NoListFiling)
+                self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
+                self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+                claim.reset_mock()
+            _ = staff.set_producer_retirement(keeper.id, staff.Active())
+            members = staff.snapshot()
+            self.assertTrue(review_items.can_move_wait(review_items.submission_item(saved, members)))
+            self.assertEqual(the_list.move_review_waits(case.root, members), [])
+            self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
+            self.assertEqual(saved.path.read_bytes(), before)
+            self.assertFalse(reservation.exists())
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_called_once()
+            self.assertEqual(read_new_item_notices(log), [])
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+
+        row, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(the_list.reserved_review_number(reservation), row.number)
+        self.assertEqual(row.native_question, the_list.NativeQuestionItem(
+            the_list.QuestionItemKind.FROM_NATE, f"submission/question/{saved.request_id}"))
+        self.assertIs(row.state, the_list.ItemState.WORKING)
+        self.assertEqual(saved.path.read_bytes(), before)
+        with new_item_notice_log(self.root, keeper.id) as log:
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [row.id])
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [row])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_studio_keeps_a_claimed_review_only_question_after_the_keeper_returns(self) -> None:
+        case = self.review_fixture()
+        keeper = fixture_member("producer", name="recovering-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        owner = fixture_member("producer", name="layout-owner")
+        _ = staff.set_producer_retirement(keeper.id, staff.RetiredProducer("claude:sonnet:high"))
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        marker = reservation.with_name("first-message.json")
+        pending = marker.read_bytes()
+        with new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()):
+            review_actions.recover_submission_deliveries(case.status, review_page.PAGE_PATH)
+            self.assertFalse(marker.exists())
+            self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.NoListFiling)
+            _ = staff.set_producer_retirement(keeper.id, staff.Active())
+            # A retry can restore the marker after the first claim.
+            _ = marker.write_bytes(pending)
+            review_actions.recover_submission_deliveries(case.status, review_page.PAGE_PATH)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [])
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
+        self.assertFalse(reservation.exists())
+        self.assertFalse(marker.exists())
+
     def check_list_notice_recovery(self, *, stop_before_row: bool, retire_producer: bool = False,
                                    authority_unavailable: bool = False, answered_marker: bool = False) -> None:
         case = self.review_fixture()

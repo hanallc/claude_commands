@@ -48,6 +48,11 @@ class QuestionRoute(StrEnum):
     UNRESOLVED = "the question needs a verified List destination"
 
 
+class StudioRouteOwner(StrEnum):
+    OTHER_WRITER = "defer to Studio while it owns the filing"
+    STUDIO_SEND = "finish the staged Studio filing"
+
+
 @dataclass(frozen=True)
 class ResolvedQuestionDestination:
     destination: investigation.ListDestination
@@ -1435,9 +1440,10 @@ def _native_question_exchanges(record: update_registration.QuestionRecord, key: 
                                zone: ZoneInfo, members: staff.StaffSnapshot,
                                history: tuple[list_exchange.FiledExchange, ...] = (),
                                unresolved: list[tuple[str, int]] | None = None, *,
-                               filing: the_list.QuestionFiling = the_list.QuestionFiling.LIVE) -> AcceptedExchanges:
+                               filing: the_list.QuestionFiling = the_list.QuestionFiling.LIVE,
+                               studio: StudioRouteOwner = StudioRouteOwner.OTHER_WRITER) -> AcceptedExchanges:
     origin = _native_question_origin(record)
-    route = resolve_legacy_question_destination(origin, links, record=record, filing=filing)
+    route = resolve_legacy_question_destination(origin, links, record=record, filing=filing, studio=studio)
     destinations = (route.destination,) if isinstance(route, ResolvedQuestionDestination) else ()
     accepted = ExchangeVerifier(record, zone, members, history).resolve(key, destinations, unresolved)
     return replace(accepted, exchanges=tuple(replace(exchange, question_route=route) for exchange in accepted))
@@ -1454,13 +1460,15 @@ def _studio_question_route(folder: Path, origin: the_list.NativeQuestionItem
             return QuestionRoute.NEW
         raise
     match fields:
+        case {"skipped": str()} if number is the_list.NextNumber.AVAILABLE:
+            return QuestionRoute.STAGED_STUDIO if (folder / "first-message.json").exists() else QuestionRoute.NEW
         case {"keeper": str(keeper)} if keeper:
             new_item_dialog.check_recipient_id(staff.StaffId(keeper))
             if number is the_list.NextNumber.AVAILABLE:
                 return QuestionRoute.STAGED_STUDIO
             return ResolvedQuestionDestination(investigation.ListDestination(staff.StaffId(keeper), number), origin)
-        case {"skipped": str()} | {"unavailable": str()} if number is the_list.NextNumber.AVAILABLE:
-            return QuestionRoute.NEW
+        case {"unavailable": str()} if number is the_list.NextNumber.AVAILABLE:
+            return QuestionRoute.STAGED_STUDIO
         case _:
             raise the_list.ListError(f"Invalid List route for request {folder.name}.")
 
@@ -1505,16 +1513,19 @@ def _native_question_origin(record: update_registration.QuestionRecord) -> the_l
 
 def _resolve_current_question_destination(
     record: update_registration.QuestionRecord, origin: the_list.NativeQuestionItem,
+    *, studio: StudioRouteOwner = StudioRouteOwner.OTHER_WRITER,
 ) -> ResolvedQuestionDestination | QuestionRoute:
     """Read the List under the caller's question filing locks."""
     links = _list_review_links(list_page.records(include_closed=True))
-    return resolve_legacy_question_destination(origin, links, record=record, filing=the_list.QuestionFiling.LIVE)
+    return resolve_legacy_question_destination(origin, links, record=record, filing=the_list.QuestionFiling.LIVE,
+                                               studio=studio)
 
 
 def resolve_legacy_question_destination(
     origin: the_list.NativeQuestionItem, links: ReviewListLinks, *,
     record: update_registration.QuestionRecord | NativeQuestionRecord = NativeQuestionRecord.ABSENT,
     filing: the_list.QuestionFiling = the_list.QuestionFiling.HISTORY,
+    studio: StudioRouteOwner = StudioRouteOwner.OTHER_WRITER,
 ) -> ResolvedQuestionDestination | QuestionRoute:
     """Resolve the original List destination from durable question records."""
     request = origin.source_key.removeprefix("submission/question/")
@@ -1527,6 +1538,8 @@ def resolve_legacy_question_destination(
         except (OSError, ValueError):
             return QuestionRoute.UNRESOLVED
         if isinstance(saved_route, ResolvedQuestionDestination):
+            return saved_route
+        if saved_route is QuestionRoute.STAGED_STUDIO and studio is StudioRouteOwner.OTHER_WRITER:
             return saved_route
         studio_route = saved_route
 
@@ -2029,7 +2042,7 @@ def file_list_submission_question(record: update_registration.QuestionRecord,
     origin = _native_question_origin(record)
     key = origin.source_key
     with the_list.lock_exchange_source(key):
-        route = _resolve_current_question_destination(record, origin)
+        route = _resolve_current_question_destination(record, origin, studio=StudioRouteOwner.STUDIO_SEND)
         if route in (QuestionRoute.NEW, QuestionRoute.STAGED_STUDIO):
             destination = file_row()
         elif isinstance(route, ResolvedQuestionDestination):
@@ -2046,7 +2059,8 @@ def file_list_submission_question(record: update_registration.QuestionRecord,
     links = _list_review_links(entries)
 
     def reload() -> AcceptedExchanges:
-        return _native_question_exchanges(record, key, links, zone, members, the_list.exchange_history(key))
+        return _native_question_exchanges(record, key, links, zone, members, the_list.exchange_history(key),
+                                          studio=StudioRouteOwner.STUDIO_SEND)
 
     filed = ((destination, exchange) for entry in entries
              if entry.keeper == destination.keeper and entry.item.number == destination.number
