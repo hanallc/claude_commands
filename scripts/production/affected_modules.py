@@ -64,6 +64,7 @@ class FactCacheLock(Enum):
 class SelectionRun:
     cache_hits: int = 0
     cache_misses: int = 0
+    extracted_files: int = 0
     cache_read_s: float = 0.0
     extraction_s: float = 0.0
     graph_s: float = 0.0
@@ -85,17 +86,22 @@ class SelectionRun:
 
 
 @dataclass(frozen=True)
+class SelectionNotRun:
+    pass
+
+
+@dataclass(frozen=True)
 class AffectedSelection:
     base: CertifiedBase
     changed_files: tuple[str, ...]
     modules: tuple[Path, ...]
-    run: SelectionRun | None = field(default=None, compare=False)
+    run: SelectionRun | SelectionNotRun = field(default_factory=SelectionNotRun, compare=False)
 
 
 @dataclass(frozen=True)
 class FullSuite:
     reason: str
-    run: SelectionRun | None = field(default=None, compare=False)
+    run: SelectionRun | SelectionNotRun = field(default_factory=SelectionNotRun, compare=False)
 
 
 class GraphError(Exception):
@@ -668,6 +674,7 @@ def write_fact_cache(path: Path, facts: dict[str, SourceFacts], published: set[s
     current = facts.keys() & retained
     added = current - original
     removed = original - current
+    saved = False
     try:
         with tempfile.TemporaryDirectory(prefix=".affected-facts-", dir=path.parent) as directory:
             temporary = Path(directory) / path.name
@@ -682,9 +689,11 @@ def write_fact_cache(path: Path, facts: dict[str, SourceFacts], published: set[s
                 _ = database.executemany("DELETE FROM facts WHERE blob = ?", ((blob,) for blob in removed))
                 _ = database.executemany("INSERT INTO facts VALUES (?, ?, ?)", (fact_row(blob, facts[blob]) for blob in added))
             os.replace(temporary, path)
-            return True
+            saved = True
     except (OSError, sqlite3.Error):
-        return False
+        # A cleanup error after replacement leaves the new snapshot published.
+        pass
+    return saved
 
 
 @dataclass
@@ -1070,8 +1079,18 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
         name = Path(path).parent.name if Path(path).name == "__init__.py" else Path(path).stem
         bare_modules[name].add(path)
     sources = sorted(paths)
-    missing = {blobs[path] for path in sources if path in blobs and blobs[path] not in cached}
-    texts = blob_texts(repo, missing) if not worktree and missing else {}
+    texts: dict[str, str] = {}
+    if not worktree:
+        missing = {blobs[path] for path in sources if path in blobs and blobs[path] not in cached}
+        if missing:
+            if run is not None:
+                run.cache_misses += len(missing)
+            started = monotonic()
+            try:
+                texts = blob_texts(repo, missing)
+            finally:
+                if run is not None:
+                    run.extraction_s += monotonic() - started
     external = set(sys.stdlib_module_names) | set(packages_distributions())
     graph: dict[str, set[str]] = {}
     tokens: dict[str, frozenset[str]] = {}
@@ -1081,11 +1100,13 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
         blob = blobs.get(path) if path not in dirty else None
         facts = cached.get(blob) if blob is not None else None
         if facts is None:
+            if worktree and run is not None:
+                run.cache_misses += 1
             started = monotonic()
             try:
                 text = (repo / path).read_text(encoding="utf-8") if worktree else texts[blobs[path]]
                 if run is not None:
-                    run.cache_misses += 1
+                    run.extracted_files += 1
                 facts = extract_facts(text, path)
             finally:
                 if run is not None:

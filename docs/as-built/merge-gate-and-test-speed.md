@@ -663,9 +663,11 @@ Only a direct test run (`start_test_run`) moves an unset `BUILDLOG_DIR` into its
 
 Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files, selected in S s`.
 The same line gives cache hits, cache misses, part times, and the cache lock result.
-A hit uses cached facts. A miss extracts facts from a source file.
+A hit uses cached facts. A miss counts before the source read.
+The extraction count records each source file that starts extraction.
 The counts include current and base graph lookups when selection builds both graphs.
 The times show cache read, extraction, graph build, and other work in seconds to one decimal place.
+Extraction time includes source reads for both graphs.
 The lock result shows when selection publishes facts or reads the old snapshot with the lock busy.
 It prints module names when ten or fewer modules are selected.
 A full run prints `full suite: <reason>` and repeats the reason in the final `Gate tests:` summary.

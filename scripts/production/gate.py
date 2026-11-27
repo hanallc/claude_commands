@@ -102,7 +102,7 @@ from scripts.production.gate_routes import (
     SuiteMode as SuiteMode, TreeSelection as TreeSelection,
 )
 from scripts.production.affected_modules import (  # noqa: E402
-    AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
+    AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, SelectionRun, select_affected,
 )
 from scripts.lib.release_waiter import local_release_waiter  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
@@ -1634,16 +1634,17 @@ def full_required() -> FullSuite | NoFullRunRequired:
         return FullSuite(f"last nightly run was red (unreadable marker: {error})")
 
 
-def report_selection(selection: AffectedSelection | FullSuite, total: int, selection_s: float) -> None:
+def report_selection(selection: AffectedSelection | FullSuite, total: int) -> None:
     if isinstance(selection, FullSuite):
         print(f"full suite: {selection.reason}", flush=True)
         return
     when = datetime.fromisoformat(selection.base.at).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
     details = ""
-    if (run := selection.run) is not None:
+    selection_s = 0.0
+    if isinstance(run := selection.run, SelectionRun):
         selection_s = run.total_s
         details = (f" (cache {run.cache_hits} hits, {run.cache_misses} misses; read {run.cache_read_s:.1f} s, "
-                   + f"extract {run.cache_misses} files {run.extraction_s:.1f} s, graph {run.graph_s:.1f} s, "
+                   + f"extract {run.extracted_files} files {run.extraction_s:.1f} s, graph {run.graph_s:.1f} s, "
                    + f"other {run.other_s:.1f} s; lock {run.lock.value})")
     print(f"affected: {len(selection.modules)} of {total} modules (base {selection.base.commit[:12]}, {when}), "
           + f"{len(selection.changed_files)} changed files, selected in {selection_s:.1f} s{details}", flush=True)
@@ -1663,10 +1664,8 @@ def select_targeted_modules(repo: Path, tested_tree: CleanTestTree | Unrecordabl
     base = ledger.certified_base()
     paths = [path for _, path in modules]
     state_dir = gate_state_dir()
-    started = time.monotonic()
     selection = select_affected(repo, base, paths, dirty, state_dir=state_dir)
-    selection_s = time.monotonic() - started
-    report_selection(selection, len(modules), selection_s)
+    report_selection(selection, len(modules))
     return selection, ledger
 
 

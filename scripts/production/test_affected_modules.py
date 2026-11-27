@@ -855,7 +855,7 @@ def shadow(root):
                   mock.patch.object(fcntl, "flock", wraps=fcntl.flock) as lock):
                 reader = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
             self.assertEqual(reader, expected)
-            assert reader.run is not None
+            assert isinstance(reader.run, affected.SelectionRun)
             self.assertIs(reader.run.lock, affected.FactCacheLock.BUSY_SNAPSHOT)
             self.assertEqual((reader.run.cache_hits, reader.run.cache_misses), (11, 1))
             self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list], [subject])
@@ -869,7 +869,7 @@ def shadow(root):
             writer = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
         graph.assert_called_once()
         self.assertEqual(writer, expected)
-        assert writer.run is not None
+        assert isinstance(writer.run, affected.SelectionRun)
         self.assertIs(writer.run.lock, affected.FactCacheLock.PUBLISHED)
         facts = affected.read_fact_cache(self.cache_file())
         self.assertIsNotNone(facts)
@@ -885,16 +885,88 @@ def shadow(root):
         warm = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
         self.assertIsInstance(cold, affected.AffectedSelection)
         self.assertEqual(warm, cold)
-        assert cold.run is not None and warm.run is not None
+        assert isinstance(cold.run, affected.SelectionRun) and isinstance(warm.run, affected.SelectionRun)
         self.assertEqual((cold.run.cache_hits, cold.run.cache_misses), (9, 2))
+        self.assertEqual(cold.run.extracted_files, 2)
         self.assertIs(cold.run.lock, affected.FactCacheLock.PUBLISHED)
         self.assertEqual((warm.run.cache_hits, warm.run.cache_misses), (11, 0))
         self.assertIs(warm.run.lock, affected.FactCacheLock.TAKEN)
+        self.assertEqual(warm.run.extracted_files, 0)
         self.assertEqual(warm.run.extraction_s, 0)
         for run in (cold.run, warm.run):
             self.assertGreaterEqual(run.cache_read_s, 0)
             self.assertGreaterEqual(run.graph_s, 0)
             self.assertGreaterEqual(run.other_s, 0)
+
+    def test_invalid_source_reads_count_misses_before_extraction(self) -> None:
+        invalid = self.repo / "scripts/broken.py"
+        _ = invalid.write_bytes(b"\xff")
+        self.certify()
+        current = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        invalid.unlink()
+        _ = self.commit()
+        historical = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        for result, extracted in ((current, 0), (historical, 1)):
+            assert isinstance(result, affected.FullSuite)
+            self.assertIn("utf-8", result.reason)
+            assert isinstance(result.run, affected.SelectionRun)
+            self.assertEqual(result.run.extracted_files, extracted)
+            self.assertEqual(result.run.cache_misses, extracted + 1)
+
+    def test_source_reads_in_both_graphs_count_as_extraction_time(self) -> None:
+        current = "scripts/current.py"
+        historical = "scripts/historical.py"
+        self.write(historical, "VALUE = 2\n")
+        self.certify()
+        (self.repo / historical).unlink()
+        self.write(current, "VALUE = 3\n")
+        _ = self.commit()
+        now = 0.0
+        read_text = Path.read_text
+        blob_texts = affected.blob_texts
+
+        def clock() -> float:
+            return now
+
+        def read_current(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            nonlocal now
+            if path == self.repo / current:
+                now += 20.0
+            return read_text(path, encoding=encoding, errors=errors)
+
+        def read_historical(repo: Path, blobs: set[str]) -> dict[str, str]:
+            nonlocal now
+            now += 40.0
+            return blob_texts(repo, blobs)
+
+        with (mock.patch.object(affected, "monotonic", side_effect=clock),
+              mock.patch.object(Path, "read_text", autospec=True, side_effect=read_current),
+              mock.patch.object(affected, "blob_texts", side_effect=read_historical)):
+            result = affected.select_affected(self.repo, self.base, self.modules, set())
+
+        assert isinstance(result, affected.AffectedSelection)
+        assert isinstance(result.run, affected.SelectionRun)
+        self.assertEqual(result.run.extraction_s, 60.0)
+        self.assertEqual(result.run.graph_s, 0.0)
+        self.assertEqual(result.run.total_s, 60.0)
+
+    def test_cache_cleanup_error_after_replacement_keeps_publication_result(self) -> None:
+        run = affected.SelectionRun(lock=affected.FactCacheLock.TAKEN)
+        cache_path = self.cache_file()
+        cache_path.parent.mkdir()
+        facts = {"example": affected.extract_facts("VALUE = 1\n", "example.py")}
+        cache = affected.FactCache(facts, cache_path, run=run)
+
+        class FailingCleanup(tempfile.TemporaryDirectory[str]):
+            @override
+            def cleanup(self) -> None:
+                super().cleanup()
+                raise OSError("cleanup failed")
+
+        with mock.patch.object(tempfile, "TemporaryDirectory", FailingCleanup):
+            cache.retain(set(facts))
+        self.assertIs(run.lock, affected.FactCacheLock.PUBLISHED)
+        self.assertEqual(affected.read_fact_cache(cache_path), facts)
 
     def test_deleted_blob_is_pruned_and_new_targets_resolve_cached_facts(self) -> None:
         self.write("scripts/component/test_caller.py", "import test_future_subject\n")
@@ -1399,7 +1471,7 @@ def shadow(root):
         self.assertIsInstance(result, affected.FullSuite)
         assert isinstance(result, affected.FullSuite)
         self.assertIn("scripts/checks/test_deleted.py", result.reason)
-        assert result.run is not None
+        assert isinstance(result.run, affected.SelectionRun)
         self.assertGreater(result.run.cache_misses, 0)
         self.assertGreaterEqual(result.run.graph_s, 0)
 
