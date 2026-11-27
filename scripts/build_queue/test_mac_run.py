@@ -29,6 +29,7 @@ from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.copies import copies
 from scripts.direct import phase_wait_holder
 from scripts.lib import build_folders, conf, process_start as process_identity
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import (
     UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture,
 )
@@ -818,7 +819,7 @@ sys.exit(71)
                 yield
 
         def claim_guest() -> None:
-            self.assertTrue(retiring.wait(3))
+            self.assertTrue(retiring.wait(TEST_HANG_GUARD_SECS), "the old claim did not reach removal")
             with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with replacement"):
                 with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
                     self.fail("The guest took the shared slot")
@@ -826,7 +827,7 @@ sys.exit(71)
         def retire(path: Path, missing_ok: bool = False) -> None:
             if path == legacy:
                 retiring.set()
-                self.assertTrue(guest_waits.wait(3))
+                self.assertTrue(guest_waits.wait(TEST_HANG_GUARD_SECS), "the guest did not see the held lock")
             unlink(path, missing_ok=missing_ok)
 
         unlink = Path.unlink
@@ -835,7 +836,7 @@ sys.exit(71)
                 mock.patch.object(Path, "unlink", autospec=True, side_effect=retire):
             guest = guests.submit(claim_guest)
             status = mac_test.command_claim(runner, self.paths, watch_claim=False)
-            guest.result(timeout=3)
+            LauncherHangGuard("guest claim refusal").result(guest)
         self.assertEqual(status, 0)
         fresh, = claim_state.read_claims(self.paths)
         self.assertEqual(fresh.path, reserved.path)

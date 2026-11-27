@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, chdir, contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 import errno
@@ -792,6 +792,22 @@ class RemoteCopiesTests(unittest.TestCase):
                     copies.unregister_remote(mirror.host, mirror.path)
 
     def test_registration_retries_deferred_removal_without_removing_a_reused_mirror(self) -> None:
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def remove_over_ssh(command: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            request, separator, _ = command[-1].partition("; copies_status=")
+            if command[0] != "ssh" or not separator:
+                return run(command, **options)
+            arguments = shlex.split(request)[2:]
+            self.assertEqual(arguments[0], "mirror-remove")
+            claims = floor_claims.ClaimSnapshot(frozenset())
+            processes = copies.MirrorProcessScan(tmp_sweep.ProcessUsesKnown([]), frozenset())
+            with (mock.patch.object(floor_claims, "read_claims", return_value=claims),
+                  mock.patch.object(copies, "scan_mirror_processes", return_value=processes),
+                  redirect_stdout(io.StringIO()) as stdout, redirect_stderr(io.StringIO()) as stderr):
+                status = copies.main(arguments)
+            return subprocess.CompletedProcess(command, status, stdout.getvalue() + f"\nrc={status}\n", stderr.getvalue())
+
         for action in ("remove", "reuse", "refused", "remote-refused", "missing-status"):
             root = self.root / action
             root.mkdir()
@@ -813,11 +829,13 @@ class RemoteCopiesTests(unittest.TestCase):
                     remote_output = "rc=2\n" if action == "remote-refused" else ""
                     _ = contexts.enter_context(mock.patch.object(subprocess, "run", return_value=
                         subprocess.CompletedProcess(["ssh"], 0, remote_output, "mirror is busy")))
+                else:
+                    _ = contexts.enter_context(mock.patch.object(subprocess, "run", side_effect=remove_over_ssh))
                 error = io.StringIO()
                 with redirect_stderr(error):
                     copies.register_remote(active)
                 if action == "remove":
-                    self.assertEqual(copies.owned_remote_mirrors("alpha"), [active])
+                    self.assertEqual(copies.owned_remote_mirrors("alpha"), [active], error.getvalue())
                     self.assertFalse(Path(mirror.path).exists())
                 elif action == "reuse":
                     self.assertNotIn("removal", cast(dict[str, object], json.loads(path.read_text())))

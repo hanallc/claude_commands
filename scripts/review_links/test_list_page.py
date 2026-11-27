@@ -199,14 +199,23 @@ class _Browser:
             raise
 
 
+class _ChromeCommandError(RuntimeError):
+    def __init__(self, method: str, error: dict[str, object]) -> None:
+        super().__init__(f"{method}: {error}")
+        self.error: dict[str, object] = error
+
+
 class _Chrome(_Browser):
-    """Keep one Chrome target and start each probe in a new document."""
+    """Keep one fixture tab and close the extra tabs after each test."""
 
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.pending: bytearray = bytearray()
         self.loaded: set[tuple[str, str]] = set()
+        self.origins: set[str] = set()
         self.sequence: int = 0
+        self.blank: bool = True
+        self.session_storage_written: bool = False
         with (root / "chrome.log").open("wb") as log:
             process = subprocess.Popen(
                 ["sh", "-c", 'exec 3<&0 4>&1; exec "$@" 1>&2', "chrome-fixture",
@@ -220,12 +229,61 @@ class _Chrome(_Browser):
             writer = process.stdin
             assert writer is not None
             os.set_blocking(writer.fileno(), False)
-            context = self.command("Target.createBrowserContext", {})["browserContextId"]
-            target = self.command("Target.createTarget", {"url": "about:blank", "browserContextId": context})
-            self.session: str = cast(str, self.command("Target.attachToTarget",
-                {"targetId": target["targetId"], "flatten": True})["sessionId"])
-            _ = self.command("Page.enable", {}, self.session)
-            _ = self.command("Page.setLifecycleEventsEnabled", {"enabled": True}, self.session)
+            self.context: str = cast(str, self.command("Target.createBrowserContext", {})["browserContextId"])
+            self.target: str
+            self.session: str
+            self.open_fixture_tab()
+            # The fixture tab keeps Chrome open after the startup tab closes.
+            for tab in self.tabs():
+                if tab["targetId"] != self.target:
+                    self.close_tab(tab["targetId"])
+
+    def open_fixture_tab(self) -> None:
+        target = self.command("Target.createTarget", {"url": "about:blank", "browserContextId": self.context})
+        self.target = cast(str, target["targetId"])
+        self.session = cast(str, self.command("Target.attachToTarget",
+            {"targetId": self.target, "flatten": True})["sessionId"])
+        _ = self.command("Page.enable", {}, self.session)
+        _ = self.command("Page.setLifecycleEventsEnabled", {"enabled": True}, self.session)
+        _ = self.command("DOMStorage.enable", {}, self.session)
+        self.blank = True
+
+    def tabs(self) -> list[dict[str, str]]:
+        targets = cast(list[dict[str, str]], self.command("Target.getTargets", {})["targetInfos"])
+        return [target for target in targets if target["type"] == "page"]
+
+    def close_tab(self, target: str) -> None:
+        try:
+            _ = self.command("Target.closeTarget", {"targetId": target})
+        except _ChromeCommandError as error:
+            if error.error.get("code") != -32602 or error.error.get("message") != "No target with given id found":
+                raise
+
+    def close_test_pages(self) -> None:
+        if self.closed:
+            return
+        with self.stop_on_error():
+            for opened in self.tabs():
+                if opened["targetId"] != self.target:
+                    self.close_tab(opened["targetId"])
+            if not self.blank:
+                self.navigate("about:blank")
+            if self.session_storage_written:
+                # Closing the tab discards session storage for all its documents.
+                old_target = self.target
+                self.open_fixture_tab()
+                self.close_tab(old_target)
+            _ = self.command("Page.resetNavigationHistory", {}, self.session)
+            _ = self.command("Emulation.clearDeviceMetricsOverride", {}, self.session)
+            _ = self.command("Emulation.setEmulatedMedia", {"media": "", "features": []}, self.session)
+            _ = self.command("Network.clearBrowserCookies", {}, self.session)
+            _ = self.command("Network.clearBrowserCache", {}, self.session)
+            for origin in sorted(self.origins):
+                _ = self.command("Storage.clearDataForOrigin",
+                                 {"origin": origin, "storageTypes": "all"}, self.session)
+            self.origins.clear()
+            self.loaded.clear()
+            self.session_storage_written = False
 
     def read(self, deadline: float) -> dict[str, object]:
         reader = self.process.stdout
@@ -238,10 +296,20 @@ class _Chrome(_Browser):
             if end >= 0:
                 reply = cast(dict[str, object], json.loads(self.pending[:end]))
                 del self.pending[:end + 1]
-                if reply.get("method") == "Page.lifecycleEvent":
-                    parameters = cast(dict[str, str], reply["params"])
-                    if parameters["name"] == "DOMContentLoaded":
-                        self.loaded.add((cast(str, reply["sessionId"]), parameters["loaderId"]))
+                method = reply.get("method")
+                if method == "Page.lifecycleEvent":
+                    lifecycle = cast(dict[str, str], reply["params"])
+                    if lifecycle["name"] == "DOMContentLoaded":
+                        self.loaded.add((cast(str, reply["sessionId"]), lifecycle["loaderId"]))
+                elif method == "Page.frameNavigated":
+                    navigation = cast(dict[str, dict[str, str]], reply["params"])
+                    origin = navigation["frame"]["securityOrigin"]
+                    if urlsplit(origin).scheme in {"http", "https", "file"}:
+                        self.origins.add(origin)
+                elif method in {"DOMStorage.domStorageItemAdded", "DOMStorage.domStorageItemUpdated"}:
+                    storage = cast(dict[str, dict[str, bool]], reply["params"])
+                    if not storage["storageId"]["isLocalStorage"]:
+                        self.session_storage_written = True
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Chrome did not answer")
                 return reply
@@ -252,7 +320,8 @@ class _Chrome(_Browser):
                 raise RuntimeError((self.root / "chrome.log").read_text(errors="replace"))
             self.pending.extend(chunk)
 
-    def command(self, method: str, parameters: dict[str, object], session: str = "") -> dict[str, object]:
+    def command(self, method: str, parameters: dict[str, object], session: str = "", *,
+                timeout: float = 20) -> dict[str, object]:
         self.sequence += 1
         request: dict[str, object] = {"id": self.sequence, "method": method, "params": parameters}
         if session:
@@ -260,7 +329,7 @@ class _Chrome(_Browser):
         writer = self.process.stdin
         assert writer is not None
         data = memoryview(json.dumps(request).encode() + b"\0")
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + timeout
         while data:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not select.select([], [writer], [], remaining)[1] or time.monotonic() >= deadline:
@@ -274,10 +343,12 @@ class _Chrome(_Browser):
             reply = self.read(deadline)
             if reply.get("id") == self.sequence:
                 if "error" in reply:
-                    raise RuntimeError(f"{method}: {reply['error']}")
+                    raise _ChromeCommandError(method, cast(dict[str, object], reply["error"]))
                 return cast(dict[str, object], reply["result"])
 
     def navigate(self, destination: str) -> None:
+        self.blank = False
+        self.loaded.clear()
         navigation = self.command("Page.navigate", {"url": destination}, self.session)
         if "errorText" in navigation:
             raise RuntimeError(f"Page.navigate: {navigation['errorText']}")
@@ -285,6 +356,7 @@ class _Chrome(_Browser):
         deadline = time.monotonic() + 20
         while load not in self.loaded:
             _ = self.read(deadline)
+        self.blank = destination == "about:blank"
 
     def dom(self, page: Path | str, marker: str, *, reduced_motion: bool,
             window_size: tuple[int, int] | None) -> subprocess.CompletedProcess[str]:
@@ -316,14 +388,13 @@ class _Chrome(_Browser):
             self.navigate(destination)
             try:
                 response = self.command("Runtime.evaluate",
-                    {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session)
+                    {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session,
+                    timeout=TEST_HANG_GUARD_SECS)
             except TimeoutError as error:
                 raise TimeoutError(f"Chrome did not find {marker} in {destination}") from error
             result = cast(dict[str, object], response["result"])
             _ = self.command("Page.removeScriptToEvaluateOnNewDocument", {"identifier": hook["identifier"]}, session)
             self.navigate("about:blank")
-            _ = self.command("Page.resetNavigationHistory", {}, session)
-            self.loaded.clear()
             return subprocess.CompletedProcess(destination, 0, str(result.get("value", "")), "")
 
 
@@ -428,6 +499,7 @@ class ListPageTests(unittest.TestCase):
     root: Path = Path()
     browser_root: ClassVar[Path]
     _chrome: ClassVar[_Chrome | None] = None
+    _test_chrome: _Chrome | None = None
     _firefox: ClassVar[_Firefox | None] = None
 
     @classmethod
@@ -475,16 +547,20 @@ class ListPageTests(unittest.TestCase):
             + "# range: 0.001..86400\nstatus.list.age_limit_seconds=45\n"
             + "# range: 0.001..86400\nstatus.review.age_limit_seconds=45\n")
 
-    @classmethod
-    def chrome(cls) -> _Chrome:
-        if cls._chrome is not None:
-            if not cls._chrome.closed and cls._chrome.process.poll() is None:
-                return cls._chrome
-            cls._chrome.close()
-        root = Path(tempfile.mkdtemp(dir=cls.browser_root, prefix="chrome-"))
-        cls._chrome = _Chrome(root)
-        cls.addClassCleanup(cls._chrome.close)
-        return cls._chrome
+    def chrome(self) -> _Chrome:
+        cls = type(self)
+        browser = cls._chrome
+        if browser is None or browser.closed or browser.process.poll() is not None:
+            if browser is not None:
+                browser.close()
+            root = Path(tempfile.mkdtemp(dir=cls.browser_root, prefix="chrome-"))
+            browser = _Chrome(root)
+            cls._chrome = browser
+            cls.addClassCleanup(browser.close)
+        if self._test_chrome is not browser:
+            self._test_chrome = browser
+            self.addCleanup(browser.close_test_pages)
+        return browser
 
     @classmethod
     def firefox(cls) -> _Firefox:
@@ -501,6 +577,8 @@ class ListPageTests(unittest.TestCase):
                      complete: threading.Event | None = None, *, dark: bool = False
                      ) -> subprocess.CompletedProcess[str]:
         if width < FIREFOX_MIN_SHARED_WIDTH:
+            if self._chrome is not None:
+                self._chrome.close()
             with tempfile.TemporaryDirectory(dir=self.root, prefix="firefox-view-") as temporary:
                 root = Path(temporary)
                 command, environment = _private_firefox_command(root / "profile", width, height, dark=dark)
@@ -519,6 +597,15 @@ class ListPageTests(unittest.TestCase):
         except (OSError, RuntimeError) as error:
             raise RuntimeError(f"Firefox could not show {destination}") from error
         return subprocess.CompletedProcess(destination, 0, "", "")
+
+    def firefox_probe(self, page: bytes, *, window_size: tuple[int, int] | None = None) -> list[list[str]]:
+        width, height = window_size or (1366, 768)
+
+        def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            return self.firefox_view(arguments[-1], None, width, height)
+
+        with patch.object(browser_test_support, "run_process_group", side_effect=load):
+            return firefox_probe_results(page, window_size=(width, height))
 
     def test_review_links_use_the_card_body_for_every_state(self) -> None:
         source = review_items.ProposalLedgerSource(self.root / "proposals.md")
@@ -1547,11 +1634,15 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
 })();
 </script>'''
         page = page.replace(b"</body>", probe + b"</body>", 1)
+        if self._chrome is not None:
+            self._chrome.close()
         self.assertEqual(window_probe_results(
             {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_review_links_open_one_card_without_leaving_the_list(self) -> None:
+        if self._chrome is not None:
+            self._chrome.close()
         root = self.root / "reviews"
         doc = self.root / "sdlc.md"
         listing = self.root / f"{change_review.PREFIX}sdlc.md"
@@ -2119,9 +2210,6 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                             result = self.firefox_view(url + "&shot=1", Path(proof), width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
                         elif size == "390,900":
-                            for browser in (self._chrome, self._firefox):
-                                if browser is not None:
-                                    browser.close()
                             result = self.firefox_view(url, None, width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
                         else:
@@ -2949,7 +3037,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 markup = list_page.render(self.root / "reviews", include_counts=False, query=server_query).decode()
                 page = markup.replace(script, before.replace("CASE", case) + script, 1)
                 page = page.replace("</body>", after + "</body>", 1)
-                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+                self.assertEqual(self.firefox_probe(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_preserves_staff_ids_in_query_filters(self) -> None:
@@ -2971,7 +3059,7 @@ const firstPaint=visible();
             script = "<script>" + list_page.SCRIPT
             start = before.replace('ADDRESS', json.dumps(f"?{query}"))
             page = markup.replace(script, start + script, 1).replace("</body>", after + "</body>", 1)
-            self.assertEqual(firefox_probe_results(page.encode()), [[]])
+            self.assertEqual(self.firefox_probe(page.encode()), [[]])
 
         after = r'''<script>
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
@@ -4537,6 +4625,9 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_schedule_filters_repeat_menu_and_scopes(self) -> None:
+        # Close idle Firefox before this Chrome test uses several renderers.
+        if self._firefox is not None:
+            self._firefox.close()
         root = self.root / "reviews"
         start = the_list.ScheduledRun(datetime(2026, 11, 30, 14, tzinfo=UTC), "Compare the account predictions.")
         one_time = the_list.ScheduledRun(datetime(2026, 11, 27, 21, tzinfo=UTC), "Set the time zone to Eastern time.")
@@ -7511,7 +7602,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
             self.browser_action_sequence(steps, reduced_motion=True, add_item=False)
         finally:
             if not browser.closed:
-                _ = browser.command("Target.closeTarget", {"targetId": other_tab})
+                browser.close_tab(other_tab)
                 _ = browser.command("Page.bringToFront", {}, browser.session)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -7941,7 +8032,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>').encode()), [[]])
+        self.assertEqual(self.firefox_probe(markup.replace('</body>', probe+'</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_undo_unpark_restores_the_parked_row(self) -> None:
@@ -7967,7 +8058,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>').encode()), [[]])
+        self.assertEqual(self.firefox_probe(markup.replace('</body>', probe+'</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_undo_unpark_restores_the_linked_row(self) -> None:
@@ -7997,7 +8088,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>').encode()), [[]])
+        self.assertEqual(self.firefox_probe(markup.replace('</body>', probe+'</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_explicit_actions_release_open_rows_from_unread_only(self) -> None:
@@ -8295,13 +8386,18 @@ window.fetch=async(_url,options)=>{
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_undo_keeps_the_words_and_leaves_the_row_unsent(self) -> None:
         self.browser_action_sequence(r'''
- const until=async(test,label)=>{
-  const end=performance.now()+8000;
-  while(!test()){
-   if(performance.now()>end) throw new Error(label);
-   await new Promise(resolve=>setTimeout(resolve,20));
-  }
- };
+ const until=(test,label)=>new Promise((resolve,reject)=>{
+  const ready=()=>{
+   if(!test()) return;
+   observer.disconnect();clearTimeout(timer);resolve();
+  };
+  const observer=new MutationObserver(ready);
+  observer.observe(document,{subtree:true,childList:true,characterData:true});
+  const timer=setTimeout(()=>{
+   observer.disconnect();reject(new Error(label));
+  },HANG_GUARD_MS);
+  ready();
+ });
  const before={state:row.dataset.state,unread:row.dataset.unread};
  const listFetch=window.fetch;let undos=0;
  window.fetch=async(path,options={})=>{
@@ -8326,7 +8422,7 @@ window.fetch=async(_url,options)=>{
  check(row.dataset.state===before.state && row.dataset.unread===before.unread,
   'After Undo the row keeps its state and its unread mark, so it is not marked sent.');
  check(undos===1 && requests.length===1,'Undo posts once and nothing else is sent.');
-''')
+'''.replace('HANG_GUARD_MS', str(TEST_HANG_GUARD_SECS * 1000)))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_held_question_hides_the_item_and_failure_restores_it(self) -> None:
@@ -10251,6 +10347,8 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_sort_filters_hash_refresh_open_rows_and_phone_cards(self) -> None:
+        if self._chrome is not None:
+            self._chrome.close()
         _ = self.fixture_items()
         self.browser(list_page.render(self.root / "reviews").decode())
 

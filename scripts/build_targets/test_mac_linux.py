@@ -42,6 +42,7 @@ from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.build_copies_test_support import (FixedRegistrationKillPoint, fixed_registration_snapshot,
                                                    kill_fixed_registration, private_copy_config)
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.production import checkpoint_gate, gate
@@ -2503,7 +2504,7 @@ fi
             mac_linux.TARGET, self.placed.attempt, str(self.guest_home / 'build/claude/mac-linux'), str(self.guest_home))))
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
-    def check_folder_report_stream(self, *, arm_requested: bool = False) -> None:
+    def check_folder_report_stream(self, *, arm_requested: bool = False, timeout: int = 2) -> None:
         attempt = self.placed.attempt
         marker = mac_linux.guest_start_line(attempt, self.repo, self.guest_home)
         command = [sys.executable, '-c',
@@ -2513,7 +2514,7 @@ fi
         dispatch = self.guest_dispatch()
         dispatch.arm_requested = arm_requested
         with mac_linux.guest_link() as link:
-            result = mac_linux.stream_guest_bundle(self.repo, command, b'', 2, link, armed, dispatch)
+            result = mac_linux.stream_guest_bundle(self.repo, command, b'', timeout, link, armed, dispatch)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b'result\n')
         self.assertEqual(result.stderr, marker.encode() + b'\n' + b'x' * 131072)
@@ -2548,6 +2549,54 @@ fi
         self.check_folder_report_thread_failure('report')
 
     def test_a_stalled_folder_config_read_warns_after_the_guest_result(self) -> None:
+        guard = LauncherHangGuard(self.id())
+        read_started = Event()
+        release_read = Event()
+        expire_join = Event()
+        preparation_join_timeouts: list[float | None] = []
+        output = io.StringIO()
+        read = conf.read
+
+        def read_config(file: str | Path) -> conf.ConfigRead:
+            if file == 'build_admission':
+                read_started.set()
+                guard.event(release_read)
+                raise TimeoutError('the fixture released the stalled read')
+            return read(file)
+
+        def join_preparation(timeout: float | None = None) -> None:
+            preparation_join_timeouts.append(timeout)
+            guard.event(expire_join)
+
+        with (guard.protect(), redirect_stdout(output), redirect_stderr(output),
+              patch.object(conf, 'read', read_config),
+              patch.object(mac_linux, 'monotonic', return_value=0.0), ExitStack() as threads):
+            def new_thread(*, target: Callable[[], None], daemon: bool) -> Thread:
+                worker = Thread(target=target, daemon=daemon)
+                if target.__name__ == 'prepare':
+                    self.assertTrue(worker.daemon, 'The stalled read must let the process exit.')
+                elif target.__name__ == 'collect':
+                    self.assertFalse(worker.daemon, 'The collector must keep the process alive to report the timeout.')
+                _ = threads.callback(guard.join, worker)
+                if target.__name__ == 'prepare':
+                    _ = threads.callback(release_read.set)
+                    _ = threads.enter_context(patch.object(worker, 'join', join_preparation))
+                elif target.__name__ == 'collect':
+                    # Let the collector warn before releasing the read.
+                    _ = threads.callback(expire_join.set)
+                return worker
+
+            _ = threads.enter_context(patch.object(mac_linux, 'Thread', new_thread))
+            self.check_folder_report_stream()
+            guard.event(read_started)
+            print('Guest result returned.', flush=True)
+        self.assertEqual(preparation_join_timeouts, [2.0], 'The join must end by the guest deadline.')
+        self.assertEqual(output.getvalue().splitlines(), [
+            'Guest result returned.',
+            'Mac Linux guest queue report failed: the queue report configuration read timed out',
+        ])
+
+    def test_a_stalled_folder_config_read_does_not_block_interpreter_exit(self) -> None:
         program = """
 from pathlib import Path
 import sys
@@ -2557,32 +2606,31 @@ from unittest.mock import patch
 from scripts.build_targets import mac_linux
 from scripts.build_targets.test_mac_linux import MacLinuxRouteTests
 from scripts.lib import conf
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-entered = Event()
+read_started = Event()
 read = conf.read
 
 def read_config(file):
     if file == 'build_admission':
-        entered.set()
+        read_started.set()
         Event().wait()
     return read(file)
 
 case = MacLinuxRouteTests('runTest')
 case.repo, case.guest_home = map(Path, sys.argv[1:])
 with (patch.object(conf, 'read', read_config),
-      patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 0.75)):
-    case.check_folder_report_stream()
-    assert entered.wait(1), 'The configuration read did not start.'
-    print('Guest result returned.', flush=True)
+      patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 0)):
+    case.check_folder_report_stream(timeout=TEST_HANG_GUARD_SECS)
+    read_started.wait()
+    print('The guest result returned and the config read is still blocked.', flush=True)
 """
-        process = subprocess.run([sys.executable, '-c', program, str(self.repo), str(self.guest_home)],
-                                 cwd=Path(__file__).resolve().parents[2], stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
+        process = subprocess.run([sys.executable, '-B', '-c', program, str(self.repo), str(self.guest_home)],
+                                 cwd=CHECKOUT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(process.returncode, 0, process.stdout)
-        self.assertEqual(process.stdout.splitlines(), [
-            'Guest result returned.',
-            'Mac Linux guest queue report failed: the queue report configuration read timed out',
-        ])
+        self.assertIn('The guest result returned and the config read is still blocked.',
+                      process.stdout.splitlines(), process.stdout)
 
     def test_a_report_preparation_start_failure_preserves_the_command_output(self) -> None:
         self.check_folder_report_thread_failure('prepare')

@@ -366,24 +366,28 @@ The list shows `t-` and `targeted-test-` rows first.
 A row includes its lock and lease files and shows its kind, size, newest modification time, lease state, and live use.
 The newest time includes the lock and lease files.
 If the command cannot read the gate root, it shows one kept row for that root and lists the other places.
-The command keeps a gate row that contains a `.git` file or folder at any depth.
+The standard list keeps a gate row that contains a `.git` file or folder at any depth.
 It also keeps a bare repository that it identifies by name.
 The standard list shows `holds a Git repository; manual review` for these rows.
-The sudo list can approve a move for a folder with top-level or nested Git checkouts or bare repositories.
-It keeps linked worktrees because a `.git` file points to a registration elsewhere.
+The sudo list can approve a move for a gate folder of a known kind.
+A `.git` file can move if its `gitdir` points inside the folder or to a missing path.
+An existing path outside the folder keeps the row for review.
+A `gitdir` with a `.` or `..` component or a symbolic link inside the folder also keeps the row.
 It keeps folders with an `objects/info/alternates` file at any depth and shows `Git alternates; manual review`.
 The target is `/build/claude/resources/shm-moved/<entry name>`. The child refuses an existing target.
 The sudo caller must own the source entries and the target parent.
 The child copies the folder and its lock and lease files into a staging folder with mode `0700`.
 It preserves modes, times, and hard links.
-It copies links as links.
+It copies symbolic links as links. It copies FIFOs without opening them.
+A socket, device, or read-only directory keeps the source in place.
 The child compares the paths, types, sizes, file hashes, and link targets.
 The child renames the verified folder to the target first. It then renames the lock and lease files.
 If publication fails, the child returns the paths it published to staging.
 The child verifies the published copy again.
 The removal guard compares the proof's final path with the target on the approved list.
-It walks the source and checks the published tree's path, identity, and entry stamps.
-The final live-use scan runs after these checks.
+It walks the source and runs the final live-use scan.
+It checks the published tree's path, identity, and entry stamps.
+It checks the copied side files just before it removes the source.
 The copy proof permits removal of the source only.
 The standard removal guard removes the lock and lease files after the source is gone.
 Cleanup can miss a write by a process with the same user ID between the entry's last check and source removal.
@@ -392,7 +396,7 @@ The gate check uses file names and runs no Git commands.
 The command keeps other rows whose Git directory, registration, alternates, or local origin use the gate root's filesystem.
 These rows show `Git data in the gate root; manual review`.
 The command keeps every folder with a `run.json` recovery record.
-It keeps unknown entries, links, mounts, and folders in use.
+It keeps unknown entries, top-level links, mounts, and folders in use.
 It keeps orphan side files and entries with unreadable evidence.
 Without sudo, the process scan checks only the current user.
 On natedev, the parent uses `/proc` to check thread paths.
