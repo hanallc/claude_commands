@@ -10,7 +10,7 @@
   },
   "build_targets": {
     "enabled.mac-linux": 22,
-    "notices.mac": 29
+    "notices.mac": 30
   },
   "cloud_gate": {
     "hana_gpu_route_enabled": 3
