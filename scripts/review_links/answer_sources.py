@@ -1171,9 +1171,10 @@ class ExchangeVerifier:
         return list_exchange.UNRECORDED_ANSWERER
 
     def review_handoff(self, item: review_items.ReviewItem, key: str, destination: investigation.ListDestination,
-                       saved: frozenset[list_exchange.FiledExchange]
+                       saved: tuple[list_exchange.FiledExchange, ...]
                        ) -> review_items.FiledReviewExchange | review_items.NoFiledReviewExchange:
-        native = isinstance(self.source, update_registration.QuestionRecord)
+        source = self.source
+        native = isinstance(source, update_registration.QuestionRecord)
         accepted = self.resolve(key, ())
         exchanges = tuple(exchange for exchange in accepted.exchanges if _eligible(exchange))
         card_can_move = native or self.report is not None
@@ -1186,6 +1187,9 @@ class ExchangeVerifier:
         verified = tuple(exchange for exchange in matched if exchange.exchange_id in accepted.verified_ids)
         ids = frozenset(exchange.exchange_id for exchange in verified if isinstance(exchange.answer, ExchangeAnswer))
         events, slot_id = self._handoff_reply_events(item, accepted, verified)
+        followups = source.item.get("followups", ()) if native else ()
+        filed_followups = frozenset(index for index in range(len(followups)) if f"followup:{index + 1}" in ids)
+        events |= frozenset(copy.log_index for copy in item.followup_log_copies if copy.followup_index in filed_followups)
         open_staff_question = any(exchange.direction is Direction.QUESTION_TO_NATE
                                   and exchange.answer is QuestionWithoutAnswer.OPEN for exchange in verified)
         offset = len(item.log) - len(self.log)
@@ -1194,10 +1198,11 @@ class ExchangeVerifier:
              and offset + self.answers[-1] in events) if self.answers else "initial" in ids))
         hides_card = (bool(verified) and item.state is not review_items.ReviewState.WAITING
                       and all(offset + position in events for position in self.answers)
-                      and (self._confirmed_native_content(verified, filed_investigation_answer) if card_can_move
+                      and (self._filed_native_content(verified, filed_investigation_answer) if card_can_move
                            else self._single_change_slot_card(item, slot_id, accepted)))
         return review_items.FiledReviewExchange(destination, hides_card, events, ids, open_staff_question,
-                                                slot_id, filed_investigation_answer)
+                                                slot_id, filed_investigation_answer,
+                                                filed_followup_indices=filed_followups)
 
     def _single_change_slot_card(self, item: review_items.ReviewItem, slot_id: str,
                                  accepted: AcceptedExchanges) -> bool:
@@ -1208,8 +1213,8 @@ class ExchangeVerifier:
                 and isinstance(slot, AnsweredQuestionSlot) and isinstance(slot.author, RecordedAnswerer)
                 and len(accepted.exchanges) == 1 and not accepted.conflicting_ids)
 
-    def _confirmed_native_content(self, saved: tuple[list_exchange.FiledExchange, ...],
-                                  filed_investigation_answer: bool) -> bool:
+    def _filed_native_content(self, saved: tuple[list_exchange.FiledExchange, ...],
+                              filed_investigation_answer: bool) -> bool:
         if self.report is not None:
             return not self.report.answer or filed_investigation_answer
         if isinstance(record := self.source, update_registration.QuestionRecord):
@@ -1243,19 +1248,19 @@ class ExchangeVerifier:
         return replace(exchange, answer=answer, binding=binding, legacy_binding="")
 
     def _handoff_reply_events(self, item: review_items.ReviewItem, accepted: AcceptedExchanges,
-                             confirmed: tuple[list_exchange.FiledExchange, ...]) -> tuple[frozenset[int], str]:
-        """Use only positions associated with confirmed exchanges."""
+                             verified: tuple[list_exchange.FiledExchange, ...]) -> tuple[frozenset[int], str]:
+        """Use the log positions of the verified exchanges."""
         offset = len(item.log) - len(self.log)
         positions: set[int] = set()
         filed_slot_id = ""
-        if any(row.exchange_id == accepted.current_slot_exchange for row in confirmed):
+        if any(row.exchange_id == accepted.current_slot_exchange for row in verified):
             assert isinstance(slot := self.slot, AnsweredQuestionSlot)
             filed_slot_id = slot.tag
             synthetic_tag = question_path.answer_log_id(slot.tag)
             positions.update(index for index, event in enumerate(item.log[:max(0, offset)])
                              if event.feedback_request_id == synthetic_tag and event.words == "Answer: " + slot.answer)
         if offset >= 0:
-            for row in confirmed:
+            for row in verified:
                 position = accepted.log_positions.get(row.exchange_id)
                 if position is None or not isinstance(row.answer, ExchangeAnswer):
                     continue
@@ -1692,35 +1697,29 @@ def file_saved_picture(root: Path, identity: str) -> None:
 def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, *,
                           sources: list[Path] | None = None,
                           members: staff.StaffSnapshot | None = None) -> list[review_items.ReviewItem]:
-    """Use the bindings on List exchanges with a matching save receipt."""
+    """Verify handoffs against the exchanges in the saved List items."""
     keys = {item.key: _review_source_key(item) for item in items if item.type in _REVIEW_SOURCE_KINDS}
     if not keys:
         return items
     members = staff.snapshot() if members is None else members
     by_key = set(keys.values())
-    index: dict[str, list[tuple[investigation.ListDestination, frozenset[list_exchange.FiledExchange]]]] = defaultdict(list)
-    history: dict[str, list[list_exchange.FiledExchange]] = defaultdict(list)
+    index: dict[str, list[list_page.ListRecord]] = defaultdict(list)
     for entry in list_page.records(include_closed=True, sources=sources):
-        by_source: dict[str, list[list_exchange.FiledExchange]] = defaultdict(list)
-        for exchange in entry.item.filed_exchanges:
-            if exchange.source_key in by_key:
-                by_source[exchange.source_key].append(exchange)
-        destination = investigation.ListDestination(entry.keeper, entry.item.number)
-        for key, saved in by_source.items():
-            history[key].extend(saved)
-            confirmed = the_list.confirmed_exchanges(key, destination, saved, sources=sources)
-            if confirmed:
-                index[key].append((destination, confirmed))
+        for key in {exchange.source_key for exchange in entry.item.filed_exchanges} & by_key:
+            index[key].append(entry)
     projected: list[review_items.ReviewItem] = []
     for item in items:
         handoff = review_items.NoFiledReviewExchange.ABSENT
         filed = index.get(keys.get(item.key, ""), ())
         if len(filed) == 1:
-            destination, saved = filed[0]
+            entry = filed[0]
+            destination = investigation.ListDestination(entry.keeper, entry.item.number)
             with review_items.after_store_write(item.key):
                 key = keys[item.key]
-                previous = the_list.combine_exchange_history(tuple(history[key]), the_list.pending_exchanges(key))
-                verifier = ExchangeVerifier(item, zone, members, previous)
+                saved = tuple(exchange for exchange in entry.item.filed_exchanges if exchange.source_key == key)
+                pending = the_list.pending_exchanges(key, sources=sources)
+                history = the_list.combine_exchange_history(saved, pending)
+                verifier = ExchangeVerifier(item, zone, members, history)
                 handoff = verifier.review_handoff(item, key, destination, saved)
         projected.append(item if item.exchange_handoff == handoff else replace(item, exchange_handoff=handoff))
     return projected
