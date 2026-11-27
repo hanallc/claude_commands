@@ -565,6 +565,22 @@ class DemoteShowrunnerTests(StaffTestCase):
                     self.assertIn(name, errors)
                 self.assertIn("journal-work", errors)
                 self.assert_no_actions(before)
+        with self.subTest(remote="matching branch tips at different fetch and push destinations"):
+            other = self.root / "other-origin.git"
+            _ = self.git("clone", "--bare", str(self.root / "origin.git"), str(other))
+            for name in ("handoff-a", "handoff-b"):
+                self.assertEqual(self.git("-C", str(other), "rev-parse", name),
+                                 self.git("ls-remote", "origin", f"refs/heads/{name}").split()[0])
+            _ = self.git("remote", "set-url", "--push", "origin", str(other))
+            try:
+                code, _, errors = self.run_command("--check")
+                self.assertEqual(code, 2, errors)
+                unmerged = errors.partition("unmerged branches: ")[2].splitlines()
+                self.assertTrue(unmerged, errors)
+                self.assertCountEqual(unmerged[0].split(", "), ("handoff-a", "handoff-b", "journal-work"))
+                self.assert_no_actions(before)
+            finally:
+                _ = self.git("config", "--unset", "remote.origin.pushurl")
         _ = self.git("-C", str(self.child_tree), "merge", "--ff-only", commit)
         self.assertEqual(self.run_command("--check")[0], 0)
         _ = self.git("push", "origin", "--delete", "handoff-a", "handoff-b")

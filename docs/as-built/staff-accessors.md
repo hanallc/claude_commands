@@ -435,7 +435,9 @@ Both `Herdr._codex_launch` and `pane_record.seed` use this method.
 An old staff record can contain a removed worktree with a `ParkedBranch` or `BranchUnrecorded`.
 Production wrap saves the branch before it removes the worktree.
 Wrap, deferred retirement, and demotion read branch names from the staff row, the wrap record, and the retirement journal.
-Git checks both the local ref and the origin ref for each name.
+Git checks the local ref and the fetch origin ref for each name.
+The local merge tip or the published merge tip can prove that a branch is merged.
+Wrap validates the push destination before cleanup and pins the exact push URL for branch deletion.
 Deferred retirement and wrap retain the row if any named branch is unmerged or its state is unknown.
 Demotion refuses known unmerged branches and reports unknown branch evidence.
 Wrap removes the unit row after cleanup and the phase note archive when no worker rows remain.

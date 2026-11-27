@@ -539,7 +539,7 @@ class RetirementBranch(NamedTuple):
     state: BranchMergeState
     tips: shutdown.BranchTips
     reason: str = ""
-    push_url: str = ""
+    fetch_identity: str = ""
 
 
 class RetirementBranches(NamedTuple):
@@ -551,12 +551,57 @@ class RetirementBranches(NamedTuple):
         return (*self.unreadable_records, *(branch.reason for branch in self.branches if branch.reason))
 
 
+RETIREMENT_BRANCH_ERRORS = (OSError, ValueError, subprocess.SubprocessError, Stop)
+
+
+def fetch_retirement_tip(run: git_merge_tree.GitRunner, fetch_url: str, ref: str, local_tip: str) -> str:
+    result = run("ls-remote", "--exit-code", "--heads", "--", fetch_url, ref)
+    if result.returncode == 2:
+        return ""
+    tip = good(result, "retire").split()[0]
+    if tip != local_tip:
+        _ = good(run("fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--", fetch_url, ref), "retire")
+    return tip
+
+
+def retirement_tips_landed(unit: shutdown.RetiringUnit, tips: shutdown.BranchTips, fetch_url: str,
+                           *, settings: conf.ConfigRead) -> bool:
+    remaining = {tip for tip in tips if tip}
+    if not remaining:
+        return True
+    run = partial(shutdown.retirement_git, unit, settings=settings)
+    target_ref = f"refs/heads/{unit.production.merge_branch}"
+    local_target = shutdown.retirement_local_tip(unit, target_ref, settings=settings)
+
+    def landed(tip: str, target: str) -> bool:
+        if not branch_is_landed(unit.production.checkout, tip, target):
+            return False
+        merges = good(run("rev-list", "--merges", "--max-count=1", tip, "--not", target), "retire")
+        return not merges or git_merge_tree.leaves_target_unchanged(run, tip, target)
+
+    if local_target:
+        remaining = {tip for tip in remaining if not landed(tip, local_target)}
+        if not remaining:
+            return True
+    if fetch_url:
+        try:
+            origin_target = fetch_retirement_tip(run, fetch_url, target_ref, local_target)
+            if origin_target and origin_target != local_target:
+                return all(landed(tip, origin_target) for tip in remaining)
+        except RETIREMENT_BRANCH_ERRORS:
+            if not local_target:
+                raise
+    if not local_target:
+        raise ValueError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
+    return False
+
+
 def retirement_branch_state(unit: shutdown.RetiringUnit, settings: conf.ConfigRead) -> RetirementBranch:
     branch = unit.branch
     ref = f"refs/heads/{branch}"
     tips = shutdown.BranchTips("", "")
-    push_url = ""
-    unknown = (OSError, ValueError, subprocess.SubprocessError, Stop)
+    fetch_identity = ""
+    fetch_url = ""
     try:
         run = partial(shutdown.retirement_git, unit, settings=settings)
         if run("check-ref-format", ref).returncode:
@@ -564,34 +609,28 @@ def retirement_branch_state(unit: shutdown.RetiringUnit, settings: conf.ConfigRe
         errors: list[str] = []
         try:
             tips = tips._replace(local=shutdown.retirement_local_tip(unit, ref, settings=settings))
-        except unknown as error:
+        except RETIREMENT_BRANCH_ERRORS as error:
             errors.append(str(error))
         try:
-            origin = shutdown.retirement_origin(unit, settings=settings)
-            push_url = origin.push_url
-            tips = tips._replace(origin=shutdown.retirement_origin_tip(unit, ref, origin, settings=settings))
-            if tips.origin and tips.origin != tips.local:
-                _ = good(run("fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--", push_url, ref), "retire")
-        except unknown as error:
+            url = shutdown.retirement_origin_url(unit.production.checkout, settings=settings)
+            resolved = run("ls-remote", "--get-url", "--", url)
+            if resolved.returncode or resolved.stdout.removesuffix("\n") != url:
+                raise ValueError("Git rewrites the checked origin fetch URL")
+            fetch_identity = shutdown.retirement_origin_identity(unit.production.checkout, url)
+            fetch_url = url
+            tips = tips._replace(origin=fetch_retirement_tip(run, fetch_url, ref, tips.local))
+        except RETIREMENT_BRANCH_ERRORS as error:
             errors.append(str(error))
-        target = f"refs/heads/{unit.production.merge_branch}"
-        for tip in dict.fromkeys(tip for tip in tips if tip):
-            try:
-                landed = branch_is_landed(unit.production.checkout, tip, target)
-                if landed and good(run("rev-list", "--merges", "--max-count=1", tip, "--not", target), "retire"):
-                    landed = git_merge_tree.leaves_target_unchanged(run, tip, target)
-                if not landed:
-                    return RetirementBranch(branch, BranchMergeState.UNMERGED, tips, f"unmerged commits on {branch}")
-            except unknown as error:
-                errors.append(str(error))
+        if not retirement_tips_landed(unit, tips, fetch_url, settings=settings):
+            return RetirementBranch(branch, BranchMergeState.UNMERGED, tips, f"unmerged commits on {branch}")
         if errors:
             raise ValueError(errors[0])
         if (rebasing := shutdown.retirement_rebase(unit, settings=settings)) is not None:
             raise ValueError(f"branch {branch} is rebasing in {rebasing}")
-    except unknown as error:
+    except RETIREMENT_BRANCH_ERRORS as error:
         return RetirementBranch(branch, BranchMergeState.UNKNOWN, tips, f"{branch}: {error}")
     state = BranchMergeState.MERGED if any(tips) else BranchMergeState.ABSENT
-    return RetirementBranch(branch, state, tips, push_url=push_url)
+    return RetirementBranch(branch, state, tips, fetch_identity=fetch_identity)
 
 
 def retirement_branches(production: Production, row: staff.StaffRow, *, checkout_branch: str = "") -> RetirementBranches:
@@ -1147,13 +1186,21 @@ def require_wrap_branches(production: Production, unit: UnitRow, *, checkout_bra
     return evidence
 
 
-def checked_wrap_branch(production: Production, unit: UnitRow) -> RetirementBranch:
+def checked_wrap_branch(production: Production, unit: UnitRow) -> tuple[RetirementBranch, shutdown.RetirementOrigin]:
     evidence = require_wrap_branches(production, unit, checkout_branch=unit.branch)
     branch = evidence.branches[0]
     if unit.branch and (not branch.tips.local or evidence.wrap_branch not in ("", unit.branch)):
         raise LifecycleStop("retire", "held", f"{unit.name}: the worktree branch conflicts with the recorded branch")
     require_removable_wrap_checkout(production, unit, branch.name)
-    return branch
+    try:
+        retiring = shutdown.RetiringUnit(production, unit.name, unit.worktree, branch.name, unit.member)
+        origin = shutdown.retirement_origin(retiring, settings=conf.read("production"))
+        if (not origin.push_url
+                or shutdown.retirement_origin_identity(production.checkout, origin.push_url) != branch.fetch_identity):
+            raise ValueError("the push destination does not match the checked fetch origin")
+    except RETIREMENT_BRANCH_ERRORS as error:
+        raise LifecycleStop("retire", "held", f"{unit.name}: {error}") from error
+    return branch, origin
 
 
 def prepare_wrap_units(production: Production, rows: tuple[UnitRow, ...]) -> tuple[PreparedWrapUnit, ...]:
@@ -1214,7 +1261,7 @@ def clean_wrap_unit(production: Production, item: PreparedWrapUnit, record: staf
             raise LifecycleStop("retire", "held", f"{unit.name}: the worktree changed during wrap")
         if has_worktree and not worktree_records.registered_checkout(unit.worktree, production.checkout, unit.branch):
             raise LifecycleStop("retire", "held", f"{unit.name}: the Git worktree identity changed")
-        branch = checked_wrap_branch(production, unit)
+        branch, origin = checked_wrap_branch(production, unit)
         _ = unit_config.park(member.id, unit.worktree, item.retirement)
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1225,7 +1272,7 @@ def clean_wrap_unit(production: Production, item: PreparedWrapUnit, record: staf
             _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))
             release_worktree_pair(unit.worktree)
             report("retire", "ok", f"removed {unit.name} worktree")
-        retire_wrap_branch(production, branch)
+        retire_wrap_branch(production, branch, origin)
 
 
 def finish_wrap_unit(production: Production, unit: UnitRow) -> bool:
@@ -1249,18 +1296,21 @@ def finish_wrap_unit(production: Production, unit: UnitRow) -> bool:
         return True
 
 
-def retire_wrap_branch(production: Production, checked_branch: RetirementBranch) -> None:
+def retire_wrap_branch(production: Production, checked_branch: RetirementBranch,
+                       origin: shutdown.RetirementOrigin) -> None:
     branch = checked_branch.name
     ref = f"refs/heads/{branch}"
     checkout = production.checkout
     local_tip, origin_tip = checked_branch.tips
+    if origin_tip and not origin.push_url:
+        raise LifecycleStop("retire", "held", f"{branch}: no checked push destination")
     if local_tip:
         if branch in worktree_records.worktree_branches(checkout).values():
             raise LifecycleStop("retire", "held", f"{branch} is in use by a worktree")
         _ = checked(checkout, "retire", "update-ref", "-d", ref, local_tip)
         report("retire", "ok", f"deleted local {branch}")
     if origin_tip:
-        result = origin_deletion.delete(checkout, "origin", ref, origin_tip, expected_push_url=checked_branch.push_url)
+        result = origin_deletion.delete(checkout, "origin", ref, origin_tip, expected_push_url=origin.push_url)
         if isinstance(result, origin_deletion.Kept):
             if result.cause is origin_deletion.RetentionCause.GIT_FAILURE:
                 raise LifecycleStop("retire", "failed", result.reason)
@@ -1320,7 +1370,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             worktree_status = checked(unit.worktree, "worktree", "status", "--short")
             if worktree_status:
                 raise LifecycleStop("worktree", "failed", f"{unit.name} at {unit.worktree} is dirty: {worktree_status}")
-        branch = checked_wrap_branch(production, unit)
+        branch, _ = checked_wrap_branch(production, unit)
         if branch.state is BranchMergeState.ABSENT:
             report("worktree", "ok", f"{unit.name} already retired")
         else:

@@ -39,6 +39,7 @@ from scripts.production.fake_unit_host import HostedUnit
 
 
 from scripts.production import log_backup, production_admission, production_doc, staff, unit_config, update_registration
+from scripts.production import tidy_wrapped
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.production_names import (
     BACKUP_CHECKOUT, CARGO_LINER_PRODUCTION, GUARD_READY_FILE, LEGACY_COPIES, LIVE_DOCUMENT_SUFFIX,
@@ -1305,6 +1306,28 @@ esac
                          "refs/heads/alpha-branch")
         self.assertEqual(self.staff.staff_file.read_bytes(), before)
         self.assertTrue(self.beta.is_dir())
+
+        published = self.promotion_checkout("published-merge")
+        _ = self.git("switch", "-c", "production", "origin/alpha-branch", cwd=published)
+        _ = self.git("commit", "--allow-empty", "-m", "Publish the merge tip", cwd=published)
+        _ = self.git("push", "origin", "production", cwd=published)
+        target = self.git("rev-parse", "HEAD", cwd=published)
+        object_check = subprocess.run(["git", "cat-file", "-e", target], cwd=self.checkout, env=self.env,
+                                      capture_output=True, check=False)
+        self.assertNotEqual(object_check.returncode, 0)
+        removed = unit_membership("example", "alpha")
+        owner = staff.snapshot().by_id(self.owner_id())
+        assert owner is not None
+        with (mock.patch.dict(os.environ, self.env, clear=True),
+              mock.patch.object(tidy_wrapped, "STATE_DIR", self.state / "showrunner")):
+            for local_merge in ("behind", "absent"):
+                with self.subTest(local_merge=local_merge):
+                    if local_merge == "absent":
+                        _ = self.git("switch", "--detach")
+                        _ = self.git("branch", "-D", "production")
+                    production_lifecycle.require_deferred_branch(removed.to_json(), owner.to_json())
+                    self.assertEqual(self.git("cat-file", "-t", target), "commit")
+                    self.assertEqual(self.staff.staff_file.read_bytes(), before)
 
     def test_wrap_reports_already_retired_unit_with_no_branches(self) -> None:
         self.running()
