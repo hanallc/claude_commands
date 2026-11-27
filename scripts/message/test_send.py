@@ -5418,7 +5418,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             code, lines = self.clear_check()
         self.assertEqual(code, 0)
         self.assertEqual(cast(list[str], channel.call_args.args[0]),
-                         [sys.executable, str(send.USER_CHANNEL), "cancel", "--source", "hana", "github-cold"])
+                         [sys.executable, str(send.USER_CHANNEL), "cancel", "--exact-tag-key", "--source", "hana", "github-cold"])
         self.assertEqual(lines, ["retired: github-cold from hana: its check passed;"
                                  + " cancelled: the emergency push for github-cold stopped"])
         self.assertEqual(self.emergencies(), [])
@@ -5475,7 +5475,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             code, lines = self.clear_check()
         command = cast(list[str], channel.call_args.args[0])
         self.assertEqual(command[:-1], ["ssh", "-o", "BatchMode=yes", "natedev"])
-        self.assertEqual(command[-1], f"{send.REMOTE} retire --to user --from hana --key github-cold")
+        self.assertEqual(command[-1], f"{send.REMOTE} retire --to user --from hana --key github-cold --exact-tag-key")
         self.assertEqual((code, lines), (0, ["retired: github-cold from hana: its check passed; on natedev:"
                                              + " cancelled: the emergency push for github-cold stopped"]))
         self.assertEqual(self.emergencies(), [])

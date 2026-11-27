@@ -149,6 +149,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, Te
 
 from scripts.herdr.place import HerdrPlace
 from scripts.agents import remote as machine_routes
+from scripts.agents import worker_lifecycle
 from scripts.herdr import herdr_types, message_proof as _message_proof
 from scripts.lib import process_group
 from scripts.message.address import CODEX_PREFIX, SESSION_PREFIX, SOCKET_PREFIX, STAFF_PREFIX, USER as USER, WORKER_PREFIX
@@ -1186,7 +1187,7 @@ def as_str(value: object) -> str:
 def locked() -> Generator[None]:
     STATE.mkdir(parents=True, exist_ok=True)
     with open(STATE / ".lock", "w", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(lock)
         yield
 
 
@@ -1532,6 +1533,8 @@ def retire(to: str, sender: str, key: str, *, reference: push_reference.Question
     with locked():
         paths = dict.fromkeys((direct, queue_path(to), *(STATE / "queue").glob("*.jsonl")))
         for path in paths:
+            if reference is not None:
+                operation_deadline.check()
             try:
                 entries = _read_queue_rows(path)
             except (OSError, UnicodeError):
@@ -1555,6 +1558,8 @@ def retire(to: str, sender: str, key: str, *, reference: push_reference.Question
                 else:
                     kept.append(row)
             if len(kept) != len(entries):
+                if reference is not None:
+                    operation_deadline.check()
                 _rewrite_queue(path, kept)
     return removed
 
@@ -1572,7 +1577,7 @@ def cancel_user_push(sender: str, key: str, *, exact_tag: bool = False) -> tuple
     return EXIT["failed"], f"FAILED: the emergency push for {key} may still repeat: {why}"
 
 
-def retire_user(sender: str, key: str) -> tuple[int, list[str]]:
+def retire_user(sender: str, key: str, *, exact_tag: bool = False) -> tuple[int, list[str]]:
     """`retire --to user`: drop the queued and kept copies, forget the key's last send, cancel the push."""
     removed = retire(USER, sender, key)
     # The event is over: a new send with the key pushes at once.
@@ -1584,7 +1589,7 @@ def retire_user(sender: str, key: str) -> tuple[int, list[str]]:
     except silence.RemoteDropFailed as error:
         drop_line = f"FAILED: {error}"
         failed = True
-    code, line = cancel_user_push(sender, key)
+    code, line = cancel_user_push(sender, key, exact_tag=exact_tag)
     return EXIT["failed"] if failed else code, [f"retired {removed} queued message{'s' if removed != 1 else ''}", drop_line, line]
 
 
@@ -1677,11 +1682,11 @@ def retire_record(record: Emergency) -> tuple[int, str]:
     if "question" in record:
         return retire_recorded_question(record["sender"], record["key"], record["question"])
     if record["machine"] == machine():
-        code, lines = retire_user(record["sender"], record["key"])
+        code, lines = retire_user(record["sender"], record["key"], exact_tag=True)
         return code, lines[-1]
     # This host holds the key's window (remote() sends --repeat-minutes 0); the posting host holds the keys.
     forget_sent(record["key"], USER)
-    forwarded = shlex.join(["retire", "--to", USER, "--from", record["sender"], "--key", record["key"]])
+    forwarded = shlex.join(["retire", "--to", USER, "--from", record["sender"], "--key", record["key"], "--exact-tag-key"])
     command = ["ssh", "-o", "BatchMode=yes", record["machine"], f"{REMOTE} {forwarded}"]
     code, out, err = run(command, "", user_cancel_timeout() + conf.read("send").number("remote_transport_seconds"))
     lines = out.strip().splitlines()
@@ -5355,6 +5360,7 @@ class RetireRequest(NamedTuple):
     to: str
     sender: str
     key: str
+    exact_tag: bool
 
 
 def parse_retire(argv: list[str]) -> RetireRequest:
@@ -5362,11 +5368,17 @@ def parse_retire(argv: list[str]) -> RetireRequest:
     _ = parser.add_argument("--to", required=True)
     _ = parser.add_argument("--from", dest="sender", required=True)
     _ = parser.add_argument("--key", required=True)
+    _ = parser.add_argument("--exact-tag-key", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    to = as_str(attr(args, "to"))
+    exact_tag = attr(args, "exact_tag_key") is True
+    if exact_tag and to != USER:
+        parser.error("--exact-tag-key requires --to user")
     return RetireRequest(
-        as_str(attr(args, "to")),
+        to,
         as_str(attr(args, "sender")),
         as_str(attr(args, "key")),
+        exact_tag,
     )
 
 
@@ -6431,6 +6443,8 @@ def main(argv: list[str]) -> int:
     match argv:
         case ["question-push-drain"]:
             return question_pushes.drain()
+        case ["question-push-release"]:
+            return silence.end_if_past()
         case ["question-push-clear", sender, key, encoded]:
             try:
                 reference = push_reference.read_reference(cast(object, json.loads(encoded)))
@@ -6458,7 +6472,7 @@ def main(argv: list[str]) -> int:
         case ["retire", *arguments]:
             request = parse_retire(arguments)
             if request.to == USER:
-                code, lines = retire_user(request.sender, request.key)
+                code, lines = retire_user(request.sender, request.key, exact_tag=request.exact_tag)
                 print("\n".join(lines))
                 return code
             removed = retire(request.to, request.sender, request.key)
