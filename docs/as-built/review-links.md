@@ -2423,8 +2423,9 @@ One resolver finds the List item for a staff question or a submitted question.
 4. Use the original List link from a verified transfer receipt when it identifies one item.
 5. Use the exchange's saved linked-item reservation if one exists.
 6. Stop if the history requires a verified destination and the earlier steps give none.
-7. Use a unique current link if the question has no such history.
-8. Allow a new item when the question has no destination history or current link.
+7. Defer to Studio Send if it saved a route and still needs to reserve a number.
+8. Use a unique current link if the question has no such history or staged route.
+9. Allow a new item when the question has no destination history, staged route, or current link.
 
 A submitted question's native receipt counts as history during migration.
 Live filing can still use the current link or file a new item for an untransferred submission.
@@ -2439,6 +2440,7 @@ A Question report filed by `move-review-waits` keeps its ordinary List workflow.
 - `_keyless_question_origin` and the final migration pass call it through `_resolved_question_origin`.
 
 The move defers a question if a List filing already owns its destination.
+The move also defers a question while Studio Send has a saved route and no reserved number.
 The move writes no marker while the filing waits for its receipt.
 
 Find unresolved completed questions in Review under **Done**.
@@ -2452,8 +2454,8 @@ After Nate answers, the item shows **Working** until the asker closes it.
 The asker can use `the_list close` while that question is **Working**.
 A question Nate sends from **New item** starts in **Working**.
 Send and restart recovery file the question with the stable request key from the locked submission.
-They read the saved List item and verify its question source before they claim the first notice.
-The pending delivery marker remains if the saved item cannot confirm that source.
+Before they claim the first notice, they read the saved row and verify that it is a question item with that source.
+The pending delivery marker remains if the row is missing or has a different kind or source.
 A reply to the native question or a Studio follow-up changes the item from **Working** to **Answered**.
 An unread reply puts a question item under **Answers** in every state, including **Closed** and **Waiting for nate**.
 Only **Mark read** clears a reply mark.

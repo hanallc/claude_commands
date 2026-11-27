@@ -1877,6 +1877,87 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(len(read_new_item_notices(log)), 1)
         self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
 
+    def test_move_review_wait_defers_a_staged_studio_question_before_reservation(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        self.assertIsInstance(review_submissions.list_filing_route(saved), dict)
+        self.assertFalse(reservation.exists())
+        before = saved.path.read_bytes()
+        members = staff.snapshot()
+        card = review_items.submission_item(saved, members)
+        self.assertTrue(review_items.can_move_wait(card))
+        self.assertEqual(the_list.move_review_waits(case.root, members), [])
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
+        self.assertEqual(saved.path.read_bytes(), before)
+        self.assertFalse(reservation.exists())
+
+        native = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE,
+                                             f"submission/question/{saved.request_id}")
+        load = the_list.load
+        confirmed: set[int] = set()
+
+        def read_row(keeper_id: staff.StaffId, identity: str, *, sources: list[Path] | None = None) -> the_list.ListItem:
+            row = load(keeper_id, identity, sources=sources)
+            if row.native_question == native and not read_new_item_notices(log):
+                confirmed.add(row.number)
+            return row
+
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              new_item_notice_log(self.root, keeper.id) as log,
+              patch.object(the_list, "load", side_effect=read_row)):
+            response = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual(response.status, 200, response.body)
+        receipt = cast(dict[str, object], json.loads(response.body))
+        row, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(confirmed, {row.number})
+        self.assertEqual(receipt["list_number"], row.number)
+        self.assertEqual(the_list.reserved_review_number(reservation), row.number)
+        self.assertEqual(row.native_question, native)
+        self.assertIs(row.state, the_list.ItemState.WORKING)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [row.id])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_studio_question_notice_stays_pending_if_a_legacy_move_saved_an_ordinary_report(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        backup = route.rename(route.with_suffix(".bak"))
+        destination, = the_list.move_review_waits(case.root, staff.snapshot())
+        _ = backup.rename(route)
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()) as errors,
+              patch.object(case.status, "write_slots", wraps=case.status.write_slots) as claim):
+            response = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(response.status, 503, response.body)
+            review_actions.recover_submission_deliveries(case.status, review_page.PAGE_PATH)
+            claim.assert_not_called()
+        self.assertIn(f"Cannot confirm the question source for L{destination.number}.", errors.getvalue())
+        self.assertEqual(read_new_item_notices(log), [])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+        self.assertFalse(reservation.exists())
+        row, = the_list.records(destination.keeper, include_closed=True)
+        self.assertEqual(row.number, destination.number)
+        self.assertIsInstance(row.report, the_list.ListReport)
+        self.assertIs(row.native_question, the_list.NoQuestionItem.ORDINARY)
+
     def check_list_notice_recovery(self, *, stop_before_row: bool, retire_producer: bool = False,
                                    authority_unavailable: bool = False, answered_marker: bool = False) -> None:
         case = self.review_fixture()
