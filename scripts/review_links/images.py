@@ -89,16 +89,17 @@ class NoImageDecision(Enum):
     OUTSIDE_STORE = auto()
 
 
+class _AnswerAttemptLookup(Enum):
+    NEW = auto()
+    REFUSED = auto()
+
+
 @dataclass(frozen=True)
 class _AnswerDraft:
     action: str
     words: str
     round_id: str | None
     request_id: str = ""
-
-    def key(self, folder: Path, saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer | None = None) -> str:
-        purpose = _signed_answer_key(saved, signed) if signed is not None and "previous_answer_key" in signed else "message"
-        return self._key(folder, saved, purpose)
 
     def request_key(self, folder: Path, saved: image_store.ImageAnswers) -> str:
         return change_page.review_delivery_key(folder / image_store.RECORD, folder.name,
@@ -114,28 +115,15 @@ class _AnswerDraft:
                 # Old keys include the saved words and the round if the form sent it.
                 for round_id in (None, signed["round_id"]):
                     original = _AnswerDraft(signed["answer"], signed["feedback"], round_id)
-                    if original._key(folder, saved, f"images-form:{self.request_id}") in keys:
+                    if original.delivery_key(folder, saved, round_id, purpose=f"images-form:{self.request_id}") in keys:
                         return key
         return None
 
-    def matches_answer(self, attempt: image_store.ImageAnswer) -> bool:
-        signed = attempt.get("signed_answer")
-        return signed is not None and (self.action, self.words) == (signed["answer"], signed["feedback"])
-
-    def resubmitted_attempt_key(self, saved: image_store.ImageAnswers) -> str | None:
-        latest = None
-        for key, attempt in reversed(saved["attempts"].items()):
-            if self.matches_answer(attempt):
-                if not _answer_delivered(attempt):
-                    return key
-                if latest is None and (self.request_id or attempt.get("form_request_keys")):
-                    latest = key
-        return latest
-
-    def _key(self, folder: Path, saved: image_store.ImageAnswers, purpose: str) -> str:
+    def delivery_key(self, folder: Path, saved: image_store.ImageAnswers, round_id: str | None,
+                     *, purpose: str = "message") -> str:
         parts = [saved["registered_at"], self.action, self.words]
-        if self.round_id is not None:
-            parts.append(self.round_id)
+        if round_id is not None:
+            parts.append(round_id)
         return change_page.review_delivery_key(folder / image_store.RECORD, folder.name, json.dumps(parts), purpose=purpose)
 
 
@@ -628,24 +616,45 @@ def _legacy_answer_words(identity: str, item: str, message: str, answer: str) ->
     return _answer_words(identity, answer, feedback.removeprefix("Feedback: ") if feedback.startswith("Feedback: ") else "")
 
 
-def _signed_answer_for_submission(attempt: image_store.ImageAnswer, saved: image_store.ImageAnswers,
-                                  draft: _AnswerDraft) -> image_store.SignedImageAnswer:
-    """Reuse the latest proof in the round when the answer matches."""
-    stored = attempt.get("signed_answer")
-    active_round = (stored["round_id"] if stored is not None
-                    else saved.get("deleted_feedback_round", feedback_round(set(attempt["answered"]))))
-    round_id = draft.round_id if draft.round_id is not None else active_round
-    proofs = [proof for entry in reversed(saved["attempts"].values())
-              if (proof := entry.get("signed_answer")) is not None and proof["round_id"] == round_id]
-    latest = max(proofs, key=lambda proof: datetime.fromisoformat(proof["time"]), default=None)
-    answer = draft.action, draft.words
-    if latest is not None and (latest["answer"], latest["feedback"]) == answer:
-        return latest
-    signed: image_store.SignedImageAnswer = {"answer": draft.action, "feedback": draft.words,
-                                             "time": datetime.now(UTC).isoformat(), "round_id": round_id}
-    if latest is not None and any((proof["answer"], proof["feedback"]) == answer for proof in proofs):
-        signed["previous_answer_key"] = _signed_answer_key(saved, latest)
-    return signed
+def _existing_answer_attempt(folder: Path, saved: image_store.ImageAnswers, draft: _AnswerDraft,
+                             round_id: str, *, retry_key: str | None = None) -> str | _AnswerAttemptLookup:
+    """Find an attempt for this image, round, answer, and feedback."""
+    attempts = saved["attempts"]
+    if retry_key is not None:
+        return retry_key if retry_key in attempts else _AnswerAttemptLookup.REFUSED
+
+    bound_key = draft.form_attempt_key(folder, saved) if draft.request_id else None
+    if bound_key is not None:
+        proof = attempts[bound_key].get("signed_answer")
+        if proof is None:
+            return _AnswerAttemptLookup.REFUSED
+        # A saved request ID selects its original round.
+        round_id = proof["round_id"]
+        candidates = {bound_key: attempts[bound_key]}
+    else:
+        if draft.request_id and draft.request_key(folder, saved) in saved.get("stale_form_request_keys", []):
+            return _AnswerAttemptLookup.REFUSED
+        candidates = attempts
+
+    identity = (round_id, draft.action, draft.words)
+    matches = [key for key, attempt in candidates.items()
+               if (proof := attempt.get("signed_answer")) is not None
+               and (proof["round_id"], proof["answer"], proof["feedback"]) == identity]
+    if matches:
+        # Older versions could save more than one attempt for the same identity.
+        return next((key for key in matches if not _answer_delivered(attempts[key])), matches[0])
+    if bound_key is not None:
+        return _AnswerAttemptLookup.REFUSED
+
+    round_key = draft.delivery_key(folder, saved, round_id, purpose="images-answer")
+    if round_key in attempts and "signed_answer" not in attempts[round_key]:
+        return round_key
+    # Older unsigned records can omit the round from the delivery key.
+    for key in (draft.delivery_key(folder, saved, round_id), draft.delivery_key(folder, saved, None)):
+        attempt = attempts.get(key)
+        if attempt is not None and "signed_answer" not in attempt and feedback_round(set(attempt["answered"])) == round_id:
+            return key
+    return _AnswerAttemptLookup.NEW
 
 
 def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_key: str | None,
@@ -665,39 +674,28 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
         saved = _image_answers(directory, record)
 
     attempts = saved["attempts"]
-    answer, feedback, round_id = draft.action, draft.words, draft.round_id
+    answer, feedback = draft.action, draft.words
     signed_form = origin is _ImageAnswerOrigin.SIGNED_FORM
     form_key = draft.request_key(folder, saved) if signed_form and draft.request_id else ""
-    form_retry = draft.form_attempt_key(folder, saved) if form_key else None
     answered: set[str] = answered_question_ids(record) if record is not None else set()
     current_round = feedback_round(answered) if record is not None else saved.get("deleted_feedback_round")
-    if retry_key is not None:
-        if record is not None or retry_key not in attempts:
-            raise question_record.AnswerRefused("no saved answer for this removed picture")
-        key = retry_key
-    elif form_retry is not None:
-        # An accepted attempt takes priority over old refusal records.
-        if not draft.matches_answer(attempts[form_retry]):
-            raise question_record.AnswerRefused(STALE_ANSWER)
-        key = form_retry
+    round_id = draft.round_id if draft.round_id is not None else current_round or feedback_round(answered)
+    existing = _existing_answer_attempt(folder, saved, draft, round_id, retry_key=retry_key)
+    if retry_key is not None and (record is not None or existing is _AnswerAttemptLookup.REFUSED):
+        raise question_record.AnswerRefused("no saved answer for this removed picture")
+    if existing is _AnswerAttemptLookup.REFUSED:
+        raise question_record.AnswerRefused(STALE_ANSWER)
+    if isinstance(existing, str):
+        key = existing
+        attempt = attempts[key]
     else:
-        stale_requests = saved.get("stale_form_request_keys", [])
-        if form_key and form_key in stale_requests:
+        if signed_form and current_round is not None and round_id != current_round:
+            if form_key:
+                saved.setdefault("stale_form_request_keys", []).append(form_key)
+                image_store.write_answers(directory, saved)
             raise question_record.AnswerRefused(STALE_ANSWER)
-        form_retry = draft.resubmitted_attempt_key(saved) if signed_form and feedback else None
-        if form_retry is not None:
-            key = form_retry
-        else:
-            if signed_form and round_id is not None and current_round is not None and round_id != current_round:
-                if form_key:
-                    saved["stale_form_request_keys"] = [*stale_requests, form_key]
-                    image_store.write_answers(directory, saved)
-                raise question_record.AnswerRefused(STALE_ANSWER)
-            key = form_key or draft.key(folder, saved)
-    attempt: image_store.ImageAnswer | None = attempts.get(key)
-    stale_round = False
-    if attempt is None:
-        previous: set[str] = set()
+        key = form_key or draft.delivery_key(folder, saved, round_id, purpose="images-answer")
+        previous = answered
         if record is None:
             message = ANSWER_PREFIX + ANSWERS[answer] + f"\nPicture {identity} was removed."
             if feedback:
@@ -705,43 +703,34 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
             if "list_item" in saved:
                 message += "\nList item: " + saved["list_item"]
         else:
-            # Keep the original question round when a request started before the store moved.
-            legacy = folder / (".review-link-feedback-" + key.removeprefix("review:"))
-            try:
-                previous = set(legacy.read_text(encoding="utf-8").splitlines())
-            except FileNotFoundError:
-                previous = answered
-                stale_round = not signed_form and round_id is not None and round_id != feedback_round(previous)
+            if not form_key:
+                legacy_key = draft.delivery_key(folder, saved, draft.round_id)
+                legacy = folder / (".review-link-feedback-" + legacy_key.removeprefix("review:"))
+                try:
+                    legacy_answered = set(legacy.read_text(encoding="utf-8").splitlines())
+                except FileNotFoundError:
+                    pass
+                else:
+                    if feedback_round(legacy_answered) == round_id and legacy_key not in attempts:
+                        key, previous = legacy_key, legacy_answered
+            if not signed_form and round_id != feedback_round(previous):
+                raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.")
             message = answer_message(record, answer, feedback)
-        attempt = {"message": message, "words": _answer_words(identity, answer, feedback), "answered": sorted(previous),
-                   "recipients": [], "confirmed": []}
-    new_proof = False
-    if signed_form and retry_key is None and form_retry is None:
-        if form_key:
-            proof: image_store.SignedImageAnswer = {
-                "answer": answer, "feedback": feedback, "time": datetime.now(UTC).isoformat(),
-                "round_id": current_round or round_id or feedback_round(answered), "form_request_key": form_key,
-            }
-        else:
-            proof = _signed_answer_for_submission(attempt, saved, draft)
-            signed_key = next((key for key, entry in attempts.items() if entry.get("signed_answer") == proof),
-                              draft.key(folder, saved, proof))
-            if signed_key != key:
-                key = signed_key
-                attempt = attempts.get(key) or {"message": attempt["message"], "words": _answer_words(identity, answer, feedback),
-                                                "answered": attempt["answered"], "recipients": [], "confirmed": []}
-        new_proof = attempt.get("signed_answer") != proof
-        if new_proof:
-            attempt["signed_answer"] = proof
+        attempt: image_store.ImageAnswer = {"message": message, "words": _answer_words(identity, answer, feedback),
+                                             "answered": sorted(previous), "recipients": [], "confirmed": []}
+    new_proof = signed_form and retry_key is None and "signed_answer" not in attempt
+    if new_proof:
+        proof: image_store.SignedImageAnswer = {"answer": answer, "feedback": feedback,
+                                                "time": datetime.now(UTC).isoformat(), "round_id": round_id}
+        if form_key and not attempt["recipients"]:
+            proof["form_request_key"] = form_key
+        attempt["signed_answer"] = proof
     new_attempt = key not in attempts
-    if stale_round and new_attempt:
-        raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.")
     request_keys = attempt.get("form_request_keys", [])
     new_request = bool(form_key) and form_key not in request_keys
     if new_request:
         attempt["form_request_keys"] = [*request_keys, form_key]
-    if new_attempt or new_proof:
-        _ = attempts.pop(key, None)
+    if new_attempt:
         attempts[key] = attempt
     if new_attempt or new_proof or new_request:
         image_store.write_answers(directory, saved)
@@ -841,10 +830,9 @@ def _send_answer(root: Path, identity: str, answer: str, feedback: str, *, origi
                 owner = _recipient_name(staff.snapshot(), saved["owner"])
                 draft_confirmed = False
                 if draft is not None:
-                    if draft.request_id:
-                        draft_confirmed = draft.form_attempt_key(folder, current) == key and draft.matches_answer(delivery)
-                    else:
-                        draft_confirmed = draft.key(folder, saved, delivery.get("signed_answer")) == key
+                    removed_round = current.get("deleted_feedback_round", feedback_round(set(delivery["answered"])))
+                    round_id = draft.round_id if draft.round_id is not None else removed_round
+                    draft_confirmed = _existing_answer_attempt(folder, current, draft, round_id) == key
                 return ImageAnswerSent(f"This picture was removed; your words went to {owner}.",
                                        draft_confirmed=draft_confirmed)
             if (record["registered_at"] == saved["registered_at"] and record["owner"] == saved["owner"]

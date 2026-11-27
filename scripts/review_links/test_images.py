@@ -951,10 +951,11 @@ class ImagesTests(ImagesFixture):
 
         images.answer_question(self.root, identity, "Q1", "The gate passed.")
         current_round = images.feedback_round({"Q1"})
-        second = self.feedback_body(record, "Shorten the red row.") + "&answer_request=" + "b" * 32
+        second = self.feedback_body(record, "Keep the red row.") + "&answer_request=" + "b" * 32
         self.submit(second)
         self.assertEqual(len(self.sent), 4)
         self.submit(second + f"&feedback_round={current_round}")
+        self.submit(self.feedback_body(record, "Keep the red row.") + "&answer_request=" + "d" * 32)
         self.assertEqual(len(self.sent), 4)
         self.submit(self.feedback_body(record, "Remove the red row.") + "&answer_request=" + "c" * 32)
 
@@ -967,7 +968,7 @@ class ImagesTests(ImagesFixture):
         entries = [entry for entry in saved.log if isinstance(entry, the_list.ImageAnswerChange)]
         self.assertEqual(len({entry.key for entry in entries}), 3)
         self.assertEqual([entry.what.partition("\n")[2] for entry in entries],
-                         ["Keep the red row.", "Shorten the red row.", "Remove the red row."])
+                         ["Keep the red row.", "Keep the red row.", "Remove the red row."])
 
     def test_retry_of_an_older_form_request_finishes_its_original_attempt(self) -> None:
         record = self.register()
@@ -1030,36 +1031,39 @@ class ImagesTests(ImagesFixture):
         identity = record["id"]
         keep, remove = "Keep the red row.", "Remove the red row."
         round_id = images.feedback_round(set())
-        request_id = "a" * 32
-        keep_form = self.feedback_body(record, keep) + f"&feedback_round={round_id}&answer_request="
+        request_id, newer_id = "a" * 32, "c" * 32
+        keep_form = self.feedback_body(record, keep)
+        change_page.deliver(images.ask_question(self.root, identity, "Which check passed?", self.status), self.status)
         directory = images.images_root(self.root)
         with patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")):
             with self.assertRaisesRegex(images.AnswerNotSent, "owner offline"):
-                self.submit(keep_form + request_id)
+                self.submit(keep_form + f"&feedback_round={round_id}&answer_request={request_id}")
         original_key, = image_store.read_answers(directory, identity)["attempts"]
         self.submit(self.feedback_body(record, remove) + f"&feedback_round={round_id}&answer_request=" + "b" * 32)
-        # Save a duplicate attempt as older versions did.
-        with (patch("scripts.review_links.images._AnswerDraft.resubmitted_attempt_key", return_value=None),
-              patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")),
+        images.answer_question(self.root, identity, "Q1", "The gate passed.")
+        newer_round = images.feedback_round({"Q1"})
+        with (patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")),
               self.assertRaisesRegex(images.AnswerNotSent, "owner offline")):
-            self.submit(keep_form + "c" * 32)
+            self.submit(keep_form + f"&feedback_round={newer_round}&answer_request={newer_id}")
         images.delete(self.root, identity)
         attempts = image_store.read_answers(directory, identity)["attempts"]
         new_key, = (key for key, attempt in attempts.items() if key != original_key and not attempt["confirmed"])
         token = images.request_token(images.console_token(self.root), identity)
         retry = {"image": identity, "token": token, "action": "retry", "retry_key": new_key,
                  "draft_action": "feedback", "feedback_round": round_id, "feedback": keep}
-        result = images.submit(self.root, urlencode({**retry, "answer_request": request_id}), self.status)
-        assert isinstance(result, images.ImageAnswerSent)
-        self.assertFalse(result.draft_confirmed)
+        for request in ({}, {"answer_request": request_id}):
+            result = images.submit(self.root, urlencode({**retry, **request}), self.status)
+            assert isinstance(result, images.ImageAnswerSent)
+            self.assertFalse(result.draft_confirmed)
         attempts = image_store.read_answers(directory, identity)["attempts"]
         self.assertEqual(attempts[original_key]["confirmed"], [])
         self.assertEqual(attempts[new_key]["confirmed"], [self.owner_id()])
-        result = images.submit(self.root, urlencode({**retry, "answer_request": "c" * 32}), self.status)
-        assert isinstance(result, images.ImageAnswerSent)
-        self.assertTrue(result.draft_confirmed)
+        for request in ({}, {"answer_request": newer_id}):
+            result = images.submit(self.root, urlencode({**retry, "feedback_round": newer_round, **request}), self.status)
+            assert isinstance(result, images.ImageAnswerSent)
+            self.assertTrue(result.draft_confirmed)
 
-    def test_three_tabs_can_restore_an_earlier_answer_in_the_same_round(self) -> None:
+    def test_same_round_reuses_earlier_feedback_after_a_different_answer(self) -> None:
         keep = "Keep the red row."
         remove = "Remove the red row."
         start = datetime(2026, 11, 24, 23, 58, tzinfo=UTC)
@@ -1074,12 +1078,12 @@ class ImagesTests(ImagesFixture):
                     with patch.object(images, "datetime", wraps=datetime) as clock:
                         clock.configure_mock(**{"now.return_value": start + timedelta(days=index)})
                         self.submit(self.feedback_body(record, words) + f"&feedback_round={round_id}")
-                self.assertEqual(len(self.sent), 6 if linked else 3)
-                times = [start + timedelta(days=index) for index in range(3)]
+                self.assertEqual(len(self.sent), 4 if linked else 2)
+                times = [start, start + timedelta(days=1)]
                 if linked:
                     source = the_list.folder(keeper.id) / f"{item.id}.md"
                     self.assertEqual(behavior_request.verified_dates(source, {keep, remove}),
-                                     {keep: times[2].date(), remove: times[1].date()})
+                                     {keep: times[0].date(), remove: times[1].date()})
                     records = [entry for entry in the_list.load(keeper.id, item.id).log
                                if isinstance(entry, the_list.ImageAnswerChange)]
                     self.assertEqual([entry.time for entry in records], times)
@@ -1087,7 +1091,7 @@ class ImagesTests(ImagesFixture):
                     paths = images.decision_root(self.root).glob(f"{record['id']}-*.json")
                     decisions = [images.read_image_decision(self.root, path) for path in paths]
                     self.assertCountEqual(decisions, [images.ImageDecision(record["id"], "feedback", words, moment)
-                                                   for words, moment in zip((keep, remove, keep), times, strict=True)])
+                                                   for words, moment in zip((keep, remove), times, strict=True)])
 
     def test_signed_resubmission_with_a_legacy_marker_creates_a_record(self) -> None:
         record = self.register()
@@ -1101,6 +1105,7 @@ class ImagesTests(ImagesFixture):
         _ = marker.write_text("")
         body = self.feedback_body(record, words)
         self.submit(body)
+        self.assertEqual(list(image_store.read_answers(directory, identity)["attempts"]), [key])
         path, = images.decision_root(self.root).glob(f"{identity}-*.json")
         decision = images.read_image_decision(self.root, path)
         assert isinstance(decision, images.ImageDecision)
@@ -1118,7 +1123,9 @@ class ImagesTests(ImagesFixture):
                 self.submit(body)
         _ = images.send_answer(self.root, pending["id"], "feedback", "Keep the red row.")
         self.assertFalse(images.decision_root(self.root).exists())
+        sends = len(self.sent)
         self.submit(body)
+        self.assertEqual(len(self.sent), sends)
         self.assertEqual(len(list(images.decision_root(self.root).glob("*.json"))), 1)
 
     def test_retry_of_a_failed_list_write_keeps_the_original_signed_time(self) -> None:
@@ -1369,10 +1376,11 @@ class ImagesTests(ImagesFixture):
                         images.delete(self.root, identity)
                     current = f"&feedback_round={images.feedback_round({'Q1'})}"
                     resubmit = body + "&answer_request=" + "b" * 32
-                    retry = {"new ID": resubmit + current, "no ID": body + current,
-                             "legacy form": body + current}.get(retry_with, first)
+                    retry = {"new ID": resubmit + old_round, "no ID": body + old_round,
+                             "legacy form": body + old_round}.get(retry_with, first)
                     online = True
                     self.submit(retry)
+                    self.submit(resubmit + old_round)
                     self.submit(resubmit + current)
                     self.submit(resubmit)
                 self.assertEqual(recipients, [self.owner_id(), *([producer.id] * 4)])
@@ -1385,6 +1393,34 @@ class ImagesTests(ImagesFixture):
                 entry, = (entry for entry in the_list.load(keeper.id, item.id).log
                           if isinstance(entry, the_list.ImageAnswerChange) and identity in entry.what)
                 self.assertIn(words, entry.what)
+
+    def test_blank_approval_from_another_tab_finishes_the_original_delivery(self) -> None:
+        keeper, producer, item = self.list_item()
+        record = images.register(self.shot, "Check the rows", self.owner_id(), "Phase check", list_item=item.id)
+        body = self.feedback_body(record, "", "approved")
+        current_round = f"&feedback_round={images.feedback_round(set())}"
+        online = False
+        sends: list[tuple[str, str]] = []
+
+        def send(_recipient: str, _sender: str, _message: str, *, key: str,
+                 recipient_key: str) -> Literal["pending"] | None:
+            sends.append((recipient_key, key))
+            return "pending" if recipient_key == producer.id and not online else None
+
+        with patch.object(change_page, "send_message", side_effect=send):
+            with self.assertRaisesRegex(images.AnswerNotSent, "has not confirmed"):
+                self.submit(body + current_round + "&answer_request=" + "a" * 32)
+            online = True
+            self.submit(body + current_round + "&answer_request=" + "b" * 32)
+            self.submit(body)
+        self.assertEqual([recipient for recipient, _ in sends], [self.owner_id(), *([producer.id] * 4)])
+        self.assertEqual(len({key for _, key in sends}), 1)
+        attempts = image_store.read_answers(images.images_root(self.root), record["id"])["attempts"]
+        attempt, = attempts.values()
+        self.assertCountEqual(attempt["confirmed"], [self.owner_id(), producer.id])
+        entry, = (entry for entry in the_list.load(keeper.id, item.id).log
+                  if isinstance(entry, the_list.ImageAnswerChange))
+        self.assertEqual(entry.what, f"Image {record['id']}: {images.ANSWERS['approved']}")
 
     def test_accepted_request_retries_its_saved_recipient_when_the_list_is_unavailable(self) -> None:
         _, producer, item = self.list_item()
@@ -1794,6 +1830,7 @@ class ImageQuestionTests(ImagesFixture):
             return question_outcome("sent" if first else "skipped")
 
         body = urlencode({"image": record["id"], "action": "feedback", "feedback": "Check the gate.",
+                          "feedback_round": images.feedback_round(set()),
                           "token": images.request_token(images.console_token(self.root), record["id"])})
         with (patch.object(change_page, "send_message", new=SEND_MESSAGE),
               patch.object(unrouted_alert, "message_outcome", side_effect=send)):
@@ -1810,6 +1847,7 @@ class ImageQuestionTests(ImagesFixture):
         record = self.register()
         self.ask(record)
         body = urlencode({"image": record["id"], "action": "feedback", "feedback": "Check the gate.",
+                          "feedback_round": images.feedback_round(set()),
                           "token": images.request_token(images.console_token(self.root), record["id"])})
         attempts: list[str] = []
         outcomes: Iterator[Literal["pending", "skipped"]] = iter(("pending", "pending", "pending", "skipped"))
@@ -1863,13 +1901,12 @@ class ImageQuestionTests(ImagesFixture):
             self.assertIn("feedback_at", image_store.read_record(folder))
             images.answer_question(self.root, identity, "Q1", "The gate passed.")
             self.assertIn("The gate passed.", images.render(self.status).decode())
-            with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
-                self.submit(first_post)
+            self.submit(first_post)
             self.assertNotIn("feedback_at", image_store.read_record(folder))
             fresh_post = approval()
             self.submit(fresh_post)
             self.assertIn("feedback_at", image_store.read_record(folder))
-            self.assertNotIn(identity, images.render(self.status).decode())
+            self.assertNotIn(f'data-image="{identity}"', images.render(self.status).decode())
             self.submit(fresh_post)
 
         self.assertEqual(len(keys), 2)
@@ -1892,8 +1929,9 @@ class ImageQuestionTests(ImagesFixture):
         self.submit(post("Shorten the red row.", set()))
         images.answer_question(self.root, identity, "Q1", "The gate passed.")
         self.submit(post("Remove the red row.", {"Q1"}))
+        self.submit(keep)
         with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
-            self.submit(keep)
+            self.submit(post("Move the red row.", set()))
         paths = images.decision_root(self.root).glob(f"{identity}-*.json")
         self.assertEqual(len(list(paths)), 3)
 
