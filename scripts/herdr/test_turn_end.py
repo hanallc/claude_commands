@@ -116,6 +116,25 @@ class NativeHookEntryTests(unittest.TestCase):
 
 @final
 class PassNoticeOrderTests(unittest.TestCase):
+    def test_changed_turn_notice_detail_is_delivered_and_replay_is_skipped(self) -> None:
+        with TemporaryDirectory() as folder:
+            run = Path(folder)
+            route = pass_notices.Route("pass", staff.StaffId("director"), "worker")
+            legacy = pass_notices.LegacyNoticeStamp("", "")
+            details = ("The check is running.", "The check is still running.")
+
+            with patch.object(pass_notices, "_send", return_value=send.Result("sent", "")) as transport:
+                for turn, detail in (("first", details[0]), ("repeat", details[0]),
+                                     ("changed", details[1]), ("repeat", details[0])):
+                    notice = pass_notices.Notice(f"worker: waiting on runs\n{detail}", "codex:worker",
+                                                 pass_notices.NoticeKind.STATUS, transition=detail,
+                                                 source_event_id=f"turn:{turn}")
+                    event = pass_notices.stage_status(run, route, notice, legacy=legacy)
+                    pass_notices.deliver_status(run, route.instance_id, event)
+
+            self.assertEqual([cast(pass_notices.Notice, call.args[3]).text.splitlines()[-1]
+                              for call in transport.call_args_list], list(details))
+
     def test_a_newer_turn_notice_never_sends_the_turn_it_replaced(self) -> None:
         with TemporaryDirectory() as folder:
             run = Path(folder)
@@ -1304,6 +1323,33 @@ class TurnEndTests(unittest.TestCase):
             self.case.agent.append(target, "assistant", f"DONE {active.instance_id}")
             self.case.fixture.world.locations[target]["agent_status"] = "done"
             self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
+
+    def test_two_native_turns_with_the_same_run_wait_send_one_notice(self) -> None:
+        self.case.agent.without_done = True
+        self.case.agent.final = "The check is running."
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        run = self.case.run_dir
+        instance = str(worker_panes.worker_pass(row, run)["instance_id"])
+        path, record = self.case.detached_record(row, "private-check")
+        record.update(status="running", pid=os.getpid())
+        atomic_file.write_text_atomic(path, json.dumps(record))
+
+        with patch.object(detached_run_process, "supervises", return_value=True):
+            for turn in ("first", "second"):
+                self.case.agent.append(pane, "user", "Check the run status.")
+                self.case.agent.complete(pane)
+                event = turn_end.hook_event({"hook_event_name": "Stop", "session_id": str(row.current_session),
+                                             "turn_id": turn, "last_assistant_message": self.case.agent.final})
+                self.assertIs(turn_end.handle(event), turn_end.TurnOutcome.WAITING_ON_RUNS)
+
+        self.assertEqual(len(self.case.agent.notices), 1)
+        self.assertIn("waiting on runs", self.case.agent.notices[0])
+        self.assertIn("; runs private-check", self.case.agent.notices[0])
+        saved = pass_notices.read(run, instance)
+        assert saved is not None
+        self.assertEqual(list(saved.notices), ["status:1"])
 
     def test_first_hook_imports_the_legacy_status_stamp_without_sending_again(self) -> None:
         self.case.agent.without_done = True

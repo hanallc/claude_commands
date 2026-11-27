@@ -102,6 +102,7 @@ def _locked(path: Path, purpose: str) -> Generator[None]:
 class PassNotices:
     route: Route
     notices: dict[str, Notice]
+    status_replays: dict[str, str]
 
     @classmethod
     def read(cls, path: Path) -> PassNotices | None:
@@ -129,7 +130,7 @@ class PassNotices:
             route = _read_route(path, fields)
             notices = pass_record.object_dict(fields.get("notices")) or {}
             if record is None:
-                record = cls(route, {})
+                record = cls(route, {}, {})
                 # Apply the legacy event only to the first complete publication.
                 initial = pass_record.object_dict(fields.get("initial")) or {}
                 notices = {**initial, **{key: value for key, value in notices.items() if key not in initial}}
@@ -144,8 +145,11 @@ class PassNotices:
                 notice = _read_notice(path, key, value)
                 if notice.kind == NoticeKind.RESULT:
                     record = cls(record.route, {name: entry for name, entry in record.notices.items()
-                                                if entry.settled or entry.kind == NoticeKind.DIAGNOSTIC})
+                                                if entry.settled or entry.kind == NoticeKind.DIAGNOSTIC},
+                                 record.status_replays)
                 record.notices[key] = notice
+            replays = pass_record.object_dict(fields.get("status_replays")) or {}
+            record.status_replays.update({event: key for event, key in replays.items() if isinstance(key, str)})
         return record
 
 
@@ -216,13 +220,17 @@ def stage_status(run: Path, route: Route, notice: Notice, *, legacy: LegacyNotic
         if any(entry.kind == NoticeKind.RESULT for entry in saved.values()):
             return ""
         statuses = [(key, entry) for key, entry in saved.items() if entry.kind == NoticeKind.STATUS]
+        replay_key = "" if record is None else record.status_replays.get(notice.source_event_id, "")
         for key, entry in statuses:
-            if notice.source_event_id and entry.source_event_id == notice.source_event_id:
+            if key == replay_key or notice.source_event_id and entry.source_event_id == notice.source_event_id:
                 return key
             if entry.legacy_stamp == legacy.incoming and (not entry.source_event_id or not notice.source_event_id):
                 return key
-        if not notice.source_event_id and statuses and statuses[-1][1].transition == notice.transition:
-            return statuses[-1][0]
+        if statuses and statuses[-1][1].transition == notice.transition:
+            key = statuses[-1][0]
+            if notice.source_event_id:
+                _append(path, {"route": asdict(route), "status_replays": {notice.source_event_id: key}})
+            return key
         key = f"status:{len(statuses) + 1}"
         _publish(path, route, {key: notice})
         return key
