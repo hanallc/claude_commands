@@ -199,10 +199,11 @@ print("SENT: recorded by the fixture")
 
     def send_notice(recipient: str, sender: str, message: str, *, key: str = "",
                     recipient_key: str = "") -> Literal["skipped", "pending"] | None:
-        result = _SEND_REVIEW_MESSAGE(recipient, sender, message, key=key, recipient_key=recipient_key)
-        if recorded is not None:
-            recorded.set()
-        return result
+        try:
+            return _SEND_REVIEW_MESSAGE(recipient, sender, message, key=key, recipient_key=recipient_key)
+        finally:
+            if recorded is not None:
+                recorded.set()
 
     with (patch.object(session_send, "SEND_SCRIPT", sender),
           patch.object(change_page, "send_message", send_notice)):
