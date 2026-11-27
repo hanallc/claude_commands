@@ -44,7 +44,7 @@ from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
 from scripts.notify import push_texts
 from scripts.production import list_exchange
-from scripts.production import delivery_state, goal, investigation, producer_map, record_store, repeat_rule, session_pane, staff, update_registration
+from scripts.production import delivery_state, goal, investigation, producer_map, record_store, repeat_rule, session_pane, staff
 from scripts.review_links import change_page, list_draft, new_item_dialog, page_frame, page_question, question_path, question_record
 from scripts.review_links.review_items import LegacyValidationLog, ValidationLogStart
 
@@ -814,47 +814,46 @@ def _native_question_origins(exchanges: Iterable[list_exchange.FiledExchange]) -
 
 
 def _submitted_question_origin(key: str) -> NativeQuestionItem | NoQuestionItem:
-    if key.startswith("submission/"):
-        try:
-            submission = new_item_dialog.read_submission_key(key)
-        except ValueError:
-            return NoQuestionItem.ORDINARY
-        if submission.kind is new_item_dialog.SubmissionKind.QUESTION:
-            return NativeQuestionItem(QuestionItemKind.FROM_NATE, f"submission/question/{submission.request_id}")
+    if not key.startswith("submission/"):
         return NoQuestionItem.ORDINARY
-
-    parts = key.split("/")
-    if len(parts) != 3 or parts[0] != "question" or not parts[2].endswith(".md"):
-        return NoQuestionItem.ORDINARY
-    _, owner, name = parts
-    owner = staff.StaffId(owner)
     try:
-        new_item_dialog.check_recipient_id(owner)
+        submission = new_item_dialog.read_submission_key(key)
     except ValueError:
         return NoQuestionItem.ORDINARY
-    folders = record_store.known_folders(record_store.RecordKind.QUESTION, owner)
-    origins: set[NativeQuestionItem] = set()
-    for folder in (*folders, *record_store.archive_folders(folders)):
-        with suppress(OSError, ValueError):
-            record = update_registration.read_review_question(folder / name, owner)
-            if record.owner == owner and (fields := record.item.get("review_submission")) is not None:
-                request = new_item_dialog.read_submission(fields)
-                origins.add(NativeQuestionItem(QuestionItemKind.FROM_NATE, f"submission/question/{request.request_id}"))
-    return next(iter(origins)) if len(origins) == 1 else NoQuestionItem.ORDINARY
+    if submission.kind is new_item_dialog.SubmissionKind.QUESTION:
+        return NativeQuestionItem(QuestionItemKind.FROM_NATE, f"submission/question/{submission.request_id}")
+    return NoQuestionItem.ORDINARY
 
 
-def _original_list_question(added: ItemChange) -> NativeQuestionItem | NoQuestionItem:
+def _added_review_link(added: ItemChange) -> str:
     if not isinstance(added.what, FieldChange) or added.what.action != "Added":
-        return NoQuestionItem.ORDINARY
+        return ""
     evidence = added.what.fields.get("evidence", "").partition("\n")[0]
     try:
         url = urlsplit(evidence)
         jumps = parse_qs(url.fragment).get("jump", [])
         if url.path != "/console/review.html" or len(jumps) != 1:
-            return NoQuestionItem.ORDINARY
-        return _submitted_question_origin(jumps[0])
+            return ""
+        return jumps[0]
     except ValueError:
-        return NoQuestionItem.ORDINARY
+        return ""
+
+
+def original_question_link(item: ListItem) -> str:
+    """Find the Review link saved when this List item was added."""
+    if not item.log or isinstance(item.report, ListReport):
+        return ""
+    added = item.log[0]
+    if added.source not in (PAGE_SOURCE, "nate via New item", "nate via /new_item"):
+        return ""
+    if key := _added_review_link(added):
+        return key
+    if added.source != PAGE_SOURCE and len(item.log) > 1:
+        link = item.log[1]
+        if (link.time == added.time and link.source == added.source and isinstance(link.what, ReviewLinksChanged)
+                and link.what.action == "Linked reviews" and len(link.what.keys) == 1):
+            return link.what.keys[0]
+    return ""
 
 
 def _legacy_question_origin(item: ListItem) -> NativeQuestionItem | NoQuestionItem:
@@ -866,22 +865,13 @@ def _legacy_question_origin(item: ListItem) -> NativeQuestionItem | NoQuestionIt
     added = item.log[0]
     if added.source not in (PAGE_SOURCE, "nate via New item", "nate via /new_item"):
         return NoQuestionItem.ORDINARY
-    original = _original_list_question(added)
+    original = _submitted_question_origin(original_question_link(item))
     if isinstance(original, NativeQuestionItem):
         return original if original in origins else NoQuestionItem.ORDINARY
     if added.source == PAGE_SOURCE:
         origins = {origin for origin in origins
                    if isinstance(reservation := _exchange_reservation(_exchange_path(origin.source_key)), ExchangeDestination)
                    and reservation.reserved_new_item and reservation.destination.number == item.number}
-    elif len(item.log) > 1:
-        link = item.log[1]
-        if (link.time != added.time or link.source != added.source or not isinstance(link.what, ReviewLinksChanged)
-                or link.what.action != "Linked reviews"):
-            return NoQuestionItem.ORDINARY
-        if len(link.what.keys) != 1:
-            return NoQuestionItem.ORDINARY
-        origin = _submitted_question_origin(link.what.keys[0])
-        return origin if origin in origins else NoQuestionItem.ORDINARY
     else:
         return NoQuestionItem.ORDINARY
     return next(iter(origins)) if len(origins) == 1 else NoQuestionItem.ORDINARY
@@ -3005,7 +2995,8 @@ def _save_new_exchanges(store: record_store.NumberedRecords, number: int, title:
 
 
 def convert_legacy_question_sources(keeper: staff.StaffId, *,
-                                    reservations: Mapping[int, set[NativeQuestionItem]]) -> None:
+                                    reservations: Mapping[int, set[NativeQuestionItem]],
+                                    question_links: Mapping[str, set[NativeQuestionItem]]) -> None:
     """Resolve the original source of each question that lacks a saved key."""
     store = _store(keeper)
     paths = tuple(store.folder().glob("L*.md"))
@@ -3020,6 +3011,8 @@ def convert_legacy_question_sources(keeper: staff.StaffId, *,
             exchanges = list_exchange.decode(fields.get("filed_exchanges", "[]"))
             item = _decode_item(store, fields, body, exchanges, NoQuestionItem.ORDINARY)
             matches = _native_question_origins(exchanges) & reservations.get(item.number, set())
+            if not matches:
+                matches = _native_question_origins(exchanges) & question_links.get(original_question_link(item), set())
             origin = next(iter(matches)) if matches else _legacy_question_origin(item)
             if (len(matches) > 1 or not isinstance(origin, NativeQuestionItem)
                     or origin.kind != QuestionItemKind(fields["question_kind"])):

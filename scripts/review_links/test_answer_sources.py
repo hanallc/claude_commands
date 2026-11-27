@@ -1136,7 +1136,8 @@ class AnswerSourceTests(unittest.TestCase):
         inventory = answer_sources.read_exchanges(self.review, members=MEMBERS)
         exchanges = tuple(list_exchange.FiledExchange.from_exchange(exchange) for exchange in inventory.exchanges)
         self.assertTrue(exchanges)
-        projected = the_list.project_question_migration(closed, exchanges)
+        projected = the_list.project_question_migration(closed, exchanges,
+            submission_question=inventory.exchanges[0].question_origin)
         self.assertIs(projected.state, the_list.ItemState.ANSWERED)
         self.assertEqual(the_list.load(KEEPER.id, identity), closed)
         self.assertEqual(self.migrate(apply=True)[0], 0)
@@ -1168,6 +1169,12 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertFalse(the_list.unread_answer_ids(saved))
 
     def test_migration_files_a_transferred_question_on_its_reserved_row(self) -> None:
+        self.check_transferred_question_destination(reserved=True)
+
+    def test_migration_files_a_transferred_question_using_the_move_receipt(self) -> None:
+        self.check_transferred_question_destination(reserved=False)
+
+    def transfer_linked_question(self, *, reserved: bool) -> tuple[str, str, int, Path]:
         request = f"r6-{'2' * 32}-question-{OWNER.id}"
         submission = origin(request)
         key = self.native("question-before-transfer", {
@@ -1177,13 +1184,17 @@ class AnswerSourceTests(unittest.TestCase):
         })
         folder = review_submissions.image_folder(submission).parent
         folder.mkdir(parents=True)
-        _ = (folder / "list-filing.json").write_text(json.dumps({
-            "keeper": KEEPER.id, "owner": OWNER.id, "producer": OWNER.id, "unit": "", "source": "nate via New item",
-        }), encoding="utf-8")
+        if reserved:
+            _ = (folder / "list-filing.json").write_text(json.dumps({
+                "keeper": KEEPER.id, "owner": OWNER.id, "producer": OWNER.id, "unit": "", "source": "nate via New item",
+            }), encoding="utf-8")
         number = the_list.add_review_item(KEEPER.id, "Which plan?", owner=OWNER.id, producer=OWNER.id, unit="",
             words="Which plan?", evidence="/console/review.html#" + urlencode({"jump": key}), review_key=key,
-            source="nate via New item", reservation=folder / "list-number")
+            source="nate via New item", reservation=(folder if reserved else self.root) / "list-number")
         source = record_store.default_question_folder(OWNER.id) / key.rsplit("/", 1)[1]
+        receipt = review_submissions.NativeSubmissionDestination("Q1", new_item_dialog.SubmissionKind.QUESTION,
+            OWNER.id, request, submission.request_digest, source, source, OWNER.id)
+        review_submissions._write_location(folder / "receipt.json", receipt)  # pyright: ignore[reportPrivateUsage]
         destination = record_store.default_question_folder(ASKER.id) / "question-after-transfer.md"
         destination.parent.mkdir(parents=True)
         document = self.root / "parent.md"
@@ -1196,7 +1207,12 @@ class AnswerSourceTests(unittest.TestCase):
         current = update_registration.read_review_question(destination, ASKER.id)
         self.assertEqual(review_submissions.native_origin(current), submission)
         self.assertNotEqual(review_items.question_record_key(current), key)
+        return request, key, number, folder
 
+    def check_transferred_question_destination(self, *, reserved: bool) -> None:
+        request, key, number, folder = self.transfer_linked_question(reserved=reserved)
+        self.assertEqual((folder / "list-number").exists(), reserved)
+        self.assertTrue((folder / "moved.json").is_file())
         dry_status, preview = self.migrate(apply=False)
         self.assertEqual(dry_status, 0)
         self.assertIn("sent-question/scoped-reply: sources=1 exchanges=1 linked=1 new-rows=0", preview)
@@ -1214,6 +1230,31 @@ class AnswerSourceTests(unittest.TestCase):
             store.write(saved.id, fields, body)
         self.assertEqual(self.migrate(apply=True)[0], 0)
         self.assertEqual(the_list.load(KEEPER.id, saved.id), saved)
+
+    def test_migration_leaves_a_transferred_question_without_verified_destination_unresolved(self) -> None:
+        request, _, number, folder = self.transfer_linked_question(reserved=False)
+        moved = folder / "moved.json"
+        receipt = folder / "receipt.json"
+        original = moved.read_text(encoding="utf-8")
+        _ = moved.write_text(original.replace("1" * 64, "0" * 64), encoding="utf-8")
+        key = f"submission/question/{request}"
+        store = list_draft.list_records(KEEPER.id, the_list.ListError)
+        row = the_list.load(KEEPER.id, f"L{number}")
+        self.assertFalse((folder / "list-number").exists())
+        for proof in ("wrong digest", "missing move receipt", "missing both receipts"):
+            with self.subTest(proof=proof):
+                if proof == "missing move receipt":
+                    moved.unlink()
+                if proof == "missing both receipts":
+                    receipt.unlink()
+                for apply in (False, True):
+                    status, log = self.migrate(apply=apply)
+                    self.assertEqual(status, 0)
+                    self.assertIn("Unresolved question destinations: 1", log)
+                    self.assertIn(f"{key}: no verified List destination", log)
+                self.assertEqual(the_list.records(KEEPER.id, include_closed=True), [row])
+                with store.locked():
+                    self.assertEqual(store.next_number(), number + 1)
 
     def test_question_migration_keeps_replies_read_after_legacy_park_or_close(self) -> None:
         for action in ("Park", "Close"):
