@@ -54,6 +54,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.copies import copies
 from scripts.lib import atomic_file, conf
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS
+from scripts.lib.checkout_test_support import copy_runtime, write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -4034,6 +4035,72 @@ class GateDispatchJournalTests(unittest.TestCase):
 
 
 class CloudRouteTests(CloudGateHangGuard, CostFixture):
+    def test_aws_bootstrap_uses_the_candidate_rerun_limit_for_selected_modules(self) -> None:
+        gate_jobs = self.root / 'guest-gate-jobs'
+        gate_jobs.mkdir()
+        _ = write_config_fixture(conf.path('gate'), 'rerun.max_failed_modules=1\n')
+        _ = write_config_fixture(conf.path('build_folders'), f'roots.gate={gate_jobs}\n')
+        (self.repo / 'scripts/production/gate.py').unlink()
+        copy_runtime(self.repo)
+        _ = write_config_fixture(self.repo / 'config/gate.conf', 'rerun.max_failed_modules=0\n')
+        _ = write_config_fixture(self.repo / 'config/build_folders.conf', f'roots.gate={gate_jobs}\n')
+        install_cost_settings(self.repo / 'config/aws_target.conf')
+        runner = self.repo / 'scripts/test_times/module_run.py'
+        attempt = self.root / 'fixture-rerun'
+        _ = runner.write_text(
+            'from pathlib import Path\n'
+            + f'attempt = Path({str(attempt)!r})\n'
+            + 'if not attempt.exists():\n'
+            + '    attempt.touch()\n'
+            + '    raise SystemExit(1)\n')
+        origin_main = gate.checked_git(self.repo, 'rev-parse', 'refs/remotes/origin/main')
+        commit = commit_repository(self.repo, 'Set the candidate rerun limit')
+        tree = gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}')
+        box = self.root / 'guest-box'
+        box.mkdir()
+        cloud_gate.save(box / 'request.json', {
+            'clone_url': str(self.repo), 'origin_main': origin_main,
+            'modules': ['scripts/fixture/test_one.py'], 'head': commit, 'dirty_paths': [], 'full': False,
+        })
+        result_file = box / 'result.json'
+        cloud_gate.save(box / 'links.json', {
+            'production': True, 'step': 'size', 'attempt': 'candidate-rerun-limit',
+            'commit': commit, 'tree': tree, 'origin': str(self.repo),
+            'mode': gate.SuiteMode.TARGETED.wire, 'module_time_limit_s': 10,
+            'log': str(box / 'uploaded.log'), 'result': str(result_file),
+        })
+        guest = box / 'guest.py'
+        _ = guest.write_text(gate_box.GUEST)
+        home = self.root / 'guest-home'
+        home.mkdir()
+        tools = self.root / 'guest-tools'
+        tools.mkdir()
+        write_stdlib_tool(tools / 'curl', """import json, sys
+from pathlib import Path
+
+assert sys.argv[sys.argv.index('-X') + 1] == 'PUT'
+config = Path(sys.argv[sys.argv.index('--config') + 1])
+destination = Path(json.loads(config.read_text().partition('= ')[2]))
+destination.write_bytes(sys.stdin.buffer.read())
+print('200', end='')
+""")
+        version = tools / 'fixture-version'
+        write_stdlib_tool(version, "print('fixture version')\n")
+        for name in ('cargo', 'rustc', 'rustdoc', 'rustup', 'cargo-nextest', 'uv', 'sqlite3'):
+            (tools / name).symlink_to(version)
+        environment = {**os.environ, 'HOME': str(home), 'GATE_BOX_DIR': str(box), 'GATE_PYTHON': sys.executable,
+                       'PATH': str(tools) + os.pathsep + os.environ['PATH']}
+        _ = environment.pop('CONF_DIR', None)
+        bootstrap = subprocess.run([sys.executable, '-I', str(guest)], cwd=box, env=environment,
+                                   capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(bootstrap.returncode, 0, bootstrap.stdout + bootstrap.stderr)
+        result = ledger.mapping(cast(object, json.loads(result_file.read_text())))
+        self.assertIn('gate', result, result)
+        run = gate_box.decode_run(result['gate'])
+        self.assertEqual([job.returncode for job in run.executions], [1])
+        self.assertEqual(result['verdict'], 'fail', result)
+        self.assertTrue(attempt.is_file())
+
     repo: Path = Path()
     modules: list[tuple[str, Path]] = []
     admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import NamedTuple, NotRequired, TypedDict, cast
 
 from scripts.production import staff
-from scripts.lib import unit_runs
+from scripts.lib import conf, unit_runs
 from scripts.production import session_staff  # noqa: E402
 from scripts.agents import remote  # noqa: E402
 from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # noqa: E402
@@ -27,9 +27,6 @@ from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # no
 # have shown; a run with enough matching samples replaces it with its own
 # measured error, so this only ever governs the first runs of a fresh history.
 DEFAULT_PERCENT_SPREAD = 10.0
-# The widest the best and worst case may stray from the reported rate: at worst
-# the work is half as far along as it says, at best twice.
-RATE_FACTOR_LIMIT = 2.0
 # Every phase heading in a worker plan, in all three forms it takes over a
 # plan's life. `· status: todo` and `· status: done` are the live-zone forms;
 # a shrunk or as-built phase drops the status marker and usually carries a
@@ -323,8 +320,12 @@ def eta_band_seconds(
     eta = eta_seconds(percent, elapsed)
     if eta is None:
         return EtaProjectionUnavailable()
-    optimistic = min(99.0, percent * RATE_FACTOR_LIMIT, percent + max(0.0, spread))
-    pessimistic = max(1.0, percent / RATE_FACTOR_LIMIT, percent - max(0.0, spread))
+    try:
+        rate_factor = conf.read("direct").number("plan_history.max_rate_factor")
+    except conf.Unusable:
+        return EtaProjectionUnavailable()
+    optimistic = min(99.0, percent * rate_factor, percent + max(0.0, spread))
+    pessimistic = max(1.0, percent / rate_factor, percent - max(0.0, spread))
     low = int(elapsed * (100.0 - optimistic) / optimistic)
     high = int(elapsed * (100.0 - pessimistic) / pessimistic)
     return EtaBand(remaining=eta, earliest=low, latest=high)

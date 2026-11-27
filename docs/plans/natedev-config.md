@@ -291,22 +291,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 7. **Proof.** Record `bash scripts/cli_agent/cli_agent.sh --status` before the change. After the change it prints the same agents.
 8. **Output tail.** `scripts/production/hand_made_limit.py` `TAIL_BYTES` (line 44, `64 * 1024`) becomes the `hand_made.output_tail_bytes=65536` row above (bob's working name `cli.hand_made.output_tail_bytes`), read at use. Its `TunableLiteral` row (batch "config/cli.conf") leaves the inventory. No test reads the live value; each test writes its own fixture config. `scripts/production/hand_made_guest.py` makes an `OutputTail` on the controller for the guest's streamed output, so a read in `OutputTail.write()` would repeat for each chunk. Read the key once on the controller before the attempt starts, and pass the bounded value to each `OutputTail`. Change the natedev and guest routes, and test both with the same fixture.
 
-**Pending decision:**
-
-**Decision 1: where a codex service tier for the `cli` function lives**
-
-Actual problem:
-`_agents_set_service_tier` in `scripts/agents/models_config.sh` (line 1126) needs a `[cli.codex]` section and writes `[cli.options]` `codex_service_tier`. This phase removes every `[cli.*]` section, so `/default_models` tier commands for `cli` lose their storage.
-
-What exists now:
-- The live `config/models.conf` has no `[cli.options]` row; the command can write one.
-- The function, subtask and all-functions forms, and `inherit`, work for every function with a `<function>.codex` section.
-
-What should change:
-- Keep the command for `cli`: it writes a `cli.conf` row `<task>.codex.service_tier` (all tasks when no subtask is named), through the `/tune` path. `inherit` removes the row.
-
-Recommendation:
-Keep the affordance in `cli.conf` as above. It adds a key name, so it needs nate's go with the P807 rename list.
+**Settled (natedev 02:16 PST 11-27):** `/default_models` set-service-tier keeps working for the `cli` function. `_agents_set_service_tier` in `scripts/agents/models_config.sh` (line 1126) writes the `cli.conf` row `<task>.codex.service_tier` through the `/tune` path, for every `cli` task when no subtask is named. `inherit` removes the row. Keep the function, subtask and all-functions forms. The new key merges under this working name; natedev names it to nate after the merge. The removal of `[cli.options] codex_service_tier` rides the P807 go. Test each form and `inherit` through `default_models.sh`.
 
 **Files:**
 - `config/cli.conf` — new
@@ -580,7 +565,7 @@ Keep the affordance in `cli.conf` as above. It adds a key name, so it needs nate
 - A browser test of the 503 draft: the existing failNextSend case covers draft retention.
 - Wait limits (screen recording duration, Review capture expiry, preview wait, attachment retry) stay in code for item 277.
 
-### Phase 13 — Production and direct literals to config  · status: todo
+### Phase 13 — Production and direct literals to config  · status: done
 **Depends on:** Phase 3
 
 #### Work Order

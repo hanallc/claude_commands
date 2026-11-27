@@ -297,8 +297,10 @@ import signal
 import socket
 import subprocess
 from time import sleep
+from unittest.mock import patch
 
 from scripts.copies import copies
+from scripts.lib import conf
 from scripts.production.gate_modules import discover_test_modules
 from scripts.production.gate_routes import AllModules, GateJobKind, GateJobResult, GateRun, SelectedModules, SuiteMode
 from scripts.test_times.gate_record import TYPE_CHECK_JOB, WallClockSpan
@@ -348,6 +350,14 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
     assert int(checked_git(repo, 'rev-list', '--count', 'main', 'origin/main')) >= 2
     assert checked_git(repo, 'rev-parse', 'main') == os.environ['FIXTURE_EXPECTED_MAIN']
     assert checked_git(repo, 'rev-parse', 'origin/main') == os.environ['FIXTURE_EXPECTED_MAIN']
+    if os.environ['FIXTURE_GUEST_RESULT'] == 'candidate-rerun-limit':
+        with patch.object(real_gate, '_gate_job_parent', return_value=Path(os.environ['TMPDIR'])):
+            assert conf.path('gate').resolve() == repo / 'config/gate.conf'
+            return real_gate.run_suites(
+                repo, type_dirs=type_dirs, full=full, mode=mode, selected=selected,
+                machine=real_gate.WholeMachine(module_progress=machine.module_progress,
+                                               rerun_failed_modules=machine.rerun_failed_modules),
+                module_time_limit_s=module_time_limit_s, time_limit=time_limit)
     assert full == (mode is SuiteMode.GATE or isinstance(selected, AllModules))
     print('A guest log line must stay outside the JSON result.')
     scenario = os.environ['FIXTURE_GUEST_RESULT']
@@ -430,10 +440,14 @@ if os.environ['FIXTURE_GUEST_RESULT'] in ('disconnect-before-copy', 'interrupted
     signal.pause()
 sys.argv = sys.argv[2:]
 runner_root = Path(sys.argv[0]).parents[2]
+if '--run-copy' in sys.argv and os.environ['FIXTURE_GUEST_RESULT'] == 'candidate-rerun-limit':
+    from scripts.production import gate as real_gate
 scripts.__path__ = [str(runner_root / 'scripts'), *scripts.__path__]
 if '--run-copy' in sys.argv:
     spec = spec_from_file_location('scripts.production.gate', runner_root / 'scripts/production/gate.py')
     gate = module_from_spec(spec)
+    if os.environ['FIXTURE_GUEST_RESULT'] == 'candidate-rerun-limit':
+        gate.real_gate = real_gate
     sys.modules[spec.name] = gate
     spec.loader.exec_module(gate)
 runpy.run_path(sys.argv[0], run_name='__main__')
@@ -1029,6 +1043,7 @@ class MacLinuxRouteTests(unittest.TestCase):
             (self.repo / 'scripts/fixture' / module).touch()
         package_root = shlex.quote(str(CHECKOUT))
         cache_option = shlex.quote(f'pycache_prefix={self.bootstrap_cache}')
+        python = shlex.quote(sys.executable)
         shim = """#!/usr/bin/env bash
 candidate="$PWD"
 options=()
@@ -1037,9 +1052,15 @@ if [[ "$1" == "-X" ]]; then
     shift 2
 fi
 """
+        # Run module commands directly. Only the guest entry points need the fixture bootstrap.
+        shim += ('if [[ "$FIXTURE_GUEST_RESULT" == candidate-rerun-limit ]]; then\n'
+                 + '    case "$1" in\n'
+                 + f'        -c|*/scripts/test_times/module_run.py) exec {python} -B "$@" ;;\n'
+                 + '    esac\n'
+                 + 'fi\n')
         self.executable(self.repo / 'scripts/lib/py', shim
                         + f'cd {package_root}\nexport PYTHONPATH={package_root}\n'
-                        + f'exec {shlex.quote(sys.executable)} -B "${{options[@]}}" -X {cache_option}'
+                        + f'exec {python} -B "${{options[@]}}" -X {cache_option}'
                         + f' -c {shlex.quote(GUEST_BOOTSTRAP)} "$candidate" "$@"\n')
         _ = shutil.copyfile(Path(mac_linux.__file__), self.repo / mac_linux.RUNNER_PATH)
         _ = self.git('add', '.')
@@ -4519,6 +4540,29 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual(output.getvalue().count(label), 1)
         self.assertIn('fixture first failure', output.getvalue())
         self.assertIn('Mac Linux guest gate passed: 2 modules', output.getvalue())
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_selected_guest_uses_the_candidate_rerun_limit(self) -> None:
+        _ = write_config_fixture(conf.path('gate'), 'rerun.max_failed_modules=1\n')
+        _ = write_config_fixture(self.repo / 'config/gate.conf', 'rerun.max_failed_modules=0\n')
+        runner = self.repo / 'scripts/test_times/module_run.py'
+        runner.parent.mkdir()
+        _ = runner.write_text(
+            'from pathlib import Path\n'
+            + 'attempt = Path("target/fixture-rerun")\n'
+            + 'if not attempt.exists():\n'
+            + '    attempt.touch()\n'
+            + '    print("fixture first failure")\n'
+            + '    raise SystemExit(1)\n')
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'Set the candidate rerun limit')
+        tree = self.git('rev-parse', 'HEAD^{tree}')
+        result = self.route('candidate-rerun-limit', selected=TreeSelection(('scripts/fixture/test_first.py',), tree))
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        self.assertFalse(result.passed, result.jobs)
+        first, = result.executions
+        self.assertEqual(first.returncode, 1)
+        self.assertIn('fixture first failure', first.output)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_guest_refuses_when_the_type_check_tool_is_missing(self) -> None:

@@ -56,6 +56,10 @@ GATE_TEST_SETTINGS = """# range: 1..
 gate_time_limit_factor=100
 # whole: 0..
 memory_stop_reruns=1
+# whole: 0..
+rerun.max_failed_modules=8
+# whole: 3..4096
+nightly.type_line_bytes=512
 """
 # The fixture has no Mac placement. The client refuses it without contacting the queue.
 MAC_GATE_TEST_SETTINGS = (

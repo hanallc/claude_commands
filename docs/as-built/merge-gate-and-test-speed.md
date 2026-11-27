@@ -917,7 +917,8 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 - **Rerun alone.** After all parallel jobs end, each failed test module runs once more, alone.
   Jobs killed at the module time limit and `types` do not run again.
   The gate also excludes jobs that trigger a tripwire, including the live config guard.
-  If more than `RERUN_LIMIT` (8) ordinary failures qualify, those failures do not run again; one line reports the count.
+  The gate reads `rerun.max_failed_modules` from `config/gate.conf` at start. The shipped value is 8.
+  If more failures qualify, the gate reports the count and skips ordinary reruns.
   Memory stops use their separate retry count even when ordinary failures exceed this limit.
   Each rerun uses the same launch, cleanup, arguments, environment, scope prefix, memory sampling, and time limit.
   A pass replaces the first failure and prints `Rerun alone: <suite>/<module> passed (first run exit N, X s)`.

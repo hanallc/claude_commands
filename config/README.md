@@ -793,6 +793,11 @@ List of crate names to exclude from `cargo fmt` checks. Used when running format
 
 MCP server definitions for reference when setting up Claude Code on a new machine. Copy these entries into `~/.claude.json` under the `mcpServers` key.
 
+## orphans.conf
+
+`corpus.max_file_bytes` sets the largest file that `/orphans` reads for references.
+The command reads this setting at the start of each scan.
+
 ## orphans_expected.json
 
 Files that the `/orphans` command should ignore when checking for unreferenced scripts and configs. Lists scripts and config files that are intentionally not referenced by any command.

@@ -921,7 +921,7 @@ class ConfigFormTests(unittest.TestCase):
                 matches = [violation for violation in violations if violation.path == path]
                 if matches:
                     covered.update(matches)
-                elif not (rule == "blank line" and path == Path("config/the_list.conf") and path not in files):
+                else:
                     problems.append(f"{path}: {rule}: stale file exception")
 
         for suffix in exceptions.DATA_SUFFIXES:

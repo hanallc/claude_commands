@@ -1,11 +1,18 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Find orphaned scripts and config files in a .claude directory."""
 
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
+
 import json
 import re
 import sys
 from pathlib import Path
 from typing import TypedDict
+
+from scripts.lib import conf
 
 # Directories that can name a script or config file in a way that keeps it
 # alive: a slash command, a skill, another script, a config file, a doc, a
@@ -24,7 +31,6 @@ REFERENCE_DIRECTORIES = (
 )
 REFERENCE_FILES = ("CLAUDE.md", "settings.json")
 SKIPPED_DIRECTORY_NAMES = frozenset({"__pycache__", ".git", ".venv", "node_modules"})
-MAXIMUM_CORPUS_FILE_BYTES = 2_000_000
 
 
 class OrphanInfo(TypedDict):
@@ -91,6 +97,7 @@ def read_reference_corpus(claude_dir: Path) -> dict[Path, str]:
     One pass beats grepping per candidate: the corpus is read a single time and
     every later question is a substring test against text already in memory.
     """
+    max_file_bytes = conf.read("orphans").whole("corpus.max_file_bytes")
     corpus: dict[Path, str] = {}
 
     candidates: list[Path] = []
@@ -107,7 +114,7 @@ def read_reference_corpus(claude_dir: Path) -> dict[Path, str]:
         if _is_skipped(candidate):
             continue
         try:
-            if candidate.stat().st_size > MAXIMUM_CORPUS_FILE_BYTES:
+            if candidate.stat().st_size > max_file_bytes:
                 continue
             corpus[candidate] = candidate.read_text(encoding="utf-8", errors="ignore")
         except OSError:
@@ -166,7 +173,11 @@ def main() -> int:
     config_dir = claude_dir / "config"
 
     expected = load_expected_orphans(claude_dir)
-    corpus = read_reference_corpus(claude_dir)
+    try:
+        corpus = read_reference_corpus(claude_dir)
+    except conf.Unusable as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 2
 
     scripts = find_scripts(scripts_dir)
     config_files = find_config_files(config_dir)

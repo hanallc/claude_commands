@@ -21,6 +21,7 @@ from scripts.production.gate_modules import GateRefused
 from scripts.lib.release_waiter import IntervalReleasePolling
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
 from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.gate_test_support import MergeGateFixture, gate_suites, suites_for_case, wait_for_file
 
 
@@ -199,6 +200,8 @@ class MergeGateHoldTests(TemporaryHoldTest):
         self.assertFalse((self.gate.checkout / "unit.txt").exists())
 
     def test_signalled_module_and_types_jobs_resume_after_hold_release(self) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
+                                 "rerun.max_failed_modules=0\n")
         for suite in ("hooks", "types"):
             with self.subTest(suite=suite):
                 os.environ["GATE_PASSED_DIR"] = str(self.gate.state / ("passes-" + suite))
@@ -234,8 +237,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
 
                 events = IntervalReleasePolling()
                 output = io.StringIO()
-                with mock.patch.object(gate, "RERUN_LIMIT", 0), \
-                        mock.patch.object(gate, "start_gate_job", side_effect=start_job), \
+                with mock.patch.object(gate, "start_gate_job", side_effect=start_job), \
                         mock.patch.object(gate, "local_release_waiter", return_value=events), \
                         mock.patch.object(events, "wait", side_effect=release), redirect_stdout(output):
                     run = gate.run_suites(self.gate.checkout, max_running_jobs=1,

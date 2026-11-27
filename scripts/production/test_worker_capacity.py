@@ -20,6 +20,7 @@ from scripts.direct import progress_history
 from scripts.herdr import herdr, herdr_types, turn_end, worker_panes
 from scripts.lib import atomic_file
 from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import broadcast, session_staff, showrunners, staff, worker, worker_capacity
 from scripts.production import test_worker as worker_fixture
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker
@@ -53,6 +54,7 @@ class WorkerCapacityTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", "worker.stop_attempts=2\n")
         runner = fixture_member("showrunner", name="capacity-runner")
         self.parent = fixture_member(
             "unit", name="capacity-unit", parent=runner.id, worktree=staff.PresentWorktree(remote.local_machine(), self.root))

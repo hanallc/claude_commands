@@ -53,6 +53,7 @@ from scripts.lib.git_test_support import commit_repository, fixture_git_environm
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.cli_fixture import invoke_cli
 
 
@@ -65,6 +66,7 @@ BOARD = Path(__file__).with_name("board.sh")
 # points apart drew four ETAs hours apart.
 SWING_REPORTS: tuple[tuple[int, int], ...] = ((86, 15), (82, 20), (78, 40), (84, 55))
 SUMMARY_HEADER = ["Scope", "%", "Elapsed", "ETA", "Unchanged", "ETA low", "ETA high"]
+DIRECT_DISPLAY_SETTINGS = "plan_history.max_rate_factor=2.0\nboard.max_note_chars=72\n"
 
 
 def recorder_parser() -> argparse.ArgumentParser:
@@ -338,9 +340,10 @@ class ProgressHistoryTests(unittest.TestCase):
             history.unlink()
 
     def write_interval(self, seconds: object) -> None:
-        _ = self.config_file.write_text(
-            f"unit_progress_interval_seconds={seconds}\nrouting_from_round=4\nastra_after_failed_fixes=2\n",
-            encoding="utf-8",
+        _ = write_config_fixture(
+            self.config_file,
+            f"unit_progress_interval_seconds={seconds}\nrouting_from_round=4\nastra_after_failed_fixes=2\n"
+            + DIRECT_DISPLAY_SETTINGS,
         )
 
     def test_cold_recorder_calls_use_each_home_and_restore_the_callers_configuration(self) -> None:
@@ -5734,7 +5737,8 @@ with patch.object(fcntl, "flock", admission):
 
     def write_full_config(self) -> None:
         """findings.py refuses every convergence limit it cannot read."""
-        _ = self.config_file.write_text(
+        _ = write_config_fixture(
+            self.config_file,
             "\n".join(
                 (
                     "# whole: 1..", "unit_progress_interval_seconds=180",
@@ -5750,8 +5754,7 @@ with patch.object(fcntl, "flock", admission):
                     "# whole: 1..", "astra_after_failed_fixes=2",
                     "",
                 )
-            ),
-            encoding="utf-8",
+            ) + DIRECT_DISPLAY_SETTINGS,
         )
 
     def run_findings(self, session_dir: Path, *arguments: str, at: int) -> str:
@@ -5940,6 +5943,22 @@ with patch.object(fcntl, "flock", admission):
         # words in the table do not.
         self.assertIn("- **Agent 1** (impl) gpt-called high · 3m ago · rerunning the scoped test", header)
         self.assertIn("- **Agent 2** (test) · 4m ago · writing the token race test", header)
+
+    def test_board_note_reads_the_character_limit_on_each_report(self) -> None:
+        session = self.start_run("note-limit", 63_000)
+        self.start_phase(session, 63_000)
+        self.run_board(session, "post", "test", "register", "up", at=63_001)
+        self.start_slot_pass(session, "impl", "impl", 63_002)
+        self.team_slot = ""
+        message = "a" * 73
+        self.run_board(session, "post", "test", "status", message, at=63_003)
+
+        for limit, expected in ((72, "a" * 71 + "…"), (9, "a" * 8 + "…"), (901, "status")):
+            with self.subTest(limit=limit):
+                _ = write_config_fixture(self.config_file, f"board.max_note_chars={limit}\n")
+                header = self.run_progress(session, 63_030)
+                note = next(line for line in header.splitlines() if "(test)" in line and "ago" in line)
+                self.assertEqual(note.rsplit(" · ", 1)[-1], expected)
 
     def test_a_finished_worker_keeps_its_own_last_words_under_the_launcher_done(self) -> None:
         """The launcher's exit post names the kind; the worker's narration names the work."""
@@ -9656,9 +9675,27 @@ class PublicPhaseHelperTests(unittest.TestCase):
         )
 
     def test_eta_band_seconds_exposes_the_existing_projection_math(self) -> None:
+        config = self.root / "eta-configuration"
+        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)}))
+        settings = config / "direct.conf"
+        _ = write_config_fixture(settings, "plan_history.max_rate_factor=2.0\n")
         self.assertEqual(
             plan_history.eta_band_seconds(50, 100, 10.0),
             plan_history.EtaBand(remaining=100, earliest=66, latest=150),
+        )
+        self.assertEqual(
+            plan_history.eta_band_seconds(20, 100, 100.0),
+            plan_history.EtaBand(remaining=400, earliest=150, latest=900),
+        )
+        _ = write_config_fixture(settings, "plan_history.max_rate_factor=1.0\n")
+        self.assertEqual(
+            plan_history.eta_band_seconds(20, 100, 100.0),
+            plan_history.EtaBand(remaining=400, earliest=400, latest=400),
+        )
+        _ = write_config_fixture(settings, "plan_history.max_rate_factor=0.5\n")
+        self.assertIsInstance(
+            plan_history.eta_band_seconds(20, 100, 100.0),
+            plan_history.EtaProjectionUnavailable,
         )
         self.assertIsInstance(
             plan_history.eta_band_seconds(0, 100, 10.0),
@@ -9793,7 +9830,9 @@ class EtaWorkClockTests(unittest.TestCase):
         # supply the Project chain. Only the phase retains that projection.
         project = {"percent": 90, "elapsed": 10 * 3600, "unchanged": 0}
         phase = {"percent": 20, "elapsed": 3600, "unchanged": 0}
-        with patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+        config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(config / "direct.conf", "plan_history.max_rate_factor=2.0\n")
+        with patch.dict(os.environ, {"USER_ZONE": "UTC", "CONF_DIR": str(config)}):
             rows = [
                 [cell.strip() for cell in line.strip("|").split("|")]
                 for line in summary_table("7", project, phase, {}, 10.0, 0.0, 0.0, {})

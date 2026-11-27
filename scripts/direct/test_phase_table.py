@@ -26,6 +26,7 @@ from scripts.message import sessions
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import fake_showrunner, fake_unit_host, session_staff, showrunners, staff
 from scripts.production.staff_test_support import (
     isolated_staff_file, production_membership, showrunner_relationship, recorded_showrunner, recorded_unit, unit_membership,
@@ -65,7 +66,10 @@ class PhaseTableTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"SCRATCH_ROOT": str(self.root / "scratch")})))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        config = self.root / "configuration"
+        environment = config_environment(config)
+        _ = write_config_fixture(config / "direct.conf", "plan_history.max_rate_factor=2.0\n")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
         production_membership("show")
         self.history_dir = self.root / "history"
         self.working_dir = self.root / "worktree"
