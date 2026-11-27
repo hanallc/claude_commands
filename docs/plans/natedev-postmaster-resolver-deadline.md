@@ -166,6 +166,183 @@ As built (commit 3d4a6fc921 on `postmaster-retry`, stacked as checkpoint 0b8bbb4
 - Tests: `scripts/production/test_broadcast.py` (recovers on the second read with a recipient seen only then, stays blocked, other problem stops at once; the sleep uses the configured wait), `scripts/message/test_roster.py`.
 - Gate: stacked with phase 10, 697 modules passed (11-24).
 
+### Phase 12 — The auto mode refusal push is short  · status: todo
+
+Item 221. nate approved the auto_mode.refused before/after pair on the Images page (07:37 PST Nov 24).
+
+#### Work Order
+
+**Goal:** The auto_mode.refused push shows a short title and the action line only. The typical example renders "modules: 2 commands refused; its build waits" with the unchanged action and no body.
+
+1. `scripts/notify/push_catalog.py`: the title carries the session, the count of refused commands and what waits. The body goes: no list of commands, no "Go:" and "Allow rule:" sentences, no sender prefix.
+2. Values a sender still passes (`command`, `rule`, `waits`) stay accepted. The `waits` clause in the title stays at most 44 characters with the rest of the title, or the title leaves it out.
+3. `scripts/message/send.py`: the `AUTO_MODE_CALL` text asks for the `waits` value in the form the title uses.
+4. Approval record: `review.py texts --approve --id auto_mode.refused` with nate's words.
+5. Tests: rows in `scripts/notify/test_push_texts.py` and `scripts/notify/test_pushover.py`.
+
+**Acceptance gate:** `copies.py run ... gate.py --affected` passes; basedpyright clean on each changed file.
+
+### Phase 13 — The UPS battery push is short; dead shutdown texts go  · status: todo
+
+Item 221: nate approved the nixos.ups_battery before/after pair on the Images page (09:49 PST Nov 24). List items 330 and 331: dwight, their producer, decided to delete five shutdown texts that no code sends (09:21 PST Nov 24).
+
+#### Work Order
+
+**Goal:** The nixos.ups_battery push renders the title "Power out: natedev on battery, 20 min left", the action "Save your open work on natedev now." and no body. The catalog has no shutdown text without a sender.
+
+1. `scripts/notify/push_catalog.py`: nixos.ups_battery title `Power out: natedev on battery, {minutes} min left`, the new action, no body. The `charge` value stays accepted and is not shown.
+2. Delete shutdown.move_failed, shutdown.restart_incomplete, shutdown.restart_untrusted, shutdown.restart_untrusted_unlisted and shutdown.manual_restart from the catalog, their approval records and their tests.
+3. Approval record: `review.py texts --approve --id nixos.ups_battery` with nate's words.
+4. Tests: change the nixos.ups_battery rows to the approved text.
+
+**Acceptance gate:** `copies.py run ... gate.py --affected` passes; basedpyright clean on each changed file.
+
+### Phase 14 — The review watch push goes  · status: todo
+
+Item 221: nate, Images page, 10:28 PST Nov 24, on review_watch.acknowledge: "this doesn't make any sense at all - this looks like a one off that should just be removed". The watch was acknowledged on 2026-10-05.
+
+#### Work Order
+
+**Goal:** No code, command or text sends, routes or names the review_watch.acknowledge push. The review ledger (`review_regime.py add` and `report`) stays.
+
+1. Delete the review_watch.acknowledge catalog entry, its approval record and its send.py description line.
+2. Delete the review watch reference kind in `scripts/notify/push_reference.py` and its branch in `scripts/notify/pushover.py`.
+3. Delete `ci_points.py watch` and `review_regime.py watch` and `ack`, and their state, when nothing else reads them.
+4. `commands/showrunner/produce.md`: delete the watch step. As-built docs that describe the watch say it is removed.
+5. Tests: delete the tests of the removed parts; keep every other test.
+
+**Acceptance gate:** `copies.py run ... gate.py --affected` passes; basedpyright clean on each changed file.
+
+### Phase 15 — The nightly assigned push is short  · status: todo
+
+Item 221: nate approved the nightly.assigned before/after pair on the Images page (10:33 PST Nov 24).
+
+#### Work Order
+
+**Goal:** The nightly.assigned push renders the title "Nightly check failed" and one line "Fix assigned to: staff." with no "No action needed." line and no other line.
+
+1. `scripts/notify/push_catalog.py`: body "Fix assigned to: {unit}."; no action line. Values a sender still passes stay accepted and are not shown.
+2. Approval record: `review.py texts --approve --id nightly.assigned` with nate's words.
+3. Tests: rows for the approved text.
+
+**Acceptance gate:** `copies.py run ... gate.py --affected` passes; basedpyright clean on each changed file.
+
+### Phase 16 — The AWS refused read push names one short command  · status: todo
+
+Item 221, List item 359: nate approved the aws.snapshot_failed text in brain's review (about 11:10 PST Nov 24). It goes live only after the `aws-deploy` command exists on natedev (builds, aws unit).
+
+#### Work Order
+
+**Goal:** The typical push renders the title "AWS refused a price read", the action "In a terminal on natedev, run aws-deploy. It asks for your AWS admin passphrase." and the body "AWS refused the us-east-2 price read, because our AWS setup does not allow it yet. The command adds the permission. Without the read, AWS merge tests skip that region after 2 hours."
+
+1. `scripts/notify/push_catalog.py` and `scripts/aws_target/aws_target.py`: the sender gives the read and the region of each refused read. One refused read renders the approved form; several name each read in the same form.
+2. The sentence "The command only allows these reads and costs nothing" goes.
+3. Approval record: `review.py texts --approve --id aws.snapshot_failed` with nate's words.
+4. Tests: rows for the approved text.
+
+**Acceptance gate:** `copies.py run ... gate.py --affected` passes; basedpyright clean on each changed file. Merge only after `aws-deploy` exists on natedev.
+
+### Phase 17 — Six approved push texts go into the catalog  · status: todo
+
+Item 221: nate approved quota.claude_next_move (11:13 PST Nov 24), quota.codex_credits_forecast and rust.warnings (11:14 PST Nov 24), and rust.errors, rust.passed and rust.repair_failed (17:59 PST Nov 23; the hana session with rust.warnings).
+
+#### Work Order
+
+**Goal:** Each of the six texts renders its approved picture; the four rust texts name the hana session.
+
+1. `scripts/notify/push_catalog.py`: the six entries.
+2. `scripts/whoami/quota_alert.py`: one short forecast line for each credit case.
+3. `scripts/buildlog/rust_release.py`: only if a value changes.
+4. Approval records with nate's words; tests with the exact approved text.
+
+**Acceptance gate:** `copies.py run ... gate.py --affected` passes; basedpyright clean on each changed file.
+
+### Phase 18 — The needs_go push names the List item to press Go on  · status: todo
+
+Item 325 and item 221: nate approved the session.needs_go before/after pair on the Images page (image b09de2d3d949, 11:23 PST Nov 24).
+
+#### Work Order
+
+**Goal:** The session.needs_go push renders the title "trunk waits for your go", the line "Session: trunk", and the action "Press Go on List item 412: remove arrange_jacks/ from phases/130/files; 140 owns it". No sender prefix, no pane, no line to type, no reason and no "what the go does".
+
+1. Base: the needsme branch (List item 232: the List page Go button and `the_list.py ask`). The hash merges only with or after needsme.
+2. `send.py` session.needs_go takes the List item number of the open go ask. It refuses the send when that item has no open go ask (`the_list.answerable_asks`).
+3. Catalog text and approval record with nate's words; tests; docs for the new form.
+
+**Acceptance gate:** `copies.py run ... gate.py --affected` passes; basedpyright clean on each changed file.
+
+### Phase 19 — /codex_winddown and its codex.reset_ready push go  · status: todo
+
+List item 326: nate, Nov 24 11:31 PST: "remove" (Nov 23 17:52 PST: "i am pretty sure it is obsolete"). Sent by natedev.
+
+#### Work Order
+
+**Goal:** /codex_winddown, its script, its tests, its state folder and the codex.reset_ready push are gone. Only history, shared and permission hits remain.
+
+1. Follow ~/.claude/commands/remove_command.md for codex_winddown: inventory, classify, remove, verify.
+2. Parts: commands/codex_winddown.md, scripts/production/codex_winddown.py, test_codex_winddown.py, the catalog entry codex.reset_ready and its approval record (by the normal tool), ~/.local/state/codex-winddown, the sample in scripts/notify/test_user_action.py:54-55, and the as-built doc lines.
+3. Report the permission rules to remove by hand.
+
+**Acceptance gate:** `copies.py run ... gate.py --affected` passes; basedpyright clean on each changed file; the searches find only history, shared and permission hits.
+
+### Phase 20 — shutdown.restart_failed names the session and the resume command  · status: todo
+
+List items 327 and 331: nate approved the text in brain's adhoc review, Nov 24 11:41 PST ("yes"). Sent by brain; dwight closes item 331 on it.
+
+#### Work Order
+
+**Goal:** a session that does not start after a move, a resume or a restart sends one short push that names it and the command that starts it. No push comes for a unit that its watchdog starts again.
+
+1. Catalog `shutdown.restart_failed`: title "{session} did not start on {account}". Action "In the natedev session, run: /agents resume {session} --to {account}". No body. Example: "trunk did not start on claude4".
+2. With no session name, the title is "A session did not start on {account}" and the action names the session id.
+3. The title fits in 44 characters. A long name is cut in the title; the action keeps the full name.
+4. Sender `scripts/agents/stop_resume.py` `_early_exit`: send no push for a unit when its watchdog starts it again. Push when the watchdog fails or the session is not a unit. The showrunner line stays as it is.
+5. Record the approval with `review.py texts --approve` (the director runs it). Update the as-built docs.
+
+**Acceptance gate:** `copies.py run ... gate.py --affected` passes; basedpyright clean on each changed file; the render of each example matches the approved text.
+
+### Phase 21 — Every Builds page run shows its unit and its showrunner  · status: todo
+
+List item 373: nate, Nov 24 13:10 PST: "handler doesn't show a showrunner in its tooltip - that should be impossible - it's an invariant". Sent by builds.
+
+#### Work Order
+
+**Goal:** every run on the Builds page resolves to its unit and its showrunner. A known unit never shows fallback text.
+
+1. Find why the handler row (Codex worker impl2 of unit cargo-liner/handler, session 01a1d62e-5f73-7b80-b00e-1842d70c3a4d, Mac run of `cargo build --locked --release -p cargo-berth`) shows "Caller: unregistered session" and no showrunner. On natedev, `unit_labels.unit_labels_for` resolves the session to cargo-liner/handler.
+2. Fix the cause where it lives. Add no fallback text for a known unit.
+3. Prove it on live-shape data (builds_page_real_rows.json shape) and take one dark desktop shot of the tooltip.
+
+**Acceptance gate:** `copies.py run ... gate.py --affected` passes; basedpyright clean on each changed file; the shot shows the handler tooltip with unit and showrunner.
+
+### Phase 22 — rca.py sends no "finding why" or "fixed why" push  · status: todo
+
+List item 330: nate, morty tab, Nov 24 13:28 PST: "okay no push - only the first is fine". Sent by morty. Scope: ~/rust/hanadocs/morty/review-ready-330.md and dwight's group-3-phone-texts.md, section "Item 49".
+
+#### Work Order
+
+**Goal:** after a permission stop, nate's phone shows only the alert. rca.py sends no started, fixed or rewritten push. The repair and its record stay.
+
+1. scripts/message/rca.py: `start` and `fixed` send no push. `fixed` still records the fix and its commit, and still retires the case's alert by its sender and key. The push review of the fixed text goes with the push.
+2. Remove `permission.rca_started`, `permission.rca_fixed` and `permission.rca_fixed_rewritten` from the catalog, their approval records (removal by hand, as natedev and brain accepted for phase 19) and their tests. Remove `RCA_TEXTS` and its send.py rows.
+3. The alert text does not change. Update the as-built docs.
+
+**Acceptance gate:** `copies.py run ... gate.py --affected` passes; basedpyright clean on each changed file; a search finds the three ids only in dated history.
+
+### Phase 23 — No phone text shows "No action needed."  · status: done
+
+List 221: nate, Nov 22: 'don't say"No action needed" i already know that - just elide it'. natedev, Nov 27 03:06 PST: go for parts 1, 3 and 4. The nate.adhoc action field is dropped (natedev 03:07 PST).
+
+As built (tip ab8abb95b6, branch `postmaster-noaction`, on main as e42c959226 on 11-27):
+
+- `scripts/notify/user_action.py` owns the header rule: `notification_header()` and `notification_message()` replace `first_line()`. No action gives only the session line, or no header. Leading whitespace-only lines go. `LEGACY_NO_ACTION_LINE` lets old records parse.
+- `scripts/notify/pushover.py`, `review.py`, `silence.py` and `scripts/message/send.py` join the header and body through these functions. `review.py check` and `replay` print the phone header; `replay` reads old log lines, legacy actions and sampled replies.
+- Catalog texts and their approvals do not change: 45 of 45 fingerprints, 89 approvals match. No `review.py texts --approve`.
+- Stated limit: an old record with no header field and an "Action:" body line replays as an action, as main did before.
+- The nate_style guide `message/push-body-under-500.md` counts only the lines that appear (nate_style 6587583).
+- Tests: `scripts/notify/test_pushover.py`, `test_review.py`, `test_push_texts.py`, `test_silence.py`, `scripts/message/test_send.py`, `scripts/hooks/test_push_gate.py`, `scripts/whoami/test_quota_zero_episode.py`.
+- Gate: `--affected` green on ab8abb95b6 (11-27); behavior check exit 0, key 5c2c4358.
+
 ## Acceptance gate
 
 - basedpyright reports zero errors, zero warnings and zero notes on each changed Python file.
