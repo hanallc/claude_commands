@@ -694,6 +694,7 @@ class NewItemServerTests(unittest.TestCase):
                           redirect_stdout(output), redirect_stderr(errors)):
                         outcome = new_item.main([item_type, assignee.name, "Check the command filing."])
                     self.assertEqual((outcome, errors.getvalue()), (new_item.Outcome.FILED, ""))
+                    server.finish_new_item_posts()
                     command_owner, command = received.pop()
                     self.assertEqual(command_owner, f"session:{owner.current_session}")
                     self.assertIn("List item ", output.getvalue())
@@ -724,6 +725,7 @@ class NewItemServerTests(unittest.TestCase):
                 outcome = new_item.main(["bug", assignee.name, "Check the caller identity.",
                                          "--session", owner.current_session])
             self.assertEqual((outcome, errors.getvalue()), (new_item.Outcome.FILED, ""))
+            server.finish_new_item_posts()
             self.assertNotIn("this session", output.getvalue())
             command_owner, command = received.pop()
             self.assertEqual(command_owner, f"session:{owner.current_session}")
