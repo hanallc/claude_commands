@@ -57,12 +57,10 @@ from io import StringIO
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Literal, TypedDict, NamedTuple, NotRequired, cast
-from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 from scripts.accounts import accounts
 from scripts.build_hold import override_guard
-from scripts.buildlog import repository as build_repository
 from scripts.herdr import herdr_types
 from scripts.agents import set_model
 from scripts.agents import worker_lifecycle
@@ -1336,139 +1334,32 @@ class BranchTips(NamedTuple):
     origin: str
 
 
-class OriginMismatch(NamedTuple):
-    expected: str
-    observed: str
-
-
-class OriginUnchanged(NamedTuple):
-    """The origin check permits the usual ref checks."""
-
-
-class CheckedRetirementPush(NamedTuple):
-    url: str
-
-
-class RetirementOrigin(NamedTuple):
-    fetch_url: str
-    push: CheckedRetirementPush | OriginMismatch
-
-
-class NoRetirementOrigin(NamedTuple):
-    """No Git refs need a retirement check."""
-
-
 class RetirementCheck(NamedTuple):
     refusals: list[str]
     branch: BranchTips
     detached_commit: str
-    origin: RetirementOrigin | NoRetirementOrigin
 
 
-def retirement_origin_location(checkout: Path, url: str) -> str:
-    if ":" not in url or url.startswith(("/", "./", "../")):
-        return str((checkout / url).resolve())
-    return url
+class RetirementResult(Enum):
+    COMPLETE = "complete"
+    PENDING = "cleanup pending"
+    REFUSED = "refused"
+
+    @property
+    def code(self) -> int:
+        return int(self is RetirementResult.REFUSED)
 
 
-def retirement_origin_identity(checkout: Path, url: str) -> str:
-    if url.startswith("file:///"):
-        return str(Path(unquote(urlsplit(url).path)).resolve())
-    location = retirement_origin_location(checkout, url)
-    if location.startswith("/"):
-        return location
-    if url.startswith("https://"):
-        network = urlsplit(url)
-        if (not network.hostname or network.query or network.fragment
-                or network.port not in (None, 443)):
-            return url
-        return build_repository.remote_identity(url, str(checkout))
-    if "://" not in url and url.startswith("git@") and not any(character in url for character in "?#\r\n\t"):
-        host, _, path = url.partition(":")
-        # Git sends absolute SCP paths as absolute SSH paths.
-        if path.startswith("/"):
-            return f"ssh://{host}{path}" if not path.startswith("/~") and "%" not in path else url
-        return build_repository.remote_identity(url, str(checkout))
-    return url
+class RetirementDeferred(Exception):
+    """Retirement needs more evidence before it can continue."""
 
 
-def retirement_origin_url(checkout: Path, *, settings: conf.ConfigRead) -> str:
-    result = retirement_run(["git", "-C", str(checkout), "remote", "get-url", "origin"], settings=settings)
-    if result.returncode or not result.stdout.strip():
-        raise ValueError(f"{checkout}: cannot read the fetch origin: {retirement_failure(result)}")
-    return result.stdout.removesuffix("\n")
+class RetirementRace(Exception):
+    """A retirement check found a change that needs a fresh request."""
 
 
-def retirement_push_urls(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
-    result = retirement_git(unit, "remote", "get-url", "--push", "--all", "origin", settings=settings)
-    return result.stdout.splitlines() if not result.returncode else []
-
-
-def retirement_origin(unit: RetiringUnit, *, settings: conf.ConfigRead) -> RetirementOrigin:
-    checkout = unit.production.checkout
-    fetch_url = retirement_origin_url(checkout, settings=settings)
-    urls = retirement_push_urls(unit, settings=settings)
-    if len(urls) != 1:
-        return RetirementOrigin(fetch_url, OriginMismatch(fetch_url, ", ".join(urls) or "unavailable push origin"))
-    push_url = urls[0]
-    if retirement_origin_location(checkout, push_url) != retirement_origin_location(checkout, fetch_url):
-        return RetirementOrigin(fetch_url, OriginMismatch(fetch_url, push_url))
-    resolved = retirement_git(unit, "ls-remote", "--get-url", "--", push_url, settings=settings)
-    if resolved.returncode or resolved.stdout.removesuffix("\n") != push_url:
-        observed = resolved.stdout.strip() if not resolved.returncode else "unavailable push origin"
-        return RetirementOrigin(fetch_url, OriginMismatch(push_url, observed))
-    return RetirementOrigin(fetch_url, CheckedRetirementPush(push_url))
-
-
-def changed_retirement_origin(checked: RetirementOrigin | NoRetirementOrigin,
-                              current: RetirementOrigin | NoRetirementOrigin) -> OriginMismatch | OriginUnchanged:
-    if isinstance(checked, RetirementOrigin) and isinstance(checked.push, OriginMismatch):
-        return checked.push
-    if isinstance(current, RetirementOrigin):
-        if isinstance(current.push, OriginMismatch):
-            return current.push
-        if isinstance(checked, RetirementOrigin):
-            if checked.fetch_url != current.fetch_url:
-                return OriginMismatch(checked.fetch_url, current.fetch_url)
-            if isinstance(checked.push, CheckedRetirementPush) and checked.push != current.push:
-                return OriginMismatch(checked.push.url, current.push.url)
-    return OriginUnchanged()
-
-
-def remember_retirement_mismatch(unit: RetiringUnit, saved: dict[str, object], mismatch: OriginMismatch | OriginUnchanged) -> None:
-    if isinstance(mismatch, OriginMismatch) and "origin_mismatch" not in saved:
-        addresses = list(mismatch)
-        save_retirement_completion(unit, {**saved, "origin_mismatch": addresses})
-        saved["origin_mismatch"] = addresses
-
-
-def report_retirement_mismatch(saved: dict[str, object]) -> None:
-    match saved.get("origin_mismatch"):
-        case [str(expected), str(observed)]:
-            recovery = saved.get("recovery_ref")
-            retained = f"Recovery ref {recovery} stays." if isinstance(recovery, str) else "The branch stays."
-            print(f"Origin mismatch between {expected!r} and {observed!r}. {retained} "
-                  + "The merge check does not prove a production merge.")
-        case _:
-            pass
-
-
-def delete_retirement_origin(unit: RetiringUnit, ref: str, tip: str, push: CheckedRetirementPush, *,
-                             settings: conf.ConfigRead) -> origin_deletion.Deleted | origin_deletion.Absent | origin_deletion.Kept | OriginMismatch:
-    limit = min(settings.number("retire_command_timeout_seconds"),
-                worker_lifecycle.effective_deadline() - time.monotonic())
-    result = origin_deletion.delete(unit.production.checkout, "origin", ref, tip, timeout=limit,
-                                    expected_push_url=push.url)
-    if isinstance(result, origin_deletion.Kept) and result.cause is origin_deletion.RetentionCause.GIT_FAILURE:
-        if result.reason == "the configured push destination changed":
-            urls = retirement_push_urls(unit, settings=settings)
-            observed = ", ".join(urls) if urls and urls != [push.url] else "unavailable push origin at deletion"
-            return OriginMismatch(push.url, observed)
-        if result.reason == "Git rewrites the approved push destination":
-            resolved = retirement_git(unit, "ls-remote", "--get-url", "--", push.url, settings=settings)
-            observed = resolved.stdout.strip()
-            return OriginMismatch(push.url, observed if observed and observed != push.url else "unavailable push origin at deletion")
-    return result
+def retirement_race(row: staff.StaffRow, reason: str, retained: str = "Retirement removed nothing") -> RetirementRace:
+    return RetirementRace(f"{reason}. {retained}. Run agents retire {row.id} again.")
 
 
 def retirement_local_tip(unit: RetiringUnit, branch_ref: str, *, settings: conf.ConfigRead) -> str:
@@ -1483,22 +1374,22 @@ def retirement_local_tip(unit: RetiringUnit, branch_ref: str, *, settings: conf.
     return ""
 
 
-def retirement_origin_tip(unit: RetiringUnit, branch_ref: str, fetch_url: str,
+def retirement_origin_tip(unit: RetiringUnit, branch_ref: str,
                           *, settings: conf.ConfigRead) -> str:
-    result = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "--", fetch_url, branch_ref,
+    result = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "--", "origin", branch_ref,
                             settings=settings)
     if result.returncode not in (0, 2):
         raise OSError(retirement_failure(result))
     return result.stdout.split()[0] if result.returncode == 0 else ""
 
 
-def retirement_branch_tips(unit: RetiringUnit, branch: str, origin: RetirementOrigin,
+def retirement_branch_tips(unit: RetiringUnit, branch: str,
                            *, settings: conf.ConfigRead) -> BranchTips:
     branch_ref = f"refs/heads/{branch}"
-    origin_tip = retirement_origin_tip(unit, branch_ref, origin.fetch_url, settings=settings)
+    origin_tip = retirement_origin_tip(unit, branch_ref, settings=settings)
     if origin_tip:
         fetched = retirement_git(unit, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "-q", "--",
-                                 origin.fetch_url, branch_ref, settings=settings)
+                                 "origin", branch_ref, settings=settings)
         if fetched.returncode:
             raise OSError(retirement_failure(fetched))
     return BranchTips(retirement_local_tip(unit, branch_ref, settings=settings), origin_tip)
@@ -1558,12 +1449,10 @@ def retirement_check(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Retire
     present = unit.worktree.is_dir()
     tips = BranchTips("", "")
     detached_commit = ""
-    if isinstance(unit.staff_member.worktree, staff.RemovedWorktree) and os.path.lexists(unit.worktree):
-        return RetirementCheck([f"{unit.worktree}: the recorded worktree was removed"], tips, detached_commit, NoRetirementOrigin())
     if unit.branch and (rebasing := retirement_rebase(unit, settings=settings)) is not None:
-        return RetirementCheck([f"branch {unit.branch} is rebasing in {rebasing}"], tips, detached_commit, NoRetirementOrigin())
+        return RetirementCheck([f"branch {unit.branch} is rebasing in {rebasing}"], tips, detached_commit)
     if not present and not unit.branch:
-        return RetirementCheck([], tips, detached_commit, NoRetirementOrigin())
+        return RetirementCheck([], tips, detached_commit)
     found: list[str] = []
     if present:
         head = retirement_checkout_head(unit)
@@ -1572,14 +1461,13 @@ def retirement_check(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Retire
         paths, _ = retirement_dirty_paths(unit.worktree, settings=settings)
         if paths:
             found.append(f"uncommitted work in {unit.worktree}: {', '.join(paths)}")
-    origin = retirement_origin(unit, settings=settings)
     if unit.branch:
-        tips = retirement_branch_tips(unit, unit.branch, origin, settings=settings)
+        tips = retirement_branch_tips(unit, unit.branch, settings=settings)
         if present and not tips.local:
-            raise ValueError(f"{unit.worktree}: checked out branch {unit.branch} is absent")
+            raise retirement_branch_race(unit, "local")
     refs = [tip for tip in (*tips, detached_commit) if tip]
     merge_branch = unit.production.merge_branch
-    merge_tips = retirement_branch_tips(unit, merge_branch, origin, settings=settings)
+    merge_tips = retirement_branch_tips(unit, merge_branch, settings=settings)
     merge_refs = [tip for tip in merge_tips if tip]
     if not merge_refs:
         raise OSError(f"merge branch {merge_branch} is absent from origin and this clone")
@@ -1591,12 +1479,13 @@ def retirement_check(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Retire
             raise OSError(retirement_failure(commits))
         merge_ref = f"refs/heads/{merge_branch}"
         if merge_tips.local and retirement_local_tip(unit, merge_ref, settings=settings) != merge_tips.local:
-            raise OSError(f"{merge_ref}: the merge branch changed during the check")
+            raise retirement_race(unit.staff_member, "The production changed before retirement",
+                                  retirement_checkout_retained(unit.worktree))
         if commits.stdout.strip() and not git_merge_tree.leaves_target_unchanged(
                 run_git, tip, merge_target, failure=retirement_failure):
             found.append(f"unmerged commits on {unit.branch or 'HEAD'}: {commits.stdout.splitlines()[0]}")
             break
-    return RetirementCheck(found, tips, detached_commit, origin)
+    return RetirementCheck(found, tips, detached_commit)
 
 
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
@@ -1607,24 +1496,21 @@ def retirement_checkout_head(unit: RetiringUnit) -> git_files.OnBranch | git_fil
     checkout = git_files.at(unit.worktree)
     head = git_files.head(checkout)
     branch = head.name if isinstance(head, git_files.OnBranch) else ""
+    if branch != unit.branch:
+        raise retirement_branch_race(unit, "local")
     if (unit.worktree.is_symlink() or checkout.git_dir == checkout.common_dir
-            or checkout.common_dir != git_files.locate(unit.production.checkout).common_dir
-            or branch != unit.branch):
+            or checkout.common_dir != git_files.locate(unit.production.checkout).common_dir):
         raise ValueError(f"{unit.worktree}: the Git worktree identity changed")
     return head
 
 def retirement_members(unit: RetiringUnit, record: staff.StaffSnapshot) -> list[staff.StaffRow]:
     return [unit.staff_member, *record.find(kind="worker", parent=unit.staff_member.id)]
 
-def retirement_remove(unit: RetiringUnit, checked: RetirementCheck, *, settings: conf.ConfigRead,
-                      saved: dict[str, object]) -> list[str]:
+def retirement_remove(unit: RetiringUnit, checked: RetirementCheck, *, settings: conf.ConfigRead) -> list[str]:
     if checked.refusals:
         return checked.refusals
     if not unit.branch and not os.path.lexists(unit.worktree):
         return []
-    origin = checked.origin
-    if not isinstance(origin, RetirementOrigin):
-        return [f"{unit.worktree}: the Git worktree identity changed"]
     try:
         require_removable_checkout(unit.worktree, unit.production.checkout, unit.branch)
     except ProductionPathsError as error:
@@ -1632,7 +1518,7 @@ def retirement_remove(unit: RetiringUnit, checked: RetirementCheck, *, settings:
     try:
         with build_folders.collector_lease(unit.worktree, wait=False) as available:
             if not available:
-                return [f"{unit.worktree}: the worktree lock is held"]
+                raise RetirementDeferred(f"{unit.worktree}: the worktree lock is held")
             if unit.worktree.is_symlink() or os.path.lexists(unit.worktree) and not unit.worktree.is_dir():
                 return [f"{unit.worktree}: expected a Git worktree directory"]
             listed = retirement_git(unit, "worktree", "list", "--porcelain", "-z", settings=settings)
@@ -1650,29 +1536,15 @@ def retirement_remove(unit: RetiringUnit, checked: RetirementCheck, *, settings:
                     return [f"uncommitted work in {unit.worktree}: {', '.join(dirty)}"]
                 if recorder_only:
                     force = ["--force"]
-            ref = f"refs/heads/{unit.branch}"
-            if unit.branch and retirement_local_tip(unit, ref, settings=settings) != checked.branch.local:
-                return [f"{ref}: the local branch changed after the merge check"]
-            if unit.branch and retirement_origin_tip(unit, ref, origin.fetch_url, settings=settings) != checked.branch.origin:
-                return [f"{ref}: the origin branch changed after the merge check"]
+            if unit.branch:
+                require_retirement_branch_tips(unit, checked.branch, settings=settings)
             if unit.worktree.is_dir() or path in registered:
                 if isinstance(unit.staff_member.worktree, staff.RemovedWorktree):
-                    return [f"{unit.worktree}: the recorded worktree was removed"]
+                    raise RetirementDeferred(f"{unit.worktree}: the recorded worktree was removed")
                 if unit.worktree.is_dir():
                     head = retirement_checkout_head(unit)
-                    if "origin_mismatch" not in saved:
-                        current = retirement_origin(unit, settings=settings)
-                        remember_retirement_mismatch(unit, saved, changed_retirement_origin(origin, current))
-                    if isinstance(head, git_files.DetachedHead):
-                        if head.commit != checked.detached_commit:
-                            return [f"{unit.worktree}: the Git worktree identity changed"]
-                        if "origin_mismatch" in saved:
-                            recovery = f"refs/retirement/{unit.staff_member.id}/{head.commit}"
-                            retained = retirement_git(unit, "update-ref", recovery, head.commit, settings=settings)
-                            if retained.returncode:
-                                return [retirement_failure(retained)]
-                            saved["recovery_ref"] = recovery
-                            save_retirement_completion(unit, saved)
+                    if isinstance(head, git_files.DetachedHead) and head.commit != checked.detached_commit:
+                        raise retirement_branch_race(unit, "local")
                 result = retirement_git(unit, "worktree", "remove", *force, str(unit.worktree), settings=settings)
                 if result.returncode:
                     return [retirement_failure(result)]
@@ -1681,8 +1553,8 @@ def retirement_remove(unit: RetiringUnit, checked: RetirementCheck, *, settings:
     except (OSError, ValueError, worktree_records.Refused, git_files.GitFilesError) as error:
         return [str(error)]
     if os.path.lexists(unit.worktree):
-        return [f"{unit.worktree}: the worktree still exists"]
-    if not unit.branch or "origin_mismatch" in saved:
+        raise RetirementDeferred(f"{unit.worktree}: the worktree still exists")
+    if not unit.branch:
         return []
     if (rebasing := retirement_rebase(unit, settings=settings)) is not None:
         return [f"branch {unit.branch} is rebasing in {rebasing}"]
@@ -1690,29 +1562,41 @@ def retirement_remove(unit: RetiringUnit, checked: RetirementCheck, *, settings:
     if owner := next((path for path, branch in worktree_records.worktree_branches(unit.production.checkout).items()
                       if branch == unit.branch), None):
         return [f"cannot delete branch '{unit.branch}' used by worktree at '{owner}'"]
-    mismatch = changed_retirement_origin(origin, retirement_origin(unit, settings=settings))
-    if isinstance(mismatch, OriginMismatch):
-        remember_retirement_mismatch(unit, saved, mismatch)
-        return []
-    if retirement_origin_tip(unit, ref, origin.fetch_url, settings=settings) != checked.branch.origin:
-        return [f"{ref}: the origin branch changed after the merge check"]
-    if retirement_local_tip(unit, ref, settings=settings) != checked.branch.local:
-        return [f"{ref}: the local branch changed after the merge check"]
-    if checked.branch.origin:
-        assert isinstance(origin.push, CheckedRetirementPush)
-        result = delete_retirement_origin(unit, ref, checked.branch.origin, origin.push, settings=settings)
-        if isinstance(result, OriginMismatch):
-            remember_retirement_mismatch(unit, saved, result)
-            return []
-        if isinstance(result, origin_deletion.Kept):
-            print(f"Kept origin ref {ref}: {result.reason}")
-            if result.cause is origin_deletion.RetentionCause.GIT_FAILURE:
-                return [result.reason]
+    require_retirement_branch_tips(unit, checked.branch, settings=settings)
     if checked.branch.local:
         result = retirement_git(unit, "update-ref", "-d", ref, checked.branch.local, settings=settings)
         if result.returncode:
+            if retirement_local_tip(unit, ref, settings=settings) != checked.branch.local:
+                raise retirement_branch_race(unit, "local")
             return [retirement_failure(result)]
+    if checked.branch.origin:
+        limit = min(settings.number("retire_command_timeout_seconds"),
+                    worker_lifecycle.effective_deadline() - time.monotonic())
+        result = origin_deletion.delete(unit.production.checkout, "origin", ref, checked.branch.origin, timeout=limit)
+        if isinstance(result, origin_deletion.Kept):
+            if result.cause is origin_deletion.RetentionCause.GIT_FAILURE:
+                return [result.reason]
+            print(f"Kept origin ref {ref}: {result.reason}")
     return []
+
+
+def retirement_checkout_retained(path: Path) -> str:
+    checkout = "present" if os.path.lexists(path) else "absent"
+    return f"The checkout is {checkout}. This attempt removed no branch refs"
+
+
+def retirement_branch_race(unit: RetiringUnit, side: Literal["local", "origin"]) -> RetirementRace:
+    return retirement_race(unit.staff_member, f"The {side} branch changed after the merge check",
+                           retirement_checkout_retained(unit.worktree))
+
+
+def require_retirement_branch_tips(unit: RetiringUnit, tips: BranchTips, *, settings: conf.ConfigRead) -> None:
+    ref = f"refs/heads/{unit.branch}"
+    if retirement_local_tip(unit, ref, settings=settings) != tips.local:
+        raise retirement_branch_race(unit, "local")
+    if retirement_origin_tip(unit, ref, settings=settings) != tips.origin:
+        raise retirement_branch_race(unit, "origin")
+
 
 def retirement_release_reservations(unit: RetiringUnit, *, settings: conf.ConfigRead) -> None:
     for key in retirement_reservations(unit.worktree):
@@ -1728,17 +1612,7 @@ class LocalUnitOutcome(TypedDict):
     worktree: str
     output: str
     branch: NotRequired[str]
-
-
-class RetirementProduction(NamedTuple):
-    merge_branch: str
-    origin: str
-
-
-def retirement_production_identity(production: Production, *, settings: conf.ConfigRead) -> RetirementProduction:
-    checkout = production.repository_checkout
-    url = retirement_origin_url(checkout, settings=settings)
-    return RetirementProduction(production.merge_branch, retirement_origin_location(checkout, url))
+    cleanup_pending: NotRequired[bool]
 
 
 def retirement_production_command(identity: staff.StaffId) -> int:
@@ -1746,9 +1620,8 @@ def retirement_production_command(identity: staff.StaffId) -> int:
         owner = staff.authority_snapshot().by_id(identity)
         if (owner is None or owner.kind != "showrunner" or isinstance(owner.doc, staff.DocUnfilled)
                 or not unit_machine_is_local(owner.doc.machine)):
-            raise ValueError("the retirement production is not registered on this machine")
-        settings = conf.read("production")
-        print(json.dumps(retirement_production_identity(read_production(owner), settings=settings)))
+            return 1
+        print(json.dumps(read_production(owner).merge_branch))
         return 0
     except (OSError, ValueError, Refusal, conf.Unusable, subprocess.SubprocessError):
         return 1
@@ -1769,7 +1642,7 @@ def retirement_journal(row: staff.StaffRow) -> Path:
 
 
 def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSnapshot,
-                        *, retirement: RetirementProduction | None = None, finish_step: bool = False,
+                        *, merge_branch: str = "", finish_step: bool = False,
                         why: str | None = None, repository_word: str = "") -> LocalUnitOutcome:
     """Run machine-bound work and require an attributed remote answer."""
     location = row.worktree
@@ -1779,7 +1652,7 @@ def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSna
     try:
         if unit_machine_is_local(location.machine):
             raise ValueError(f"worktree belongs to this machine: {location.machine}")
-        payload = {"action": action, "identity": str(row.id), "finish_step": finish_step, "retirement": retirement,
+        payload = {"action": action, "identity": str(row.id), "finish_step": finish_step, "merge_branch": merge_branch,
                    "repository_word": repository_word, "rows": [member.to_json() for member in record.rows]}
         if why is not None:
             payload["why"] = why
@@ -1801,11 +1674,17 @@ def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSna
             if not isinstance(fields["branch"], str):
                 raise ValueError("remote parked branch must be a string")
             result["branch"] = fields["branch"]
+        result["cleanup_pending"] = fields.get("cleanup_pending") is True
         result["code"] = status
         if result["output"]:
             print(result["output"], end="" if result["output"].endswith("\n") else "\n")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+        if action == "retire-complete":
+            report_retirement_cleanup(row, "Remote cleanup is incomplete", str(error))
+            result["code"] = 0
+            result["cleanup_pending"] = True
+        else:
+            print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
     return result
 
 
@@ -1813,71 +1692,63 @@ def retirement_staff(row: staff.StaffRow, expected: staff.StaffSnapshot) -> staf
     record = staff.authority_snapshot()
     current = record.by_id(row.id)
     if current is None or current.kind != "unit" or current.to_json() != row.to_json():
-        raise staff.StaffRefused(f"{row.name}: the unit changed before retirement")
+        raise retirement_race(row, "The unit changed before retirement")
     parent = record.parent_of(current)
     previous_parent = expected.parent_of(row)
     if (parent is None or parent.kind != "showrunner" or previous_parent is None
             or parent.to_json() != previous_parent.to_json()):
-        raise staff.StaffRefused(f"{row.name}: the production changed before retirement")
+        raise retirement_race(row, "The production changed before retirement")
     if {worker.id: worker.to_json() for worker in record.find(kind="worker", parent=row.id)} != {
             worker.id: worker.to_json() for worker in expected.find(kind="worker", parent=row.id)}:
-        raise staff.StaffRefused(f"{row.name}: the unit's workers changed before retirement")
+        raise retirement_race(row, "The unit's workers changed before retirement")
     return record
 
 
 @contextmanager
 def retirement_member_locks(row: staff.StaffRow, record: staff.StaffSnapshot) -> Generator[None]:
-    with staff.slot_operation(row.id, row.name), ExitStack() as locks:
-        for worker in record.find(kind="worker", parent=row.id):
-            _ = locks.enter_context(staff.slot_operation(worker.id, worker.name))
+    with ExitStack() as locks:
+        try:
+            _ = locks.enter_context(staff.slot_operation(row.id, row.name))
+            for worker in record.find(kind="worker", parent=row.id):
+                _ = locks.enter_context(staff.slot_operation(worker.id, worker.name))
+        except staff.StaffRefused as error:
+            raise RetirementDeferred(str(error)) from error
         yield
 
 
-def remote_retirement_production(parent: staff.StaffRow, expected: object, *,
-                                 settings: conf.ConfigRead) -> tuple[RetirementProduction, OriginMismatch | OriginUnchanged]:
-    match expected:
-        case [str(merge_branch), str(origin)] if merge_branch and origin:
-            requested = RetirementProduction(merge_branch, origin)
-        case _:
-            raise ValueError("the retirement request has no production identity")
-    if isinstance(parent.doc, staff.DocUnfilled):
-        raise ValueError("the retirement production has no document")
-    if unit_machine_is_local(parent.doc.machine):
-        actual = list(retirement_production_identity(read_production(parent), settings=settings))
-    else:
-        code, response = run_remote(["_retire-production", parent.id])
-        if code:
-            raise ValueError("cannot verify the retirement production on its document host")
-        actual = cast(object, json.loads(response))
-    match actual:
-        case [str(merge_branch), str(origin)] if merge_branch == requested.merge_branch and origin:
-            production = RetirementProduction(merge_branch, origin)
-        case _:
-            raise ValueError("the production merge branch changed before retirement")
-    mismatch = retirement_repository_mismatch(requested.origin, production.origin)
-    return production, mismatch
+def require_retirement_production(row: staff.StaffRow, parent: staff.StaffRow, merge_branch: str) -> None:
+    try:
+        if not isinstance(parent.doc, staff.DocUnfilled) and unit_machine_is_local(parent.doc.machine):
+            actual: object = read_production(parent).merge_branch
+        else:
+            code, response = run_remote(["_retire-production", parent.id])
+            if code:
+                raise RetirementDeferred("cannot read the production merge branch on its document host")
+            actual = cast(object, json.loads(response))
+    except (OSError, ValueError, Refusal, subprocess.SubprocessError) as error:
+        raise RetirementDeferred(f"cannot read the production merge branch: {error}") from error
+    if not isinstance(actual, str) or not actual:
+        raise RetirementDeferred("the production document host did not return a merge branch")
+    if actual != merge_branch:
+        raise retirement_race(row, "The production changed before retirement")
 
 
-def retirement_repository_mismatch(expected: str, observed: str) -> OriginMismatch | OriginUnchanged:
-    # The machines already resolved their local paths.
-    if retirement_origin_identity(Path("/"), expected) != retirement_origin_identity(Path("/"), observed):
-        return OriginMismatch(expected, observed)
-    return OriginUnchanged()
-
-
-def retire_remote_unit(row: staff.StaffRow, record: staff.StaffSnapshot, fields: dict[str, object]) -> int:
+def retire_remote_unit(row: staff.StaffRow, record: staff.StaffSnapshot, fields: dict[str, object]) -> RetirementResult:
     settings = conf.read("production")
     location = row.worktree
     assert not isinstance(location, staff.WorktreeUnfilled)
     parent = record.parent_of(row)
     assert parent is not None
-    identity, mismatch = remote_retirement_production(parent, fields.get("retirement"), settings=settings)
+    merge_branch = fields.get("merge_branch")
+    if not isinstance(merge_branch, str) or not merge_branch:
+        raise ValueError("the retirement request has no merge branch")
+    require_retirement_production(row, parent, merge_branch)
     saved = active_retirement(row, record)
     if saved:
         checkout, branch = Path(str(saved["checkout"])), str(saved["branch"])
     elif isinstance(location, staff.RemovedWorktree):
         if os.path.lexists(location.path):
-            raise ValueError(f"{location.path}: the recorded worktree was removed")
+            raise RetirementDeferred(f"{location.path}: the recorded worktree was removed")
         if isinstance(parent.doc, (staff.LiveDoc, staff.WrappedDoc)) and unit_machine_is_local(parent.doc.machine):
             checkout = read_production(parent).checkout
         elif isinstance(parent.worktree, staff.PresentWorktree) and unit_machine_is_local(parent.worktree.machine):
@@ -1885,19 +1756,16 @@ def retire_remote_unit(row: staff.StaffRow, record: staff.StaffSnapshot, fields:
         elif fields.get("repository_word"):
             checkout = worktrees.main_checkout_for_word(str(fields["repository_word"]))
         else:
-            raise ValueError("the production checkout is unknown on this machine")
+            raise RetirementDeferred("the production checkout is unknown on this machine")
         branch = location.branch.value if isinstance(location.branch, staff.ParkedBranch) else ""
     elif location.path.is_dir():
         checkout = worktree_records.main_checkout(location.path)
         branch = git_files.current_branch(location.path)
     else:
-        raise ValueError("worktree and retirement journal are absent; branch is unknown")
-    production = Production(Path(), parent.name, identity.merge_branch, checkout, Path(), ZoneInfo("UTC"), parent)
+        raise RetirementDeferred("worktree and retirement journal are absent; branch is unknown")
+    production = Production(Path(), parent.name, merge_branch, checkout, Path(), ZoneInfo("UTC"), parent)
     unit = RetiringUnit(production, row.name, location.path, branch, row)
-    observed = retirement_production_identity(production, settings=settings).origin
-    if isinstance(mismatch, OriginUnchanged):
-        mismatch = retirement_repository_mismatch(identity.origin, observed)
-    return retire_local_unit(unit, settings=settings, record=record, saved=saved, mismatch=mismatch)
+    return retire_local_unit(unit, settings=settings, record=record, saved=saved)
 
 
 def unit_local_command() -> int:
@@ -1933,12 +1801,26 @@ def unit_local_command() -> int:
                 stopped = stop_resume.stop(row.current_session, deadline=worker_lifecycle.effective_deadline())
                 result["code"] = int(bool(max(_result_code(stopped), int(bool(reasons)))))
             elif fields["action"] == "retire-complete":
-                result["code"] = finish_retirement_on_worktree_host(row)
+                retirement = finish_retirement_on_worktree_host(row)
+                result["code"] = retirement.code
+                result["cleanup_pending"] = retirement is RetirementResult.PENDING
             elif fields["action"] == "retire":
                 with retirement_member_locks(row, record):
-                    result["code"] = retire_remote_unit(row, retirement_staff(row, record), fields)
+                    retirement = retire_remote_unit(row, retirement_staff(row, record), fields)
+                result["code"] = retirement.code
+                result["cleanup_pending"] = retirement is RetirementResult.PENDING
             else:
                 raise ValueError("unknown remote lifecycle action")
+        except RetirementRace as error:
+            result["code"] = 1
+            print(error)
+        except RetirementDeferred as error:
+            result["code"] = 0
+            result["cleanup_pending"] = True
+            if fields["action"] == "retire-complete":
+                report_retirement_cleanup(row, "Journal cleanup is incomplete", str(error))
+            else:
+                report_retirement_deferred(row, str(error))
         except (OSError, ValueError, Refusal, staff.StaffRefused, staff.StaffNotFound,
                 herdr_types.HerdrFailure, unit_config.ConfigRefused, conf.Unusable, subprocess.SubprocessError) as error:
             result["code"] = 1
@@ -2039,7 +1921,7 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
             if owned:
                 retained[path.stem] = owned
     except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
-        print(f"anomaly: {owner.name}: cannot read retained panes: {error}")
+        report_retirement_cleanup(owner, "Pane cleanup is unconfirmed", f"cannot read retained panes: {error}")
         return False
     if isinstance(place, RetiringPane):
         retained.setdefault(place.session, set()).add(place.pane)
@@ -2049,7 +1931,7 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
             client = herdr.Herdr(session)
             panes = {pane["pane_id"]: pane for pane in client.panes()}
         except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
-            print(f"anomaly: {session}: pane close failed: {error}")
+            report_retirement_cleanup(owner, "Pane cleanup is unconfirmed", f"{session}: {error}")
             confirmed = False
             continue
         for identity in sorted(identities, key=lambda identity: (
@@ -2075,12 +1957,11 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
                             continue
                     reason = f"{identity}: terminal identity changed"
                     if isinstance(shell, UnprovedShell):
-                        reason += (f". Run agents retire {owner.id} after the replacement pane closes."
-                                   " The journal has no shell identity.")
+                        reason += ". The journal has no shell identity"
                     raise herdr_types.HerdrFailure(reason, "wrong_target")
                 if pane is None or pane.get("terminal_id") != terminal:
                     if not client.close_retained_pane(identity, terminal=terminal):
-                        print(f"anomaly: {session}:{identity}: pane close is not confirmed")
+                        report_retirement_cleanup(owner, "Pane cleanup is unconfirmed", f"{session}:{identity}")
                         confirmed = False
                     continue
                 launch = publications[session].get(identity)
@@ -2090,21 +1971,20 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
                     continue
                 if (not isinstance(client.pane_activity(identity), herdr.PaneAtShell)
                         or pane_launch.native_sessions(client, pane)):
-                    print(f"anomaly: {session}:{identity}: foreground work keeps the pane open")
+                    report_retirement_cleanup(owner, "Foreground work remains", f"pane {session}:{identity} stays open")
                     confirmed = False
                     continue
                 if not client.close_retained_pane(identity, terminal=terminal):
-                    print(f"anomaly: {session}:{identity}: pane close is not confirmed")
+                    report_retirement_cleanup(owner, "Pane cleanup is unconfirmed", f"{session}:{identity}")
                     confirmed = False
             except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
-                print(f"anomaly: {session}:{identity}: pane close failed: {error}")
+                report_retirement_cleanup(owner, "Pane cleanup is unconfirmed", f"{session}:{identity}: {error}")
                 confirmed = False
     return confirmed
 
 def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, record: staff.StaffSnapshot,
                              pane_workers: list[worker_panes.WorkerPane], pane: RetiringPane | herdr.NoPane,
-                             origin: RetirementOrigin | NoRetirementOrigin, cleanup_token: str,
-                             saved: dict[str, object]) -> int:
+                             cleanup_token: str, session_failures: list[str]) -> RetirementResult:
     row = unit.staff_member
     owned = retirement_members(unit, record)
     for key in retirement_holds({member.id for member in owned}):
@@ -2124,36 +2004,47 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
         if pid != os.getpid() and pid not in classified and not retirement_idle_shell(pane, pid):
             for reason in retirement_stop_orphan(unit, pid, row.current_session, settings=settings):
                 print(f"anomaly: {reason}")
-    if ((retirement_holds({member.id for member in owned}) or retirement_live_claims(retirement_mac_claims(unit.worktree)))
-            or (unit.worktree.exists() and any(not retirement_idle_shell(pane, pid)
-                for pid in unit_move.processes_inside(unit.worktree)))):
+    processes = unit.worktree.exists() and any(
+        not retirement_idle_shell(pane, pid) for pid in unit_move.processes_inside(unit.worktree))
+    if processes:
         print(f"refused: live holds or processes remain in {unit.worktree}")
-        return 1
+        return RetirementResult.REFUSED
+    if retirement_holds({member.id for member in owned}) or retirement_live_claims(retirement_mac_claims(unit.worktree)):
+        report_retirement_cleanup(row, "Checkout retained", f"live holds or claims remain in {unit.worktree}")
+        return RetirementResult.PENDING
+    if session_failures:
+        return RetirementResult.PENDING
     # Check the work again after the sessions stop.
     checked = retirement_check(unit, settings=settings)
     if checked.refusals:
         print("\n".join(f"refused: {reason}" for reason in checked.refusals))
-        return 1
-    remember_retirement_mismatch(unit, saved, changed_retirement_origin(origin, checked.origin))
+        return RetirementResult.REFUSED
     remaining = worker_panes.observe(row.id, record) if pane_workers else []
-    if any(isinstance(item, (worker_panes.OpenWorker, worker_panes.UncertainWorker, worker_panes.ProcessUnknownWorker)) for item in remaining):
-        return 1
+    for item in remaining:
+        if isinstance(item, (worker_panes.OpenWorker, worker_panes.UncertainWorker, worker_panes.ProcessUnknownWorker)):
+            report_retirement_cleanup(row, "Session cleanup is incomplete", f"{item.row.name}: worker pane may still be active")
+            return RetirementResult.PENDING
     try:
         copies.remove_trees(str(row.id))
     except copies.RemoteMirrorKept as error:
         print(f"refused: {error}")
-        return 1
+        return RetirementResult.REFUSED
     except copies.CopyError as error:
-        print(f"anomaly: {error}".replace("\n", " "))
-        return 1
+        report_retirement_cleanup(row, "Copy cleanup is incomplete", str(error))
+        return RetirementResult.PENDING
     require_retirement_receipt(row, cleanup_token)
     for member in owned:
-        staff.require_stopped(member.id)
-    failed = retirement_remove(unit, checked, settings=settings, saved=saved)
+        try:
+            staff.require_stopped(member.id)
+        except (staff.StaffRefused, staff.StaffUnreadable) as error:
+            report_retirement_cleanup(row, "Session cleanup is incomplete", str(error))
+            return RetirementResult.PENDING
+    failed = retirement_remove(unit, checked, settings=settings)
     if failed:
-        print("\n".join(f"anomaly: {reason}" for reason in failed))
-        return 1
-    return 0
+        for reason in failed:
+            report_retirement_cleanup(row, "Checkout cleanup is incomplete", reason)
+        return RetirementResult.REFUSED
+    return RetirementResult.COMPLETE
 
 def saved_retirement(row: staff.StaffRow) -> dict[str, object]:
     """Read the facts needed to retry one removal."""
@@ -2175,7 +2066,7 @@ def saved_retirement(row: staff.StaffRow) -> dict[str, object]:
 
 
 def active_retirement(row: staff.StaffRow, record: staff.StaffSnapshot) -> dict[str, object]:
-    saved = saved_retirement(row)
+    saved = cleanup_journal(row)
     if "cleanup_token" not in saved:
         return saved
     parent = record.parent_of(row)
@@ -2188,25 +2079,25 @@ def active_retirement(row: staff.StaffRow, record: staff.StaffSnapshot) -> dict[
 
 
 def retire_local_unit(unit: RetiringUnit, *, settings: conf.ConfigRead,
-                      record: staff.StaffSnapshot, saved: dict[str, object],
-                      mismatch: OriginMismatch | OriginUnchanged) -> int:
+                      record: staff.StaffSnapshot, saved: dict[str, object]) -> RetirementResult:
     row = unit.staff_member
+    if isinstance(row.worktree, staff.RemovedWorktree) and os.path.lexists(unit.worktree):
+        raise RetirementDeferred(f"{unit.worktree}: the recorded worktree was removed")
     if saved:
         branch = str(saved["branch"])
         checkout = Path(str(saved["checkout"]))
         if unit.worktree.is_dir() and retirement_branch(unit.worktree) != branch:
-            raise ValueError(f"{unit.worktree}: the branch changed after retirement began")
+            raise retirement_branch_race(unit, "local")
         unit = replace(unit, production=replace(unit.production, checkout=checkout), branch=branch)
     checked = retirement_check(unit, settings=settings)
     if checked.refusals:
         print("\n".join(f"refused: {reason}" for reason in checked.refusals))
-        return 1
+        return RetirementResult.REFUSED
     if unit.branch or os.path.lexists(unit.worktree):
         require_removable_checkout(unit.worktree, unit.production.checkout, unit.branch)
         with build_folders.collector_lease(unit.worktree, wait=False) as available:
             if not available:
-                print(f"refused: {unit.worktree}: the worktree lock is held")
-                return 1
+                raise RetirementDeferred(f"{unit.worktree}: the worktree lock is held")
     parent = record.parent_of(row)
     assert parent is not None
     previous_token = saved.get("cleanup_token")
@@ -2223,15 +2114,23 @@ def retire_local_unit(unit: RetiringUnit, *, settings: conf.ConfigRead,
                if isinstance(pane, RetiringPane) and isinstance(pane.shell, RetirementShell) else {}),
         }
     workers = record.find(kind="worker", parent=row.id)
-    if isinstance(mismatch, OriginUnchanged):
-        mismatch = changed_retirement_origin(NoRetirementOrigin(), checked.origin)
-    if isinstance(mismatch, OriginMismatch):
-        _ = saved.setdefault("origin_mismatch", list(mismatch))
     saved.update(cleanup_token=token, merge_branch=unit.production.merge_branch,
                  parent=parent.to_json(), workers=[worker.to_json() for worker in workers])
     save_retirement_completion(unit, saved)
-    staff.remove_unit_for_retirement(row, parent, workers, token)
-    return run_retirement_cleanup(unit, record, saved, checked, token, settings=settings)
+    try:
+        staff.remove_unit_for_retirement(row, parent, workers, token)
+    except staff.StaffNotFound as error:
+        raise retirement_race(row, "The unit changed before retirement") from error
+    except staff.StaffRefused as error:
+        reason = str(error)
+        if reason.endswith("the unit or its production changed before retirement"):
+            raise retirement_race(row, "The unit or its production changed before retirement") from error
+        if reason.endswith("the unit's workers changed before retirement"):
+            raise retirement_race(row, "The unit's workers changed before retirement") from error
+        if reason.endswith("a retirement cleanup receipt already exists"):
+            raise retirement_race(row, "The staff record does not confirm retirement") from error
+        raise
+    return run_retirement_cleanup(unit, record, saved, token, settings=settings)
 
 
 def require_retirement_receipt(row: staff.StaffRow, token: str) -> None:
@@ -2241,43 +2140,51 @@ def require_retirement_receipt(row: staff.StaffRow, token: str) -> None:
     if (current.by_id(row.id) is not None or not isinstance(claim, staff.RetirementCheckoutClaim)
             or claim.token != token or isinstance(location, staff.WorktreeUnfilled)
             or location.path.resolve() != claim.path):
-        raise staff.StaffRefused(f"{row.name}: the staff record does not confirm retirement")
+        raise retirement_race(row, "The staff record does not confirm retirement",
+                              retirement_checkout_retained(location.path) if not isinstance(location, staff.WorktreeUnfilled)
+                              else "This attempt removed no branch refs")
     if any(isinstance(member.worktree, staff.PresentWorktree) and unit_machine_is_local(member.worktree.machine)
            and member.worktree.path.resolve() == claim.path for member in current.rows):
-        raise staff.StaffRefused(f"{location.path}: another member holds the worktree")
+        raise retirement_race(row, "The staff record does not confirm retirement",
+                              "Another member holds the checkout. This attempt removed no branch refs")
 
 
-def retirement_retry_notice(row: staff.StaffRow) -> None:
-    assert not isinstance(row.worktree, staff.WorktreeUnfilled)
-    print(f"Cleanup incomplete for {row.worktree.path}. Retry with: agents retire {row.id}")
+def report_retirement_deferred(row: staff.StaffRow, reason: str) -> None:
+    detail = " ".join(reason.splitlines()).rstrip(".")
+    print(f"Retirement is incomplete: {detail}. Run agents retire {row.id} again.")
+
+
+def report_retirement_cleanup(row: staff.StaffRow, summary: str, reason: str) -> None:
+    detail = " ".join(reason.splitlines()).rstrip(".")
+    print(f"{summary}: {detail}. Cleanup journal retained. Run agents retire {row.id} again.")
 
 
 def run_retirement_cleanup(unit: RetiringUnit, record: staff.StaffSnapshot, saved: dict[str, object],
-                           checked: RetirementCheck, token: str, *, settings: conf.ConfigRead) -> int:
+                           token: str, *, settings: conf.ConfigRead) -> RetirementResult:
     row = unit.staff_member
     try:
         require_retirement_receipt(row, token)
         with staff.supplied_snapshot(record):
-            code = clean_retired_unit(unit, record, saved, checked, token, settings=settings)
-        if not code:
-            saved["cleanup_complete"] = True
-            save_retirement_completion(unit, saved)
-            return 0
+            result = clean_retired_unit(unit, record, saved, token, settings=settings)
+        if result is RetirementResult.COMPLETE:
+            save_retirement_completion(unit, {**saved, "cleanup_complete": True})
+        return result
+    except RetirementDeferred as error:
+        report_retirement_cleanup(row, "Checkout cleanup is incomplete", str(error))
+        return RetirementResult.PENDING
     except (OSError, ValueError, staff.StaffRefused, Refusal, copies.CopyError,
             herdr_types.HerdrFailure, conf.Unusable, unit_config.ConfigRefused, subprocess.SubprocessError) as error:
-        print(f"anomaly: {row.name}: {error}")
-    finally:
-        report_retirement_mismatch(saved)
-    retirement_retry_notice(row)
-    return 1
+        report_retirement_cleanup(row, "Cleanup is incomplete", str(error))
+        return RetirementResult.REFUSED
 
 
 def clean_retired_unit(unit: RetiringUnit, record: staff.StaffSnapshot, saved: dict[str, object],
-                       checked: RetirementCheck, token: str, *, settings: conf.ConfigRead) -> int:
+                       token: str, *, settings: conf.ConfigRead) -> RetirementResult:
     row = unit.staff_member
     if saved.get("pane_id"):
         if not saved.get("pane_terminal"):
-            raise ValueError("the retirement journal has no saved terminal identity")
+            report_retirement_cleanup(row, "Pane cleanup is unconfirmed", "the journal has no saved terminal identity")
+            return RetirementResult.PENDING
         pid, start = saved.get("shell_pid"), saved.get("shell_start")
         shell = (RetirementShell(pid, start) if type(pid) is int and pid > 0 and isinstance(start, str) and start
                  else UnprovedShell())
@@ -2286,14 +2193,15 @@ def clean_retired_unit(unit: RetiringUnit, record: staff.StaffSnapshot, saved: d
         pane = herdr.NoPane(row.name)
     pane_workers, reasons = retirement_stop_members(row, record)
     for reason in reasons:
-        print(f"anomaly: {reason}")
-    if reasons or retirement_clear_worktree(unit, settings=settings, record=record, pane_workers=pane_workers,
-                                            pane=pane, origin=checked.origin, cleanup_token=token, saved=saved):
-        return 1
+        report_retirement_cleanup(row, "Session cleanup is incomplete", reason)
+    result = retirement_clear_worktree(unit, settings=settings, record=record, pane_workers=pane_workers,
+                                       pane=pane, cleanup_token=token, session_failures=reasons)
+    if result is not RetirementResult.COMPLETE:
+        return result
     if not retirement_close_idle_shell(pane, row, record):
-        return 1
+        return RetirementResult.PENDING
     unit_config.discard_parked(row.id)
-    return 0
+    return RetirementResult.COMPLETE
 
 
 def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
@@ -2307,19 +2215,18 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
             current = retirement_staff(row, record)
             production = retirement_production_of(unit.production.name, record=current)
             if production != unit.production or current.parent_of(row) != production.owner:
-                raise staff.StaffRefused(f"{row.name}: the production changed before retirement")
-            code = retire_local_unit(unit, settings=settings, record=current,
-                                     saved=active_retirement(row, current), mismatch=OriginUnchanged())
-            if code:
-                return code
+                raise retirement_race(row, "The production changed before retirement")
+            retirement = retire_local_unit(unit, settings=settings, record=current,
+                                           saved=active_retirement(row, current))
+            if retirement is not RetirementResult.COMPLETE:
+                return retirement.code
     else:
         word = build_folders.repo_word(unit.production.repository_checkout) if isinstance(row.worktree, staff.RemovedWorktree) else ""
-        identity = retirement_production_identity(unit.production, settings=settings)
         save_retirement_completion(unit, {})
-        code = unit_remote_command("retire", row, record, retirement=identity,
-                                   repository_word=word)["code"]
-        if code:
-            return code
+        outcome = unit_remote_command("retire", row, record, merge_branch=unit.production.merge_branch,
+                                      repository_word=word)
+        if outcome["code"] or outcome.get("cleanup_pending"):
+            return outcome["code"]
     return retirement_complete(row)
 
 
@@ -2337,40 +2244,57 @@ def retirement_complete(row: staff.StaffRow) -> int:
     assert not isinstance(location, staff.WorktreeUnfilled)
     if not unit_machine_is_local(location.machine):
         outcome = unit_remote_command("retire-complete", row, staff.StaffSnapshot((row,)))
-        if outcome["code"]:
+        if outcome["code"] or outcome.get("cleanup_pending"):
             return outcome["code"]
-        retirement_journal(row).unlink(missing_ok=True)
-    elif finish_retirement_on_worktree_host(row):
-        return 1
+        try:
+            retirement_journal(row).unlink(missing_ok=True)
+        except OSError as error:
+            report_retirement_cleanup(row, "Journal cleanup is incomplete", str(error))
+            return 0
+    else:
+        try:
+            retirement = finish_retirement_on_worktree_host(row)
+        except RetirementDeferred as error:
+            report_retirement_cleanup(row, "Journal cleanup is incomplete", str(error))
+            return 0
+        if retirement is not RetirementResult.COMPLETE:
+            return retirement.code
     print(f"{row.name} retired")
     return 0
 
 
-def finish_retirement_on_worktree_host(row: staff.StaffRow) -> int:
-    saved = saved_retirement(row)
+def cleanup_journal(row: staff.StaffRow) -> dict[str, object]:
+    try:
+        return saved_retirement(row)
+    except (OSError, ValueError) as error:
+        raise RetirementDeferred(str(error)) from error
+
+
+def finish_retirement_on_worktree_host(row: staff.StaffRow) -> RetirementResult:
+    saved = cleanup_journal(row)
     token = saved.get("cleanup_token")
     if not isinstance(token, str):
         if row.id in staff.authority_snapshot().retirement_cleanup:
-            raise staff.StaffRefused(f"{row.name}: the retirement cleanup journal is missing")
+            raise RetirementDeferred("the retirement cleanup journal is missing")
         retirement_journal(row).unlink(missing_ok=True)
-        return 0
+        return RetirementResult.COMPLETE
     parent = staff.StaffRow.from_json(saved.get("parent"))
     raw_workers = saved.get("workers")
     if not isinstance(raw_workers, list) or staff.StaffRow.from_json(saved.get("completed_row")) != row:
-        raise ValueError("the retirement cleanup journal does not match the unit")
+        raise RetirementDeferred("the retirement cleanup journal does not match the unit")
     workers = [staff.StaffRow.from_json(raw) for raw in cast(list[object], raw_workers)]
     if (not row.reports_to(parent.id) or parent.kind != "showrunner"
             or any(worker.kind != "worker" or not worker.reports_to(row.id) for worker in workers)):
-        raise ValueError("invalid staff rows in the retirement cleanup journal")
+        raise RetirementDeferred("invalid staff rows in the retirement cleanup journal")
     location = row.worktree
     assert not isinstance(location, staff.WorktreeUnfilled)
     members = staff.StaffSnapshot((row, parent, *workers))
     with retirement_member_locks(row, members):
-        saved = saved_retirement(row)
+        saved = cleanup_journal(row)
         if not saved:
-            return 0
+            return RetirementResult.COMPLETE
         if saved.get("cleanup_token") != token:
-            raise ValueError("the retirement journal changed before cleanup")
+            raise RetirementDeferred("the retirement journal changed before cleanup")
         if saved.get("cleanup_complete") is not True:
             try:
                 current = staff.authority_snapshot()
@@ -2380,28 +2304,31 @@ def finish_retirement_on_worktree_host(row: staff.StaffRow) -> int:
                 checkout = Path(str(saved["checkout"]))
                 merge_branch = saved.get("merge_branch")
                 if not checkout.is_absolute() or not isinstance(merge_branch, str) or not merge_branch:
-                    raise ValueError("the retirement journal has no production checkout or merge branch")
+                    raise RetirementDeferred("the retirement journal has no production checkout or merge branch")
                 known = {member.id for member in members.rows}
                 record = staff.StaffSnapshot((*members.rows, *(member for member in current.rows if member.id not in known)))
                 production = Production(Path(), parent.name, merge_branch, checkout, Path(), ZoneInfo("UTC"), parent)
                 unit = RetiringUnit(production, row.name, location.path, str(saved["branch"]), row)
                 if unit.worktree.is_dir() and retirement_branch(unit.worktree) != unit.branch:
-                    raise ValueError(f"{unit.worktree}: the branch changed after retirement began")
+                    raise retirement_branch_race(unit, "local")
                 settings = conf.read("production")
                 checked = retirement_check(unit, settings=settings)
                 if checked.refusals:
                     print("\n".join(f"refused: {reason}" for reason in checked.refusals))
-                    retirement_retry_notice(row)
-                    return 1
+                    return RetirementResult.REFUSED
             except (OSError, ValueError, staff.StaffRefused, Refusal, conf.Unusable, subprocess.SubprocessError) as error:
-                print(f"anomaly: {row.name}: {error}")
-                retirement_retry_notice(row)
-                return 1
-            if run_retirement_cleanup(unit, record, saved, checked, token, settings=settings):
-                return 1
-        staff.finish_unit_retirement(row.id, token)
-        retirement_journal(row).unlink(missing_ok=True)
-    return 0
+                report_retirement_cleanup(row, "Cleanup is incomplete", str(error))
+                return RetirementResult.REFUSED
+            result = run_retirement_cleanup(unit, record, saved, token, settings=settings)
+            if result is not RetirementResult.COMPLETE:
+                return result
+        try:
+            staff.finish_unit_retirement(row.id, token)
+            retirement_journal(row).unlink(missing_ok=True)
+        except (OSError, staff.StaffRefused) as error:
+            report_retirement_cleanup(row, "Journal cleanup is incomplete", str(error))
+            return RetirementResult.PENDING
+    return RetirementResult.COMPLETE
 
 
 def retired_unit_receipt(reference: str, record: staff.StaffSnapshot) -> staff.StaffRow | None:
@@ -2452,7 +2379,14 @@ def retire_named_unit(name: str) -> int:
                         return retirement_complete(completed)
                 raise
             unit = retirement_find_unit(unit_production_name(row, record), str(row.id), record=record)
-            return retirement_retire(unit, settings=settings, record=record)
+            try:
+                return retirement_retire(unit, settings=settings, record=record)
+            except RetirementDeferred as error:
+                report_retirement_deferred(row, str(error))
+                return 0
+        except RetirementRace as error:
+            print(error)
+            return 1
         except (RetirementRefused, Refusal, ValueError, OSError, copies.CopyError, conf.Unusable,
                 unit_config.ConfigRefused, subprocess.SubprocessError) as error:
             print(f"retire: {error}")
