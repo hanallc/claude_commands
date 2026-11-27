@@ -261,6 +261,11 @@ Placement waits before it considers any later candidate.
 A reading taken before the last backoff failure is also stale.
 The queue allows 30 seconds for the reading, including time spent in the reader's queue.
 The SSH probe shares the same 30-second limit across its connection attempts.
+The guest main probe and the background end check share the `mac-linux` backoff.
+A connection failure starts the backoff for `mac_test.unreachable_backoff_s` seconds.
+Both checks skip SSH during the backoff.
+The first good guest answer clears the backoff.
+The queue holds the slot until it gets the exact end proof.
 The usual queue pass and client poll still apply after the reading or deadline.
 A current `mac-linux` assignment of another episode makes the guest busy.
 The guest gate consumes its launch permission before the guest run starts, so its assignment stays current while the gate runs.
@@ -538,6 +543,12 @@ A failed query raises `AdmissionUnavailable` within the query bound. Commands pr
 The Builds page shows the saved Mac idle alert first, in red.
 The feed reads it through `mac_idle.view_alert_line()`, which also checks the live Mac state, and sends its text in `mac_idle_alert`.
 An empty value hides the alert on the page.
+`scripts/buildlog/machine_watch.py` reads `notices.<machine>` in `build_targets.conf` when it prepares a phone push for a machine that does not answer.
+Set `notices.mac=off` to suppress that push for the Mac.
+The default is `on`.
+`off` stops a new push only. A push that was already sent can repeat until its alert clears.
+The Builds page continues to use the saved alert.
+
 The Build limits section shows one facts line under each machine heading, in `<div class="build-limit-facts">` below the state.
 The feed reads `machine_facts.read_facts(machine_facts.state_path())` once per render and passes it to `limits_view.build_limits(..., facts=)`.
 `limits_view.facts_line()` writes each line into `MachineLimits.facts` with the `facts_*` words in `PAGE_WORDS`.

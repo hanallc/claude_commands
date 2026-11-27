@@ -142,6 +142,17 @@ def read_record(folder: Path) -> FolderRecord | None:
     return FolderRecord(owner=owner, session_id=session_id)
 
 
+# A session folder and its record; None when the folder has no readable record (it still is a session folder).
+SessionFolder = tuple[Path, FolderRecord | None]
+
+
+def session_folders(root: Path) -> list[SessionFolder]:
+    """Each session folder under root with its record, from one read of the folders."""
+    entries = sorted(root.iterdir()) if root.is_dir() else []
+    return [(folder, read_record(folder)) for folder in entries
+            if not folder.name.startswith(".") and not folder.is_symlink() and folder.is_dir()]
+
+
 def write_record(folder: Path, record: FolderRecord) -> None:
     temporary = folder / f"{RECORD}.{os.getpid()}"
     _ = temporary.write_text(json.dumps(record) + "\n", encoding="utf-8")

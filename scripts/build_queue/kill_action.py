@@ -30,7 +30,7 @@ from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import store
 from scripts.buildlog.parse import CARGO_BUILD_VERBS
 from scripts.lib import atomic_file, conf, process_start, process_stop
-from scripts.lib.build_steps import GATE_PROGRAMS, command_program, live_process_arguments
+from scripts.lib.build_steps import GATE_STEPS, command_program, live_process_arguments
 from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit
 from scripts.message import send_budget, session_send
@@ -91,7 +91,7 @@ def candidate(step: admission_records.RunningStep, reservation: admission_record
             or not step.step.isprintable()
             or step.pid != reservation["pid"] or reservation["pid"] <= 1
             or not reservation["start_time"].isdecimal()
-            or step.step in GATE_PROGRAMS or isinstance(step.job, StepJob)
+            or step.step in GATE_STEPS or isinstance(step.job, StepJob)
             or isinstance(step.verify, admission_records.VerifyCall) or step.step not in BUILD_STEPS):
         return NoKillCandidate()
     run = step.run
@@ -467,6 +467,7 @@ class DeliveryState(StrEnum):
 
 class KillOffer(TypedDict):
     handle: str
+    kill_number: int
     pid: int
     started_by: str
     recipient_name: str
@@ -476,6 +477,7 @@ class KillOffer(TypedDict):
 
 class KillResult(TypedDict):
     reference: str
+    kill_number: NotRequired[int]
     step: str
     pid: int
     stop: Literal[StopState.STOPPING, StopState.STOPPED, StopState.UNCONFIRMED, StopState.ALREADY_ENDED]
@@ -625,8 +627,8 @@ class KillActions:
         self._retry: set[str] = set()
         self._worker: threading.Thread | None = None
 
-    def handle(self, target: KillTarget | OutsideKillTarget) -> str:
-        data = repr((target.candidate.reference, target.route, target.recipient)).encode()
+    def handle(self, target: KillTarget | OutsideKillTarget, kill_number: int = 0) -> str:
+        data = repr((target.candidate.reference, target.route, target.recipient, kill_number)).encode()
         return hmac.new(self._key, data, sha256).hexdigest()
 
     def _cache(self, action: SavedKillAction) -> None:
@@ -640,6 +642,7 @@ class KillActions:
             raise ValueError("the Builds stop record has a different run")
         if re.fullmatch(r"[0-9a-f]{32}", action.id) is None:
             raise ValueError("the Builds stop record has an invalid notice ID")
+        _ = action.result.setdefault("kill_number", 0)
         return action
 
     def _save(self, action: SavedKillAction) -> None:
@@ -696,7 +699,8 @@ class KillActions:
         finally:
             os.close(descriptor)
 
-    def options(self, refresh_seconds: float) -> tuple[dict[str, KillOffer], list[KillResult]]:
+    def options(self, refresh_seconds: float,
+                listed: frozenset[str] | None = None) -> tuple[dict[str, KillOffer], list[KillResult]]:
         now = time.time()
         cutoff = now - 2 * refresh_seconds
         with self._lock:
@@ -705,6 +709,11 @@ class KillActions:
                     del self._actions[reference]
             actions = dict(self._actions)
             self._offers = {reference: offer for reference, offer in self._offers.items() if offer.expires_at > now}
+        for reference in listed or ():
+            try:
+                actions[reference] = self._read(reference)
+            except FileNotFoundError:
+                _ = actions.pop(reference, None)
         targets: dict[str, KillTarget | OutsideKillTarget] = {}
         try:
             targets.update(live_targets())
@@ -713,14 +722,19 @@ class KillActions:
         except (OSError, ValueError, admission_wire.AdmissionUnavailable):
             pass
         now_in_zone = datetime.now(user_zone())
-        offers: dict[str, KillOffer] = {
-            reference: {"handle": self.handle(target), "pid": target.candidate.row_pid,
-                        "started_by": target.starter, "recipient_name": target.recipient_name,
-                        "step": target.candidate.step, "message": notification(target.candidate, now_in_zone)}
-            for reference, target in targets.items()
-            if reference not in actions or (
-                isinstance(target, OutsideKillTarget) and actions[reference].result["stop"] == StopState.UNCONFIRMED)
-        }
+        offers: dict[str, KillOffer] = {}
+        for reference, target in targets.items():
+            if listed is not None and reference not in listed:
+                continue
+            action = actions.get(reference)
+            if action is not None and (not isinstance(target, OutsideKillTarget)
+                                       or action.result["stop"] != StopState.UNCONFIRMED):
+                continue
+            number = action.result.get("kill_number", 0) if action is not None else 0
+            offers[reference] = {"handle": self.handle(target, number), "kill_number": number,
+                                 "pid": target.candidate.row_pid, "started_by": target.starter,
+                                 "recipient_name": target.recipient_name, "step": target.candidate.step,
+                                 "message": notification(target.candidate, now_in_zone)}
         if offers:
             deadline = now + 2 * refresh_seconds
             with self._lock:
@@ -863,7 +877,7 @@ class KillActions:
                 continue
         self.retry_pending()
 
-    def stop(self, reference: str, handle: str, words: str) -> KillResult | NoStopRoute:
+    def stop(self, reference: str, handle: str, words: str, kill_number: int = 0) -> KillResult | NoStopRoute:
         if re.fullmatch(r"[0-9a-f]{64}", reference) is None:
             return NoStopRoute()
         with self._lock:
@@ -871,20 +885,23 @@ class KillActions:
         if offered is None or offered.expires_at <= time.time():
             return NoStopRoute()
         target = offered.target
-        if not hmac.compare_digest(self.handle(target), handle):
+        if not hmac.compare_digest(self.handle(target, kill_number), handle):
             return NoStopRoute()
         run = target.candidate
         with self._record_lock(reference):
             try:
                 previous = self._read(reference)
             except FileNotFoundError:
-                pass
+                current_number = 0
             else:
                 if previous.result["stop"] != StopState.UNCONFIRMED or not isinstance(previous.stage, FinishedStop):
                     return NoStopRoute()
+                current_number = previous.result.get("kill_number", 0)
+            if current_number != kill_number:
+                return NoStopRoute()
             if isinstance(target, OutsideKillTarget):
                 current = self._outside_targets().get(reference) if self._outside_targets is not None else None
-                if current is None or self.handle(current) != handle:
+                if current is None or self.handle(current, kill_number) != handle:
                     return NoStopRoute()
             route = target.route
             state = detached_run_state(route, target.recipient) if isinstance(route, DetachedCommand) else None
@@ -892,13 +909,14 @@ class KillActions:
                 return NoStopRoute()
             if isinstance(target, KillTarget) and isinstance(route, DetachedCommand) and isinstance(state, RunningDetachedRun):
                 queued = live_targets().get(reference)
-                if queued is None or self.handle(queued) != handle:
+                if queued is None or self.handle(queued, kill_number) != handle:
                     state = detached_run_state(route, target.recipient)
                     if not isinstance(state, EndedDetachedRun):
                         return NoStopRoute()
             at = datetime.now(user_zone())
             message = notification(run, at)
-            result: KillResult = {"reference": reference, "step": run.step, "pid": run.row_pid,
+            result: KillResult = {"reference": reference, "kill_number": current_number + 1, "step": run.step,
+                                  "pid": run.row_pid,
                                   "stop": StopState.STOPPING, "delivery": DeliveryState.PENDING,
                                   "time": at.strftime("%H:%M %Z"), "recipient_name": target.recipient_name,
                                   "recipient_role": target.recipient_role}
