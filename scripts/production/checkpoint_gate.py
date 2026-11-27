@@ -179,11 +179,27 @@ def checkpoint_gate_targets(command: Sequence[str], folder: Path) -> tuple[str, 
 
 
 def gate_program_start(command: Sequence[str]) -> int:
-    """Skip the env prefix and its assignments before identifying a gate."""
+    """Skip env options and assignments before identifying the program."""
     if not command or Path(command[0]).name != "env":
         return 0
     start = 1
-    while start < len(command) and "=" in command[start]:
+    while start < len(command):
+        word = command[start]
+        if word == "--":
+            start += 1
+            break
+        option, equals, _ = word.partition("=")
+        if option in ("--unset", "--chdir", "--argv0"):
+            start += 1 if equals else 2
+        elif option in ("--block-signal", "--default-signal", "--ignore-signal"):
+            start += 1
+        elif word in ("--ignore-environment", "--debug", "--list-signal-handling"):
+            start += 1
+        elif short := re.fullmatch(r"-[iv]*(?:([uCa])(.*))?", word):
+            start += 2 if short[1] and not short[2] else 1
+        else:
+            break
+    while start < len(command) and not command[start].startswith("-") and "=" in command[start]:
         start += 1
     return start
 

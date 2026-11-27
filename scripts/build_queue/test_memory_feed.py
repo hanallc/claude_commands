@@ -59,7 +59,9 @@ from scripts.lib.build_copies_test_support import write_private_build_roots
 from scripts.lib.process_group import run_process_group
 from scripts.review_links import console_theme, page_frame, review_link, test_page_frame, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, HAND_MADE, GateJobNotRecorded, StepJob
-from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
+from scripts.lib.build_steps import (
+    OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, parse_command_program, read_step_names,
+)
 from scripts.message import sessions, unit_labels
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
@@ -2093,6 +2095,9 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(row.get("showrunner"), "solo")
             self.assertEqual(row["unit"], "—")
             self.assertTrue(row["name"].startswith("solo: "))
+
+    def test_command_program_returns_other_command_for_standard_input_after_separator(self) -> None:
+        self.assertEqual(parse_command_program(["python3", "--", "-"]), OTHER_COMMAND)
 
     def test_gate_rows_name_the_job_from_the_command_arguments(self) -> None:
         gate_command = ["python3", "/repo/scripts/production/gate.py", "--merge-branch", "sdlc"]

@@ -181,6 +181,8 @@ def parse_command_program(argv: Sequence[str], *, keep_path: bool = False,
             if option == "-":
                 return OTHER_COMMAND
             if option == "--":
+                if index < len(argv) and argv[index] == "-":
+                    return OTHER_COMMAND
                 break
             if option.startswith("--"):
                 index += 1 if option in LONG_VALUE_OPTIONS else 0

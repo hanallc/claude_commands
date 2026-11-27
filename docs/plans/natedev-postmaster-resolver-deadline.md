@@ -16,7 +16,7 @@
   - `config/send.conf` — send.py time budgets (`delivery_timeout`, `check_timeout`, and others).
 - **Test lanes:** `scripts/message/test_send.py`, `scripts/message/test_roster.py`, `scripts/message/test_send_delivery.py`, and the `test_*.py` beside any other changed file.
 - **Build:** none.
-- **Test:** `~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --repo <worktree>` (`--module <suite/module>` while iterating).
+- **Test:** `~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py --affected --repo <worktree>` (`--module <suite/module>` for a named module).
 - **Lint:** `basedpyright` on each changed Python file: zero errors, zero warnings.
 - **Invariants:**
   - A lookup that cannot prove the recipient still fails with its current reason; a fix never sends to a guessed recipient.
