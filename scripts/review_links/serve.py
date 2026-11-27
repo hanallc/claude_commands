@@ -1055,6 +1055,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 fields = parse_qs(route.query)
                 delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
                 snapshot = server.review_cache.get()
+                if 'body' in fields and fields.get('view') == [review_page.ReviewBodyView.STUDIO_INLINE.value]:
+                    try:
+                        content = snapshot.body(fields['body'][0], view=review_page.ReviewBodyView.STUDIO_INLINE,
+                                                studio_item=fields.get('item', [''])[0])
+                    except LookupError as error:
+                        self.review_response(html.escape(str(error)).encode(), 'text/html; charset=utf-8',
+                                             version=snapshot.version, status=404)
+                    else:
+                        self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)
+                    return None
                 if 'filed' in fields:
                     url = snapshot.filed_item_url(root, fields['filed'][0], include_done=True)
                     self.json_response(200, {"url": url})

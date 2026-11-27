@@ -363,6 +363,17 @@ def _save_review_park(item: review_items.ReviewItem, until: datetime, words: str
                       check_deadline: Callable[[datetime], None],
                       verify_revision: Callable[[], object] | None, root: Path | None) -> str:
     event = 'Later until '+question_path.write_later(until)+(': '+words if words else '')
+    handoff = item.exchange_handoff
+    if isinstance(handoff, review_items.FiledReviewExchange) and handoff.open_staff_question:
+        def check_studio_deadline(moment: datetime) -> None:
+            if verify_revision is not None:
+                _ = verify_revision()
+            check_deadline(moment)
+
+        destination = handoff.destination
+        _ = the_list.park(destination.keeper, f"L{destination.number}", until, source=the_list.PAGE_SOURCE,
+                          note='Later: '+words if words else '', check_deadline=check_studio_deadline)
+        return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
 
     def record_later(publish_deadline: Callable[[], None]) -> None:
         def check_and_publish() -> None:

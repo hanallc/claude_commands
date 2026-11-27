@@ -843,16 +843,24 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
             + ask + tell + '</div>' + schedule_editor + '</form>')
 
 
-def review_card_link(key: str, label: str, *, studio_question: bool = False) -> str:
-    url = html.escape(review_page.card_url(key, studio_question=studio_question), quote=True)
+def review_card_link(key: str, label: str) -> str:
+    url = html.escape(review_page.card_url(key), quote=True)
     return f'<a href="{url}" data-list-review-card="" aria-haspopup="dialog">{html.escape(label)}</a>'
+
+
+def linked_review_keys(item: the_list.ListItem) -> tuple[str, ...]:
+    origin = item.native_question
+    if isinstance(origin, the_list.NativeQuestionItem) and origin.kind is the_list.QuestionItemKind.TO_NATE:
+        return tuple(key for key in item.reviews if key != origin.source_key)
+    return item.reviews
 
 
 def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.ReviewItem], today: datetime) -> str:
     """Describe the current turn for the linked reviews without storing their states."""
-    if not item.reviews:
+    keys = linked_review_keys(item)
+    if not keys:
         return ""
-    linked = [reviews[identity] for identity in item.reviews if identity in reviews]
+    linked = [reviews[identity] for identity in keys if identity in reviews]
     ready = [review for review in linked if review.queue_at(today) is question_path.Queue.NEEDS_ME]
     waiting = [review for review in linked if review.state != review_items.ReviewState.DONE
                and review.queue_at(today) is not question_path.Queue.NEEDS_ME]
@@ -939,6 +947,7 @@ def filed_exchange_sections(item: the_list.ListItem, today: datetime, names: sta
     returned = {entry.what.identity for entry in item.log if isinstance(entry.what, the_list.ReturnedAnswer)}
     native = item.question_kind is not the_list.NoQuestionItem.ORDINARY
     sections: list[str] = []
+    open_cards: set[str] = set()
     for exchange in item.filed_exchanges:
         if exchange.source is list_exchange.Source.LIST:
             continue
@@ -948,7 +957,13 @@ def filed_exchange_sections(item: the_list.ListItem, today: datetime, names: sta
         answer = exchange.answer
         if (item.state is not the_list.ItemState.CLOSED and answer is list_exchange.QuestionWithoutAnswer.OPEN
                 and exchange.direction is list_exchange.Direction.QUESTION_TO_NATE):
-            body += '<p>' + review_card_link(exchange.source_key, "Answer question", studio_question=True) + '</p>'
+            if exchange.source_key in open_cards:
+                continue
+            open_cards.add(exchange.source_key)
+            key = html.escape(exchange.source_key, quote=True)
+            sections.append(f'<section class="page-question" data-studio-question-card="{key}">'
+                            + body + '<p role="status" data-send-status hidden></p></section>')
+            continue
         identity = the_list.ReturnedAnswerId(exchange.source_key, exchange.exchange_id)
         if isinstance(answer, list_exchange.ExchangeAnswer) and (native or identity not in returned):
             actor = exchange.answerer
@@ -1253,8 +1268,11 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
         and (not question or value and value is not the_list.EtaStatus.NOT_ASKED))
     report = review_page.list_report_details(item.report) if isinstance(item.report, the_list.ListReport) else ''
     links = item_links_html(entry, log, progress.next_step)
-    return ('<div class="list-panel"><div>' + report + asks + '<div class="list-item-fields">' + fields
-            + '</div>' + linked_items + links + filed_exchange_sections(item, today, names, unread_answers)
+    exchanges = filed_exchange_sections(item, today, names, unread_answers)
+    question_first = item.state is the_list.ItemState.WAITING_FOR_NATE and item.question_kind is the_list.QuestionItemKind.TO_NATE
+    return ('<div class="list-panel"><div>' + report + asks + (exchanges if question_first else '')
+            + '<div class="list-item-fields">' + fields + '</div>' + linked_items + links
+            + ('' if question_first else exchanges)
             + '<div data-list-item-content>' + sections + '</div>'
             + '</div>' + record_table.log_panel(log_id, log.markup) + '</div>')
 
@@ -1270,7 +1288,7 @@ type ReviewDisplay = ReviewRecords | Literal[LinkedReviewRead.AFTER_RENDER]
 
 
 def has_all_linked_reviews(item: the_list.ListItem, reviews: ReviewRecords) -> bool:
-    return all(identity in reviews for identity in item.reviews)
+    return all(identity in reviews for identity in linked_review_keys(item))
 
 
 def read_linked_reviews(root: Path, *, members: staff.StaffSnapshot) -> list[review_items.ReviewItem]:
@@ -1288,8 +1306,9 @@ def linked_reviews(root: Path, members: staff.StaffSnapshot, records: ImmediateR
 
 def review_links(item: the_list.ListItem, reviews: ReviewDisplay, today: datetime) -> str:
     links = ''
-    if item.reviews and reviews is not LinkedReviewRead.AFTER_RENDER:
-        cards = (review_card(identity, reviews) for identity in item.reviews)
+    keys = linked_review_keys(item)
+    if keys and reviews is not LinkedReviewRead.AFTER_RENDER:
+        cards = (review_card(identity, reviews) for identity in keys)
         links = '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
         if isinstance(item.report, the_list.ListReport) and (review := reviews.get(item.report.evidence_key)):
             if words := review_items.list_reply(review):
@@ -1302,7 +1321,7 @@ def review_links(item: the_list.ListItem, reviews: ReviewDisplay, today: datetim
 
 def render_review_updates(root: Path, members: staff.StaffSnapshot, review_records: ImmediateReviewRecords) -> str:
     """Render only the linked Review fields for items on the List."""
-    entries = [entry for entry in records() if entry.item.reviews]
+    entries = [entry for entry in records() if linked_review_keys(entry.item)]
     if not entries:
         return ""
     reviews = linked_reviews(root, members, review_records, (entry.item for entry in entries))
@@ -1423,8 +1442,9 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         attributes["report"] = item.report.kind.value
     if the_list.question_item(item) is not the_list.NoQuestionItem.ORDINARY:
         attributes["question-item"] = ""
-    if item.reviews:
-        attributes["list-review-keys"] = json.dumps(item.reviews, ensure_ascii=False)
+    keys = linked_review_keys(item)
+    if keys:
+        attributes["list-review-keys"] = json.dumps(keys, ensure_ascii=False)
     if item.state is the_list.ItemState.CLOSED:
         attributes["linked-closed-item"] = ""
     attrs = ''
@@ -1454,7 +1474,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
     if parking_label:
         state += '<small data-parked-note>Parked until ' + parking_label + '</small>'
-    if item.reviews:
+    if keys:
         if reviews is LinkedReviewRead.AFTER_RENDER:
             attrs += f' data-list-review-version="{review_version(item)}"'
             state += f'<small data-list-review-summary="{REVIEW_UNAVAILABLE}">Checking linked reviews…</small>'
@@ -1674,7 +1694,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
                                             unread_answers if can_read else frozenset(), progress)
     if has_detail:
         reviews: ReviewRecords = {}
-        if item.reviews:
+        if linked_review_keys(item):
             try:
                 reviews = linked_reviews(reading.root, members, review_records, (item,))
             except (OSError, ValueError, change_review.ChangeReviewError) as error:
@@ -2374,7 +2394,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     if status == "standalone":
         status = change_page.DeliveryStatus(root)
     reviews: ReviewDisplay = {}
-    if any(entry.item.reviews for entry in items):
+    if any(linked_review_keys(entry.item) for entry in items):
         reviews = (review_records if review_records is LinkedReviewRead.AFTER_RENDER
                    else linked_reviews(root, members, review_records, (entry.item for entry in items),
                                        defer_missing=include_counts and defer_counts))
@@ -2438,7 +2458,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         linked = not visible and selection.reveals(entry, open_question)
         shown += visible
         row_reviews = reviews
-        if entry.item.reviews and (
+        if linked_review_keys(entry.item) and (
             reviews is LinkedReviewRead.AFTER_RENDER
             or (include_counts and defer_counts and review_records is not LinkedReviewRead.FROM_DISK
                 and not has_all_linked_reviews(entry.item, reviews))
@@ -2599,7 +2619,7 @@ SCHEDULE_TEMPLATES = """
 
 
 STYLE = (record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE
-         + review_page.SUBMISSION_EVIDENCE_STYLE) + '''
+         + review_page.SUBMISSION_EVIDENCE_STYLE + review_page.REVIEW_FORM_STYLE) + '''
 [data-list-review-dialog]{position:fixed;inset:0;margin:calc(var(--page-window-top,0px) + 16px) auto auto;
 width:min(1060px,calc(100% - 48px));
 max-width:none;max-height:calc(100dvh - 32px - var(--page-window-top,0px));padding:0;
@@ -2755,6 +2775,13 @@ font-weight:600;cursor:pointer}
 .list-log .log-evidence div{white-space:pre-wrap}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 .page-question time{color:var(--ink-3);font-size:13px}
+.page-question[data-studio-question-card]{padding-block:8px 16px;border-bottom:1px solid var(--line)}
+[data-studio-question-card] [data-review-form]{margin-top:12px}
+[data-studio-question-card] .review-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+[data-studio-question-card] .review-actions>.later-menu{margin-inline-start:auto}
+[data-studio-question-card] [data-review-body] h2{font-size:14px;margin:12px 0 4px}
+[data-studio-question-card] .question-choices{display:grid;gap:4px;border:0;margin:12px 0;padding:0}
+[data-studio-question-card] .question-choices label{display:flex;gap:8px;align-items:baseline}
 .list-table small[data-new-answer]{color:var(--accent)}
 .page-question .question-unread{margin-inline-start:6px;color:var(--accent);text-transform:none}
 .list-panel:has([data-waiting-note]){min-height:12rem}
@@ -2784,7 +2811,7 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 # Use the Python case-folding table for browser search.
 SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + record_table.SCRIPT
           + review_legacy.SHOW_ALIAS_SCRIPT
-          + record_table.DATE_TIME_SCRIPT + '''(() => {
+          + record_table.DATE_TIME_SCRIPT + review_page.REVIEW_FORM_SCRIPT + '''(() => {
 ''' + question_path.queue_script() + '''
 const queuesByState=''' + json.dumps(QUEUE_BY_STATE) + ''';
 const chipsByQueue=''' + json.dumps(CHIP_BY_QUEUE) + ''';
@@ -3081,7 +3108,72 @@ function installListDetail(item){
   if(loading){void loadClosedListDetail(item,loading);return;}
   const form=detail.querySelector('[data-feedback-form]');
   if(form && !form.retainDraft) bindFeedbackForm(form);
+  for(const card of detail.querySelectorAll('[data-studio-question-card]')) if(!card.dataset.loaded) void loadStudioQuestion(item,card);
   tableView.showDraftCopy(drafts.get(item.dataset.key)?.words,form?.elements.words?.type==='textarea');
+}
+async function loadStudioQuestion(item,card){
+ if(card.dataset.loaded==='loading') return;
+ const session=tableView.openSession;
+ const current=()=>tableView.openItem===item && tableView.openSession===session && card.isConnected;
+ const query=new URLSearchParams({body:card.dataset.studioQuestionCard,view:'studio-inline',item:item.dataset.key});
+ const notice=card.querySelector('[data-send-status]');
+ card.dataset.loaded='loading';
+ try{
+  const response=await fetch(reviewPagePath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
+  if(!response.ok) throw new Error('The item is unavailable.');
+  const template=document.createElement('template');
+  template.innerHTML=await response.text();
+  const form=template.content.querySelector('[data-review-form]');
+  if(!form) throw new Error('The item is unavailable.');
+  if(!current()) return;
+  tableView.preserveRecordRowTop(()=>card.replaceChildren(template.content));
+  card.dataset.loaded='ready';
+  bindStudioQuestion(item,card,form);
+ }catch(error){
+  if(current()) showActionFailure(notice,error.message);
+ }finally{
+  if(card.dataset.loaded==='loading') delete card.dataset.loaded;
+ }
+}
+function bindStudioQuestion(item,card,form){
+ const showNotice=text=>showActionFailure(card.querySelector('[data-send-status]'),text);
+ const send=async(data,button)=>{
+  if(tableView.openItem!==item || cardSubmitBlocked(form,tableView.rowFading(item.dataset.key))) return;
+  const action=data.get('outcome'),key=item.dataset.key;
+  const draftKey=reviewFormKey(form), submittedDraft=rememberReviewDraft(form);
+  const hold=holdCard(item,hidden=>{if(hidden) tableView.applyAction();});
+  let saved=false;
+  startListSave();
+  showNotice('');
+  await saveReviewAction(data,{
+   url:reviewPagePath,hold,button,
+   sending:()=>setCardSubmitting(form,true),
+   confirmedSave:()=>{
+    saved=true;
+    if(reviewDrafts.get(draftKey)===submittedDraft) reviewDrafts.delete(draftKey);
+   },
+   saved:()=>{},
+   failed:reason=>showNotice('Not saved: '+reason),
+   undone:message=>{showNotice(message);form.elements.feedback.focus({preventScroll:true});},
+   displayFailed:()=>showNotice('Saved; the item could not refresh.'),
+   recover:async reason=>{
+    await loadStudioQuestion(item,card);
+    if(card.isConnected) showNotice('Not saved: '+reason);
+   },
+   finished:()=>{
+    hold.restore();
+    saving--;
+    tableView.preserveRecordRowTop(()=>{
+     if(saved && (action==='answer' || action==='later')) tableView.closeCard(key,{focusShow:true});
+     else if(form.isConnected){setCardSubmitting(form,false);syncControls();}
+     tableView.applyAction();
+    });
+    if(saved && action==='question') void loadStudioQuestion(item,card);
+    refreshAfterListSave(saved);
+   },
+  });
+ };
+ const syncControls=bindReviewForm(form,{zone:()=>content.dataset.zone,settings:()=>JSON.parse(content.dataset.parking),send});
 }
 async function loadClosedListDetail(item,loading){
  const session=tableView.openSession;
@@ -4242,6 +4334,7 @@ function keepRowBelowHeader(update){
  },{topInset:stuckPageActionsBottom});
 }
 async function refresh(_supersede=false,current=()=>true){
+ if(!_supersede && document.activeElement?.closest('[data-studio-question-card]')) return;
  if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh()) return;
  const signal=listRequestSignal();
  const delivery=tableView.deliveryRequest();

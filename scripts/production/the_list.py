@@ -4659,6 +4659,7 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
 
 def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
+         note: str = "",
          check_deadline: Callable[[datetime], None] | None = None,
          assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
          schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED,
@@ -4690,7 +4691,11 @@ def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
     def parking_event(changed: ListItem) -> FieldChange:
         return FieldChange("Updated", {}) if isinstance(changed.schedule, ScheduledSeries) else event
 
-    return _change(keeper, identity, edit, parking_event, source, page_action=notice, assigned_to=assigned_to).item
+    def follow(_before: ListItem, _after: ListItem, moment: datetime) -> tuple[ItemChange, ...]:
+        return (ItemChange(moment, note, source),)
+
+    return _change(keeper, identity, edit, parking_event, source, page_action=notice, assigned_to=assigned_to,
+                   follow=follow if note else None).item
 
 
 def unread_delivery(item: ListItem) -> bool:

@@ -67,6 +67,14 @@ class ReviewBodyView(Enum):
     TABLE = 'table'
     CARD = 'card'
     STUDIO_QUESTION = 'studio-question'
+    STUDIO_INLINE = 'studio-inline'
+
+
+def studio_question_open(item: ReviewItem) -> bool:
+    handoff = item.exchange_handoff
+    return (isinstance(item.source, review_items.QuestionSource)
+            and isinstance(handoff, review_items.FiledReviewExchange)
+            and handoff.open_staff_question and 'answer' in item.actions)
 
 
 def card_url(key: str, *, studio_question: bool = False) -> str:
@@ -243,12 +251,24 @@ class ReviewSnapshot:
             record_table.chip_row('Show', SHOW_CHIPS, 'open').encode(),
             record_table.chip_row('Show', SHOW_CHIPS, selected).encode(), 1)
 
-    def body(self, key: str, *, view: ReviewBodyView = ReviewBodyView.TABLE) -> bytes:
+    def body(self, key: str, *, view: ReviewBodyView = ReviewBodyView.TABLE,
+             studio_item: str = '') -> bytes:
         """Render one retained record without a store read."""
         item = self.records.get(key)
         if item is None:
             raise LookupError('This item is not in the current snapshot.')
+        if view is ReviewBodyView.STUDIO_INLINE:
+            handoff = item.exchange_handoff
+            if not isinstance(handoff, review_items.FiledReviewExchange) or not studio_question_open(item):
+                raise LookupError('This question is no longer open.')
+            destination = handoff.destination
+            if studio_item != f'{destination.keeper}/L{destination.number}':
+                raise LookupError('This question is no longer open on this item.')
         body = self.render_body(item, self.assets, view=view)
+        if view is ReviewBodyView.STUDIO_INLINE:
+            if body == CARD_ERROR:
+                raise LookupError('The item is unavailable.')
+            return body
         if view is ReviewBodyView.TABLE:
             if body == CARD_ERROR:
                 return body
@@ -1086,9 +1106,8 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
          owner: str = '', validator: str = '', assignment: str = '',
          receivers: Mapping[str, page_frame.SendReceiver] = NO_SEND_RECEIVERS,
          names: staff_names.StaffNames | None = None, view: ReviewBodyView = ReviewBodyView.TABLE) -> str:
-    studio_answer = (view is ReviewBodyView.STUDIO_QUESTION and review_items.on_list(item)
-                     and isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
-                     and item.exchange_handoff.open_staff_question and 'answer' in item.actions)
+    inline = view is ReviewBodyView.STUDIO_INLINE
+    studio_answer = view in (ReviewBodyView.STUDIO_QUESTION, ReviewBodyView.STUDIO_INLINE) and studio_question_open(item)
     if ((review_items.on_list(item) and not studio_answer) or item.state == ReviewState.DONE
             or (item.type == ReviewType.FOR_YOU and not item.actions)):
         return ''
@@ -1108,7 +1127,8 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         labels.update(read='Got it', question='Ask a follow-up')
     elif validator:
         labels['question'] = 'Ask a question'
-    for index, action in enumerate(("answer",) if studio_answer else item.actions):
+    actions = (('answer', 'question') if inline else ('answer',)) if studio_answer else item.actions
+    for index, action in enumerate(actions):
         if (action == 'read' and isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
                 and not item.unread_answer):
             continue
@@ -1128,7 +1148,7 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         if action == 'approve':
             closes.append(assignment)
     later = ''
-    if (not studio_answer and item.state not in (ReviewState.DONE, ReviewState.VALIDATING)
+    if ((inline or not studio_answer) and item.state not in (ReviewState.DONE, ReviewState.VALIDATING)
             and item.type not in (ReviewType.RESPONSE, ReviewType.FOR_YOU) and not waiting_change(item)):
         later = record_table.park_control('Later', field='later', action='outcome', value='later')
     words = ''
@@ -1144,7 +1164,9 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
             placeholder = 'Type your words. They go with the button that you press.'
         words = (f'<label for="{field}">Your words</label><textarea id="{field}" name="feedback" rows="{words_rows}" '
                  + f'placeholder="{placeholder}"></textarea>')
-    if item.type == ReviewType.RESPONSE:
+    if inline:
+        groups = '<div class="review-actions">'+''.join((*closes, *returns))+later+'</div>'
+    elif item.type == ReviewType.RESPONSE:
         receiver = receivers.get('question')
         label = receiver.name if isinstance(receiver, page_frame.SendTo) else owner
         shown_owner = names.html(item.owner, label) if names is not None else html.escape(label)
@@ -1270,7 +1292,8 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs, *,
     handoff = ''
     exchange = ''
     filed = item.exchange_handoff
-    studio_card = inputs.view is ReviewBodyView.STUDIO_QUESTION
+    inline = inputs.view is ReviewBodyView.STUDIO_INLINE
+    studio_card = inputs.view in (ReviewBodyView.STUDIO_QUESTION, ReviewBodyView.STUDIO_INLINE)
     filed_followups: frozenset[int] = (filed.filed_followup_indices
                                      if isinstance(filed, review_items.FiledReviewExchange)
                                      and not (studio_card and filed.hides_card) else frozenset())
@@ -1353,19 +1376,24 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs, *,
         question_route = change_browser.shown_question_route(source.record, inputs.members)
     revision = record_revision(item, inputs.assets, inputs.members, question_route=question_route)
     receivers = review_receivers(item, inputs.members, question_route=question_route)
+    actions = form(item, inputs.browser, inputs.words_rows, revision, owner=owner, validator=validator,
+                   receivers=receivers, names=names, view=inputs.view,
+                   assignment=assign_menu(item, names) if 'approve' in item.actions else '')
+    body += inputs.assets.get('question-delivery:'+item.key, '')
+    body += inputs.assets.get('submission:'+item.key, '')
+    if inline:
+        if not studio_question_open(item):
+            return CARD_ERROR.decode()
+        return '<div data-review-body>'+body+'</div>'+actions
     footer = ('' if response is not None else '<p class="review-source">Owner: '+names.html(item.owner, owner)
               +' · Source: '+names.html(item.source_unit, review_items.name(item.source_unit, inputs.members))+'</p>')
     fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
-    body += inputs.assets.get('question-delivery:'+item.key, '')
-    body += inputs.assets.get('submission:'+item.key, '')
     log_id = html.escape('review-log-'+item.key.replace('/', '-'), quote=True)
     if isinstance(filed, review_items.FiledReviewExchange):
         body += f'<p><a href="{report_url(filed.destination)}">Open answer on List item {filed.destination.number}</a></p>'
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div>'
             +'<div class="review-log-column">'+record_table.log_panel(log_id, log_html(item, inputs, owner))+exchange+'</div>'
-            +form(item, inputs.browser, inputs.words_rows, revision,
-                  owner=owner, validator=validator, receivers=receivers, names=names, view=inputs.view,
-                  assignment=assign_menu(item, names) if 'approve' in item.actions else '')+footer+'</div>')
+            +actions+footer+'</div>')
 
 
 def owner_name(item: ReviewItem, members: staff.StaffSnapshot) -> str:
@@ -1505,10 +1533,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
                               change_browser.QuestionRouteReading.RESOLVE) -> ReviewItem:
         if review_items.pending_list_move(current) is not investigation.NoListMove.ABSENT:
             raise review_items.ReviewRecordChanged(investigation.LIST_MOVE_PENDING)
-        handoff = current.exchange_handoff
-        if review_items.on_list(current) and (
-                not isinstance(handoff, review_items.FiledReviewExchange) or not handoff.open_staff_question
-                or outcome != "answer"):
+        if (review_items.on_list(current)
+                and not (studio_question_open(current) and outcome in ('answer', 'question', 'later'))):
             raise review_items.ReviewRecordChanged('Open the report on the List.')
         if current.state == ReviewState.DONE:
             raise review_items.ReviewRecordChanged('This item is already Done.')
@@ -1728,7 +1754,17 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
 
 
 QUESTION_COLOR_RULE = '.question{--type-color:#b99aff}'
-STYLE = '<style>' + QUESTION_COLOR_RULE + SUBMISSION_EVIDENCE_STYLE + '''
+REVIEW_FORM_STYLE = '''
+[data-review-form] label{display:block;font-weight:600;margin-bottom:6px}
+[data-review-form] textarea{display:block;box-sizing:border-box;width:100%;font:inherit;padding:9px 12px;background:var(--bg);
+color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
+.review-actions{margin-top:12px}
+.review-later{margin-left:auto}
+.review-actions button{margin:0;font:inherit;min-height:40px;padding:6px 14px;border:1px solid var(--ink-3);border-radius:8px;
+background:var(--card);color:var(--ink)}.review-actions .primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+'''
+
+STYLE = '<style>' + QUESTION_COLOR_RULE + SUBMISSION_EVIDENCE_STYLE + REVIEW_FORM_STYLE + '''
 main:has(>[data-review]){max-width:1124px}
 [data-review]{display:flex;flex-wrap:wrap;align-items:center}
 [data-review]>:is(.page-title,.page-heading,.review-queue){flex:0 0 100%;min-width:0}
@@ -1757,15 +1793,8 @@ background:var(--card);border:1px solid var(--line);border-radius:999px;color:va
 .review-log-column{display:flex;flex-direction:column;min-width:0}.review-log-column>.list-log-panel{flex:1 0 0}
 .review-log-column>.list-log-panel:not(:last-child){min-height:8rem}
 .review-panel [data-review-form]{grid-column:1/-1;border-top:1px solid var(--line);padding-top:12px;margin-top:10px}
-[data-review-form] label{display:block;font-weight:600;margin-bottom:6px}
-[data-review-form] textarea{display:block;box-sizing:border-box;width:100%;font:inherit;padding:9px 12px;background:var(--bg);
-color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
-.review-actions{margin-top:12px}
-.review-later{margin-left:auto}
 .list-table small[data-new-answer]{color:var(--accent)}
 .list-log span{white-space:pre-wrap}
-.review-actions button{margin:0;font:inherit;min-height:40px;padding:6px 14px;border:1px solid var(--ink-3);border-radius:8px;
-background:var(--card);color:var(--ink)}.review-actions .primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .review-source{grid-column:1/-1;color:var(--ink-3);font-size:12px;margin-top:16px!important}
 .list-table .list-row td:last-child{text-align:right}.list-table [data-detail]>td{text-align:left}
 .review-handoff{display:block;margin-top:4px;color:var(--ink-2)}
@@ -1826,7 +1855,7 @@ column-gap:24px;row-gap:0;border:0;padding:0}
 [data-review-card-notice]{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style>'''
 
-REVIEW_CARD_SCRIPT = r'''
+REVIEW_CARD_BODY_SCRIPT = r'''
 const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
 const colored=(name,markup)=>markup || escapeText(name);
 const entrySortValues=entry=>[entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
@@ -1902,13 +1931,17 @@ function installReviewBody(row,body){
  if(panel) updateTitleFallback(panel);
  updateHandoffAges(detail);
 }
+'''
+
+REVIEW_FORM_SCRIPT = r'''
 const reviewDrafts=new Map();
+const reviewFormScope=form=>form.closest('[data-studio-question-card]') ?? recordDetails(recordFromDetail(form));
+const reviewFormKey=form=>form.closest('[data-studio-question-card]')?.dataset.studioQuestionCard ?? recordFromDetail(form).dataset.key;
 function bindReviewForm(form,{zone,settings,remember=()=>rememberReviewDraft(form,true),send}){
  const words=form.elements.feedback,later=form.elements.later,assignee=form.elements.assignee;
- const row=recordFromDetail(form);
- const stored=reviewDrafts.get(row.dataset.key);
+ const stored=reviewDrafts.get(reviewFormKey(form));
  if(stored) restoreReviewDraft(form,stored.draft);
- const choices=recordDetails(row).querySelectorAll('input[name=choice]');
+ const choices=reviewFormScope(form).querySelectorAll('input[name=choice]');
  const submit=(button,outcome,until)=>{
   const data=new URLSearchParams(new FormData(form));data.set('outcome',outcome);
   if(outcome==='later') data.set('later',until);
@@ -1916,7 +1949,11 @@ function bindReviewForm(form,{zone,settings,remember=()=>rememberReviewDraft(for
   void send(data,button);
  };
  const routedButtons=form.querySelectorAll('[data-send-assignee],button:has([data-send-with-words])');
- const syncSendLabels=()=>routedButtons.forEach(updateSendLabel);
+ const inlineAsk=form.closest('[data-studio-question-card]') && form.querySelector('[value="question"]');
+ const syncSendLabels=()=>{
+  routedButtons.forEach(updateSendLabel);
+  if(inlineAsk) inlineAsk.disabled=Boolean(form.dataset.sending) || !words.value.trim();
+ };
  const update=()=>{remember();syncSendLabels();};
  syncSendLabels();
  choices.forEach(choice=>choice.addEventListener('change',()=>{words.value=choice.value;update();words.focus();}));
@@ -1935,10 +1972,11 @@ function bindReviewForm(form,{zone,settings,remember=()=>rememberReviewDraft(for
   submit(button,outcome);
  });
  if(later) bindDateTimePicker(form,{zone,settings,summaryPrefix:'Hides until '});
+ return syncSendLabels;
 }
 function readReviewDraft(form){
  if(!form?.elements.feedback) return null;
- const choices=[...recordDetails(recordFromDetail(form)).querySelectorAll('input[name=choice]')];
+ const choices=[...reviewFormScope(form).querySelectorAll('input[name=choice]')];
  const assignee=form.elements.assignee?.selectedOptions[0];
  return {feedback:form.elements.feedback.value,later:form.elements.later?.value ?? '',
   assignee:assignee?.value ?? '',assigneeName:assignee?.dataset.assigneeName ?? assignee?.textContent ?? '',
@@ -1947,7 +1985,7 @@ function readReviewDraft(form){
 function rememberReviewDraft(form,edited=false){
  const draft=readReviewDraft(form);
  if(!draft) return;
- const key=recordFromDetail(form).dataset.key;
+ const key=reviewFormKey(form);
  const previous=reviewDrafts.get(key);
  // The animation copy can clear the live radio selection.
  draft.choice=draft.choice || previous?.draft.choice || '';
@@ -1967,7 +2005,7 @@ function restoreReviewDraft(form,draft){
   }
   assignee.value=draft.assignee;
  }
- recordDetails(recordFromDetail(form)).querySelectorAll('input[name=choice]').forEach(choice=>choice.checked=choice.value===draft.choice);
+ reviewFormScope(form).querySelectorAll('input[name=choice]').forEach(choice=>choice.checked=choice.value===draft.choice);
 }
 async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true,present=apply=>apply(),report}){
  const revision=form.elements.revision?.value,key=recordFromDetail(form).dataset.key;
@@ -2015,13 +2053,13 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
   refreshError(error);
  }
 }
-async function saveReviewAction(data,{hold,button,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
+async function saveReviewAction(data,{url=location.pathname,hold,button,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
  let conflict=false,confirmed=false;
  try{
   const outcome=data.get('outcome'), receiver=sendReceiver(button);
   if(outcome!=='later') data.set('receiver',receiver ?? '');
   sending?.();
-  const response=await hold.post(location.pathname,{method:'POST',body:data},
+  const response=await hold.post(url,{method:'POST',body:data},
    outcome==='later' || outcome==='validate' ? null : receiver);
   conflict=response.status===409;
   confirmed=response.ok;
@@ -2040,6 +2078,8 @@ async function saveReviewAction(data,{hold,button,sending,confirmedSave,saved,fa
  }
 }
 '''
+
+REVIEW_CARD_SCRIPT = REVIEW_CARD_BODY_SCRIPT + REVIEW_FORM_SCRIPT
 
 CARD_VIEW_SCRIPT = r'''(() => {
 const frame=window.frameElement;

@@ -42,11 +42,11 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result, sessions
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import (change_review, change_routing, delivery_state, investigation, list_exchange, record_store, repeat_rule,
-                                session_pane, session_staff, showrunners, staff, the_list, unrouted_alert)
+                                session_pane, session_staff, showrunners, staff, the_list, unrouted_alert, update_registration)
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import (browser_test_support, console, go_ledger, list_page, page_frame, serve, staff_names,
                                   studio_page)
-from scripts.review_links import change_browser, change_page, images, new_item_dialog, page_question, question_record
+from scripts.review_links import answer_sources, change_browser, change_page, images, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_link, review_page, review_submissions, search_fold, send_hold
 from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.server_test_support import started_review_server
@@ -2972,6 +2972,58 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  check(!row(1).hidden && row(1).dataset.parked==='true','Answers includes the parked question.');
  check(row(1).querySelector('[data-new-answer]'),'The parked question shows the new answer.');
 """)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_answers_the_team_question_in_its_open_row(self) -> None:
+        item = self.studio_team_question()
+        with (patch.object(serve.ReviewLinksHandler, "deliver_review", return_value=change_page.DeliveryConfirmed()),
+              self.studio_review_server() as origin):
+            self.open_studio_review_fixture(origin, "#show=questions")
+            self.studio_review_check(r"""
+ const item=row(1);
+ check(!item.hidden && !recordIsOpen(item),'The Questions chip shows the closed row.');
+ item.querySelector('.list-toggle').click();
+ await until(()=>recordDetails(item).querySelector('[data-studio-question-card] [data-review-form]'));
+ const card=recordDetails(item).querySelector('[data-studio-question-card]');
+ const form=card.querySelector('[data-review-form]');
+ check(!dialog.open && !card.querySelector('iframe'),'The question opens in the row.');
+ check(card.textContent.includes('Both layouts fit the list.') &&
+       card.textContent.includes('so readers can see the controls.'),'The card shows the reason and recommendation.');
+ const choices=card.querySelectorAll('input[name=choice]');
+ check(choices.length===2,'The card shows both choices.');
+ check(form.querySelector('[value="question"]').disabled,'Ask question needs words.');
+ choices[1].click();
+ check(form.elements.feedback.value==='Use the wide layout.','The choice fills Your words.');
+ check(!form.querySelector('[value="question"]').disabled,'Words enable Ask question.');
+ check(form.querySelector('[data-later-toggle]').textContent.trim().startsWith('Later'),'The card has Later.');
+ form.querySelector('[value="answer"]').click();
+ await until(()=>row(1)?.hidden);
+ check(!dialog.open,'Answer leaves Questions without opening a window.');
+""")
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.state, the_list.ItemState.WORKING)
+        exchange, = saved.filed_exchanges
+        assert isinstance(exchange.answer, list_exchange.ExchangeAnswer)
+        self.assertEqual(exchange.answer.text, "Use the wide layout.")
+
+    def studio_team_question(self) -> the_list.ListItem:
+        members = staff.snapshot()
+        parts = update_registration.QuestionParts(
+            ask="Which layout should the Review page use?",
+            context="Both layouts fit the list. The wide layout gives each card more space.",
+            items=[], choices=["Use the compact layout.", "Use the wide layout."],
+            recommend="Use the wide layout so readers can see the controls.",
+        )
+        question = update_registration.OutstandingItem(since=NOW.strftime("%Y-%m-%dT%H:%M"), text=parts["ask"],
+            question=update_registration.question_text(parts), asked_by=DWIGHT.id, parts=parts)
+        folder = record_store.default_question_folder(MORTY.id)
+        folder.mkdir(parents=True, exist_ok=True)
+        record = update_registration.QuestionRecord(folder / f"question-{DWIGHT.id}-layout.md",
+                                                     MORTY.id, DWIGHT.id, question, "open")
+        update_registration.write_question_record(record)
+        answer_sources.file_saved_question(record, members)
+        item, = the_list.records(MORTY.id)
+        return item
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_linked_reply_shows_mark_read_and_park_without_schedule_fields(self) -> None:

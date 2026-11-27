@@ -6836,6 +6836,88 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(exchange.answer, answer_sources.ExchangeAnswer)
         self.assertIn("Use the wide layout.", exchange.answer.text)
 
+    def filed_studio_team_question(self) -> tuple[test_review_page.ReviewPageTests, str, list_page.ListRecord]:
+        case = self.review_fixture()
+        key = case.question()
+        members = staff.snapshot()
+        source = review_page.build_snapshot(case.root).records[key].source
+        assert isinstance(source, review_items.QuestionSource)
+        parts = update_registration.QuestionParts(
+            ask="Which layout should the Review page use?",
+            context="Both layouts fit the list. The wide layout gives each card more space.",
+            items=[], choices=["Use the compact layout.", "Use the wide layout."],
+            recommend="Use the wide layout so readers can see the controls.",
+        )
+        record = replace(source.record, item={**source.record.item, "parts": parts})
+        update_registration.write_question_record(record)
+        answer_sources.file_saved_question(record, members)
+        keeper = record_store.list_keeper(conf.read("console"), members)
+        assert keeper is not None
+        item, = the_list.records(keeper.id)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        _ = self.enterContext(patch.object(self.server, "review_cache", cache))
+        _ = self.enterContext(patch.object(self.server, "delivery_status", case.status))
+        return case, key, list_page.ListRecord(keeper.id, item)
+
+    def test_studio_inline_team_question_uses_the_review_answer(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        self.assertEqual(self.list_filter_markup("?show=questions")[0], [str(row.item.number)])
+        studio = self.request(studio_page.PAGE_PATH)
+        self.assertIn(b'data-studio-question-card=', studio.body)
+        self.assertNotIn(b'>Answer question</a>', studio.body)
+        fragment = review_page.PAGE_PATH + "?" + urlencode({"body": key, "view": "studio-inline", "item": row.key})
+        response = self.request(fragment)
+        self.assertEqual(response.status, 200, response.body)
+        for part in (b'Both layouts fit the list.', b'Use the compact layout.', b'Use the wide layout.',
+                     b'so readers can see the controls.', b'Your words', b'>Answer</button>',
+                     b'>Ask question</button>', b'data-later-toggle>Later'):
+            self.assertIn(part, response.body)
+        self.assertNotIn(b'<dialog', response.body)
+        self.assertEqual(self.request(fragment.replace(row.item.id, "L999")).status, 404)
+        revision = re.search(rb'name="revision" value="([^"]+)"', response.body)
+        assert revision is not None
+        body = case.body(key, "answer", "Use the wide layout.") + "&" + urlencode({"revision": revision[1].decode()})
+        with capture_sender("send_to_staff") as send:
+            status, answer = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+        self.assertEqual(status, 200, answer)
+        send.assert_called_once()
+        self.assertEqual(self.list_filter_markup("?show=questions")[0], [])
+        stored = the_list.load(row.keeper, row.item.id)
+        self.assertEqual(stored.state, the_list.ItemState.WORKING)
+        exchange, = stored.filed_exchanges
+        self.assertIsInstance(exchange.answer, list_exchange.ExchangeAnswer)
+        assert isinstance(exchange.answer, list_exchange.ExchangeAnswer)
+        self.assertEqual(exchange.answer.text, "Use the wide layout.")
+        self.assertEqual(self.request(fragment).status, 404)
+
+    def test_studio_inline_team_question_can_wait_or_ask_for_more(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        page = self.server.review_cache.get()
+        data = page.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        revision = urlencode({"revision": shown[1].decode()})
+        later = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        body = case.body(key, "later", "Wait for the desktop check.") + "&" + revision
+        with capture_sender("send_to_staff") as send:
+            status, reply = self.post(review_page.PAGE_PATH, body + "&" + urlencode({"later": later.isoformat()}))
+            self.assertEqual(status, 200, reply)
+            send.assert_not_called()
+            self.assertEqual(self.list_filter_markup("?show=questions")[0], [])
+            item = the_list.load(row.keeper, row.item.id)
+            self.assertEqual(item.parked_until, later)
+            self.assertEqual(item.log[-1].what, "Later: Wait for the desktop check.")
+            _ = the_list.unpark(row.keeper, row.item.id, source="nate")
+            ask = "Does the wide layout fit on a laptop?"
+            body = case.body(key, "question", ask) + "&" + revision
+            status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+        self.assertEqual(status, 200, reply)
+        send.assert_called_once()
+        current = self.server.review_cache.get().records[key].source
+        assert isinstance(current, review_items.QuestionSource)
+        self.assertEqual(current.record.item.get("followup", {}).get("text"), ask)
+
     def test_legacy_change_reply_retry_files_the_saved_answer(self) -> None:
         case = self.review_fixture(changes=1)
         page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, ("C1",), "")
