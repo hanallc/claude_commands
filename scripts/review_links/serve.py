@@ -27,7 +27,7 @@ import time
 import threading
 from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -936,6 +936,8 @@ def held_delivery_result(outcome: change_page.DeliveryOutcome, no_message: bool 
 class ReviewLinksHandler(SimpleHTTPRequestHandler):
     """Serve regular files within the snapshot root, without directory indexes."""
 
+    _save_send_response: Callable[[send_hold.HeldResponse], None] | None = None
+
     @override
     def send_head(self) -> BinaryIO | None:
         server = cast(ReviewLinksServer, self.server)
@@ -1311,18 +1313,20 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         undo_requested = self.headers.get(send_hold.HOLD_HEADER) == "1"
         request_ids = self.headers.get_all(send_hold.REQUEST_HEADER, [])
-        tracked_new_item = route.path == review_page.NEW_ITEM_PATH and bool(request_ids)
-        if tracked_new_item or (undo_requested and self.held_send_path(route.path)):
+        new_item_send = route.path == review_page.NEW_ITEM_PATH
+        if (new_item_send and request_ids) or (undo_requested and self.held_send_path(route.path)):
             if request_ids and (len(request_ids) != 1 or not send_hold.valid_hold_id(request_ids[0])):
                 self.json_response(400, {"reason": "The send has no valid request ID."})
                 return
             request_id = request_ids[0] if request_ids else ""
             seconds = conf.read("review_links").whole("undo_seconds")
-            server = cast(ReviewLinksServer, self.server)
-            if tracked_new_item or seconds or (request_id and server.send_holds.has_hold(request_id)):
-                self.hold_post(route, seconds, request_id, retry=tracked_new_item and not undo_requested)
+            if new_item_send and (request_id or seconds):
+                self.new_item_post(request_id=request_id, undo_seconds=seconds)
                 return
-        if route.path == review_page.NEW_ITEM_PATH:
+            if seconds or (request_id and server.send_holds.has_hold(request_id)):
+                self.hold_post(route, seconds, request_id)
+                return
+        if new_item_send:
             self._write_post(self.new_item_post)
             return
         if route.path == review_page.ATTACHMENT_PATH:
@@ -1700,7 +1704,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             raise new_item_dialog.SubmissionError("Invalid New item request.")
         return cast(dict[str, object], payload)
 
-    def new_item_post(self) -> None:
+    def new_item_post(self, *, request_id: str = "", undo_seconds: int = 0) -> None:
         """File and publish a native record before sending its message."""
         server = cast(ReviewLinksServer, self.server)
         if self.path != review_page.NEW_ITEM_PATH or self.headers.get_content_type() != "application/json":
@@ -1720,18 +1724,34 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if len(body) != size:
                 raise new_item_dialog.SubmissionError("Incomplete New item request.")
             fields = self._new_item_fields(body)
+        except (ValueError, RecursionError) as error:
+            reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
+            self.json_response(400, {"error": reason})
+            return
+        except OSError:
+            self.json_response(400, {"error": "Could not read the New item request."})
+            return
+        if request_id or undo_seconds:
+            self.new_item_operation(server, fields, body, request_id, undo_seconds)
+            return
+        replay = server.send_holds.active_replay(self.headers.get(send_hold.REPLAY_TICKET_HEADER, ""))
+        self.file_new_item(server, fields, replay)
+
+    def file_new_item(self, server: ReviewLinksServer, fields: dict[str, object],
+                      replay: send_hold.ActiveReplay | send_hold.NoActiveReplay) -> None:
+        try:
             token = fields.get("token")
+            valid_token = self.valid_request_token(token) or (
+                isinstance(replay, send_hold.ActiveReplay) and replay.new_item_token_verified)
             if fields.get("kind") == new_item_dialog.SCHEDULED_KIND:
-                replay = server.send_holds.active_replay(self.headers.get(send_hold.REPLAY_TICKET_HEADER, ""))
-                verified_replay = isinstance(replay, send_hold.ActiveReplay) and replay.scheduled_token_verified
-                if not verified_replay and not self.valid_request_token(token):
+                verified_schedule = isinstance(replay, send_hold.ActiveReplay) and replay.scheduled_token_verified
+                if not valid_token and not verified_schedule:
                     self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
                     return
                 scheduled = new_item_dialog.read_scheduled_request(fields)
                 sent_at = replay.started_at if isinstance(replay, send_hold.ActiveReplay) else the_list.now()
                 self.scheduled_item_post(server, scheduled, sent_at=sent_at)
                 return
-            valid_token = self.valid_request_token(token)
         except new_item_dialog.ScheduledDraftRequired as error:
             self.json_response(409, {"code": "wrong_draft_kind", "error": str(error)})
             return
@@ -2691,7 +2711,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         status = {send_hold.UndoResult.UNDONE: 200, send_hold.UndoResult.ALREADY_SENT: 409}.get(outcome, 404)
         self.json_response(status, {"outcome": outcome.value})
 
-    def hold_post(self, route: SplitResult, seconds: int, request_id: str, *, retry: bool) -> None:
+    def hold_post(self, route: SplitResult, seconds: int, request_id: str) -> None:
         """Hold a marked send for Undo."""
         server = cast(ReviewLinksServer, self.server)
         if not self.same_origin(required=True) or route.query:
@@ -2709,45 +2729,82 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if len(body) != size:
             self.json_response(400, {"reason": "The send is incomplete."})
             return
-        fields = self.held_new_item_fields(route.path, body)
-        admission = send_hold.HoldAdmission.CONSOLE_SEND
-        if fields.get("kind") == new_item_dialog.SCHEDULED_KIND:
-            admission = (send_hold.HoldAdmission.VERIFIED_SCHEDULE if self.valid_request_token(fields.get("token"))
-                         else send_hold.HoldAdmission.STALE_SCHEDULE_TOKEN)
         try:
-            # A restart waits until the browser has the hold id, so it can read the result from the next server.
             with server.send_holds.answering():
-                if retry and seconds and not server.send_holds.has_hold(request_id):
-                    with server.list_store_access(), server.staff_read_scope():
-                        if self.held_draft_is_filed(fields):
-                            seconds = 0
-                held = server.send_holds.hold(route.path, dict(self.headers.items()), body, seconds,
-                                              request_id=request_id, admission=admission, retry=retry)
+                held = server.send_holds.hold(route.path, dict(self.headers.items()), body, seconds, request_id=request_id)
                 self.json_response(202, held, hold=send_hold.HoldHeader.HELD)
-        except send_hold.StaleScheduleToken:
-            self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN}, hold_resolved=True)
+        except send_hold.OperationConflict:
+            self.json_response(409, {"reason": "This Send ID has different content."})
         except send_hold.HoldsStopped:
             self.json_response(503, {"reason": "The console is restarting. Send again."})
         except OSError as error:
-            print(f"review-links send hold: {error}", file=sys.stderr)
-            self.json_response(503, {"reason": "The send could not be confirmed. Try again."})
+            self.browser_failure(503, "The send could not be confirmed. Try again.", error)
 
-    def held_new_item_fields(self, path: str, body: bytes) -> dict[str, object]:
-        if path != review_page.NEW_ITEM_PATH or self.headers.get_content_type() != "application/json":
-            return {}
+    def new_item_operation(self, server: ReviewLinksServer, fields: dict[str, object], body: bytes,
+                           request_id: str, seconds: int) -> None:
+        path = review_page.NEW_ITEM_PATH
         try:
-            return self._new_item_fields(body)
-        except (ValueError, RecursionError):
-            return {}
+            binding = send_hold.operation_binding(path, body, refreshable_token=True)
+            with server.send_holds.answering():
+                operation = server.send_holds.submit(
+                    path, dict(self.headers.items()), body, request_id=request_id, binding=binding,
+                    admit=partial(self.admit_new_item, server, fields, seconds), refreshable_token=True)
+                if isinstance(operation, send_hold.DirectSend):
+                    replay = send_hold.ActiveReplay(datetime.fromtimestamp(operation.started_at, UTC),
+                                                   False, operation.new_item_token_verified)
+                    with server.send_holds.direct_result(operation) as save:
+                        self._save_send_response = save
+                        try:
+                            self._write_post(partial(self.file_new_item, server, fields, replay))
+                        finally:
+                            self._save_send_response = None
+                elif isinstance(operation, send_hold.HeldResponse):
+                    self.write_send_response(operation)
+                else:
+                    self.json_response(202, operation, hold=send_hold.HoldHeader.HELD)
+        except send_hold.OperationConflict:
+            self.json_response(409, {"reason": "This Send ID has different content."})
+        except send_hold.HoldsStopped:
+            self.json_response(503, {"reason": "The console is restarting. Send again."})
+        except (OSError, ValueError, RecursionError) as error:
+            self.browser_failure(503, "The send could not be confirmed. Try again.", error)
+
+    def admit_new_item(
+            self, server: ReviewLinksServer, fields: dict[str, object], seconds: int,
+            operation: send_hold.UnseenOperation | send_hold.ReleasedFile
+    ) -> send_hold.HoldAdmission | send_hold.DirectAdmission | send_hold.HeldResponse:
+        valid_token = self.valid_request_token(fields.get("token"))
+        if not valid_token:
+            return self.send_json_answer(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
+        if isinstance(operation, dict) and operation.get("refresh_token"):
+            return send_hold.DirectAdmission(True)
+
+        filing = self.new_item_draft_filing(server, fields)
+        if isinstance(filing, review_submissions.UnreadableDraftFiling):
+            raise filing.error
+        if isinstance(operation, dict):
+            # An expired or uncertain result can only recover a confirmed item.
+            if isinstance(filing, review_submissions.FiledDraft):
+                return send_hold.DirectAdmission(True)
+            return send_hold.HoldAdmission(0)
+        if isinstance(filing, review_submissions.IncompleteDraftFiling):
+            return self.send_json_answer(409, {"code": "draft_pending", "error": "Retry the original Send for this draft."})
+        if not seconds or isinstance(filing, review_submissions.FiledDraft):
+            return send_hold.DirectAdmission(True)
+        if not self.same_origin(required=True):
+            return self.send_json_answer(403, {"reason": "Send from the console page."})
+        return send_hold.HoldAdmission(seconds, new_item_token_verified=True)
 
     @staticmethod
-    def held_draft_is_filed(fields: dict[str, object]) -> bool:
+    def new_item_draft_filing(server: ReviewLinksServer,
+                              fields: dict[str, object]) -> review_submissions.DraftFilingRead:
         draft_id = fields.get("request_id")
-        if not isinstance(draft_id, str):
-            return False
-        if new_item_dialog.SCHEDULED_DRAFT_ID.fullmatch(draft_id):
-            return new_item.scheduled_draft_is_filed(new_item_dialog.read_scheduled_draft_id(draft_id))
-        return review_submissions.is_draft_id(draft_id) and review_submissions.draft_is_filed(draft_id)
+        if isinstance(draft_id, str) and (review_submissions.is_draft_id(draft_id)
+                                          or review_submissions.DRAFT_ID.fullmatch(draft_id)
+                                          or new_item_dialog.SCHEDULED_DRAFT_ID.fullmatch(draft_id)):
+            with server.list_store_access(), server.staff_read_scope():
+                return new_item.read_draft_filing(draft_id)
+        return review_submissions.UnclaimedDraft()
 
     def hold_result(self, hold_id: str) -> None:
         """Answer with the response of a released send, or say that it is still held."""
@@ -2760,34 +2817,43 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if result is send_hold.HoldState.PENDING:
             self.json_response(202, {"pending": True}, hold=send_hold.HoldHeader.PENDING)
         elif result is send_hold.HoldState.UNDONE:
-            self.json_response(404, {"reason": "This send was undone."}, hold_resolved=True)
+            self.json_response(404, {"reason": "This send was undone."}, hold=send_hold.HoldHeader.UNDONE)
         elif result is send_hold.HoldState.MISSING:
-            self.json_response(404, {"reason": "This send was undone or its result expired."}, hold_resolved=True)
+            self.json_response(404, {"reason": "There is no saved result for this Send ID."})
+        elif result is send_hold.HoldState.EXPIRED:
+            self.json_response(410, {"reason": "The send result expired."})
+        elif result is send_hold.HoldState.UNCERTAIN:
+            self.json_response(503, {"reason": send_hold.MAY_HAVE_LEFT})
         else:
-            self.send_response(result.status)
-            self.send_header(send_hold.RESOLVED_HEADER, "1")
-            self.send_header("Content-Type", result.content_type)
-            self.send_header("Content-Length", str(len(result.body)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            _ = self.wfile.write(result.body)
+            self.write_send_response(result, resolved=True)
+
+    @staticmethod
+    def send_json_answer(status: int, fields: Mapping[str, object]) -> send_hold.HeldResponse:
+        return send_hold.HeldResponse(status, "application/json; charset=utf-8", json.dumps(fields).encode("utf-8"))
 
     def json_response(self, status: int, fields: Mapping[str, object], *,
-                      hold: send_hold.HoldHeader | None = None, hold_resolved: bool = False) -> None:
-        content = json.dumps(fields).encode("utf-8")
-        self.send_response(status)
+                      hold: send_hold.HoldHeader | None = None) -> None:
+        response = self.send_json_answer(status, fields)
+        resolved = self._save_send_response is not None
+        if self._save_send_response is not None:
+            self._save_send_response(response)
+            self._save_send_response = None
+        self.write_send_response(response, hold=hold, resolved=resolved)
+
+    def write_send_response(self, response: send_hold.HeldResponse, *, hold: send_hold.HoldHeader | None = None,
+                            resolved: bool = False) -> None:
+        self.send_response(response.status)
         if hold is not None:
             self.send_header("X-Send-Hold", hold.value)
-        if hold_resolved:
+        if resolved:
             self.send_header(send_hold.RESOLVED_HEADER, "1")
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Content-Type", response.content_type)
+        self.send_header("Content-Length", str(len(response.body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         if self.command != "HEAD":
-            _ = self.wfile.write(content)
+            _ = self.wfile.write(response.body)
             self.wfile.flush()
 
     @override

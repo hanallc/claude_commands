@@ -1,15 +1,13 @@
-"""Hold one console send for a short time so the user can undo it, as an email client does.
+"""Save each console Send until release, cancellation, or recovery.
 
-The browser marks a send with the hold header. The server saves the request and answers 202 at once.
-When the hold time ends, the server replays the saved request to itself; the normal handler then saves and sends.
-An undo before that time replaces the saved request with an undone mark, so nothing is saved and nothing is sent.
-Each hold is a file, so a server restart replays the holds that it finds, and a browser that lost its
-connection reads the same result again. A replay first writes a "may have left" result, so a server that stops
-during a replay never sends that request again.
+The server replays held requests through the normal handler when Undo ends.
+The server records uncertainty before release so a restart cannot replay the same request twice.
+After the response expires, the terminal record still reserves the Send ID.
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import json
 import secrets
@@ -37,7 +35,7 @@ HOLD_FOLDER = ".review-link-holds"
 REPLAY_HEADERS = frozenset(("content-type", "origin", "host", "accept"))
 # The server waits this long after the browser's Undo time ends, so a late Undo click still wins.
 RELEASE_GRACE_SECONDS = 1.0
-# A browser reads the result of a released send within this time; the sweep then deletes the result file.
+# Keep the response body for this time. Keep the Send ID after the body expires.
 RESULT_KEEP_SECONDS = 600.0
 RESULT_WAIT_SECONDS = 25.0
 # A handler that runs longer than this gives the "may have left" result.
@@ -55,19 +53,26 @@ class PendingFile(TypedDict):
     due: float
     started_at: NotRequired[float]
     scheduled_token_verified: NotRequired[bool]
+    new_item_token_verified: NotRequired[bool]
+    binding: NotRequired[str]
+    release_now: NotRequired[bool]
 
 
 class ReleasedFile(TypedDict):
     state: Literal["released"]
     status: int
     content_type: str
-    body: str
+    body: NotRequired[str]
     released_at: float
+    binding: NotRequired[str]
+    started_at: NotRequired[float]
+    refresh_token: NotRequired[bool]
 
 
 class UndoneFile(TypedDict):
     state: Literal["undone"]
     undone_at: float
+    binding: NotRequired[str]
 
 
 class ClosingFile(TypedDict):
@@ -81,12 +86,14 @@ HoldFile = PendingFile | ReleasedFile | UndoneFile | ClosingFile
 class BadFile(Enum):
     """A file in the hold folder that is not a readable hold."""
     UNREADABLE = "unreadable"
+    ABSENT = "no saved operation"
 
 
 class HoldHeader(Enum):
     """The X-Send-Hold answer header: the send waits for Undo, or its result is not ready."""
     HELD = "held"
     PENDING = "pending"
+    UNDONE = "undone"
 
 
 class HeldFields(TypedDict):
@@ -98,20 +105,40 @@ class HoldsStopped(Exception):
     """The server restarts, so it takes no new hold."""
 
 
-class HoldAdmission(Enum):
-    CONSOLE_SEND = "console send"
-    VERIFIED_SCHEDULE = "verified Scheduled token"
-    STALE_SCHEDULE_TOKEN = "stale Scheduled token"
+class OperationConflict(Exception):
+    """The Send ID has different content."""
 
 
-class StaleScheduleToken(Exception):
-    """The server cannot admit a new Scheduled hold with this token."""
+class UnseenOperation(Enum):
+    ABSENT = "no operation"
+
+
+@dataclass(frozen=True)
+class HoldAdmission:
+    seconds: float
+    new_item_token_verified: bool = False
+
+
+@dataclass(frozen=True)
+class DirectAdmission:
+    """Run the normal New item handler on this connection."""
+
+    new_item_token_verified: bool
+
+
+@dataclass(frozen=True)
+class DirectSend:
+    hold_id: str
+    started_at: float
+    binding: str
+    new_item_token_verified: bool
 
 
 @dataclass(frozen=True)
 class ActiveReplay:
     started_at: datetime
     scheduled_token_verified: bool
+    new_item_token_verified: bool = False
 
 
 class NoActiveReplay(Enum):
@@ -129,6 +156,8 @@ class HoldState(Enum):
     PENDING = "pending"
     UNDONE = "undone"
     MISSING = "missing"
+    EXPIRED = "expired"
+    UNCERTAIN = "uncertain"
 
 
 class UndoResult(Enum):
@@ -149,9 +178,26 @@ def failed(reason: str) -> HeldResponse:
     return HeldResponse(503, "application/json; charset=utf-8", json.dumps({"reason": reason}).encode("utf-8"))
 
 
-def released_file(response: HeldResponse) -> ReleasedFile:
-    return {"state": "released", "status": response.status, "content_type": response.content_type,
-            "body": base64.b64encode(response.body).decode("ascii"), "released_at": time.time()}
+def operation_binding(path: str, body: bytes, *, refreshable_token: bool = False) -> str:
+    if refreshable_token:
+        fields = cast(dict[str, object], json.loads(body))
+        _ = fields.pop("token", None)
+        body = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(path.encode("utf-8") + b"\0" + body).hexdigest()
+
+
+def released_file(response: HeldResponse, binding: str, started_at: float) -> ReleasedFile:
+    saved: ReleasedFile = {"state": "released", "status": response.status, "content_type": response.content_type,
+                           "body": base64.b64encode(response.body).decode("ascii"), "released_at": time.time(),
+                           "binding": binding, "started_at": started_at}
+    if response.status == 403 and response.content_type.startswith("application/json"):
+        try:
+            fields = cast(object, json.loads(response.body))
+        except (ValueError, RecursionError):
+            return saved
+        if isinstance(fields, dict) and cast(dict[str, object], fields).get("code") == "stale_token":
+            saved["refresh_token"] = True
+    return saved
 
 
 class Holds:
@@ -179,8 +225,10 @@ class Holds:
 
     def _write(self, hold_id: str, saved: HoldFile) -> None:
         # A hold keeps the user's words and images, so only the owner can read it.
-        self._folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-        write_text_atomic(self._file(hold_id), json.dumps(saved), new_file_mode=0o600)
+        content = json.dumps(saved)
+        with self._lock:
+            self._folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write_text_atomic(self._file(hold_id), content, new_file_mode=0o600)
 
     def _saved(self, path: Path) -> HoldFile | BadFile:
         """Read one hold file, or name it on stderr when it is not a hold."""
@@ -188,6 +236,8 @@ class Holds:
             saved = cast(HoldFile, json.loads(path.read_text(encoding="utf-8")))
             if saved["state"] in ("pending", "released", "undone", "closing"):
                 return saved
+        except FileNotFoundError:
+            return BadFile.ABSENT
         except (OSError, ValueError, KeyError, TypeError) as error:
             print(f"review-links send hold {path.name}: {error}", file=sys.stderr)
             return BadFile.UNREADABLE
@@ -211,51 +261,86 @@ class Holds:
                 self._answering -= 1
 
     def has_hold(self, hold_id: str) -> bool:
-        """Check for a saved request when the current Undo time is zero."""
+        """Check for an operation when the current Undo time is zero."""
         with self._lock:
-            if hold_id in self._timers or hold_id in self._releasing or hold_id in self._failed:
-                return True
-            saved = self._existing(hold_id)
-            return saved is not BadFile.UNREADABLE and saved["state"] != "closing"
+            return self._existing(hold_id) is not BadFile.ABSENT or hold_id in self._failed
 
     def _existing(self, hold_id: str) -> HoldFile | BadFile:
-        path = self._file(hold_id)
-        return self._saved(path) if path.exists() else BadFile.UNREADABLE
+        return self._saved(self._file(hold_id))
 
     def hold(self, path: str, headers: Mapping[str, str], body: bytes, seconds: float, *,
-             request_id: str = "", admission: HoldAdmission = HoldAdmission.CONSOLE_SEND,
-             retry: bool = False) -> HeldFields:
-        """Save a send or return its existing hold with the remaining Undo time."""
+             request_id: str = "") -> HeldFields:
+        held = self.submit(path, headers, body, request_id=request_id, binding=operation_binding(path, body),
+                           admit=lambda _: HoldAdmission(seconds))
+        assert isinstance(held, dict)
+        return held
+
+    def submit(self, path: str, headers: Mapping[str, str], body: bytes, *, request_id: str, binding: str,
+               admit: Callable[[UnseenOperation | ReleasedFile], HoldAdmission | DirectAdmission | HeldResponse],
+               refreshable_token: bool = False) -> HeldFields | DirectSend | HeldResponse:
+        """Resolve an existing operation or admit a new one under the same lock."""
         hold_id = request_id or new_hold_id()
         if not valid_hold_id(hold_id):
             raise ValueError("Invalid hold id")
-        started_at = time.time()
-        saved: PendingFile = {
-            "state": "pending", "path": path, "body": base64.b64encode(body).decode("ascii"),
-            "headers": {name: value for name, value in headers.items() if name.lower() in REPLAY_HEADERS},
-            "started_at": started_at, "due": started_at + seconds + (RELEASE_GRACE_SECONDS if seconds else 0),
-            "scheduled_token_verified": admission is HoldAdmission.VERIFIED_SCHEDULE}
-        with self._lock:
-            if hold_id in self._releasing or hold_id in self._failed:
-                return {"hold": hold_id, "seconds": 0}
-            timer = self._timers.get(hold_id)
-            existing = self._existing(hold_id)
-            if timer is not None:
-                remaining = (max(0.0, existing["due"] - RELEASE_GRACE_SECONDS - time.time())
-                             if existing is not BadFile.UNREADABLE and existing["state"] == "pending"
-                             and not timer.finished.is_set() else 0.0)
-                return {"hold": hold_id, "seconds": remaining}
-            if existing is not BadFile.UNREADABLE:
-                if existing["state"] != "closing":
+        while True:
+            with self._lock:
+                existing = self._existing(hold_id)
+                opening: UnseenOperation | ReleasedFile = UnseenOperation.ABSENT
+                started_at = time.time()
+                if isinstance(existing, dict) and existing["state"] != "closing":
+                    if existing.get("binding", binding) != binding:
+                        raise OperationConflict
+                    if existing["state"] == "pending":
+                        if "binding" not in existing:
+                            original = operation_binding(existing["path"], base64.b64decode(existing["body"]),
+                                                         refreshable_token=refreshable_token and existing["path"] == path)
+                            if original != binding:
+                                raise OperationConflict
+                        seconds = (max(0.0, existing["due"] - RELEASE_GRACE_SECONDS - started_at)
+                                   if hold_id in self._timers and not existing.get("release_now") else 0.0)
+                        return {"hold": hold_id, "seconds": seconds}
+                    if (existing["state"] != "released" or hold_id in self._releasing or hold_id in self._failed
+                            or "binding" not in existing
+                            or ("body" in existing and not existing.get("refresh_token"))):
+                        return {"hold": hold_id, "seconds": 0}
+                    opening = existing
+                    started_at = existing.get("started_at", started_at)
+                elif existing is BadFile.UNREADABLE or hold_id in self._failed:
                     return {"hold": hold_id, "seconds": 0}
-                if not retry:
-                    saved["due"] = time.time()
+            admission = admit(opening)
+            with self._lock:
+                if existing != self._existing(hold_id) or hold_id in self._failed:
+                    continue
+                if isinstance(admission, HeldResponse):
+                    return admission
+                if isinstance(admission, DirectAdmission):
+                    self._write(hold_id, released_file(failed(MAY_HAVE_LEFT), binding, started_at))
+                    self._releasing.add(hold_id)
+                    return DirectSend(hold_id, started_at, binding, admission.new_item_token_verified)
+                if isinstance(opening, dict):
+                    return {"hold": hold_id, "seconds": 0}
+                seconds = admission.seconds
+                if isinstance(existing, dict) and existing["state"] == "closing":
                     seconds = 0
-            if admission is HoldAdmission.STALE_SCHEDULE_TOKEN:
-                raise StaleScheduleToken
-            self._write(hold_id, saved)
-            self._schedule(hold_id, saved["due"])
-        return {"hold": hold_id, "seconds": seconds}
+                saved: PendingFile = {
+                    "state": "pending", "path": path, "body": base64.b64encode(body).decode("ascii"),
+                    "headers": {name: value for name, value in headers.items() if name.lower() in REPLAY_HEADERS},
+                    "started_at": started_at, "due": started_at + seconds + (RELEASE_GRACE_SECONDS if seconds else 0),
+                    "new_item_token_verified": admission.new_item_token_verified, "binding": binding,
+                    "release_now": seconds == 0}
+                self._write(hold_id, saved)
+                self._schedule(hold_id, saved["due"])
+                return {"hold": hold_id, "seconds": seconds}
+
+    @contextmanager
+    def direct_result(self, send: DirectSend) -> Generator[Callable[[HeldResponse], None]]:
+        """Save the normal handler response before it reaches the browser."""
+        try:
+            yield lambda answer: self._finish(send.hold_id, answer, send.binding, send.started_at)
+        finally:
+            with self._lock:
+                self._releasing.discard(send.hold_id)
+                self._lock.notify_all()
 
     def _schedule(self, hold_id: str, due: float) -> None:
         timer = threading.Timer(max(0.0, due - time.time()), self._release, (hold_id,))
@@ -270,35 +355,44 @@ class Holds:
         The mark is written before the timer stops, so a failed write raises OSError and the send still leaves.
         """
         with self._lock:
+            saved = self._existing(hold_id)
+            if hold_id in self._releasing or hold_id in self._failed:
+                return UndoResult.ALREADY_SENT
+            if isinstance(saved, BadFile) or saved["state"] == "closing":
+                return UndoResult.MISSING
             timer = self._timers.get(hold_id)
-            if timer is not None:
+            if timer is not None and saved["state"] == "pending" and not saved.get("release_now"):
                 undone: UndoneFile = {"state": "undone", "undone_at": time.time()}
+                if "binding" in saved:
+                    undone["binding"] = saved["binding"]
                 self._write(hold_id, undone)
                 del self._timers[hold_id]
                 timer.cancel()
+                self._lock.notify_all()
                 return UndoResult.UNDONE
-            if hold_id in self._releasing or hold_id in self._failed:
-                return UndoResult.ALREADY_SENT
-            saved = self._existing(hold_id)
-        if saved is BadFile.UNREADABLE or saved["state"] == "closing":
-            return UndoResult.MISSING
-        return UndoResult.UNDONE if saved["state"] == "undone" else UndoResult.ALREADY_SENT
+            return UndoResult.UNDONE if saved["state"] == "undone" else UndoResult.ALREADY_SENT
 
     def send_now(self, hold_id: str, *, expect_post: bool = False) -> bool:
-        """Release a pending send or record that its POST must send at once."""
+        """Save the immediate deadline or record page close before the POST."""
         with self._lock:
+            saved = self._existing(hold_id)
             timer = self._timers.get(hold_id)
             if timer is None:
                 if not expect_post or hold_id in self._releasing or hold_id in self._failed:
                     return False
-                saved = self._existing(hold_id)
-                if saved is BadFile.UNREADABLE:
+                if saved is BadFile.ABSENT:
                     self._write(hold_id, {"state": "closing", "closed_at": time.time()})
                     return True
-                return saved["state"] == "closing"
+                return isinstance(saved, dict) and saved["state"] == "closing"
+            if not isinstance(saved, dict) or saved["state"] != "pending":
+                raise OSError("The pending send is unreadable.")
+            saved["due"] = time.time()
+            saved["release_now"] = True
+            # A restart must retain this deadline after the page receives the answer.
+            self._write(hold_id, saved)
             timer.cancel()
-        threading.Thread(target=self._release, args=(hold_id,), daemon=True).start()
-        return True
+            self._schedule(hold_id, saved["due"])
+            return True
 
     def stop_if_idle(self) -> bool:
         """Stop all holds when no replay runs and no hold request is answered. Return whether they stopped.
@@ -337,7 +431,11 @@ class Holds:
             started_at = saved["started_at"] if "started_at" in saved else path.stat().st_mtime
             sent_at = datetime.fromtimestamp(started_at, UTC)
             # A server that stops during the replay finds this result, and never sends the request again.
-            self._write(hold_id, released_file(failed(MAY_HAVE_LEFT)))
+            binding = saved.get("binding", "")
+            marker = released_file(failed(MAY_HAVE_LEFT), binding, started_at)
+            if not binding:
+                del marker["binding"]
+            self._write(hold_id, marker)
         except (OSError, OverflowError, ValueError, KeyError, TypeError) as error:
             # A pending file left here would leave with the next server, after the page said it failed.
             print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
@@ -348,7 +446,8 @@ class Holds:
         # Only the replay request receives this ticket. The browser receives the hold ID.
         ticket = new_hold_id()
         with self._lock:
-            self._active_replays[ticket] = ActiveReplay(sent_at, saved.get("scheduled_token_verified") is True)
+            self._active_replays[ticket] = ActiveReplay(sent_at, saved.get("scheduled_token_verified") is True,
+                                                        saved.get("new_item_token_verified") is True)
         try:
             response = self._replay(saved["path"], saved["headers"], body, ticket)
         except TimeoutError:
@@ -359,8 +458,14 @@ class Holds:
         finally:
             with self._lock:
                 del self._active_replays[ticket]
+        self._finish(hold_id, response, binding, started_at)
+
+    def _finish(self, hold_id: str, response: HeldResponse, binding: str, started_at: float) -> None:
         try:
-            self._write(hold_id, released_file(response))
+            saved = released_file(response, binding, started_at)
+            if not binding:
+                del saved["binding"]
+            self._write(hold_id, saved)
         except OSError as error:
             print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
             with self._lock:
@@ -369,7 +474,7 @@ class Holds:
     def result(self, hold_id: str, *, wait: float = RESULT_WAIT_SECONDS) -> HeldResponse | HoldState:
         """Return the response of a released send, waiting a short time for a pending one.
 
-        A read keeps the result, so a browser that lost the answer can read it again until the sweep deletes it.
+        A read keeps the result so the browser can read it again until the response body expires.
         """
         deadline = time.monotonic() + wait
         with self._lock:
@@ -380,10 +485,9 @@ class Holds:
                 _ = self._lock.wait(left)
             if hold_id in self._failed:
                 return self._failed[hold_id]
-            path = self._file(hold_id)
-            saved = self._saved(path) if path.exists() else BadFile.UNREADABLE
-        if saved is BadFile.UNREADABLE:
-            return HoldState.MISSING
+            saved = self._existing(hold_id)
+        if isinstance(saved, BadFile):
+            return HoldState.MISSING if saved is BadFile.ABSENT else HoldState.UNCERTAIN
         match saved["state"]:
             case "pending":
                 # Only a stopped server keeps a pending file without its timer; the next server sends it.
@@ -395,49 +499,43 @@ class Holds:
             case "closing":
                 return HoldState.MISSING
             case "released":
+                if "body" not in saved:
+                    return HoldState.UNCERTAIN if saved["status"] >= 500 else HoldState.EXPIRED
                 return HeldResponse(saved["status"], saved["content_type"], base64.b64decode(saved["body"]))
 
     def recover(self) -> None:
-        """Schedule each saved send after a restart, and delete old results."""
+        """Schedule each saved send after a restart and remove expired response bodies."""
         if not self._folder.is_dir():
             return
         with self._lock:
             for path in sorted(self._folder.glob("*.json")):
                 saved = self._saved(path) if valid_hold_id(path.stem) else BadFile.UNREADABLE
-                if saved is not BadFile.UNREADABLE and saved["state"] == "pending":
+                if isinstance(saved, dict) and saved["state"] == "pending":
                     self._schedule(path.stem, saved["due"])
         self.expire()
 
     def expire(self) -> None:
-        """Delete each result and undone mark older than RESULT_KEEP_SECONDS, and each file that is not a hold.
-
-        The folder is private to the holds, so a bad hold, or an old temporary file of a cut write, goes too.
-        """
+        """Remove expired response bodies and old temporary files."""
         if not self._folder.is_dir():
             return
         oldest = time.time() - RESULT_KEEP_SECONDS
-        with self._lock:
-            busy = self._timers.keys() | self._releasing
-        # A released or undone file does not change again, so the reads need no lock.
         for path in self._folder.iterdir():
-            if path.stem in busy:
-                continue
-            if path.suffix != ".json" or not valid_hold_id(path.stem):
-                if path.is_file() and path.stat().st_mtime < oldest:
-                    path.unlink(missing_ok=True)
-                continue
-            saved = self._saved(path)
-            if saved is BadFile.UNREADABLE:
-                path.unlink(missing_ok=True)
-            elif saved["state"] == "released" and saved["released_at"] < oldest:
-                path.unlink(missing_ok=True)
-            elif saved["state"] == "undone" and saved["undone_at"] < oldest:
-                path.unlink(missing_ok=True)
-            elif saved["state"] == "closing" and saved["closed_at"] < oldest:
-                with self._lock:
-                    current = self._existing(path.stem)
-                    if current == saved:
-                        path.unlink(missing_ok=True)
+            with self._lock:
+                if path.suffix != ".json" or not valid_hold_id(path.stem):
+                    try:
+                        if path.is_file() and path.stat().st_mtime < oldest:
+                            path.unlink(missing_ok=True)
+                    except FileNotFoundError:
+                        pass
+                    continue
+                if path.stem in self._timers or path.stem in self._releasing:
+                    continue
+                saved = self._saved(path)
+                if isinstance(saved, BadFile):
+                    continue
+                if saved["state"] == "released" and "body" in saved and saved["released_at"] < oldest:
+                    del saved["body"]
+                    self._write(path.stem, saved)
 
 
 def replay_to(address: str, port: int) -> Replay:

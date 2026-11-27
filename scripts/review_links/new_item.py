@@ -657,8 +657,8 @@ def refuse_scheduled_draft_reuse(request_id: str) -> None:
     review_submissions.refuse_scheduled_draft_reuse(request_id, load_list_draft=_load_list_draft)
 
 
-def scheduled_draft_is_filed(request_id: new_item_dialog.ScheduledDraftId) -> bool:
-    return review_submissions.draft_is_filed(request_id.value, load_list_draft=_load_list_draft)
+def read_draft_filing(draft_id: str) -> review_submissions.DraftFilingRead:
+    return review_submissions.read_draft_filing(draft_id, load_list_draft=_load_list_draft)
 
 
 def submit_scheduled(request: new_item_dialog.ScheduledSubmission, *,

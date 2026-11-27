@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import page_frame, send_hold
 from scripts.review_links.browser_test_support import firefox_probe_results
 from scripts.review_links.send_hold import HeldResponse, Holds, HoldState, UndoResult
@@ -60,8 +61,8 @@ class HoldsTests(unittest.TestCase):
         self.assertIs(holds.result(hold_id, wait=0), HoldState.UNDONE)
         with patch.object(send_hold, "RESULT_KEEP_SECONDS", -1.0):
             holds.expire()
-        self.assertEqual(self.held_files(), [])
-        self.assertIs(holds.undo(hold_id), UndoResult.MISSING)
+        self.assertEqual(self.held_files(), [f"{hold_id}.json"])
+        self.assertIs(holds.undo(hold_id), UndoResult.UNDONE)
         self.assertEqual(replays.sent, [])
 
     def test_a_failed_undo_write_keeps_the_send_and_its_timer(self) -> None:
@@ -103,8 +104,13 @@ class HoldsTests(unittest.TestCase):
         _ = (self.folder / f"{hold_id}.json").write_text(json.dumps(pending), encoding="utf-8")
         after = Holds(self.folder, replays)
         after.recover()
-        with patch.object(send_hold, "write_text_atomic", side_effect=OSError("disk full")), \
-                contextlib.redirect_stderr(io.StringIO()):
+        def fail_result(path: Path, words: str, *, new_file_mode: int | None = None) -> None:
+            if json.loads(words)["state"] == "released":
+                raise OSError("disk full")
+            write_text_atomic(path, words, new_file_mode=new_file_mode)
+
+        with (patch.object(send_hold, "write_text_atomic", side_effect=fail_result),
+              contextlib.redirect_stderr(io.StringIO())):
             self.assertTrue(after.send_now(hold_id))
             result = after.result(hold_id, wait=5)
         assert isinstance(result, HeldResponse)
@@ -126,8 +132,9 @@ class HoldsTests(unittest.TestCase):
         self.assertEqual(self.held_files(), [f"{hold_id}.json"])
         with patch.object(send_hold, "RESULT_KEEP_SECONDS", -1.0):
             holds.expire()
-        self.assertEqual(self.held_files(), [])
-        self.assertIs(holds.result(hold_id, wait=0), HoldState.MISSING)
+        self.assertEqual(self.held_files(), [f"{hold_id}.json"])
+        self.assertIs(holds.result(hold_id, wait=0), HoldState.EXPIRED)
+        self.assertNotIn('"body"', (self.folder / f"{hold_id}.json").read_text())
 
     def test_an_undo_after_the_send_left_says_already_sent(self) -> None:
         replays = Replays()
@@ -148,6 +155,19 @@ class HoldsTests(unittest.TestCase):
         self.assertIs(holds.undo(hold_id), UndoResult.ALREADY_SENT)
         self.assertEqual(len(replays.sent), 1)
 
+    def test_page_close_persists_the_immediate_release_time_before_restart(self) -> None:
+        before = Holds(self.folder, Replays())
+        hold_id = before.hold("/review", {}, b"words", 60)["hold"]
+        with patch.object(before, "_schedule"):
+            self.assertTrue(before.send_now(hold_id))
+        self.assertTrue(before.stop_if_idle())
+
+        replays = Replays()
+        after = Holds(self.folder, replays)
+        after.recover()
+        self.assertEqual(after.result(hold_id, wait=2), OK)
+        self.assertEqual(replays.sent, [("/review", {}, b"words")])
+
     def test_a_stop_waits_for_a_running_replay_and_no_replay_starts_after_it(self) -> None:
         started, finish, calls = threading.Event(), threading.Event(), list[str]()
 
@@ -163,6 +183,8 @@ class HoldsTests(unittest.TestCase):
         self.assertFalse(holds.stop_if_idle())
         # The saved file already says the send may have left, so a crash now never sends it again.
         saved = cast(send_hold.ReleasedFile, json.loads((self.folder / f"{hold_id}.json").read_text(encoding="utf-8")))
+        self.assertIn("body", saved)
+        assert "body" in saved
         self.assertEqual((saved["status"], json.loads(base64.b64decode(saved["body"]))),
                          (503, {"reason": send_hold.MAY_HAVE_LEFT}))
         self.assertIs(holds.result(hold_id, wait=0), HoldState.PENDING)
@@ -182,7 +204,8 @@ class HoldsTests(unittest.TestCase):
         holds = Holds(self.folder, Replays())
         hold_id = holds.hold("/review", {}, b"words", 60)["hold"]
         _ = holds.undo(hold_id)
-        released = send_hold.released_file(send_hold.failed(send_hold.MAY_HAVE_LEFT))
+        binding = send_hold.operation_binding("/review", b"words")
+        released = send_hold.released_file(send_hold.failed(send_hold.MAY_HAVE_LEFT), binding, time.time())
         _ = (self.folder / f"{hold_id}.json").write_text(json.dumps(released), encoding="utf-8")
         replays = Replays()
         after = Holds(self.folder, replays)
@@ -207,10 +230,11 @@ class HoldsTests(unittest.TestCase):
             Holds(self.folder, Replays()).recover()
             holds.expire()
         self.assertIn("unknown state", stderr.getvalue())
-        # The sweep deletes each bad hold and each old file that is not a hold; the pending hold stays.
-        self.assertEqual(self.held_files(), [f"{hold_id}.json"])
+        # An unreadable Send ID stays reserved.
+        self.assertEqual(set(self.held_files()), {f"{hold_id}.json", f"{'1' * 24}.json", f"{'2' * 24}.json"})
         self.assertFalse(stale.exists())
-        self.assertIs(holds.result("1" * 24, wait=0), HoldState.MISSING)
+        with contextlib.redirect_stderr(stderr):
+            self.assertIs(holds.result("1" * 24, wait=0), HoldState.UNCERTAIN)
 
     def test_a_failed_replay_gives_a_503_result(self) -> None:
         def refused(_path: str, _headers: Mapping[str, str], _body: bytes, _ticket: str) -> HeldResponse:
@@ -222,7 +246,7 @@ class HoldsTests(unittest.TestCase):
         self.assertEqual(result.status, 503)
         self.assertIn(b"The held send failed", result.body)
 
-    def test_a_restart_sends_each_held_send_and_deletes_old_results(self) -> None:
+    def test_a_restart_sends_each_held_send_and_removes_old_response_bodies(self) -> None:
         before = Holds(self.folder, Replays())
         waiting = before.hold("/review", {}, b"words", 60)["hold"]
         _ = before.undo(waiting)
@@ -241,7 +265,8 @@ class HoldsTests(unittest.TestCase):
         after.recover()
         self.assertEqual(after.result(waiting, wait=5), OK)
         self.assertEqual(replays.sent, [("/review", {}, b"words")])
-        self.assertEqual(self.held_files(), [f"{waiting}.json", "not-a-hold.json"])
+        self.assertEqual(set(self.held_files()), {f"{old}.json", f"{waiting}.json", "not-a-hold.json"})
+        self.assertIs(after.result(old, wait=0), HoldState.EXPIRED)
 
 
 HELD_SEND_PROBE = r"""<script>

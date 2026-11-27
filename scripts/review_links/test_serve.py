@@ -296,9 +296,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                     super().review_post()
 
             @override
-            def new_item_post(self) -> None:
+            def new_item_post(self, *, request_id: str = "", undo_seconds: int = 0) -> None:
                 with new_item_posts.running():
-                    super().new_item_post()
+                    super().new_item_post(request_id=request_id, undo_seconds=undo_seconds)
 
         server.RequestHandlerClass = ReviewFixtureHandler
         self.port = server.server_port
@@ -432,9 +432,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                     complete.set()
 
             @override
-            def new_item_post(self) -> None:
+            def new_item_post(self, *, request_id: str = "", undo_seconds: int = 0) -> None:
                 during_post.append((get_recipients().status, len(reads)))
-                super().new_item_post()
+                super().new_item_post(request_id=request_id, undo_seconds=undo_seconds)
 
         def read() -> staff.StaffSnapshot:
             members = staff.local_snapshot()
@@ -1138,13 +1138,14 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(investigation.records(owner.id), [])
 
     def held_http(self, method: str, path: str, body: bytes | None = None, *,
-                  headers: dict[str, str] | None = None) -> tuple[int, str, dict[str, object]]:
+                  headers: dict[str, str] | None = None, origin: bool = True) -> tuple[int, str, dict[str, object]]:
         """Send one request from the console origin and return its status, hold header, and JSON fields."""
         host = f"127.0.0.1:{self.port}"
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
-            connection.request(method, path, body, {"Host": host, "Origin": f"http://{host}",
-                                                    "Content-Type": "application/json", **(headers or {})})
+            origin_header = {"Origin": f"http://{host}"} if origin else {}
+            connection.request(method, path, body, {"Host": host, "Content-Type": "application/json",
+                                                    **origin_header, **(headers or {})})
             response = connection.getresponse()
             body = response.read()
             json_answer = (response.getheader("Content-Type") or "").startswith("application/json")
@@ -1261,6 +1262,36 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(self.hold_states(), ["released"])
                 self.assertEqual(the_list.records(morty.id), [item])
 
+    def test_a_stale_scheduled_send_admits_the_same_id_after_refresh(self) -> None:
+        case = self.review_fixture()
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        send_id = send_hold.new_hold_id()
+        held_path = f"{send_hold.HOLD_PATH}/{send_id}"
+        marked = {send_hold.HOLD_HEADER: "1", send_hold.REQUEST_HEADER: send_id}
+        request = {
+            "token": "expired", "kind": "scheduled", "page": "list", "page_recipient": "producer",
+            "request_id": "s1-" + uuid4().hex, "recipient_id": morty.id, "assignee_id": case.fixture.unit.id,
+            "words": "Check the Scheduled item. Start 2099-11-30T09:00Z.",
+        }
+        stale_body = json.dumps(request).encode()
+        stale = self.held_http("POST", review_page.NEW_ITEM_PATH, stale_body, headers=marked)
+        self.assertEqual((stale[0], stale[2]["code"]), (403, "stale_token"))
+        self.assertEqual(self.hold_states(), [])
+        fresh_body = json.dumps({**request, "token": self.server.new_item_token}).encode()
+        admitted = self.held_http("POST", review_page.NEW_ITEM_PATH, fresh_body, headers=marked)
+        self.assertEqual(admitted, (202, "held", {"hold": send_id, "seconds": 60}))
+        late = self.held_http("POST", review_page.NEW_ITEM_PATH, stale_body, headers=marked)
+        self.assertEqual((late[0], late[1], late[2]["hold"]), (202, "held", send_id))
+        self.assertGreater(cast(float, late[2]["seconds"]), 0)
+        self.assertEqual(the_list.records(morty.id), [])
+        self.assertEqual(self.held_http("POST", held_path + "/send")[0], 200)
+        status, _, saved = self.held_http("GET", held_path)
+        self.assertEqual(status, 200, saved)
+        item, = the_list.records(morty.id)
+        self.assertEqual(item.id, saved["id"])
+        self.assertIsInstance(item.schedule, the_list.ScheduledRun)
+
     def test_a_closed_page_sends_a_held_new_item_at_once(self) -> None:
         case, other, body = self.held_new_item()
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
@@ -1312,7 +1343,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_retry_first_starts_the_hold_and_a_late_post_joins_it(self) -> None:
         self.check_retry_first(page_closed=False)
 
-    def test_retry_first_starts_undo_after_the_page_close_signal(self) -> None:
+    def test_retry_first_releases_at_once_after_the_page_close_signal(self) -> None:
         self.check_retry_first(page_closed=True)
 
     def check_retry_first(self, *, page_closed: bool) -> None:
@@ -1321,26 +1352,144 @@ class ReviewLinksServerTests(unittest.TestCase):
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request_id = send_hold.new_hold_id()
         held_path = f"{send_hold.HOLD_PATH}/{request_id}"
-        recovery_headers = {send_hold.REQUEST_HEADER: request_id}
-        expected = (202, "held", {"hold": request_id, "seconds": 60})
+        headers = {send_hold.REQUEST_HEADER: request_id, send_hold.HOLD_HEADER: "1"}
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
               capture_sender("send_message") as send):
             if page_closed:
-                self.assertEqual(self.held_http("POST", held_path + "/send", headers=recovery_headers)[0], 200)
-            self.assertEqual(self.held_http("POST", review_page.NEW_ITEM_PATH, body,
-                                            headers=recovery_headers), expected)
-            late = self.held_http("POST", review_page.NEW_ITEM_PATH, body,
-                                  headers={**recovery_headers, send_hold.HOLD_HEADER: "1"})
+                self.assertEqual(self.held_http("POST", held_path + "/send", headers=headers)[0], 200)
+            first_headers = {send_hold.REQUEST_HEADER: request_id} if page_closed else headers
+            expected_seconds = 0 if page_closed else 60
+            self.assertEqual(self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=first_headers),
+                             (202, "held", {"hold": request_id, "seconds": expected_seconds}))
+            late = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=headers)
             self.assertEqual((late[0], late[1], late[2]["hold"]), (202, "held", request_id))
-            self.assertGreater(cast(float, late[2]["seconds"]), 0)
-            self.assertEqual(self.hold_states(), ["pending"])
-            self.assertEqual(investigation.records(other.id), [])
-            send.assert_not_called()
-            self.assertEqual(self.held_http("POST", held_path + "/send")[0], 200)
+            remaining = cast(float, late[2]["seconds"])
+            if page_closed:
+                self.assertEqual(remaining, 0)
+            else:
+                self.assertGreater(remaining, 0)
+                self.assertEqual(self.hold_states(), ["pending"])
+                self.assertEqual(investigation.records(other.id), [])
+                send.assert_not_called()
+                self.assertEqual(self.held_http("POST", held_path + "/send")[0], 200)
             status, _, fields = self.held_http("GET", held_path)
             self.assertEqual(status, 200, fields)
             self.assertEqual(self.hold_states(), ["released"])
+            send.assert_called_once()
+        self.assertEqual(len(investigation.records(other.id)), 1)
+
+    def test_a_zero_undo_send_files_without_origin(self) -> None:
+        case, other, body = self.held_new_item()
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=0\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        send_id = send_hold.new_hold_id()
+        marked = {send_hold.HOLD_HEADER: "1", send_hold.REQUEST_HEADER: send_id}
+        started, resume = threading.Event(), threading.Event()
+        file = serve.ReviewLinksHandler.review_item_post
+
+        def delay(handler: serve.ReviewLinksHandler, server: serve.ReviewLinksServer, fields: dict[str, object],
+                  token: object, valid_token: bool, claims: ExitStack) -> None:
+            started.set()
+            self.assertTrue(resume.wait(TEST_HANG_GUARD_SECS))
+            file(handler, server, fields, token, valid_token, claims)
+
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(serve.ReviewLinksHandler, "review_item_post", delay),
+              capture_sender("send_message") as send,
+              ThreadPoolExecutor(max_workers=1) as pool):
+            post = pool.submit(self.new_item_http, body, headers=marked)
+            try:
+                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
+                _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+                retry = self.new_item_http(body, headers=marked)
+                self.assertEqual((retry.status, json.loads(retry.body)), (202, {"hold": send_id, "seconds": 0}))
+                new_id = {**marked, send_hold.REQUEST_HEADER: send_hold.new_hold_id()}
+                blocked = self.new_item_http(body, headers=new_id)
+                self.assertEqual(blocked.status, 403, blocked.body)
+            finally:
+                resume.set()
+            first = post.result(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(first.status, 200, first.body)
+            self.assertEqual(self.held_http("GET", f"{send_hold.HOLD_PATH}/{send_id}"),
+                             (200, "", json.loads(first.body)))
+            send.assert_called_once()
+        self.assertEqual(len(investigation.records(other.id)), 1)
+
+    def test_a_legacy_list_marker_recovers_an_item_without_undo(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              new_item_notice_log(self.root, owner.id) as notices):
+            for marker in ("list-receipt-key", "list-capture-target.json"):
+                with self.subTest(marker=marker):
+                    draft_id = "r6-" + uuid4().hex
+                    request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
+                                      page="list", request_id=draft_id,
+                                      page_recipient=new_item_dialog.PageRecipient.SELECTED)
+                    body = self.new_item_body(request)
+                    status, _, saved = self.held_http("POST", review_page.NEW_ITEM_PATH, body)
+                    self.assertEqual(status, 200, saved)
+                    folder = self.submission_draft_folder(draft_id)
+                    index = folder.parent / ".draft-index" / draft_id
+                    shutil.rmtree(index)
+                    receipt = folder / "receipt.json"
+                    native_request = f"{draft_id}-investigation-{owner.id}"
+                    if marker == "list-receipt-key":
+                        receipt.unlink()
+                        key = new_item_dialog.submission_key(new_item_dialog.SubmissionKind.INVESTIGATION,
+                                                             owner.id, cast(str, saved["id"]), native_request)
+                        _ = (folder / marker).write_text(key + "\n", encoding="utf-8")
+                    else:
+                        fields = cast(dict[str, object], json.loads(receipt.read_text(encoding="utf-8")))
+                        _ = (folder / marker).write_text(json.dumps({
+                            **fields, "request_id": native_request,
+                        }), encoding="utf-8")
+                        receipt.unlink()
+                    (folder / "pending.json").unlink(missing_ok=True)
+                    marked = {send_hold.HOLD_HEADER: "1", send_hold.REQUEST_HEADER: send_hold.new_hold_id()}
+                    recovered = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=marked)
+                    self.assertEqual(recovered[0:2], (200, ""), recovered)
+                    self.assertEqual(recovered[2]["id"], saved["id"])
+            self.assertEqual(len(read_new_item_notices(notices)), 2)
+        self.assertEqual(len(investigation.records(owner.id)), 2)
+
+    def test_expired_send_results_cannot_reopen_completed_or_undone_operations(self) -> None:
+        case, other, body = self.held_new_item()
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(send_hold, "RESULT_KEEP_SECONDS", -1.0),
+              capture_sender("send_message") as send):
+            for action in ("send", "undo"):
+                with self.subTest(action=action):
+                    request_id = send_hold.new_hold_id()
+                    path = f"{send_hold.HOLD_PATH}/{request_id}"
+                    headers = {send_hold.HOLD_HEADER: "1", send_hold.REQUEST_HEADER: request_id}
+                    self.assertEqual(self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=headers),
+                                     (202, "held", {"hold": request_id, "seconds": 60}))
+                    self.assertEqual(self.held_http("POST", path + "/" + action)[0], 200)
+                    self.assertEqual(self.held_http("GET", path)[0], 200 if action == "send" else 404)
+                    self.server.send_holds.expire()
+                    retry = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=headers)
+                    if action == "undo":
+                        self.assertEqual(retry, (202, "held", {"hold": request_id, "seconds": 0}))
+                        self.assertEqual(self.held_http("GET", path)[2]["reason"], "This send was undone.")
+                    else:
+                        self.assertEqual(retry[0:2], (200, ""), retry)
+                    fields = cast(dict[str, object], json.loads(body))
+                    different = json.dumps({**fields, "words": "Do not substitute these words."}).encode()
+                    self.assertEqual(self.held_http("POST", review_page.NEW_ITEM_PATH, different, headers=headers)[0], 409)
+                    body = json.dumps({**fields, "request_id": "r6-" + uuid4().hex}).encode()
             send.assert_called_once()
         self.assertEqual(len(investigation.records(other.id)), 1)
 
@@ -1360,8 +1509,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(self.hold_states(), [])
         resumed = self.held_http("POST", review_page.NEW_ITEM_PATH, body,
                                 headers={send_hold.REQUEST_HEADER: request_id})
-        self.assertEqual(resumed, (202, "held", {"hold": request_id, "seconds": 0}))
-        self.assertEqual(self.held_http("GET", f"{send_hold.HOLD_PATH}/{request_id}"), (200, "", saved))
+        self.assertEqual(resumed, (200, "", saved))
         item, = the_list.records(morty.id)
         self.assertEqual(item.id, saved["id"])
 
@@ -1464,7 +1612,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         browser = f"/{change_page.CONSOLE_FOLDER}/changes.html"
         for path in (review_page.PAGE_PATH, list_page.PAGE_PATH, images.PAGE_PATH, review_page.NEW_ITEM_PATH, browser):
             with self.subTest(path=path), patch.object(serve.ReviewLinksHandler, "_write_post") as write:
-                status, hold, fields = self.held_http("POST", path, b"outcome=works", headers=marked)
+                body = (json.dumps({"token": self.server.new_item_token}).encode()
+                        if path == review_page.NEW_ITEM_PATH else b"outcome=works")
+                status, hold, fields = self.held_http("POST", path, body, headers=marked)
                 self.assertEqual((status, hold), (202, "held"), fields)
                 write.assert_not_called()
                 undo = f"{send_hold.HOLD_PATH}/{fields['hold']}/undo"

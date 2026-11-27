@@ -1511,6 +1511,7 @@ function bindDraft(dialog, fresh = false) {
 
  function editDraft(event) {
   if (sending || isRecovering()) return;
+  if (submittedDraft?.mode === 'unadmitted') clearSubmittedDraft();
   if (event?.target.name === 'kind') {
    discardCapture();
    if (!awaitingNativeRecovery || isEditingLater()) {
@@ -1600,9 +1601,10 @@ function bindDraft(dialog, fresh = false) {
   const data = await response.json().catch(() => null);
   if (!response.ok || !data) {
    const failure = new Error(data?.error || data?.reason || fallback);
-   if (unresolvedHold) throw failure;
-   failure.definiteRefusal = response.status >= 400 && response.status < 500 && data?.code !== 'draft_pending';
    failure.staleToken = response.status === 403 && data?.code === 'stale_token';
+   if (unresolvedHold) throw failure;
+   failure.definiteRefusal = response.status >= 400 && response.status < 500 &&
+     !failure.staleToken && data?.code !== 'draft_pending';
    failure.screenshotExpired = response.status === 409 && data?.code === 'screenshot_expired';
    if (response.status === 409 && data?.code === 'already_filed' &&
        typeof data.id === 'string' && /^[QPIL][1-9][0-9]*$/.test(data.id)) {
@@ -1644,12 +1646,14 @@ function bindDraft(dialog, fresh = false) {
   updateSend();
  }
 
- async function post(payload, {keepalive = false, hold, receiver, receipt} = {}) {
+ async function post(payload, {keepalive = false, requestId, receiver, receipt} = {}) {
   const options = {method: 'POST', headers: {'Content-Type': 'application/json'},
                    body: JSON.stringify(payload), keepalive};
-  const response = await (hold ? heldFetch(endpoint, options, receiver, undefined, receipt, hold) : fetch(endpoint, options));
-  if (!hold && receipt) await showImmediateSendReceipt(response, receipt);
-  return responseData(response, 'Could not send this item.', {unresolvedHold: hold && !!submittedDraft?.holdId});
+  const response = await (requestId ? heldFetch(endpoint, options, receiver, undefined, receipt, requestId)
+                                    : fetch(endpoint, options));
+  return responseData(response, 'Could not send this item.', {
+   unresolvedHold: requestId && response.headers.get('X-Send-Hold-Resolved') !== '1'
+  });
  }
 
  function clip(value, length = 240) {
@@ -2070,7 +2074,7 @@ function bindDraft(dialog, fresh = false) {
        draft.assignee !== laterBase.assignee || draft.include !== laterBase.include || !sameFiles) laterDraft = draft;
    laterBase = undefined;
   }
-  draft.mode = draft.mode === 'screenshot-expired' ? 'screenshot-expired' : 'retry';
+  if (!['screenshot-expired', 'unadmitted'].includes(draft.mode)) draft.mode = 'retry';
   draftId = original.request_id;
   ownerPage = original.page ?? '';
   if (ownerPage === 'list') {
@@ -2083,7 +2087,7 @@ function bindDraft(dialog, fresh = false) {
     }
    }
   }
-  awaitingEarlierSend = true;
+  awaitingEarlierSend = draft.mode !== 'unadmitted' || awaitingNativeRecovery;
   form.elements.kind.value = draft.selectedKind || original.kind;
   selectedRecipient = original.recipient_id;
   selectedAssignee = original.assignee_id || '';
@@ -2156,7 +2160,8 @@ function bindDraft(dialog, fresh = false) {
   }
   setSending(true);
   try {
-   await storeSubmittedDraft({...submittedDraft, payload, mode: 'retry', includeScreenshot: renew});
+   await storeSubmittedDraft({...submittedDraft, payload, mode: 'retry', includeScreenshot: renew,
+                              holdId: randomNonce().slice(0, 24)});
    includePage.checked = renew;
    setError('');
   } catch (failure) {
@@ -2335,6 +2340,7 @@ function bindDraft(dialog, fresh = false) {
  dialog.querySelector('[data-cancel]').addEventListener('click', () => close());
  done.addEventListener('click', () => close({acknowledged: true}));
  async function submissionPayload() {
+  if (submittedDraft?.mode === 'unadmitted') return submittedDraft.payload;
   const pending = pendingPayload();
   if (pending) return pending;
   const type = form.elements.kind.value, recipient = recipientChips.querySelector('input:checked');
@@ -2378,39 +2384,40 @@ function bindDraft(dialog, fresh = false) {
    if (submittedDraft?.payload !== item) {
     const recipientName = recipientChips.querySelector('input:checked')?.nextElementSibling.textContent;
     const draft = {payload: item, mode: 'live', recipientName, pageContext, selectedKind: form.elements.kind.value,
-                   includeScreenshot: includePage.checked, holdId: hadEarlierSend ? '' : randomNonce().slice(0, 24)};
+                   includeScreenshot: includePage.checked, holdId: randomNonce().slice(0, 24)};
     if (separateFromNativeDraft && nativeListEdit) {
      const files = await Promise.all(nativeListEdit.files.map(pastedData));
      draft.nativeListEdit = {...nativeListEdit, files};
     }
     await storeSubmittedDraft(draft);
+   } else if (!submittedDraft.holdId) {
+    await storeSubmittedDraft({...submittedDraft, holdId: randomNonce().slice(0, 24)});
    }
    awaitingEarlierSend = true;
    storeListDraft();
    usedPreview = Boolean(item.capture_key && !item.defer_capture);
-   const sendItem = hold => {
+   const requestId = submittedDraft.holdId;
+   const sendItem = () => {
     posted = true;
     if (usedPreview && captureSession?.image?.key === item.capture_key) captureSession.sent = true;
     const receiver = recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
-    return post({...item, token}, {hold, receiver: receiver || undefined,
+    return post({...item, token}, {requestId, receiver: receiver || undefined,
                                  receipt: item.kind === 'scheduled' ? scheduledReceipt : undefined});
-   };
-   const requestId = submittedDraft.holdId;
-   const onResolvedRefusal = async () => {
-    if (submittedDraft?.holdId === requestId) {
-     const draft = {...submittedDraft, holdId: ''};
-     submittedDraft = draft;
-     await storeSubmittedDraft(draft).catch(() => {});
-    }
    };
    let result;
    try {
-    result = await sendItem(requestId ? {requestId, recover: hadEarlierSend, onResolvedRefusal} : undefined);
+    result = await sendItem();
    } catch (failure) {
-    if ((onList && item.kind !== 'scheduled') || !failure?.staleToken) throw failure;
+    if (!failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);
     setOptions(fresh);
-    if (!pendingPayload() && selectedRecipient !== item.recipient_id) throw failure;
+    if (onList && item.kind !== 'scheduled') {
+     if (!hadEarlierSend && !pendingPayload()) {
+      if (selectedRecipient === item.recipient_id) failure.unadmittedDraft = true;
+      else failure.definiteRefusal = true;
+     }
+     throw failure;
+    }
     result = await sendItem();
    }
    const expectedId = item.kind === 'scheduled' ? /^L[1-9][0-9]*$/ : /^[QPI][1-9][0-9]*$/;
@@ -2430,7 +2437,12 @@ function bindDraft(dialog, fresh = false) {
     setError(failure.message);
     return;
    }
-   if (posted && !failure?.definiteRefusal && submittedDraft && !isRecovering()) {
+   if (failure?.unadmittedDraft) {
+    awaitingEarlierSend = awaitingNativeRecovery;
+    try { await storeSubmittedDraft({...submittedDraft, mode: 'unadmitted'}); } catch (_) {}
+    storeListDraft();
+   } else if (posted && !failure?.definiteRefusal && submittedDraft && !isRecovering()) {
+    submittedDraft.mode = 'retry';
     showSubmittedDraft(submittedDraft);
     try { await storeSubmittedDraft(submittedDraft); } catch (_) {}
    }
@@ -2464,8 +2476,8 @@ function bindDraft(dialog, fresh = false) {
     if (failure?.screenshotExpired && !chooseCapture && includePage.checked) {
      discardCapture(!onList);
      void renewCapture();
-    } else if (onList && (failure?.staleToken || failure instanceof TypeError)) {
-     if (!pendingPayload() && (failure?.staleToken || !captureSession?.image)) discardCapture();
+    } else if (onList && failure instanceof TypeError) {
+     if (!pendingPayload() && !captureSession?.image) discardCapture();
      const signal = opening.signal;
      const fresh = await loadOptions(signal).catch(() => null);
      if (!signal.aborted && fresh) {

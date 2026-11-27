@@ -252,7 +252,7 @@ async function sendSaved() {
      return Promise.resolve(new Response(
        JSON.stringify({code:'stale_token', error:'The token expired again.'}), {status:403, headers:resolved}));
     }
-    throw new Error('The dialog attempted an extra Send.');
+    return Promise.resolve(Response.json({id:'I1'}));
    };
    const trySend = async () => {
     const rejected = untilError();
@@ -270,13 +270,14 @@ async function sendSaved() {
          'An unrelated HTTP 403 uses the server message and does not retry.');
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    await trySend();
-   window.fetch = originalFetch;
    check(attempted.length === 4 && attempted[2].request_id === attempted[3].request_id &&
          error.textContent === 'The token expired again.', 'The dialog retries an expired token once.');
    check(attempted[0].request_id === attempted[1].request_id && attempted[1].request_id !== attempted[2].request_id &&
          attempted[0].recipient_id !== attempted[1].recipient_id && attempted[1].kind !== attempted[2].kind,
          'Changing the recipient keeps the draft ID. Changing the kind creates a new ID.');
-   type('');
+   await sendSaved();
+   window.fetch = originalFetch;
+   await open();
    dialog.querySelector('[data-cancel]').click();
    check(closeToLauncher(), 'Cancel restores focus to the launcher.');
 
@@ -644,7 +645,7 @@ async function sendSaved() {
     check(renewedKey !== retry.capture_key && next.capture_key === renewedKey &&
           next.request_id !== retry.request_id, 'The next Send uses a new capture and draft ID.');
    }
-   const listPosts = [];
+   const listPosts = [], listSendIds = [];
    let listToken = 'list-token-before-restart';
    window.fetch = (url, options) => {
     if (url === '/console/review/new-item?page=list') {
@@ -660,6 +661,7 @@ async function sendSaved() {
      const payload = JSON.parse(options.body);
      if (payload.page_capture) return json({error:'No Firefox.'}, 503);
      listPosts.push(payload);
+     listSendIds.push(new Headers(options.headers).get('X-Undo-Request'));
     }
     return originalFetch(url, options);
    };
@@ -689,6 +691,7 @@ async function sendSaved() {
          listPosts[1].request_id === listPosts[0].request_id && listPosts[1].words === listPosts[0].words &&
          listPosts[1].recipient_id === listPosts[0].recipient_id && listPosts[1].token === listToken,
          'The retry sends the same List draft and recipient with the current token.');
+   check(!!listSendIds[0] && listSendIds[1] === listSendIds[0], 'List Retry keeps the Send ID.');
 
    window.fetch = (url, options) => {
     if (url === '/console/review/new-item?page=list') {
@@ -1541,7 +1544,7 @@ function storeShippedPointer(id, value) {
 history.replaceState(null, '', '/console/list.html' + location.search);
 const posts = [], fetchHTTP = window.fetch;
 let captures = 0, lostHold;
-let scheduledRetryHold;
+let scheduledRetryHold, scheduledSendId;
 window.fetch = async (path, options) => {
  if (!reloadAfterSend && path.endsWith('?capture_key=' + firstKey)) {
   return fetchHTTP(path.replace(firstKey, readyKey), options);
@@ -1561,12 +1564,15 @@ window.fetch = async (path, options) => {
   if (item.request_id) {
    posts.push(item);
    if (shippedUnsent && item.kind === 'scheduled') {
+    scheduledSendId = hold;
     if (!restored.scheduled) {
+     const response = await fetchHTTP(path, options);
+     if (!response.ok) return response;
      if (options.keepalive) lostHold = hold;
      throw new TypeError('The Scheduled reply was lost.');
     }
     scheduledRetryHold = new Headers(options.headers).get('X-Undo-Hold');
-    return Response.json({id:'L1'});
+    return fetchHTTP(path, options);
    }
    if (!restored && posts.length === 1) {
     if (reloadAfterSend) {
@@ -1651,7 +1657,7 @@ async function checkSeparateScheduledDraft() {
   check(posts.length === 1 && /^s1-/.test(posts[0].request_id) && posts[0].words === scheduleWords,
         'The first Scheduled Send uses a fresh ID.');
   check(pending().id === restored.id, 'The Scheduled Send keeps the shipped pointer.');
-  sessionStorage.setItem(probeKey, JSON.stringify({...restored, scheduled:posts[0]}));
+  sessionStorage.setItem(probeKey, JSON.stringify({...restored, scheduled:posts[0], sendId:scheduledSendId}));
  } else {
   await waitForStep(() => send.textContent === 'Retry' && !send.disabled, 'The Scheduled Retry did not recover on reload.');
   const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
@@ -1660,9 +1666,11 @@ async function checkSeparateScheduledDraft() {
   check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored.scheduled) &&
         detail.id === 'L1' && !dialog.open,
         'Scheduled Retry uses the same Send and confirms the saved item.');
-  check(scheduledRetryHold === null, 'Scheduled Retry asks for no new Undo hold.');
+  check(scheduledRetryHold === '1' && scheduledSendId === restored.sendId,
+        'Scheduled Retry sends the original operation and hold request.');
   const toast = window.top.document.querySelector('[data-send-undo-receipt]');
-  check(toast?.textContent === 'Saved List item 1.' && !toast.querySelector('button'),
+  check(toast?.textContent.includes('List item 1.') && toast.textContent.includes('Starts:') &&
+        !toast.querySelector('button'),
         'Scheduled Retry shows the saved receipt without Undo.');
   check(pending().id === restored.id, 'Scheduled Retry keeps the shipped pointer.');
   launch.click();
@@ -2123,6 +2131,15 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 self.send_json(403, {"code": "stale_token", "error": "The New item token expired. Try Send again."})
                 return
             try:
+                if fields.get("kind") == "scheduled":
+                    with (patch.dict(os.environ, fixture.environment()),
+                          patch.object(Path, "home", return_value=fixture.root),
+                          patch.object(new_item, "user_zone", return_value=ZoneInfo("America/New_York"))):
+                        scheduled = new_item.submit_scheduled(new_item_dialog.read_scheduled_request(fields))
+                    self.send_json(200, {"id": scheduled.id,
+                                         "receipt": new_item.filing_receipt(scheduled.claim.assignment, scheduled.id),
+                                         "readback": scheduled.claim.readback})
+                    return
                 request = review_submissions.read_request(fields)
                 fixture.posts.append(request)
                 image = fixture.screenshot if fields.get("capture_key") == CAPTURE_KEY else new_item_dialog.NO_PAGE_SCREENSHOT
@@ -2334,7 +2351,8 @@ window.fetch = (path, options) => {
     def check_list_retry(self, *, reload_after_send: bool, shipped_pointer: str = "",
                          shipped_unsent: bool = False) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
+        owner = staff.StaffRow(OWNER, "producer", "morty" if shipped_unsent else "builds",
+                               staff.StaffRoot(), current_session=OWNER)
         configuration = temporary / "config"
         configuration.mkdir()
         _ = (configuration / "console.conf").write_text(f"page.list.owner={OWNER}\n")
@@ -2356,6 +2374,15 @@ window.fetch = (path, options) => {
             self.assertEqual(fixture.posts[0].request_id, fixture.posts[1].request_id)
         with patch.dict(os.environ, fixture.environment()):
             record, = investigation.records(owner.id)
+            if shipped_unsent:
+                scheduled, = the_list.records(owner.id)
+                self.assertIsInstance(scheduled.schedule, the_list.ScheduledRun)
+                schedule = scheduled.schedule
+                assert isinstance(schedule, the_list.ScheduledRun)
+                self.assertEqual(schedule.start, datetime(2099, 11, 30, 9, tzinfo=UTC))
+                scheduled_posts = [post for post in fixture.wire_posts if post.get("kind") == "scheduled"]
+                self.assertEqual(len(scheduled_posts), 2)
+                self.assertEqual(scheduled_posts[0], scheduled_posts[1])
         self.assertEqual((record.id, record.question), ("I1", "Keep the first List Send."))
         submission = record.submission
         assert isinstance(submission, new_item_dialog.ReviewSubmission)
@@ -2420,6 +2447,10 @@ window.fetch = (path, options) => {
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_scheduled_send_refreshes_a_stale_token_without_another_undo(self) -> None:
         self.assert_scheduled_receipt("list", held=True, stale=True)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_an_unseen_scheduled_send_still_offers_undo_after_token_refresh(self) -> None:
+        self.assert_scheduled_receipt("list", held=True, stale_before_hold=True)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_retry_recovers_a_pending_hold_after_both_replies_are_lost(self) -> None:
@@ -2552,11 +2583,12 @@ function until(test) {
             self.assertEqual(new_item.schedule_lines(schedule),
                              ("Starts: Fri Jan 15 2027 13:00 PST (16:00 EST)", "Repeats: Daily"))
 
-    def assert_scheduled_receipt(self, page: str, *, held: bool, stale: bool = False) -> None:
+    def assert_scheduled_receipt(self, page: str, *, held: bool, stale: bool = False,
+                                 stale_before_hold: bool = False) -> None:
         script = r"""
 const failures = [], check = (ok, message) => { if (!ok) failures.push(message); };
 const host = window.top.document, nativeFetch = window.fetch;
-const page = __PAGE__, holdEnabled = __HOLD__, stale = __STALE__;
+const page = __PAGE__, holdEnabled = __HOLD__, stale = __STALE__, staleBeforeHold = __STALE_BEFORE_HOLD__;
 const launch = document.querySelector('[data-owner-new]'), dialog = document.querySelector('dialog');
 const words = dialog.querySelector('textarea'), send = dialog.querySelector('[type="submit"]');
 const hold = 'a'.repeat(24), heldPath = '/send-hold/' + hold;
@@ -2580,8 +2612,13 @@ window.fetch = async (path, options = {}) => {
   recipients:[{id:'cargo-liner',name:'cargo-liner'}]});
  const item = JSON.parse(options.body);
  if (item.kind !== 'scheduled') return Response.json({});
- posts.push([new Headers(options.headers).get('X-Undo-Hold'), item]);
- return holdEnabled && posts.length === 1
+ const headers = new Headers(options.headers);
+ posts.push([headers.get('X-Undo-Hold'), item, headers.get('X-Undo-Request')]);
+ if (staleBeforeHold && posts.length === 1) {
+  token = 'fresh';
+  return Response.json({code:'stale_token',error:'The token expired.'},{status:403});
+ }
+ return holdEnabled && headers.get('X-Undo-Hold') === '1' && posts.length === (staleBeforeHold ? 2 : 1)
    ? Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}}) : Response.json(saved);
 };
 function until(test) {
@@ -2618,13 +2655,13 @@ function until(test) {
   const receipt = toast();
   check(!dialog.open && dialog.querySelector('[data-done]').parentElement.hidden,
         'The save keeps the dialog closed without an acknowledgment.');
-  if (stale) {
-   check(posts.length === 2 && posts[0][0] === '1' && posts[1][0] === null,
-         'The stale-token retry asks for no new Undo hold.');
-   check(posts[1][1].token === 'fresh' && posts[1][1].request_id === posts[0][1].request_id,
-         'The retry uses the fresh token and the original draft ID.');
-   check(!undoToast.isConnected && host.querySelectorAll('[data-send-undo]').length === 1,
-         'The page removes the first toast and shows the receipt without Undo.');
+  if (stale || staleBeforeHold) {
+   check(posts.length === 2 && posts[0][0] === '1' && posts[1][0] === '1' && posts[0][2] === posts[1][2],
+         'The stale-token retry keeps the Send ID and hold request.');
+   check(posts[1][1].token === 'fresh' && JSON.stringify(posts[1][1]) === JSON.stringify({...posts[0][1],token:'fresh'}),
+         'The retry changes only the token.');
+   check(undoToast.isConnected === staleBeforeHold && host.querySelectorAll('[data-send-undo]').length === 1,
+         'A released hold does not offer another Undo. An unseen Send offers Undo once.');
   } else {
    check(posts.length === 1 && posts[0][0] === '1', 'Scheduled uses the shared hold.');
    check(host.querySelectorAll('[data-send-undo]').length === 1 && (!undoToast || undoToast === receipt),
@@ -2642,7 +2679,8 @@ function until(test) {
 })();
 """
         probe = (script.replace("__PAGE__", json.dumps(page)).replace("__HOLD__", json.dumps(held))
-                 .replace("__STALE__", json.dumps(stale)).replace("__WORDS__", json.dumps(SCHEDULED_RECEIPT_WORDS)))
+                 .replace("__STALE__", json.dumps(stale)).replace("__STALE_BEFORE_HOLD__", json.dumps(stale_before_hold))
+                 .replace("__WORDS__", json.dumps(SCHEDULED_RECEIPT_WORDS)))
         self.assertEqual(firefox_probe_results(bug_fixture_page(script=probe)), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")

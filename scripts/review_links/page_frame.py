@@ -1170,13 +1170,13 @@ function showSendUndo(request,seconds,receiver,receipt){
   });
  });
 }
-async function heldFetch(url,init={},receiver,onHold,receipt,{requestId,recover=false,onResolvedRefusal}={}){
+async function heldFetch(url,init={},receiver,onHold,receipt,requestId){
  const headers=new Headers(init.headers);
- if(!recover) headers.set('X-Undo-Hold','1');
+ headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
  const key=requestId || JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
  let request=heldRequests.get(key);
- if(recover && request?.closed){
+ if(requestId && request?.closed){
   request.finish();
   request=undefined;
  }
@@ -1184,19 +1184,16 @@ async function heldFetch(url,init={},receiver,onHold,receipt,{requestId,recover=
  headers.set(SEND_REQUEST_HEADER,request.id);
  const keepalive=body.length<=KEEPALIVE_LIMIT && new TextEncoder().encode(body).length<=KEEPALIVE_LIMIT;
  const post=async keepalive=>{
-  if(!recover && request.expired()) throw new Error('The retry time ended. The send may have left.');
+  if(!requestId && request.expired()) throw new Error('The retry time ended. The send may have left.');
   return fetch(url,{...init,headers,keepalive});
  };
  const first=await post(keepalive).catch(error=>{
   if(!keepalive) throw error;
   return post(false);
  });
- const settled=response=>response.ok || !onResolvedRefusal || response.headers.get(HOLD_RESOLVED_HEADER)==='1';
+ const settled=response=>response.ok || !requestId || response.headers.get(HOLD_RESOLVED_HEADER)==='1';
  if(first.headers.get('X-Send-Hold')!=='held'){
-  if(first.status<500 && settled(first)){
-   request.finish();
-   if(!first.ok) await onResolvedRefusal?.();
-  }
+  if(first.status<500 && settled(first)) request.finish();
   if(receipt) await showImmediateSendReceipt(first,receipt,()=>request.closed);
   return first;
  }
@@ -1213,16 +1210,19 @@ async function heldFetch(url,init={},receiver,onHold,receipt,{requestId,recover=
  for(let failures=0;;){
   try{
    const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
-   if(response.headers.get('X-Send-Hold')!=='pending'){
-    if(settled(response)){
-     if(response.status!==404 || !request.expired()) request.finish();
-     if(!response.ok) await onResolvedRefusal?.();
-    }
+   const state=response.headers.get('X-Send-Hold');
+   if(state==='undone'){
+    request.finish();
+    throw new SendUndone();
+   }
+   if(state!=='pending'){
+    if(settled(response) && response.status!==410 && (response.status!==404 || !request.expired())) request.finish();
     if(typeof undo==='function') await undo(response);
     else if(receipt) await showImmediateSendReceipt(response,receipt,()=>request.closed);
     return response;
    }
   }catch(error){
+   if(error instanceof SendUndone) throw error;
    if(++failures>=30){
     if(typeof undo==='function') await undo();
     throw error;
@@ -1241,7 +1241,6 @@ function sendActionReceiver(form,data){
  return JSON.parse(form.dataset.sendLabels || '{}')[verdict];
 }
 window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendActionReceiver=sendActionReceiver;
-window.showImmediateSendReceipt=showImmediateSendReceipt;
 })();
 '''
 

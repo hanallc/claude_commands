@@ -1913,36 +1913,126 @@ def _draft_filing(folder: Path, *, repair_index: bool = True,
     return UnclaimedDraft()
 
 
-def draft_is_filed(request_id: str, *,
-                   load_list_draft: LoadListDraft | ListRecordCheck = ListRecordCheck.OMIT) -> bool:
-    """Check whether a Retry can recover an item that already exists."""
-    filing = _draft_filing(_request_folder(request_id), repair_index=False, load_list_draft=load_list_draft)
-    if isinstance(filing, FiledDraft):
-        return True
-    if isinstance(filing, (ClaimedDraft, NativeDraftAwaitingReceipt)):
-        destination = filing.destination
-        if isinstance(destination, NativeSubmissionDestination):
-            with _locked_request(destination.address, recovered=destination) as lookup:
-                return _saved_draft(lookup) is not None
-    return False
+@dataclass(frozen=True)
+class IncompleteDraftFiling:
+    """A filing claim exists without a confirmed item."""
+
+
+@dataclass(frozen=True)
+class UnreadableDraftFiling:
+    """The resolver cannot confirm the state of a draft."""
+
+    error: OSError
+
+
+@dataclass(frozen=True)
+class ResolvedNativeDraft:
+    """The native item and the lookup that keeps it locked for recovery."""
+
+    item: LocatedSubmission
+    lookup: SubmissionLookup
+
+
+type ResolvedDraftFiling = UnclaimedDraft | IncompleteDraftFiling | FiledDraft | ResolvedNativeDraft
 
 
 @contextmanager
 def _locked_legacy_list_target(folder: Path, members: staff.StaffSnapshot | None
-                               ) -> Generator[LocatedSubmission | NoNativeSubmission]:
+                               ) -> Generator[ResolvedNativeDraft | UnclaimedDraft | IncompleteDraftFiling]:
     """Read the native record named by a base-format draft marker."""
     try:
         key = (folder / "list-receipt-key").read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         hint = _read_request_file(folder / "list-capture-target.json", folder.name)
-        if isinstance(hint, NativeSubmissionDestination):
-            with _locked_request(hint.address, members, recovered=hint) as lookup:
-                yield _saved_draft(lookup) or NoNativeSubmission()
+        if isinstance(hint, UnreadableRequestFile):
+            raise hint.error
+        if isinstance(hint, NoRequestFile):
+            yield UnclaimedDraft()
+            return
+        if not isinstance(hint, NativeSubmissionDestination):
+            yield IncompleteDraftFiling()
+            return
+        with _locked_request(hint.address, members, recovered=hint) as lookup:
+            item = _saved_draft(lookup)
+            yield ResolvedNativeDraft(item, lookup) if item is not None else IncompleteDraftFiling()
+        return
+
+    target = read_submission_key(key)
+    address = _request_address(target.kind, target.recipient_id, target.request_id)
+    with _locked_request(address, members) as lookup:
+        item = _saved_draft(lookup)
+        if item is not None and item.destination.id == target.item_id:
+            yield ResolvedNativeDraft(item, lookup)
         else:
-            yield NoNativeSubmission()
-    else:
-        with scoped_submission(read_submission_key(key), members=members) as item:
-            yield item
+            yield IncompleteDraftFiling()
+
+
+@contextmanager
+def _resolve_draft_filing(folder: Path, members: staff.StaffSnapshot | None, *, repair_index: bool,
+                          load_list_draft: LoadListDraft | ListRecordCheck = ListRecordCheck.OMIT
+                          ) -> Generator[ResolvedDraftFiling | ClaimedDraft]:
+    """Resolve the same filing claims for Send admission and item recovery."""
+    token = _browser_draft_token.get()
+    recovery = isinstance(token, BrowserDraftRecoveryToken)
+    filing = _draft_filing(folder, repair_index=repair_index and not recovery, load_list_draft=load_list_draft)
+    if isinstance(filing, UnclaimedDraft):
+        if recovery:
+            yield filing
+            return
+        with _locked_legacy_list_target(folder, members) as legacy:
+            if repair_index and isinstance(legacy, ResolvedNativeDraft):
+                _claim_recovered_native_draft(folder, legacy.item.destination)
+                _ = _publish_recovered_native_draft(folder, legacy.item.destination)
+            yield legacy
+        return
+    if isinstance(filing, PendingFiling):
+        yield IncompleteDraftFiling()
+        return
+
+    hint = filing.destination
+    if not isinstance(hint, NativeSubmissionDestination):
+        yield filing if isinstance(filing, (ClaimedDraft, FiledDraft)) else IncompleteDraftFiling()
+        return
+    earlier = _is_earlier_native_draft(folder, hint)
+    if recovery and (earlier or (hint.browser_token_digest and not hmac.compare_digest(
+            hint.browser_token_digest, token.digest))):
+        yield IncompleteDraftFiling()
+        return
+    if repair_index and isinstance(filing, NativeDraftAwaitingReceipt):
+        index = _draft_index(folder)
+        if isinstance(_read_request_file(index / "pending.json", index.name), NoRequestFile):
+            _write_draft_index(folder, filing)
+    local = _read_location_hint(folder)
+    relocated = isinstance(local, NativeSubmissionDestination) and local.owner != hint.owner
+    must_exist = isinstance(filing, (NativeDraftAwaitingReceipt, FiledDraft))
+    with _locked_request(hint.address, members, recovered=hint, search_owner_stores=must_exist or relocated) as lookup:
+        item = _saved_draft(lookup)
+        if item is not None and (not recovery or item.destination.browser_token_digest == hint.browser_token_digest):
+            yield ResolvedNativeDraft(item, lookup)
+            return
+    if must_exist:
+        raise OSError(f"Cannot find the native record for request {hint.request_id}.")
+    yield filing
+
+
+type DraftFilingRead = UnclaimedDraft | IncompleteDraftFiling | FiledDraft | UnreadableDraftFiling
+
+
+def read_draft_filing(request_id: str, *,
+                      load_list_draft: LoadListDraft | ListRecordCheck = ListRecordCheck.OMIT) -> DraftFilingRead:
+    """Read the draft state without changing the filing index."""
+    try:
+        with _locked_filing_draft(request_id) as folder:
+            with _resolve_draft_filing(folder, None, repair_index=False, load_list_draft=load_list_draft) as filing:
+                if isinstance(filing, ResolvedNativeDraft):
+                    return FiledDraft(filing.item.destination)
+                if isinstance(filing, ClaimedDraft):
+                    return IncompleteDraftFiling()
+                return filing
+    except OSError as error:
+        return UnreadableDraftFiling(error)
+    except (ValueError, staff.StaffRefused) as error:
+        return UnreadableDraftFiling(OSError(str(error)))
 
 
 def _is_earlier_native_draft(folder: Path, destination: NativeSubmissionDestination) -> bool:
@@ -1973,8 +2063,8 @@ def file_list_draft(draft_id: new_item_dialog.ScheduledDraftId, payload_hash: st
     request_id = draft_id.value
     with _locked_filing_draft(request_id) as folder:
         _sync_draft_parents(folder)
-        filing = _draft_filing(folder, load_list_draft=load_list_draft)
-        candidate = filing.destination if isinstance(filing, (ClaimedDraft, FiledDraft)) else filing
+        with _resolve_draft_filing(folder, None, repair_index=True, load_list_draft=load_list_draft) as filing:
+            candidate = filing.destination if isinstance(filing, (ClaimedDraft, FiledDraft)) else filing
         if not isinstance(candidate, (ListItemDestination, UnclaimedDraft)):
             raise DraftPending()
         if isinstance(filing, FiledDraft):
@@ -2090,46 +2180,16 @@ def _locked_browser_recipient(address: SubmissionAddress, page: str, page_recipi
 @contextmanager
 def _locked_filed_draft(folder: Path, members: staff.StaffSnapshot | None, *, on_list: bool = False
                         ) -> Generator[SubmissionLookup | NoNativeSubmission]:
-    token = _browser_draft_token.get()
-    recovery = isinstance(token, BrowserDraftRecoveryToken)
-    filing = _draft_filing(folder, repair_index=not recovery)
-    if isinstance(filing, UnclaimedDraft) and not recovery:
-        with _locked_legacy_list_target(folder, members) as item:
-            if isinstance(item, LocatedSubmission):
-                _claim_recovered_native_draft(folder, item.destination)
-                filing = _publish_recovered_native_draft(folder, item.destination)
-    if not isinstance(filing, (ClaimedDraft, NativeDraftAwaitingReceipt, FiledDraft)):
-        yield NoNativeSubmission()
-        return
-    hint = filing.destination
-    if isinstance(hint, NativeSubmissionDestination):
-        earlier = _is_earlier_native_draft(folder, hint)
-        if earlier:
-            if recovery:
-                yield NoNativeSubmission()
-                return
-            if not on_list:
-                raise DraftAlreadyFiled(hint.id)
-        # A legacy receipt has no digest to check. Recovery files nothing new.
-        if recovery and hint.browser_token_digest and not hmac.compare_digest(hint.browser_token_digest, token.digest):
-            yield NoNativeSubmission()
+    with _resolve_draft_filing(folder, members, repair_index=True) as filing:
+        if isinstance(filing, ResolvedNativeDraft):
+            saved = filing.item.destination
+            if not on_list and _is_earlier_native_draft(folder, saved):
+                raise DraftAlreadyFiled(saved.id)
+            yield filing.lookup
             return
-        if isinstance(filing, NativeDraftAwaitingReceipt):
-            index = _draft_index(folder)
-            if isinstance(_read_request_file(index / "pending.json", index.name), NoRequestFile):
-                _write_draft_index(folder, filing)
-        local = _read_location_hint(folder)
-        relocated = isinstance(local, NativeSubmissionDestination) and local.owner != hint.owner
-        must_exist = isinstance(filing, (NativeDraftAwaitingReceipt, FiledDraft))
-        with _locked_request(hint.address, members, recovered=hint,
-                             search_owner_stores=must_exist or relocated) as lookup:
-            saved = _saved_draft(lookup)
-            if saved is not None and (not recovery or saved.destination.browser_token_digest == hint.browser_token_digest):
-                yield lookup
-                return
-        if must_exist:
-            raise OSError(f"Cannot find the native record for request {hint.request_id}.")
-    yield NoNativeSubmission()
+        if isinstance(filing, IncompleteDraftFiling) and not isinstance(_browser_draft_token.get(), BrowserDraftRecoveryToken):
+            raise DraftPending()
+        yield NoNativeSubmission()
 
 
 def _recover_unverified_draft(request_id: str, members: staff.StaffSnapshot | None,
@@ -2340,12 +2400,12 @@ def _locked_list_draft(address: SubmissionAddress, members: staff.StaffSnapshot 
     """Recover the first deferred Send before the content lookup."""
     folder, _ = _prepare_request_folder(address.request_id)
     with exclusive(folder / ".lock"):
-        hint = _read_request_file(folder / "list-capture-target.json", address.request_id)
-        if isinstance(hint, NativeSubmissionDestination):
-            with _locked_request(hint.address, members) as lookup:
-                if _saved_draft(lookup) is not None:
-                    yield lookup
-                    return
+        with _locked_legacy_list_target(folder, members) as filing:
+            if isinstance(filing, ResolvedNativeDraft):
+                yield filing.lookup
+                return
+            if isinstance(filing, IncompleteDraftFiling):
+                raise DraftPending()
         with _locked_draft_request(address, members, page="list", fingerprint=fingerprint,
                                    page_recipient=page_recipient) as lookup:
             yield lookup
