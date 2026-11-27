@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from functools import partial
 from pathlib import Path
-from typing import cast, final
+from typing import Literal, cast, final
 from zoneinfo import ZoneInfo
 
 from scripts.lib.user_zone import user_zone
@@ -41,13 +41,10 @@ class LegacyListLink:
 type ListLink = investigation.ListDestination | LegacyListLink
 
 
-class NoQuestionReservation(StrEnum):
-    ABSENT = "no List reservation for the submitted question"
-
-
 class QuestionRoute(StrEnum):
     ORDINARY = "use the ordinary linked exchange route"
     NEW = "the question can use a new List item"
+    STAGED_STUDIO = "Studio must reserve a List number for this question"
     UNRESOLVED = "the question needs a verified List destination"
 
 
@@ -1446,18 +1443,26 @@ def _native_question_exchanges(record: update_registration.QuestionRecord, key: 
     return replace(accepted, exchanges=tuple(replace(exchange, question_route=route) for exchange in accepted))
 
 
-def _question_reservation(folder: Path, request_id: str) -> investigation.ListDestination | NoQuestionReservation:
-    """Read the List reservation by the native question's request ID."""
+def _studio_question_route(folder: Path, origin: the_list.NativeQuestionItem
+                           ) -> ResolvedQuestionDestination | Literal[QuestionRoute.NEW, QuestionRoute.STAGED_STUDIO]:
+    """Read the saved Studio route and its number reservation."""
     number = the_list.reserved_review_number(folder / "list-number")
-    if isinstance(number, the_list.NextNumber):
-        return NoQuestionReservation.ABSENT
-    fields = cast(object, json.loads((folder / "list-filing.json").read_text(encoding="utf-8")))
+    try:
+        fields = cast(object, json.loads((folder / "list-filing.json").read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        if number is the_list.NextNumber.AVAILABLE:
+            return QuestionRoute.NEW
+        raise
     match fields:
         case {"keeper": str(keeper)} if keeper:
             new_item_dialog.check_recipient_id(staff.StaffId(keeper))
-            return investigation.ListDestination(staff.StaffId(keeper), number)
+            if number is the_list.NextNumber.AVAILABLE:
+                return QuestionRoute.STAGED_STUDIO
+            return ResolvedQuestionDestination(investigation.ListDestination(staff.StaffId(keeper), number), origin)
+        case {"skipped": str()} | {"unavailable": str()} if number is the_list.NextNumber.AVAILABLE:
+            return QuestionRoute.NEW
         case _:
-            raise the_list.ListError(f"Invalid List route for request {request_id}.")
+            raise the_list.ListError(f"Invalid List route for request {folder.name}.")
 
 
 def _moved_question_link(path: Path, record: update_registration.QuestionRecord,
@@ -1514,14 +1519,16 @@ def resolve_legacy_question_destination(
     """Resolve the original List destination from durable question records."""
     request = origin.source_key.removeprefix("submission/question/")
     folder: Path | None = None
+    studio_route = QuestionRoute.NEW
     if origin.kind is the_list.QuestionItemKind.FROM_NATE:
         try:
             folder = review_submissions._request_folder(request)  # pyright: ignore[reportPrivateUsage]
-            reserved = _question_reservation(folder, request)
+            saved_route = _studio_question_route(folder, origin)
         except (OSError, ValueError):
             return QuestionRoute.UNRESOLVED
-        if isinstance(reserved, investigation.ListDestination):
-            return ResolvedQuestionDestination(reserved, origin)
+        if isinstance(saved_route, ResolvedQuestionDestination):
+            return saved_route
+        studio_route = saved_route
 
     try:
         exchange = the_list.exchange_reservation(origin.source_key)
@@ -1591,9 +1598,13 @@ def resolve_legacy_question_destination(
 
     if isinstance(exchange, the_list.ExchangeDestination):
         return ResolvedQuestionDestination(exchange.destination, the_list.NoQuestionItem.ORDINARY)
-    if transferred or move_markers or (has_receipt and filing is the_list.QuestionFiling.HISTORY):
+    if transferred or move_markers:
         return QuestionRoute.UNRESOLVED
     if origin.source_key in links.filed_sources or the_list.exchange_filing_started(origin.source_key):
+        return QuestionRoute.UNRESOLVED
+    if studio_route is QuestionRoute.STAGED_STUDIO:
+        return studio_route
+    if has_receipt and filing is the_list.QuestionFiling.HISTORY:
         return QuestionRoute.UNRESOLVED
     current = _linked_destinations(links.current, keys)
     if len(current) == 1:
@@ -1784,7 +1795,7 @@ class FilingPlan:
 
     @property
     def unresolved_question_destination(self) -> bool:
-        return self.exchanges[0].question_route is QuestionRoute.UNRESOLVED
+        return self.exchanges[0].question_route in (QuestionRoute.STAGED_STUDIO, QuestionRoute.UNRESOLVED)
 
 
 def _plans(exchanges: Iterable[Exchange], filed: Iterable[tuple[investigation.ListDestination, list_exchange.FiledExchange]]
@@ -1835,7 +1846,7 @@ def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadEx
         first = next((exchange for exchange in exchanges if exchange.direction is Direction.QUESTION_TO_NATE),
                      exchanges[0])
         route = first.question_route
-        if (plan.unresolved_question_destination or route is QuestionRoute.UNRESOLVED
+        if (plan.unresolved_question_destination or route in (QuestionRoute.STAGED_STUDIO, QuestionRoute.UNRESOLVED)
                 or (isinstance(planned.question_route, ResolvedQuestionDestination) and route is QuestionRoute.NEW)):
             return NoExchangeFiling.UNRESOLVED_QUESTION
         if isinstance(route, ResolvedQuestionDestination):
@@ -1934,7 +1945,7 @@ def move_question_wait(root: Path, item: review_items.ReviewItem, members: staff
         origin = _native_question_origin(record)
         with the_list.lock_exchange_source(origin.source_key):
             resolved = _resolve_current_question_destination(record, origin)
-            if resolved is QuestionRoute.UNRESOLVED:
+            if resolved in (QuestionRoute.STAGED_STUDIO, QuestionRoute.UNRESOLVED):
                 return investigation.NoListDestination.ABSENT
             if the_list.exchange_reservation(origin.source_key) is not the_list.NextNumber.AVAILABLE:
                 return investigation.NoListDestination.ABSENT
@@ -2019,7 +2030,7 @@ def file_list_submission_question(record: update_registration.QuestionRecord,
     key = origin.source_key
     with the_list.lock_exchange_source(key):
         route = _resolve_current_question_destination(record, origin)
-        if route is QuestionRoute.NEW:
+        if route in (QuestionRoute.NEW, QuestionRoute.STAGED_STUDIO):
             destination = file_row()
         elif isinstance(route, ResolvedQuestionDestination):
             destination = route.destination
@@ -2042,8 +2053,6 @@ def file_list_submission_question(record: update_registration.QuestionRecord,
              for exchange in entry.item.filed_exchanges)
     for plan in _plans(reload(), filed):
         if file_source(plan, members, reload) == destination:
-            if isinstance(route, ResolvedQuestionDestination) and route.origin is the_list.NoQuestionItem.ORDINARY:
-                return
             break
     else:
         if update_registration.pending_review_reply(record):

@@ -503,6 +503,8 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
         else:
             _ = file_row()
     except the_list.RetiredListProducer as error:
+        if isinstance(record, update_registration.QuestionRecord):
+            raise
         review_submissions.skip_list_filing(saved, str(error))
 
 
