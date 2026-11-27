@@ -28,7 +28,7 @@ from typing import Literal, cast, final, override
 from unittest.mock import patch
 
 from scripts.accounts import refusals
-from scripts.agents import detached_run_process, detached_runs, restart, shutdown, shutdown_record, worker_lifecycle
+from scripts.agents import detached_run_process, detached_runs, restart, shutdown, shutdown_record, stop_resume, worker_lifecycle
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, pass_notices, side_pane, turn_end, worker_panes
@@ -214,6 +214,46 @@ class TurnEndTests(unittest.TestCase):
     def test_agents_stop_reports_unchanged_for_a_closed_worker_without_a_pass(self) -> None:
         row = self.case.fixture.worker("closed")
         self.assertEqual(self.stop_closed_worker(row), f"{row.current_session}: unchanged\n")
+
+    def test_agents_stop_cancels_an_older_parked_pass(self) -> None:
+        row, _, _ = self.parked_worker_with_run()
+        older = self.case.run_dir
+        newer = older.with_name("newer-run")
+        state = worker_panes.run_state(older)
+        state.update({"pass": {}, "events": [], "history_file": str(newer / "history.jsonl")})
+        atomic_file.write_text_atomic(newer / unit_runs.STATE_FILE, json.dumps(state))
+        _ = staff.set_run(self.case.fixture.parent.id, staff.OpenRun(newer))
+        instance = progress_history.begin_dispatch(newer, slot=row.name, phase="8", role="impl",
+            worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"],
+            prompt=self.case.prompt, kind="impl", lens="")
+        progress_history.complete_dispatch(newer, row.name, instance)
+        self.assertTrue(progress_history.parked_worker_pass(worker_panes.worker_pass(row, older)))
+
+        with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(older.parent)}):
+            self.assertEqual(worker_panes.worker_run(row), newer)
+            self.assertEqual(self.stop_closed_worker(row), f"{row.name}: ended 1 open pass as canceled\n")
+        self.assertEqual(worker_panes.worker_pass(row, older)["status"], "canceled")
+        self.assertTrue(progress_history.dispatch_completed(newer, row.name, instance))
+
+    def test_agents_stop_keeps_the_pass_when_an_open_worker_exits_before_the_signal(self) -> None:
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        self.assertIsInstance(worker_panes.observe_worker(self.case.fixture.parent.id, row, staff.snapshot()),
+                              worker_panes.OpenWorker)
+
+        def exited(*_args: object, **_kwargs: object) -> herdr.StoppedConversation:
+            _ = self.case.fixture.world.locations.pop(pane, None)
+            return herdr.StoppedConversation()
+
+        with (patch.object(herdr, "read_conversation", side_effect=exited),
+              patch.object(stop_resume, "_signal_process") as signal,
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            code = shutdown.main(["stop", f"{self.case.fixture.parent.name}/{row.name}"])
+        self.assertEqual(code, 0, errors.getvalue())
+        signal.assert_not_called()
+        self.assertEqual(output.getvalue(), f"{row.current_session}: unchanged\n")
+        self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir)["status"], "active")
 
     def test_native_hook_inputs_complete_each_family_once_and_close_its_pane(self) -> None:
         cases = [(family, close, "current") for family in ("codex", "claude")

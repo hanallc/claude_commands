@@ -2462,6 +2462,11 @@ def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
         return ended
 
 
+def cancel_worker_passes_in_runs(runs: Iterable[Path], worker_id: staff.StaffId) -> int:
+    """End the worker's open passes across its runs. The caller holds the worker lock."""
+    return sum(cancel_worker_passes(run, worker_id) for run in runs)
+
+
 def _resolve_worker_agent(task: str) -> pass_recorder.AgentIdentity:
     """Ask the shared agent registry which agent a task resolves to.
 

@@ -89,7 +89,9 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
         if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
             return WorkerNotStopped(row.name, state.reason)
         try:
-            run = worker_panes.worker_run(row)
+            record = staff.local_snapshot()
+            scanned = worker_panes.parent_run_index(record)
+            run = worker_panes.worker_run(row, record=record, scanned=scanned)
             with suppress(FileNotFoundError):
                 _ = recorder_state.read_state(run / recorder_state.STATE_FILENAME)
         except recorder_state.OldRecorderState as error:
@@ -107,7 +109,8 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
             return WorkerNotStopped(row.name, "the stop did not prove that the worker stopped")
         canceled: int | PassesNotCanceled
         try:
-            canceled = progress_history.cancel_worker_passes(run, row.id)
+            pass_runs = worker_panes.worker_pass_runs(row, run, record, scanned=scanned)
+            canceled = progress_history.cancel_worker_passes_in_runs(pass_runs, row.id)
         except (OSError, ValueError, SystemExit, recorder_state.OldRecorderState) as error:
             canceled = PassesNotCanceled(" ".join(str(error).split()))
         runs = run / detached_runs.DETACHED_RUNS_DIR
@@ -196,10 +199,12 @@ def stop() -> int:
                 continue
             try:
                 # A closed worker with no open pass needs no stop and no report.
-                if isinstance(state, worker_panes.ClosedWorker) and isinstance(progress_history.active_dispatch(
-                        state.row.id, worker_panes.worker_run(state.row, record=record, scanned=scanned)),
-                        progress_history.NoActiveDispatch):
-                    continue
+                if isinstance(state, worker_panes.ClosedWorker):
+                    primary = worker_panes.worker_run(state.row, record=record, scanned=scanned)
+                    runs = worker_panes.worker_pass_runs(state.row, primary, record, scanned=scanned)
+                    if all(isinstance(progress_history.active_dispatch(state.row.id, run), progress_history.NoActiveDispatch)
+                           for run in runs):
+                        continue
                 outcomes.append(stop_worker(parent, state.row, client))
             except (herdr_types.HerdrFailure, staff.StaffRefused, OSError, ValueError,
                     recorder_state.OldRecorderState) as error:

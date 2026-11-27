@@ -217,8 +217,11 @@ def _cancel_closed_worker_passes(row: staff.StaffRow, stopped: stop_resume.NotRu
             current = record.by_id(row.id)
             if current is None or not hold.owns(current) or current.current_session != stopped.session_id:
                 return _result_code(stop_resume.StopFailed(stopped.session_id, "the worker changed before pass cancellation"))
-            run = worker_panes.worker_run(current, record=record)
-            if isinstance(progress_history.active_dispatch(current.id, run), progress_history.NoActiveDispatch):
+            scanned = worker_panes.parent_run_index(record)
+            primary = worker_panes.worker_run(current, record=record, scanned=scanned)
+            runs = worker_panes.worker_pass_runs(current, primary, record, scanned=scanned)
+            if all(isinstance(progress_history.active_dispatch(current.id, run), progress_history.NoActiveDispatch)
+                   for run in runs):
                 return _result_code(stopped)
             backend = record.backends.get(current.id)
             kind = backend.family if isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend)) else ""
@@ -228,16 +231,17 @@ def _cancel_closed_worker_passes(row: staff.StaffRow, stopped: stop_resume.NotRu
                 return _result_code(stop_resume.StopUnproved(stopped.session_id, observed.reason))
             if isinstance(observed, herdr.LiveConversation):
                 return _result_code(stop_resume.StopFailed(stopped.session_id, "the worker resumed before pass cancellation"))
-            ended = progress_history.cancel_worker_passes(run, current.id)
+            ended = progress_history.cancel_worker_passes_in_runs(runs, current.id)
             if ended:
                 passes = "pass" if ended == 1 else "passes"
                 print(f"{current.name}: ended {ended} open {passes} as canceled")
                 return 0
-            remaining = progress_history.active_dispatch(current.id, run)
-            if isinstance(remaining, progress_history.ActiveDispatchUnavailable):
-                return _result_code(stop_resume.StopFailed(stopped.session_id, remaining.reason))
-            if isinstance(remaining, progress_history.ActiveDispatch):
-                return _result_code(stop_resume.StopFailed(stopped.session_id, "an open pass is pending completion"))
+            for run in runs:
+                remaining = progress_history.active_dispatch(current.id, run)
+                if isinstance(remaining, progress_history.ActiveDispatchUnavailable):
+                    return _result_code(stop_resume.StopFailed(stopped.session_id, remaining.reason))
+                if isinstance(remaining, progress_history.ActiveDispatch):
+                    return _result_code(stop_resume.StopFailed(stopped.session_id, "an open pass is pending completion"))
     return _result_code(stopped)
 
 
@@ -999,10 +1003,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{row.name if row is not None else session}: would stop")
             return 0
         unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None and row.kind in ("unit", "showrunner") else []
+        worker_was_stopped = (row is not None and row.kind == "worker" and isinstance(row.parent, staff.ReportsTo)
+            and isinstance(worker_panes.observe_worker(row.parent.id, row, record),
+                           (worker_panes.ClosedWorker, worker_panes.StoppedWorker)))
         deadline = worker_lifecycle.effective_deadline()
         result = (stop_resume.stop_producer(target.id, "agents stop ran", deadline=deadline)
                   if target is not None and target.kind == "producer" else stop_resume.stop(session, deadline=deadline))
-        if isinstance(result, stop_resume.NotRunning) and row is not None and row.kind == "worker":
+        if (worker_was_stopped and isinstance(result, stop_resume.NotRunning)
+                and row is not None and row.current_session == result.session_id):
             try:
                 return _cancel_closed_worker_passes(row, result, deadline=deadline)
             except recorder_state.OldRecorderState as error:

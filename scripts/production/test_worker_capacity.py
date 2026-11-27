@@ -1,6 +1,7 @@
 """Tests for the Codex worker stop: which workers stop, what ends, and who gets a report."""
 from __future__ import annotations
 
+import json
 import unittest
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
@@ -11,6 +12,7 @@ from unittest import mock
 from scripts.agents import detached_runs, remote, restart, shutdown_record
 from scripts.direct import progress_history
 from scripts.herdr import herdr, herdr_types, worker_panes
+from scripts.lib import atomic_file, unit_runs
 from scripts.production import broadcast, session_staff, showrunners, staff, worker_capacity
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker
 
@@ -143,6 +145,30 @@ class WorkerCapacityTests(StaffTestCase):
         self.assertEqual(self.stop([closed], closed), 0)
         self.stop_row.assert_not_called()
         self.cancel.assert_called_once_with(self.run_dir, self.codex.id)
+        self.assertEqual(self.sent, [(str(self.parent.id), worker_capacity.SENDER, "\n".join([
+            HEADING, "Passes ended as canceled: implementer. Continue that work yourself from the worktree."]))])
+
+    def test_a_closed_codex_worker_with_an_older_open_pass_gets_its_pass_canceled(self) -> None:
+        older = self.root / "older-run"
+        atomic_file.write_text_atomic(older / unit_runs.STATE_FILE, json.dumps({
+            "owner_staff_id": self.parent.id,
+            "pass": {self.codex.name: {"worker_id": self.codex.id, "instance_id": "older", "status": "active"}},
+        }))
+
+        def active(_identity: staff.StaffId, run: Path) -> progress_history.ActiveDispatch | progress_history.NoActiveDispatch:
+            return (progress_history.ActiveDispatch("older", ("launcher",)) if run == older
+                    else progress_history.NoActiveDispatch())
+
+        def cancel(run: Path, _identity: staff.StaffId) -> int:
+            return int(run == older)
+
+        self.active.side_effect = active
+        self.cancel.side_effect = cancel
+        closed = worker_panes.ClosedWorker(self.codex)
+        with mock.patch.object(worker_panes, "parent_run_index", return_value={self.parent.current_session: [str(older)]}):
+            self.assertEqual(self.stop([closed], closed), 0)
+        self.cancel.assert_any_call(older, self.codex.id)
+        self.stop_row.assert_not_called()
         self.assertEqual(self.sent, [(str(self.parent.id), worker_capacity.SENDER, "\n".join([
             HEADING, "Passes ended as canceled: implementer. Continue that work yourself from the worktree."]))])
 

@@ -817,6 +817,16 @@ def worker_run_directories(record: staff.StaffSnapshot, *, scanned: dict[str, li
     return unit_runs.LauncherRunDirectories(found, scanned)
 
 
+def worker_pass_runs(row: staff.StaffRow, primary: Path, record: staff.StaffSnapshot, *,
+                     scanned: dict[str, list[str]] | None = None) -> tuple[Path, ...]:
+    """Include the primary run and every other run that has a pass for the worker."""
+    selected = replace(record, rows=tuple(member for member in record.rows if member.kind != "worker" or member.id == row.id))
+    read = cache(run_state)
+    directories = worker_run_directories(selected, scanned=scanned, read=read)
+    return (primary, *(run for run in directories.by_worker.get(row.id, ())
+                       if run != primary and _worker_passes_in(row, read(run), record)))
+
+
 def worker_run(member: staff.StaffRow, *,
                record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
                scanned: dict[str, list[str]] | None = None) -> Path:
