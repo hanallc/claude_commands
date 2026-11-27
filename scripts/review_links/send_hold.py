@@ -75,7 +75,8 @@ class NeedsTokenFile(TypedDict):
     binding: str
     started_at: float
     content_type: str
-    body: str
+    body: NotRequired[str]
+    released_at: NotRequired[float]
 
 
 class UndoneFile(TypedDict):
@@ -446,12 +447,18 @@ class Holds:
         try:
             path = self._file(hold_id)
             saved = cast(PendingFile, json.loads(path.read_text(encoding="utf-8")))
-            body = base64.b64decode(saved["body"])
             # For older files, the modification time can be later than Send.
             started_at = saved["started_at"] if "started_at" in saved else path.stat().st_mtime
+            request_path = saved.get("path", "")
+            if not request_path:
+                marker = released_file(failed(MAY_HAVE_LEFT), "", started_at)
+                del marker["binding"]
+                self._write(hold_id, marker)
+                return
+            body = base64.b64decode(saved["body"])
             sent_at = datetime.fromtimestamp(started_at, UTC)
             # A server that stops during the replay finds this result, and never sends the request again.
-            binding = saved.get("binding") or operation_binding(saved["path"], body)
+            binding = saved.get("binding") or operation_binding(request_path, body)
             self._write(hold_id, released_file(failed(MAY_HAVE_LEFT), binding, started_at))
         except (OSError, OverflowError, ValueError, KeyError, TypeError) as error:
             # A pending file left here would leave with the next server, after the page said it failed.
@@ -466,7 +473,7 @@ class Holds:
             self._active_replays[ticket] = ActiveReplay(sent_at, saved.get("scheduled_token_verified") is True,
                                                         saved.get("new_item_token_verified") is True)
         try:
-            response = self._replay(saved["path"], saved["headers"], body, ticket)
+            response = self._replay(request_path, saved["headers"], body, ticket)
         except TimeoutError:
             # The handler can still finish after the replay stops waiting.
             response = failed(MAY_HAVE_LEFT)
@@ -475,14 +482,14 @@ class Holds:
         finally:
             with self._lock:
                 del self._active_replays[ticket]
-        self._finish(hold_id, response, binding, started_at, refreshable_token=saved["path"] == NEW_ITEM_PATH)
+        self._finish(hold_id, response, binding, started_at, refreshable_token=request_path == NEW_ITEM_PATH)
 
     def _finish(self, hold_id: str, response: HeldResponse, binding: str, started_at: float, *,
                 refreshable_token: bool) -> None:
         try:
             if refreshable_token and _needs_token(response):
                 self._write(hold_id, {"state": "needs_token", "binding": binding, "started_at": started_at,
-                                      "content_type": response.content_type,
+                                      "content_type": response.content_type, "released_at": time.time(),
                                       "body": base64.b64encode(response.body).decode("ascii")})
             else:
                 self._write(hold_id, released_file(response, binding, started_at))
@@ -519,6 +526,8 @@ class Holds:
             case "closing":
                 return HoldState.MISSING
             case "needs_token":
+                if "body" not in saved:
+                    return HoldState.EXPIRED
                 return HeldResponse(403, saved["content_type"], base64.b64decode(saved["body"]))
             case "released":
                 if "body" not in saved:
@@ -555,7 +564,13 @@ class Holds:
                 saved = self._saved(path)
                 if isinstance(saved, BadFile):
                     continue
-                if saved["state"] == "released" and "body" in saved and saved["released_at"] < oldest:
+                if saved["state"] != "released" and saved["state"] != "needs_token":
+                    continue
+                if "body" not in saved:
+                    continue
+                released_at = (saved["released_at"] if saved["state"] == "released" or "released_at" in saved
+                               else path.stat().st_mtime)
+                if released_at < oldest:
                     del saved["body"]
                     self._write(path.stem, saved)
 

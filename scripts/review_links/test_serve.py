@@ -1342,6 +1342,53 @@ class ReviewLinksServerTests(unittest.TestCase):
             assert isinstance(item.schedule, the_list.ScheduledRun)
             self.assertEqual(item.schedule.start, start)
 
+    def test_bound_token_refresh_skips_unreadable_draft_lookup(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="item-producer")
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        folder = self.root / send_hold.HOLD_FOLDER
+        folder.mkdir(exist_ok=True)
+        unreadable = review_submissions.UnreadableDraftFiling(OSError("Unreadable draft fixture."))
+        refusal = serve.ReviewLinksHandler.send_json_answer(403, {"code": "stale_token"})
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(change_page, "deliver_with_outcome", return_value=change_page.DeliveryConfirmed()) as deliver):
+            for state in ("needs_token", "released"):
+                with self.subTest(state=state):
+                    send_id = send_hold.new_hold_id()
+                    request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                                      page="review", request_id="r6-" + uuid4().hex)
+                    body = self.new_item_body(request)
+                    binding = send_hold.operation_binding(review_page.NEW_ITEM_PATH, body)
+                    started_at = time.time() - 1
+                    released = send_hold.released_file(refusal, binding, started_at)
+                    saved: send_hold.ReleasedFile | send_hold.NeedsTokenFile
+                    if state == "needs_token":
+                        assert "body" in released
+                        saved = {"state": "needs_token", "binding": binding, "started_at": started_at,
+                                 "content_type": refusal.content_type, "body": released["body"]}
+                    else:
+                        released["refresh_token"] = True
+                        saved = released
+                    _ = (folder / f"{send_id}.json").write_text(json.dumps(saved), encoding="utf-8")
+                    headers = {send_hold.HOLD_HEADER: "1", send_hold.REQUEST_HEADER: send_id,
+                               "Origin": f"http://127.0.0.1:{self.port}"}
+                    before = update_registration.question_records_for_owner(owner.id, strict=True)
+                    deliver.reset_mock()
+                    with patch.object(serve.ReviewLinksHandler, "new_item_draft_filing", return_value=unreadable) as lookup:
+                        reply = self.new_item_http(body, headers=headers, finished=True)
+                    self.assertEqual(reply.status, 200, reply.body)
+                    lookup.assert_not_called()
+                    deliver.assert_called_once()
+                    receipt = cast(dict[str, object], json.loads(reply.body))
+                    records = update_registration.question_records_for_owner(owner.id, strict=True)
+                    original, = (question for question in records if question not in before)
+                    self.assertEqual(original.item.get("review_id"), receipt["id"])
+                    self.assertEqual(self.held_http("GET", f"{send_hold.HOLD_PATH}/{send_id}"), (200, "", receipt))
+
     def test_a_stale_scheduled_send_admits_the_same_id_after_refresh(self) -> None:
         case = self.review_fixture()
         morty = fixture_member("producer", name="morty")

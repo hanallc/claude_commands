@@ -13,7 +13,7 @@ import unittest
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import page_frame, send_hold
@@ -214,6 +214,84 @@ class HoldsTests(unittest.TestCase):
         assert isinstance(result, HeldResponse)
         self.assertEqual(result.status, 503)
         self.assertEqual(replays.sent, [])
+
+    def test_legacy_pending_without_path_preserves_id_after_restart(self) -> None:
+        hold_id = "a" * 24
+        self.folder.mkdir()
+        record = self.folder / f"{hold_id}.json"
+        _ = record.write_text(json.dumps({"state": "pending", "headers": {}, "body": "d29yZHM=",
+                                          "due": time.time()}), encoding="utf-8")
+        replays = Replays()
+        holds = Holds(self.folder, replays)
+        with contextlib.redirect_stderr(io.StringIO()):
+            holds.recover()
+            result = holds.result(hold_id, wait=5)
+        self.assertTrue(record.is_file())
+        saved = cast(send_hold.ReleasedFile, json.loads(record.read_text(encoding="utf-8")))
+        self.assertEqual((saved["state"], saved["status"]), ("released", 503))
+        self.assertNotIn("binding", saved)
+        self.assertEqual(result, send_hold.failed(send_hold.MAY_HAVE_LEFT))
+        self.assertTrue(holds.stop_if_idle())
+
+        after = Holds(self.folder, replays)
+        after.recover()
+        self.assertEqual(after.hold("/review", {}, b"words", 60, request_id=hold_id),
+                         {"hold": hold_id, "seconds": 0})
+        self.assertEqual(after.result(hold_id, wait=0), result)
+        self.assertEqual(replays.sent, [])
+
+    def test_needs_token_body_expires_but_refresh_survives_restart(self) -> None:
+        endpoint = send_hold.NEW_ITEM_PATH
+        original = b'{"token":"stale","words":"question"}'
+        fresh = b'{"token":"fresh","words":"question"}'
+        stale = HeldResponse(403, "application/json", b'{"code":"stale_token"}')
+        replay = Mock(return_value=stale)
+        response_time = time.time()
+        sent_at = response_time - 5
+        now = response_time
+        self.folder.mkdir()
+        with patch.object(send_hold, "time", Mock(wraps=time, time=lambda: now)):
+            for legacy in (False, True):
+                with self.subTest(legacy=legacy):
+                    now = response_time
+                    hold_id = send_hold.new_hold_id()
+                    record = self.folder / f"{hold_id}.json"
+                    pending: send_hold.PendingFile = {
+                        "state": "pending", "path": endpoint, "headers": {}, "due": now, "started_at": sent_at,
+                        "body": base64.b64encode(original).decode("ascii"),
+                    }
+                    _ = record.write_text(json.dumps(pending), encoding="utf-8")
+                    holds = Holds(self.folder, replay)
+                    holds.recover()
+                    self.assertEqual(holds.result(hold_id, wait=5), stale)
+                    self.assertTrue(holds.stop_if_idle())
+                    saved = cast(dict[str, object], json.loads(record.read_text(encoding="utf-8")))
+                    if legacy:
+                        _ = saved.pop("released_at", None)
+                        _ = record.write_text(json.dumps(saved), encoding="utf-8")
+                    os.utime(record, (now, now) if legacy else (now + 2, now + 2))
+                    now += send_hold.RESULT_KEEP_SECONDS + 1
+
+                    replay.reset_mock()
+                    after = Holds(self.folder, replay)
+                    after.recover()
+                    self.assertIs(after.result(hold_id, wait=0), HoldState.EXPIRED)
+                    expected = {key: value for key, value in saved.items() if key != "body"}
+                    binding = send_hold.operation_binding(endpoint, fresh)
+                    self.assertEqual(expected, {
+                        "state": "needs_token", "binding": binding, "started_at": sent_at,
+                        "content_type": stale.content_type, **({} if legacy else {"released_at": response_time}),
+                    })
+                    self.assertEqual(json.loads(record.read_text(encoding="utf-8")), expected)
+                    admission = Mock(return_value=send_hold.DirectAdmission(True))
+                    send = after.submit(endpoint, {}, fresh, request_id=hold_id, binding=binding, admit=admission)
+                    admission.assert_called_once_with(expected)
+                    self.assertEqual(send, send_hold.DirectSend(hold_id, sent_at, binding, True))
+                    assert isinstance(send, send_hold.DirectSend)
+                    with after.direct_result(send) as save:
+                        save(OK)
+                    self.assertEqual(after.result(hold_id, wait=0), OK)
+                    replay.assert_not_called()
 
     def test_a_bad_hold_file_is_skipped_and_the_folder_is_private(self) -> None:
         holds = Holds(self.folder, Replays())

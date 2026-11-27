@@ -2776,12 +2776,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         valid_token = self.valid_request_token(fields.get("token"))
         if not valid_token:
             return self.send_json_answer(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
+        if isinstance(operation, dict) and (operation["state"] == "needs_token" or operation.get("refresh_token")):
+            return send_hold.DirectAdmission(True)
         filing = self.new_item_draft_filing(server, fields)
         if isinstance(filing, review_submissions.UnreadableDraftFiling):
             raise filing.error
         if isinstance(operation, dict):
-            if operation["state"] == "needs_token" or operation.get("refresh_token"):
-                return send_hold.DirectAdmission(True)
             # An expired or uncertain result can only recover a confirmed item.
             if isinstance(filing, review_submissions.FiledDraft):
                 return send_hold.DirectAdmission(True)
