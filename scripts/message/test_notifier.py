@@ -554,7 +554,11 @@ class NotifierTests(unittest.TestCase):
             bindings.mkdir(parents=True)
             _ = (bindings / "fixture.json").write_text("{}")
             _ = self.successful("tick")
-        self.assertEqual(self.send_args.read_text().splitlines(), ["question-push-drain"])
+            self.assertEqual(self.send_args.read_text().splitlines(), ["question-push-drain"])
+            self.send_args.unlink()
+            _ = (notify / "silence-kept.jsonl").write_text("{}\n")
+            _ = self.successful("tick")
+        self.assertEqual(self.send_args.read_text().splitlines(), ["question-push-release"])
 
     def test_tick_on_another_notifier_state_never_reads_the_real_emergencies(self) -> None:
         state = self.root / "xdg"

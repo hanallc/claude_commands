@@ -144,32 +144,42 @@ def report(line: str) -> None:
 
 def drain(question: Path | None = None) -> int:
     """Retire current bindings and old kept copies on the notification owner."""
+    started = time.monotonic()
     if silence.on_mac() or not (directory().is_dir() or silence.kept_file().exists()):
         return 0
+    deadline = started + conf.read("send").number("user_cancel_timeout")
+    try:
+        with operation_deadline.within(deadline):
+            return _drain(question)
+    except TimeoutError as error:
+        report(f"Question push retirement pending. {error}")
+        return 1
+
+
+def _drain(question: Path | None) -> int:
     selected = str(question.resolve()) if question is not None else None
     failed = 0
 
     def wanted(reference: push_reference.QuestionReference) -> bool:
         return selected is None or (reference["path"] == selected and reference.get("machine") != "mac")
 
-    pending: dict[str, tuple[Binding, Path | None]] = {}
-    for path in sorted(directory().glob("*.json")):
-        try:
-            binding = read_binding(path)
-            if binding is not None and wanted(binding.reference):
-                pending[binding.tag_key] = (binding, path)
-        except (OSError, ValueError) as error:
-            report(f"Question push state unavailable. {path.name}: {error}")
-            failed = 1
+    pending: dict[str, Path | Binding] = {}
+    for path in directory().glob("*.json"):
+        operation_deadline.check()
+        pending[path.name] = path
     try:
         for push in silence.read_kept(strict=True):
+            operation_deadline.check()
             reference = push.get("reference", push_reference.NO_REFERENCE)
             if reference["kind"] == "question" and wanted(reference):
                 binding = Binding(push["source"], push["key"], reference, False)
-                _ = pending.setdefault(binding.tag_key, (binding, None))
+                pending[binding.tag_key] = binding
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as error:
         report(f"Cannot read kept Question pushes. {error}")
         failed = 1
+    operation_deadline.check()
     if not pending:
         return failed
 
@@ -181,34 +191,47 @@ def drain(question: Path | None = None) -> int:
             entries = entries[turn:] + entries[:turn]
         except FileNotFoundError:
             pass
-    deadline = time.monotonic() + conf.read("send").number("user_cancel_timeout")
     last_checked: str | None = None
     for key in entries:
-        if time.monotonic() >= deadline:
-            break
-        observed, path = pending[key]
+        entry = pending[key]
         terminal = question is not None
+        label = str(entry) if isinstance(entry, Path) else entry.reference["path"]
         try:
-            with silence.locked(nonblocking=True), operation_deadline.within(deadline):
+            operation_deadline.check()
+            with silence.locked(nonblocking=True):
                 last_checked = key
-                current = read_binding(path or binding_path(observed.source, observed.key))
-                if (path is not None and current != observed
-                        or path is None and current is not None and current.reference == observed.reference):
-                    continue
-                if not settled(observed.reference):
+                if isinstance(entry, Path):
+                    binding = read_binding(entry)
+                    operation_deadline.check()
+                    if binding is None or not wanted(binding.reference):
+                        continue
+                else:
+                    binding = entry
+                    current = read_binding(binding_path(binding.source, binding.key))
+                    operation_deadline.check()
+                    if current is not None and current.reference == binding.reference:
+                        continue
+                label = binding.reference["path"]
+                reason = settled(binding.reference)
+                operation_deadline.check()
+                if not reason:
                     continue
                 terminal = True
-                if path is not None:
-                    report(retire_locked(path, observed))
+                if isinstance(entry, Path):
+                    report(retire_locked(entry, binding))
                 else:
-                    dropped = silence.drop_locked(observed.source, observed.key, observed.reference)
+                    dropped = silence.drop_locked(binding.source, binding.key, binding.reference)
                     if dropped:
-                        report(f"retired {dropped} kept copies for {observed.source} / {observed.key}")
+                        report(f"retired {dropped} kept copies for {binding.source} / {binding.key}")
         except BlockingIOError:
             continue
+        except TimeoutError as error:
+            report(f"Question push retirement pending. {label}: {error}")
+            failed = 1
+            break
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             message = "Answer saved. Push retirement pending." if terminal else "Question push state unavailable."
-            report(f"{message} {observed.reference['path']}: {error}")
+            report(f"{message} {label}: {error}")
             failed = 1
     if question is None and last_checked is not None:
         write_text_atomic(cursor, last_checked)

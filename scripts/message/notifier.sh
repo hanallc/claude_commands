@@ -501,16 +501,16 @@ clear_check() {
   log_error "clear-check: ${output//$'\n'/ / }"
 }
 
-question_push_drain() {
-  local output fired
+question_push_job() {
+  local job=$1 output fired
   if [[ -n ${NOTIFIER_SEND:-} ]]; then
-    output=$("$NOTIFIER_SEND" question-push-drain 2>&1)
+    output=$("$NOTIFIER_SEND" "$job" 2>&1)
   else
-    output=$("$PY" "$SEND" question-push-drain 2>&1)
+    output=$("$PY" "$SEND" "$job" 2>&1)
   fi
   if (( $? != 0 )) && [[ -n $output ]]; then
     fired=$(fired_stamp)
-    log_error "question-push-drain: ${output//$'\n'/ / }"
+    log_error "$job: ${output//$'\n'/ / }"
   fi
 }
 
@@ -582,7 +582,10 @@ cmd_tick() {
     local question_pushes=$notify_state/question-pushes
     local -a bindings=("$question_pushes"/*.json(N))
     if (( ${#bindings} )) || [[ -s $notify_state/silence-kept.jsonl ]]; then
-      question_push_drain
+      question_push_job question-push-drain
+    fi
+    if [[ -s $notify_state/silence-kept.jsonl && ! -e $notify_state/silence.json ]]; then
+      question_push_job question-push-release
     fi
   fi
   [[ -n $EMERGENCIES && -s $EMERGENCIES ]] && clear_check
