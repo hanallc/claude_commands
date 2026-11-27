@@ -951,10 +951,10 @@ class CopyGuardDispatchTests(IsolatedHookTests):
             + f"dispatch.EVENTS['pre_tool_use'] = (dispatch.CopyPolicyHook(), dispatch.HookSpec({str(later)!r}, None))\n"
             + "sys.argv = ['hook_dispatch.py', 'pre_tool_use']\ndispatch.main()\n"
         )
-        for config in (ROOT / "config/copies.conf", self.root / "missing-copies.conf"):
+        for config in (ROOT / "config", self.root / "missing-config"):
             with self.subTest(config=config.name):
                 marker.unlink(missing_ok=True)
-                self.environment["COPIES_CONFIG"] = str(config)
+                self.environment["CONF_DIR"] = str(config)
                 result = self.run_python(["-c", driver], {"tool_name": "Bash", "tool_input": {"command": "true"}})
                 self.assertEqual((result.returncode, result.stderr), (2, "later refusal\n"))
                 self.assertTrue(marker.exists())

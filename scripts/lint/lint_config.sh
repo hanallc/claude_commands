@@ -19,7 +19,6 @@
 # A missing config file enables every check.
 # Numeric settings set limits and adjustments, not check states.
 
-LINT_CONFIG_FILE="${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"
 # shellcheck source=/dev/null
 source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
 
@@ -75,11 +74,11 @@ _lint_config_field() {
 _lint_config_raw_into() {
     local _lint_want="$1" _lint_output="$2" _lint_presence_output="$3"
     local _lint_line _lint_key _lint_value
-    local _lint_stem="${LINT_CONFIG_FILE##*/}"
-    conf_record "${_lint_stem%.conf}"
+    local _lint_file="${CONF_DIR:-$HOME/.claude/config}/lint.conf"
+    conf_record lint
     printf -v "$_lint_output" '%s' ''
     printf -v "$_lint_presence_output" '%s' absent
-    [[ -f "$LINT_CONFIG_FILE" && -r "$LINT_CONFIG_FILE" ]] || return 0
+    [[ -f "$_lint_file" && -r "$_lint_file" ]] || return 0
     while IFS= read -r _lint_line || [[ -n "$_lint_line" ]]; do
         _lint_line="${_lint_line%%#*}"
         [[ "$_lint_line" != *=* ]] && continue
@@ -91,12 +90,12 @@ _lint_config_raw_into() {
         _lint_value="${_lint_value#"${_lint_value%%[![:space:]]*}"}"
         _lint_value="${_lint_value%"${_lint_value##*[![:space:]]}"}"
         if [[ -n "${CONF_SHIFT_READ_LOG:-}" ]]; then
-            conf_record_shift "$LINT_CONFIG_FILE" "$_lint_key" "$_lint_value"
+            conf_record_shift "$_lint_file" "$_lint_key" "$_lint_value"
         fi
         printf -v "$_lint_output" '%s' "$_lint_value"
         printf -v "$_lint_presence_output" '%s' present
         return 0
-    done < "$LINT_CONFIG_FILE"
+    done < "$_lint_file"
     return 0
 }
 
@@ -118,7 +117,7 @@ lint_config_build_oom_score_adj() {
         printf -v "$1" '%s' "$_lint_adj"
     else
         printf 'warning: %s: build_oom_score_adj=%s is invalid (expected integer -1000..1000) — using 500\n' \
-            "$LINT_CONFIG_FILE" "$_lint_adj" >&2
+            "${CONF_DIR:-$HOME/.claude/config}/lint.conf" "$_lint_adj" >&2
         printf -v "$1" '%s' 500
     fi
 }
@@ -133,7 +132,7 @@ lint_config_clippy_fix_jobs() {
         printf -v "$1" '%s' "$_lint_jobs"
     else
         printf 'warning: %s: clippy_fix_jobs=%s is invalid (expected integer 1..9999) — using 8\n' \
-            "$LINT_CONFIG_FILE" "$_lint_jobs" >&2
+            "${CONF_DIR:-$HOME/.claude/config}/lint.conf" "$_lint_jobs" >&2
         printf -v "$1" '%s' 8
     fi
 }
@@ -152,7 +151,7 @@ lint_config_state() {
         on|off) printf '%s' "$value" ;;
         "") printf 'on' ;;
         *)
-            echo "warning: $LINT_CONFIG_FILE: $op=$value is not on/off — treating as on" >&2
+            echo "warning: ${CONF_DIR:-$HOME/.claude/config}/lint.conf: $op=$value is not on/off — treating as on" >&2
             printf 'on'
             ;;
     esac
@@ -181,12 +180,12 @@ lint_config_enabled() {
 # Prints the line a caller emits in place of the command it did not run. Loud on
 # purpose: a skipped check must never read as a passing one.
 lint_config_skip_notice() {
-    printf 'SKIPPED: %s — %s=off in %s\n' "$2" "$1" "$LINT_CONFIG_FILE"
+    printf 'SKIPPED: %s — %s=off in %s\n' "$2" "$1" "${CONF_DIR:-$HOME/.claude/config}/lint.conf"
 }
 
 _lint_config_set() {
     local op="$1" value="$2" tmp
-    local stem="${LINT_CONFIG_FILE##*/}"
+    local file="${CONF_DIR:-$HOME/.claude/config}/lint.conf"
     if ! _lint_config_is_op "$op"; then
         _lint_config_unknown "$op"
         return 1
@@ -199,13 +198,13 @@ _lint_config_set() {
             ;;
     esac
 
-    if [[ ! -f "$LINT_CONFIG_FILE" ]]; then
-        echo "error: missing config file: $LINT_CONFIG_FILE" >&2
+    if [[ ! -f "$file" ]]; then
+        echo "error: missing config file: $file" >&2
         return 1
     fi
 
-    tmp="$LINT_CONFIG_FILE.tmp.$$"
-    conf_record "${stem%.conf}"
+    tmp="$file.tmp.$$"
+    conf_record lint
     if ! awk -v op="$op" -v val="$value" '
         {
             line = $0
@@ -224,16 +223,17 @@ _lint_config_set() {
             print line
         }
         END { if (!found) print op "=" val }
-    ' "$LINT_CONFIG_FILE" > "$tmp"; then
+    ' "$file" > "$tmp"; then
         rm -f "$tmp"
-        echo "error: failed to rewrite $LINT_CONFIG_FILE" >&2
+        echo "error: failed to rewrite $file" >&2
         return 1
     fi
-    mv "$tmp" "$LINT_CONFIG_FILE"
+    mv "$tmp" "$file"
 }
 
 _lint_config_status() {
     local op state want="${1:-}"
+    local file="${CONF_DIR:-$HOME/.claude/config}/lint.conf"
     if [[ -n "$want" ]] && ! _lint_config_is_op "$want"; then
         _lint_config_unknown "$want"
         return 1
@@ -246,8 +246,8 @@ _lint_config_status() {
         printf 'op=%s state=%s runs=%s applies=%s\n' \
             "$op" "$state" "$(_lint_config_field "$op" 2)" "$(_lint_config_field "$op" 3)"
     done
-    if [[ ! -f "$LINT_CONFIG_FILE" ]]; then
-        echo "# note: $LINT_CONFIG_FILE does not exist — every check defaults to on"
+    if [[ ! -f "$file" ]]; then
+        echo "# note: $file does not exist — every check defaults to on"
     fi
 }
 
@@ -277,7 +277,7 @@ Examples:
   lint_config.sh mend on
   lint_config.sh doc
 
-Config: $LINT_CONFIG_FILE
+Config: ${CONF_DIR:-$HOME/.claude/config}/lint.conf
 EOF
 }
 

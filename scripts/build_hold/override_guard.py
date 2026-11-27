@@ -26,7 +26,6 @@ OVERRIDE_VARIABLES: tuple[str, ...] = (
     "MAC_TEST_STATE_DIR",
     "MAC_TEST_CONFIG",
     "BUILD_TARGETS_SCRIPT",
-    "BUILD_TARGETS_CONFIG",
     "BUILD_TARGETS_NOW",
     # The same folder under its name before the rename, which unit_runs.environ still reads.
 )

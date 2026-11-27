@@ -520,12 +520,11 @@ def shutdown_fixture_configuration(root: Path) -> dict[str, str]:
             if stem == "copies":
                 content = content.replace("~/remote-mirrors", str(root / "remote-mirrors"))
             _ = write_config_fixture(destination, content)
-    return {"CONF_DIR": str(root), "COPIES_CONFIG": str(root / "copies.conf"),
-            "BUILD_TARGETS_CONFIG": str(root / "build_targets.conf")}
+    return {"CONF_DIR": str(root)}
 
 
 def retirement_copies_environment(root: Path) -> dict[str, str]:
-    private = build_copies_test_support.private_copy_config(root)
+    private = build_copies_test_support.private_copy_config(root, configuration=root)
     return {**private.environment, "HOME": str(root), "SCRATCH_COPIES_ROOT": str(root / "copies")}
 
 
@@ -1192,7 +1191,6 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         config = shutdown_fixture_configuration(self.root)
         _ = self.limits()
         environment = retirement_copies_environment(self.root)
-        _ = (Path(environment["CONF_DIR"]) / "build_folders.conf").replace(self.root / "build_folders.conf")
         self.enterContext(mock.patch.dict(os.environ, {**config, **environment, "CONF_DIR": str(self.root)}))
         runs = self.root / "runs"
         self.run_folder = runs / "run-1"
@@ -4167,7 +4165,6 @@ class UnitRenameTests(UnitRenameFixture):
         output = build_root / "origin/alpha"
         self.write(output / "director/artifact", "director")
         self.write(output / "review/artifact", "review")
-        self.env["COPIES_CONFIG"] = str(Path(self.env["CONF_DIR"]) / "copies.conf")
         with mock.patch.dict(os.environ, self.env, clear=True):
             with build_copies.take_copy(self.checkout, "HEAD", showrunner="demo", unit="alpha",
                                        work="rename", purpose="fixture") as copy:

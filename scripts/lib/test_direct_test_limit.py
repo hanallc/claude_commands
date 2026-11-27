@@ -27,6 +27,7 @@ LIMIT_LINE = (f"stopped at the {CASE_LIMIT}-second direct test limit. "
               "Run longer tests with copies.py run and gate.py --affected --module.")
 LIMIT_REQUEST = f"scope requested: {CASE_LIMIT}"
 FIXTURE_SCOPE = "claude-direct-test-" + "0" * 32 + ".scope"
+CALLER_REGISTRY_PIN = "/home/worker/.claude/config/models.conf"
 LIMIT_FIXTURE = STANDALONE_TEST_STARTUP + """
 startup = sys.modules["_devtools_python_startup"]
 startup._user_test_manager_available = lambda: True
@@ -44,6 +45,16 @@ class Example(unittest.TestCase):
     def test_failure(self):
         self.fail('fixture failure')
 
+    def test_inherited_registry_pin_is_clear(self):
+        self.assertNotIn('MODELS_CONFIG_FILE', os.environ)
+
+    def test_registry_pin_set_in_a_test_stays(self):
+        self.assertNotIn('MODELS_CONFIG_FILE', os.environ)
+        pin = os.path.join(os.environ['HOME'], 'fixture-models.conf')
+        os.environ['MODELS_CONFIG_FILE'] = pin
+        unittest.defaultTestLoader.loadTestsFromTestCase(unittest.TestCase)
+        self.assertEqual(os.environ.get('MODELS_CONFIG_FILE'), pin)
+
     def test_long(self):
         print('fixture started', flush=True)
         print('fixture finished', flush=True)
@@ -58,7 +69,7 @@ GATE_CASE = """
 from direct_case import Example
 
 def load_tests(loader, tests, pattern):
-    return loader.loadTestsFromName("test_long", Example)
+    return loader.loadTestsFromNames(("test_long", "test_inherited_registry_pin_is_clear"), Example)
 """
 GATE_FIXTURE = """
 import os, sys
@@ -140,6 +151,20 @@ class DirectTestLimitTests(unittest.TestCase):
 
     def test_plain_python_requests_the_direct_limit_before_the_test(self) -> None:
         self.assert_limit_before_fixture(self.run_case("test_long"))
+
+    def test_unittest_clears_the_inherited_registry_pin(self) -> None:
+        self.environment["MODELS_CONFIG_FILE"] = CALLER_REGISTRY_PIN
+        result = self.invoke(sys.executable, "-c", """
+import os, runpy, sys, unittest
+assert os.environ["MODELS_CONFIG_FILE"] == sys.argv.pop(1)
+runpy.run_module("unittest", run_name="__main__", alter_sys=True)
+""", CALLER_REGISTRY_PIN, "direct_case.Example.test_inherited_registry_pin_is_clear")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_registry_pin_set_in_a_test_survives_later_boundary_calls(self) -> None:
+        self.environment["MODELS_CONFIG_FILE"] = CALLER_REGISTRY_PIN
+        result = self.run_case("test_registry_pin_set_in_a_test_stays")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_no_user_manager_runs_the_test_in_a_private_folder(self) -> None:
         self.environment = without_user_test_manager(self.root, self.environment)
@@ -266,6 +291,7 @@ runpy.run_module("unittest", run_name="__main__", alter_sys=True)
         manager_query = self.root / "manager-query"
         write_stdlib_tool(self.root / "busctl", f"from pathlib import Path\nPath({str(manager_query)!r}).touch()\n")
         environment = {**self.environment, "PYTHONPATH": startup.startup_pythonpath(""),
+                       "MODELS_CONFIG_FILE": CALLER_REGISTRY_PIN,
                        "PATH": os.pathsep.join((str(self.root), self.environment["PATH"]))}
         run = run_gate_test_fixture(
             case, [shim, "-c", GATE_FIXTURE, shim, str(MODULE_RUN), str(self.root), case.name], environment)

@@ -197,7 +197,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         }
         copies_config = self.root / "fixture-config/copies.conf"
         _ = write_config_fixture(copies_config, "guard_timeout_seconds=10\n")
-        self.environment["COPIES_CONFIG"] = str(copies_config)
+        self.environment["CONF_DIR"] = str(copies_config.parent)
         _ = self.environment.pop("CODEX_BIN", None)
         _ = self.environment.pop("STUB_DISABLED", None)
         _ = self.environment.pop("STUB_DISABLED_COMMAND", None)
@@ -712,7 +712,7 @@ class CodexHookInstallerTests(unittest.TestCase):
     def test_install_repairs_managed_and_unmanaged_float_timeouts(self) -> None:
         directory = self.root / "config"
         directory.mkdir()
-        self.environment["COPIES_CONFIG"] = str(directory / "copies.conf")
+        self.environment["CONF_DIR"] = str(directory)
         for seconds, expected, user_seconds, user_expected in ((10.0, 10, 5.0, 5), (10.25, 11, 5.25, 6)):
             with self.subTest(seconds=seconds):
                 _ = write_config_fixture(directory / "copies.conf", f"guard_timeout_seconds={seconds}\n")

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone, tzinfo
 import io
 import json
@@ -70,6 +70,23 @@ class HoldNotification(TypedDict):
     text: str
 
 
+class TargetWatcherTests(unittest.TestCase):
+    def test_watchers_forward_the_private_configuration_folder(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        paths = mac_test.StatePaths(root / "state", "linux", registry_selected=True)
+        environment = {"CONF_DIR": str(root / "config"), "HOME": str(root), "PATH": os.defpath}
+        with (mock.patch.dict(os.environ, environment, clear=True),
+              mock.patch.object(mac_test, "lock_if_available", return_value=nullcontext(True)),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run):
+            mac_test.start_watcher(paths)
+            mac_test.start_claim_watcher(paths)
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            command = cast(list[str], call.args[0])
+            self.assertIn(f"CONF_DIR={environment['CONF_DIR']}", command)
+            self.assertEqual(command[-2:], ["--target", "linux"])
+
+
 class IsolatedTargetState(unittest.TestCase):
     """Use temporary records and synchronous command boundaries."""
 
@@ -101,7 +118,6 @@ class IsolatedTargetState(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             "HOME": str(self.root),
-            "BUILD_TARGETS_CONFIG": str(self.config),
             "MAC_TEST_CONFIG": str(self.root / "mac.conf"),
             "MAC_TEST_STATE_DIR": str(self.mac_state),
             "BUILD_HOLD_DIR": str(self.root / "holders"),

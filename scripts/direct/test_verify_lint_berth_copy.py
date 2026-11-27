@@ -68,7 +68,7 @@ class VerifyLintBerthCopyTests(support.VerifyLintScopeFixture):
     def setUp(self) -> None:
         super().setUp()
         for key in tuple(self.environment):
-            if key.startswith("GIT_") or key in ("BASH_ENV", "STAFF_CONFIG"):
+            if key.startswith("GIT_") or key == "BASH_ENV":
                 _ = self.environment.pop(key)
         self.environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
         _ = caller_admission(self, self.root, self.environment)

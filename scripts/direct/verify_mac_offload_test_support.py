@@ -1303,7 +1303,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "CLAUDE_CODE_SESSION_ID": "", "BUILD_TARGETS_NOW": "",
             "BUILD_TARGETS_POLL_S": "0.25",
             "LINT_CONFIG_READER": str(reader),
-            "LINT_CONFIG_FILE": str(reader), "CONF_DIR": str(Path(reader).parent),
+            "CONF_DIR": str(reader.parent),
             "UNIT_RUN_DIR": str(self.board),
             "UNIT_TEAM_ROLE": "test",
             "VERIFY_MAC_RUNNER": str(self.runner),
@@ -1324,6 +1324,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         private = copies_environment(self.root)
         configuration = Path(self.environment["CONF_DIR"])
         settings_source = Path(private["CONF_DIR"]) / "build_folders.conf"
+        _ = shutil.copy2(settings_source.with_name("copies.conf"), configuration / "copies.conf")
         settings_lines = [
             line for line in settings_source.read_text(encoding="utf-8").splitlines()
             if (key := line.partition("=")[0].strip()) != "patterns.tool" and not key.startswith("patterns.tool.")

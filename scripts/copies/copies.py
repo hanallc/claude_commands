@@ -419,9 +419,9 @@ class CopiesConfiguration:
 
 
 def config_settings() -> tuple[Path, dict[str, str]]:
-    path = Path(os.environ.get("COPIES_CONFIG") or Path(__file__).resolve().parents[2] / "config/copies.conf")
-    path = path.expanduser()
-    return path, conf.read(path).values()
+    source = "copies" if os.environ.get("CONF_DIR") else Path(__file__).resolve().parents[2] / "config/copies.conf"
+    settings = conf.read(source)
+    return settings.source, settings.values()
 
 
 def load_config() -> CopiesConfiguration:

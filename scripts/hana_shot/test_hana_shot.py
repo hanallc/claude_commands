@@ -408,8 +408,7 @@ class BuildLogIsolatedTest(unittest.TestCase):
             settings += "resend_seconds=0.05\n"
         _ = write_config_fixture(self.scratch / "config/hana_shot.conf", settings)
         environment = fixture_git_environment(self.scratch)
-        for name in ("BASH_ENV", "STAFF_CONFIG"):
-            _ = environment.pop(name, None)
+        _ = environment.pop("BASH_ENV", None)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **environment,
             **config_environment(self.scratch / "config"),

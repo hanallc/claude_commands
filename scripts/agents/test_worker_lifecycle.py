@@ -237,8 +237,9 @@ class FixtureHomeSafetyTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
         real = root / "real"
         real.mkdir()
-        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE"):
-            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE")}
+        variables = ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "CONF_DIR", "MODELS_CONFIG_FILE")
+        for name in variables:
+            environment = dict.fromkeys(variables, str(root / "safe"))
             environment[name] = str(real / "nested")
             with (self.subTest(variable=name), patch(f"{fixture_support.__name__}.REAL_HOME", real),
                   patch.dict(os.environ, environment),

@@ -266,7 +266,7 @@ class MergeGateLedgerTests(MergeGateFixture):
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
         environment = super().fixture_configuration(directory)
         pin_ledger_settings(directory, directory, Path("/tmp").resolve())
-        return {**environment, "STAFF_CONFIG": str(directory / "staff.conf")}
+        return environment
 
     @override
     def install_fixture_runner(self) -> None:

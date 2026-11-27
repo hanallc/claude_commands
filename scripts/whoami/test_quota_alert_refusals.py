@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib import conf
 from scripts.lib.test_models_registry import write_registry
 
 import os
@@ -136,7 +137,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertIsNone(quota_alert.notice(lambda: "natedev"))
 
     def test_failed_refusal_push_retries_on_the_next_refusal_then_stops(self) -> None:
-        _ = write_registry(quota_alert.REGISTRY, {"direct.claude": {"impl": "opus:ultra"}}, base_text=REGISTRY)
+        _ = write_registry(conf.path("models"), {"direct.claude": {"impl": "opus:ultra"}}, base_text=REGISTRY)
         notes: Notes = [self.note("codex1.md", "active", "0")]
         _ = self.alert(notes, self.now)
         self.pushed.clear()
@@ -150,7 +151,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(len(self.pushed), 2)
 
     def test_a_refused_switch_still_alerts_and_says_why(self) -> None:
-        registry = quota_alert.REGISTRY
+        registry = conf.path("models")
         _ = write_registry(registry, {"direct.claude": {"impl": "opus:ultra"}}, base_text=REGISTRY)
         notes: Notes = [self.note("codex1.md", "active", "0")]
         _ = self.alert(notes, self.now)

@@ -20,7 +20,7 @@ class CliFixtureTests(unittest.TestCase):
             caller = Path(scratch) / "caller"
             caller.mkdir()
             environment = {**os.environ, "HOME": str(caller)}
-            for name in ("SHOWRUNNERS_CONFIG", "NOTIFIER_STATE_DIR", "NOTIFIER_SESSIONS_DIR",
+            for name in ("CONF_DIR", "NOTIFIER_STATE_DIR", "NOTIFIER_SESSIONS_DIR",
                          "SHOWRUNNER_STATE_DIR", "SHOWRUNNERS_SESSIONS", "SHOWRUNNERS_SEND",
                          "CLAUDE_CONFIG_DIR", "AGENT_NOTES_DIR", "CLAUDE_SESSIONS_DIR"):
                 _ = environment.pop(name, None)

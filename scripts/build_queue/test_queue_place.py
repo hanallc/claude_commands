@@ -267,7 +267,7 @@ class QueuePlaceFixture(ExitStack):
                             **{"program_first_peak_gib.rust-analyzer": "18"})
         self.enter_context(mock.patch.dict(os.environ, {
             **gate_isolation_environment(self.root), **fake_memory_readings(self.root),
-            "LINT_CONFIG_FILE": str(self.config.with_name("lint.conf")), "BUILDLOG_DIR": str(self.log),
+            "BUILDLOG_DIR": str(self.log),
             "BUILDLOG_PROC": str(self.proc),
             "BUILDLOG_SCOPE": "0", "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "UNIT_SESSION_DIR": "", "UNIT_RUN_DIR": "", "CLAUDE_CODE_SESSION_ID": "queue-place-test",

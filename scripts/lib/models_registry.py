@@ -21,6 +21,7 @@ from typing import Literal, NamedTuple, cast, final
 from scripts.lib import build_folders
 from scripts.lib import conf_reads, land_main, main_publish, main_push_lock, registry_rows, waiting_rows
 from scripts.lib.registry_rows import parse_registry as parse_registry
+from scripts.lib.registry_rows import registry_path as registry_path
 from scripts.lib.operation_environment import OPERATION_ENVIRONMENT as OPERATION_ENVIRONMENT
 from scripts.lib.operation_environment import agent_environment as agent_environment
 from scripts.lib.process_failure import failure_detail
@@ -77,12 +78,12 @@ def _snapshot(environment: Mapping[str, str], variable: str, path: Path, *,
 def launch_configuration(environment: Mapping[str, str], *, registry: Path | None = None) -> LaunchModelConfiguration:
     """Use the parent's operation configuration, or read a new configuration."""
     return LaunchModelConfiguration(*_snapshot(
-        environment, OPERATION_ENVIRONMENT[0], registry or registry_path(), synchronize=True))
+        environment, OPERATION_ENVIRONMENT[0], registry or registry_path(environment), synchronize=True))
 
 
 def edit_base(environment: Mapping[str, str]) -> RegistryEditBase:
     """Start an editor operation, or continue its parent's editor operation."""
-    return RegistryEditBase(*_snapshot(environment, OPERATION_ENVIRONMENT[1], registry_path(), synchronize=True))
+    return RegistryEditBase(*_snapshot(environment, OPERATION_ENVIRONMENT[1], registry_path(environment), synchronize=True))
 
 
 def _sync_catalog(path: Path, environment: Mapping[str, str]) -> None:
@@ -98,7 +99,7 @@ def _sync_catalog(path: Path, environment: Mapping[str, str]) -> None:
     if state.is_file() and not any(source.exists() and source.stat().st_mtime > state.stat().st_mtime for source in sources):
         return
     try:
-        result = subprocess.run([str(script)], env={**environment, "MODELS_CONFIG_FILE": str(path)},
+        result = subprocess.run([str(script), "--registry", str(path)], env=environment,
                                 stdout=subprocess.DEVNULL, check=False)
         if result.returncode == 0:
             return
@@ -259,16 +260,6 @@ class FastForwardCheckFailed(OSError):
     """The check refused the move before any change to the checkout."""
 
 
-def registry_path(environment: Mapping[str, str] | None = None) -> Path:
-    configured = (os.environ if environment is None else environment).get("MODELS_CONFIG_FILE")
-    if configured:
-        return Path(configured)
-    if environment is None:
-        return DEFAULT_PATH
-    home = Path(environment.get("HOME", str(Path.home())))
-    return home / ".claude/config/models.conf"
-
-
 def registry_text(registry: Path | None = None) -> str:
     return conf_reads.read_text(registry or registry_path())
 
@@ -280,7 +271,7 @@ def _shell_rows(rows: tuple[registry_rows.RegistryRow, ...]) -> str:
 
 
 def configuration_shell(configuration: LaunchModelConfiguration | RegistryEditBase) -> str:
-    return (f"MODELS_CONFIG_FILE={shlex.quote(str(configuration.path))}\n"
+    return (f"MODELS_REGISTRY_PATH={shlex.quote(str(configuration.path))}\n"
             + f"MODELS_REGISTRY_BASE={shlex.quote(configuration.text)}\n"
             + f"{OPERATION_ENVIRONMENT[0]}={shlex.quote(_encoded(configuration))}\n"
             + _shell_rows(configuration.rows))

@@ -511,7 +511,7 @@ def resolve_model(args: Arguments, role: str, env: dict[str, str]) -> tuple[str,
         refuse(str(error))
     result = call(["bash", "-c", '''source "$1" &&
 { IFS= read -r -d "" table; _models_table_load "$table"; } || exit 2
-export MODELS_LAUNCH_CONFIGURATION MODELS_CONFIG_FILE
+export MODELS_LAUNCH_CONFIGURATION
 agents_resolve "$2" || exit 2
 if [[ -n "$3" || -n "$4" ]]; then
  pair="${3:-$AGENT_WORD}"

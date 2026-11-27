@@ -353,7 +353,7 @@ class AddUnitTestCase(ShutdownTestCase):
             command = self.bin / name
             _ = command.write_text(STUB, encoding="utf-8")
             _ = command.chmod(0o755)
-        self.agent_config = self.root / "models.conf"
+        self.agent_config = config_root / "models.conf"
         self.pause_state = self.root / "conversation-pause"
         codex_config = self.root / "codex.toml"
         codex_cache = self.root / "models.json"
@@ -362,17 +362,15 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = sync_state.touch()
         self.env = {**os.environ, **configuration, "HOME": str(home),
                     "HERDR_PLATFORM": "linux",
-                    "COPIES_CONFIG": str(copies_config),
                     "TOKIO_WORKER_THREADS": "1",
                     "NOTIFIER_SESSIONS_DIR": str(registry),
                     "FAKE_CLAUDE_SOCKET": str(self.root / "claude.sock"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "STUB_STATE": str(self.state),
-                    "SHOWRUNNERS_CONFIG": str(self.config), "CLAUDE_TEST_SECRET": "must-not-leak",
+                    "CLAUDE_TEST_SECRET": "must-not-leak",
                     "CONVERSATION_PAUSE_STATE_DIR": str(self.pause_state),
                     "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
                     "AGENT_NOTES_DIR": str(notes),
-                    "MODELS_CONFIG_FILE": str(self.agent_config),
                     "CODEX_CONFIG_FILE": str(codex_config),
                     "CODEX_MODELS_CACHE_FILE": str(codex_cache),
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}

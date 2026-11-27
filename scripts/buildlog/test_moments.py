@@ -594,7 +594,7 @@ with index.read_only() as connection:
 '''
         result = subprocess.run(
             [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program], capture_output=True, text=True, check=False,
-            timeout=60, env={**os.environ, "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
+            timeout=60, env={**os.environ, "CONF_DIR": str(Path(config).parent),
                              "PYTHONPATH": str(Path(report.__file__).resolve().parents[1] / "lib/python_startup")},
         )
         self.assertEqual(result.returncode, 0, result.stderr)

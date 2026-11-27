@@ -107,8 +107,9 @@ It never deletes catalog rows or moves family targets backwards.
 
 ### Configuration lifetimes
 
-`models_registry.py` owns the path resolver and the only registry parser.
-An explicit `--registry` selects the path before `registry_path()` supplies `MODELS_CONFIG_FILE` or the default path.
+`registry_rows.py` owns the path resolver and the registry parser. `models_registry.py` re-exports both.
+An explicit `--registry` takes precedence over `registry_path()`.
+The resolver checks `MODELS_CONFIG_FILE`, then `CONF_DIR/models.conf`, then `~/.claude/config/models.conf`.
 Bash passes a set `MODELS_CONFIG_FILE` explicitly, even when the shell variable is not exported.
 An explicit caller argument wins over that shell variable.
 

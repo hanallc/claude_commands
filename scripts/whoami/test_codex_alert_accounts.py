@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import base64
@@ -44,12 +45,12 @@ CURRENT_READING_AGE = timedelta()
 
 def registry_view() -> str:
     """Read the shared registry containing the alert's edits."""
-    return models_registry.registry_text(quota_alert.REGISTRY)
+    return models_registry.registry_text(conf.path("models"))
 
 
 def reset_registry(text: str) -> None:
     """Replace the shared test registry with `text` through the fixture writer."""
-    _ = write_registry(quota_alert.REGISTRY, base_text=text)
+    _ = write_registry(conf.path("models"), base_text=text)
 
 
 class CodexAccountAlertTests(unittest.TestCase):
@@ -86,7 +87,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = (self.root / "staff.json").write_text('{"schema":2,"rows":[]}\n')
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
-        config = self.root / "showrunners.conf"
+        config = conf.path("showrunners")
         _ = config.write_text(("""# range: 0..
 threshold_percent=1
 # range: 0..
@@ -94,11 +95,9 @@ stall_minutes=5
 faults_to=director
 always=director
 """))
-        registry = self.root / "models.conf"
+        registry = conf.path("models")
         _ = write_registry(registry, base_text=REGISTRY)
-        _ = self.enterContext(patch.object(quota_alert, "CONFIG", config))
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "alerts.json"))
-        _ = self.enterContext(patch.object(quota_alert, "REGISTRY", registry))
         _ = self.enterContext(patch.object(quota_alert, "recipients", return_value=["director"]))
         _ = self.enterContext(patch.object(quota_alert, "relay", side_effect=self.relay))
         _ = self.enterContext(patch.object(quota_alert, "tell_user", side_effect=self.push))

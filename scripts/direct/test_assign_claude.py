@@ -213,7 +213,7 @@ exec python3 -c ''' + shlex.quote(GROUP_STOP_READY) + "\n")
         session = self.start_phase("custom-models-path")
         environment = self.launch_environment(session)
         custom = self.root / "custom-models.conf"
-        _ = custom.write_text(Path(environment.pop("MODELS_CONFIG_FILE")).read_text())
+        _ = custom.write_text((Path(environment["CONF_DIR"]) / "models.conf").read_text())
         configuration = models_registry.launch_configuration({
             "MODELS_LAUNCH_CONFIGURATION": json.dumps([str(custom), custom.read_text()]),
         })
@@ -272,7 +272,7 @@ exec python3 -c ''' + shlex.quote(GROUP_STOP_READY) + "\n")
     def test_implementation_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
         session = self.start_phase("registry-snapshot")
         environment = self.environment()
-        probe = RegistryReadProbe(self.root, Path(environment["MODELS_CONFIG_FILE"]))
+        probe = RegistryReadProbe(self.root, (Path(environment["CONF_DIR"]) / "models.conf"))
         result = self.run_assignment(self.assign_command(session), probe.environment(environment))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(probe.reads()), 1, probe.reads())
@@ -427,7 +427,7 @@ exec python3 -c ''' + shlex.quote(GROUP_STOP_READY) + "\n")
 
     def test_model_resolution_failure_preserves_the_previous_pass(self) -> None:
         session = self.start_phase("resolve-failed")
-        registry = self.root / ".claude/config/models.conf"
+        registry = self.root / "models.conf"
         _ = registry.write_text("invalid configuration\n")
         before = (session / "progress_history_state.json").read_bytes()
         result = self.checked_launch(session)

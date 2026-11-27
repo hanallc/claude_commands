@@ -59,7 +59,6 @@ from scripts.whoami.note_file import InvalidReset, KnownReset, NoResetKnown, res
 
 STATE_DIR = Path(os.environ.get("CODEX_PACER_STATE_DIR", Path.home() / ".local" / "state" / "codex-pacer"))
 SESSIONS = Path.home() / ".codex" / "sessions"
-MODELS_CONF = models_registry.registry_path()
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 
 BUFFER = 5.0                 # percent left at every checkpoint
@@ -446,7 +445,7 @@ def make_plan(state: State, notes: Sequence[AgentNote], registry: str, now: date
 def registry_tier() -> str:
     """The worker rows' stored tier: what the bulk of codex launches carry."""
     try:
-        rows = models_registry.parse_registry(models_registry.registry_text(MODELS_CONF))
+        rows = models_registry.parse_registry(models_registry.registry_text())
     except OSError:
         return ""
     return rows.get("direct.options", {}).get("codex_service_tier", "")

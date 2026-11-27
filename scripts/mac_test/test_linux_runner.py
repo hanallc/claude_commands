@@ -221,7 +221,7 @@ class LinuxShellTests(unittest.TestCase):
         _ = (self.root / "lint.conf").write_text(WORKSPACE_SWEEP_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / ".config"),
-            "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
+            "CONF_DIR": str(self.root),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.mirror = self.root / offload.remote_mirror(self.identity, "linux", 2)
@@ -248,7 +248,7 @@ class LinuxShellTests(unittest.TestCase):
             "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / ".config"),
             "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
             "TEST_REAL_RM": real_rm,
-            "TOOL_EVENTS": str(self.event_path), "BUILD_TARGETS_CONFIG": str(registry),
+            "TOOL_EVENTS": str(self.event_path),
             "CONF_DIR": str(self.root),
             "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
@@ -1766,7 +1766,7 @@ class LinuxCopyTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
         _ = write_config_fixture(self.root / "linux.conf", "host=fake-linux\noffload=on\n", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
+            "CONF_DIR": str(self.root),
         })))
 
     def git(self, *words: str) -> str:
@@ -1813,7 +1813,7 @@ class LinuxCopyTests(unittest.TestCase):
         ssh = self.root / "ssh"
         _ = ssh.write_text('#!/bin/bash\nwhile [[ $1 == -o ]]; do shift 2; done\n'
                            + '[[ $1 == natedev ]] && exit 255\n'
-                           + 'shift\ncd "$TEST_REMOTE_HOME" || exit 1\nexec bash -c "$*"\n')
+                           + 'shift\ncd "$TEST_REMOTE_HOME" || exit 1\nunset CONF_DIR\nexec bash -c "$*"\n')
         ssh.chmod(0o755)
         controller = offload.ProcessController()
         request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), owner="verify", target="linux", holder_session="fixture-session")

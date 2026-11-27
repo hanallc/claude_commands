@@ -55,7 +55,7 @@ class TargetSyncTests(unittest.TestCase):
         )
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(temporary), "BUILD_TARGETS_CONFIG": str(self.registry), "BUILDLOG_PEER": "",
+            "HOME": str(temporary), "BUILDLOG_PEER": "",
             "CONF_DIR": str(temporary),
         })))
         _ = self.enterContext(mock.patch.object(store, "host_name", return_value="natedev"))
@@ -235,6 +235,14 @@ class TargetSyncTests(unittest.TestCase):
         self.assertEqual(self.exchange(), 0)
 
         self.assertEqual([timeout for argv, timeout in self.commands if argv[0] == "ssh"], [13, 13])
+
+    def test_sync_settings_use_the_code_checkout_without_conf_dir(self) -> None:
+        configuration = Path(record.__file__).resolve().parents[2] / "config/build_targets.conf"
+        with mock.patch.dict(os.environ):
+            del os.environ["CONF_DIR"]
+            with mock.patch("scripts.lib.conf.read") as read:
+                _ = record.sync_config()
+        read.assert_called_once_with(configuration)
 
     def test_pause_prevents_every_peer_command_and_keeps_success_state(self) -> None:
         self.assertEqual(self.exchange(), 0)

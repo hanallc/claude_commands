@@ -358,7 +358,7 @@ class ProducerLifecycleTests(unittest.TestCase):
                                           "producers": {"morty": "claude:opus:high", "dwight": "claude:sonnet:high"}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {**config_environment(self.config),
             "HOME": str(self.root), "STAFF_FILE": str(self.root / "staff.json"),
-            "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "MODELS_CONFIG_FILE": str(self.registry),
+            "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "CONF_DIR": str(self.registry.parent),
             "MODELS_CONFIG_PUBLISH": "0", "MODELS_CONFIG_TIER_ONLY": "1"})))
         _ = cast(object, self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes")))
         _ = cast(object, self.enterContext(patch.object(roster, "roster", return_value=roster.Roster([], []))))

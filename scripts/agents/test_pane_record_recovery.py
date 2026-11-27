@@ -238,7 +238,7 @@ class PaneRecordRecoveryTests(unittest.TestCase):
         write_machine_config(configuration)
         _ = write_config_fixture(configuration / "staff.conf", "producer_workspace=producers\n")
         registry = write_registry(configuration / "models.conf", {"producers": {"alpha": "claude:opus:max"}})
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(registry.parent)})))
         for pid in (123, 4242):
             self.native_processes[pid] = herdr.NativeAgentProcess(herdr.EnvironmentThread(self.row.current_session),
                 "fixture-generation", {"HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2",
@@ -392,9 +392,9 @@ class PaneMoveRecoveryTests(FolderMoveFixture):
         configuration.mkdir()
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             _ = write_config_fixture(configuration / source.name)
-        registry = write_registry(configuration / "models.conf")
+        _ = write_registry(configuration / "models.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(configuration), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+            "CONF_DIR": str(configuration), "MODELS_CONFIG_PUBLISH": "0",
         })))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
 

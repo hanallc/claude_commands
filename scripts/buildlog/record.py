@@ -134,9 +134,9 @@ def sync_config() -> dict[str, str]:
     """Read peer settings when a sync or report needs them."""
     from scripts.lib import conf
 
-    path = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(Path(__file__).resolve().parents[2]
-                                                         / "config/build_targets.conf"))).expanduser()
-    return conf.read(path).values()
+    source = ("build_targets" if os.environ.get("CONF_DIR")
+              else Path(__file__).resolve().parents[2] / "config/build_targets.conf")
+    return conf.read(source).values()
 
 
 def target_hosts(target: str) -> tuple[str, ...]:

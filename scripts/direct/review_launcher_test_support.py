@@ -207,7 +207,6 @@ class ReviewLauncherFixture(LauncherFixture):
         environment["CODEX_THREAD_ID"] = self.staff_parent
         environment["PYTHONPATH"] = str(DIRECT_DIR.resolve().parent / "lib/python_startup")
         _ = environment.pop("STAFF_ID", None)
-        environment["LINT_CONFIG_FILE"] = str(self.root / "lint.conf")
         environment["UNIT_EARLY_POLL_SECS"] = "0.01"
         environment["TEST_WAIT_HELPER_DIR"] = str(DIRECT_DIR.resolve())
         environment["FAST_TRACK_STATE_DIR"] = str(self.root / "fast-track-state")

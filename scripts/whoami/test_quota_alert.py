@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.lib import conf
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert, quota_state
 from scripts.production import showrunners
@@ -59,7 +60,7 @@ class RecipientFailureTests(unittest.TestCase):
 
 def write_settings(config: quota_alert.Config) -> None:
     """Write the four settings with their configured types."""
-    _ = quota_alert.CONFIG.write_text(
+    _ = conf.path("showrunners").write_text(
         f"# range: 0..\nthreshold_percent={config['threshold_percent']}\n"
         + f"# range: 0..\nstall_minutes={config['stall_minutes']}\n"
         + f"faults_to={config['faults_to']}\nalways={' '.join(config['always'])}\n")
@@ -129,7 +130,9 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertIsNot(quota_alert.tell_user, REAL_TELL_USER)
 
     def test_load_config_reads_the_shared_configuration(self) -> None:
-        named_config = self.root / "named-showrunners.conf"
+        folder = self.root / "named-config"
+        folder.mkdir()
+        named_config = folder / "showrunners.conf"
         _ = named_config.write_text(("""# range: 0..
 threshold_percent=7
 # range: 0..
@@ -138,7 +141,7 @@ faults_to=fault-handler
 always=always-there
 """), encoding="utf-8")
 
-        with mock.patch.object(quota_alert, "CONFIG", named_config):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(folder)}):
             config = quota_alert.load_config()
 
         self.assertEqual(config["threshold_percent"], 7)
@@ -348,7 +351,7 @@ always=always-there
         past = local_reset(self.now - timedelta(hours=1))
         notes: Notes = [self.note("codex2.md", "inactive", "0"), self.note("claude1.md", "active", "2"),
                         self.note("claude2.md", "active", "null"), self.note("codex1.md", "active", "0", past)]
-        with quota_alert.CONFIG.open("a", encoding="utf-8") as settings:
+        with conf.path("showrunners").open("a", encoding="utf-8") as settings:
             _ = settings.write("token_expiry.lead_days=30 7\n"
                                + "token_expiry.hana_linux_runners.ends=2099-01-01\n"
                                + "token_expiry.hana_macos_runner_query.ends=2099-01-01\n")

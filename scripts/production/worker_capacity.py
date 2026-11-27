@@ -211,7 +211,7 @@ def stop() -> int:
     if faults:
         text = "\n".join(["Codex worker stop is incomplete. A Codex worker that still runs can spend credits.", *faults])
         print(text, file=sys.stderr)
-        delivered = _send(showrunners.load_settings_from(showrunners.CONFIG)["faults_to"], text) and delivered
+        delivered = _send(showrunners.load_settings()["faults_to"], text) and delivered
     return 0 if delivered and not faults else 1
 
 

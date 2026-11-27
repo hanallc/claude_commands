@@ -337,7 +337,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
     def assert_held_role_family(self, family: Literal["claude", "codex"],
                                 models: tuple[str, str], efforts: tuple[str, str],
                                 permission_flag: str, permissions: tuple[str, str]) -> None:
-        _ = write_registry(Path(os.environ["MODELS_CONFIG_FILE"]), {
+        _ = write_registry((Path(os.environ["CONF_DIR"]) / "models.conf"), {
             "assignments": {"design_roles": family},
             "design_roles." + family: dict(zip(("designer", "reviewer"),
                 (model + ":" + effort for model, effort in zip(models, efforts, strict=True)), strict=True)),
@@ -463,14 +463,13 @@ class DurableRolesTests(HeldRolePaneCase):
         assert unit is not None
         _ = staff.update_current_session(unit.current_session, staff.native_id(self.holder_session))
         _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.repository), expected=unit.worktree)
-        config = self.root / "models.conf"
+        config = Path(os.environ["CONF_DIR"]) / "models.conf"
         _ = write_registry(config, {'assignments': {'design_roles': 'codex'}, 'design_roles.codex': {'designer': 'gpt-fixture:xhigh', 'reviewer': 'gpt-review-fixture:high'}, 'codex.agents': {'gpt-fixture': 'xhigh', 'gpt-review-fixture': 'high'}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root / "home"), "DESIGN_ROLES_STATE": str(self.root / "roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "ownership"), "DESIGN_ROLES_HOST": "natedev",
             "ASTRA_ROLES_STATE": str(self.root / "holds"), "CODEX_THREAD_ID": self.holder_session,
             "USAGE_STATE_DIR": str(self.root / "usage"),
-            "MODELS_CONFIG_FILE": str(config),
         })))
         _ = self.enterContext(patch.object(design_roles, "authority_request", side_effect=self.authority))
         _ = self.enterContext(patch.object(design_roles, "dispatch_turn", side_effect=self.dispatch))
@@ -1294,13 +1293,13 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(list((self.root / "roles").glob("*/design.json")), [])
 
     def test_invalid_model_registry_refuses_before_thread_creation(self) -> None:
-        write_text_atomic(Path(os.environ["MODELS_CONFIG_FILE"]), "[design_roles.codex\ndesigner=gpt-fixture:xhigh\n")
+        write_text_atomic((Path(os.environ["CONF_DIR"]) / "models.conf"), "[design_roles.codex\ndesigner=gpt-fixture:xhigh\n")
         with self.assertRaises(design_roles.RoleRefused):
             _ = self.open_designer()
         self.assertEqual(self.launches, [])
 
     def test_missing_or_disallowed_configured_model_never_uses_a_fallback(self) -> None:
-        config = Path(os.environ["MODELS_CONFIG_FILE"])
+        config = (Path(os.environ["CONF_DIR"]) / "models.conf")
         for index, model in enumerate((None, "unlisted-model:xhigh", "gpt-fixture:invalid-effort")):
             document = f"configuration-{index}.md"
             write_text_atomic(self.repository / document, "# Private design\n")

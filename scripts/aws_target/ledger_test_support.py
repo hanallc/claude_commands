@@ -61,6 +61,11 @@ def text_setting(path: Path, key: str, value: str) -> None:
     _ = path.write_text("\n".join([*lines, f"{key}={value}"]) + "\n")
 
 
+def account_fixture_path(home: Path) -> Path:
+    """Return the installed account settings path under a private home."""
+    return home / '.claude/config/aws_target.conf'
+
+
 def install_cost_settings(path: Path) -> None:
     """Install complete settings with exact, private test prices."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -228,18 +233,18 @@ class AwsSettingsFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.settings = self.root / "aws_target.conf"
+        self.settings = account_fixture_path(self.root)
         self.state = self.root / "state"
         self.state.mkdir()
         install_aws_fixture_settings(self.root)
+        install_cost_settings(self.settings)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **self.fixture_environment(), "HOME": str(self.root),
-            "AWS_TARGET_CONFIG": str(self.settings),
             "FOR_YOU_ACTIONS_DIR": str(self.root / "actions"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })))
         # Remove inherited AWS paths and credentials. The patch restores them when the test ends.
-        for name in [name for name in os.environ if name.startswith("AWS_") and name != "AWS_TARGET_CONFIG"]:
+        for name in [name for name in os.environ if name.startswith("AWS_")]:
             del os.environ[name]
 
     def fixture_environment(self) -> dict[str, str]:
@@ -286,6 +291,7 @@ class CostFixture(AwsSettingsFixture):
     def commit_settings(self) -> None:
         for arguments in (("init", "-q"), ("config", "user.name", "Cost fixture"),
                           ("config", "user.email", "cost@example.invalid"),
-                          ("add", self.settings.name), ("commit", "-qm", "Record valid settings")):
+                          ("add", str(self.settings.relative_to(self.root))),
+                          ("commit", "-qm", "Record valid settings")):
             _ = subprocess.run(["git", "-C", str(self.root), *arguments], check=True,
                                capture_output=True, timeout=TEST_HANG_GUARD_SECS)

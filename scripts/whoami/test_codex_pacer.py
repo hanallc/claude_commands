@@ -35,6 +35,17 @@ def local(hours: float) -> str:
 
 
 class PlanTests(unittest.TestCase):
+    def test_registry_tier_follows_the_current_config_directory(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with patch.dict(os.environ):
+            _ = os.environ.pop("MODELS_CONFIG_FILE", None)
+            for tier in ("default", "fast"):
+                config = root / tier
+                config.mkdir()
+                _ = (config / "models.conf").write_text(f"[direct.options]\ncodex_service_tier={tier}\n")
+                os.environ["CONF_DIR"] = str(config)
+                self.assertEqual(pacer.registry_tier(), tier)
+
     def test_share_spends_exactly_the_affordable_rate(self) -> None:
         share = pacer.fast_share(affordable=2.0, demand_rate=1.0, k=3.0)
         self.assertAlmostEqual(1.0 * (1 + share * (3.0 - 1)), 2.0)

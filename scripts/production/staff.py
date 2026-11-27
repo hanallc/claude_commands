@@ -109,8 +109,7 @@ class BackendUnavailable:
 def _seconds(key: str) -> float:
     from scripts.lib import conf
 
-    source = Path(os.environ["STAFF_CONFIG"]) if os.environ.get("STAFF_CONFIG") else "staff"
-    return conf.read(source).number(key)
+    return conf.read("staff").number(key)
 
 
 def _wait_seconds(key: str) -> float:

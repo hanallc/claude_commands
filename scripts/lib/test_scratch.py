@@ -59,7 +59,7 @@ class ScratchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         environment = {key: value for key, value in os.environ.items()
-                       if not key.startswith("GIT_") and key not in ("BASH_ENV", "STAFF_CONFIG")}
+                       if not key.startswith("GIT_") and key != "BASH_ENV"}
         fixture = copies_environment(self.base)
         _ = write_config_fixture(Path(fixture["CONF_DIR"]) / "build_folders.conf",
             f"roots.build={self.base / 'build'}\nroots.build.natedev={self.base / 'build'}\n"

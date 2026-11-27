@@ -206,7 +206,7 @@ remote_start_hold_seconds=1200
 # range: 5e-324..
 source_check_seconds=1
 """ + ADMISSION_CONFIG_FIXTURE.read_text())
-        self.configuration = self.base / "copies.conf"
+        self.configuration = configuration / "copies.conf"
         self.settings = {"owner.verify": "verify",
                          "remote_registry": str(self.base / "remote-mirrors"),
                          "git_timeout_seconds": "10",
@@ -216,7 +216,7 @@ source_check_seconds=1
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith(("GIT_", "COPIES_STEP_")) and key not in (
                            "UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_TARGET_DIR", "COPIES_RUN_PID",
-                           "BASH_ENV", "STAFF_CONFIG", admission_client.RESERVED_STEP_ENV)}
+                           "BASH_ENV", admission_client.RESERVED_STEP_ENV)}
         environment.update({
             **copy_configuration.environment,
             "HOME": str(home),
@@ -227,7 +227,6 @@ source_check_seconds=1
             "SCRATCH_ROOT": str(self.base / "scratch"),
             "SCRATCH_HOLDS": str(self.base / "holds.json"),
             "SCRATCH_COPIES_ROOT": str(self.base / "workspaces"),
-            "COPIES_CONFIG": str(self.configuration),
             # A child's fresh copy goes in the test folder, so a killed child leaves nothing outside it.
             "TMPDIR": str(temporary),
         })
@@ -1946,6 +1945,15 @@ with patch.object(subprocess, 'run', pause_clone):
                     self.assertTrue((tree / '.git').is_file())
                     self.assertTrue((tree / 'tracked.txt').is_file())
                     self.assertEqual(self.lease(tree)['unit'], tree.parent.name)
+
+    def test_copies_settings_select_the_fixture_or_the_code_checkout(self) -> None:
+        path, values = copies.config_settings()
+        self.assertEqual(path, self.configuration)
+        self.assertEqual(values["remote_registry"], str(self.base / "remote-mirrors"))
+        with mock.patch.dict(os.environ):
+            del os.environ["CONF_DIR"]
+            path, _ = copies.config_settings()
+        self.assertEqual(path, Path(copies.__file__).resolve().parents[2] / "config/copies.conf")
 
     def test_missing_or_invalid_required_configuration_refuses_before_clone(self) -> None:
         variants = [

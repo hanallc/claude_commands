@@ -24,7 +24,7 @@ from scripts.buildlog.test_index import use_test_log
 use_test_log()
 
 from scripts.aws_target import ledger, measurement, run_cost
-from scripts.aws_target.ledger_test_support import numeric_settings
+from scripts.aws_target.ledger_test_support import account_fixture_path, numeric_settings
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
 
 
@@ -126,12 +126,14 @@ class AwsReportTests(MeasurementFixture):
                 self.assertEqual(original.count("**Today (UTC"), 1)
                 self.assertLess(original.index("### Mac\n"), original.index("### AWS\n"))
                 self.assertLess(original.index("### AWS\n"), original.rindex("Mac copies: none started."))
-        account = self.root / 'account/aws_target.conf'
-        account.parent.mkdir()
+        account_home = self.root / 'account'
+        account = account_fixture_path(account_home)
+        account.parent.mkdir(parents=True)
         _ = account.write_bytes(self.settings.read_bytes())
         numeric_settings(account, {'daily_limit_usd': '7'})
-        self.costs({'daily_limit_usd': '1'})
-        with self.subTest(settings='installed account'), mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(account)}):
+        numeric_settings(self.root / 'aws_target.conf', {'daily_limit_usd': '1'})
+        account_environment = {'HOME': str(account_home), 'BUILD_TARGETS_STATE_DIR': str(self.state.parent)}
+        with self.subTest(settings='installed account'), mock.patch.dict(os.environ, account_environment):
             output = self.render()
             self.assertIn('of the $7.00 daily limit', output)
             self.assertIn('**Today (UTC 2026-01-15, estimate):', output)
@@ -298,7 +300,7 @@ class AwsReportTests(MeasurementFixture):
                         self.assertIn('**Today (UTC 2026-01-15, estimate): $1.00', output)
 
     def test_gate_type_comparison_uses_finished_times_and_billed_days_in_the_window(self) -> None:
-        numeric_settings(self.settings, {'gate_type_window_days': '2'})
+        numeric_settings(self.root / 'aws_target.conf', {'gate_type_window_days': '2'})
         launches: list[dict[str, object]] = []
         for attempt, size, mode, at, box_s, gate_s in (
             ('merge-m', 'm7a.8xlarge', 'gate', MIDNIGHT - 3600, 100, 60),
@@ -393,7 +395,7 @@ class AwsReportTests(MeasurementFixture):
              'reason': 'fixture future reason'},
         ]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
-        numeric_settings(self.settings, {'gate_type_window_days': '1'})
+        numeric_settings(self.root / 'aws_target.conf', {'gate_type_window_days': '1'})
         output = self.render()
         lines = [line for line in output.splitlines() if line.startswith('- Cloud gate uses natedev:')]
         self.assertEqual(len(lines), 2)

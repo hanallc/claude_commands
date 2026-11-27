@@ -5340,8 +5340,7 @@ class CloudAdmissionTests(unittest.TestCase):
                 directory = fixture.root / "queue-target-state"
                 book = ledger.CostLedger(directory / "aws")
                 saved = book.path.read_bytes()
-                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(directory),
-                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(directory)}):
                     _ = read_aws_gate_evidence(fixture, request)
                     reply, = fixture.server.handle_request(request)
                     if cause == "ready":
@@ -5364,8 +5363,7 @@ class CloudAdmissionTests(unittest.TestCase):
 
         with PlacementFixture() as fixture:
             directory = fixture.root / "queue-target-state"
-            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(directory),
-                                              "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(directory)}):
                 first = aws_gate_request(fixture)
                 second = aws_gate_request(fixture)
                 gate_settings = fixture.root / "cloud_gate.conf"

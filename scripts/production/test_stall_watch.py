@@ -276,8 +276,7 @@ class StallWatchTests(unittest.TestCase):
         }
         for name, contents in configuration.items():
             _ = (self.root / f"{name}.conf").write_text(contents)
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root),
-            "STAFF_CONFIG": str(self.root / "staff.conf")}))
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         self.environment["HERDR_PANE_RECORD_DIR"] = str(self.root / "pane-records")
         self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         self.bin = self.root / "bin"
@@ -322,7 +321,6 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             "CODEX_HOME": str(self.root / "codex"),
             "HOME": str(self.root),
             "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
-            "SHOWRUNNERS_CONFIG": str(self.config),
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
@@ -927,8 +925,7 @@ runpy.run_path(str(script), run_name='__main__')
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(stall_watch, "STATE_DIR", self.state),
               mock.patch.object(stall_watch, "processes", return_value=[]),
-              mock.patch.multiple(showrunners, SESSIONS=reader, CONFIG=self.config,
-                                  NOTIFIER_STATE_DIR=self.notifier),
+              mock.patch.multiple(showrunners, SESSIONS=reader, NOTIFIER_STATE_DIR=self.notifier),
               mock.patch.object(unit_lookup, "read_run_states", return_value=unit_lookup.RunStates({})),
               redirect_stderr(errors)):
             _ = stall_watch.tick(START + 60, deadline=began + 0.15)
@@ -2004,7 +2001,7 @@ runpy.run_path(str(script), run_name='__main__')
         _ = write_config_fixture(self.root / "context_usage.conf", "transcript.tail_bytes=524288\n")
         registry = self.root / "models.conf"
         _ = write_registry(registry, {"claude.context": {"default": str(window)}}, replace_sections=("claude.context",))
-        self.environment.update(MODELS_CONFIG_FILE=str(registry), CLAUDE_CODE_AUTO_COMPACT_WINDOW="400k")
+        self.environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "400k"
         transcript = self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl"
         entries = [{"type": "assistant", "message": {"model": "claude-test-1", "usage": usage}}
                    for usage in ({"input_tokens": 400_000},

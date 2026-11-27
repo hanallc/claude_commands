@@ -201,7 +201,7 @@ Path('admission.json').write_text(json.dumps({{'fresh': fresh,
             r'''CMD=test
 HOLD_WAIT_DIR="$PWD/tmp"
 tree_key() {
-  VERIFY_TEST_BUILD_INPUTS_FILE="$HOLD_WAIT_DIR/test-build-inputs" "$PY" "$TREE_WATCH_SCRIPT" --key "$@" --package sample "$VERIFY" "$HOME/.claude/scripts/lint/invoke.sh" "$LINT_CONFIG_FILE" -- test sample --filter native_rate <<< "$TEST_METADATA"
+  VERIFY_TEST_BUILD_INPUTS_FILE="$HOLD_WAIT_DIR/test-build-inputs" "$PY" "$TREE_WATCH_SCRIPT" --key "$@" --package sample "$VERIFY" "$HOME/.claude/scripts/lint/invoke.sh" "$CONF_DIR/lint.conf" -- test sample --filter native_rate <<< "$TEST_METADATA"
 }
 build_hold_wait_local() {
   printf "// edited during hold\n" >> src/lib.rs

@@ -18,9 +18,15 @@ if [[ "$(uname -s)" == Linux ]]; then
     export MODELS_CONFIG_PUBLISH="${MODELS_CONFIG_PUBLISH:-later}"
 fi
 
+registry=()
 if [[ "${1:-}" == "--check" ]]; then
     CHECK_ONLY=true
-elif [[ $# -ne 0 ]]; then
+    shift
+elif [[ "$#" == 2 && "$1" == "--registry" ]]; then
+    registry=(--registry "$2")
+    shift 2
+fi
+if [[ $# -ne 0 ]]; then
     echo "usage: $0 [--check]" >&2
     exit 2
 fi
@@ -163,7 +169,7 @@ warn_missing_claude_aliases() {
 }
 
 command -v jq >/dev/null || fail "jq is required"
-_models_registry_parse || exit 1
+_models_registry_parse "${registry[@]}" || exit 1
 [[ -f "$CODEX_CONFIG_FILE" ]] || fail "Codex config not found: $CODEX_CONFIG_FILE"
 # Every query below uses the same complete snapshot, even if Codex rewrites the
 # live file between queries. Only the shared reader opens/parses that file.
@@ -344,7 +350,7 @@ done <<< "$assigned_rows"
 
 warn_missing_claude_aliases
 
-tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+tmp_file="$(mktemp "${MODELS_REGISTRY_PATH}.XXXXXX")"
 cleanup() {
     rm -f "$tmp_file"
     release_lock
@@ -385,10 +391,10 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     printf '%s\n' "$line" >> "$tmp_file"
 done < <(printf '%s' "$MODELS_REGISTRY_BASE")
 
-[[ "$saw_codex_agents" == true ]] || fail "[codex.agents] section not found in $MODELS_CONFIG_FILE"
+[[ "$saw_codex_agents" == true ]] || fail "[codex.agents] section not found in $MODELS_REGISTRY_PATH"
 
 # Keep models/efforts seen on another machine and never downgrade a family.
-merged_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+merged_file="$(mktemp "${MODELS_REGISTRY_PATH}.XXXXXX")"
 if ! "$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/models_registry.py" catalog \
     --before <(printf '%s' "$MODELS_REGISTRY_BASE") --after "$tmp_file" > "$merged_file"; then
     rm -f "$merged_file"
@@ -420,11 +426,11 @@ if [[ "$catalog_current" == true ]]; then
 fi
 
 if [[ "$CHECK_ONLY" == true ]]; then
-    echo "Codex agent catalog is stale: $MODELS_CONFIG_FILE" >&2
+    echo "Codex agent catalog is stale: $MODELS_REGISTRY_PATH" >&2
     exit 1
 fi
 
 models_registry_store "$tmp_file" "add Codex catalog models and efforts" additive-catalog
 trap release_lock EXIT
 checkpoint_sync_state
-echo "Updated Codex agent catalog: $MODELS_CONFIG_FILE"
+echo "Updated Codex agent catalog: $MODELS_REGISTRY_PATH"

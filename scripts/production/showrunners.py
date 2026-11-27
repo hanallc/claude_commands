@@ -26,7 +26,6 @@ from scripts.lib import conf as tunables
 from scripts.lib.showrunner_state import state_root
 from scripts.message import session_send
 
-CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or tunables.path("showrunners"))
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
 SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SHOWRUNNER_STATE_DIR = state_root()
@@ -185,11 +184,11 @@ class ShowrunnerSource:
 
 
 def load_settings() -> ShowrunnerSettings:
-    return load_settings_from(CONFIG)
+    return load_settings_from("showrunners")
 
 
-def load_settings_from(path: Path) -> ShowrunnerSettings:
-    settings = tunables.read(path)
+def load_settings_from(source: Path | str) -> ShowrunnerSettings:
+    settings = tunables.read(source)
     return ShowrunnerSettings(
         threshold_percent=settings.number("threshold_percent"),
         stall_minutes=settings.number("stall_minutes"),

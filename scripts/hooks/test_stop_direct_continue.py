@@ -157,7 +157,7 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
             "XDG_STATE_HOME": str(root / "state"), 
             "UNIT_HISTORY_DIR": str(history.parent), "UNIT_SYNC_WRITES": "0",
             "SCRATCH_ROOT": str(root / "scratch"),
-            "CLAUDE_PROBE_SESSION": "0", "MODELS_CONFIG_FILE": str(config),
+            "CLAUDE_PROBE_SESSION": "0",
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k", "STAFF_FILE": str(root / "staff.json"), "CONF_DIR": str(root),
         }
         fixture = DirectorStopFixture(root, run, root / "staff.json", root / "transcript.jsonl", environment)

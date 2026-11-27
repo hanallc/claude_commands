@@ -33,7 +33,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.aws_target import config as aws_config, hana_result, ledger
 from scripts.aws_target.hana_generation import HanaHostGeneration
-from scripts.aws_target.ledger_test_support import install_cost_settings, numeric_settings, text_setting
+from scripts.aws_target.ledger_test_support import account_fixture_path, install_cost_settings, numeric_settings, text_setting
 from scripts.buildlog import aws_costs, charts, cost_actions, costs, index, machine_facts, parse, store
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config, write_live_mac_state
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, person_actions, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
@@ -104,7 +104,7 @@ PRIVATE_AWS_FIELDS = {
 def write_aws_cost_fixture(root: Path, *, unknown_unit: str = "", instant: int = AWS_COST_TIME,
                            first_job: StepJob | GateJobNotRecorded | None = AWS_COST_JOB) -> ledger.CostLedger:
     """Save a bill, three finished runs, and the latest fixed costs."""
-    settings = root / "aws_target.conf"
+    settings = account_fixture_path(root)
     install_cost_settings(settings)
     text_setting(settings, "notification_recipient", PRIVATE_AWS_FIELDS["recipient"])
     _ = (root / "build_steps.conf").write_text(
@@ -1122,6 +1122,7 @@ class MemoryFeedTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         write_private_build_roots(self.root / "build_folders.conf", self.root, FIXTURE_MACHINE)
+        _ = write_config_fixture(self.root / "copies.conf", f"remote_registry={self.root / 'remote-mirrors'}\n")
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
         _ = write_config_fixture(self.root / "build_admission.conf",
@@ -1142,7 +1143,7 @@ class MemoryFeedTests(unittest.TestCase):
             "CONF_DIR": str(self.root),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILD_TARGETS_STATE_DIR": str(self.root / "target-state"),
-            "AWS_TARGET_CONFIG": str(self.root / "aws_target.conf"),
+            "HOME": str(self.root),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "USER_ZONE": "UTC",
@@ -6048,7 +6049,7 @@ const refresh = createPageRefresh(tick);
 
     def test_aws_cost_feed_uses_saved_bills_and_box_time(self) -> None:
         _ = write_aws_cost_fixture(self.root)
-        numeric_settings(self.root / "aws_target.conf", {"cost_explorer_interval_seconds": "82800"})
+        numeric_settings(account_fixture_path(self.root), {"cost_explorer_interval_seconds": "82800"})
         with (mock.patch.object(subprocess, "run", side_effect=AssertionError("AWS costs only read saved records")),
               mock.patch.object(subprocess, "Popen", side_effect=AssertionError("AWS costs only read saved records"))):
             costs = aws_costs.read_saved_costs(AWS_COST_TIME)
@@ -6097,7 +6098,7 @@ const refresh = createPageRefresh(tick);
                 root = Path(folder)
                 _ = write_aws_cost_fixture(root, first_job=job)
                 with mock.patch.dict(os.environ, {
-                    "CONF_DIR": str(root), "AWS_TARGET_CONFIG": str(root / "aws_target.conf"),
+                    "CONF_DIR": str(root), "HOME": str(root),
                     "BUILD_TARGETS_STATE_DIR": str(root / "target-state"),
                 }):
                     billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][1]
@@ -6126,7 +6127,7 @@ const refresh = createPageRefresh(tick);
 
     def test_aws_cost_feed_uses_the_same_day_amount_as_the_guard(self) -> None:
         book = write_aws_cost_fixture(self.root)
-        settings = aws_config.read_settings(self.root / "aws_target.conf")
+        settings = aws_config.read_settings(account_fixture_path(self.root))
         state = book.priced_snapshot(AWS_COST_TIME)
         guard = ledger.gate_spend_days(state, settings, book.read_bills(), AWS_COST_TIME, reserve=True)
         daily, _ = ledger.spending_periods(tuple(charge for day in guard for charge in day.intervals),
@@ -6142,7 +6143,7 @@ const refresh = createPageRefresh(tick);
         with book.transaction() as state:
             state.reconciliations.append(ledger.CostReconciliation(
                 bill.at, bill.period_start, bill.period_end, bill.actual_usd, "Cost Explorer", Decimal("0.01")))
-        settings = aws_config.read_settings(self.root / "aws_target.conf")
+        settings = aws_config.read_settings(account_fixture_path(self.root))
         priced = book.priced_snapshot(AWS_COST_TIME)
         days = ledger.gate_spend_days(priced, settings, (bill,), AWS_COST_TIME)
         self.assertEqual(aws_costs.daily_charge_totals(days, settings.accounting_zone)[bill.day], Decimal("12.01"))
@@ -6246,7 +6247,7 @@ const refresh = createPageRefresh(tick);
                 self.assertEqual(aws_costs.recorded_unit(value), "")
 
     def test_aws_cost_feed_keeps_the_caps_when_evidence_is_missing(self) -> None:
-        install_cost_settings(self.root / "aws_target.conf")
+        install_cost_settings(account_fixture_path(self.root))
         actual = aws_costs.read_saved_costs(AWS_COST_TIME)
         self.assertEqual(actual, {**aws_costs.empty_costs(AWS_COST_TIME), "limits": {
             "day_usd": "20.00", "month_usd": "400.00", "reserve_usd": "3.00"}})
@@ -6320,7 +6321,7 @@ const refresh = createPageRefresh(tick);
     def test_aws_cost_feed_keeps_bill_days_in_utc(self) -> None:
         instant = int(datetime(2026, 2, 1, 2, tzinfo=UTC).timestamp())
         _ = write_aws_cost_fixture(self.root, instant=instant)
-        text_setting(self.root / "aws_target.conf", "accounting_zone", "America/New_York")
+        text_setting(account_fixture_path(self.root), "accounting_zone", "America/New_York")
         actual = aws_costs.read_saved_costs(instant)
         self.assertEqual([(row["day"], row["state"], row["amount_usd"]) for row in actual["days"]], [
             ("2026-02-01", "estimate", "4.00"), ("2026-01-31", "final", "12.00"),

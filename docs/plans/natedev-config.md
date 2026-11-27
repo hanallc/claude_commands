@@ -189,7 +189,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - A packaged-defaults fallback in `stall_watch` when no committed limit is usable: the old code raised in the same case.
 - A Hana row that ships `models_registry.py` with `conf.py`: no guest config has an `# agent:` limit.
 
-### Phase 5 — Per-file config environment variables to CONF_DIR  · status: todo
+### Phase 5 — Per-file config environment variables to CONF_DIR  · status: done
 **Depends on:** Phase 4
 
 #### Work Order

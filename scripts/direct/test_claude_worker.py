@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -20,7 +21,7 @@ from unittest.mock import patch
 from scripts.lib.helper_tree_test_support import copy_helpers
 
 from scripts.direct import worker_state
-from scripts.lib import models_registry
+from scripts.lib import models_registry, nix_env
 from scripts.direct import claude_worker
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.process_group import send_process_group
@@ -136,6 +137,28 @@ class ClaudeWorkerFixture:
     environment: dict[str, str]
 
 
+class ClaudeStartTests(unittest.TestCase):
+    def test_worker_settings_use_the_loaded_config_directory(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        caller = {"CONF_DIR": str(root / "caller")}
+        turn = claude_worker.ClaudeTurn("fixture", root, root, root / "prompt",
+            root / "summary", root / "log", "", "", "", "", False, caller)
+        for loaded in (nix_env.Loaded({"CONF_DIR": str(root / "envrc-config")}, root / ".envrc"),
+                       nix_env.Loaded({}, root / ".envrc"), nix_env.NoEnvrc({})):
+            prepared = claude_worker.PreparedClaudeLaunch("", caller, loaded)
+            with (self.subTest(loaded=loaded), patch.object(subprocess, "Popen") as start,
+                  patch.object(claude_worker, "_banner_identity", return_value="abcdef12")):
+                _ = claude_worker._start(turn, "fixture-claude", dict(caller), prepared)  # pyright: ignore[reportPrivateUsage]
+                call = start.call_args
+                assert call is not None
+                arguments = cast(list[str], call.args[0])
+                settings = cast(dict[str, object], json.loads(arguments[arguments.index("--settings") + 1]))
+                worker_environment = cast(dict[str, str], settings["env"])
+                launch_environment = cast(dict[str, str], call.kwargs["env"])
+                self.assertEqual(worker_environment.get("CONF_DIR"), loaded.env.get("CONF_DIR"))
+                self.assertEqual(launch_environment.get("CONF_DIR"), loaded.env.get("CONF_DIR"))
+
+
 class ClaudeTurnWaitTests(unittest.TestCase):
     def test_wait_uses_the_configured_poll_interval(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -182,10 +205,11 @@ class NativeClaudeWorkerTests(StaffTestCase):
         record: dict[str, object] = {"pid": os.getpid(), "procStart": sessions.process_start(os.getpid()),
                   "sessionId": identity, "name": "fresh-impl", "entrypoint": "cli",
                   "messagingSocketPath": "", "updatedAt": 1, "formerNames": [], "tmux": ""}
-        models = write_registry(self.root / "models.conf")
-        self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
+        config = self.root / "config"
+        _ = shutil.copytree(CHECKOUT / "config", config)
+        _ = write_registry(config / "models.conf")
         environment = {**os.environ, "CODEX_THREAD_ID": unit.id, "UNIT_RUN_DIR": str(run_dir),
-            "CONF_DIR": str(CHECKOUT / "config"), "UNIT_WORKER_POLL_SECS": "0",
+            "CONF_DIR": str(config), "UNIT_WORKER_POLL_SECS": "0",
             "CLAUDE_BIN": str(backend), "CLAUDE_WORKER_SEND_SCRIPT": str(sender),
             "FIXTURE_CHECKOUT": str(CHECKOUT), "FIXTURE_NATIVE_ID": identity,
             "FIXTURE_BACKEND_LOG": str(backend_log), "FIXTURE_SENT": str(sent),

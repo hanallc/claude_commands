@@ -343,8 +343,7 @@ class MergeGateFixture(unittest.TestCase):
     def setUpClass(cls) -> None:
         configuration = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="gate-config-", dir="/tmp")))
         environment = fixture_git_environment(configuration)
-        for key in ("BASH_ENV", "STAFF_CONFIG"):
-            _ = environment.pop(key, None)
+        _ = environment.pop("BASH_ENV", None)
         environment.update(cls.fixture_configuration(configuration))
         _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, environment, clear=True)))
         tmpfs = build_folders.tmpfs_temporary_parent()

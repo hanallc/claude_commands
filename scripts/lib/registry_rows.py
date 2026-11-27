@@ -1,9 +1,22 @@
-"""Parse and replay the rows of the model registry text; no files and no git."""
+"""Resolve the model registry path. Parse and replay its rows."""
 from __future__ import annotations
 
+import os
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
+from pathlib import Path
 from typing import NamedTuple
+
+
+def registry_path(environment: Mapping[str, str] | None = None) -> Path:
+    """Resolve the worker's registry path or the current configuration folder."""
+    settings = os.environ if environment is None else environment
+    if worker_registry := settings.get("MODELS_CONFIG_FILE"):
+        return Path(worker_registry)
+    if configured := settings.get("CONF_DIR"):
+        return Path(configured).expanduser() / "models.conf"
+    home = Path(settings.get("HOME") or Path.home())
+    return home / ".claude/config/models.conf"
 
 
 class RegistryRow(NamedTuple):

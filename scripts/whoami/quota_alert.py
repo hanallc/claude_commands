@@ -276,7 +276,6 @@ def _selection(value: ClaudeAccountsInUse | ReadCurrentClaudeSelection) -> Claud
 
 
 from scripts.production.showrunners import (
-    CONFIG as CONFIG,
     Showrunner as Showrunner,
     ShowrunnerSettings as ShowrunnerSettings,
     load_settings_from as load_settings_from,
@@ -292,7 +291,6 @@ SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
 AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
 # The same override models_config.sh reads; edit_registry() passes it on explicitly.
-REGISTRY = models_registry.registry_path()
 # The session whose user is shown a switch on their next prompt.
 OWNER = "natedev"
 NO_WORKER_MODE_SENDER = "quota-alert"
@@ -682,7 +680,7 @@ QuotaNotice = UserPush | QuotaStatusNote
 
 
 def load_config() -> Config:
-    return load_settings_from(CONFIG)
+    return load_settings_from(conf.path("showrunners"))
 
 
 def showrunners_now() -> list[Showrunner]:
@@ -979,7 +977,7 @@ def local_time(stamp: str) -> str:
 
 def registry_assignments() -> dict[str, str]:
     """[assignments] in the registry: function, or exact-task override, -> family."""
-    rows = models_registry.parse_registry(models_registry.registry_text(REGISTRY))
+    rows = models_registry.parse_registry(models_registry.registry_text())
     return rows.get("assignments", {})
 
 
@@ -994,8 +992,7 @@ def edit_registry(editor: str, *args: str) -> str | None:
     publish = "0" if os.environ.get("MODELS_CONFIG_PUBLISH") == "0" else "later"
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   env={**os.environ, "MODELS_CONFIG_FILE": str(REGISTRY),
-                                        "MODELS_CONFIG_PUBLISH": publish}, start_new_session=True)
+                                   env={**os.environ, "MODELS_CONFIG_PUBLISH": publish}, start_new_session=True)
     except OSError as error:
         return str(error)
     with process:
@@ -2204,7 +2201,7 @@ class NoClaudeExpirySchedule(Enum):
 
 
 def _claude_expiry_schedule() -> ClaudeExpirySchedule | NoClaudeExpirySchedule:
-    settings = conf.read(CONFIG)
+    settings = conf.read("showrunners")
     keys = ("claude_expiry.alert_hours", "claude_expiry.repeat_hours")
     if isinstance(settings.settings, dict) and not any(settings.effective_key(key) in settings.settings for key in keys):
         return NoClaudeExpirySchedule.CONFIGURED
@@ -2391,7 +2388,7 @@ def token_alerts(now: datetime) -> list[str]:
 
     if not _claude_quota_sender() or silence.active():
         return []
-    settings = conf.read(CONFIG)
+    settings = conf.read("showrunners")
     keys = settings.settings if isinstance(settings.settings, dict) else ()
     configured = token_expiry.configured_tokens(keys, settings.values)
     tokens = [(token, token.ends.day.isoformat()) for token in configured

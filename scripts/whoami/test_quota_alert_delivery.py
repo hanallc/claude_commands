@@ -1,6 +1,7 @@
 """Quota alerts: delivery."""
 
 from __future__ import annotations
+from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture
 
 import io
@@ -59,7 +60,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertLessEqual(text.count("recommended"), 1)
 
     def test_every_user_push_states_its_action_as_send_py_requires(self) -> None:
-        _ = write_registry(quota_alert.REGISTRY, {"direct.claude": {"impl": "opus:ultra"}}, base_text=REGISTRY)
+        _ = write_registry(conf.path("models"), {"direct.claude": {"impl": "opus:ultra"}}, base_text=REGISTRY)
         claude = self.note("claude2.md", "active", "0", limit_reset_count="3")
         codex = self.note("codex1.md", "active", "0")
         spare = self.note("claude1.md", "inactive", "80", login="spare@example.invalid")
@@ -116,7 +117,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                 self.assertEqual(run.call_args.kwargs["timeout"], send_budget.seconds(limit - quota_alert.KILL_GRACE))
 
     def test_failed_codex_reminder_retries_phone_delivery_without_session_alerts(self) -> None:
-        _ = quota_alert.CONFIG.write_text(quota_alert.CONFIG.read_text().replace("threshold_percent=1", "threshold_percent=2"))
+        _ = conf.path("showrunners").write_text(conf.path("showrunners").read_text().replace("threshold_percent=1", "threshold_percent=2"))
         note = self.note("codex1.md", "active", "2")
         self.push_errors.append(quota_alert.PushFailed("fixture offline"))
         log = self.alert([note], self.now)

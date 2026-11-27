@@ -27,7 +27,7 @@ from typing import TextIO, cast, override
 from scripts.build_queue import execution_identity
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.aws_target import cloud_gate, hana_placement as hana, ledger as aws_ledger
-from scripts.aws_target.ledger_test_support import install_aws_fixture_settings
+from scripts.aws_target.ledger_test_support import account_fixture_path, install_aws_fixture_settings, install_cost_settings
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue import admission_client as client, mac_run, queue_snapshot
@@ -208,9 +208,8 @@ def register_scaler(fixture: PlacementFixture) -> placement.PlacementCandidate:
 def scaler_gate_request(fixture: PlacementFixture) -> wire.PlacementRequest:
     request = mac_linux_and_natedev_request(fixture)
     install_aws_fixture_settings(fixture.root)
+    install_cost_settings(account_fixture_path(fixture.root))
     cloud = register_scaler(fixture)
-    _ = cast(object, fixture.enter_context(mock.patch.dict(os.environ,
-        {"AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")})))
     book = aws_ledger.CostLedger(target_config.ssh_target_state_directory("aws"))
     book.record_inventory(aws_ledger.ResourceInventory(int(fixture.clock.now()), (), "fixture", builder_removed=True))
     local = request.local
@@ -715,7 +714,9 @@ def aws_gate_request(fixture: PlacementFixture, *, enabled: bool = True, daily_r
         "targets=natedev,claude-aws\nkind.claude-aws=scaler\nsettings.claude-aws=cloud_gate.conf\n"
         + f"enabled.claude-aws={'on' if enabled else 'off'}\n")
     _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=on\n")
-    _ = write_config_fixture(fixture.root / "aws_target.conf", "# range: 0..\ndaily_limit_usd=35\n")
+    account = account_fixture_path(fixture.root)
+    install_cost_settings(account)
+    _ = write_config_fixture(account, "# range: 0..\ndaily_limit_usd=35\n")
     book = aws_ledger.CostLedger(fixture.root / "queue-target-state" / "aws")
     now = int(fixture.clock.now())
     with book.transaction() as state:
@@ -783,8 +784,7 @@ class AwsGatePlacementTests(unittest.TestCase):
     def test_dead_caller_after_prelaunch_closes_without_a_launch(self) -> None:
         for consumed in (True, False):
             with self.subTest(consumed=consumed), PlacementFixture() as fixture:
-                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state"),
-                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state")}):
                     request, assignment, binding = self.assigned_gate(fixture)
                     owner = request.owner
                     holder = placement.ClaimHolderIdentity(owner.host, owner.pid, owner.start_time)
@@ -808,8 +808,7 @@ class AwsGatePlacementTests(unittest.TestCase):
 
     def test_disabling_the_scaler_after_grant_refuses_launch_permission(self) -> None:
         with PlacementFixture() as fixture:
-            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state"),
-                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state")}):
                 request, assignment, binding = self.assigned_gate(fixture)
                 holder = placement.ClaimHolderIdentity(request.owner.host, request.owner.pid, request.owner.start_time)
                 aws_ledger.GateDispatchJournal(binding.journal).begin(binding, holder)
@@ -823,8 +822,7 @@ class AwsGatePlacementTests(unittest.TestCase):
     def test_unused_grant_checks_the_registry_on_replay(self) -> None:
         for change in ("disabled", "removed"):
             with self.subTest(change=change), PlacementFixture() as fixture:
-                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state"),
-                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state")}):
                     request, assignment, binding = self.assigned_gate(fixture)
                     _ = write_config_fixture(binding.registry,
                         "enabled.claude-aws=off\n" if change == "disabled" else "targets=natedev\n")
@@ -836,18 +834,17 @@ class AwsGatePlacementTests(unittest.TestCase):
         from scripts.aws_target import cloud_gate
 
         with PlacementFixture() as fixture:
-            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state"),
-                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state")}):
                 request, assignment, binding = self.assigned_gate(fixture)
             assert isinstance(request.local, wire.LocalAdmissionContext)
             caller_root = fixture.root / "caller-target-state"
             with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(caller_root),
-                                             "AWS_TARGET_CONFIG": str(caller_root / "aws_target.conf"),
+                                             "HOME": str(caller_root),
                                              "BUILDLOG_PLACEMENT_SIDECAR": request.local.sidecar}):
                 dispatch = cloud_gate.begin_assigned_gate(assignment)
             self.assertEqual(dispatch.binding, binding)
             self.assertEqual(dispatch.journal.read().binding.directory, binding.directory)
-            self.assertEqual(dispatch.binding.account_settings, fixture.root / "aws_target.conf")
+            self.assertEqual(dispatch.binding.account_settings, account_fixture_path(fixture.root))
             self.assertFalse(caller_root.exists())
 
 

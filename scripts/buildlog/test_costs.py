@@ -24,7 +24,7 @@ from scripts.buildlog import store
 from scripts.buildlog import test_moments as fixtures
 from scripts.buildlog.test_index import Record, call, ci_job, ci_run
 from scripts.buildlog.test_holds import hold_event
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 
 class CostTests(unittest.TestCase):
@@ -215,16 +215,13 @@ class CostTests(unittest.TestCase):
 
 
     def test_recorded_target_wins_and_configured_legacy_hosts_map_to_each_target(self) -> None:
-        config = self.fixture.fixture.root / "targets.conf"
-        config.parent.mkdir(parents=True, exist_ok=True)
-        _ = config.write_text("targets=natedev,mac,aws\nkind.natedev=local\nplatform.natedev=linux\n"
+        config = Path(os.environ["CONF_DIR"]) / "build_targets.conf"
+        _ = write_config_fixture(config, "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
                               + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                              + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws.conf\n"
                               + "sync.hosts.mac=replacement-mac\nsync.hosts.aws=cloud-host\nsync.hosts.natedev=local-host\n"
                               + UNREACHABLE_WAIT_FIXTURE)
         _ = config.with_name("mac_test.conf").write_text("host=fixture\n")
-        _ = config.with_name("aws.conf").write_text("host=fixture\n")
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), closing(self.fixture.connection(
+        with closing(self.fixture.connection(
             fixtures.build("new-mac", 3600, target="mac", host="different-name", duration_s=120),
             fixtures.build("legacy-mac", 3800, host="replacement-mac", mem_wait_s=60),
             fixtures.build("legacy-aws", 3900, host="cloud-host", mem_wait_s=120),

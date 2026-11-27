@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 from scripts.production.staff_test_support import unit_membership, fixture_member, fixture_runtime_id
 
@@ -73,7 +73,8 @@ class ShowrunnerFixture(StaffTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.config = self.root / "config" / "showrunners.conf"
-        self.config.parent.mkdir()
+        _ = config_environment(self.config.parent)
+        self.config.unlink()
         self.notifier = self.root / "notifier"
         self.notifier.mkdir()
         self.sessions = self.root / "sessions"
@@ -181,7 +182,7 @@ raise SystemExit(1)
 
     def environment(self, pane: str = "", caller: str = "") -> dict[str, str]:
         # Keep the caller identity and host observations isolated from the running suite.
-        return {**os.environ, "SHOWRUNNERS_CONFIG": str(self.config),
+        return {**os.environ, "CONF_DIR": str(self.config.parent),
                 "NOTIFIER_STATE_DIR": str(self.notifier), "NOTIFIER_SESSIONS_DIR": str(self.sessions),
                 "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
                 "SHOWRUNNER_STATE_DIR": str(self.state), "SHOWRUNNERS_SEND": str(self.send_script),
@@ -795,10 +796,15 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertEqual((self.root / "herdr-responses.json").read_bytes(), before)
 
     def test_settings_read_each_file_change(self) -> None:
-        _ = write_config_fixture(self.config, "stall_minutes=5\n")
-        self.assertEqual(showrunners.load_settings_from(self.config)["stall_minutes"], 5)
-        _ = write_config_fixture(self.config, "stall_minutes=9\n")
-        self.assertEqual(showrunners.load_settings_from(self.config)["stall_minutes"], 9)
+        home = self.root / "config-home"
+        _ = write_config_fixture(home / ".claude/config/showrunners.conf", "stall_minutes=12\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.config.parent), "HOME": str(home)}):
+            _ = write_config_fixture(self.config, "stall_minutes=5\n")
+            self.assertEqual(showrunners.load_settings()["stall_minutes"], 5)
+            _ = write_config_fixture(self.config, "stall_minutes=9\n")
+            self.assertEqual(showrunners.load_settings()["stall_minutes"], 9)
+            del os.environ["CONF_DIR"]
+            self.assertEqual(showrunners.load_settings()["stall_minutes"], 12)
 
     def test_settings_read_exact_staff_recipient_ids(self) -> None:
         row = fixture_member("showrunner", name="director")

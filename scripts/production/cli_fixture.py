@@ -67,8 +67,6 @@ def production_paths(environment: Mapping[str, str]) -> Generator[None]:
     with ExitStack() as scope:
         _ = scope.enter_context(patch.object(note_file, "AGENTS_DIR", home / "rust/hanadocs/agents"))
         for name, value in {
-            "CONFIG": Path(environment.get("SHOWRUNNERS_CONFIG") or
-                           str(Path(showrunners.__file__).parents[2] / "config/showrunners.json")),
             "NOTIFIER_STATE_DIR": Path(environment.get("NOTIFIER_STATE_DIR") or str(home / ".local/state/notifier")),
             "SHOWRUNNER_STATE_DIR": Path(environment.get("SHOWRUNNER_STATE_DIR") or str(home / ".local/state/showrunner")),
             "SESSIONS": Path(environment.get("SHOWRUNNERS_SESSIONS") or

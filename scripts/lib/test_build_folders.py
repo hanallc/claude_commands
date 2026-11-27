@@ -56,10 +56,7 @@ class FolderFormTests(unittest.TestCase):
         })))
         _ = cast(object, self.enterContext(mock.patch("socket.gethostname", return_value="natedev")))
         self.write_config()
-        _ = (self.root / "copies.conf").write_text("# range: 5e-324..\ngit_timeout_seconds=10\n")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "COPIES_CONFIG": str(self.root / "copies.conf"),
-        })))
+        _ = write_config_fixture(self.root / "copies.conf", "git_timeout_seconds=10\n")
 
     def write_config(self, *, alias: str = "claude", machine_root: str = "disk") -> None:
         _ = self.config.write_text(
@@ -116,6 +113,10 @@ class FolderFormTests(unittest.TestCase):
                 [], 0, stdout="git@example.invalid:team/widget.git\n")) as git:
             self.assertEqual(folders.repo_word(self.root), "widget")
         self.assertEqual(git.call_args.kwargs["timeout"], 10)
+        _ = write_config_fixture(self.root / ".claude/config/copies.conf", "git_timeout_seconds=15\n")
+        with mock.patch.dict(os.environ, {"HOME": str(self.root)}):
+            del os.environ["CONF_DIR"]
+            self.assertEqual(folders.repository_git_timeout(), 15)
 
     def test_held_copy_reports_kernel_identity_and_missing_or_partial_lease(self) -> None:
         from scripts.lib import build_copies, process_start
@@ -925,7 +926,6 @@ class BuildFolderTests(unittest.TestCase):
         self.root.mkdir()
         config = Path(self.enterContext(tempfile.TemporaryDirectory(dir=private)))
         environment = fixture_git_environment(private)
-        _ = environment.pop("STAFF_CONFIG", None)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **environment,
             **config_environment(config), "TMPDIR": str(self.root), copy_record.ROOT_ENV: str(self.root / "scratch"),
@@ -2721,8 +2721,7 @@ assert not loaded, loaded
         config = copied / "build_folders.conf"
         config.unlink()
         environment = config_environment(config.parent, values=FixtureConfigValues.EXACT)
-        self.assertEqual(environment, {"CONF_DIR": str(config.parent),
-                                       "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
+        self.assertEqual(environment, {"CONF_DIR": str(config.parent), "MODELS_CONFIG_FILE": ""})
         sources = Path(__file__).resolve().parents[2] / "config"
         admission = config.parent / ADMISSION_CONFIG_FIXTURE.name
         self.assertEqual(conf.read(admission).values(), conf.read(ADMISSION_CONFIG_FIXTURE).values())

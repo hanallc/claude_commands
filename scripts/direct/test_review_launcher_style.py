@@ -11,6 +11,7 @@ from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
 from scripts.lint.style_review import BEGIN, END
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class StyleLauncherTests(support.ReviewLauncherFixture):
@@ -109,10 +110,9 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
                 # start_phase writes a plan outside the tracked baseline; commit it for the empty case.
                 _ = self.commit_working_tree("phase plan")
                 config = self.root / "lint.conf"
-                _ = config.write_text(f"style_review={'off' if off else 'on'}\n")
+                _ = write_config_fixture(config, f"style_review={'off' if off else 'on'}\n")
                 environment = self.environment()
-                environment["LINT_CONFIG_FILE"] = str(config)
-                environment["CONF_DIR"] = str(Path(config).parent)
+                environment["CONF_DIR"] = str(config.parent)
                 command = self.review_command(session)
                 command[2:2] = ["--phase", "3", "--style-since", "HEAD"]
                 result = subprocess.run(command, env=environment, text=True, capture_output=True,

@@ -254,8 +254,8 @@ class ShellLaunchTests(NixFixture):
             (ROOT / "scripts/agents/models_config.sh").read_text()
             + "\nagents_resolve() { AGENT_FAMILY=claude; AGENT_MODEL=fixture; AGENT_CLAUDE_ACCOUNT=workers; }\n"
             + "agents_claude_args() { echo '--model fixture'; }\n")
-        registry = write_registry(self.root / "models.conf")
-        self.env.update(MODELS_CONFIG_FILE=str(registry), MODELS_CONFIG_PUBLISH="0", MODELS_CONFIG_TIER_ONLY="1")
+        _ = write_registry(Path(self.env["CONF_DIR"]) / "models.conf")
+        self.env.update(MODELS_CONFIG_PUBLISH="0", MODELS_CONFIG_TIER_ONLY="1")
         self.started = self.root / "started.jsonl"
         self.script(self.bin / "claude", '''import json, os, sys
 from pathlib import Path

@@ -177,8 +177,9 @@ def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str],
     settings = {name: value for name, value in loaded.env.items()
                 if not name.startswith(("HERDR_", "CODEX_", "CLAUDE_CODE_MESSAGING_"))
                 and name not in {"CLAUDE_CODE_BRIDGE_SESSION_ID", "TMUX", "TMUX_PANE"}}
-    settings.update({name: "" for name in environment if name not in loaded.env})
-    settings.update({name: environment.get(name, "") for name in ("UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "MODELS_CONFIG_FILE")})
+    settings.update({name: "" for name in environment if name not in loaded.env and name != "CONF_DIR"})
+    settings.update({name: environment.get(name, "") for name in
+                     ("UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "MODELS_CONFIG_FILE")})
     settings.update({name: environment[name] for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_REMOTE_MEMORY_DIR")
                      if name in environment})
     _ = settings.pop("CLAUDE_CODE_CHILD_SESSION", None)

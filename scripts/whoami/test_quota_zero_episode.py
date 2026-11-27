@@ -7,6 +7,7 @@ from scripts.production.staff_test_support import foreign_hostname
 import io
 import json
 import os
+import shutil
 import socket
 import unittest
 from contextlib import redirect_stdout
@@ -127,10 +128,12 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
 
     def test_uncertain_registry_switch_keeps_the_named_route_until_the_weekly_reset(self) -> None:
         for failed_step in ("edit", "confirmation"):
+            folder = self.root / f"{failed_step}-config"
+            _ = shutil.copytree(conf.directory(), folder)
             with (self.subTest(failed_step=failed_step),
                   mock.patch.object(quota_alert, "STATE", self.root / f"{failed_step}-alerts.json"),
-                  mock.patch.object(quota_alert, "REGISTRY", self.root / f"{failed_step}-models.conf")):
-                _ = write_registry(quota_alert.REGISTRY, base_text=REGISTRY)
+                  mock.patch.dict(os.environ, {"CONF_DIR": str(folder)})):
+                _ = write_registry(conf.path("models"), base_text=REGISTRY)
                 owner = self.readings(self.now).selected_account
                 assert isinstance(owner, agent_accounts.KnownCodexAccount)
                 until = self.now + timedelta(days=2)
@@ -1007,7 +1010,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
                         next_moves.next_moves_file().unlink(missing_ok=True)
                         usage_store.store_file().unlink(missing_ok=True)
                         usage_store.label_file().unlink(missing_ok=True)
-                        _ = write_registry(quota_alert.REGISTRY, base_text=REGISTRY)
+                        _ = write_registry(conf.path("models"), base_text=REGISTRY)
                         self.phone.reset_mock()
                         self.relay.reset_mock()
                         self.swap.reset_mock()

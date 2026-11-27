@@ -193,7 +193,9 @@ def _run(launch: ClaudeLaunch) -> int:
             name = "UNIT_RUN_DIR" if key == "PLAN_DELEGATE_BOARD_DIR" else key.replace("PLAN_DELEGATE_", "UNIT_", 1)
             _ = env.setdefault(name, value)
     env["UNIT_TEAM_ROLE"] = launch.slot
-    env["MODELS_CONFIG_FILE"] = str(models_registry.launch_configuration(env).path)
+    configuration = models_registry.launch_configuration(env)
+    env = configuration.environment(env)
+    env["MODELS_CONFIG_FILE"] = str(configuration.path)
 
     def child(arguments: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
         return subprocess.run(arguments, env=env, text=True, check=check, capture_output=capture)

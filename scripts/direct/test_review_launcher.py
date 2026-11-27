@@ -37,7 +37,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         session = self.start_implementation("registry-snapshot")
         self.finish_implementation(session)
         environment = self.environment()
-        probe = RegistryReadProbe(self.root, Path(environment["MODELS_CONFIG_FILE"]))
+        probe = RegistryReadProbe(self.root, (Path(environment["CONF_DIR"]) / "models.conf"))
         result = subprocess.run(self.review_command(session, "contract", ""),
                                 env=probe.environment(environment), capture_output=True, text=True,
                                 timeout=TEST_HANG_GUARD_SECS)
@@ -60,7 +60,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                         _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({
                             "oauthAccount": {"emailAddress": "review@example.invalid"}}))
                     environment.update(claude_catalog_environment(self.root / ".claude2", {"opus": expected_model}))
-                registry = Path(environment["MODELS_CONFIG_FILE"])
+                registry = (Path(environment["CONF_DIR"]) / "models.conf")
                 _ = write_registry(registry, {"assignments": {"direct": "claude"},
                     "direct.claude": {"review": "opus:high"},
                     "claude.agents": {"opus": "high", "sonnet": "low"}})
@@ -87,7 +87,7 @@ set -euo pipefail
 python3 - <<'EDIT'
 import os
 from pathlib import Path
-path = Path(os.environ["MODELS_CONFIG_FILE"])
+path = Path(os.environ["CONF_DIR"]) / "models.conf"
 path.write_text(os.environ["NEXT_REVIEW_REGISTRY"])
 EDIT
 exec bash "''' + str(agent_exec) + '''" "$@"
@@ -396,7 +396,7 @@ exec bash "''' + str(agent_exec) + '''" "$@"
     def test_codex_reviewers_must_use_assign(self) -> None:
         session = self.start_implementation("codex-refused")
         self.finish_implementation(session)
-        registry = self.root / ".claude/config/models.conf"
+        registry = self.root / "models.conf"
         _ = registry.write_text(registry.read_text().replace("direct=claude", "direct=codex"))
         phase = session / "phases/3"
         phase.mkdir(parents=True, exist_ok=True)

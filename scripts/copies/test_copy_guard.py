@@ -322,7 +322,6 @@ class CopyGuardTests(unittest.TestCase):
         result = subprocess.run(request,
                                 cwd=repository, text=True, capture_output=True, timeout=10, check=False,
                                 env={**os.environ, "HOME": str(self.root), "CONF_DIR": str(config),
-                                     "COPIES_CONFIG": str(copies_config),
                                      "STAFF_FILE": str(self.root / "staff.json"),
                                      "WORKTREES_STATE_DIR": str(self.root / "worktree state")})
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -25,7 +25,7 @@ from scripts.lib import process_start as process_identity
 from scripts.copies.copies_test_support import copies_environment
 
 
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture, config_environment
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 from scripts.mac_test import eligibility, offload, mac_test
 from scripts.buildlog import treekey
@@ -401,18 +401,18 @@ class OffloadCommandFixture(unittest.TestCase):
         self.sync_config()
         self.sync_fixture()
         write_mac_target_registry(self.root, self.config_path.name)
-        _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
+        copies = copies_environment(self.root, configuration=self.config_path.parent)
+        _ = write_config_fixture(self.config_path.parent / "copies.conf", "owner.verify=verify\n")
         self.environment = {
             **os.environ, **interpreter_cache_environment(self.root / "cache"),
-            **config_environment(self.root),
-            **copies_environment(self.root),
+            **copies,
             **fixture_zsh_environment(),
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             "MAC_TEST_FIXTURE_CLAIM_FILE": str(self.claim_file),
             "MAC_TEST_FIXTURE_LEGACY_CLAIM_FILE": str(legacy_claim_file),
-            "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
+            "MAC_TEST_CONFIG": str(self.config_path),
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
             "MAC_TEST_REAL_STATE": str(STATE_SCRIPT),
             "BUILD_HOLD_DIR": str(self.root / "holders"),

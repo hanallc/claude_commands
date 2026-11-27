@@ -1167,7 +1167,7 @@ class SettingsTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         registry = root / "models.conf"
         _ = registry.write_text("\n".join(shifted_config_lines(REGISTRY_TEXT)) + "\n", encoding="utf-8")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(registry.parent)})))
         log = root / "shifts.log"
         self.addCleanup(conf_reads.set_shift_read_log, conf_reads.set_shift_read_log(str(log)))
 

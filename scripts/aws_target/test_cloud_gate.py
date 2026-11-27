@@ -36,8 +36,8 @@ from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger, s3_presi
 from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import (
-    CostFixture, account_reply, install_aws_fixture_settings, instant, numeric_settings,
-    override_fixture_settings, text_setting,
+    CostFixture, account_fixture_path, account_reply, install_aws_fixture_settings, install_cost_settings, instant,
+    numeric_settings, override_fixture_settings, text_setting,
 )
 from scripts.build_queue import admission_client, admission_wire, admission_protocol as wire, cloud_progress, execution_identity, placement, progress_profile, queue_place
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
@@ -382,7 +382,7 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
     def test_scaler_assignment_consumes_once_and_retains_pending_launch(self) -> None:
         with (PlacementFixture() as fixture,
               mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
-              mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(self.settings)}),
+              mock.patch.dict(os.environ, {'HOME': str(self.root)}),
               mock.patch.object(store, 'host_name', return_value=fixture.server.host)):
             fixture.clock.epoch = self.now
             fixture.configure(cloud_gate_slots=1)
@@ -3951,10 +3951,12 @@ class GateDispatchJournalTests(unittest.TestCase):
                 self.assertEqual(instance.settings_path, dispatch.binding.account_settings)
                 return 0
 
-            different_account = root / 'different-account.conf'
+            worker_home = root / 'worker-home'
+            different_account = account_fixture_path(worker_home)
+            install_cost_settings(different_account)
             account = str(dispatch.binding.account_settings)
             directory = str(dispatch.binding.directory)
-            with (mock.patch.dict(os.environ, {'CONF_DIR': str(root), 'AWS_TARGET_CONFIG': str(different_account)}),
+            with (mock.patch.dict(os.environ, {'CONF_DIR': str(root), 'HOME': str(worker_home)}),
                   mock.patch.object(cloud_gate, 'execute_gate_worker', side_effect=execute) as execute_worker):
                 worker_command = cloud_gate.gate_attempt_command('--worker', folder, dispatch.binding.directory,
                                                                  progress, dispatch=dispatch)
@@ -4050,7 +4052,6 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             'deployment_id': 'fixture', 'revision': 'fixture', 'version': '1',
             'subnets': [{'id': 'fixture-subnet', 'zone': 'fixture-zone'}]})
         book = ledger.CostLedger(self.state)
-        settings_path = self.settings
         common = ['--repo', str(repo), '--merge-branch', 'fixture', '--unit', 'fixture']
         merge = [*common, '--unit-branch', 'unit', '--phase', '1', '--checkpoint', tip, '--previous-checkpoint', base]
         nightly = [*common, '--nightly']
@@ -4058,7 +4059,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             for status in (GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS):
                 with (self.subTest(nightly=command is nightly, status=status),
                       PlacementFixture() as fixture,
-                      mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(settings_path)})):
+                      mock.patch.dict(os.environ, {'HOME': str(self.root)})):
                     assignment, binding, sidecar = assigned_cloud_fixture(fixture, book, ('gate.py', *command))
                     assignment_file = fixture.root / 'assignment.json'
                     admission_wire.write_assignment(assignment_file, wire.Assignment(assignment))
@@ -4163,7 +4164,6 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
-        _ = self.enterContext(mock.patch.object(cloud_gate, 'account_settings_path', side_effect=lambda: Path(os.environ.get('AWS_TARGET_CONFIG', str(self.settings)))))
         _ = write_config_fixture(self.root / 'gate.conf')
         override_fixture_settings(self.root / 'cloud_gate.conf',
             '# one of: on, off\nenabled=on\ncredential_file=~/.config/aws-build/credentials\n')
@@ -5918,17 +5918,15 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
         self.assertTrue(self.admission.callers_released())
 
-        installed = self.root / '.claude/config/aws_target.conf'
-        installed.parent.mkdir(parents=True)
-        _ = installed.write_bytes(self.settings.read_bytes())
-        numeric_settings(installed, {'daily_limit_usd': '1'})
+        checkout_account = self.settings.read_text()
+        numeric_settings(self.settings, {'daily_limit_usd': '1'})
         checkout = self.repo / 'config'
         checkout.mkdir()
         for source in self.root.glob('*.conf'):
             _ = (checkout / source.name).write_bytes(source.read_bytes())
         for missing_minimum in (True, False):
             with self.subTest(missing_minimum=missing_minimum):
-                contents = self.settings.read_text()
+                contents = checkout_account
                 if missing_minimum:
                     contents = '\n'.join(line for line in contents.splitlines()
                                          if not line.startswith('box_minimum_seconds=')) + '\n'
@@ -5957,7 +5955,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                     'security_group': 'fixture-group', 'revision': 'fixture-revision',
                     'subnets': [{'id': 'fixture-a', 'zone': 'a'}]}
                 cloud_gate.save(self.state / 'gate-deployment.json', deployment)
-                with mock.patch.dict(os.environ, {'CONF_DIR': str(checkout), 'AWS_TARGET_CONFIG': str(installed)}):
+                with mock.patch.dict(os.environ, {'CONF_DIR': str(checkout)}):
                     outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                                              module_time_limit_s=1800, service=service)
                 self.assertEqual(outcome, cloud_gate.CloudDeclined('daily_limit'))

@@ -439,8 +439,7 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
           mock.patch.object(os, "rename", os.rename),
           mock.patch.object(os, "replace", os.replace)):
         for module, fields in (
-            (showrunners, {"CONFIG": Path(environment["SHOWRUNNERS_CONFIG"]),
-                           "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"]),
+            (showrunners, {"NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"]),
                            "SHOWRUNNER_STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"])}),
             (tidy_wrapped, {"STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"]),
                             "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"])}),
@@ -601,7 +600,6 @@ class ProductionRenameFixture(StaffTestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
-            "SHOWRUNNERS_CONFIG": str(self.home / ".claude/showrunners.json"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),

@@ -36,7 +36,6 @@ EXPECTED_VARIABLES = (
     "MAC_TEST_STATE_DIR",
     "MAC_TEST_CONFIG",
     "BUILD_TARGETS_SCRIPT",
-    "BUILD_TARGETS_CONFIG",
     "BUILD_TARGETS_NOW",
 )
 SHELL_CALL = 'source "$1"; build_override_refusal "$2" "$3" "$4"'

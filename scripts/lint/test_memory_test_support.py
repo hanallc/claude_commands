@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from scripts.lib import conf
+from scripts.lib.registry_rows import registry_path
 from scripts.lint.memory_test_support import (
     ConfigFixtureRefused, commit_config_fixture, config_environment, shifted_number, write_config_fixture,
 )
@@ -16,6 +17,16 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class ConfigFixtureTests(unittest.TestCase):
+    def test_config_environment_clears_an_inherited_registry_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            caller_registry = "/home/worker/.claude/config/models.conf"
+            with mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": caller_registry}):
+                fixture_environment = {**os.environ, **config_environment(folder)}
+                self.assertFalse(fixture_environment.get("MODELS_CONFIG_FILE"))
+                self.assertEqual(registry_path(fixture_environment), folder / "models.conf")
+                self.assertEqual(os.environ["MODELS_CONFIG_FILE"], caller_registry)
+
     def test_partial_config_keeps_values_and_receives_committed_defaults_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

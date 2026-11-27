@@ -257,7 +257,7 @@ def setUpModule() -> None:
         "BUILDLOG_LIVE_MEMORY_TRIPWIRE": os.environ.get(
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE", str(root / "live-memory-reads.jsonl")
         ),
-        "LINT_CONFIG_FILE": str(root / "lint.conf"), "CONF_DIR": str(Path(root / "build_admission.conf").parent),
+        "CONF_DIR": str(root),
         "BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice"),
         "USER_ZONE": "America/New_York",
     })))
@@ -285,7 +285,7 @@ class BuildBudgetTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.config = Path(self.enterContext(tempfile.TemporaryDirectory())) / "build_admission.conf"
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"LINT_CONFIG_FILE": str(self.config.with_name("lint.conf")), "CONF_DIR": str(Path(self.config).parent)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.config.parent)})))
         _ = write_config_fixture(self.config, "build_budget_gib=21")
         commit_config_fixture(self.config)
 
@@ -2227,7 +2227,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
         super().setUp()
         self.enterContext(patch.dict(os.environ, {
             **fake_memory_readings(self.root),
-            "LINT_CONFIG_FILE": str(self.root / "lint.conf"), "CONF_DIR": str(Path(self.root / "build_admission.conf").parent),
+            "CONF_DIR": str(self.root),
         }))
         _ = write_config_fixture(self.root / "build_admission.conf", "")
         commit_config_fixture(self.root / "build_admission.conf")
@@ -3755,7 +3755,6 @@ class HistoryAdmissionTests(MemoryQueueFixture):
         write_memory_config(config)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             **fake_memory_readings(self.root, total_kib=60 * GIB // 1024),
-            "LINT_CONFIG_FILE": str(config),
         })))
 
 
@@ -5254,7 +5253,7 @@ class ProcessMemoryTests(unittest.TestCase):
             environment = fake_memory_readings(root, available_kib=2 * GIB // 1024, total_kib=60 * GIB // 1024)
             config = root / 'build_admission.conf'
             write_memory_config(config)
-            environment.update({'BUILDLOG_DIR': str(root), 'BUILDLOG_PROC': str(proc), 'LINT_CONFIG_FILE': str(config)})
+            environment.update({'BUILDLOG_DIR': str(root), 'BUILDLOG_PROC': str(proc)})
             with patch.dict(os.environ, environment), patch.object(time, 'time', return_value=NOW.timestamp()):
                 inputs = fixture_queue_inputs(directory, gate.process_table(proc), NOW_EPOCH, admission_policy_fixture())
                 inputs = replace(inputs, blockers_for=frozenset({"400-waiter"}))
@@ -6765,7 +6764,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         super().setUp()
         self.config = self.root / "build_admission.conf"
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            **fake_memory_readings(self.root), "LINT_CONFIG_FILE": str(self.config.with_name("lint.conf")),
+            **fake_memory_readings(self.root),
         })))
         self.write_config()
         commit_config_fixture(self.config)

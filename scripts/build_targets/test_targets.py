@@ -117,7 +117,6 @@ class IsolatedTargetTest(unittest.TestCase):
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         })))
         _ = self.enterContext(mock.patch.object(build_hold, "record_hold_event"))
-        _ = os.environ.pop("BUILD_TARGETS_CONFIG", None)
         home_config = self.root / ".claude/config"
         home_config.mkdir(parents=True)
         _ = config_environment(home_config)

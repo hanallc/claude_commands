@@ -459,7 +459,7 @@ class LaunchSettingsTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root / "home"),
             "CLAUDE_CONFIG_DIR": str(self.root / "claude-config"),
-            "MODELS_CONFIG_FILE": str(self.path),
+            "CONF_DIR": str(self.path.parent),
             "MODELS_CONFIG_PUBLISH": "0",
             "MODELS_CONFIG_TIER_ONLY": "1",
             "CODEX_PACER_TIER_FILE": str(self.root / "absent-tier"),

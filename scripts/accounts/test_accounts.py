@@ -686,14 +686,14 @@ class AccountsTests(unittest.TestCase):
         unmapped = fixture_member("producer", name="fixture-unmapped")
         runner = fixture_member("showrunner", name="fixture-runner")
         membership = staff.StaffSnapshot((claude, codex, paused, stopped, remote_member, unmapped, runner))
-        registry = write_registry(self.root / "producer-models.conf", {"producers": {
+        registry = write_registry(Path(os.environ["CONF_DIR"]) / "models.conf", {"producers": {
             member.name: "claude:opus:max" if member == claude else "codex:gpt-test:high"
             for member in (claude, codex, paused, stopped, remote_member, unmapped)}})
         live = [sessions.SessionRecord(pid=990901 + index, sessionId=member.current_session,
             name=member.name, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy")
             for index, member in enumerate((claude, runner))]
         before = Path(os.environ["STAFF_FILE"]).read_bytes()
-        with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH}),
+        with (patch.dict(os.environ, {"CONF_DIR": str(registry.parent), "PATH": MODELS_RESOLVER_PATH}),
               patch.object(staff, "local_snapshot", return_value=membership),
               patch.object(sessions, "running_sessions", return_value=live),
               patch.object(pane_launch, "record_directory", return_value=self.root / "private-launches"),
@@ -734,9 +734,9 @@ class AccountsTests(unittest.TestCase):
 
         for label in ("claude2", "claude4"):
             self.login_directory(label, label + "@example.invalid")
-        registry = write_registry(self.root / "producer-models.conf", {"producers": {
+        registry = write_registry(Path(os.environ["CONF_DIR"]) / "models.conf", {"producers": {
             "producer-claude": "claude:opus:max", "producer-codex": "codex:gpt-test:high"}})
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(registry.parent), "PATH": MODELS_RESOLVER_PATH})))
         cases: tuple[tuple[staff.Kind, accounts.ClaudeGroup, str, str, str], ...] = (
             ("unit", "units", "claude", "", ""), ("producer", "producers", "claude", "", ""),
             ("producer", "producers", "codex", "", ""),
@@ -1926,7 +1926,7 @@ class AccountsTests(unittest.TestCase):
         registry = write_registry(self.main_dir / "config/models.conf")
         arguments = ["--model", "haiku", "--help", "--detail"]
         with (patch.dict(os.environ, {"PATH": str(self.home / ".local/bin") + os.pathsep + MODELS_RESOLVER_PATH,
-                                     "MODELS_CONFIG_FILE": str(registry),
+                                     "CONF_DIR": str(registry.parent),
                                      "MODELS_CONFIG_PUBLISH": "0"}),
               patch.object(os, "execvpe") as launch):
             self.assertEqual(self.run_cli("exec", "--probe", "claude2", *arguments), (0, "", ""))
@@ -7917,10 +7917,10 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(source),
             doc=staff.LiveDoc(machine, self.root / "codex-producer/plan.md"),
             worktree=staff.PresentWorktree(machine, self.root / "codex-producer"))
-        registry = write_registry(self.root / "producer-models.conf", {"producers": {"codex-producer": "codex:gpt-test:high"}})
+        registry = write_registry(Path(os.environ["CONF_DIR"]) / "models.conf", {"producers": {"codex-producer": "codex:gpt-test:high"}})
         identity = str(producer.current_session)
 
-        with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH}),
+        with (patch.dict(os.environ, {"CONF_DIR": str(registry.parent), "PATH": MODELS_RESOLVER_PATH}),
               patch.object(stop_resume, "_read_move_source", return_value=stop_resume.StoppedMoveSource()),
               patch.object(stop_resume, "_record_launches"),
               patch.object(stop_resume, "_stop", return_value=stop_results.NotRunning(identity)),
@@ -7959,9 +7959,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(source),
             doc=staff.LiveDoc(machine, self.root / "codex-producer/plan.md"),
             worktree=staff.PresentWorktree(machine, self.root / "codex-producer"))
-        registry = write_registry(self.root / "producer-models.conf", {"producers": {"codex-producer": "codex:gpt-test:high"}})
+        registry = write_registry(Path(os.environ["CONF_DIR"]) / "models.conf", {"producers": {"codex-producer": "codex:gpt-test:high"}})
 
-        with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH}),
+        with (patch.dict(os.environ, {"CONF_DIR": str(registry.parent), "PATH": MODELS_RESOLVER_PATH}),
               patch.object(stop_resume, "move_sessions", return_value=[stop_results.ResumePending(
                   producer.current_session, "codex1", "destination is not ready")]) as producer_move,
               redirect_stdout(io.StringIO())):
@@ -8018,11 +8018,11 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                     _ = fixture_member("producer", name="missing-settings-producer",
                         doc=staff.LiveDoc(machine, self.root / "missing-settings-producer/plan.md"),
                         worktree=staff.PresentWorktree(machine, self.root / "missing-settings-producer"))
-                registry = write_registry(self.root / "producer-models.conf", {"producers": {
+                registry = write_registry(Path(os.environ["CONF_DIR"]) / "models.conf", {"producers": {
                     "codex-producer": "codex:gpt-test:high", "claude-producer": "claude:opus:max",
                     "paused-producer": "codex:gpt-test:high", "remote-document-producer": "codex:gpt-test:high",
                     "remote-worktree-producer": "codex:gpt-test:high"}})
-                _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH})))
+                _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(registry.parent), "PATH": MODELS_RESOLVER_PATH})))
                 before = Path(os.environ["STAFF_FILE"]).read_bytes()
 
                 observed: list[Path] = []
@@ -8458,9 +8458,9 @@ class PaneWorkerMoveTests(unittest.TestCase):
                                                + "# range: 0.01..600\nworker_publish_lock_seconds=15\n"
                                                + "# range: 1..600\npane_agent_start_seconds=90\n")
         _ = (config / "shutdown.conf").write_text("# whole: 1..300\nstop_grace_seconds=2\n# whole: 1..300\nkill_grace_seconds=5\n# whole: 1..300\nmove_stop_margin_seconds=10\n")
-        registry = write_registry(config / "models.conf")
+        _ = write_registry(config / "models.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "CONF_DIR": str(config), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+            "CONF_DIR": str(config), "MODELS_CONFIG_PUBLISH": "0",
             "UNIT_RUN_DIR": str(self.run_dir), "XDG_STATE_HOME": str(self.root / "state"),
             "HERDR_PLATFORM": "linux", "HERDR_PROC": str(self.world.process_root),
         })))

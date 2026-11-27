@@ -28,7 +28,7 @@ from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
 
 from scripts.agents import remote
 from scripts.direct import recorder_state
-from scripts.lib import conf_reads, transcripts, unit_runs
+from scripts.lib import conf_reads, models_registry, transcripts, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import session_records
 from scripts.production import staff
@@ -235,9 +235,6 @@ def _config_path() -> Path:
     return Path(os.environ.get("CONF_DIR") or "~/.claude/config").expanduser() / "direct.conf"
 
 
-DEFAULT_MODELS_CONFIG_PATH = Path("~/.claude/config/models.conf").expanduser()
-
-
 def inherited_registry_text(encoded: str) -> str:
     """Read the exact inherited registry text without opening a publication path."""
     match cast(object, json.loads(encoded)):
@@ -256,9 +253,7 @@ def config_digest() -> str:
     """
     try:
         encoded = os.environ.get("MODELS_LAUNCH_CONFIGURATION", "")
-        text = (inherited_registry_text(encoded) if encoded else conf_reads.read_text(
-            Path(os.environ["MODELS_CONFIG_FILE"]) if os.environ.get("MODELS_CONFIG_FILE")
-            else DEFAULT_MODELS_CONFIG_PATH))
+        text = inherited_registry_text(encoded) if encoded else models_registry.registry_text()
         registry = text.encode("utf-8")
         conf_reads.record(_config_path().stem)
         contents = registry + _config_path().read_bytes()

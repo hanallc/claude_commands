@@ -29,9 +29,9 @@ def write_private_build_roots(settings: Path, root: Path, machine: str) -> None:
     _ = settings.write_text("\n".join(lines) + "\n")
 
 
-def private_copy_config(root: Path) -> CopyTestConfiguration:
+def private_copy_config(root: Path, *, configuration: Path | None = None) -> CopyTestConfiguration:
     """Give direct calls and child commands private roots without a caller session."""
-    environment = config_environment(root / "config")
+    environment = config_environment(configuration if configuration is not None else root / "config")
     settings = Path(environment["CONF_DIR"]) / "build_folders.conf"
     machine = host_name()
     host = conf.host_key_name(machine)
@@ -79,7 +79,7 @@ folders.unused_days=2"""
     _ = write_config_fixture(copies, f"remote_registry={root / 'remote-mirrors'}\ngit_timeout_seconds=10\n")
     git_config = write_fixture_git_config(root)
     environment.update({
-        "COPIES_CONFIG": str(copies), "SCRATCH_ROOT": str(root / "scratch"),
+        "SCRATCH_ROOT": str(root / "scratch"),
         "SCRATCH_COPIES_ROOT": str(root / "workspaces"), "SCRATCH_HOLDS": str(root / "holds.json"),
         "SESSION_TEMP_ROOT": str(root / "session"), "SESSION_FORMER_ROOT": str(root / "former-session"),
         "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_FOLDER": "",

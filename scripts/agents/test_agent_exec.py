@@ -25,6 +25,7 @@ from scripts.production.staff_test_support import (
 )
 from scripts.accounts import accounts
 from scripts.lib.nix_env_test_support import NixFixture
+from scripts.lint.memory_test_support import config_environment
 from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
 
 
@@ -60,14 +61,14 @@ class CodexCliLauncherTests(NixFixture):
         selection = self.home / ".claude/config/accounts.json"
         selection.parent.mkdir(parents=True)
         _ = selection.write_text('{"workers": "codex1"}')
-        registry = write_registry(self.root / "models.conf", {
+        registry = write_registry(Path(self.env["CONF_DIR"]) / "models.conf", {
             "assignments": {"cli": "codex"},
             "cli.codex": {"interactive": "gpt-test:high", "merge_branch": "gpt-test:high"},
             "cli.options": {"codex_service_tier": "default"},
             "codex.agents": {"gpt-test": "high"},
         })
         self.launched = self.root / "codex-start.json"
-        self.env.update(AGENT_NOTES_DIR=str(notes), MODELS_CONFIG_FILE=str(registry),
+        self.env.update(AGENT_NOTES_DIR=str(notes),
                         MODELS_CONFIG_PUBLISH="0", CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
                         CODEX_CONFIG_FILE=str(self.root / "codex.toml"),
                         CODEX_MODELS_CACHE_FILE=str(self.root / "models.json"),
@@ -98,7 +99,7 @@ _ = Path(os.environ["CODEX_START_LOG"]).write_text(json.dumps({
                     self.assertEqual(launched["arguments"], expected)
 
     def test_a_launch_inside_a_worker_reads_the_changed_registry(self) -> None:
-        registry = Path(self.env["MODELS_CONFIG_FILE"])
+        registry = (Path(self.env["CONF_DIR"]) / "models.conf")
         original = write_registry(registry, {"assignments": {"sample": "codex"},
             "sample.codex": {"task": "gpt-test:high"}, "sample.options": {"codex_service_tier": "fast"}}).read_text()
         changed = original.replace("task=gpt-test:high", "task=gpt-next:low")
@@ -113,7 +114,7 @@ with Path(os.environ["CODEX_START_LOG"]).open("a") as output:
         key: os.environ[key] for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE") if key in os.environ}}) + "\\n")
 Path(sys.argv[sys.argv.index("-o") + 1]).write_text("complete")
 if "NESTED_LAUNCH" not in os.environ:
-    Path(os.environ["MODELS_CONFIG_FILE"]).write_text(os.environ["NEXT_REGISTRY"])
+    (Path(os.environ["CONF_DIR"]) / "models.conf").write_text(os.environ["NEXT_REGISTRY"])
     command = ["bash", os.environ["AGENT_EXEC"], "sample.task", "readonly", os.getcwd(),
                os.environ["PROMPT"], os.environ["NESTED_OUTPUT"], os.environ["NESTED_LOG"]]
     with open(Path(os.environ["FIXTURE_CHECKOUT"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
@@ -171,8 +172,7 @@ class ClaudeLauncherTests(unittest.TestCase):
         notes.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "PATH": os.environ.get("PATH", os.defpath),
             "AGENT_NOTES_DIR": str(notes), "STAFF_FILE": str(self.home / "staff.json"),
-            "STAFF_CONFIG": str(SCRIPTS.parent / "config/staff.conf"),
-            "CONF_DIR": str(SCRIPTS.parent / "config"),
+            **config_environment(self.home / "config"),
             **source_environment(self.home / "sources")}, clear=True)))
         _ = copy_helpers(self.home)
         _ = (self.home / ".claude.json").write_text("{}")
@@ -181,7 +181,7 @@ class ClaudeLauncherTests(unittest.TestCase):
         groups = accounts.groups_file()
         groups.parent.mkdir(parents=True, exist_ok=True)
         _ = groups.write_text(json.dumps({"showrunners": "claude3"}))
-        registry = self.home / "models.conf"
+        registry = self.home / "config/models.conf"
         _ = write_registry(registry, {'assignments': {'cli': 'claude', 'sample': 'claude'}, 'cli.claude': {'interactive': 'opus:high'}, 'sample.claude': {'task': 'opus:high'}, 'claude.agents': {'opus': 'low,medium,high,max'}})
         binary = self.home / "bin/claude"
         binary.parent.mkdir()
@@ -201,7 +201,7 @@ class ClaudeLauncherTests(unittest.TestCase):
                               + "print(json.dumps({'type': 'result', 'result': 'finished'}))\n")
         binary.chmod(0o755)
         self.environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE")}
-        self.environment.update(MODELS_CONFIG_PUBLISH="0", HOME=str(self.home), AGENT_NOTES_DIR=str(notes), MODELS_CONFIG_FILE=str(registry),
+        self.environment.update(MODELS_CONFIG_PUBLISH="0", HOME=str(self.home), AGENT_NOTES_DIR=str(notes),
                                 CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
                                 XDG_CACHE_HOME=str(self.home / "cache"), XDG_STATE_HOME=str(self.home / "state"),
                                 PATH=str(binary.parent) + os.pathsep + os.environ["PATH"])
@@ -220,14 +220,16 @@ class ClaudeLauncherTests(unittest.TestCase):
                               + "Path(os.environ['TEST_AGENT_ENV']).write_text(json.dumps(dict(os.environ)))\n")
         binary.chmod(0o755)
         recorded = self.home / "cli-environment.json"
+        pinned_registry = self.home / "worker-models.conf"
         for family in ("codex", "claude"):
             with self.subTest(family=family):
-                _ = write_registry(Path(self.environment["MODELS_CONFIG_FILE"]), {"assignments": {"cli": family}})
-                with patch.dict(os.environ, {**self.environment, "MODELS_CONFIG_TIER_ONLY": "1"}):
+                _ = write_registry(pinned_registry, {"assignments": {"cli": family}})
+                inherited = {**self.environment, "MODELS_CONFIG_FILE": str(pinned_registry), "MODELS_CONFIG_TIER_ONLY": "1"}
+                with patch.dict(os.environ, inherited):
                     environment = models_registry.launch_configuration({
                         **os.environ, models_registry.OPERATION_ENVIRONMENT[0]: ""}).environment(
                         models_registry.edit_base({
-                            **os.environ, models_registry.OPERATION_ENVIRONMENT[1]: ""}).environment(self.environment))
+                            **os.environ, models_registry.OPERATION_ENVIRONMENT[1]: ""}).environment(inherited))
                 environment.update(TEST_AGENT_ENV=str(recorded), MODELS_CONFIG_TIER_ONLY="1",
                                    CLAUDE_CONFIG_DIR=str(accounts.account_dir("claude1")))
                 result = subprocess.run(["bash", str(SCRIPTS / "cli_agent/cli_agent.sh")],
@@ -237,7 +239,8 @@ class ClaudeLauncherTests(unittest.TestCase):
                 launched = cast(dict[str, str], json.loads(recorded.read_text()))
                 self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", launched)
                 self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", launched)
-                self.assertEqual(launched["MODELS_CONFIG_FILE"], environment["MODELS_CONFIG_FILE"])
+                self.assertEqual(launched["MODELS_CONFIG_FILE"], str(pinned_registry))
+                self.assertEqual(launched["CONF_DIR"], environment["CONF_DIR"])
                 if family == "codex":
                     self.assertEqual(launched["CODEX_HOME"], str(workers))
                 else:
@@ -268,7 +271,7 @@ class ClaudeLauncherTests(unittest.TestCase):
         for launcher in ("cli", "exec"):
             for caller, expected in (("claude1", "claude1"), ("", "claude3")):
                 with self.subTest(launcher=launcher, caller=caller):
-                    probe = RegistryReadProbe(self.home, Path(self.environment["MODELS_CONFIG_FILE"]))
+                    probe = RegistryReadProbe(self.home, (Path(self.environment["CONF_DIR"]) / "models.conf"))
                     environment = probe.environment(self.environment)
                     if caller:
                         environment["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(caller))

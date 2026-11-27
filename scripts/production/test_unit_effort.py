@@ -88,7 +88,7 @@ class UnitEffortTests(unittest.TestCase):
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
-            "NOTIFIER_SESSIONS_DIR": str(self.records), "MODELS_CONFIG_FILE": str(self.registry),
+            "NOTIFIER_SESSIONS_DIR": str(self.records), "CONF_DIR": str(self.registry.parent),
             "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(synced)}))

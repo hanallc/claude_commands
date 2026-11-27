@@ -151,12 +151,12 @@ class PaneWorld(herdr.Herdr):
         _ = write_config_fixture(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
         _ = write_config_fixture(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
-        for name in ("detached_runs.conf", "postmaster.conf", "user_zone.conf"):
+        for name in ("detached_runs.conf", "postmaster.conf", "staff.conf", "user_zone.conf"):
             _ = write_config_fixture(config / name)
-        registry = write_registry(config / "models.conf")
+        _ = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),
-            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+            "MODELS_CONFIG_PUBLISH": "0",
             "HERDR_PROC": str(test.root / "proc"), "HERDR_PLATFORM": "linux",
             "HERDR_PANE_RECORD_DIR": str(test.root / "pane-records"),
             "CLAUDE_CONFIG_DIR": str(test.root / "claude"), "CODEX_HOME": str(test.root / "codex"),

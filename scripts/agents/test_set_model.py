@@ -180,7 +180,8 @@ class SetModelTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.registry = self.root / "models.conf"
+        self.registry = self.root / "config/models.conf"
+        self.registry.parent.mkdir()
         _ = self.registry.write_text(REGISTRY)
         self.write_cache()
         self.write_catalog(self.root, OPUS_ID)
@@ -190,7 +191,6 @@ class SetModelTests(unittest.TestCase):
         _ = (self.root / "codex.toml").write_text('model = "gpt-6.2-sol"\n')
         (self.root / "last_success").touch()
         config = self.root / "config"
-        config.mkdir()
         source = Path(__file__).resolve().parents[2] / "config"
         (config / "machines.conf").symlink_to(source / "machines.conf")
         (config / "script_prompts.conf").symlink_to(source / "script_prompts.conf")
@@ -200,7 +200,7 @@ class SetModelTests(unittest.TestCase):
             + "# whole: 1..10\nscreen_reads=1\n"
             + "# range: 0.1..120\npane_timeout_seconds=30\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "MODELS_CONFIG_FILE": str(self.registry), "MODELS_CONFIG_PUBLISH": "0", "MODELS_CONFIG_TIER_ONLY": "0",
+            "MODELS_CONFIG_PUBLISH": "0", "MODELS_CONFIG_TIER_ONLY": "0",
             "CODEX_MODELS_CACHE_FILE": str(self.root / "models-cache.json"),
             "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "last_success"),

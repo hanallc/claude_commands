@@ -346,7 +346,7 @@ if __name__ == "__main__":
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_TARGETS_SCRIPT": str(targets),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint" / "lint_config.sh"),
-            "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
+            **config_environment(self.root),
         })
 
     def write_executable(self, path: Path, source: str) -> None:

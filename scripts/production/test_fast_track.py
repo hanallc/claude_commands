@@ -25,7 +25,7 @@ from unittest.mock import patch
 from scripts.lib import build_folders, zone
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture
 from scripts.production import fast_track, merge_checkpoint
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
@@ -334,7 +334,7 @@ class FastTrackTests(MergeCheckpointFixture):
 
     def pin_configuration(self) -> None:
         config = self.config.parent
-        self.env.update(CONF_DIR=str(config), USER_ZONE="UTC")
+        self.env.update(config_environment(config), USER_ZONE="UTC")
         _ = (config / "build_folders.conf").write_text(
             f"""# whole: 1..
 names.suffix_length=8
@@ -357,7 +357,7 @@ locks.probe_wait_seconds=0.25
 locks.probe_retry_seconds=1
 """,
         )
-        _ = write_config_fixture(Path(self.env["COPIES_CONFIG"]),
+        _ = write_config_fixture(config / "copies.conf",
             f"""remote_registry={self.root / 'remote-mirrors'}
 wait_seconds=0.01
 git_timeout_seconds=10

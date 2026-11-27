@@ -313,8 +313,6 @@ class RemoteCopiesTests(unittest.TestCase):
         fixture = OffloadCommandFixture()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
-        private_settings = Path(fixture.environment["COPIES_CONFIG"]).with_name("build_folders.conf")
-        _ = shutil.copyfile(private_settings, Path(fixture.environment["CONF_DIR"]) / private_settings.name)
         fixture.environment["STAFF_FILE"] = staff_file
         fixture.fixture["hold_run"] = True
         fixture.sync_fixture()

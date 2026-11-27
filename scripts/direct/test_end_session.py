@@ -46,8 +46,7 @@ class EndSessionTests(unittest.TestCase):
         _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = fixture_git_environment(self.root)
-        for key in ("BASH_ENV", "STAFF_CONFIG"):
-            _ = environment.pop(key, None)
+        _ = environment.pop("BASH_ENV", None)
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment, clear=True)))
         self.session_dir = self.root / "run"
         self.session_dir.mkdir()

@@ -975,7 +975,7 @@ class VerifyMemoryRouteHolderTests(_RecordedHoldWaitFixture):
         config = self.fixture.root / "lint.conf"
         _ = write_config_fixture(config, "mend=on\nfmt=on\nclippy=on\n")
         self.fixture.environment.update({"LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
-            "LINT_CONFIG_FILE": str(config), "LINT_SKIP_SWEEP": "1",
+            "CONF_DIR": str(config.parent), "LINT_SKIP_SWEEP": "1",
             "TEST_TAPLO_EVENTS": str(self.fixture.root / "taplo-events.jsonl"), "TEST_TAPLO_STATUS": "0",
             "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "101"})
         process = self.start("lint", "sample")

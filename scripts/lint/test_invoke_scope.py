@@ -95,7 +95,7 @@ def configured_scope_command(root: Path, config: Path, *,
     result = BuildAdmissionTests(methodName="runTest").run_invoke(
         root, 'printf "%s" "$BUILDLOG_SCOPE_SH"', [], environment={
             "LINT_CONFIG_READER": str(reader),
-            "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
+            "CONF_DIR": str(config.parent),
         },
     )
     if result.returncode != 0:
@@ -140,7 +140,7 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
     def read_config(self, config: Path, command: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             command, capture_output=True, text=True, check=False,
-            env={**os.environ, "HOME": str(config.parent), "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
+            env={**os.environ, "HOME": str(config.parent), "CONF_DIR": str(config.parent),
                  "PYTHONPATH": str(INVOKE.resolve().parents[1] / "lib/python_startup")},
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
@@ -170,15 +170,32 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.assert_readers(Path(directory) / "lint.conf", 500, warns=False)
 
+    def test_shell_reads_and_writes_the_selected_lint_file(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        fixture = root / "fixture/lint.conf"
+        live = root / ".claude/config/lint.conf"
+        _ = write_config_fixture(fixture, "mend=on\n")
+        _ = write_config_fixture(live, "mend=off\n")
+        command = (
+            'source "$1"; lint_config_enabled mend; _lint_config_set mend off; '
+            'unset CONF_DIR; if lint_config_enabled mend; then exit 1; fi; _lint_config_set mend on'
+        )
+        result = subprocess.run(["bash", "-euc", command, "lint-config-test", str(LINT_CONFIG_READER)],
+                                env={**os.environ, "HOME": str(root), "CONF_DIR": str(fixture.parent),
+                                     "LINT_CONFIG_FORCE": "0"},
+                                capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mend=off\n", fixture.read_text())
+        self.assertIn("mend=on\n", live.read_text())
+
     def test_absent_key_uses_default_silently(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = write_lint_config(Path(directory), 650, include_adjustment=False)
-            override = config.rename(config.with_name("override.conf"))
             reads = Path(directory) / "config-reads"
             _ = reads.write_text("")
             with patch.dict(os.environ, {"CONF_READ_LOG": str(reads)}):
-                self.assert_readers(override, 500, warns=False)
-            self.assertEqual(reads.read_text().splitlines(), [override.stem])
+                self.assert_readers(config, 500, warns=False)
+            self.assertEqual(reads.read_text().splitlines(), [config.stem])
 
     def test_python_reader_recovers_committed_values_and_refuses_without_history(self) -> None:
         from scripts.lint.memory_test_support import commit_config_fixture
@@ -649,8 +666,8 @@ sweep_after_step test-step
             tool = tools / "systemd-cat"
             _ = tool.write_text("#!/bin/sh\nexec cat >/dev/null\n")
             tool.chmod(0o755)
-            lint_config = root / "lint.conf"
-            _ = lint_config.write_text(f"sweep={state}\n")
+            lint_config = root / "config/lint.conf"
+            _ = write_config_fixture(lint_config, f"sweep={state}\n")
             reader, writer = os.pipe()
             try:
                 command = ('source "$1"; run_once() { printf "%s\\n" "${2##*/}" >&"$SWEEP_TEST_FD"; }; '
@@ -661,7 +678,7 @@ sweep_after_step test-step
                     env={**invoke_test_environment(), **config_environment(root / "config"), "HOME": directory,
                          "TMPDIR": directory, "XDG_RUNTIME_DIR": str(runtime), "BUILD_HOLD_DIR": str(root / "hold"),
                          "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}", "LINT_INVOKE_SOURCED": "",
-                         "LINT_SKIP_SWEEP": "", "LINT_CONFIG_FORCE": "1", "LINT_CONFIG_FILE": str(lint_config),
+                         "LINT_SKIP_SWEEP": "", "LINT_CONFIG_FORCE": "1",
                          "SWEEP_TEST_FD": str(writer)})
                 os.close(writer)
                 writer = -1
@@ -724,7 +741,7 @@ sweep_after_step() { :; }
 '''
         return self.run_invoke(root, shell, [command], environment={
             "PATH": str(root) + os.pathsep + os.environ["PATH"],
-            "LINT_CONFIG_READER": str(LINT_CONFIG_READER), "LINT_CONFIG_FILE": str(config),
+            "LINT_CONFIG_READER": str(LINT_CONFIG_READER), "CONF_DIR": str(config.parent),
             "LINT_INVOKE_SOURCED": "", "BUILDLOG_MEM_RESERVATION": "",
             "CARGO_MAKEFLAGS": "cargo-pool", "MAKEFLAGS": "make-pool", "MFLAGS": "m-pool",
         })

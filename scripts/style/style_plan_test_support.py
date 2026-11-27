@@ -177,7 +177,7 @@ class StylePlanFixture(unittest.TestCase):
         fixture_parent = Path(tempfile.mkdtemp(prefix="style-plan-fixture-")).resolve()
         cls.addClassCleanup(shutil.rmtree, fixture_parent)
         environment = fixture_git_environment(fixture_parent)
-        for key in ("BASH_ENV", "RIPGREP_CONFIG_PATH", "STAFF_CONFIG"):
+        for key in ("BASH_ENV", "RIPGREP_CONFIG_PATH"):
             _ = environment.pop(key, None)
         _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, environment, clear=True)))
         cls.template_repo = fixture_parent / "sample"

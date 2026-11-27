@@ -111,8 +111,7 @@ class LauncherFixture(unittest.TestCase):
                            check=True, capture_output=True, text=True)
         self.config_file = self.root / "direct.conf"
         _ = self.config_file.write_text("\n".join(configuration), encoding="utf-8")
-        registry_file = self.root / ".claude/config/models.conf"
-        registry_file.parent.mkdir(parents=True)
+        registry_file = self.root / "models.conf"
         _ = write_registry(registry_file, base_text=registry)
         self.prompt_file = self.root / prompt_name
         _ = self.prompt_file.write_text(prompt, encoding="utf-8")
@@ -194,7 +193,7 @@ def launcher_environment(root: Path) -> dict[str, str]:
     environment = {name: value for name, value in os.environ.items() if not name.startswith("HERDR_")}
     environment.update(MODELS_CONFIG_PUBLISH="0", HOME=str(root), XDG_CACHE_HOME=str(root / "cache"),
                        UNIT_WORKER_POLL_SECS="0.01", UNIT_SYNC_WRITES="0",
-                       TEST_LEGACY_LAUNCH="1", MODELS_CONFIG_FILE=str(root / ".claude/config/models.conf"),
+                       TEST_LEGACY_LAUNCH="1",
                        UNIT_HISTORY_DIR=str(root / "history"), CONF_DIR=str(root),
                        TZ="UTC", USER_ZONE="UTC")
     seed_interpreter_cache(root / "cache")
@@ -233,10 +232,7 @@ def invoke_recorder(arguments: Sequence[str], environment: Mapping[str, str],
         recorder.main()
         return 0
 
-    with (
-        patch.object(models_registry, "DEFAULT_PATH", home / ".claude/config/models.conf"),
-        patch.object(pass_recorder, "DEFAULT_MODELS_CONFIG_PATH", home / ".claude/config/models.conf"),
-    ):
+    with patch.object(models_registry, "DEFAULT_PATH", home / ".claude/config/models.conf"):
         result = invoke_cli(recorder, main, list(arguments), environment, cwd)
     if check:
         result.check_returncode()

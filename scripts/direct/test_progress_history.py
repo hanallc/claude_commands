@@ -130,7 +130,7 @@ class ProgressHistoryTests(unittest.TestCase):
         # writes to this same path: one file, so arm-review resolves the agent
         # the test wrote instead of reading an empty one beside it.
         self.team_slot = ""
-        self.models_config_file = self.root / ".claude" / "config" / "models.conf"
+        self.models_config_file = self.root / "models.conf"
         _ = write_registry(self.models_config_file)
         run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
@@ -204,19 +204,20 @@ class ProgressHistoryTests(unittest.TestCase):
         _ = script.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(log)!r}).touch()\n")
         script.chmod(0o755)
         reads = self.root / "config-reads"
+        registry = settings / "models.conf"
         original = self.models_config_file.read_text()
-        configuration = models_registry.LaunchModelConfiguration(self.models_config_file, original, ())
+        configuration = models_registry.LaunchModelConfiguration(registry, original, ())
         for inherited in (False, True):
             _ = reads.write_text("")
             with self.subTest(inherited=inherited), patch.object(pass_recorder, "inherited_registry_text", wraps=pass_recorder.inherited_registry_text) as launches, patch.object(models_registry, "__file__", str(script.parent.parent / "lib/models_registry.py")), patch.dict(os.environ, {
-                "HOME": str(self.root), "CONF_DIR": str(settings), "MODELS_CONFIG_FILE": str(self.models_config_file),
+                "HOME": str(self.root), "CONF_DIR": str(settings),
                 "MODELS_CONFIG_TIER_ONLY": "0", "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "missing-sync-state"),
                 "MODELS_LAUNCH_CONFIGURATION": configuration.environment({})["MODELS_LAUNCH_CONFIGURATION"] if inherited else "",
             }):
                 # The two subtests call the digest in one process with a changed environment and file,
                 # as verify_helper.py does in two calls.
-                _ = self.models_config_file.write_text(original + "# later edit\n")
-                text = original if inherited else self.models_config_file.read_text()
+                _ = registry.write_text(original + "# later edit\n")
+                text = original if inherited else registry.read_text()
                 with conf_reads.record_reads(reads):
                     self.assertEqual(pass_recorder.config_digest(),
                                      hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
@@ -350,12 +351,10 @@ from pathlib import Path
 from unittest.mock import patch
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct import progress_history
-from scripts.direct import pass_record as pass_recorder
 from scripts.lib import conf
 
 root, working = map(Path, sys.argv[1:])
 caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-          pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
           conf.path('user_zone'), {sig: signal.getsignal(sig) for sig in
                           (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
 plan = working / 'cold-plan.md'
@@ -371,7 +370,7 @@ for number in (1, 2):
     environment = {**os.environ, 'HOME': str(home), 'USER_ZONE': 'UTC',
                    'UNIT_SYNC_WRITES': '0', 'UNIT_PASS_OWNER': 'launcher',
                    'UNIT_NOW_EPOCH': '1000'}
-    for key in ('CONF_DIR', 'MODELS_CONFIG_FILE', 'UNIT_HISTORY_DIR',
+    for key in ('CONF_DIR', 'UNIT_HISTORY_DIR',
                 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
         environment.pop(key, None)
     session = home / 'session'
@@ -394,8 +393,7 @@ for number in (1, 2):
     started, = [event for event in events if event['event_type'] == 'pass_started']
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-                pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
-                conf.path('user_zone'), {sig: signal.getsignal(sig) for sig in caller[-1]})
+                      conf.path('user_zone'), {sig: signal.getsignal(sig) for sig in caller[-1]})
     assert restored == caller, (restored, caller)
 print('two homes isolated; recorder lock retained; caller restored')
 '''
@@ -453,7 +451,6 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
         environment["CONF_DIR"] = str(Path(self.config_file).parent)
-        environment["MODELS_CONFIG_FILE"] = str(self.models_config_file)
         environment["TZ"] = zone
         environment["USER_ZONE"] = zone
         environment["UNIT_NOW_EPOCH"] = str(at)
@@ -482,7 +479,6 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
         environment["CONF_DIR"] = str(Path(self.config_file).parent)
-        environment["MODELS_CONFIG_FILE"] = str(self.models_config_file)
         environment["TZ"] = zone
         environment["USER_ZONE"] = zone
         environment["UNIT_NOW_EPOCH"] = str(at)
@@ -510,7 +506,6 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
         environment["CONF_DIR"] = str(Path(self.config_file).parent)
-        environment["MODELS_CONFIG_FILE"] = str(self.models_config_file)
         environment["UNIT_NOW_EPOCH"] = str(at)
         environment["UNIT_PASS_OWNER"] = "launcher"
         environment["TZ"] = "UTC"
@@ -3105,7 +3100,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         commit = self.fixture_commit("external interleave")
         _ = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1015)
         environment = {**os.environ, "UNIT_HISTORY_DIR": str(self.history_dir), "UNIT_NOW_EPOCH": "1030",
-                       "CONF_DIR": str(Path(self.config_file).parent), "MODELS_CONFIG_FILE": str(self.models_config_file)}
+                       "CONF_DIR": str(Path(self.config_file).parent)}
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         finish_program = '''import sys
@@ -4056,7 +4051,6 @@ with patch.object(fcntl, "flock", admission):
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
         environment["CONF_DIR"] = str(Path(self.config_file).parent)
-        environment["MODELS_CONFIG_FILE"] = str(self.models_config_file)
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
         environment["UNIT_NOW_EPOCH"] = str(at)
@@ -4681,7 +4675,7 @@ with patch.object(fcntl, "flock", admission):
         _ = prompt.write_text("Phase 3 — Retry handling\nRead the requested files.\n")
         command = ["bash", "assign.sh", "impl", str(prompt)]
         with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
-                                     "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
+                                     "UNIT_NOW_EPOCH": "41020"}):
             first = progress_history.begin_dispatch(
                 session, slot="impl2", phase="3", role="review", worker_name="impl2",
                 worker_id=member.id,
@@ -4751,7 +4745,7 @@ with patch.object(fcntl, "flock", admission):
                 prompt=prompt, kind="impl", lens="")
 
         with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
-                                     "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
+                                     "UNIT_NOW_EPOCH": "41020"}):
             predecessor = begin()
             progress_history.complete_dispatch(session, "impl", predecessor, status="error")
             failed_pass = self.pass_slots(session)["impl"]
@@ -4838,7 +4832,7 @@ with patch.object(fcntl, "flock", admission):
         _ = prompt.write_text("Phase 3 — Retry handling\nRead the requested files.\n")
         command = ["bash", "assign.sh", "review", str(prompt)]
         with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
-                                     "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
+                                     "UNIT_NOW_EPOCH": "41020"}):
             instance = progress_history.begin_dispatch(
                 session, slot="test", phase="3", role="review", worker_name="impl2",
                 worker_id=member.id,
@@ -4892,7 +4886,7 @@ with patch.object(fcntl, "flock", admission):
         _ = prompt.write_text("Phase 3 — Retry handling\nRepair the failed gate.\n")
         command = ["bash", "assign.sh", "--role", "fix", "--prompt", str(prompt)]
         with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
-                                     "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
+                                     "UNIT_NOW_EPOCH": "41020"}):
             with self.assertRaisesRegex(SystemExit, "Fix launch has no ledger round"):
                 _ = progress_history.begin_dispatch(
                     session, slot="test", phase="3", role="fix", worker_name="fix",

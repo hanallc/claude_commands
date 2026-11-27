@@ -68,7 +68,7 @@ class MeasurementFixture(CostFixture):
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.root / "buildlog"),
-            "BUILD_TARGETS_CONFIG": str(self.root / "build_targets.conf"),
+            "CONF_DIR": str(self.root),
             **{name: str(self.root / name) for name in COORDINATION_VARIABLES},
             "BUILDLOG_PEER": "", "USER_ZONE": "UTC", "TZ": "UTC",
         })))

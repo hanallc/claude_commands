@@ -158,7 +158,7 @@ class RepositoryClaimTests(unittest.TestCase):
             **config_environment(self.root),
             **private,
             "CONF_DIR": str(self.root),
-            "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry),
+            "HOME": str(self.root),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILD_HOLD_DIR": str(self.root / "holders"),

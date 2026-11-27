@@ -1767,11 +1767,11 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(staff.by_id(morty.id), moved)
 
         with self.subTest(operation="producer creation"):
-            registry = self.root / "models.conf"
+            registry = Path(os.environ["CONF_DIR"]) / "models.conf"
             _ = registry.write_text("[producers]\n")
             marker = f"mac:{'1' * 32}"
             with (self.machine("mac"),
-                  mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0"})):
+                  mock.patch.dict(os.environ, {"MODELS_CONFIG_PUBLISH": "0"})):
                 _ = staff.producer_creation_registry("claim", "dwight", marker, "claude:sonnet:high")
                 self.assertEqual(staff.producer_creation_registry("read", "Dwight"),
                                  staff.RecordedProducerCreation("dwight", marker))
@@ -1790,11 +1790,11 @@ class StaffTests(StaffCommandTestCase):
                               ("claim", "read-named", "claim", "finish", "read-named", "finish", "read-named")])
 
     def test_old_caller_reads_a_marker_from_the_new_owner(self) -> None:
-        registry = self.root / "models.conf"
+        registry = Path(os.environ["CONF_DIR"]) / "models.conf"
         marker = f"mac:{'1' * 32}"
         _ = registry.write_text(f"[producer_creations]\ndwight={marker}\n")
         with (self.machine("mac"),
-              mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0"})):
+              mock.patch.dict(os.environ, {"MODELS_CONFIG_PUBLISH": "0"})):
             result = subprocess.run(["ssh", "-o", "BatchMode=yes", "natedev",
                 "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
                 + "producer-creation read --name=Dwight --marker= --profile= --json"],
