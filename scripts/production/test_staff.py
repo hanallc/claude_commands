@@ -1759,6 +1759,36 @@ class StaffTests(StaffCommandTestCase):
         back = staff.transfer_producer(morty.id, morty.id, staff.SessionHome(self.root / ".codex2"), folder)
         self.assertEqual(back, replace(morty, home=staff.SessionHome(self.root / ".codex2"), worktree=folder))
 
+    def test_remote_producer_clone_records_the_source_and_launch_in_one_write(self) -> None:
+        source = fixture_member("producer", name="morty")
+        identity = staff.native_id(fixture_runtime_id("morty-copy"))
+        home = staff.SessionHome(self.root / "mac/.claude4")
+        folder = staff.PresentWorktree("mac", self.root / "mac/launch")
+        clone_of = staff.ProducerClone(source.id)
+        with self.machine("mac"):
+            clone = staff.create_producer_clone("morty-copy", identity, clone_of, folder, home)
+        self.assertEqual([command[0] for command in self.ssh_commands()], ["create-producer-clone"])
+        expected = staff.StaffRow(identity, "producer", "morty-copy", staff.StaffRoot(),
+                                  worktree=folder, current_session=identity, home=home, clone_of=clone_of)
+        self.assertEqual(clone, expected)
+        self.assertEqual(staff.by_id(identity), expected)
+        self.assertEqual(clone.to_json()["clone_of"], source.id)
+        self.assertEqual(staff.StaffRow.from_json(clone.to_json()), expected)
+        legacy = source.to_json()
+        self.assertNotIn("clone_of", legacy)
+        self.assertEqual(staff.StaffRow.from_json(legacy).clone_of, staff.NotAClone())
+
+    def test_producer_clone_refuses_a_name_claimed_before_admission(self) -> None:
+        source = fixture_member("producer", name="morty")
+        _ = fixture_member("producer", name="MORTY-COPY")
+        folder = staff.PresentWorktree("natedev", self.root / "launch")
+        home = staff.SessionHome(self.root / ".claude4")
+        before = self.staff_state()
+        with self.assertRaisesRegex(staff.StaffRefused, "another staff row has this name"):
+            _ = staff.create_producer_clone("morty-copy", fixture_runtime_id("fork"),
+                                           staff.ProducerClone(source.id), folder, home)
+        self.assertEqual(self.staff_state(), before)
+
     def test_a_remote_producer_transfer_uses_one_owner_write(self) -> None:
         morty = fixture_member("producer", name="morty")
         session = staff.native_id(fixture_runtime_id("morty-claude"))

@@ -467,6 +467,16 @@ class NoTopItem:
 
 
 @dataclass(frozen=True)
+class ProducerClone:
+    source: StaffId
+
+
+@dataclass(frozen=True)
+class NotAClone:
+    """The row has no clone source."""
+
+
+@dataclass(frozen=True)
 class StaffRow:
     id: StaffId
     kind: Kind
@@ -487,6 +497,7 @@ class StaffRow:
     retirement: RetiredProducer | Active = field(default_factory=Active, kw_only=True)
     top_item: TopItem | NoTopItem = field(default_factory=NoTopItem, kw_only=True)
     resume_pending: ResumePending | NoPendingResume = field(default_factory=NoPendingResume, kw_only=True)
+    clone_of: ProducerClone | NotAClone = field(default_factory=NotAClone, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def reports_to(self, identity: StaffId) -> bool:
@@ -526,6 +537,8 @@ class StaffRow:
             value["retired_producer"] = self.retirement.profile
         if isinstance(self.top_item, TopItem):
             value["top_item"] = self.top_item.number
+        if isinstance(self.clone_of, ProducerClone):
+            value["clone_of"] = self.clone_of.source
         return value
 
     @classmethod
@@ -574,6 +587,13 @@ class StaffRow:
             if kind != "producer" or not isinstance(number, int) or isinstance(number, bool) or number < 1:
                 raise StaffUnreadable("invalid producer top item")
             top_item = TopItem(number)
+        clone_of: ProducerClone | NotAClone = NotAClone()
+        if "clone_of" in fields:
+            source = fields["clone_of"]
+            if kind != "producer" or not isinstance(source, str) or not _valid_id(source) or source == staff_id:
+                raise StaffUnreadable("invalid producer clone source")
+            clone_of = ProducerClone(StaffId(source))
+            known_fields.add("clone_of")
         invalid: list[str] = []
         for key, fact in (("role", parsed_role), ("home", parsed_home)):
             if isinstance(fact, (KnownWorkerRole, SessionHome)):
@@ -596,7 +616,7 @@ class StaffRow:
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
                    resume_pending=ResumePending.from_json(fields["resume_pending"])
                    if "resume_pending" in fields else NoPendingResume(),
-                   unknown_fields=_unknown_fields(fields, known_fields))
+                   clone_of=clone_of, unknown_fields=_unknown_fields(fields, known_fields))
 
 
 def unit_command(unit: StaffRow | UnitType) -> str:
@@ -1403,6 +1423,8 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
             raise StaffRefused(f"{row.kind} cannot hold worktree")
         if row.kind not in ("showrunner", "producer") and not isinstance(row.doc, DocUnfilled):
             raise StaffRefused(f"{row.kind} cannot hold doc")
+        if isinstance(row.clone_of, ProducerClone) and (row.kind != "producer" or not isinstance(row.doc, DocUnfilled)):
+            raise StaffRefused(f"{row.name}: a producer clone cannot own a document")
         if row.kind != "producer" and isinstance(row.worktree, PresentWorktree):
             # Two producers can start in one folder; a producer's worktree owns no path.
             location = (row.worktree.machine, row.worktree.path)
@@ -2143,6 +2165,30 @@ def create_session(name: str, identity: str, folder: SessionLaunchFolder, home: 
                        current_session=session_id, home=home, launch_folder=folder)
         rows.append(row)
         return row
+
+    return _transaction(edit)
+
+
+def create_producer_clone(name: str, identity: str, clone_of: ProducerClone,
+                          folder: PresentWorktree, home: SessionHome) -> StaffRow:
+    """Admit a new producer with its clone source, folder, and account."""
+    validate_name("session", name)
+    if not home.path.is_absolute():
+        raise StaffRefused(f"{name}: the session home must be absolute")
+    if not is_owner():
+        return _remote_row(["create-producer-clone", identity, f"--name={name}", "--clone-of", clone_of.source,
+                            "--machine", folder.machine, "--path", str(folder.path), "--home", str(home.path)])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        source = _row_by_id(rows, clone_of.source)
+        if source is None or source.kind != "producer":
+            raise StaffRefused(f"{clone_of.source}: producer clone source is unavailable")
+        if any(row.name.casefold() == name.casefold() for row in rows):
+            raise StaffRefused(f"{name}: another staff row has this name")
+        row = _ensure_row(rows, "producer", name, STAFF_ROOT, worktree=folder, runtime_id=identity)
+        clone = replace(row, home=home, clone_of=clone_of)
+        rows[rows.index(row)] = clone
+        return clone
 
     return _transaction(edit)
 
@@ -2912,6 +2958,7 @@ class _Arguments:
     resume_key: str = ""
     restore_pause: bool = False
     home: str = ""
+    clone_of: str = ""
     runtime_id: str = ""
     new_id: str = ""
     value: str = ""
@@ -2991,11 +3038,14 @@ def _parser() -> argparse.ArgumentParser:
     _ = add.add_argument("--worktree", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
     _ = add.add_argument("--doc", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
     _ = add.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
-    create = verbs.add_parser("create-session", help=argparse.SUPPRESS)
-    _ = create.add_argument("target")
-    for field_name in ("name", "machine", "path", "home"):
-        _ = create.add_argument(f"--{field_name}", required=True)
-    _ = create.add_argument("--json", action="store_true")
+    for verb in ("create-session", "create-producer-clone"):
+        create = verbs.add_parser(verb, help=argparse.SUPPRESS)
+        _ = create.add_argument("target")
+        for field_name in ("name", "machine", "path", "home"):
+            _ = create.add_argument(f"--{field_name}", required=True)
+        if verb == "create-producer-clone":
+            _ = create.add_argument("--clone-of", required=True)
+        _ = create.add_argument("--json", action="store_true")
     worker_parser = verbs.add_parser("ensure-worker", help=argparse.SUPPRESS)
     _ = worker_parser.add_argument("target")
     _ = worker_parser.add_argument("--name", required=True)
@@ -3127,6 +3177,9 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
     if arguments.verb == "create-session":
         return create_session(arguments.name, arguments.target,
                               SessionLaunchFolder(arguments.machine, Path(arguments.path)), SessionHome(Path(arguments.home)))
+    if arguments.verb == "create-producer-clone":
+        return create_producer_clone(arguments.name, arguments.target, ProducerClone(StaffId(arguments.clone_of)),
+                                     PresentWorktree(arguments.machine, Path(arguments.path)), SessionHome(Path(arguments.home)))
     if arguments.verb == "ensure-worker":
         assert arguments.parent is not None
         return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))

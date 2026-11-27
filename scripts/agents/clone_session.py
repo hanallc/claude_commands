@@ -1,4 +1,4 @@
-"""Fork a live conversation into a separate staff session."""
+"""Fork a live conversation into a separate staff row."""
 from __future__ import annotations
 
 import json
@@ -45,6 +45,7 @@ class CloneSource:
     pane: str
     kind: AgentKind
     launch: herdr.ForegroundLaunch
+    producer_clone: staff.ProducerClone | staff.NotAClone
 
     @property
     def identity(self) -> str:
@@ -107,7 +108,8 @@ def _source(reference: str, record: staff.StaffSnapshot) -> tuple[CloneSource, h
         raise ValueError(f"{reference}: the source pane changed sessions")
     member = record.by_current_session(identity)
     label = next((tab.label for tab in tabs if tab.pane_id == place.pane and tab.label), reference)
-    return CloneSource(member.name if member is not None else label, place.pane, live.kind, launch), client
+    producer_clone = staff.ProducerClone(member.id) if member is not None and member.kind == "producer" else staff.NotAClone()
+    return CloneSource(member.name if member is not None else label, place.pane, live.kind, launch, producer_clone), client
 
 
 _CODEX_MODEL = r"gpt-[a-z0-9][a-z0-9.-]*"
@@ -168,9 +170,14 @@ def _live_settings(source: CloneSource, client: herdr.Herdr, home: Path) -> Live
 
 
 def _arguments(source: CloneSource, settings: LiveForkSettings, name: str) -> list[str]:
-    prompt = (f"You are {name}, a clone of {source.name}. Use {name} as your session name. "
-              f"Messages to {source.name} are for the source session. "
-              "Wait for a request addressed to you.")
+    if isinstance(source.producer_clone, staff.ProducerClone):
+        prompt = (f"You are {name}, a clone of {source.name}. "
+                  f"Do not continue the ongoing work of {source.name}. "
+                  "Do new actions that Nate gives you.")
+    else:
+        prompt = (f"You are {name}, a clone of {source.name}. Use {name} as your session name. "
+                  f"Messages to {source.name} are for the source session. "
+                  "Wait for a request addressed to you.")
     if source.kind == "codex":
         return ["fork", source.identity, "--model", settings.model,
                 "-c", f"model_reasoning_effort={json.dumps(settings.effort)}", "--", prompt]
@@ -207,8 +214,13 @@ def _admit_clone(name: str, source: CloneSource, client: herdr.Herdr, launched: 
         try:
             pane_record.write(client.session, entry)
             try:
-                row = staff.create_session(name, native, staff.SessionLaunchFolder(remote.local_machine(), prepared.directory),
-                                           staff.SessionHome(home))
+                machine = remote.local_machine()
+                if isinstance(source.producer_clone, staff.ProducerClone):
+                    row = staff.create_producer_clone(name, native, source.producer_clone,
+                                                      staff.PresentWorktree(machine, prepared.directory), staff.SessionHome(home))
+                else:
+                    row = staff.create_session(name, native, staff.SessionLaunchFolder(machine, prepared.directory),
+                                               staff.SessionHome(home))
             except staff.StaffUnreadable as error:
                 # A lost reply can follow a committed staff write.
                 raise _AdmissionUnconfirmed(

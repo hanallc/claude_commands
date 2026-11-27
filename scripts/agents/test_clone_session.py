@@ -8,14 +8,15 @@ import json
 import os
 from pathlib import Path
 from typing import Literal, cast, final, override
-from unittest.mock import ANY, Mock, patch
+from unittest.mock import ANY, Mock, call, patch
 
 from scripts.agents import member_account, pane_record, shutdown, shutdown_record, stop_resume
 from scripts.herdr import herdr
-from scripts.lib import copy_record, scratch, session_folder
+from scripts.lib import conf, copy_record, scratch, session_folder
 from scripts.message import roster, send, sessions
-from scripts.production import staff
+from scripts.production import broadcast, staff
 from scripts.production.staff_test_support import StaffTestCase
+from scripts.review_links import review_submissions
 
 SOURCE = "019b3a40-4250-7000-8000-000000000201"
 FORK = "019b3a40-4250-7000-8000-000000000202"
@@ -128,6 +129,75 @@ class CloneCommandTests(StaffTestCase):
         call = cast(Mock, self.launch).call_args
         assert call is not None
         return cast(herdr.PreparedAgentEnvironment, call.args[2])
+
+    def clone_producer(self) -> tuple[staff.StaffRow, staff.StaffRow]:
+        document = self.root / "morty"
+        document.mkdir()
+        producer = staff.ensure("producer", name="morty", runtime_id=THIRD,
+                                doc=staff.LiveDoc("natedev", document),
+                                worktree=staff.PresentWorktree("natedev", self.folder))
+        current = staff.native_id("019b3a40-4250-7000-8000-000000000204")
+        producer = staff.update_current_session(producer.current_session, current)
+        self.source("claude", self.clone_scratch / ".claude4", ["claude"], footer="Opus 4.8 high", identity=current)
+        cast(Mock, self.client.tab_sessions).return_value = [herdr.TabSession(PANE, producer.name, "workspace", current)]
+
+        def native_session(pane: str, _kind: str, _timeout: float) -> str:
+            return current if pane == PANE else FORK
+
+        cast(Mock, self.native).side_effect = native_session
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic):
+            result = shutdown.main(["clone", producer.name, "morty-copy"])
+        self.assertEqual(result, 0, diagnostic.getvalue())
+        record = staff.initial_snapshot()
+        clone = record.by_current_session(FORK)
+        assert clone is not None
+        return producer, clone
+
+    def test_producer_clone_admits_a_separate_root_and_opens_for_new_actions(self) -> None:
+        producer, clone = self.clone_producer()
+        self.assertEqual((clone.id, clone.current_session, clone.kind, clone.name), (FORK, FORK, "producer", "morty-copy"))
+        self.assertEqual(clone.clone_of, staff.ProducerClone(producer.id))
+        self.assertEqual(clone.parent, staff.StaffRoot())
+        self.assertEqual(clone.doc, staff.DocUnfilled())
+        self.assertEqual(clone.worktree, staff.PresentWorktree("natedev", self.folder))
+        self.assertEqual(clone.home, staff.SessionHome(self.clone_scratch / ".claude4"))
+        record = staff.initial_snapshot()
+        self.assertEqual(record.by_id(producer.id), producer)
+        self.assertFalse(any(row.reports_to(clone.id) for row in record.rows))
+        self.assertIsNotNone(pane_record.publication_for_session(FORK, record=record))
+        cast(Mock, self.remember).assert_called_once_with(clone.id, FORK_PANE)
+        launched = cast(Mock, self.launch).call_args
+        assert launched is not None
+        arguments = cast(list[str], launched.args[4])
+        self.assertEqual(arguments[:3], ["--resume", producer.current_session, "--fork-session"])
+        self.assertEqual(arguments[-1], "You are morty-copy, a clone of morty. "
+                         + "Do not continue the ongoing work of morty. Do new actions that Nate gives you.")
+
+    def test_producer_broadcast_delivers_to_the_source_and_its_clone(self) -> None:
+        producer, clone = self.clone_producer()
+        members = (self.owner, producer, clone)
+        entries = [roster.RosterEntry("natedev", "claude", "freestanding", row.name, "idle",
+                                      roster.Messageable(f"session:{row.current_session}"), str(self.folder),
+                                      roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker(),
+                                      session=roster.ClaudeSession(row.current_session)) for row in members]
+        cast(Mock, roster.roster).return_value = roster.Roster(entries, [])
+        with patch.object(broadcast, "_send", return_value=("sent", "")) as deliver:
+            self.assertEqual(broadcast.main(["--here", "--from", "nate", "--producers", "Review update."]), 0)
+        message = "Review update.\n\nSent directly to producers on this machine; do not pass it on."
+        self.assertCountEqual(deliver.call_args_list, [
+            call(f"session:{producer.current_session}", "nate", message, "--here"),
+            call(f"session:{clone.current_session}", "nate", message, "--here"),
+        ])
+
+    def test_new_item_offers_a_producer_clone(self) -> None:
+        producer, clone = self.clone_producer()
+        record = staff.initial_snapshot()
+        options = review_submissions.new_item_routing("review", conf.read_or_repository("console"), record)
+        self.assertEqual(options["recipients"], [
+            {"id": row.id, "name": row.name, "proposal": True} for row in (producer, clone)
+        ])
+        self.assertEqual(review_submissions.selected_recipient(clone.id, record), clone)
 
     def test_clone_refuses_the_removed_as_option(self) -> None:
         diagnostic = io.StringIO()
