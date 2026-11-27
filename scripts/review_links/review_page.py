@@ -1990,11 +1990,6 @@ const firstReviewCard=(()=>{
  }
  const params=recordPlaceParams(reviewPlaceOptions);
  legacyReviewPlace(params);
- if(history.state?.recordTable && params.get('show')==='Done'){
-  params.set('show','open');
-  for(const field of ['item','jump','linked','reveal']) params.delete(field);
-  history.replaceState(null,'',location.pathname+'#'+params);
- }
  const key=recordItemLink(params,value=>resolveShownRecordId(index,value));
  if(!index.has(key)) return null;
  const version=document.querySelector('[data-review]').dataset.version;

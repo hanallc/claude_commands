@@ -395,10 +395,6 @@ The console applies the link's recorded place and keeps the source frame open.
 
 The console URL also records the place of each opened page as `at.<id>=<path, query and fragment>`.
 A reload or a shared link opens each page at its recorded place.
-If Review restores a Done view on load, it selects Open and closes the saved card.
-A new address that specifies Done selects Done.
-A console link uses its Review address even if the address matches a saved place.
-The Done chip selects Done during the visit.
 The console takes a recorded place only when its path is the configured path of that page; otherwise it opens the configured URL.
 A place equal to the configured URL removes its `at.<id>` key.
 The console reads a frame's place when the frame loads and at each `hashchange` in the frame.
