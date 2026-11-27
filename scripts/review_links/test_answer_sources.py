@@ -1161,6 +1161,33 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertIs(saved.state, the_list.ItemState.CLOSED)
         self.assertFalse(the_list.unread_answer_ids(saved))
 
+    def test_legacy_question_keeps_its_first_link_when_the_second_files_first(self) -> None:
+        first, second = (self.native(name, {
+            "since": FILED, "text": words, "question": words, "review_id": identity,
+            "review_submission": new_item_dialog.stored_submission(origin(request)),
+            "followup": {"text": words, "sent": FILED},
+        }) for name, words, identity, request in (
+            ("original", "Which plan?", "Q1", "request-original"),
+            ("second", "Which route?", "Q2", "request-second"),
+        ))
+        number = the_list.add_review_item(KEEPER.id, "Which plan?", owner=OWNER.id, producer=OWNER.id, unit="",
+            words="Which plan?", evidence="", review_key=first, source="nate via New item",
+            reservation=self.root / "list-number")
+        item = the_list.link(KEEPER.id, f"L{number}", (second,), source="nate")
+        folder = record_store.default_question_folder(OWNER.id)
+        for key, expected_origin in (
+            (second, the_list.NoQuestionItem.ORDINARY),
+            (first, the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, "submission/question/request-original")),
+        ):
+            record = update_registration.read_review_question(folder / key.rsplit("/", 1)[1], OWNER.id)
+            answer_sources.file_saved_question(record, MEMBERS)
+            saved = the_list.load(KEEPER.id, item.id)
+            self.assertEqual(saved.native_question, expected_origin)
+            self.assertEqual(saved.reviews, (first, second))
+        saved = the_list.load(KEEPER.id, item.id)
+        self.assertEqual({exchange.source_key for exchange in saved.filed_exchanges},
+                         {"submission/question/request-original", "submission/question/request-second"})
+
     def test_studio_followup_reply_moves_the_question_to_answers(self) -> None:
         key = "question/staff/asked.md"
         incoming = list_exchange.Exchange(list_exchange.Source.STAFF_QUESTION, key, "initial",

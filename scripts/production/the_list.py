@@ -44,7 +44,7 @@ from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
 from scripts.notify import push_texts
 from scripts.production import list_exchange
-from scripts.production import delivery_state, goal, investigation, producer_map, record_store, repeat_rule, session_pane, staff
+from scripts.production import delivery_state, goal, investigation, producer_map, record_store, repeat_rule, session_pane, staff, update_registration
 from scripts.review_links import change_page, list_draft, new_item_dialog, page_frame, page_question, question_path, question_record
 from scripts.review_links.review_items import LegacyValidationLog, ValidationLogStart
 
@@ -804,6 +804,36 @@ def _native_question_origins(exchanges: Iterable[list_exchange.FiledExchange]) -
             if isinstance(kind := native_question_kind(exchange), QuestionItemKind)}
 
 
+def _submitted_question_origin(key: str) -> NativeQuestionItem | NoQuestionItem:
+    if key.startswith("submission/"):
+        try:
+            submission = new_item_dialog.read_submission_key(key)
+        except ValueError:
+            return NoQuestionItem.ORDINARY
+        if submission.kind is new_item_dialog.SubmissionKind.QUESTION:
+            return NativeQuestionItem(QuestionItemKind.FROM_NATE, f"submission/question/{submission.request_id}")
+        return NoQuestionItem.ORDINARY
+
+    parts = key.split("/")
+    if len(parts) != 3 or parts[0] != "question" or not parts[2].endswith(".md"):
+        return NoQuestionItem.ORDINARY
+    _, owner, name = parts
+    owner = staff.StaffId(owner)
+    try:
+        new_item_dialog.check_recipient_id(owner)
+    except ValueError:
+        return NoQuestionItem.ORDINARY
+    folders = record_store.known_folders(record_store.RecordKind.QUESTION, owner)
+    origins: set[NativeQuestionItem] = set()
+    for folder in (*folders, *record_store.archive_folders(folders)):
+        with suppress(OSError, ValueError):
+            record = update_registration.read_review_question(folder / name, owner)
+            if record.owner == owner and (fields := record.item.get("review_submission")) is not None:
+                request = new_item_dialog.read_submission(fields)
+                origins.add(NativeQuestionItem(QuestionItemKind.FROM_NATE, f"submission/question/{request.request_id}"))
+    return next(iter(origins)) if len(origins) == 1 else NoQuestionItem.ORDINARY
+
+
 def _original_list_question(added: ItemChange) -> NativeQuestionItem | NoQuestionItem:
     if not isinstance(added.what, FieldChange) or added.what.action != "Added":
         return NoQuestionItem.ORDINARY
@@ -813,33 +843,36 @@ def _original_list_question(added: ItemChange) -> NativeQuestionItem | NoQuestio
         jumps = parse_qs(url.fragment).get("jump", [])
         if url.path != "/console/review.html" or len(jumps) != 1:
             return NoQuestionItem.ORDINARY
-        submission = new_item_dialog.read_submission_key(jumps[0])
+        return _submitted_question_origin(jumps[0])
     except ValueError:
         return NoQuestionItem.ORDINARY
-    if submission.kind is new_item_dialog.SubmissionKind.QUESTION:
-        return NativeQuestionItem(QuestionItemKind.FROM_NATE, f"submission/question/{submission.request_id}")
-    return NoQuestionItem.ORDINARY
 
 
 def _legacy_question_origin(item: ListItem) -> NativeQuestionItem | NoQuestionItem:
     if not item.log or isinstance(item.report, ListReport):
         return NoQuestionItem.ORDINARY
     origins = _native_question_origins(item.filed_exchanges)
+    if not origins:
+        return NoQuestionItem.ORDINARY
     added = item.log[0]
+    if added.source not in (PAGE_SOURCE, "nate via New item", "nate via /new_item"):
+        return NoQuestionItem.ORDINARY
+    original = _original_list_question(added)
+    if isinstance(original, NativeQuestionItem):
+        return original if original in origins else NoQuestionItem.ORDINARY
     if added.source == PAGE_SOURCE:
-        original = _original_list_question(added)
-        if isinstance(original, NativeQuestionItem):
-            return original if original in origins else NoQuestionItem.ORDINARY
         origins = {origin for origin in origins
                    if isinstance(reservation := _exchange_reservation(_exchange_path(origin.source_key)), ExchangeDestination)
                    and reservation.reserved_new_item and reservation.destination.number == item.number}
-    elif added.source in ("nate via New item", "nate via /new_item") and len(item.log) > 1:
+    elif len(item.log) > 1:
         link = item.log[1]
-        if (link.time == added.time and link.source == added.source and isinstance(link.what, ReviewLinksChanged)
-                and link.what.action == "Linked reviews" and any(key.startswith("question/") for key in link.what.keys)):
-            origins = {origin for origin in origins if origin.kind is QuestionItemKind.FROM_NATE}
-        else:
+        if (link.time != added.time or link.source != added.source or not isinstance(link.what, ReviewLinksChanged)
+                or link.what.action != "Linked reviews"):
             return NoQuestionItem.ORDINARY
+        if len(link.what.keys) != 1:
+            return NoQuestionItem.ORDINARY
+        origin = _submitted_question_origin(link.what.keys[0])
+        return origin if origin in origins else NoQuestionItem.ORDINARY
     else:
         return NoQuestionItem.ORDINARY
     return next(iter(origins)) if len(origins) == 1 else NoQuestionItem.ORDINARY
@@ -2284,7 +2317,8 @@ def question_visibility(keeper: staff.StaffId, item: ListItem,
     unanswered = tuple(question for question in item.questions if question.answer is None)
     if not unanswered:
         return QuestionAttention()
-    waiting = item.state is not ItemState.ANSWERED
+    waiting = (item.question_kind is NoQuestionItem.ORDINARY
+               or not question_can_mark_read(item, unread_answer_ids(item)))
     failed: set[str] = set()
     for question in unanswered:
         target = list_question_target(keeper, item, question.recipient_id(keeper))
@@ -4326,6 +4360,12 @@ def _clear_unread(item: ListItem) -> ListItem:
     return replace(item, unread_since=NoTimestamp.UNSET)
 
 
+def question_can_mark_read(item: ListItem, unread_answers: frozenset[UnreadAnswerId]) -> bool:
+    """Allow acknowledgment of answers while the native question is open."""
+    return (item.question_kind is not NoQuestionItem.ORDINARY
+            and (item.state is ItemState.ANSWERED or item.state is ItemState.WORKING and bool(unread_answers)))
+
+
 def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
               update: UnreadUpdate | NoUnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT,
               page_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
@@ -4342,13 +4382,15 @@ def mark_read_edit(keeper: staff.StaffId, identity: str, *, source: str,
     """
     def edit(item: ListItem, moment: datetime) -> ListItem:
         if question_item(item) is not NoQuestionItem.ORDINARY:
-            if item.state is not ItemState.ANSWERED or (
+            if not question_can_mark_read(item, unread_answer_ids(item)) or (
                     update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update):
                 raise ListError("The question changed. Check it again before marking it read.")
             if isinstance(page_request, PageRequest) and page_request.words:
                 if isinstance(item.owner, UnassignedOwner):
                     raise ListError("The question has no owner for your words.")
                 console_text.require(page_request.words, "list field", refusal=ListError)
+            if item.state is ItemState.WORKING:
+                return _clear_unread(item)
             state = ItemState.WORKING if item.question_kind is QuestionItemKind.TO_NATE else ItemState.CLOSED
             return _move_question(item, QuestionMove.READ, state, moment, source, closing_words="Read by nate")
         if update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update:

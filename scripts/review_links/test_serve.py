@@ -1801,6 +1801,41 @@ class ReviewLinksServerTests(unittest.TestCase):
                                                 authority_unavailable=scenario == "authority unavailable",
                                                 answered_marker=scenario == "staff unavailable with answered marker")
 
+    def test_restart_files_a_studio_question_before_claiming_its_notice(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        body = self.new_item_body(request)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO())):
+            with patch.object(the_list, "_save", side_effect=OSError("The List write stopped.")):
+                self.assertEqual(self.new_item_http(body, finished=True).status, 503)
+            self.assertEqual(the_list.records(keeper.id), [])
+            self.assertEqual(read_new_item_notices(log), [])
+            pending, = review_submissions.pending_initial_deliveries(case.root)
+            restarted = change_page.DeliveryStatus(case.root)
+            with patch.object(restarted, "write_slots", side_effect=OSError("The notice claim stopped.")):
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            item, = the_list.records(keeper.id)
+            source = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE,
+                                                 f"submission/question/{pending.address.request_id}")
+            self.assertEqual(item.native_question, source)
+            self.assertIs(item.state, the_list.ItemState.WORKING)
+            self.assertIs(the_list.question_item_exchanges(item)[0].answer, list_exchange.QuestionWithoutAnswer.OPEN)
+            self.assertEqual(read_new_item_notices(log), [])
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            with patch.object(self.server, "delivery_status", restarted):
+                self.assertEqual(self.new_item_http(body, finished=True).status, 200)
+        self.assertEqual(the_list.records(keeper.id), [item])
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [item.id])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
     def check_list_notice_recovery(self, *, stop_before_row: bool, retire_producer: bool = False,
                                    authority_unavailable: bool = False, answered_marker: bool = False) -> None:
         case = self.review_fixture()
@@ -6121,6 +6156,41 @@ class ReviewLinksServerTests(unittest.TestCase):
                                           owner=owner, members=staff.snapshot())
         self.assertEqual(row.keeper, keeper)
         return the_list.load(keeper, f"L{row.number}")
+
+    def test_studio_marks_a_second_linked_question_read_without_closing_the_item(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        item = self.working_studio_question(keeper.id, keeper.id)
+        question = review_submissions.submit(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, keeper.id))
+        key = review_items.submission_review_key(question)
+        _ = the_list.link(keeper.id, item.id, (key,), source="nate")
+        words = "Use the links on the right."
+        self.assertTrue(change_page.answer_item(question.key, words, question.details.reply_token, case.status))
+        snapshot = review_page.build_snapshot(case.root)
+        self.assertNotIn(key, {entry["key"] for entry in snapshot.entries})
+        current = the_list.load(keeper.id, item.id)
+        self.assertIs(current.state, the_list.ItemState.WORKING)
+        self.assertEqual(current.native_question, item.native_question)
+        answer, = the_list.unread_answer_ids(current)
+        self.assertEqual(answer, the_list.ReturnedAnswerId(f"submission/question/{question.request_id}", "followup:1"))
+        page = self.request(f"{studio_page.PAGE_PATH}?show=answers")
+        self.assertEqual(page.status, 200, page.body)
+        summary = re.search(rb'<tbody data-list-item[^>]*data-state="Working"[^>]*>', page.body)
+        assert summary is not None
+        self.assertNotIn(b" hidden", summary[0])
+        self.assertIn(b'<small data-new-answer>New answer</small>', page.body)
+        self.assertIn(b'value="read">Mark read</button>', page.body)
+        prefix, token = list_page.signed_item_request(list_page.ListRecord(keeper.id, current),
+                                                     list_page.form_secret(self.server.root))
+        body = urlencode({"keeper": keeper.id, "id": item.id, "request": prefix, "token": token,
+                          "action": "read", "words": "", "until": ""})
+        status, response = self.post(studio_page.PAGE_PATH, body)
+        self.assertEqual(status, 200, response)
+        saved = the_list.load(keeper.id, item.id)
+        self.assertEqual((saved.state, saved.native_question), (item.state, item.native_question))
+        self.assertFalse(the_list.unread_answer_ids(saved))
+        self.assertFalse(change_page.answer_item(question.key, words, question.details.reply_token, case.status))
+        self.assertEqual(the_list.load(keeper.id, item.id), saved)
 
     def test_question_state_rejects_ordinary_close_remove_and_update(self) -> None:
         keeper = self.configure_list_keeper()

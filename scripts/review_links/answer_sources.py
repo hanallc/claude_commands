@@ -1669,6 +1669,26 @@ def file_saved_submission(scoped: new_item_dialog.ScopedSubmissionKey, members: 
         file_saved_review(review_items.submission_item(saved, members), members)
 
 
+def file_list_submission_question(saved: review_submissions.SavedSubmission, destination: investigation.ListDestination,
+                                  members: staff.StaffSnapshot) -> None:
+    """File the question under the recipient locks before the first notice."""
+    record = saved.record
+    assert isinstance(record, update_registration.QuestionRecord)
+    key = f"submission/question/{saved.request_id}"
+    links = (destination,)
+    zone = user_zone()
+
+    def reload() -> AcceptedExchanges:
+        return _native_question_exchanges(record, key, links, zone, members, the_list.exchange_history(key))
+
+    filed = the_list.load(destination.keeper, f"L{destination.number}").filed_exchanges
+    for plan in _plans(reload(), ((destination, exchange) for exchange in filed)):
+        if isinstance(file_source(plan, members, reload), investigation.ListDestination):
+            return
+    if saved.awaiting_reply:
+        raise OSError(f"Cannot file the open question {saved.id} on the List.")
+
+
 def file_saved_investigation(record: investigation.Investigation) -> None:
     with review_items.after_store_write(review_items.investigation_record_key(record)):
         members = staff.snapshot()

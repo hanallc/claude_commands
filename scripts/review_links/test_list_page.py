@@ -2860,6 +2860,39 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_linked_reply_shows_mark_read_and_park_without_schedule_fields(self) -> None:
+        key = "submission/question/primary"
+        exchange = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "followup:1",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which width?", NOW, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.QuestionWithoutAnswer.OPEN)
+        members = staff.snapshot()
+        with the_list.lock_exchange_source(key) as source:
+            row = the_list.file_exchanges(source, (exchange,), exchange.question, linked=the_list.NextNumber.AVAILABLE,
+                                          owner=OWNER.id, members=members)
+        reply_key = "submission/question/linked"
+        reply = replace(exchange, source_key=reply_key, question="Which height?", answer=list_exchange.ExchangeAnswer(
+            "Use 800 pixels.", NOW + timedelta(minutes=1), list_exchange.AnswerRead.UNREAD))
+        with the_list.lock_exchange_source(reply_key) as source:
+            self.assertEqual(the_list.file_exchanges(source, (reply,), reply.question, linked=row,
+                                                      owner=OWNER.id, members=members), row)
+        with self.studio_review_server() as origin:
+            self.open_studio_review_fixture(origin)
+            self.studio_review_check(r"""
+ document.querySelector('[data-filter-row="show"] [data-filter-value="answers"]').click();
+ await paint();
+ const item=row(1);
+ check(!item.hidden && item.dataset.state==='Working','Answers shows the Working item.');
+ item.querySelector('.list-toggle').click();
+ const form=recordDetails(item).querySelector('[data-feedback-form]');
+ check(form.querySelector('[value="read"]'),'The linked reply has a Mark read button.');
+ form.querySelector('[data-later-toggle]').click();
+ form.querySelector('[data-later-choose]').click();
+ await paint();
+ check(!form.querySelector('[data-later-custom]').hidden,'Park opens the date and time controls.');
+ check(!form.querySelector('[data-schedule-template],[data-schedule-words]'),'Park omits the schedule fields.');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_evidence_opens_only_reviews_linked_to_the_item(self) -> None:
         review = investigation.file(OWNER.id, "Find the cause", "Read the failed check.", waiting_why="Work continues.")
         key = review_items.investigation_record_key(review)
@@ -4564,7 +4597,8 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
     def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
         item = self.add("Explain this item")
         form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", members=staff.snapshot(),
-                                       parking_label="", schedule=the_list.NoSchedule.UNSET, today=NOW)
+                                       parking_label="", schedule=the_list.NoSchedule.UNSET, today=NOW,
+                                       unread_answers=frozenset())
         actions, words = form.split('</div>', 1)
         self.assertNotIn('value="tell"', actions)
         self.assertNotIn('<label for="words-', words)
@@ -6298,6 +6332,7 @@ window.fetch=async(_path,options={})=>{
  const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
  dialog.querySelector('[data-cancel]').click();
  await closed;
+ await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
  const picker=recordDetails(row(1)).querySelector('[data-later-menu]');
  window.checkPicker=picker=>{
   const box=picker.getBoundingClientRect();
@@ -6342,6 +6377,7 @@ window.fetch=async(_path,options={})=>{
  const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
  dialog.querySelector('[data-cancel]').click();
  await closed;
+ await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
  const form=recordDetails(row(1)).querySelector('form');
  const picker=form.querySelector('[data-later-menu]');
  const pickerBox=picker.getBoundingClientRect();
