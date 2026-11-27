@@ -310,38 +310,35 @@ def source_scan_scopes(definitions: dict[str, tuple[ScopeDefinition, list[ScanNo
     return tuple(scopes)
 
 
-def extract_facts(text: str, path: str) -> SourceFacts:
-    tokens = path_tokens(text)
-    config_reads = {Path(token).name.removesuffix(".conf") for token in tokens if token.endswith(".conf")}
-    try:
-        tree = ast.parse(text, filename=path)
-    except SyntaxError as error:
-        return SourceFacts((), tokens, frozenset(config_reads), InvalidPython(error.msg))
-    definitions: dict[str, tuple[ScopeDefinition, list[ScanNode]]] = {"": (tree, [])}
-    imports_by_depth: dict[int, list[ast.Import | ast.ImportFrom]] = defaultdict(list)
-    config_calls: list[tuple[ast.expr, str]] = []
-    active_calls: list[ast.Call] = []
-    ls_files_calls: set[ast.Call] = set()
+class _SourceFactWalk:
+    def __init__(self, tree: ast.Module, config_reads: set[str]) -> None:
+        self.definitions: dict[str, tuple[ScopeDefinition, list[ScanNode]]] = {"": (tree, [])}
+        self.imports_by_depth: dict[int, list[ast.Import | ast.ImportFrom]] = defaultdict(list)
+        self.config_calls: list[tuple[ast.expr, str]] = []
+        self.active_calls: list[ast.Call] = []
+        self.ls_files_calls: set[ast.Call] = set()
+        self.config_reads: set[str] = config_reads
+        self.visit(tree, 0, "", self.definitions[""][1])
 
-    def visit(node: ast.AST, depth: int, name: str, scope: list[ScanNode] | None,
-              in_copy_source: bool = False) -> None:
+    def visit(self, node: ast.AST, depth: int, name: str,
+              scope: list[ScanNode] | None, in_copy_source: bool = False) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             name = f"{name}.{node.name}".lstrip(".")
             body: list[ScanNode] = []
-            definitions[name] = node, body
+            self.definitions[name] = node, body
             # Scans use only the body. Imports and definitions can also occur in other fields.
             for field, value in cast(Iterator[tuple[str, object]], ast.iter_fields(node)):
                 children = cast(list[object], value) if isinstance(value, list) else [value]
                 for child in children:
                     if isinstance(child, ast.AST):
-                        visit(child, depth + 1, name, body if field == "body" else None, in_copy_source)
+                        self.visit(child, depth + 1, name, body if field == "body" else None, in_copy_source)
             return
 
         if isinstance(node, ast.Lambda):
             scope = None
         copy_source: ast.expr | None = None
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            imports_by_depth[depth].append(node)
+            self.imports_by_depth[depth].append(node)
             if scope is not None:
                 scope.append(node)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -350,35 +347,43 @@ def extract_facts(text: str, path: str) -> SourceFacts:
         elif isinstance(node, ast.Call):
             if scope is not None:
                 scope.append(node)
-            active_calls.append(node)
+            self.active_calls.append(node)
             if node.args:
                 first = node.args[0]
                 if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                    config_calls.append((node.func, first.value))
+                    self.config_calls.append((node.func, first.value))
                 if isinstance(node.func, ast.Attribute) and node.func.attr == "copytree":
                     copy_source = first
         elif isinstance(node, ast.Constant):
             if node.value == "ls-files":
-                ls_files_calls.update(active_calls)
+                self.ls_files_calls.update(self.active_calls)
             if in_copy_source and node.value == "config":
-                config_reads.add("*")
+                self.config_reads.add("*")
             return
         elif isinstance(node, ast.JoinedStr) and any(
                 isinstance(part, ast.Constant) and isinstance(part.value, str) and part.value.endswith(".conf")
                 for part in node.values):
-            config_reads.add("*")
+            self.config_reads.add("*")
 
         for child in ast.iter_child_nodes(node):
-            visit(child, depth + 1, name, scope, in_copy_source or child is copy_source)
+            self.visit(child, depth + 1, name, scope, in_copy_source or child is copy_source)
         if isinstance(node, ast.Call):
-            _ = active_calls.pop()
+            _ = self.active_calls.pop()
 
-    visit(tree, 0, "", definitions[""][1])
+
+def extract_facts(text: str, path: str) -> SourceFacts:
+    tokens = path_tokens(text)
+    config_reads = {Path(token).name.removesuffix(".conf") for token in tokens if token.endswith(".conf")}
+    try:
+        tree = ast.parse(text, filename=path)
+    except SyntaxError as error:
+        return SourceFacts((), tokens, frozenset(config_reads), InvalidPython(error.msg))
+    walk = _SourceFactWalk(tree, config_reads)
     imports: list[tuple[int, str, tuple[str, ...]]] = []
     conf_modules: set[str] = set()
     conf_functions: set[str] = set()
     # Group the imports by depth to preserve breadth-first order.
-    for node in chain.from_iterable(imports_by_depth[depth] for depth in sorted(imports_by_depth)):
+    for node in chain.from_iterable(walk.imports_by_depth[depth] for depth in sorted(walk.imports_by_depth)):
         if isinstance(node, ast.Import):
             imports.extend((0, alias.name, ()) for alias in node.names)
             conf_modules.update(alias.asname or alias.name for alias in node.names
@@ -389,7 +394,7 @@ def extract_facts(text: str, path: str) -> SourceFacts:
                 conf_modules.update(alias.asname or alias.name for alias in node.names if alias.name == "conf")
             elif not node.level and node.module == "scripts.lib.conf":
                 conf_functions.update(alias.asname or alias.name for alias in node.names)
-    for function, first in config_calls:
+    for function, first in walk.config_calls:
         reader = isinstance(function, ast.Name) and function.id in conf_functions
         if isinstance(function, ast.Attribute):
             parts: list[str] = []
@@ -402,7 +407,7 @@ def extract_facts(text: str, path: str) -> SourceFacts:
         if reader:
             config_reads.add(Path(first).name.removesuffix(".conf"))
     return SourceFacts(tuple(imports), tokens, frozenset(config_reads),
-                       scan_scopes=source_scan_scopes(definitions, ls_files_calls))
+                       scan_scopes=source_scan_scopes(walk.definitions, walk.ls_files_calls))
 
 
 def indexed_files(repo: Path) -> tuple[set[str], dict[str, str]]:

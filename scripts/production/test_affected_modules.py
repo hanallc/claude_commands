@@ -16,6 +16,7 @@ import tempfile
 import unittest
 from typing import cast, override
 from unittest import mock
+from weakref import ref
 
 from scripts.buildlog import index as buildlog_index
 from scripts.production import affected_modules as affected
@@ -212,6 +213,21 @@ shutil.copytree(factory() / "config", destination)
             ("scan", ("root",), (affected.ScanPattern(parameter, "*", True),)),
             ("scan.child", (), (affected.ScanPattern(root, "child", False),)),
         ))
+
+    def test_extraction_releases_ast_nodes(self) -> None:
+        original_parse = ast.parse
+        functions: list[ref[ast.expr]] = []
+
+        def parse(text: str, *, filename: str) -> ast.Module:
+            tree = original_parse(text, filename=filename)
+            statement = tree.body[0]
+            assert isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+            functions.append(ref(statement.value.func))
+            return tree
+
+        with mock.patch.object(ast, "parse", new=parse):
+            _ = affected.extract_facts('read("settings")', "fixture.py")
+            self.assertIsNone(functions[0]())
 
     def test_copytree_config_detection_applies_to_the_source(self) -> None:
         facts = affected.extract_facts('shutil.copytree(source, destination / "config")', "fixture.py")
