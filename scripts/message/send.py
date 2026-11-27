@@ -153,7 +153,7 @@ from scripts.herdr import herdr_types, message_proof as _message_proof
 from scripts.lib import process_group
 from scripts.message.address import CODEX_PREFIX, SESSION_PREFIX, SOCKET_PREFIX, STAFF_PREFIX, USER as USER, WORKER_PREFIX
 from scripts.production import session_staff, staff, unit_lookup, unit_names
-from scripts.lib import conf, models_registry, process_start
+from scripts.lib import conf, file_lock, models_registry, process_start
 from scripts.lib.atomic_file import write_bytes_atomic
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
@@ -5521,6 +5521,18 @@ WorkerResultReceipt = WorkerResultProbe
 
 
 @dataclass(frozen=True)
+class WorkerResultTranscript:
+    """The exact transcript file read at the submission boundary."""
+
+    path: Path
+    identity: str
+
+
+class UnverifiedWorkerResultTranscript(Enum):
+    UNAVAILABLE = "the submission has no verified transcript file"
+
+
+@dataclass(frozen=True)
 class WorkerResultSubmission:
     """Request pane input with confirmation of a new transcript occurrence."""
 
@@ -5528,6 +5540,8 @@ class WorkerResultSubmission:
     before_input: Callable[[], object] = lambda: None
     worker_only: bool = False
     before_holder: Callable[[], object] = lambda: None
+    at_boundary: Callable[[float, WorkerResultTranscript | UnverifiedWorkerResultTranscript], object] = (
+        lambda _submitted_at, _transcript: None)
 
 
 class NoResultTranscript(Enum):
@@ -5562,18 +5576,35 @@ def _result_transcript_cursors(source: Path, stream: str
         yield entry, cursor
 
 
+def _result_transcript_identity(source: Path) -> WorkerResultTranscript | UnverifiedWorkerResultTranscript:
+    try:
+        resolved = source.resolve(strict=True)
+        return WorkerResultTranscript(resolved, file_lock.device_key(resolved))
+    except (OSError, ValueError, RuntimeError):
+        return UnverifiedWorkerResultTranscript.UNAVAILABLE
+
+
+@dataclass(frozen=True)
+class WorkerResultSubmissionBoundary:
+    cursor: worker_panes.TranscriptCursor
+    transcript: WorkerResultTranscript | UnverifiedWorkerResultTranscript
+
+
 def _result_submission_boundary(worker: staff.StaffRow, membership: staff.StaffSnapshot
-                                ) -> worker_panes.TranscriptCursor | NoResultTranscript:
+                                ) -> WorkerResultSubmissionBoundary | NoResultTranscript:
     from scripts.herdr import worker_panes
 
     source = _result_transcript_source(worker, membership)
     if isinstance(source, NoResultTranscript):
         return source
+    transcript = _result_transcript_identity(source)
     stream = worker_panes.transcript_stream(worker, source)
     boundary = worker_panes.TranscriptCursor(stream, 0, hashlib.sha256().hexdigest())
     for _, boundary in _result_transcript_cursors(source, stream):
         pass
-    return boundary
+    if _result_transcript_identity(source) != transcript:
+        transcript = UnverifiedWorkerResultTranscript.UNAVAILABLE
+    return WorkerResultSubmissionBoundary(boundary, transcript)
 
 
 @dataclass(frozen=True)
@@ -5699,9 +5730,16 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                 _ = receipt.before_input()
                 if isinstance(receipt, WorkerResultSubmission):
                     try:
-                        boundary = _result_submission_boundary(worker, membership)
+                        captured = _result_submission_boundary(worker, membership)
                     except (OSError, ValueError) as error:
                         raise herdr_types.HerdrFailure(f"worker transcript is unavailable: {error}") from error
+                    if isinstance(captured, WorkerResultSubmissionBoundary):
+                        boundary = captured.cursor
+                        transcript = captured.transcript
+                    else:
+                        boundary = captured
+                        transcript = UnverifiedWorkerResultTranscript.UNAVAILABLE
+                    _ = receipt.at_boundary(time.time(), transcript)
                 attempting_input = True
 
             def check_message_status() -> None:
