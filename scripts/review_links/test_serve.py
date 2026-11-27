@@ -1262,6 +1262,86 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(self.hold_states(), ["released"])
                 self.assertEqual(the_list.records(morty.id), [item])
 
+    def test_legacy_pending_token_refresh_resumes_without_another_hold(self) -> None:
+        case = self.review_fixture()
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        start = datetime(2099, 11, 30, 9, tzinfo=timezone.utc)
+        sent_at = (start - timedelta(seconds=5)).timestamp()
+        current = start + timedelta(seconds=2)
+        host = f"127.0.0.1:{self.port}"
+        send_id = send_hold.new_hold_id()
+        held_path = f"{send_hold.HOLD_PATH}/{send_id}"
+        request = {
+            "token": self.server.new_item_token, "kind": "scheduled", "page": "list",
+            "page_recipient": "producer", "request_id": "s1-" + uuid4().hex,
+            "recipient_id": morty.id, "assignee_id": case.fixture.unit.id,
+            "words": "Check the Scheduled item. Start 2099-11-30T09:00Z.",
+        }
+        body = json.dumps(request).encode()
+        pending: send_hold.PendingFile = {
+            "state": "pending", "path": review_page.NEW_ITEM_PATH,
+            "headers": {"Host": host, "Origin": f"http://{host}", "Content-Type": "application/json"},
+            "body": base64.b64encode(body).decode("ascii"), "started_at": sent_at, "due": start.timestamp() + 1,
+        }
+        folder = self.root / send_hold.HOLD_FOLDER
+        folder.mkdir(exist_ok=True)
+        record = folder / f"{send_id}.json"
+        _ = record.write_text(json.dumps(pending), encoding="utf-8")
+        self.assertTrue(self.server.send_holds.stop_if_idle())
+        self.server.shutdown()
+        self.server.server_close()
+
+        @contextmanager
+        def restart() -> Generator[serve.ReviewLinksServer]:
+            with started_review_server(("127.0.0.1", self.port), self.root) as resumed:
+                worker = threading.Thread(target=resumed.serve_forever, daemon=True)
+                worker.start()
+                try:
+                    yield resumed
+                finally:
+                    resumed.shutdown()
+                    worker.join(TEST_HANG_GUARD_SECS)
+
+        marked = {send_hold.HOLD_HEADER: "1", send_hold.REQUEST_HEADER: send_id, "Origin": f"http://{host}"}
+        with (patch.object(send_hold, "time", Mock(wraps=time, time=lambda: current.timestamp())),
+              patch.object(the_list, "now", return_value=current),
+              patch.object(list_page, "recover_pending"),
+              patch.object(change_page, "recover_pending")):
+            with restart() as resumed:
+                self.assertNotEqual(resumed.new_item_token, request["token"])
+                stale = self.held_http("GET", held_path)
+                self.assertEqual((stale[0], stale[2].get("code")), (403, "stale_token"))
+            saved_refusal = cast(dict[str, object], json.loads(record.read_text(encoding="utf-8")))
+            self.assertEqual(the_list.records(morty.id), [])
+            with restart() as resumed:
+                fresh = {**request, "token": resumed.new_item_token}
+                changed = self.new_item_http(json.dumps({**fresh, "words": "Use different words."}).encode(),
+                                             headers=marked)
+                ready = threading.Barrier(2)
+
+                def retry() -> HttpReply:
+                    _ = ready.wait(TEST_HANG_GUARD_SECS)
+                    return self.new_item_http(json.dumps(fresh).encode(), headers=marked)
+
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    attempts = [pool.submit(retry) for _ in range(2)]
+                    direct, joined = sorted((attempt.result(timeout=TEST_HANG_GUARD_SECS) for attempt in attempts),
+                                            key=lambda reply: reply.status)
+                self.assertEqual((direct.status, joined.status), (200, 202))
+                self.assertEqual(json.loads(joined.body), {"hold": send_id, "seconds": 0})
+                self.assertEqual(changed.status, 409, changed.body)
+                status, _, saved = self.held_http("GET", held_path)
+                self.assertEqual((status, saved), (200, json.loads(direct.body)))
+            self.assertEqual(saved_refusal["state"], "needs_token")
+            self.assertEqual(saved_refusal["binding"], send_hold.operation_binding(review_page.NEW_ITEM_PATH, body))
+            self.assertEqual(saved_refusal["started_at"], sent_at)
+            item, = the_list.records(morty.id)
+            self.assertEqual(item.id, saved["id"])
+            self.assertIsInstance(item.schedule, the_list.ScheduledRun)
+            assert isinstance(item.schedule, the_list.ScheduledRun)
+            self.assertEqual(item.schedule.start, start)
+
     def test_a_stale_scheduled_send_admits_the_same_id_after_refresh(self) -> None:
         case = self.review_fixture()
         morty = fixture_member("producer", name="morty")

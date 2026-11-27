@@ -32,10 +32,10 @@ from scripts.review_links import new_item_dialog, reply_tokens, review_submissio
 from scripts.review_links import question_path, question_record, review_actions, review_events, staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
 from scripts.review_links.review_items import source_stamp as source_stamp
+from scripts.review_links.send_hold import NEW_ITEM_PATH as NEW_ITEM_PATH
 from scripts.statusline import rebuild_row
 
 PAGE_PATH = REVIEW_PATH
-NEW_ITEM_PATH = '/console/review/new-item'
 ATTACHMENT_PATH = '/console/review/attachment'
 HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
 CARD_COLUMNS = ('<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%">'

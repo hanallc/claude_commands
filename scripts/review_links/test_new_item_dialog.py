@@ -252,7 +252,8 @@ async function sendSaved() {
      return Promise.resolve(new Response(
        JSON.stringify({code:'stale_token', error:'The token expired again.'}), {status:403, headers:resolved}));
     }
-    return Promise.resolve(Response.json({id:'I1'}));
+    if (attempted.length === 5) return Promise.resolve(Response.json({id:'I1'}));
+    throw new Error('The dialog attempted an extra Send.');
    };
    const trySend = async () => {
     const rejected = untilError();
@@ -276,6 +277,7 @@ async function sendSaved() {
          attempted[0].recipient_id !== attempted[1].recipient_id && attempted[1].kind !== attempted[2].kind,
          'Changing the recipient keeps the draft ID. Changing the kind creates a new ID.');
    await sendSaved();
+   check(attempted.length === 5, 'The dialog sends exactly five requests.');
    window.fetch = originalFetch;
    await open();
    dialog.querySelector('[data-cancel]').click();

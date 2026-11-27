@@ -24,6 +24,7 @@ from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib.atomic_file import write_text_atomic
 
+NEW_ITEM_PATH = "/console/review/new-item"
 HOLD_PATH = "/send-hold"
 HOLD_HEADER = "X-Undo-Hold"
 REQUEST_HEADER = "X-Undo-Request"
@@ -69,6 +70,14 @@ class ReleasedFile(TypedDict):
     refresh_token: NotRequired[bool]
 
 
+class NeedsTokenFile(TypedDict):
+    state: Literal["needs_token"]
+    binding: str
+    started_at: float
+    content_type: str
+    body: str
+
+
 class UndoneFile(TypedDict):
     state: Literal["undone"]
     undone_at: float
@@ -80,7 +89,7 @@ class ClosingFile(TypedDict):
     closed_at: float
 
 
-HoldFile = PendingFile | ReleasedFile | UndoneFile | ClosingFile
+HoldFile = PendingFile | ReleasedFile | NeedsTokenFile | UndoneFile | ClosingFile
 
 
 class BadFile(Enum):
@@ -111,6 +120,9 @@ class OperationConflict(Exception):
 
 class UnseenOperation(Enum):
     ABSENT = "no operation"
+
+
+type AdmissionState = UnseenOperation | ReleasedFile | NeedsTokenFile
 
 
 @dataclass(frozen=True)
@@ -178,26 +190,33 @@ def failed(reason: str) -> HeldResponse:
     return HeldResponse(503, "application/json; charset=utf-8", json.dumps({"reason": reason}).encode("utf-8"))
 
 
-def operation_binding(path: str, body: bytes, *, refreshable_token: bool = False) -> str:
-    if refreshable_token:
-        fields = cast(dict[str, object], json.loads(body))
-        _ = fields.pop("token", None)
-        body = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+def operation_binding(path: str, body: bytes) -> str:
+    if path == NEW_ITEM_PATH:
+        try:
+            payload = cast(object, json.loads(body))
+        except (ValueError, RecursionError):
+            payload = None
+        if isinstance(payload, dict):
+            fields = cast(dict[str, object], payload)
+            _ = fields.pop("token", None)
+            body = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(path.encode("utf-8") + b"\0" + body).hexdigest()
 
 
 def released_file(response: HeldResponse, binding: str, started_at: float) -> ReleasedFile:
-    saved: ReleasedFile = {"state": "released", "status": response.status, "content_type": response.content_type,
-                           "body": base64.b64encode(response.body).decode("ascii"), "released_at": time.time(),
-                           "binding": binding, "started_at": started_at}
-    if response.status == 403 and response.content_type.startswith("application/json"):
-        try:
-            fields = cast(object, json.loads(response.body))
-        except (ValueError, RecursionError):
-            return saved
-        if isinstance(fields, dict) and cast(dict[str, object], fields).get("code") == "stale_token":
-            saved["refresh_token"] = True
-    return saved
+    return {"state": "released", "status": response.status, "content_type": response.content_type,
+            "body": base64.b64encode(response.body).decode("ascii"), "released_at": time.time(),
+            "binding": binding, "started_at": started_at}
+
+
+def _needs_token(response: HeldResponse) -> bool:
+    if response.status != 403 or not response.content_type.startswith("application/json"):
+        return False
+    try:
+        fields = cast(object, json.loads(response.body))
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(fields, dict) and cast(dict[str, object], fields).get("code") == "stale_token"
 
 
 class Holds:
@@ -234,7 +253,7 @@ class Holds:
         """Read one hold file, or name it on stderr when it is not a hold."""
         try:
             saved = cast(HoldFile, json.loads(path.read_text(encoding="utf-8")))
-            if saved["state"] in ("pending", "released", "undone", "closing"):
+            if saved["state"] in ("pending", "released", "needs_token", "undone", "closing"):
                 return saved
         except FileNotFoundError:
             return BadFile.ABSENT
@@ -276,8 +295,8 @@ class Holds:
         return held
 
     def submit(self, path: str, headers: Mapping[str, str], body: bytes, *, request_id: str, binding: str,
-               admit: Callable[[UnseenOperation | ReleasedFile], HoldAdmission | DirectAdmission | HeldResponse],
-               refreshable_token: bool = False) -> HeldFields | DirectSend | HeldResponse:
+               admit: Callable[[AdmissionState], HoldAdmission | DirectAdmission | HeldResponse]
+               ) -> HeldFields | DirectSend | HeldResponse:
         """Resolve an existing operation or admit a new one under the same lock."""
         hold_id = request_id or new_hold_id()
         if not valid_hold_id(hold_id):
@@ -285,23 +304,23 @@ class Holds:
         while True:
             with self._lock:
                 existing = self._existing(hold_id)
-                opening: UnseenOperation | ReleasedFile = UnseenOperation.ABSENT
+                opening: AdmissionState = UnseenOperation.ABSENT
                 started_at = time.time()
                 if isinstance(existing, dict) and existing["state"] != "closing":
                     if existing.get("binding", binding) != binding:
                         raise OperationConflict
                     if existing["state"] == "pending":
                         if "binding" not in existing:
-                            original = operation_binding(existing["path"], base64.b64decode(existing["body"]),
-                                                         refreshable_token=refreshable_token and existing["path"] == path)
+                            original = operation_binding(existing["path"], base64.b64decode(existing["body"]))
                             if original != binding:
                                 raise OperationConflict
                         seconds = (max(0.0, existing["due"] - RELEASE_GRACE_SECONDS - started_at)
                                    if hold_id in self._timers and not existing.get("release_now") else 0.0)
                         return {"hold": hold_id, "seconds": seconds}
-                    if (existing["state"] != "released" or hold_id in self._releasing or hold_id in self._failed
-                            or "binding" not in existing
-                            or ("body" in existing and not existing.get("refresh_token"))):
+                    if (existing["state"] != "released" and existing["state"] != "needs_token"
+                            or hold_id in self._releasing or hold_id in self._failed or "binding" not in existing):
+                        return {"hold": hold_id, "seconds": 0}
+                    if existing["state"] == "released" and "body" in existing and not existing.get("refresh_token"):
                         return {"hold": hold_id, "seconds": 0}
                     opening = existing
                     started_at = existing.get("started_at", started_at)
@@ -336,7 +355,8 @@ class Holds:
     def direct_result(self, send: DirectSend) -> Generator[Callable[[HeldResponse], None]]:
         """Save the normal handler response before it reaches the browser."""
         try:
-            yield lambda answer: self._finish(send.hold_id, answer, send.binding, send.started_at)
+            yield lambda answer: self._finish(send.hold_id, answer, send.binding, send.started_at,
+                                              refreshable_token=True)
         finally:
             with self._lock:
                 self._releasing.discard(send.hold_id)
@@ -431,11 +451,8 @@ class Holds:
             started_at = saved["started_at"] if "started_at" in saved else path.stat().st_mtime
             sent_at = datetime.fromtimestamp(started_at, UTC)
             # A server that stops during the replay finds this result, and never sends the request again.
-            binding = saved.get("binding", "")
-            marker = released_file(failed(MAY_HAVE_LEFT), binding, started_at)
-            if not binding:
-                del marker["binding"]
-            self._write(hold_id, marker)
+            binding = saved.get("binding") or operation_binding(saved["path"], body)
+            self._write(hold_id, released_file(failed(MAY_HAVE_LEFT), binding, started_at))
         except (OSError, OverflowError, ValueError, KeyError, TypeError) as error:
             # A pending file left here would leave with the next server, after the page said it failed.
             print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
@@ -458,14 +475,17 @@ class Holds:
         finally:
             with self._lock:
                 del self._active_replays[ticket]
-        self._finish(hold_id, response, binding, started_at)
+        self._finish(hold_id, response, binding, started_at, refreshable_token=saved["path"] == NEW_ITEM_PATH)
 
-    def _finish(self, hold_id: str, response: HeldResponse, binding: str, started_at: float) -> None:
+    def _finish(self, hold_id: str, response: HeldResponse, binding: str, started_at: float, *,
+                refreshable_token: bool) -> None:
         try:
-            saved = released_file(response, binding, started_at)
-            if not binding:
-                del saved["binding"]
-            self._write(hold_id, saved)
+            if refreshable_token and _needs_token(response):
+                self._write(hold_id, {"state": "needs_token", "binding": binding, "started_at": started_at,
+                                      "content_type": response.content_type,
+                                      "body": base64.b64encode(response.body).decode("ascii")})
+            else:
+                self._write(hold_id, released_file(response, binding, started_at))
         except OSError as error:
             print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
             with self._lock:
@@ -498,6 +518,8 @@ class Holds:
                 return HoldState.UNDONE
             case "closing":
                 return HoldState.MISSING
+            case "needs_token":
+                return HeldResponse(403, saved["content_type"], base64.b64decode(saved["body"]))
             case "released":
                 if "body" not in saved:
                     return HoldState.UNCERTAIN if saved["status"] >= 500 else HoldState.EXPIRED

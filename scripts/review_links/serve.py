@@ -2744,11 +2744,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                            request_id: str, seconds: int) -> None:
         path = review_page.NEW_ITEM_PATH
         try:
-            binding = send_hold.operation_binding(path, body, refreshable_token=True)
+            binding = send_hold.operation_binding(path, body)
             with server.send_holds.answering():
                 operation = server.send_holds.submit(
                     path, dict(self.headers.items()), body, request_id=request_id, binding=binding,
-                    admit=partial(self.admit_new_item, server, fields, seconds), refreshable_token=True)
+                    admit=partial(self.admit_new_item, server, fields, seconds))
                 if isinstance(operation, send_hold.DirectSend):
                     replay = send_hold.ActiveReplay(datetime.fromtimestamp(operation.started_at, UTC),
                                                    False, operation.new_item_token_verified)
@@ -2771,18 +2771,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
     def admit_new_item(
             self, server: ReviewLinksServer, fields: dict[str, object], seconds: int,
-            operation: send_hold.UnseenOperation | send_hold.ReleasedFile
+            operation: send_hold.AdmissionState
     ) -> send_hold.HoldAdmission | send_hold.DirectAdmission | send_hold.HeldResponse:
         valid_token = self.valid_request_token(fields.get("token"))
         if not valid_token:
             return self.send_json_answer(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
-        if isinstance(operation, dict) and operation.get("refresh_token"):
-            return send_hold.DirectAdmission(True)
-
         filing = self.new_item_draft_filing(server, fields)
         if isinstance(filing, review_submissions.UnreadableDraftFiling):
             raise filing.error
         if isinstance(operation, dict):
+            if operation["state"] == "needs_token" or operation.get("refresh_token"):
+                return send_hold.DirectAdmission(True)
             # An expired or uncertain result can only recover a confirmed item.
             if isinstance(filing, review_submissions.FiledDraft):
                 return send_hold.DirectAdmission(True)
