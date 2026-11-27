@@ -2317,10 +2317,10 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
             path = Path(memory.cgroup)
         else:
             continue
-        if not path.is_relative_to(CGROUP):
+        if not path.is_relative_to(CGROUP) or path.name in SWAP_OWNER_SLICES:
             continue
         running_groups.add(path)
-        if path.name not in SWAP_OWNER_SLICES and not gate.detached_tool_memory(memory, builds):
+        if not gate.detached_tool_memory(memory, builds):
             identity = step_labels(step, labels)
             name = step_text(step, names, labels=labels)
             detail = staff_names.text_parts(staff_names.StaffReference(identity.session))

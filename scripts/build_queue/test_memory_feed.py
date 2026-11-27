@@ -2993,6 +2993,22 @@ const refresh = createPageRefresh(tick);
         self.assertEqual({row["name"]: row["bytes"] for row in reading.rows if row["pool"] == "builds_ci"}, {
             "live": 3 * gib, "hana CI": gib, "Left by runs that ended": 6 * gib})
 
+    def test_swap_counts_the_idle_ci_slice_remainder_as_ended(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(8 * gib, 4 * gib)
+        _ = self.cgroup("hana.slice", 4 * gib)
+        ci = self.cgroup("hana.slice/hana-ci.slice", 4 * gib)
+        listener = self.cgroup("hana.slice/hana-ci.slice/runner.service", gib)
+        _ = (listener / "cgroup.events").write_text("populated 1\n")
+        memory = admission_records.UnownedSliceMemory(gib, cgroup=str(ci), owner=ci.name, pid=701,
+            job_state=IdleService(), service_job_state=IdleService())
+        service = admission_records.RunningStep("", ci.name, "service", str(ci), 0, memory, pid=701)
+
+        reading = memory_feed.read_swap((service,), {}, 6, read_step_names())
+        assert isinstance(reading, memory_feed.SwapReading)
+        self.assertEqual({row["name"]: row["bytes"] for row in reading.rows if row["pool"] == "builds_ci"}, {
+            "hana CI": gib, "Left by runs that ended": 3 * gib})
+
     def test_swap_keeps_the_saved_difference_out_of_the_ended_amount(self) -> None:
         gib = admission_records.GIB
         self.host_swap(8 * gib, 5 * gib)
