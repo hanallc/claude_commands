@@ -9,19 +9,26 @@ from pathlib import Path
 from typing import cast, final
 from unittest import mock
 
-from scripts.lib.berth_board import Board, BoardUnavailable, read_board
+from scripts.lib.berth_board import (
+    Board, BoardUnavailable, MergeEmpty, MergeNotDerived, MergeProtected, MergeReleased, MergeUnavailable,
+    read_board,
+)
 
 
 def snapshot(identity: str, status: str = "blocking", lifecycle: dict[str, object] | None = None) -> dict[str, object]:
     # The wire shapes are from cargo-berth's board/rows.rs and ledger/journal.rs.
+    scopes = [{"kind": "file", "path": "Cargo.toml"}, {"kind": "tree", "path": "src/module"}]
+    extent = {"status": "not_derived", "protection": scopes}
     return {
         "reservation_id": identity,
         "target": {"ref": "refs/heads/main", "short_name": "main", "source": "repository_trunk", "commit": "abc"},
         "holder": {"worktree_id": "worker", "worktree_root": "/tmp/worker", "branch": {
             "kind": "attached", "reference": "refs/heads/product-worker",
         }, "liveness": "live"},
-        "scopes": [{"kind": "file", "path": "Cargo.toml"}, {"kind": "tree", "path": "src/module"}],
-        "lifecycle": lifecycle or {"stage": "active"}, "edit_blocking_status": status,
+        "source": {"kind": "explicit"}, "scopes": scopes,
+        "merge_extent": extent if status == "blocking" else {"status": "released", "at_release": extent},
+        "lifecycle": lifecycle or {"stage": "active" if status == "blocking" else "released"},
+        "edit_blocking_status": status,
     }
 
 
@@ -79,6 +86,63 @@ class BerthBoardTests(unittest.TestCase):
         outstanding = reservations["product-1"]
         self.assertEqual((outstanding.lifecycle, outstanding.protected_tip), ("outstanding", "34de61b0d"))
         self.assertEqual(reservations["released-1"].protected_tip, "")
+
+    def read_snapshot(self, reservation: dict[str, object]) -> Board | BoardUnavailable:
+        value = envelope(populated=False)
+        payload = cast(dict[str, object], value["payload"])
+        data = cast(dict[str, object], payload["data"])
+        data["targets"] = [{"reservations": [reservation]}]
+        return self.read(value)
+
+    def test_merge_extent_parses_live_retained_and_released_protection(self) -> None:
+        working_tree: dict[str, list[str]] = {"tracked_paths": [], "untracked_paths": []}
+        key = {"trunk": "a" * 40, "head": "b" * 40, "working_tree": working_tree}
+        scopes = [{"kind": "file", "path": "Cargo.lock"}, {"kind": "tree", "path": "some/tree"}]
+        protected = {"status": "protected", "key": key, "scopes": scopes}
+        empty = {"status": "empty", "key": key}
+        not_derived = {"status": "not_derived", "protection": scopes}
+        parsed_scopes = ("file:Cargo.lock", "tree:some/tree")
+        for extent, evidence, blocks in (
+            (protected, MergeProtected(parsed_scopes), True),
+            (empty, MergeEmpty(), False),
+            (not_derived, MergeNotDerived(parsed_scopes), True),
+        ):
+            failure = "worktree unavailable"
+            unavailable = {"status": "unavailable", "retained_evidence": extent, "failure": failure}
+            for wire, expected, status in (
+                (extent, evidence, "blocking"),
+                (unavailable, MergeUnavailable(evidence, failure), "blocking"),
+                ({"status": "released", "at_release": unavailable},
+                 MergeReleased(MergeUnavailable(evidence, failure)), "clear"),
+            ):
+                with self.subTest(wire=wire):
+                    result = self.read_snapshot({**snapshot("holder", status), "merge_extent": wire})
+                    if not isinstance(result, Board):
+                        self.fail(str(result))
+                    holder, = result.reservations()
+                    self.assertEqual(holder.merge_extent, expected)
+                    self.assertFalse(holder.blocks_foreign("Cargo.toml"))
+                    self.assertFalse(holder.blocks_foreign("Cargo.lock/child"))
+                    self.assertFalse(holder.blocks_foreign("some/trees/child"))
+                    self.assertEqual(holder.blocks_foreign("Cargo.lock"), blocks and status == "blocking")
+                    self.assertEqual(holder.blocks_foreign("some/tree/child"), blocks and status == "blocking")
+
+    def test_malformed_merge_extent_refuses_the_board(self) -> None:
+        missing_extent = snapshot("holder")
+        del missing_extent["merge_extent"]
+        self.assertIsInstance(self.read_snapshot(missing_extent), BoardUnavailable)
+        cases: tuple[object, ...] = (
+            None, {"status": "unknown"}, {"status": "empty", "key": {}},
+            {"status": "not_derived", "protection": []},
+            {"status": "not_derived", "protection": ["file:Cargo.lock"]},
+            {"status": "not_derived", "protection": [{"kind": "file", "path": "../Cargo.lock"}]},
+            {"status": "unavailable", "failure": "worktree unavailable", "retained_evidence": {}},
+            {"status": "released", "at_release": {"status": "released"}},
+        )
+        for extent in cases:
+            with self.subTest(extent=extent):
+                result = self.read_snapshot({**snapshot("holder"), "merge_extent": extent})
+                self.assertIsInstance(result, BoardUnavailable)
 
     def test_empty_envelope_is_available_even_when_process_reports_another_status(self) -> None:
         for exit_code in (0, 1):
