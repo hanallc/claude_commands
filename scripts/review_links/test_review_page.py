@@ -6,6 +6,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.change_review_test_support import pictured_changes
 
 import shutil
+import base64
 import html
 import json
 import re
@@ -16,12 +17,13 @@ import subprocess
 import tempfile
 import time
 import threading
-from collections.abc import Generator, Iterator
-from contextlib import contextmanager
+from collections.abc import Generator, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, tzinfo
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Self, TextIO, cast
+from typing import Callable, ClassVar, Self, TextIO, cast
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, conf_reads, urgency
 from scripts.lib import user_zone as user_zone_config
@@ -48,8 +50,9 @@ from scripts.review_links import change_browser, change_page, console, for_you, 
 from scripts.review_links import question_path, question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
-from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
+from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
+from scripts.review_links.test_review_submissions import PNG
 from scripts.statusline import counts_row
 
 
@@ -82,14 +85,28 @@ def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
 
 
 
-BODY_READY_SCRIPT = r"""async function readyReviewCard(row){
- if(!row) throw new Error('The summary row is missing.');
+BODY_READY_SCRIPT = r"""async function waitForReview(ready){
  const end=performance.now()+8000;
- while(!recordDetails(row).querySelector('[data-review-form]')){
-  if(performance.now()>end) throw new Error('The card body did not load: '+row.dataset.key);
+ while(!ready()){
+  if(performance.now()>end) return false;
   await new Promise(resolve=>requestAnimationFrame(resolve));
  }
+ return true;
+}
+async function readyReviewCard(row){
+ if(!row) throw new Error('The summary row is missing.');
+ if(!await waitForReview(()=>recordDetails(row).querySelector('[data-review-form]')))
+  throw new Error('The card body did not load: '+row.dataset.key);
  return recordDetails(row).querySelector('[data-review-form]');
+}
+function nextReviewRefresh(){
+ const content=document.querySelector('[data-review]');
+ return new Promise(resolve=>content.addEventListener('review-refreshed',resolve,{once:true}));
+}
+async function showReview(){
+ const refreshed=nextReviewRefresh();
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await refreshed;
 }
 """
 
@@ -139,7 +156,10 @@ def snapshot_probe_page(page: str, snapshots: dict[str, dict[str, object]], step
 
 def browser_markup(root: Path, *, show: str = 'open') -> str:
     """Adapt the existing fake refresh responses to the snapshot protocol."""
-    snapshot = review_page.build_snapshot(root)
+    return browser_pages(review_page.build_snapshot(root), (show,))[show]
+
+
+def browser_pages(snapshot: review_page.ReviewSnapshot, shows: Sequence[str]) -> dict[str, str]:
     bodies = {key:snapshot.body(key).decode() for key in snapshot.records}
     bridge = r"""
 const fixtureFetch=fetch,fixtureBodies=FIXTURE_BODIES;
@@ -162,11 +182,13 @@ window.fetch=async(url,options={})=>{
  return {ok:true,json:async()=>fixtureIndexResponse,text:async()=>text};
 };
 """.replace('FIXTURE_BODIES',json.dumps(bodies).replace('</','<\\/'))
-    return snapshot.render(show=show).decode().replace('<script>','<script>'+BODY_READY_SCRIPT+bridge+'</script><script>',1)
+    script = '<script>' + BODY_READY_SCRIPT + bridge + '</script><script>'
+    return {show: snapshot.render(show=show).decode().replace('<script>', script, 1) for show in shows}
 
 
 class ReviewPageTests(unittest.TestCase):
     fixture: test_change_page.ChangePageTests = test_change_page.ChangePageTests("runTest")
+    browser_command: ClassVar[Callable[..., object] | None] = None
     root: Path = Path()
     status: change_page.DeliveryStatus = change_page.DeliveryStatus(Path())
 
@@ -217,9 +239,6 @@ class ReviewPageTests(unittest.TestCase):
         self.fixture.set_up_review(changes=3)
         self.fixture.page = change_page.ReviewPage(
             self.fixture.review_list, self.fixture.production, ('C1', 'C2', 'C3'), 'selected-fixture')
-        self.configure_review()
-
-    def configure_review(self) -> None:
         config = self.fixture.temporary / 'config'
         _ = write_config_fixture(config / "production.conf", "question_title_max_chars=100\n")
         _ = write_config_fixture(config / "console.conf",
@@ -326,7 +345,8 @@ class ReviewPageTests(unittest.TestCase):
 
         source = subprocess.check_output(
             ['git', 'show', 'eb6e3239d:scripts/review_links/review_page.py'],
-            cwd=Path(__file__).resolve().parents[2], text=True)
+            cwd=Path(__file__).resolve().parents[2], text=True,
+            env=fixture_git_environment(self.fixture.temporary), timeout=TEST_HANG_GUARD_SECS)
         start = '(reviewPlace => {'
         shared_script = review_page.SCRIPT.split(start, 1)[0]
         old_script = start + source.split("r'''"+start, 1)[1].rsplit("''')", 1)[0]
@@ -371,7 +391,7 @@ window.fetch=(url,options)=>{
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         markup = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_response_card_hides_validating_and_keeps_the_filters_on_submit(self) -> None:
@@ -457,12 +477,8 @@ window.fetch=(url,options)=>{
         self.assertIn(created.key, {item.key for item in review_items.read_open(self.root)})
 
     def test_bug_card_shows_captured_page_state_and_screenshot(self) -> None:
-        import base64
-
-        from scripts.review_links.test_review_submissions import PNG
-
         owner = self.ready_submission_recipient()
-        _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
+        _ = write_config_fixture(conf.path('console'), f'page.review.owner={owner.id}\n')
         cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
         evidence = new_item_dialog.PageDataEvidence("Review", (("Page", "Console"),))
         state = new_item_dialog.BugPageState(
@@ -756,7 +772,7 @@ window.fetch=(url,options)=>{
  await fixtureFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''.replace('CASES', cases)
         markup = page.replace('</body>', probe+'</body>').encode()
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(self.firefox_probe_results(markup), [[]])
 
     def test_investigation_shows_its_question_title_once_in_details(self) -> None:
         title = 'Why did the gate stop?'
@@ -1178,10 +1194,13 @@ window.fetch=(url,options)=>{
         _ = issue.write_text(Path(current.removeprefix('proposal/')).read_text().replace('P1', 'P2'))
         key = 'proposal/'+str(issue)
 
+        self.enterContext(patch.dict(os.environ, fixture_git_environment(doc.parent), clear=True))
+
         def git(*arguments: str) -> str:
             return subprocess.run(['git', '-C', str(doc.parent), '-c', 'user.name=Fixture',
                                    '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', *arguments],
-                                  check=True, capture_output=True, text=True).stdout.strip()
+                                  check=True, capture_output=True, text=True,
+                                  timeout=TEST_HANG_GUARD_SECS).stdout.strip()
 
         _ = git('init', '-b', 'main')
         _ = git('add', doc.name)
@@ -1721,7 +1740,7 @@ window.fetch=(url,options)=>{
         for is_validating, source in ((True, markup), (False, open_markup)):
             with self.subTest(validating=is_validating):
                 script = probe.replace('VALIDATING', json.dumps(is_validating))
-                self.assertEqual(firefox_probe_results(source.replace('</body>', script + '</body>').encode()), [[]])
+                self.assertEqual(self.firefox_probe_results(source.replace('</body>', script + '</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_retries_an_unavailable_body_with_the_same_version(self) -> None:
@@ -1801,7 +1820,7 @@ window.fetch=(url,options)=>{
         for first_load in (False, True):
             with self.subTest(first_load=first_load):
                 script = probe.replace('FIRST_LOAD', json.dumps(first_load))
-                self.assertEqual(firefox_probe_results(markup.replace('</body>', script + '</body>').encode()), [[]])
+                self.assertEqual(self.firefox_probe_results(markup.replace('</body>', script + '</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_shows_saved_actions_and_refreshes_until_delivery_ends(self) -> None:
@@ -1898,7 +1917,7 @@ window.fetch=(url,options)=>{
                     markup = browser_markup(self.root)
                 script = (probe.replace('ACTION', json.dumps(action)).replace('FILTER', json.dumps(filter_id))
                           .replace('COMPLETED', json.dumps(completed)))
-                self.assertEqual(firefox_probe_results(markup.replace('</body>', script + '</body>').encode()), [[]])
+                self.assertEqual(self.firefox_probe_results(markup.replace('</body>', script + '</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_closing_action_closes_when_the_saved_detail_is_unavailable(self) -> None:
@@ -1934,7 +1953,7 @@ window.fetch=(url,options)=>{
         for action in ('later', 'works'):
             with self.subTest(action=action):
                 script = probe.replace('ACTION', json.dumps(action))
-                self.assertEqual(firefox_probe_results(markup.replace('</body>', script + '</body>').encode()), [[]])
+                self.assertEqual(self.firefox_probe_results(markup.replace('</body>', script + '</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_history_opens_a_filtered_review_and_submits_only_its_own_form(self) -> None:
@@ -2014,11 +2033,11 @@ window.fetch=(url,options)=>{
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe + '</body>').encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.replace('</body>', probe + '</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_windowed_rows_keep_open_cards_and_drafts_across_scroll_and_refresh(self) -> None:
-        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'page_request_timeout_seconds=3\n')
+        _ = write_config_fixture(conf.path('review_links'), 'page_request_timeout_seconds=3\n')
         key = self.question()
         records = review_items.read(self.root)
         question = next(item for item in records if item.key == key)
@@ -2336,7 +2355,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
  return measuredFetch(url,options);
 };</script>"""
         markup = (initial.render(show='all').decode().replace('<head>','<head>'+spy,1)
-                  .replace('</body>',probe+'<img hidden src="/complete"></body>'))
+                  .replace('</body>',probe+'</body>'))
 
         class Probe(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
@@ -2344,10 +2363,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
                 fields=parse_qs(route.query)
                 snapshot=current[0]
                 content_type='text/html; charset=utf-8'
-                if route.path=='/complete':
-                    _ = complete.wait(TEST_HANG_GUARD_SECS)
-                    body=b''
-                elif route.path=='/advance':
+                if route.path=='/advance':
                     current[0]=fresh
                     body=b''
                 elif route.path=='/advance-again':
@@ -2404,19 +2420,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        with ThreadingHTTPServer(('127.0.0.1',0),Probe) as server:
-            thread=threading.Thread(target=server.serve_forever,daemon=True)
-            thread.start()
-            try:
-                with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                    result=run_process_group(['firefox','--headless','--no-remote','--profile',profile,
-                        '--window-size','1440,900','--screenshot',str(self.fixture.temporary/'window.png'),
-                        f'http://127.0.0.1:{server.server_port}/#item=page-owner%2FC399'],
-                        timeout=45)
-                self.assertEqual(result.returncode,0,result.stderr)
-            finally:
-                server.shutdown()
-                thread.join(5)
+        self.run_browser_probe(Probe, complete, route='/#item=page-owner%2FC399')
         self.assertEqual(results,[[]])
         self.assertEqual(
             set(requested_bodies),
@@ -2592,7 +2596,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   check(!notice.hidden && !document.querySelector('[data-record-inline-view]'),
    'An index that removes a loaded card closes it and shows the notice.');
 """
-        self.assertEqual(firefox_probe_results(snapshot_probe_page(page, snapshots, steps)), [[]])
+        self.assertEqual(self.firefox_probe_results(snapshot_probe_page(page, snapshots, steps)), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_loads_the_new_body_while_another_send_is_held(self) -> None:
@@ -2628,7 +2632,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   await until(()=>content.dataset.version===snapshots.fresh.version,'the refresh after Undo');
   check(recordIsOpen(row(1)) && undo.posts.length===1,'Undo keeps the other card open and sends no second action.');
 """
-        self.assertEqual(firefox_probe_results(snapshot_probe_page(
+        self.assertEqual(self.firefox_probe_results(snapshot_probe_page(
             page, {'initial': initial, 'fresh': fresh}, steps)), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
@@ -2680,7 +2684,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
                 validating = state == review_items.ReviewState.VALIDATING
                 _, fresh = self.browser_snapshot([replace(first, title='The updated Change', state=state,
                     actions=('question',) if validating else first.actions)])
-                self.assertEqual(firefox_probe_results(snapshot_probe_page(
+                self.assertEqual(self.firefox_probe_results(snapshot_probe_page(
                     page, {'initial': initial, 'fresh': fresh},
                     steps.replace('VALIDATING', json.dumps(validating)))), [[]])
 
@@ -2755,7 +2759,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    field.selectionStart===2 && field.selectionEnd===5,'The draft, its focus and its selection stay.');
 """
         page_bytes = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
-        self.assertEqual(firefox_probe_results(page_bytes), [[]])
+        self.assertEqual(self.firefox_probe_results(page_bytes), [[]])
 
     def long_log_records(self, extra: int = 0) -> list[review_items.ReviewItem]:
         """Return three change rows; change-2 has a log of 40 entries plus extra newer entries."""
@@ -2794,7 +2798,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
     width+' px: The log is 9rem tall from the config. Found '+log.clientHeight+' px.');
   }
 """
-        self.assertEqual(firefox_probe_results(snapshot_probe_page(page, {'initial': initial}, steps)), [[]])
+        self.assertEqual(self.firefox_probe_results(snapshot_probe_page(page, {'initial': initial}, steps)), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_review_refresh_keeps_the_open_log_position(self) -> None:
@@ -2825,7 +2829,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    'The log keeps its first visible entry at the same place. Expected '+offset+' px, found '+found+' px.');
 """.replace('WIDTH', str(width))
                 markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
-                self.assertEqual(firefox_probe_results(markup), [[]])
+                self.assertEqual(self.firefox_probe_results(markup), [[]])
 
     def assert_saved_detail_keeps_the_open_log_position(self, reply: str) -> None:
         """Save feedback on the open row with a scrolled log; the new detail has one more log entry."""
@@ -2862,7 +2866,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    'The log keeps its first visible entry at the same place. Expected '+offset+' px, found '+found+' px.');
 """.replace('REPLY', reply)
         markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(self.firefox_probe_results(markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_review_save_keeps_the_open_log_position(self) -> None:
@@ -2932,7 +2936,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   check(state()==='Waiting','The open row keeps its saved state after the page scrolls away and back. Found '+state()+'.');
 """
         markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(self.firefox_probe_results(markup), [[]])
 
     def assert_own_save_keeps_the_open_row(self, opener: str) -> None:
         """Open change-15 with the opener, save feedback, and check the row stays open at the same pixel."""
@@ -2968,7 +2972,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   check(!row(15) || Math.abs(row(15).getBoundingClientRect().top-top)<1,'After the save, the open row stays at the same pixel.');
 """.replace('OPENER', opener)
         markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(self.firefox_probe_results(markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_own_save_keeps_a_row_opened_by_an_item_link(self) -> None:
@@ -3041,7 +3045,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   check(!row(15),'A new link to the handed change shows no row before the next snapshot.');
 """.replace('LEAVE', leave)
         markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(self.firefox_probe_results(markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_relink_after_closing_an_own_save_row_hides_the_handed_change(self) -> None:
@@ -3077,7 +3081,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   stays('a chip click');
 """
         markup = self.handed_change_page(stale=True).decode().replace('AFTER_SUBMIT', steps).encode()
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(self.firefox_probe_results(markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_own_save_row_stays_open_after_a_link_to_the_same_item(self) -> None:
@@ -3094,7 +3098,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   check(!row(15) || Math.abs(row(15).getBoundingClientRect().top-top)<1,'After the same-item link, the own row stays at the same pixel.');
 """
         markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(self.firefox_probe_results(markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_deferred_link_after_change_feedback_waits_for_the_snapshot(self) -> None:
@@ -3110,7 +3114,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   check(row(15).dataset.state==='Waiting','The snapshot shows the handed change as Waiting.');
 """
         markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(self.firefox_probe_results(markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_tab_reaches_adjacent_rows_after_a_distant_scroll(self) -> None:
@@ -3120,7 +3124,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
         with patch.object(review_items, 'read', return_value=records):
             page = self.fixture.temporary / 'tab-review.html'
             _ = page.write_bytes(review_page.build_snapshot(self.root).render())
-        with self.firefox_commands(page) as command:
+        with self.firefox_commands(page.as_uri()) as command:
             cross_window = command('WebDriver:ExecuteAsyncScript', args=[], script=r"""
 const done=arguments[0];
 const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
@@ -3180,19 +3184,19 @@ requestAnimationFrame(focusRow);
         list_chip = record_table.chip_row('Show', [record_table.Chip('open', 'Open', 3)], 'open').replace('id="', 'id="fixture-')
         page = self.fixture.temporary / 'chip-contrast.html'
         _ = page.write_text(review.replace('<div data-review ', list_chip + '<div data-review ', 1))
-        with self.firefox_commands(page) as command:
+        with self.firefox_commands(page.as_uri()) as command:
             for theme in ('dark', 'light'):
                 for selector in ('#filter-show-open', '#fixture-filter-show-open'):
-                    position = cast(dict[str, list[int]], command('WebDriver:ExecuteScript',
-                        args=[theme, selector], script=r"""
+                    for state in ('hover', 'active'):
+                        with self.subTest(theme=theme, selector=selector, state=state):
+                            position = cast(dict[str, list[int]], command('WebDriver:ExecuteScript',
+                                args=[theme, selector], script=r"""
 const [theme, selector] = arguments;
 document.documentElement.dataset.theme = theme;
 const {x, y, width, height} = document.querySelector(selector).getBoundingClientRect();
 return [Math.floor(x + width / 2), Math.floor(y + height / 2)];
 """))
-                    x, y = position['value']
-                    for state in ('hover', 'active'):
-                        with self.subTest(theme=theme, selector=selector, state=state):
+                            x, y = position['value']
                             actions: list[dict[str, int | str]] = [
                                 {'type': 'pointerMove', 'origin': 'viewport', 'x': x, 'y': y, 'duration': 0}]
                             if state == 'active':
@@ -3231,47 +3235,89 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
                         'actions': [{'type': 'pointerMove', 'origin': 'viewport', 'x': 2, 'y': 2, 'duration': 0}]}])
                     _ = command('WebDriver:ReleaseActions')
 
-    @contextmanager
-    def firefox_commands(self, page: Path) -> Generator[Callable[..., object]]:
-        profile = self.fixture.temporary / 'marionette-profile'
-        profile.mkdir()
-        _ = (profile/'user.js').write_text('user_pref("marionette.port", 0);\n')
-        with subprocess.Popen(['firefox', '--headless', '--no-remote', '--profile', str(profile), '--marionette',
-                               'about:blank'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              start_new_session=True) as browser:
-            try:
-                with self.marionette_commands(browser) as command:
-                    _ = command('WebDriver:Navigate', url=page.as_uri())
-                    yield command
-            finally:
-                stop_process_group(browser)
+    @classmethod
+    def firefox(cls) -> Callable[..., object]:
+        if cls.browser_command is not None:
+            return cls.browser_command
+        with ExitStack() as startup:
+            send = startup.enter_context(cls.start_firefox())
+            _ = startup.callback(setattr, cls, 'browser_command', None)
+            session = startup.pop_all()
+        cls.addClassCleanup(session.close)
 
+        def command(name: str, **parameters: object) -> object:
+            try:
+                return send(name, **parameters)
+            except (OSError, ValueError, OverflowError, AssertionError) as error:
+                try:
+                    session.close()
+                except Exception as cleanup_error:
+                    error.add_note(f'Firefox cleanup failed: {cleanup_error}')
+                raise
+
+        cls.browser_command = command
+        return command
+
+    @classmethod
     @contextmanager
-    def marionette_commands(self, browser: subprocess.Popen[bytes]) -> Generator[Callable[..., object]]:
+    def start_firefox(cls) -> Generator[Callable[..., object]]:
+        with tempfile.TemporaryDirectory(prefix='review-firefox-') as temporary:
+            profile = Path(temporary)
+            _ = (profile / 'user.js').write_text('user_pref("marionette.port", 0);\n')
+            environment = {**os.environ, 'MOZ_HEADLESS_WIDTH': '1600', 'MOZ_HEADLESS_HEIGHT': '1100',
+                           'XDG_CACHE_HOME': str(profile / 'cache'), 'XDG_STATE_HOME': str(profile / 'state')}
+            with subprocess.Popen(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                                   '--marionette', 'about:blank'], env=environment, start_new_session=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as browser:
+                try:
+                    with cls.marionette_commands(browser) as command:
+                        yield command
+                finally:
+                    stop_process_group(browser)
+
+    @staticmethod
+    @contextmanager
+    def marionette_commands(browser: subprocess.Popen[bytes]) -> Generator[Callable[..., object]]:
         output = browser.stdout
         assert output is not None
+        descriptor = output.fileno()
         log = b''
-        port = 0
+        deadline = time.monotonic() + 15
         with selectors.DefaultSelector() as startup:
             _ = startup.register(output, selectors.EVENT_READ)
-            while startup.select(timeout=15):
-                chunk = os.read(output.fileno(), 4096)
+            while startup.select(timeout=max(0, deadline - time.monotonic())):
+                chunk = os.read(descriptor, 4096)
                 if not chunk:
                     break
                 log += chunk
-                if match := re.search(rb'Listening on port (\d+)\b', log):
-                    port = int(match[1])
+                if re.search(rb'Listening on port (\d+)\b', log):
                     break
-        self.assertGreater(port, 0, log.decode(errors='replace'))
+                if time.monotonic() >= deadline:
+                    break
+        if not (match := re.search(rb'Listening on port (\d+)\b', log)):
+            raise AssertionError(log.decode(errors='replace'))
+        port = int(match[1])
 
-        with socket.create_connection(('127.0.0.1', port), timeout=15) as connection, connection.makefile('rb') as reader:
+        def drain_output(reader: int) -> None:
+            with os.fdopen(reader, 'rb') as stream:
+                while stream.read(8192):
+                    pass
+
+        threading.Thread(target=drain_output, args=(os.dup(descriptor),), daemon=True).start()
+        with socket.create_connection(('127.0.0.1', port), timeout=45) as connection, connection.makefile('rb') as reader:
             def receive() -> object:
                 length = bytearray()
                 while (character := reader.read(1)) != b':':
                     if not character:
-                        self.fail('Firefox closed the Marionette connection.')
+                        raise AssertionError('Firefox closed the Marionette connection.')
+                    if not character.isdigit():
+                        raise AssertionError('Marionette sent an invalid message length.')
                     length.extend(character)
-                return cast(object, json.loads(reader.read(int(length))))
+                size = int(length)
+                payload = reader.read(size)
+                if len(payload) != size:
+                    raise AssertionError('Marionette sent an incomplete message.')
+                return cast(object, json.loads(payload))
 
             sequence = 0
 
@@ -3279,14 +3325,105 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
                 nonlocal sequence
                 sequence += 1
                 payload = json.dumps([0, sequence, name, parameters]).encode()
-                connection.sendall(str(len(payload)).encode()+b':'+payload)
-                message = cast(list[object], receive())
-                self.assertEqual(message[:3], [1, sequence, None], message)
-                return message[3]
+                connection.sendall(str(len(payload)).encode() + b':' + payload)
+                message = receive()
+                if not isinstance(message, list):
+                    raise AssertionError(f'{name}: {message}')
+                fields = cast(list[object], message)
+                if len(fields) != 4 or fields[:3] != [1, sequence, None]:
+                    raise AssertionError(f'{name}: {fields}')
+                return fields[3]
 
             _ = receive()
             _ = command('WebDriver:NewSession', capabilities={})
+            _ = command('WebDriver:SetTimeouts', pageLoad=30000, script=30000)
             yield command
+
+    @contextmanager
+    def firefox_commands(self, url: str) -> Generator[Callable[..., object]]:
+        def open_tab(send: Callable[..., object]) -> str:
+            original = cast(dict[str, str], send('WebDriver:GetWindowHandle'))['value']
+            tab = cast(dict[str, str], send('WebDriver:NewWindow', type='tab'))
+            _ = send('WebDriver:SwitchToWindow', handle=tab['handle'])
+            _ = send('WebDriver:Navigate', url=url)
+            return original
+
+        send = self.firefox()
+        opened = send, open_tab(send)
+
+        def command(name: str, **parameters: object) -> object:
+            nonlocal opened
+            send = self.firefox()
+            if send is not opened[0]:
+                opened = send, open_tab(send)
+            return send(name, **parameters)
+
+        try:
+            yield command
+        finally:
+            send, original = opened
+            if send is type(self).browser_command:
+                _ = send('WebDriver:CloseWindow')
+                _ = send('WebDriver:SwitchToWindow', handle=original)
+
+    def run_browser_probe(self, handler: type[BaseHTTPRequestHandler], complete: threading.Event,
+                          *, route: str = '/') -> None:
+        with ThreadingHTTPServer(('127.0.0.1', 0), handler) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
+            thread.start()
+            try:
+                with self.firefox_commands(f'http://127.0.0.1:{server.server_port}{route}'):
+                    self.assertTrue(complete.wait(45), 'The browser did not post the probe result.')
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+
+    def firefox_probe_results(self, page: bytes, *, width: int | None = None,
+                              reload_page: bytes = b'', image: bytes = b'',
+                              legacy_pages: Mapping[str, bytes] | None = None) -> list[list[str]]:
+        results: list[list[str]] = []
+        complete = threading.Event()
+        frame = b'<iframe src="/accounts"></iframe>' if width is None else (
+            f'<iframe src="/page" style="border:0;width:{width}px;height:900px"></iframe>'.encode())
+
+        class Probe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                route = urlsplit(self.path)
+                if legacy_pages is not None and route.path == '/console/changes.html':
+                    self.send_response(303)
+                    self.send_header('Location', review_page.legacy_url(route.path, route.query))
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/svg+xml' if route.path == '/fixture-image.svg'
+                                 else 'text/html; charset=utf-8')
+                self.end_headers()
+                if route.path == '/' and not route.query:
+                    body = frame
+                elif reload_page and route.path == '/reload':
+                    body = reload_page
+                elif image and route.path == '/fixture-image.svg':
+                    body = image
+                elif legacy_pages is not None and route.path == '/console/review.html':
+                    show = parse_qs(route.query).get('show', ['open'])[0]
+                    body = legacy_pages.get(show, legacy_pages['open'])
+                else:
+                    body = frame if width is not None and route.path != '/page' else page
+                _ = self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                payload = self.rfile.read(int(self.headers['Content-Length']))
+                results.append(cast(list[str], json.loads(payload)))
+                self.send_response(204)
+                self.end_headers()
+                complete.set()
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        self.run_browser_probe(Probe, complete)
+        return results
 
     def test_reader_projects_states_without_copying_the_records(self) -> None:
         key = self.question()
@@ -3820,7 +3957,7 @@ const marked=row && !row.hidden && row.querySelector('[data-new-answer]')?.textC
 void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Open Change needs a New answer mark.'])});
 </script>""".replace('KEY', json.dumps(key))
                 markup = snapshot.render().replace(b'</body>', proof.encode() + b'</body>')
-                self.assertEqual(firefox_probe_results(markup), [[]])
+                self.assertEqual(self.firefox_probe_results(markup), [[]])
             body = self.card_body(snapshot, key, 'read')
             _, result = review_page.submit(self.root, body, self.status, snapshot=snapshot)
             self.assertEqual(result, 'marked read')
@@ -4074,9 +4211,10 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
     def test_show_chips_replace_the_review_select(self) -> None:
         _ = self.question()
         _ = self.investigation(False)
+        snapshot = review_page.build_snapshot(self.root)
         for show, _ in review_page.SHOWS:
             with self.subTest(show=show):
-                source = review_page.render(self.root, show=show).decode()
+                source = snapshot.render(show=show).decode()
                 for label in ('Type', 'Show', 'Owner'):
                     key = label.lower()
                     self.assertIn(f'<div class="record-filter-row" role="group" aria-label="{label}"'
@@ -4130,8 +4268,9 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
         self.assertNotIn('<', encoded)
         self.assertNotIn('&', encoded)
         self.assertEqual(unpack_index(encoded), entries)
+        snapshot = review_page.build_snapshot(self.root)
         for show, _ in review_page.SHOWS:
-            source = review_page.render(self.root, show=show).decode()
+            source = snapshot.render(show=show).decode()
             payload = source.split('data-review-index>', 1)[1].split('</script>', 1)[0]
             self.assertEqual(unpack_index(payload), entries, 'Every Show carries the same complete index.')
             self.assertNotIn('<span data-list-count', source)
@@ -4162,7 +4301,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
                     'Validating':validating_keys, 'doneKey':done_key,
                     'waitingInvestigation':waiting_investigation, 'waitingChange':waiting_change,
                     'all':open_keys+validating_keys+[waiting_investigation, waiting_change]}
-        pages = {show: browser_markup(self.root, show=show) for show, _ in review_page.SHOWS}
+        pages = browser_pages(review_page.build_snapshot(self.root), [show for show, _ in review_page.SHOWS])
         setup = r"""<script>
 const nativeFetch=fetch,nativeTimeout=setTimeout;
 let reviewClock=1794907200000;
@@ -4288,11 +4427,11 @@ window.fetch=async(url,options)=>{
   check(count('Validating')?.textContent==='1','F001: Validating retains its complete count after the load');
   check(document.activeElement===chip('Validating'),'F002: the pressed Show chip keeps focus after the load');
   chip('all')?.focus();chip('all')?.click();await flush();await flush();
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  await showReview();
   check(document.activeElement===chip('all'),'F002: the Show chip keeps focus after refresh');
   const typeChip=()=>document.querySelector('[data-filter-row="type"] [data-filter-value="change"]');
   typeChip().focus();typeChip().click();
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  await showReview();
   check(document.activeElement===typeChip(),'F002: the type chip keeps focus after refresh');
   document.querySelector('[data-filter-row="type"] [data-filter-value="all"]').click();
   chip('Validating')?.click();await flush();await flush();
@@ -4301,13 +4440,13 @@ window.fetch=async(url,options)=>{
   check(exactKeys('Validating'),'Validating shows the active check.');
   check(['all','open','Waiting','Done','Validating'].map(value=>count(value)?.textContent).join('|')==='9|6|2|0|1',
     'Show counts exclude the completed investigation.');
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  await showReview();
   check(selected('Validating') && new URL(window.refreshRequests.at(-1),location.href).searchParams.has('version'),
     'refresh checks the version and retains the pressed Show view');
   const reload=document.createElement('iframe');reload.src='/reload'+location.hash;
   const loaded=new Promise(resolve=>reload.addEventListener('load',resolve,{once:true}));document.body.append(reload);await loaded;
-  await flush();await flush();
-  check(selected('Validating',reload.contentDocument) && reload.contentDocument.querySelector('[data-review]').dataset.show==='Validating',
+  check(await waitForReview(()=>selected('Validating',reload.contentDocument) &&
+    reload.contentDocument.querySelector('[data-review]')?.dataset.show==='Validating'),
     'a reload keeps the shared Show address');reload.remove();
   for(const value of ['Waiting','all','open']){
    chip(value)?.click();await flush();await flush();
@@ -4422,7 +4561,7 @@ window.fetch=async(url,options)=>{
   chip('open').click();await flush();await flush();
   check(ownerChips().length===2 && ownerChips()[0].textContent==='All 1','Show restores matching owners');
   chooseType('investigation');chooseOwner(builder);
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  await showReview();
   check(filterControl.ownerId(selectedOwner())===builder && ownerChips()[0].textContent==='All 1' &&
     ownerChips().every(button=>button.querySelector('b').textContent!=='0'),'refresh retains the matching owner list and selection');
   const legacy=document.createElement('iframe');
@@ -4457,57 +4596,22 @@ window.fetch=async(url,options)=>{
    filterControl.ownerId(selectedOwner())===questionOwner && selectedOwner().textContent==='page-owner 0';
   const question=document.querySelector('[data-type="question"]');question.querySelector('.list-toggle').click();await readyReviewCard(question);
   const form=recordDetails(question).querySelector('[data-review-form]');form.elements.feedback.value='Use this layout.';
-  form.querySelector('[value="answer"]').click();await new Promise(resolve=>nativeTimeout(resolve,1100));
+  const saved=nextReviewRefresh();form.querySelector('[value="answer"]').click();await saved;
   check(hasEmptyOwnerSelection() && !question.isConnected && count('all').textContent==='0',
     'A save removes the completed question from the Owner and Show counts.');
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  await showReview();
   check(hasEmptyOwnerSelection() && count('all').textContent==='0',
     'Refresh keeps the completed question out of the counts.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace('EXPECTED', json.dumps(expected))
+        base = pages['open'].replace('<head>', '<head>'+setup, 1)
+        body = base.replace('</body>', probe+'</body>').encode()
         for width in (1440, 390):
             with self.subTest(width=width):
                 base = pages['open'].replace('<head>', '<head>'+setup, 1)
                 body = base.replace('</body>', probe+'</body>').encode()
-                results: list[list[str]] = []
-                complete = threading.Event()
-
-                class Probe(BaseHTTPRequestHandler):
-                    def do_GET(self) -> None:
-                        path = urlsplit(self.path).path
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/html; charset=utf-8')
-                        self.end_headers()
-                        if path == '/complete':
-                            _ = complete.wait(20)
-                        else:
-                            _ = self.wfile.write(base.encode() if path == '/reload' else body if path == '/page' else
-                                b'<iframe src="/page" style="border:0;width:100vw;height:100vh"></iframe><img hidden src="/complete">')
-
-                    def do_POST(self) -> None:
-                        results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-                        complete.set()
-                        self.send_response(204)
-                        self.end_headers()
-
-                    @override
-                    def log_message(self, format: str, *args: object) -> None:
-                        pass
-
-                with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
-                    thread = threading.Thread(target=server.serve_forever, daemon=True)
-                    thread.start()
-                    try:
-                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', profile,
-                                '--window-size', f'{width},900', '--screenshot', str(self.fixture.temporary/'show-chips.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], timeout=30)
-                        self.assertEqual(done.returncode, 0, done.stderr)
-                    finally:
-                        server.shutdown()
-                        thread.join(TEST_HANG_GUARD_SECS)
-                self.assertEqual(results, [[]])
+                self.assertEqual(self.firefox_probe_results(body, width=width, reload_page=base.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_filter_counts_share_the_complete_index(self) -> None:
@@ -4518,7 +4622,7 @@ window.fetch=async(url,options)=>{
         deadline = datetime(2099, 1, 1, tzinfo=user_zone())
         review_later.save(f'investigation/{parked.owner}/{parked.id}', deadline)
         _ = review_page.submit(self.root, self.body('page-owner/C1', 'works'), self.status)
-        pages = {show: browser_markup(self.root, show=show) for show, _ in review_page.SHOWS}
+        pages = browser_pages(review_page.build_snapshot(self.root), [show for show, _ in review_page.SHOWS])
         setup = r"""<script>
 const nativeFetch=fetch,nativeTimeout=setTimeout;
 window.setInterval=()=>0;window.clearInterval=()=>{};
@@ -4607,11 +4711,10 @@ window.fetch=async(url,options)=>{
   const row=document.querySelector('[data-list-item][data-type="question"]');
   row.querySelector('.list-toggle').click();await readyReviewCard(row);
   const form=recordDetails(row).querySelector('form');form.elements.feedback.value='Use the first layout.';
-  form.requestSubmit(form.querySelector('[value="answer"]'));
-  await new Promise(resolve=>nativeTimeout(resolve,1100));
+  const saved=nextReviewRefresh();
+  form.requestSubmit(form.querySelector('[value="answer"]'));await saved;
   check(counts('[data-filter-row="show"] [data-filter-value]')==='0|0|0|0|0','A save removes the completed entry from all Show counts.');
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
-  await flush();await flush();
+  await showReview();
   check(counts('[data-filter-row="show"] [data-filter-value]')==='0|0|0|0|0','A refresh retains the saved state from the server index.');
   type('change').click();
   check(counts('[data-filter-row="show"] [data-filter-value]')==='2|1|0|0|1','A refresh replaces an unsaved entry in the index.');
@@ -4622,43 +4725,7 @@ window.fetch=async(url,options)=>{
             with self.subTest(width=width):
                 base = pages['open'].replace('<head>', '<head>'+setup, 1)
                 body = base.replace('</body>', probe+'</body>').encode()
-                results: list[list[str]] = []
-                complete = threading.Event()
-
-                class Probe(BaseHTTPRequestHandler):
-                    def do_GET(self) -> None:
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/html; charset=utf-8')
-                        self.end_headers()
-                        if self.path == '/complete':
-                            _ = complete.wait(20)
-                        else:
-                            _ = self.wfile.write(base.encode() if self.path == '/reload' else body if self.path == '/page' else
-                                b'<iframe src="/page" style="border:0;width:100vw;height:100vh"></iframe><img hidden src="/complete">')
-
-                    def do_POST(self) -> None:
-                        results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-                        complete.set()
-                        self.send_response(204)
-                        self.end_headers()
-
-                    @override
-                    def log_message(self, format: str, *args: object) -> None:
-                        pass
-
-                with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
-                    thread = threading.Thread(target=server.serve_forever, daemon=True)
-                    thread.start()
-                    try:
-                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', profile,
-                                '--window-size', f'{width},900', '--screenshot', str(self.fixture.temporary/'show-chips.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], timeout=30)
-                        self.assertEqual(done.returncode, 0, done.stderr)
-                    finally:
-                        server.shutdown()
-                        thread.join(TEST_HANG_GUARD_SECS)
-                self.assertEqual(results, [[]])
+                self.assertEqual(self.firefox_probe_results(body, width=width, reload_page=base.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_question_chip_counts_match_rows_while_a_saved_followup_awaits_refresh(self) -> None:
@@ -4745,7 +4812,7 @@ window.fetch=async(url,options)=>{
 })();</script>'''.replace('ANSWERED', json.dumps(answered)).replace('REMAINING', json.dumps(remaining)).replace(
             'OTHER_OWNER', json.dumps(other_owner.id)).replace('OTHER_QUESTION', json.dumps(other_question))
         page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_each_review_chip_counts_the_rows_after_its_click(self) -> None:
@@ -4834,7 +4901,7 @@ window.fetch=async(url,options)=>{
  }catch(error){failures.push(String(error));}
  await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''.replace('QUESTION', json.dumps(question))
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>', 1).encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.replace('</body>', probe+'</body>', 1).encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_owner_counts_follow_the_type_and_show_chips(self) -> None:
@@ -4947,7 +5014,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace('EXPECTED', json.dumps(expected))
         markup = page.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     def test_server_supplies_the_selected_show_and_complete_index(self) -> None:
         ready = self.investigation()
@@ -5178,9 +5245,10 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         _ = self.question()
         _ = self.investigation(False)
         pages = console.read_pages()
+        identities = tuple(page.identity for page in pages)
         self.assertEqual(next(page.icon for page in pages if page.identity == 'review'), 'inbox', 'F009: use the Review icon')
-        self.assertIn('review',[page.identity for page in pages])
-        self.assertFalse({'changes','questions','investigations'} & {page.identity for page in pages})
+        self.assertIn('review', identities)
+        self.assertFalse({'changes','questions','investigations'}.intersection(identities))
         request = console.NewsRequest(self.root)
         waiting = review_page.waiting_items(request)
         self.assertFalse(any(key.startswith('investigation/') for key in waiting))
@@ -5223,8 +5291,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
 
     def test_review_render_reads_card_motion_settings(self) -> None:
         before = review_page.build_snapshot(self.root)
-        settings = self.fixture.temporary / "config/review_links.conf"
-        _ = write_config_fixture(settings, "card_fade_out_ms=365\ncard_fade_in_ms=725\n")
+        _ = write_config_fixture(conf.path('review_links'), 'card_fade_out_ms=365\ncard_fade_in_ms=725\n')
         after = review_page.build_snapshot(self.root)
         self.assertNotEqual(after.version, before.version)
         self.assertIn(b'data-card-fade-out-ms="365" data-card-fade-in-ms="725"', after.render())
@@ -5366,8 +5433,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                     else:
                         proposal, efficiency = case.decisions()
                         key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
-                        _ = write_config_fixture(case.fixture.temporary / 'config/nightly_review.conf',
-                            'state_folder=nightly-review\n')
+                        _ = write_config_fixture(conf.path('nightly_review'), 'state_folder=nightly-review\ntitle_characters=90\n')
                     old_id = ''
                     if wait in ('question', 'validate'):
                         delivery, _ = review_page.submit(case.root, case.body(key, wait, 'Check the old case.'), case.status)
@@ -5581,7 +5647,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
 
     def test_recovery_alerts_the_showrunner_after_a_failed_send_and_completion_write(self) -> None:
         producer = fixture_member("producer", name="bob")
-        _ = write_config_fixture(conf.path("review_links"), "unrouted_alert_recipient=page-owner\n")
+        _ = write_config_fixture(conf.path('review_links'), 'unrouted_alert_recipient=page-owner\n')
         question = self.file_sent_question(producer.id)
         open_record = investigation.file(producer.id, "Why did the gate stop?", "Read the gate log.",
                                          waiting_why="The producer checks the gate.")
@@ -6110,7 +6176,7 @@ const marked=row?.querySelector('[data-new-answer]')?.textContent==='New answer'
 void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Open row needs a New answer mark.'])});
 </script>""".replace('KEY', json.dumps(key))
             markup = answered.render().replace(b'</body>', proof.encode() + b'</body>')
-            self.assertEqual(firefox_probe_results(markup), [[]])
+            self.assertEqual(self.firefox_probe_results(markup), [[]])
 
         delivery, result = review_page.submit(self.root, self.card_body(answered, key, 'read'), self.status, snapshot=answered)
         self.assertIsInstance(delivery, change_page.NoMessageDelivery)
@@ -6497,10 +6563,10 @@ window.fetch=async(url,options={})=>{
 </script>""".replace('KEY', json.dumps(proposal)).replace('ASSIGNEE', json.dumps(self.fixture.unit.id))
         for removed in (False, True):
             with self.subTest(removed=removed):
-                self.assertEqual(firefox_probe_results((page+probe.replace('__REMOVE_OPTION__', json.dumps(removed))).encode()), [[]])
+                self.assertEqual(self.firefox_probe_results((page+probe.replace('__REMOVE_OPTION__', json.dumps(removed))).encode()), [[]])
 
     def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
-        _ = write_config_fixture(self.fixture.temporary / 'config/nightly_review.conf', 'state_folder=nightly-review\n')
+        _ = write_config_fixture(conf.path('nightly_review'), 'state_folder=nightly-review\ntitle_characters=90\n')
         proposal, efficiency = self.decisions()
         folder = self.fixture.temporary / 'decision-proposals'
         ledger = self.fixture.temporary / 'decision-efficiency.md'
@@ -6609,7 +6675,7 @@ window.fetch=async(url,options={})=>{
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = page.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     def new_item_filter_page(self, kind: new_item_dialog.SubmissionKind, *, matches_filters: bool = False) -> bytes:
         owner = self.ready_submission_recipient()
@@ -6714,12 +6780,12 @@ window.fetch=async(url,options={})=>{
     def test_new_items_keep_every_review_filter(self) -> None:
         for kind in new_item_dialog.SubmissionKind:
             with self.subTest(kind=kind):
-                self.assertEqual(firefox_probe_results(self.new_item_filter_page(kind)), [[]])
+                self.assertEqual(self.firefox_probe_results(self.new_item_filter_page(kind)), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_new_item_opens_when_it_matches_every_review_filter(self) -> None:
         page = self.new_item_filter_page(new_item_dialog.SubmissionKind.QUESTION, matches_filters=True)
-        self.assertEqual(firefox_probe_results(page), [[]])
+        self.assertEqual(self.firefox_probe_results(page), [[]])
 
     def test_the_reader_counts_only_for_you_across_all_five_stores(self) -> None:
         _ = self.investigation()
@@ -6916,45 +6982,8 @@ window.fetch=async(url)=>{
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         body = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>').encode()
-        results: list[list[str]] = []
-        complete = threading.Event()
-
-        class Probe(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/html; charset=utf-8')
-                self.end_headers()
-                if self.path == '/complete':
-                    _ = complete.wait(20)
-                elif self.path == '/fixture-image.svg':
-                    _ = self.wfile.write(b'<svg xmlns="http://www.w3.org/2000/svg"/>')
-                else:
-                    _ = self.wfile.write(body if self.path == '/page' else
-                        b'<iframe src="/page" style="width:100vw;height:100vh"></iframe><img hidden src="/complete">')
-
-            def do_POST(self) -> None:
-                results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-                complete.set()
-                self.send_response(204)
-                self.end_headers()
-
-            @override
-            def log_message(self, format: str, *args: object) -> None:
-                pass
-
-        with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                    done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', profile,
-                        '--window-size', '390,900', '--screenshot', str(self.fixture.temporary/'review-titles.png'),
-                        f'http://127.0.0.1:{server.server_port}/'], timeout=30)
-                self.assertEqual(done.returncode, 0, done.stderr)
-            finally:
-                server.shutdown()
-                thread.join(TEST_HANG_GUARD_SECS)
-        self.assertEqual(results, [[]])
+        image = b'<svg xmlns="http://www.w3.org/2000/svg"/>'
+        self.assertEqual(self.firefox_probe_results(body, width=390, image=image), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_owner_button_is_the_only_title_action(self) -> None:
@@ -6991,7 +7020,7 @@ window.fetch=async(url)=>{
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_clears_the_review_save_notice(self) -> None:
@@ -7065,7 +7094,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
             with self.subTest(action=action, reduced_motion=reduced):
                 markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
                 markup = markup.replace('REDUCED', json.dumps(reduced)).replace('ACTION', json.dumps(action))
-                self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+                self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_departing_card_keeps_its_place_in_the_scrolled_window(self) -> None:
@@ -7232,7 +7261,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
 })();
 </script>"""
         markup = browser_markup(self.root).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_scroll_keeps_held_later_and_validate_cards_hidden(self) -> None:
@@ -7270,7 +7299,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
 })();
 </script>"""
         markup = browser_markup(self.root).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_undo_keeps_the_card_words_and_a_second_send_posts_again(self) -> None:
@@ -7337,7 +7366,7 @@ window.fetch=async(url,options)=>{
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = browser_markup(self.root).replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_held_review_question_and_feedback_hide_the_row(self) -> None:
@@ -7380,7 +7409,7 @@ window.fetch=async(url,options)=>{
 })();
 </script>"""
         markup = browser_markup(self.root).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_refused_card_reverses_above_the_next_departing_card(self) -> None:
@@ -7521,7 +7550,7 @@ Element.prototype.animate=function(...args){
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_reload_keeps_a_saved_verdict_and_the_selected_show(self) -> None:
@@ -7660,7 +7689,7 @@ window.fetch=(url,options)=>{
                 request_script = '<script>'+review_page.CARD_REQUEST_SCRIPT
                 page = page.replace(request_script, count_requests.replace('CASE', json.dumps(case))+request_script, 1)
                 page = page.replace('</body>', probe.replace('CASE', json.dumps(case))+'</body>', 1)
-                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+                self.assertEqual(self.firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_back_during_a_save_keeps_the_link_for_a_change_and_question(self) -> None:
@@ -7736,7 +7765,7 @@ window.fetch=(url,options={})=>{
 </script>"""
         page = browser_markup(self.root).replace('<head>', '<head>'+setup, 1)
         page = page.replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_back_and_forward_defer_the_link_to_its_own_pending_save(self) -> None:
@@ -7836,7 +7865,7 @@ window.fetch=(url,options={})=>{
         for refuse_question in (False, True):
             with self.subTest(refuse_question=refuse_question):
                 script = probe.replace('REFUSE_QUESTION', json.dumps(refuse_question))
-                self.assertEqual(firefox_probe_results(page.replace('</body>', script+'</body>', 1).encode()), [[]])
+                self.assertEqual(self.firefox_probe_results(page.replace('</body>', script+'</body>', 1).encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_console_reload_preserves_show_and_an_explicit_link_opens_the_card(self) -> None:
@@ -7887,7 +7916,7 @@ window.fetch=(url,options)=>String(url)==='/results' ? sendProbe(url,options) :
         shell = shell.replace('</body>', probe+'</body>', 1)
         review_html, shell_html = (json.dumps(page).replace('</', '<\\/') for page in (review, shell))
         router = f'<script>document.write(location.pathname.endsWith("review.html") ? {review_html} : {shell_html});</script>'
-        self.assertEqual(firefox_probe_results(router.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(router.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_links_keep_completed_changes_and_questions_hidden(self) -> None:
@@ -8021,7 +8050,7 @@ window.fetch=(url,options={})=>{
         markup = browser_markup(self.root, show='all')
         page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
         with self.subTest(navigation='same tab'):
-            self.assertEqual(firefox_probe_results(page.encode()), [[]])
+            self.assertEqual(self.firefox_probe_results(page.encode()), [[]])
 
         fixture = self.fixture
         _ = change_review.record_verdict(fixture.review_list, 'C1', 'works', datetime.now(user_zone()).date(),
@@ -8036,7 +8065,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(hidden && review.datase
 </script>"""
         page = markup.replace('<head>', '<head>'+initial_link, 1).replace('</body>', initial_probe+'</body>', 1)
         with self.subTest(navigation='fresh load'):
-            self.assertEqual(firefox_probe_results(page.encode()), [[]])
+            self.assertEqual(self.firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
@@ -8052,7 +8081,8 @@ void fetch('/results',{method:'POST',body:JSON.stringify(hidden && review.datase
         for _ in range(3):
             done = self.investigation()
             _ = investigation.mark_read(done.owner, done.id)
-        source = browser_markup(self.root)
+        snapshot = review_page.build_snapshot(self.root)
+        source = browser_pages(snapshot, ('open',))['open']
         setup = r"""<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, original=MARKUP;
 window.setInterval=()=>0;window.clearInterval=()=>{};
@@ -8192,7 +8222,7 @@ window.fetch=async(_url,options={})=>{
   const status=document.querySelector('[data-hidden-action-status]');
   check(status.hidden && !status.textContent,'The hidden row leaves no action status.');
   check(!visibleStatus('Not saved: Fixture newer refusal'),'saving another card clears the failure notice');
-  await new Promise(resolve=>nativeTimeout(resolve,950));
+  await refreshed;
   check(target.hidden,'the saved row leaves the view');
   check(status.hidden && !status.textContent,'The animation leaves no action status.');
   check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='4','the count excludes the saved row');
@@ -8327,7 +8357,7 @@ window.fetch=async(_url,options={})=>{
   check(fresh.hidden,'Later removes the question from the page');
   check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='0','Later removes the question from the filtered count');
   const nativeNow=Date.now;Date.now=()=>new Date('2099-01-01T09:00').getTime()+1000;
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  await showReview();
   let returned=rows().find(row=>row.dataset.type==='question');
   check(!returned.hidden && returned.dataset.state==='Open','Later returns the question with its original state');
   Date.now=nativeNow;
@@ -8365,7 +8395,7 @@ window.fetch=async(_url,options={})=>{
    const entry=entries.r.find(entry=>entry[0]===pendingKey);entry[6]=['Open','Waiting','Validating'].indexOf(state);entry[8]=updated;
    payload.textContent=JSON.stringify(entries);
    window.refreshMarkup=update.documentElement.outerHTML;
-   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+   await showReview();
    const shownPending=rows().find(row=>row.dataset.key===pendingKey);
    check(Boolean(shownPending && !shownPending.hidden)===revealed,'F021: state and revision control return for '+state+' '+updated);
    check(Number(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent)===initialCount-(revealed?0:1),
@@ -8384,49 +8414,11 @@ window.fetch=async(_url,options={})=>{
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
-        self_root = self.root
-        body = source.replace('<head>','<head>'+setup,1).replace('</body>',probe+'</body>').encode()
-        for width in (1440,390):
+        body = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>').encode()
+        legacy_pages = {show: snapshot.render(show=show) for show, _ in review_page.SHOWS}
+        for width in (1440, 390):
             with self.subTest(width=width):
-                results: list[list[str]] = []
-                complete = threading.Event()
-                class Probe(BaseHTTPRequestHandler):
-                    def do_GET(self) -> None:
-                        if self.path.startswith('/console/changes.html'):
-                            self.send_response(303)
-                            self.send_header('Location', review_page.legacy_url('/console/changes.html', self.path.partition('?')[2]))
-                            self.end_headers()
-                            return
-                        self.send_response(200)
-                        self.send_header('Content-Type','text/html; charset=utf-8')
-                        self.end_headers()
-                        if self.path == '/complete':
-                            _ = complete.wait(90)
-                        else:
-                            _ = self.wfile.write(review_page.render(self_root, show=parse_qs(self.path.partition('?')[2]).get('show', ['open'])[0])
-                                if self.path.startswith('/console/review.html') else
-                                body if self.path == '/page' else b'<iframe src="/page" style="border:0;width:100vw;height:100vh"></iframe><img hidden src="/complete">')
-                    def do_POST(self) -> None:
-                        results.append(cast(list[str],json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-                        complete.set()
-                        self.send_response(204)
-                        self.end_headers()
-                    @override
-                    def log_message(self, format: str, *args: object) -> None:
-                        pass
-                with ThreadingHTTPServer(('127.0.0.1',0),Probe) as server:
-                    thread=threading.Thread(target=server.serve_forever,daemon=True)
-                    thread.start()
-                    try:
-                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done=run_process_group(['firefox','--headless','--no-remote','--profile',profile,
-                                '--window-size',f'{width},900','--screenshot',str(self.fixture.temporary/f'review-{width}.png'),
-                                f'http://127.0.0.1:{server.server_port}/'],timeout=120)
-                        self.assertEqual(done.returncode,0,done.stderr)
-                    finally:
-                        server.shutdown()
-                        thread.join(TEST_HANG_GUARD_SECS)
-                self.assertEqual(results,[[]])
+                self.assertEqual(self.firefox_probe_results(body, width=width, legacy_pages=legacy_pages), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_later_focus_moves_to_the_calendar_when_previous_month_disables(self) -> None:
@@ -8458,7 +8450,7 @@ Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_later_time_displays_and_saves_24_hour_time(self) -> None:
@@ -8530,7 +8522,7 @@ window.fetch=async(_url,options={})=>{
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_later_retains_drafts_and_resolves_daylight_saving_times(self) -> None:
@@ -8601,43 +8593,7 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
             with self.subTest(scenario=scenario):
                 page = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
                 body = page.replace('SCENARIO', json.dumps(scenario)).encode()
-                results: list[list[str]] = []
-                complete = threading.Event()
-
-                class Probe(BaseHTTPRequestHandler):
-                    def do_GET(self) -> None:
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/html; charset=utf-8')
-                        self.end_headers()
-                        if self.path == '/complete':
-                            _ = complete.wait(20)
-                        else:
-                            _ = self.wfile.write(body if self.path == '/page' else
-                                b'<iframe src="/page" style="width:100vw;height:100vh"></iframe><img hidden src="/complete">')
-
-                    def do_POST(self) -> None:
-                        results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-                        complete.set()
-                        self.send_response(204)
-                        self.end_headers()
-
-                    @override
-                    def log_message(self, format: str, *args: object) -> None:
-                        pass
-
-                with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
-                    thread = threading.Thread(target=server.serve_forever, daemon=True)
-                    thread.start()
-                    try:
-                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', profile,
-                                '--window-size', '1440,900', '--screenshot', str(self.fixture.temporary/'later-time.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], timeout=30)
-                        self.assertEqual(done.returncode, 0, done.stderr)
-                    finally:
-                        server.shutdown()
-                        thread.join(TEST_HANG_GUARD_SECS)
-                self.assertEqual(results, [[]])
+                self.assertEqual(self.firefox_probe_results(body, width=1440), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_later_chooser_validates_restored_drafts(self) -> None:
@@ -8687,7 +8643,7 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_review_draws_the_same_body_as_the_single_card(self) -> None:
@@ -8717,13 +8673,15 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace("EXPECTED", json.dumps(expected).replace('</', '<\\/'))
         markup = browser_markup(self.root).replace('</body>', probe + '</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(self.firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_uses_the_shared_status_with_the_real_loader(self) -> None:
         _ = self.question()
         _ = self.investigation()
-        assert_status_states(self, browser_markup(self.root),15)
+        markup = browser_markup(self.root)
+        with patch.object(conf, 'directory', return_value=self.fixture.temporary / 'config'):
+            assert_status_states(self, markup, 15)
 
 
 if __name__ == '__main__':
