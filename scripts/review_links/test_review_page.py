@@ -9579,7 +9579,6 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
         key = 'page-owner/C1'
         snapshot = review_page.build_snapshot(self.root)
         single = snapshot.body(key, view=review_page.ReviewBodyView.CARD).decode()
-        expected = single.split('<template data-card-body>', 1)[1].split('</template>', 1)[0]
         probe = r"""<script>
 (async()=>{
  const failures=[];
@@ -9587,8 +9586,7 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
   const row=document.querySelector('[data-key="page-owner/C1"]');
   row.querySelector('.list-toggle').click();
   const form=await readyReviewCard(row);
-  const template=document.createElement('template');
-  template.innerHTML=EXPECTED;
+  const template=new DOMParser().parseFromString(SINGLE,'text/html').querySelector('[data-card-body]');
   const rendered=recordDetails(row).cloneNode(true);
   // The picker adds the suggestion list ID when it binds the form.
   rendered.querySelector('[data-later-time]').removeAttribute('aria-controls');
@@ -9600,7 +9598,7 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
   if(!form.elements.revision.value) failures.push('The Review action has no revision.');
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
-})();</script>""".replace("EXPECTED", json.dumps(expected).replace('</', '<\\/'))
+})();</script>""".replace("SINGLE", json.dumps(single).replace('</', '<\\/'))
         markup = browser_markup(self.root).replace('</body>', probe + '</body>')
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
