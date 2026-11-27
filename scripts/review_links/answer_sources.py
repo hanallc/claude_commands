@@ -1705,6 +1705,20 @@ def file_saved_picture(root: Path, identity: str) -> None:
         _file_live(partial(_reload_picture, root, identity, keepers, user_zone()), entries, staff.snapshot())
 
 
+def _review_handoff_exchanges(item: review_items.ReviewItem, key: str, row: the_list.ListItem,
+                              destination: investigation.ListDestination, saved: tuple[list_exchange.FiledExchange, ...],
+                              sources: list[Path] | None) -> tuple[list_exchange.FiledExchange, ...]:
+    durable = the_list.confirmed_exchanges(key, destination, saved, sources=sources)
+    if (item.type in review_items.QUESTION_TYPES and len(durable) < len(saved)
+            and the_list.exchange_has_linked_destination(key, destination, sources=sources)):
+        logged = {event.what for event in row.log if isinstance(event.what, the_list.ReturnedAnswer)}
+        durable |= frozenset(exchange for exchange in saved
+            if exchange.source is Source.SCOPED_REPLY and exchange.direction is Direction.ANSWER_TO_NATE
+            and isinstance(exchange.answer, ExchangeAnswer)
+            and the_list.ReturnedAnswer(the_list.ReturnedAnswerId(key, exchange.exchange_id), exchange.answer.text) in logged)
+    return tuple(exchange for exchange in saved if exchange in durable)
+
+
 def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, *,
                           sources: list[Path] | None = None,
                           members: staff.StaffSnapshot | None = None) -> list[review_items.ReviewItem]:
@@ -1731,9 +1745,8 @@ def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, 
                 pending = the_list.pending_exchanges(key, sources=sources)
                 history = the_list.combine_exchange_history(saved, pending)
                 verifier = ExchangeVerifier(item, zone, members, history)
-                confirmed = the_list.confirmed_exchanges(key, destination, saved, sources=sources)
-                handoff = verifier.review_handoff(item, key, destination,
-                                                  tuple(exchange for exchange in saved if exchange in confirmed))
+                filed_exchanges = _review_handoff_exchanges(item, key, entry.item, destination, saved, sources)
+                handoff = verifier.review_handoff(item, key, destination, filed_exchanges)
         projected.append(item if item.exchange_handoff == handoff else replace(item, exchange_handoff=handoff))
     return projected
 

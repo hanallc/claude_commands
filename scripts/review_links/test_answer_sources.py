@@ -984,6 +984,36 @@ class AnswerSourceTests(unittest.TestCase):
         snapshot = review_page.build_snapshot(self.review)
         self.assertNotIn(key, {row["key"] for row in snapshot.entries})
 
+    def test_linked_sent_question_hides_when_its_answer_log_saves_without_a_receipt(self) -> None:
+        words = "Use plan A."
+        key = self.native("linked-pending", {"since": FILED, "text": "Choose a plan", "question": "Which plan?",
+            "review_id": "Q1", "review_submission": new_item_dialog.stored_submission(origin("request-1234567890")),
+            "followups": [{"followup": "Which plan?", "reply": words, "replied_at": FIRST_REPLY.isoformat()}],
+        })
+        row = the_list.add(KEEPER.id, "Review the plan", owner=OWNER.id, source="nate", changes={})
+        _ = the_list.link(KEEPER.id, row.id, (key,), source="nate")
+        _ = change_page.console_folder(self.review)
+        self.assertIn(key, {entry["key"] for entry in review_page.build_snapshot(self.review).entries})
+
+        def fail_receipt(path: Path, content: str, *, new_file_mode: int | None = None) -> None:
+            if path.suffix == ".saved":
+                raise OSError("Could not save the List receipt.")
+            atomic_file.write_text_atomic(path, content, new_file_mode=new_file_mode)
+
+        with patch.object(the_list, "write_text_atomic", fail_receipt):
+            self.assertEqual(self.migrate(apply=True)[0], 1)
+        saved, = the_list.records(KEEPER.id)
+        self.assertEqual(saved.id, row.id)
+        exchange, = saved.filed_exchanges
+        answer, = (event.what for event in saved.log if isinstance(event.what, the_list.ReturnedAnswer))
+        self.assertEqual(answer, the_list.ReturnedAnswer(
+            the_list.ReturnedAnswerId(exchange.source_key, exchange.exchange_id), words))
+        destination = investigation.ListDestination(KEEPER.id, saved.number)
+        self.assertFalse(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)))
+        snapshot = review_page.build_snapshot(self.review)
+        self.assertNotIn(key, {entry["key"] for entry in snapshot.entries})
+        self.assertEqual(snapshot.filed_item_url(self.review, key), review_page.report_url(destination))
+
     def test_migration_closes_questions_that_nate_already_answered(self) -> None:
         fields: update_registration.OutstandingItem = {"since": FILED, "text": "Choose a plan",
                                                         "question": "Which plan?"}

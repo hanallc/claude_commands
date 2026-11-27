@@ -2696,6 +2696,16 @@ def confirmed_exchanges(key: str, destination: investigation.ListDestination,
     return frozenset(exchange for exchange in exchanges if _exchange_receipt_line(destination, exchange) in receipt)
 
 
+def exchange_has_linked_destination(key: str, destination: investigation.ListDestination,
+                                    *, sources: list[Path] | None = None) -> bool:
+    path = _exchange_path(key)
+    if sources is not None:
+        sources.append(path)
+    reservation = _exchange_reservation(path)
+    return (isinstance(reservation, ExchangeDestination) and not reservation.reserved_new_item
+            and reservation.destination == destination)
+
+
 def _recover_exchange_allocation(store: record_store.NumberedRecords, journal: Path) -> None:
     try:
         value = journal.read_text(encoding="utf-8")
