@@ -2744,6 +2744,65 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  check(words.value==='' && posts===2,'A confirmed save clears the submitted words.');
 """)
 
+    def test_question_read_form_takes_priority_over_a_second_waiting_question(self) -> None:
+        key = "submission/question/waiting-and-answered"
+        exchange = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "followup:1",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which width?", NOW, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.QuestionWithoutAnswer.OPEN)
+        with the_list.lock_exchange_source(key) as source:
+            row = the_list.file_exchanges(source, (exchange,), exchange.question, linked=the_list.NextNumber.AVAILABLE,
+                                          owner=OWNER.id, members=staff.snapshot())
+        identity = f"L{row.number}"
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            for request, words in (("ask-one", "Which width fits?"), ("ask-two", "Which height fits?")):
+                delivery = the_list.ask_question(row.keeper, identity, the_list.PageRequest(request, "question", words),
+                                                 status, recipient=MORTY.id)
+                change_page.deliver(delivery, status)
+        waiting = list_page.saved_action_state(row.keeper, identity, status=status)
+        self.assertEqual(waiting["waiting_for_answer"], "true")
+        with patch.object(staff, "caller_identity", return_value=MORTY.current_session), redirect_stdout(io.StringIO()):
+            self.assertEqual(the_list.main(["answer", identity, "--question", "Q1", "--text", "Use 800 pixels."]), 0)
+        saved = list_page.saved_action_state(row.keeper, identity, status=status, include_detail=True)
+        self.assertEqual((saved["item_state"], saved["open_question"], saved["waiting_for_answer"]),
+                         ("Answered", "true", "false"))
+        detail = saved.get("detail_html", "")
+        self.assertIn('data-question="Q2"', detail)
+        self.assertIn('aria-label="Your words for sdlc"', detail)
+        self.assertIn('value="read">Mark read</button>', detail)
+        self.assertNotIn('data-waiting-actions', detail)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_answers_chip_includes_a_parked_question_with_a_new_reply(self) -> None:
+        key = "submission/question/parked-and-answered"
+        exchange = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "followup:1",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which width?", NOW, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.QuestionWithoutAnswer.OPEN)
+        members = staff.snapshot()
+        with the_list.lock_exchange_source(key) as source:
+            row = the_list.file_exchanges(source, (exchange,), exchange.question, linked=the_list.NextNumber.AVAILABLE,
+                                          owner=OWNER.id, members=members)
+        _ = the_list.park(row.keeper, f"L{row.number}", NOW + timedelta(days=1), source="nate")
+        reply = replace(exchange, answer=list_exchange.ExchangeAnswer(
+            "Use 800 pixels.", NOW + timedelta(minutes=1), list_exchange.AnswerRead.UNREAD))
+        with the_list.lock_exchange_source(key) as source:
+            self.assertEqual(the_list.file_exchanges(source, (reply,), reply.question, linked=row,
+                                                      owner=OWNER.id, members=members), row)
+        page = without_scripts(list_page.render(self.root / "reviews", include_counts=False, query="show=answers").decode())
+        summary = re.search(r'<tbody data-list-item[^>]+data-number="1"[^>]*>', page)
+        assert summary is not None
+        self.assertNotIn(" hidden", summary[0])
+        self.assertIn('data-parked="true"', summary[0])
+        with self.studio_review_server() as origin:
+            self.open_studio_review_fixture(origin)
+            self.studio_review_check(r"""
+ const answers=document.querySelector('[data-filter-row="show"] [data-filter-value="answers"]');
+ answers.click();await paint();
+ check(!row(1).hidden && row(1).dataset.parked==='true','Answers includes the parked question.');
+ check(row(1).querySelector('[data-new-answer]'),'The parked question shows the new answer.');
+""")
+
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_evidence_opens_only_reviews_linked_to_the_item(self) -> None:
         review = investigation.file(OWNER.id, "Find the cause", "Read the failed check.", waiting_why="Work continues.")

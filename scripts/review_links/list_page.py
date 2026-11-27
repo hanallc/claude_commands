@@ -216,11 +216,11 @@ def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
         return ListChip.SCHEDULED
     if state == the_list.ItemState.REPAIRED:
         return ListChip.NEEDS_ME
+    if question_item and state is the_list.ItemState.ANSWERED:
+        return ListChip.ANSWERS
     if question_item and not parked:
         if state is the_list.ItemState.WAITING_FOR_NATE:
             return ListChip.QUESTIONS
-        if state is the_list.ItemState.ANSWERED:
-            return ListChip.ANSWERS
         if state is the_list.ItemState.WORKING:
             return ListChip.WORKING
     base = question_path.Queue.DONE if report and state == the_list.ItemState.DELIVERED else QUEUE_BY_STATE[state]
@@ -808,7 +808,7 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
         ask_signature = route.signature
         split = entry.item.question_kind is not the_list.NoQuestionItem.ORDINARY and route.name != recipient_name
         if split:
-            words_label = "Your words about this item"
+            words_label = "Your words"
         ask = page_frame.send_button("Ask" if split else "Ask question", page_frame.SendTo(route.name),
                                      'name="action" value="question" disabled', show_receiver=split)
     hidden = signed_form_fields(entry, secret, ask_signature=ask_signature)
@@ -2769,10 +2769,10 @@ const chipFor=data=>{
  if(data.state==='Closed' || data.undoPending==='true' || data.sendHeld!==undefined) return;
  if(data.state==='Repaired') return 'needs-me';
  if(data.state==='Scheduled') return 'scheduled';
+ if(data.questionItem!==undefined && data.state==='Answered') return 'answers';
  const parked=isParked(data);
  if(data.questionItem!==undefined && !parked){
   if(data.state==='Waiting for nate') return 'questions';
-  if(data.state==='Answered') return 'answers';
   if(data.state==='Working') return 'working';
  }
  const queue=data.report && data.state==='Delivered' ? queuesByState.Done : queuesByState[data.state];
@@ -3623,7 +3623,7 @@ function bindFeedbackForm(form){
    const askReceiver=askRetry ? askRetry.askReceiver : signed.askReceiver;
    const split=signed.showAskName && askReceiver && askReceiver!==name;
    const wordsLabel=canReject ? 'Your words about this repair' :
-    split ? 'Your words about this item' : 'Your words for '+name+' about this item';
+    split ? 'Your words' : 'Your words for '+name+' about this item';
    tell.textContent=retry?.tellLabel ?? signed.tellLabel;
    tell.dataset.sendReceiver=name;
    words.placeholder=wordsLabel;
