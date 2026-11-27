@@ -60,8 +60,13 @@ def commit_all(root: Path) -> None:
 
 def reservation(reservation_id: str, root: Path, branch: str, *scopes: str,
                 status: Literal["blocking", "clear"] = "blocking", lifecycle: str = "active",
-                protected_tip: str = "") -> berth_board.Reservation:
-    return berth_board.Reservation(reservation_id, "lint", root, branch, scopes, lifecycle, status, protected_tip)
+                protected_tip: str = "", merge_extent: berth_board.MergeExtent | None = None,
+                source_kind: str = "explicit") -> berth_board.Reservation:
+    return berth_board.Reservation(
+        reservation_id, "lint", root, branch, scopes, lifecycle, status, protected_tip,
+        merge_extent=merge_extent if merge_extent is not None else berth_board.MergeProtected(scopes),
+        source_kind=source_kind,
+    )
 
 
 def head(root: Path) -> str:
@@ -377,6 +382,29 @@ class HoldFilterTests(unittest.TestCase):
         kept, withheld = self.hold(
             reservation("own-1", self.ROOT, "mine", "tree:src"),
             reservation("other-2", Path("/fixture/other"), "theirs", "file:src/foreign.rs"),
+        )
+        self.assertEqual(kept, fix_return.MirrorChanges(
+            ("src/held.rs", "src/free.rs", "src/clear.rs"), ("src/gone.rs",)))
+        self.assertEqual(withheld, (fix_return.Withheld("src/foreign.rs", "other-2 (theirs)"),))
+
+    def test_foreign_holder_uses_merge_protection(self) -> None:
+        coverage = "crates/cargo-style/src/coverage/comparison.rs"
+        changes = fix_return.MirrorChanges((coverage, "Cargo.lock"), ())
+        own = reservation("own-1", self.ROOT, "mine", "tree:.", merge_extent=berth_board.MergeEmpty())
+        protected = berth_board.MergeProtected(("file:Cargo.lock",))
+        for extent in (protected, berth_board.MergeUnavailable(protected, "worktree unavailable")):
+            with self.subTest(extent=extent):
+                foreign = reservation("other-2", Path("/fixture/other"), "theirs", "tree:crates/cargo-style",
+                                      merge_extent=extent)
+                kept, withheld = fix_return.hold_filter(self.ROOT, changes, berth_board.Board((own, foreign)))
+                self.assertEqual(kept, fix_return.MirrorChanges((coverage,), ()))
+                self.assertEqual(withheld, (fix_return.Withheld("Cargo.lock", "other-2 (theirs)"),))
+
+    def test_active_plan_shrink_keeps_its_declared_protection(self) -> None:
+        kept, withheld = self.hold(
+            reservation("own-1", self.ROOT, "mine", "tree:src"),
+            reservation("other-2", Path("/fixture/other"), "theirs", "file:src/foreign.rs",
+                        merge_extent=berth_board.MergeEmpty(), source_kind="plan_shrink"),
         )
         self.assertEqual(kept, fix_return.MirrorChanges(
             ("src/held.rs", "src/free.rs", "src/clear.rs"), ("src/gone.rs",)))

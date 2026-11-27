@@ -450,6 +450,41 @@ with socket.socket(fileno=int(sys.argv[1])) as peer:
             self.assertEqual(result.get("reason"), f"Still running after Kill: pid {process.pid}")
             self.assertEqual(notices, [])
 
+    def test_saved_kill_numbers_advance_per_row_and_read_old_results_as_zero(self) -> None:
+        run = kill_action.OutsideKillCandidate(17, "123", "test.py")
+        recipient = staff.StaffId("fixture")
+        target = kill_action.OutsideKillTarget(run, kill_action.OutsideCommandTree(), recipient,
+                                               "test, worker", "test", "worker")
+        other_run = replace(run, row_pid=18)
+        other_target = replace(target, candidate=other_run)
+        targets = {run.reference: target, other_run.reference: other_target}
+        actions = kill_action.KillActions(self.root, lambda: targets)
+        record = self.root / ".review-link-build-kill" / f"{run.reference}.json"
+
+        def stop(service: kill_action.KillActions, reference: str) -> int | None:
+            offers, _ = service.options(15)
+            offer = offers[reference]
+            result = service.stop(reference, offer["handle"], "", offer["kill_number"])
+            assert not isinstance(result, kill_action.NoStopRoute)
+            return result.get("kill_number")
+
+        with (patch.object(kill_action, "live_targets", return_value={}),
+              patch.object(kill_action, "stop_outside_tree", return_value=kill_action.OutsideProcessSurvived(17))):
+            first = stop(actions, run.reference)
+            legacy = worker_lifecycle.read_json_object(record)
+            legacy_result = cast(dict[str, object], legacy["result"])
+            _ = legacy_result.pop("kill_number", None)
+            _ = record.write_text(json.dumps(legacy))
+            resumed = kill_action.KillActions(self.root, lambda: targets)
+            resumed.resume()
+            _, (old_result,) = resumed.options(15)
+            after_legacy = stop(resumed, run.reference)
+            other_first = stop(resumed, other_run.reference)
+            retry = stop(resumed, run.reference)
+        saved = admission_wire.parse_record(record.read_text(), kill_action.SavedKillAction)
+        self.assertEqual((first, old_result.get("kill_number"), after_legacy, other_first,
+                          retry, saved.result.get("kill_number")), (1, 0, 1, 1, 2, 2))
+
     def test_outside_kill_waits_for_a_late_child_in_the_run_slice(self) -> None:
         queued, _, scope = self.scoped_target()
         run = kill_action.OutsideKillCandidate(queued.candidate.holder_pid, queued.candidate.holder_start, "test.py")
@@ -1014,6 +1049,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
                 self.assertEqual(actions.options(15)[1][0]["stop"], kill_action.StopState.STOPPING)
                 saved = self.saved_action(target)
                 self.assertIsInstance(saved.stage, kill_action.StopRequested)
+                self.assertEqual(actions.options(15, frozenset({run.reference})), ({}, [saved.result]))
                 self.finish_run(target, stop_reason=reason, stop_pass_requested=True, stop_notice_id=action.id)
                 targets.return_value = {}
                 return False
@@ -1024,7 +1060,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
             deliver.assert_called_once()
             (saved,) = cast(tuple[kill_action.SavedKillAction], deliver.call_args.args)
             self.assertEqual((saved.recipient, saved.message), (target.recipient, reason + "\nUse the next slot."))
-            self.assertEqual(result, {"reference": run.reference, "step": "nextest", "pid": 17,
+            self.assertEqual(result, {"reference": run.reference, "kill_number": 1, "step": "nextest", "pid": 17,
                                       "stop": kill_action.StopState.STOPPED, "delivery": kill_action.DeliveryState.SENT,
                                       "time": "16:41 PST", "recipient_name": "impl3", "recipient_role": "worker"})
             self.assertEqual(actions.options(15), ({}, [result]))
