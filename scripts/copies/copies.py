@@ -40,6 +40,8 @@ from scripts.lib import (
     build_copies, build_folder_lock, build_folders, cancellation, conf, copy_record, file_lock, git_index, git_rescue,
     process_group, process_start, scratch, session_folder,
 )
+from scripts.lib import copy_owner as owner_lookup
+from scripts.lib.copy_owner import ACTIVE_GATES as ACTIVE_GATES, ActiveGate as ActiveGate
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -49,7 +51,7 @@ from scripts.lib.copy_record import (
 from scripts.buildlog.store import host_name
 from scripts.buildlog import treekey
 from scripts.lib.build_copies import CopyGitFailure, source_checkout
-from scripts.build_queue import first_step
+from scripts.build_queue import first_step, placement
 from scripts.lib.build_steps import (
     GATE_SCRIPTS, MERGE_GATE_PROGRAMS,
     OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, command_program,
@@ -67,22 +69,9 @@ if TYPE_CHECKING:
 # Checksums skip equal files. Changed files get the receiver write time.
 RSYNC_RECEIVER_WRITE_TIME_FLAGS = "-rlpc"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
-OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
 PREPARED_GATE_FD = "BUILDLOG_PREPARED_GATE_FD"
-
-
-@dataclass(frozen=True)
-class ActiveGate:
-    """The caller holds the copy for the gate."""
-
-    tree: Path
-    source: Path
-    owner: str
-
-
-ACTIVE_GATES: ContextVar[tuple[ActiveGate, ...]] = ContextVar("active_gate_checkouts", default=())
 
 
 @dataclass(frozen=True)
@@ -468,24 +457,11 @@ def source_owner(source: Path) -> str:
 
 def recorded_owner(source: Path, *,
                    intent: scratch.RemovalIntentAccess = scratch.RemovalIntentAccess.RECOVER) -> str:
-    """Use the standing checkout owner, copy owner or staff owner; empty when none is recorded."""
-    for active in reversed(ACTIVE_GATES.get()):
-        if active.tree == source.resolve():
-            return active.owner
-    record = scratch.task_of(source, intent=intent)
-    if isinstance(record, copy_record.Registered):
-        owner = record.fields.get("owner_unit")
-        if isinstance(owner, str):
-            return checked_owner(owner)
-    from scripts.production import staff
-    from scripts.agents.remote import local_machine
+    """Read the copy owner and permit removal intent recovery by default."""
     try:
-        member = staff.local_snapshot().by_worktree(local_machine(), source.resolve())
-        if member is not None:
-            return str(member.id)
-    except staff.StaffUnreadable:
-        pass
-    return ""
+        return owner_lookup.recorded_owner(source, intent=intent)
+    except owner_lookup.InvalidCopyOwner as error:
+        raise CopyError(str(error)) from error
 
 
 def fallback_owner(role: str) -> str:
@@ -585,9 +561,10 @@ def main_checkout(source: Path) -> Path:
 
 
 def checked_owner(owner: str) -> str:
-    if not OWNER.fullmatch(owner):
-        raise CopyError(f"{owner!r}: owner must match [a-z0-9][a-z0-9_-]*")
-    return owner
+    try:
+        return owner_lookup.checked_owner(owner)
+    except owner_lookup.InvalidCopyOwner as error:
+        raise CopyError(str(error)) from error
 
 
 def holder(tree: Path) -> KnownHolder | UnreadableHolder:
@@ -1633,7 +1610,7 @@ def gate_command_source_check(command: Sequence[str], *,
 @contextmanager
 def _command_copy(
     owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
-    merge: MergePolicy, step: str = "", gate_targets: tuple[str, ...] = (), place_unnamed_gate: bool = True,
+    merge: MergePolicy, step: str = "", gate_targets: placement.GateTargets | None = None, place_unnamed_gate: bool = True,
     check_source: Callable[[Path], None] | None = None,
 ) -> Generator[AdmittedCommandCopy | DirectCommandCopy]:
     """Hold the copy and any first-step admission through the caller scope."""
@@ -1641,11 +1618,12 @@ def _command_copy(
 
     job = command_job(command)
     label = step or (job.step if isinstance(job, StepJob) else "")
+    named = gate_targets is not None and bool(gate_targets.names)
     try:
         with ExitStack() as scope:
-            if isinstance(job, StepJob) and (gate_targets or not uses_parent_reservation(tuple(command))):
+            if isinstance(job, StepJob) and (named or not uses_parent_reservation(tuple(command))):
                 source = Path(repo).expanduser().resolve()
-                if (check_source is not None or gate_targets
+                if (check_source is not None or named
                         or place_unnamed_gate and command_program(command) in GATE_SCRIPTS
                         or isinstance(verify_command(command), VerifyCommand)):
                     source = scope.enter_context(requested_source(source, policy, merge))
@@ -1672,7 +1650,7 @@ def _command_copy(
 
 @contextmanager
 def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
-                 merge: MergePolicy = NO_MERGE, step: str = "", gate_targets: tuple[str, ...] = ()) -> Generator[Path]:
+                 merge: MergePolicy = NO_MERGE, step: str = "", gate_targets: placement.GateTargets | None = None) -> Generator[Path]:
     """Admit the command before preparing the copy. Hold the copy until the caller exits."""
     with _command_copy(owner, repo, policy, command, merge=merge, step=step, gate_targets=gate_targets,
                        place_unnamed_gate=False) as prepared:
@@ -2776,7 +2754,7 @@ def mirror_remove(args: CopyArguments) -> int:
                 recover_mirror_stage(tree, pending)
             if tree.exists():
                 task_record = copy_record.record_path(tree)
-                clone_path = (args.host == "localhost" and OWNER.fullmatch(args.owner) is not None
+                clone_path = (args.host == "localhost" and owner_lookup.OWNER_PATTERN.fullmatch(args.owner) is not None
                               and tree.name.startswith(clone_owner_prefix(args.owner))
                               and (tree.resolve().parent == copy_record.root().resolve() or scratch.in_session_folder(tree)))
                 if task_record is None and scratch.in_session_folder(tree):
@@ -2943,7 +2921,7 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
         environment = {**os.environ, "BUILDLOG_PREPARED_COPY": str(source)}
         return run_prepared_gate(command, cwd=source, descriptors=tuple(args.lease_fd), environment=environment)
 
-    if not targets and uses_parent_reservation(tuple(command)):
+    if not targets.names and uses_parent_reservation(tuple(command)):
         result = run()
     else:
         with first_step.admitted_run(command, source, targets=targets) as admitted:

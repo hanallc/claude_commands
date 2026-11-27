@@ -20,7 +20,10 @@ from scripts.build_queue import admission_client, admission_records, admission_w
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import write_process
-from scripts.build_queue.test_placement import PlacementFixture
+from scripts.build_queue.test_placement import PlacementFixture, local_candidate
+from scripts.build_targets import target_config
+from scripts.build_targets.gate_targets import TARGET_NOT_CONFIGURED
+from scripts.buildlog import treekey
 from scripts.copies import copies
 from scripts.lib import build_folders, process_stat
 from scripts.lib.build_steps import GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, gate_job_from_process
@@ -114,7 +117,7 @@ class CheckpointGateTests(unittest.TestCase):
                 run.assert_called_once()
                 argv = cast(list[str], run.call_args.args[0])
                 self.assertEqual(run.call_args.kwargs["pass_fds"], (descriptor,))
-                self.assertEqual(argv[2:], ["gate-step", "--repo", str(folder), "--targets", "natedev,mac-linux",
+                self.assertEqual(argv[2:], ["gate-step", "--repo", str(folder),
                     "--lease-fd", str(descriptor), "--", *GATE])
 
             process = folder / "42"
@@ -123,14 +126,16 @@ class CheckpointGateTests(unittest.TestCase):
             self.assertEqual(gate_job_from_process("gate", process, start_time="123"), StepJob("test-all"))
 
             write_gate(folder, GATE, 0, lease_fd=descriptor)
-            with mock.patch.object(first_step, "admitted_run") as place:
+            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "natedev,mac-linux"}),
+                  mock.patch.object(first_step, "admitted_run") as place):
                 handoff = mock.Mock()
                 admitted = mock.Mock(spec=first_step.FirstStepAdmission, handoff=handoff,
                                      grant=first_step.HandedOff())
                 place.return_value = nullcontext(admitted)
                 result = run_gate_step(self, argv[2:])
                 self.assertEqual(result.returncode, 0, result.stderr)
-                place.assert_called_once_with(list(GATE), folder, targets=("natedev", "mac-linux"))
+                place.assert_called_once_with(list(GATE), folder, targets=placement.GateTargets(
+                    ("natedev", "mac-linux"), (("aws", placement.GATE_CALLER_EXCLUSION),), caller_supplied=True))
                 handoff.assert_called_once_with(folder)
 
     def test_gate_without_targets_starts_directly(self) -> None:
@@ -146,16 +151,38 @@ class CheckpointGateTests(unittest.TestCase):
         with PlacementFixture() as fixture:
             _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=natedev\nenabled.natedev=on\n")
             _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=off\n")
-            with (mock.patch.dict(os.environ),
-                  mock.patch.object(build_folders, "repo_word", return_value="claude"),
-                  mock.patch.object(subprocess, "run",
-                      return_value=subprocess.CompletedProcess(GATE, 0, "", "")) as run):
-                _ = os.environ.pop("BUILDLOG_GATE_TARGETS", None)
-                result = checkpoint_gate.run_test_command(list(GATE), fixture.root)
-            self.assertEqual(result.returncode, 0)
-            run.assert_called_once()
-            self.assertEqual(run.call_args.args[0][2:],
-                             ["gate-step", "--repo", str(fixture.root), "--targets", "natedev", "--", *GATE])
+            write_gate(fixture.root, GATE, 0)
+            local = local_candidate(fixture)
+
+            def grant(request: admission_wire.PlacementRequest) -> admission_wire.Assignment:
+                self.assertEqual(request.route, target_config.ANY_ELIGIBLE_TARGET)
+                self.assertEqual(request.constraints.candidates, (local,))
+                caller_supplied = bool(os.environ.get("BUILDLOG_GATE_TARGETS"))
+                reason = placement.GATE_CALLER_EXCLUSION if caller_supplied else TARGET_NOT_CONFIGURED
+                self.assertEqual(request.identity.gate_targets, placement.GateTargets(("natedev",),
+                    (("mac-linux", reason), ("aws", reason)), caller_supplied=caller_supplied))
+                return admission_wire.Assignment(placement.PlacementAssignment(request.episode, "attempt",
+                    local.destination, request.constraints.source_key, request.owner, request.constraints.session,
+                    request.since))
+
+            for requested in ("", "natedev"):
+                with (self.subTest(requested=requested),
+                      mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": requested}),
+                      mock.patch.object(build_folders, "repo_word", return_value="claude"),
+                      mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
+                      mock.patch.object(treekey, "tree_key", return_value="fixture-source"),
+                      mock.patch.object(first_step, "_placement_grant", side_effect=grant) as place,
+                      mock.patch.object(admission_client, "cancel_placement", return_value=admission_wire.Ok()),
+                      mock.patch.object(subprocess, "run",
+                          return_value=subprocess.CompletedProcess(GATE, 0, "", "")) as run):
+                    result = checkpoint_gate.run_test_command(list(GATE), fixture.root)
+                    self.assertEqual(result.returncode, 0)
+                    run.assert_called_once()
+                    argv = cast(list[str], run.call_args.args[0])
+                    self.assertEqual(argv[2:], ["gate-step", "--repo", str(fixture.root), "--", *GATE])
+                    gate_result = run_gate_step(self, argv[2:])
+                    self.assertEqual(gate_result.returncode, 0, gate_result.stderr)
+                    place.assert_called_once()
 
     def test_named_module_gate_keeps_the_parent_reservation(self) -> None:
         with PlacementFixture() as fixture:
@@ -509,7 +536,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
             return result
 
         with (PlacementFixture(), mock.patch.dict(os.environ),
-              mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+              mock.patch.object(first_step, "gate_targets", return_value=placement.GateTargets(("mac-linux",), ())),
               mock.patch.object(first_step, "_gate_request", return_value=fixture.request),
               mock.patch.object(admission_records, "process_start_time", return_value="456"),
               mock.patch.object(build_folders, "tool_folder", side_effect=tool_folder),
@@ -544,7 +571,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
 
         with (PlacementFixture(),
               mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": ""}, clear=False),
-              mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+              mock.patch.object(first_step, "gate_targets", return_value=placement.GateTargets(("mac-linux",), ())),
               mock.patch.object(first_step, "_gate_request", return_value=fixture.request),
               mock.patch.object(first_step, "_placement_grant", return_value=admission_wire.Assignment(fixture.guest)),
               mock.patch.object(admission_records, "process_start_time", return_value="456"),

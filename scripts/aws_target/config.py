@@ -11,6 +11,7 @@ import json
 from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
+from scripts.build_queue.placement import CLOUD_GATE_OFF_REASON
 from scripts.build_targets import target_config
 
 
@@ -50,7 +51,7 @@ def aws_switch(*machines: conf.ConfigRead) -> AwsSwitch:
 
 def cloud_gate_off_reason(switch: AwsOff | AwsSwitchUnusable) -> str:
     """Name why the cloud gate routes make no AWS call."""
-    return switch.reason if isinstance(switch, AwsSwitchUnusable) else 'cloud gates are off (cloud_gate.conf enabled=off)'
+    return switch.reason if isinstance(switch, AwsSwitchUnusable) else CLOUD_GATE_OFF_REASON
 
 
 def gate_regions(home: str, configuration: conf.ConfigRead | None = None) -> tuple[str, ...]:

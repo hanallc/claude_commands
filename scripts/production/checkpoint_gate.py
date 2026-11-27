@@ -169,7 +169,7 @@ def test_steps(production: ProductionDocument, paths: tuple[str, ...],
 def checkpoint_gate_targets(command: Sequence[str], folder: Path) -> tuple[str, ...]:
     """Report unavailable placement as a blocked checkpoint."""
     try:
-        return gate_targets(command, folder)
+        return gate_targets(command, folder).names
     except FirstStepRefused as error:
         reason = str(error)
         raise Stop("test", "blocked", reason, reason) from error
@@ -211,7 +211,7 @@ def run_test_command(command: list[str], folder: Path, *, merge_head: str = "",
                      *gate_copy_command(command[start:])]
     elif targets := checkpoint_gate_targets(command, folder):
         submitted = [str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "gate-step",
-                     "--repo", str(folder.resolve()), "--targets", ",".join(targets),
+                     "--repo", str(folder.resolve()),
                      *(word for fd in locks for word in ("--lease-fd", str(fd))), "--", *command]
     try:
         return subprocess.run(submitted, cwd=folder, capture_output=True, text=True, check=False, pass_fds=locks)

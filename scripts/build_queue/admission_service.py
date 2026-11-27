@@ -212,21 +212,8 @@ class RetryAfterAvailability:
 
 
 PLACEMENT_REASON_TEXT = {
-    "mac_linux_off": "the guest is off",
-    "mac_linux_unregistered": "the guest has no queue registration",
-    "mac_linux_settings_unreadable": "the guest settings are unreadable or invalid",
-    "mac_linux_backoff_unreadable": "the guest backoff record is unreadable or invalid",
-    "mac_linux_backoff": "the guest is in retry backoff",
-    "mac_linux_reading_required": "the queue needs a newer guest reading",
-    MAC_LINUX_NO_ANSWER: "the Mac does not answer",
+    **placement.PLACEMENT_REASON_TEXT,
     MAC_LINUX_START_UNCONFIRMED: "the Mac Linux guest did not confirm a start",
-    "busy": "the target is busy",
-    "off": "the target is off",
-    "disk": "the target needs more disk space",
-    "command": "the target does not support this command",
-    "repo": "the target does not support this repository",
-    "linux_only": "this step runs only on Linux",
-    "offload_exclude": "the target excludes this step",
 }
 
 
@@ -1729,6 +1716,7 @@ class Connection:
     finished: bool = False
     version: int = 1
     placement_request_digest: bytes | None = None
+    parent_gate: status_wire.ParentGateTargets | None = None
 
 
 @dataclass(frozen=True)
@@ -3239,6 +3227,8 @@ class AdmissionServer:
             row["verify"] = identity.verify
         if isinstance(identity.job, StepJob):
             row["job"] = identity.job
+        if identity.gate_targets is not None:
+            row["gate_targets"] = identity.gate_targets
         if isinstance(request, ServiceEstimatedAdmission):
             row["ci_runner"] = request.runner
             if isinstance(request.job_start, records.JobStart):
@@ -3952,7 +3942,7 @@ class AdmissionServer:
             waiter = record.queue_waiter
             identity = wire.Identity(waiter.get("session_id", ""), waiter.get("session_name", ""),
                 record.step, record.worktree, waiter.get("unit", ""), job=record.gate_job,
-                verify=waiter.get("verify", records.NotVerifyCall()))
+                verify=waiter.get("verify", records.NotVerifyCall()), gate_targets=waiter.get("gate_targets"))
             sidecar = Path(record.sidecar)
             started_at = step_estimator.epoch(record.admitted_at)
             current = cloud_progress.read(sidecar) if record.sidecar else cloud_progress.NoCloudProgress()
@@ -4012,15 +4002,25 @@ class AdmissionServer:
             if (request is not None and assignment is not None
                     and assignment.assignment.destination.provider == "local"):
                 candidates[record.reservation_id] = assignment.placement_candidates or self._placement_candidate_reading(request)
-        if not candidates:
+        nested_targets = {report.reservation: report.gate_targets for connection in self.connections.values()
+                          if (report := connection.parent_gate) is not None}
+        if not candidates and not nested_targets:
             return reading
+
+        def with_targets(step: records.RunningStep, reservation: str) -> records.RunningStep:
+            if (targets := nested_targets.get(reservation)) is not None:
+                return replace(step, gate_targets=targets, placement_candidates=())
+            if named := candidates.get(reservation):
+                return replace(step, placement_candidates=named)
+            return step
+
         reservations = iter(reading.explanation.decided_from.reservations)
         running: list[records.RunningStep] = []
         explained: list[records.ExplainedRunningStep] = []
         for step, entry in zip(reading.view.running, reading.explanation.running, strict=True):
-            named = candidates.get(next(reservations).get("reservation_id", ""), ()) if gate.running_has_reservation(step) else ()
-            running.append(replace(step, placement_candidates=named) if named else step)
-            explained.append(replace(entry, step=replace(entry.step, placement_candidates=named)) if named else entry)
+            reservation = next(reservations).get("reservation_id", "") if gate.running_has_reservation(step) else ""
+            running.append(with_targets(step, reservation))
+            explained.append(replace(entry, step=with_targets(entry.step, reservation)))
         return replace(reading, view=replace(reading.view, running=tuple(running)),
                        explanation=replace(reading.explanation, running=tuple(explained)))
 
@@ -4070,10 +4070,12 @@ class AdmissionServer:
                 pid=pid, started_at=saved.permission.consumed_at if isinstance(saved.permission, placement.PermissionConsumed) else 0,
                 unit=identity.unit, project=gate.step_project(request.profile.repo), execution=evidence,
                 assignment_host=assignment.destination.host, verify=identity.verify,
-                assignment_target=assignment.destination.target if guest else "",
+                assignment_target=assignment.destination.target if guest or identity.gate_targets is not None else "",
                 placement_candidates=saved.placement_candidates or self._placement_candidate_reading(request),
                 confirmed_guest_run=confirmed, counter=counter,
-                route=request.route if guest else records.DIRECT_CARGO, job=identity.job if guest else GATE_JOB_NOT_RECORDED,
+                route=request.route if guest or identity.gate_targets is not None else records.DIRECT_CARGO,
+                job=identity.job if guest or identity.gate_targets is not None else GATE_JOB_NOT_RECORDED,
+                gate_targets=identity.gate_targets,
                 mac_placement=f"{assignment.episode}/{assignment.attempt}"
                     if (assignment.destination.provider == "mac" or confirmed is not None
                         or guest and consumed and assignment.episode in self.bumps.moves) else "",
@@ -4140,7 +4142,8 @@ class AdmissionServer:
                     records.MachineChoiceWait(), row.get("unit", ""),
                     project=gate.step_project(row.get("repository_name", "")), run=row.get("build_run", NoLiveBuildRun()),
                     route=records.waiter_route(row), verify=row.get("verify", records.NotVerifyCall()),
-                    job=row.get("job", GATE_JOB_NOT_RECORDED), what=row.get("what", "")))
+                    job=row.get("job", GATE_JOB_NOT_RECORDED), what=row.get("what", ""),
+                    gate_targets=row.get("gate_targets")))
                 continue
             request = routed.get(row_id)
             candidates = self.placement_eligibility.get(request.episode, ()) if request is not None else ()
@@ -4156,6 +4159,8 @@ class AdmissionServer:
                 job=row.get("job", GATE_JOB_NOT_RECORDED), ci_runner=row.get("ci_runner", ""),
                 ci_job_start=records.waiter_job_start(row),
                 verify=row.get("verify", records.NotVerifyCall()), placement_targets=targets,
+                placement_candidates=candidates if "gate_targets" in row else (),
+                gate_targets=row.get("gate_targets"),
                 speculative_copy=request is not None and isinstance(request.purpose, placement.SpeculativeCopy),
                 took_place=took_place, what=row.get("what", "")))
         reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible)))
@@ -5867,7 +5872,8 @@ done
 
         candidate = configured_scaler_gate(conf.read(registry), destination.target)
         if not isinstance(candidate.eligibility, placement.AllowedHost):
-            raise ValueError(f"The AWS scaler is {candidate.eligibility.reason}")
+            reason = candidate.eligibility.reason
+            raise ValueError("The AWS scaler is off" if reason == "off" else reason)
         if (candidate.destination, candidate.settings) != (destination, self._placement_settings(request, destination)):
             raise ValueError("The AWS scaler differs from the assigned target")
 
@@ -6081,7 +6087,7 @@ done
         candidates = self.placement_eligibility.get(request.episode)
         if candidates is None:
             candidates = tuple(placement.CandidateEligibility(candidate.destination,
-                placement.EvidenceNeeded("the target reading is unavailable")
+                placement.EvidenceNeeded(placement.TARGET_READING_UNAVAILABLE)
                     if isinstance(candidate.eligibility, placement.AllowedHost) else candidate.eligibility)
                 for candidate in request.constraints.candidates)
         return tuple(replace(candidate, eligibility=replace(state, reason=reason))
@@ -7083,7 +7089,7 @@ done
         return [self._placement_status(assignment, check_lifetime=False)]
 
     def _authorize(self, request: wire.Request, uid: int) -> str:
-        if isinstance(request, status_wire.PlacementStatusRequest):
+        if isinstance(request, (status_wire.PlacementStatusRequest, status_wire.ParentGateTargets)):
             return ""
         if isinstance(request, wire.VerifyRunSlotRequest):
             if uid != os.getuid() and process_uid(request.owner.pid, self.proc.path) != uid:
@@ -7193,6 +7199,21 @@ done
             print(f"admission request {type(request).__name__}: wall={wall:.3f}s cpu={cpu:.3f}s",
                   file=sys.stderr, flush=True)
 
+    def _report_parent_gate(self, request: status_wire.ParentGateTargets,
+                            connection: Connection | NoConnection) -> wire.Ok | wire.Refused:
+        record = next((row for row in self.reservations.values() if row.reservation_id == request.reservation), None)
+        if (record is None or not isinstance(record.place, wire.LocalPlace)
+                or not isinstance(record.ending, NotEnding) or not isinstance(connection, Connection)):
+            return wire.Refused("The parent reservation is unavailable")
+        credentials = connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        pid, uid, _ = struct.unpack("3i", credentials)
+        if ((uid != os.getuid() and self._account(record.owner) != uid)
+                or pid not in gate.process_tree({record.owner.pid: record.owner.start_time}, self.proc.processes())):
+            return wire.Refused("The gate does not use this parent reservation")
+        connection.parent_gate = request
+        self._schedule_pass()
+        return wire.Ok()
+
     def _handle_request(self, request: wire.Request, connection: Connection | NoConnection
                         ) -> list[wire.Reply]:
         uid = peer_uid(connection)
@@ -7215,6 +7236,8 @@ done
             return [wire.Ok()]
         if isinstance(request, wire.SettlementRequest):
             return [self._request_settlement(request)]
+        if isinstance(request, status_wire.ParentGateTargets):
+            return [self._report_parent_gate(request, connection)]
         provider_report = isinstance(request, wire.ExecutionReport) and (
             request.assignment.destination.provider == "scaler" or is_mac_linux_guest(request.assignment.destination))
         if (isinstance(connection, Connection) and not provider_report
@@ -7675,7 +7698,8 @@ done
         if connection.finished:
             return
         connection.sending += self.reply_bytes(reply, version=connection.version)
-        connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply))
+        connection.finished = not (isinstance(reply, (wire.Wait, wire.BuildHistoryReply))
+                                   or isinstance(reply, wire.Ok) and connection.parent_gate is not None)
         if connection.finished:
             self._drop_deferred_requests(connection)
         self.epoll.modify(connection.socket.fileno(), select.EPOLLOUT if connection.finished
@@ -7773,6 +7797,8 @@ done
         self.epoll.unregister(descriptor)
         del self.connections[descriptor]
         connection.socket.close()
+        if connection.parent_gate is not None:
+            self._schedule_pass()
 
     def _detach_admission(self, connection: Connection, reply: wire.Refused | NoWaitReply = NO_WAIT_REPLY) -> bool:
         """End this connection's eligibility before a later pass can grant it."""
