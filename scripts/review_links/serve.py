@@ -1983,9 +1983,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         response["list_producer"] = review_items.name(report_row.producer, created.members)
                     elif on_list or isinstance(request, new_item_dialog.NewItemRequest) and (
                             request.page_recipient == new_item_dialog.PageRecipient.PRODUCER):
-                        number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
-                        if isinstance(number, int):
-                            response["list_number"] = number
+                        reservation = review_submissions.list_filing_reservation(saved)
+                        destination = the_list.review_reservation(reservation)
+                        if not isinstance(destination, the_list.NextNumber):
+                            response["list_number"] = destination.number
                 if pending or (main_request is not None and list_page_request
                                and isinstance(screenshot, new_item_dialog.PageScreenshot)):
                     if review_submissions.PAGE_SCREENSHOT not in details.images:

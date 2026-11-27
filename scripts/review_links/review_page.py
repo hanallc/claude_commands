@@ -309,9 +309,7 @@ class ReviewSnapshot:
 
 
 def list_destination(item: ReviewItem) -> investigation.ListDestination | investigation.NoListDestination:
-    source = item.source
-    return (source.record.list_destination if isinstance(source, review_items.InvestigationSource)
-            else investigation.NoListDestination.ABSENT)
+    return item.moved_report
 
 
 def report_url(destination: investigation.ListDestination) -> str:
@@ -579,8 +577,10 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     submission_keys: dict[str, str] = {}
     unavailable_cards: set[str] = set()
     status = change_page.DeliveryStatus(root)
-    items = review_items.read(root, members=members, show='active', sources=sources, zone=zone)
+    items = review_items.read(root, members=members, show='active', sources=sources, zone=zone,
+                              include_filed=True, retain_moved_questions=True)
     items.extend(moved_report_evidence(members, sources, zone))
+    items = review_items.apply_list_handoffs(items, zone, sources=sources, members=members)
     sources.extend(for_you.source_paths())
     actions = for_you.read(members=members)
     items.extend(review_items.for_you_item(row, members, zone=zone) for row in actions.rows)
@@ -802,11 +802,13 @@ class ReviewSnapshotCache:
         """Replace or remove one record while serving the previous version to readers."""
         if members is None:
             members = staff.snapshot()
+        sources = ReviewSourceStamps()
         try:
-            item: ReviewItem | ReviewRecordNotPublished = review_items.read_current(self.root, current.records[key], members)
+            item: ReviewItem | ReviewRecordNotPublished = review_items.read_current(
+                self.root, current.records[key], members, sources=sources)
         except (FileNotFoundError, review_items.ReviewRecordMissing):
             item = ReviewRecordNotPublished()
-        return self.publish_item(current, key, item, members), item
+        return self.publish_item(current, key, item, members, stamps=sources.before_read), item
 
     def create_submission(
         self, request: (new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry
@@ -865,11 +867,12 @@ class ReviewSnapshotCache:
                 previous = current.records.get(previous_key)
                 if isinstance(projected.source, review_items.ProposalSource) and previous is not None:
                     projected = replace(projected, queue_after=previous.queue_after)
-                item = review_items.read_current(self.root, projected, members)
+                sources = ReviewSourceStamps()
+                item = review_items.read_current(self.root, projected, members, sources=sources)
                 origin = review_items.submission_origin(item)
                 if not isinstance(origin, new_item_dialog.ReviewSubmission) or origin.request_id != saved.request_id:
                     raise review_items.ReviewRecordChanged('The saved Review item changed.')
-                fresh = self.publish_item(current, item.key, item, members, stamps=stamps,
+                fresh = self.publish_item(current, item.key, item, members, stamps={**sources.before_read, **stamps},
                                           replaced_key=previous_key)
             finally:
                 self.invalidate()
@@ -930,7 +933,11 @@ class ReviewSnapshotCache:
         sources = ReviewSourceStamps()
         if isinstance(item, ReviewRecordNotPublished) or (
                 item.state == ReviewState.DONE and item.type != ReviewType.FOR_YOU
-                and not review_items.on_list(item)):
+                and not review_items.on_list(item) and not (
+                    isinstance(item.source, review_items.InvestigationSource)
+                    and isinstance(item.source.record.list_destination, investigation.ListDestination))
+                and not (item.type in review_items.QUESTION_TYPES
+                         and any(review_items.list_move_event(event) for event in item.log))):
             _ = records.pop(key, None)
             entries = [entry for entry in current.entries if entry['key'] not in (key, previous_key)]
             record_version = key
@@ -939,6 +946,7 @@ class ReviewSnapshotCache:
             record_assets = retain_record_assets(item, change_page.DeliveryStatus(self.root), sources)
             assets.update(record_assets)
             if (stamps is not None and current.records.get(key) == item and members == current.members
+                    and all(current.source_stamps.get(path) == stamp for path, stamp in stamps.items())
                     and key not in current.unavailable_cards
                     and all(assets.get(asset) == current.assets.get(asset) for asset in asset_keys)):
                 return current

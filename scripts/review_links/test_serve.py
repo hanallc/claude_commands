@@ -1879,7 +1879,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         row, = the_list.records(keeper.id, include_closed=True)
         self.assertEqual(confirmed, {row.number})
         self.assertEqual(receipt["list_number"], row.number)
-        self.assertEqual(the_list.reserved_review_number(reservation), row.number)
+        self.assertEqual(the_list.review_reservation(reservation), investigation.ListDestination(keeper.id, row.number))
         self.assertEqual(row.native_question, native)
         self.assertIs(row.state, the_list.ItemState.WORKING)
         notice, = read_new_item_notices(log)
@@ -2162,8 +2162,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             with patch.object(the_list, "_save", side_effect=OSError("The row write stopped.")):
                 review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
             claim.assert_not_called()
-            number = the_list.reserved_review_number(reservation)
-            assert isinstance(number, int)
+            destination = the_list.review_reservation(reservation)
+            assert isinstance(destination, investigation.ListDestination)
+            number = destination.number
             folder = the_list.folder(keeper.id)
             counter = (folder / ".next-number").read_bytes()
             row = folder / f"L{number}.md"
@@ -2184,7 +2185,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(route.read_bytes(), before)
             self.assertEqual(saved.path.read_bytes(), original)
             self.assertEqual((folder / ".next-number").read_bytes(), counter)
-            self.assertEqual(the_list.reserved_review_number(reservation), number)
+            self.assertEqual(the_list.review_reservation(reservation), destination)
             self.assertEqual(read_new_item_notices(log), [])
             review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
         item, = the_list.records(keeper.id, include_closed=True)
@@ -2235,7 +2236,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
 
         row, = the_list.records(keeper.id, include_closed=True)
-        self.assertEqual(the_list.reserved_review_number(reservation), row.number)
+        self.assertEqual(the_list.review_reservation(reservation), investigation.ListDestination(keeper.id, row.number))
         self.assertEqual(row.native_question, the_list.NativeQuestionItem(
             the_list.QuestionItemKind.FROM_NATE, f"submission/question/{saved.request_id}"))
         self.assertIs(row.state, the_list.ItemState.WORKING)

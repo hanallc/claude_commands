@@ -77,6 +77,19 @@ class ListDestination:
     keeper: staff.StaffId
     number: int
 
+    def encode(self) -> str:
+        return json.dumps((self.keeper, self.number))
+
+    @staticmethod
+    def decode(raw: str) -> ListDestination:
+        match cast(object, json.loads(raw)):
+            case [str(keeper), int(number)] if (keeper and Path(keeper).name == keeper
+                                                and keeper not in (".", "..")
+                                                and type(number) is int and number > 0):
+                return ListDestination(staff.StaffId(keeper), number)
+            case _:
+                raise InvestigationError("invalid List destination")
+
 
 class NoListDestination(Enum):
     ABSENT = "still on Review"
@@ -88,14 +101,7 @@ class CliFilingOutput(StrEnum):
 
 
 def _read_list_destination(raw: str) -> ListDestination | NoListDestination:
-    if not raw:
-        return NoListDestination.ABSENT
-    data = cast(object, json.loads(raw))
-    match data:
-        case [str(keeper), int(number)] if keeper and number > 0:
-            return ListDestination(staff.StaffId(keeper), number)
-        case _:
-            raise InvestigationError("invalid List destination")
+    return ListDestination.decode(raw) if raw else NoListDestination.ABSENT
 
 
 @dataclass(frozen=True)
@@ -374,7 +380,7 @@ def _save(store: Investigations, item: Investigation, path: Path,
         fields["purpose"] = item.purpose
     destination = item.list_destination
     if isinstance(destination, ListDestination):
-        fields["list_destination"] = json.dumps((destination.keeper, destination.number))
+        fields["list_destination"] = destination.encode()
     if item.cli_output is CliFilingOutput.PENDING:
         fields["cli_output"] = item.cli_output
     body = f"{item.question}{ANSWER_SECTION}{item.answer}"
@@ -646,9 +652,6 @@ def file_on_list(path: Path, write_list_item: Callable[[Investigation], ListDest
             return item
         if mode is ListFilingMode.MOVE_WAIT and item.state != InvestigationState.OPEN:
             return item
-        if mode is ListFilingMode.MOVE_BUG and item.purpose is InvestigationPurpose.INVESTIGATE:
-            # Prevent Review actions before the List row becomes visible.
-            item = _save(store, replace(item, purpose=InvestigationPurpose.MOVING_LEGACY_BUG), path)
         destination = write_list_item(item)
         if (mode is ListFilingMode.NEW_REPORT and item.purpose is InvestigationPurpose.LIST_INVESTIGATION
                 and isinstance(item.submission, new_item_dialog.NoReviewSubmission)):
@@ -659,7 +662,8 @@ def file_on_list(path: Path, write_list_item: Callable[[Investigation], ListDest
             event = ReviewLog(moment, "nate", f"moved to List item {destination.number}")
             item = replace(item, log=(*item.log, event))
             if mode is ListFilingMode.MOVE_BUG:
-                item = replace(item, state=InvestigationState.READ, answered=item.answered or stamp, read=stamp)
+                item = replace(item, state=InvestigationState.READ, answered=item.answered or stamp, read=stamp,
+                               purpose=InvestigationPurpose.MOVING_LEGACY_BUG)
         return _save(store, replace(item, list_destination=destination), path)
 
 
@@ -683,6 +687,16 @@ def list_evidence_record(key: str) -> Investigation:
     return load(staff.StaffId(owner), identity)
 
 
+def _list_owns_review_actions(item: Investigation) -> bool:
+    if item.belongs_on_list:
+        return True
+    if item.kind is not InvestigationKind.BUG:
+        return False
+    saved = cast(Callable[[str, str], bool],
+                 import_module("scripts.production.the_list").has_legacy_bug_report)
+    return saved(f"investigation/{item.owner}/{item.id}", item.submission_scope)
+
+
 def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
               check: Callable[[], object] | None = None) -> Investigation:
     """Mark an answer read once; accept an exact repeat without writing."""
@@ -692,7 +706,7 @@ def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
         item = _load(store, identity, path)
         if item.state == InvestigationState.READ:
             return item
-        if item.belongs_on_list:
+        if _list_owns_review_actions(item):
             raise InvestigationError("Open the report on the List.")
         if item.state != InvestigationState.ANSWER_READY:
             raise InvestigationError(f"{identity}: cannot read an investigation in state {item.state}")
@@ -712,7 +726,7 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str, 
     with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
-        if item.belongs_on_list:
+        if _list_owns_review_actions(item):
             raise InvestigationError("Open the report on the List.")
         replace_wait = (item.state == InvestigationState.OPEN and action == 'question'
                         and isinstance(new_reply_proof, reply_tokens.ReplyTokenProof)
@@ -743,7 +757,7 @@ def record_review_log(owner: staff.StaffId, identity: str, words: str, *,
     with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
-        if item.belongs_on_list:
+        if _list_owns_review_actions(item):
             raise InvestigationError("Open the report on the List.")
         event = ReviewLog(datetime.now(timezone.utc), 'nate', words)
         _ = _save(store, replace(item, log=review_events.append(item.log, event)), path)
@@ -755,7 +769,7 @@ def change_waiting(record: Investigation, action: str, words: str, *, check: Cal
     with store.locked(check=check):
         path = _record_path(store, record.id)
         item = _load(store, record.id, path)
-        if item.belongs_on_list:
+        if _list_owns_review_actions(item):
             raise InvestigationError("Open the report on the List.")
         if item.submission != record.submission or item.state != InvestigationState.OPEN:
             raise InvestigationError("The selected investigation changed.")

@@ -871,10 +871,12 @@ class NumberedRecords:
                 yield
 
     def _list_folders(self) -> Iterator[Path]:
+        seen: set[Path] = set()
         for owner in state_root().iterdir():
             if owner.is_dir() and not owner.is_symlink():
-                folder = owner / self.collection
-                if not folder.is_symlink():
+                folder = (owner / self.collection).resolve()
+                if folder not in seen:
+                    seen.add(folder)
                     yield folder
 
     def _previous_numbers(self) -> Iterator[int]:
@@ -917,8 +919,9 @@ class NumberedRecords:
         self.require_list_keeper()
         counter = self.counter_path()
         saved = self._saved_next_number(counter)
+        current = counter.parent.resolve()
         former = (self._saved_next_number(folder / counter.name) for folder in self._list_folders()
-                  if folder != counter.parent)
+                  if folder != current)
         number = max(saved or max(self._previous_numbers(), default=0) + 1, max(former, default=0))
         while os.path.lexists(self.path(f"{self.prefix}{number}")):
             number += 1

@@ -357,6 +357,7 @@ class ReviewItem:
     body_answer_events: frozenset[int] = frozenset()
     exchange_handoff: FiledReviewExchange | NoFiledReviewExchange = NoFiledReviewExchange.ABSENT
     followup_log_copies: tuple[FollowupLogCopy, ...] = ()
+    moved_report: investigation.ListDestination | investigation.NoListDestination = investigation.NoListDestination.ABSENT
 
     def for_you(self, now: datetime) -> bool:
         """Count Open records whose next action belongs to the user."""
@@ -878,7 +879,7 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    states: tuple[ReviewState, ...] = REVIEW_STATES,
                    kinds: tuple[ReviewType, ...] = QUESTION_TYPES,
                    owner_options: dict[staff.StaffId, str] | None = None,
-                   selection: ReviewSelection = ALL_RECORDS) -> list[ReviewItem]:
+                   selection: ReviewSelection = ALL_RECORDS, retain_moved_questions: bool = False) -> list[ReviewItem]:
     selected = owners or tuple(member for member in members.rows if member.kind == 'producer' or
         member.kind == 'showrunner' and (include_unowned or
             isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc)) and member.doc.path in documents))
@@ -888,14 +889,18 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
     seen: set[Path] = set()
     identities_found: set[staff.StaffId] = set()
     statuses = tuple(status for status in ('open', 'closed')
-                     if (ReviewState.DONE in states if status == 'closed' else states != (ReviewState.DONE,)))
+                     if (retain_moved_questions or ReviewState.DONE in states if status == 'closed'
+                         else states != (ReviewState.DONE,)))
 
     def append(record: update_registration.QuestionRecord, *, unowned: bool = False) -> None:
         if record.path in seen:
             return
         seen.add(record.path)
-        if question_state(record) not in states or not selection.includes(
-                record.path, 'question/'+record.owner+'/'+record.path.name):
+        if question_state(record) not in states and not (
+                retain_moved_questions and any(list_move_event(event)
+                                               for event in review_events.decode(record.item.get('review_log', '')))):
+            return
+        if not selection.includes(record.path, 'question/'+record.owner+'/'+record.path.name):
             return
         item = question_item(record, members, unowned=unowned, zone=zone)
         if item.type in kinds:
@@ -1004,13 +1009,9 @@ def investigation_type(record: investigation.Investigation) -> ReviewType:
 
 
 def on_list(item: ReviewItem) -> bool:
-    """Check if the source record belongs to a List item."""
-    if isinstance(item.exchange_handoff, FiledReviewExchange) and item.exchange_handoff.hides_card:
-        return True
-    source = item.source
-    if isinstance(source, InvestigationSource) and source.record.belongs_on_list:
-        return True
-    return any(list_move_event(event) for event in item.log)
+    """Check if a verified List row replaces this Review card."""
+    return isinstance(item.moved_report, investigation.ListDestination) or (
+        isinstance(item.exchange_handoff, FiledReviewExchange) and item.exchange_handoff.hides_card)
 
 
 def list_move_event(event: ReviewLog) -> bool:
@@ -1502,14 +1503,14 @@ class ApplyListHandoffs(Protocol):
                  sources: list[Path] | None = None, members: staff.StaffSnapshot) -> list[ReviewItem]: ...
 
 
-def _apply_list_handoffs(items: list[ReviewItem], zone: ZoneInfo, *,
+def apply_list_handoffs(items: list[ReviewItem], zone: ZoneInfo, *,
                          sources: list[Path] | None = None, members: staff.StaffSnapshot) -> list[ReviewItem]:
     apply = cast(ApplyListHandoffs, import_module("scripts.review_links.answer_sources").apply_review_handoffs)
     return apply(items, zone, sources=sources, members=members)
 
 
 def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot, *,
-                 include_filed: bool = False) -> ReviewItem:
+                 include_filed: bool = False, sources: list[Path] | None = None) -> ReviewItem:
     """Reread the exact record. Use the snapshot owner for an Efficiency ledger."""
     source = item.source
     if isinstance(source, ForYouSource):
@@ -1527,15 +1528,15 @@ def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot, *,
     zone = user_zone()
     if isinstance(source, ProposalSource) and 'review_submission' in source.record.fields:
         record = read_sent_proposal(selection, source.record, members)
-        return record if include_filed else _apply_list_handoffs([record], zone, members=members)[0]
+        return record if include_filed else apply_list_handoffs([record], zone, sources=sources, members=members)[0]
     kinds = QUESTION_TYPES if item.type in QUESTION_TYPES else (item.type,)
     try:
-        records = project(root, members, kinds, REVIEW_STATES, None, [], selection, user_zone())
+        records = project(root, members, kinds, REVIEW_STATES, None, [] if sources is None else sources, selection, zone)
     except FileNotFoundError:
         records = []
     for record in records:
         if record.key == item.key:
-            return record if include_filed else _apply_list_handoffs([record], zone, members=members)[0]
+            return record if include_filed else apply_list_handoffs([record], zone, sources=sources, members=members)[0]
     raise ReviewRecordMissing('This item is no longer on the list.')
 
 
@@ -1618,13 +1619,14 @@ def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
          owner_options: dict[staff.StaffId, str] | None = None,
          sources: list[Path] | None = None, zone: ZoneInfo | None = None,
-         include_filed: bool = False) -> list[ReviewItem]:
+         include_filed: bool = False, retain_moved_questions: bool = False) -> list[ReviewItem]:
     """Read each record from its existing store without another stored copy."""
     members = staff.snapshot() if members is None else members
     zone = zone or user_zone()
-    items = project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS, zone)
+    items = project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS, zone,
+                    retain_moved_questions=retain_moved_questions)
     if not include_filed:
-        items = _apply_list_handoffs(items, zone, sources=sources, members=members)
+        items = apply_list_handoffs(items, zone, sources=sources, members=members)
     if open_view(show):
         now = datetime.now(zone)
         return [item for item in items if item.for_you(now)]
@@ -1633,7 +1635,7 @@ def read(root: Path, *, members: staff.StaffSnapshot | None = None,
 
 def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, ...], states: tuple[ReviewState, ...],
             owner_options: dict[staff.StaffId, str] | None, sources: list[Path] | None,
-            selection: ReviewSelection, zone: ZoneInfo) -> list[ReviewItem]:
+            selection: ReviewSelection, zone: ZoneInfo, *, retain_moved_questions: bool = False) -> list[ReviewItem]:
     """Select the requested records and apply the shared projection."""
     documents = tuple(dict.fromkeys(doc for member in members.rows if isinstance(member.doc, staff.LiveDoc)
                                     if (doc := record_store.local_document(member)) is not None))
@@ -1641,7 +1643,7 @@ def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, .
     question_kinds = tuple(kind for kind in kinds if kind in QUESTION_TYPES)
     if question_kinds:
         items.extend(question_items(members,documents,zone=zone,states=states,kinds=question_kinds,owner_options=owner_options,
-                                   sources=sources,selection=selection))
+                                   sources=sources,selection=selection,retain_moved_questions=retain_moved_questions))
     if ReviewType.CHANGE in kinds:
         items.extend(change_items(root,members,zone=zone,states=states,owner_options=owner_options,sources=sources,selection=selection))
     reports = tuple(kind for kind in kinds if kind in INVESTIGATION_TYPES)
@@ -1691,7 +1693,7 @@ def read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.Sta
     zone = zone or user_zone()
     items = _read_kind(kind, scope, members, below=below, sources=sources, own=own,
                        states=selected_states(show), zone=zone)
-    return _apply_list_handoffs(with_later([normalize_times(item, zone) for item in items], sources, zone=zone),
+    return apply_list_handoffs(with_later([normalize_times(item, zone) for item in items], sources, zone=zone),
                                  zone, sources=sources, members=members)
 
 
@@ -1812,7 +1814,7 @@ def ready_investigations(owner: staff.StaffId, *, sources: list[Path] | None = N
     zone = user_zone()
     members = staff.snapshot()
     items = investigation_items(members, owners=(owner,), sources=sources, states=(ReviewState.OPEN,), zone=zone)
-    return count_items(_apply_list_handoffs(with_later(items, sources, zone=zone), zone, sources=sources, members=members),
+    return count_items(apply_list_handoffs(with_later(items, sources, zone=zone), zone, sources=sources, members=members),
                        datetime.now(zone))
 
 

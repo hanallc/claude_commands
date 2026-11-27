@@ -3986,8 +3986,76 @@ the_list.fire_scheduled(timedelta(minutes=2))
         self.assertEqual(the_list.moved_report_candidate(MORTY.id, report.evidence_key), destination)
         self.assertEqual(the_list.file_report(MORTY.id, report, "Check the change", owner=RUNNER.id, producer=MORTY.id,
                                               unit="", source="nate", reservation=path), destination)
-        self.assertEqual(the_list.reserved_review_number(path), destination.number)
+        self.assertEqual(the_list.review_reservation(path), destination)
         self.assertEqual((folder / ".next-number").read_bytes(), counter)
+
+    def test_report_retry_keeps_the_former_keeper_after_the_native_write_stops(self) -> None:
+        for case in ("typed reservation", "numeric reservation"):
+            with (self.subTest(case=case),
+                  patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / case)})):
+                config = self.list_config.with_name("console.conf")
+                _ = config.write_text(f"page.list.owner={MORTY.id}\n")
+                native = investigation.file(RUNNER.id, "Check the report", "Keep the report.",
+                                            waiting_why="The owner checks the report.")
+                source = investigation.review_record_path(native.owner, native.id)
+                evidence = f"investigation/{native.owner}/{native.id}"
+                report = the_list.report_from_investigation(native, the_list.ReportKind.INVESTIGATION, evidence)
+
+                def file_report(keeper: staff.StaffId, reservation: Path | the_list.NextNumber
+                                ) -> investigation.ListDestination:
+                    return the_list.file_report(keeper, report, native.title, owner=RUNNER.id, producer=MORTY.id,
+                                                unit="", source="nate", reservation=reservation)
+
+                destination = file_report(MORTY.id, the_list.NextNumber.AVAILABLE)
+                _ = config.write_text(f"page.list.owner={BOB.id}\n")
+                reservation = self.root / case / "list-number"
+                route = reservation.with_name("list-filing.json")
+                _ = route.write_text(json.dumps({"keeper": BOB.id}))
+                with patch.object(investigation, "_save", side_effect=OSError("The native write stopped.")):
+                    with self.assertRaisesRegex(OSError, "The native write stopped"):
+                        _ = investigation.file_on_list(source, lambda _: file_report(BOB.id, reservation))
+                self.assertEqual(the_list.review_reservation(reservation), destination)
+                self.assertIs(investigation.load(native.owner, native.id).list_destination,
+                              investigation.NoListDestination.ABSENT)
+                if case == "numeric reservation":
+                    _ = reservation.write_text(f"{destination.number}\n")
+                saved = investigation.file_on_list(source, lambda _: file_report(BOB.id, reservation))
+                self.assertEqual(saved.list_destination, destination)
+                self.assertEqual(the_list.review_reservation(reservation), destination)
+                self.assertEqual(the_list.records(BOB.id, include_closed=True), [])
+                row, = the_list.records(MORTY.id, include_closed=True)
+                self.assertEqual((row.number, row.report), (destination.number, report))
+
+    def test_numeric_review_reservation_recovers_the_saved_route_after_a_keeper_change(self) -> None:
+        reservation = self.root / "list-number"
+        route = reservation.with_name("list-filing.json")
+        route_text = json.dumps({"keeper": MORTY.id})
+        _ = route.write_text(route_text)
+
+        def file(keeper: staff.StaffId) -> investigation.ListDestination:
+            return the_list.file_review_item(keeper, "Check the change", owner=RUNNER.id, producer=MORTY.id,
+                                             unit="", words="", evidence="", review_key="sdlc/C1",
+                                             source="nate", reservation=reservation)
+
+        with patch.object(the_list, "_save", side_effect=OSError("The List write stopped.")):
+            with self.assertRaisesRegex(OSError, "The List write stopped"):
+                _ = file(MORTY.id)
+        destination = the_list.review_reservation(reservation)
+        assert isinstance(destination, investigation.ListDestination)
+        _ = reservation.write_text(f"{destination.number}\n")
+        _ = self.list_config.with_name("console.conf").write_text(f"page.list.owner={BOB.id}\n")
+        route.unlink()
+        with self.assertRaisesRegex(the_list.ListError, "cannot verify the keeper"):
+            _ = file(BOB.id)
+        self.assertEqual(the_list.records(MORTY.id, include_closed=True), [])
+        self.assertEqual(the_list.records(BOB.id, include_closed=True), [])
+        self.assertEqual(reservation.read_text(), f"{destination.number}\n")
+        _ = route.write_text(route_text)
+        self.assertEqual(file(BOB.id), destination)
+        self.assertEqual(the_list.review_reservation(reservation), destination)
+        self.assertEqual(the_list.records(BOB.id, include_closed=True), [])
+        saved, = the_list.records(MORTY.id, include_closed=True)
+        self.assertEqual((saved.number, saved.reviews), (destination.number, ("sdlc/C1",)))
 
     def test_invalid_fields_and_inputs_refuse_without_writing(self) -> None:
         item = self.add()

@@ -24,6 +24,7 @@ from urllib.parse import urlencode
 
 from scripts.console_text import check as console_text
 from scripts.lib import atomic_file
+from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import (
@@ -691,6 +692,175 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertEqual(other.id, "L2")
         self.assertEqual(self.migrate(apply=True)[0], 0)
         self.assertEqual({item.id for item in the_list.records(KEEPER.id)}, {"L1", "L2"})
+
+    def test_fresh_list_creation_recovers_exchange_allocation_without_reading_sources(self) -> None:
+        for method in ("add", "create_records"):
+            for stage in ("before counter", "after counter"):
+                with (self.subTest(method=method, stage=stage),
+                      patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / method / stage)})):
+                    key = self.native("interrupted", {"since": FILED, "text": "Choose a plan", "question": "Which plan?"})
+                    stop = (patch.object(record_store.NumberedRecords, "finish_reserved_number",
+                                         side_effect=OSError("The counter write stopped."))
+                            if stage == "before counter" else
+                            patch.object(the_list, "_save_exchange_reservation",
+                                         side_effect=OSError("The reservation write stopped.")))
+                    with stop:
+                        self.assertEqual(self.migrate(apply=True)[0], 1)
+                    journal = record_store.state_root() / ".list-exchange-allocation"
+                    self.assertTrue(journal.is_file())
+                    invalid = the_list.folder(ASKER.id) / "L30.md"
+                    invalid.parent.mkdir(parents=True)
+                    _ = invalid.write_text("Invalid row.")
+                    keeper = KEEPER.id
+                    config = self.root / "config" / "console.conf"
+                    if stage == "after counter":
+                        keeper = OWNER.id
+                    _ = write_config_fixture(config, f"page.list.owner={keeper}\n")
+                    with patch.object(the_list, "scan_list_records", side_effect=AssertionError("Unexpected source scan.")):
+                        if method == "add":
+                            with self.assertRaisesRegex(the_list.ListError, "next available number"):
+                                _ = the_list.add(keeper, "Reserved", owner=OWNER.id, source="nate", changes={}, number=1)
+                            fresh = the_list.add(keeper, "New row", owner=OWNER.id, source="nate", changes={})
+                        else:
+                            fresh = the_list._new_item(31, "New batch", OWNER.id, keeper, "nate", {})  # pyright: ignore[reportPrivateUsage]
+                            the_list.create_records(keeper, (fresh,))
+                    self.assertGreater(fresh.number, 1)
+                    self.assertFalse(journal.exists())
+                    reserved = investigation.ListDestination(KEEPER.id, 1)
+                    self.assertEqual(the_list.exchange_reservation(key), the_list.ExchangeDestination(reserved, True))
+                    other = self.native("another-source", {"since": FILED, "text": "Another question",
+                                                          "question": "Which result?"})
+                    self.assertEqual(self.migrate(apply=True)[0], 1)
+                    self.assertIs(the_list.exchange_reservation(other), the_list.NextNumber.AVAILABLE)
+                    invalid.unlink()
+                    self.assertEqual(self.migrate(apply=True)[0], 0)
+                    self.assertEqual(the_list.load(KEEPER.id, "L1").filed_exchanges[0].source_key, key)
+                    second = the_list.exchange_reservation(other)
+                    assert isinstance(second, the_list.ExchangeDestination)
+                    self.assertGreater(second.destination.number, fresh.number)
+                    _ = write_config_fixture(config, f"page.list.owner={KEEPER.id}\n")
+
+    def test_list_alias_shares_the_lock_destination_and_receipt(self) -> None:
+        key = self.native("alias-question", {"since": FILED, "text": "Choose a plan", "question": "Which plan?"})
+        with patch.object(the_list, "_save_exchange_reservation", side_effect=OSError("The reservation write stopped.")):
+            self.assertEqual(self.migrate(apply=True)[0], 1)
+        old = the_list.folder(KEEPER.id)
+        alias = the_list.folder(OWNER.id)
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        alias.symlink_to(old, target_is_directory=True)
+        config = self.root / "config" / "console.conf"
+        _ = write_config_fixture(config, f"page.list.owner={OWNER.id}\n")
+        acquired: list[Path] = []
+
+        @contextmanager
+        def no_second_lock(path: Path) -> Generator[object]:
+            if path.resolve() == old / ".lock":
+                self.assertFalse(acquired)
+                acquired.append(path)
+            with exclusive(path) as lock:
+                yield lock
+
+        with patch.object(record_store, "exclusive", side_effect=no_second_lock):
+            extra = the_list.add(OWNER.id, "Another row", owner=OWNER.id, source="nate", changes={})
+        self.assertEqual(extra.number, 2)
+        self.assertEqual(acquired, [alias / ".lock"])
+
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        saved = investigation.ListDestination(KEEPER.id, 1)
+        self.assertEqual(the_list.exchange_reservation(key), the_list.ExchangeDestination(saved, True))
+        row = the_list.load(KEEPER.id, "L1")
+        rows = the_list.scan_list_records()
+        self.assertEqual(len(rows), 2)
+        entries = list_page.records(include_closed=True)
+        alias_entry, = (entry for entry in entries if entry.item.number == 1)
+        self.assertEqual(alias_entry.keeper, OWNER.id)
+        alias_destination = investigation.ListDestination(alias_entry.keeper, row.number)
+        self.assertEqual(the_list.confirmed_exchanges(key, alias_destination, row.filed_exchanges), set(row.filed_exchanges))
+        with the_list.lock_exchange_source(key) as locked:
+            receipt = locked.reservation.with_suffix(".saved")
+            payload = receipt.read_bytes()
+        self.assertTrue(payload.startswith(f"{KEEPER.id}/L1 ".encode()))
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        self.assertEqual(receipt.read_bytes(), payload)
+        item = next(card for card in review_items.read(self.review, members=MEMBERS) if card.key == key)
+        self.assertTrue(review_items.on_list(item))
+
+    def test_moved_question_requires_a_readable_report_for_its_source(self) -> None:
+        key = self.native("moved-question", {"since": FILED, "text": "Choose a plan", "question": "Which plan?",
+                                           "review_log": encode((ReviewLog(START, "nate", "moved to List item 1"),))})
+        unrelated = self.native("unrelated-question", {"since": FILED, "text": "Another question",
+                                                       "question": "Which result?"})
+        report = the_list.ListReport(the_list.ReportKind.QUESTION, key, "Choose a plan")
+        destination = the_list.file_report(KEEPER.id, report, "Choose a plan", owner=OWNER.id,
+                                           producer=OWNER.id, unit="", source="nate")
+        row = the_list.folder(destination.keeper) / f"L{destination.number}.md"
+        record = row.read_text()
+        _ = change_page.console_folder(self.review)
+        cache = review_page.ReviewSnapshotCache(self.review, start_worker=False)
+        self.addCleanup(cache.close)
+        repaired = cache.get()
+        self.assertNotIn(key, {entry["key"] for entry in repaired.entries})
+        self.assertIn(row, repaired.source_stamps)
+
+        load = the_list.load
+
+        def unreadable(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = None) -> the_list.ListItem:
+            if (keeper, identity) == (destination.keeper, row.stem):
+                raise PermissionError("The List row is unreadable.")
+            return load(keeper, identity, sources=sources)
+
+        for fault in ("missing", "invalid", "unreadable", "broken link", "wrong source", "wrong kind"):
+            with self.subTest(fault=fault):
+                match fault:
+                    case "missing":
+                        row.unlink()
+                    case "invalid":
+                        _ = row.write_text("Invalid row.")
+                    case "broken link":
+                        row.unlink()
+                        row.symlink_to(self.root / "missing-row")
+                    case "wrong source":
+                        _ = row.write_text(record.replace(key, unrelated))
+                    case "wrong kind":
+                        _ = row.write_text(record.replace(r'\"Question\"', r'\"Proposal\"'))
+                    case "unreadable":
+                        pass
+                read = patch.object(the_list, "load", side_effect=unreadable) if fault == "unreadable" else nullcontext()
+                with read:
+                    opened = review_items.read(self.review, members=MEMBERS, show="open")
+                    self.assertEqual({card.key for card in opened}, {key, unrelated})
+                    changed, item = cache.publish_record(repaired, key, members=MEMBERS)
+                    assert isinstance(item, review_items.ReviewItem)
+                    self.assertFalse(review_items.on_list(item))
+                    self.assertIn(b"Choose a plan", changed.body(key))
+                    fresh = review_page.build_snapshot(self.review)
+                    self.assertTrue({key, unrelated}.issubset(entry["key"] for entry in fresh.entries))
+                if row.is_symlink():
+                    row.unlink()
+                _ = row.write_text(record)
+                repaired, item = cache.publish_record(changed, key, members=MEMBERS)
+                assert isinstance(item, review_items.ReviewItem)
+                self.assertTrue(review_items.on_list(item))
+                self.assertNotIn(key, {entry["key"] for entry in repaired.entries})
+
+    def test_closed_moved_question_returns_to_review_when_its_report_disappears(self) -> None:
+        key = self.native("closed-moved", {"since": FILED, "text": "Choose a plan", "question": "Which plan?",
+                                          "review_log": encode((ReviewLog(START, "nate", "moved to List item 1"),))},
+                          status="closed")
+        report = the_list.ListReport(the_list.ReportKind.QUESTION, key, "Choose a plan")
+        destination = the_list.file_report(KEEPER.id, report, "Choose a plan", owner=OWNER.id, producer=OWNER.id,
+                                           unit="", source="nate")
+        _ = change_page.console_folder(self.review)
+        snapshot = review_page.build_snapshot(self.review)
+        self.assertNotIn(key, {entry["key"] for entry in snapshot.entries})
+        row = the_list.folder(destination.keeper) / f"L{destination.number}.md"
+        saved = row.read_bytes()
+        row.unlink()
+        snapshot = review_page.build_snapshot(self.review)
+        item, = (entry for entry in snapshot.entries if entry["key"] == key)
+        self.assertIs(item["state"], review_items.ReviewState.DONE)
+        _ = row.write_bytes(saved)
+        self.assertNotIn(key, {entry["key"] for entry in review_page.build_snapshot(self.review).entries})
 
     def test_keyed_staff_ask_retry_files_the_existing_question(self) -> None:
         key = self.native("keyed", {"since": FILED, "text": "Choose a plan", "question": "Which plan?",

@@ -155,7 +155,7 @@ def move_wait_to_list(root: Path, item: review_items.ReviewItem, members: staff.
             ' '.join(current.title.split()), owner=current.owner or the_list.UnassignedOwner.NOT_RECORDED,
             producer=current_route.producer, unit=current_route.unit, source='moved from Review',
             state=the_list.ItemState.WORKING)
-        if destination != expected:
+        if not the_list.same_destination(destination, expected):
             raise MovedReportNumberChanged(destination)
 
     while True:
@@ -495,7 +495,7 @@ def _refresh_studio_question_route(saved: review_submissions.SavedSubmission, re
                                    ) -> review_submissions.ListFilingRoute:
     """Resolve the keeper before publishing a new or reserved row."""
     path = reservation.with_name("list-filing.json")
-    if isinstance(the_list.reserved_review_number(reservation), int):
+    if record_store.saved_path_exists(reservation):
         if isinstance(route, dict):
             return route
         raise OSError(f"Cannot read the reserved List route for {saved.id}.")
@@ -524,7 +524,7 @@ def _ensure_studio_question_filing(saved: review_submissions.SavedSubmission,
     with update_registration.wrap_question_locks(record.owner):
         reservation = review_submissions.list_filing_reservation(saved)
         if not record_store.saved_path_exists(reservation.with_name("list-filing.json")):
-            if isinstance(the_list.reserved_review_number(reservation), int):
+            if record_store.saved_path_exists(reservation):
                 raise OSError(f"Cannot find the reserved List route for {saved.id}.")
             return
         saved_route = review_submissions.list_filing_route(saved)
@@ -532,7 +532,7 @@ def _ensure_studio_question_filing(saved: review_submissions.SavedSubmission,
                 reservation.with_name("first-message.json")):
             return
         members = staff.snapshot()
-        if (isinstance(the_list.reserved_review_number(reservation), the_list.NextNumber)
+        if (not record_store.saved_path_exists(reservation)
                 and record_store.list_keeper(conf.read_or_repository("console"), members) is None):
             def save_fallback() -> None:
                 if isinstance(saved_route, review_submissions.NoListFiling):
@@ -588,7 +588,7 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
                     raise OSError(f"Cannot file {saved.id} on the List: {error}") from error
         return
     if isinstance(route, review_submissions.NoListFiling):
-        if isinstance(the_list.reserved_review_number(reservation), int):
+        if record_store.saved_path_exists(reservation):
             raise OSError(f"Cannot find the reserved List route for {saved.id}.")
         if route_saved:
             with record_store.list_destination_lock():
@@ -610,10 +610,10 @@ def _skip_submission_list_filing(
     with record_store.list_destination_lock():
         destination = the_list.review_fallback_destination(review_items.submission_review_key(saved))
         if destination is investigation.NoListDestination.ABSENT:
-            number = the_list.reserved_review_number(reservation)
-            if isinstance(number, int):
+            reserved = the_list.review_reservation(reservation)
+            if isinstance(reserved, investigation.ListDestination):
                 if isinstance(route, review_submissions.ListFilingUnavailable) or record_store.saved_path_exists(
-                        the_list.folder(route["keeper"]) / f"L{number}.md"):
+                        the_list.folder(reserved.keeper) / f"L{reserved.number}.md"):
                     raise the_list.ListError("The Review source still has a List reservation.")
             review_submissions.skip_list_filing(saved, reason)
 

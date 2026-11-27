@@ -5162,6 +5162,47 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             self.assertEqual(the_list.records(keeper.id), [moved])
             self.assertEqual(investigation.load(owner.id, old.id), done)
 
+    def test_legacy_bug_move_keeps_review_visible_until_the_native_save(self) -> None:
+        keeper = fixture_member("producer", name="morty")
+        native = investigation.file(self.fixture.unit.id, "Check the menu", "The last entry clips.",
+                                    waiting_why="The owner checks the menu.", kind=investigation.InvestigationKind.BUG)
+        path = investigation.review_record_path(native.owner, native.id)
+        prior = path.read_bytes()
+        key = review_items.investigation_record_key(native)
+        invalid = the_list.folder(keeper.id) / "L9.md"
+        invalid.parent.mkdir(parents=True)
+        _ = invalid.write_text("Invalid row.")
+        members = staff.snapshot()
+        with self.assertRaises(the_list.IncompleteListScan):
+            _ = the_list.move_review_bugs(members)
+        self.assertEqual(path.read_bytes(), prior)
+        self.assertIn(key, {item["key"] for item in review_page.build_snapshot(self.root).entries})
+        invalid.unlink()
+
+        with patch.object(investigation, "_save", side_effect=OSError("The native write stopped.")):
+            with self.assertRaisesRegex(OSError, "The native write stopped"):
+                _ = the_list.move_review_bugs(members)
+        self.assertEqual(path.read_bytes(), prior)
+        self.assertIn(key, {item["key"] for item in review_page.build_snapshot(self.root).entries})
+        saved, = the_list.records(keeper.id)
+        destination, = the_list.move_review_bugs(members)
+        self.assertEqual(destination, investigation.ListDestination(keeper.id, saved.number))
+        self.assertEqual(the_list.records(keeper.id), [saved])
+        moved = investigation.load(native.owner, native.id)
+        self.assertIs(moved.purpose, investigation.InvestigationPurpose.MOVING_LEGACY_BUG)
+        self.assertNotIn(key, {item["key"] for item in review_page.build_snapshot(self.root).entries})
+
+    def test_review_displays_an_older_pending_bug_move(self) -> None:
+        keeper = fixture_member("producer", name="morty")
+        with investigation.file_for_list(investigation.InvestigationPurpose.MOVING_LEGACY_BUG):
+            native = investigation.file(self.fixture.unit.id, "Check the menu", "The last entry clips.",
+                                        waiting_why="The owner checks the menu.", kind=investigation.InvestigationKind.BUG)
+        key = review_items.investigation_record_key(native)
+        self.assertIn(key, {item["key"] for item in review_page.build_snapshot(self.root).entries})
+        destination, = the_list.move_review_bugs(staff.snapshot())
+        self.assertEqual(destination.keeper, keeper.id)
+        self.assertNotIn(key, {item["key"] for item in review_page.build_snapshot(self.root).entries})
+
     def test_new_investigation_uses_the_shared_list_report(self) -> None:
         owner = self.ready_submission_recipient()
         keeper = fixture_member('producer', name='morty')
