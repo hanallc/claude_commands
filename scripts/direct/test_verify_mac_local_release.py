@@ -57,7 +57,10 @@ printf 'owned child stopped; inherited job kept\\n'
                         pass_fds=(ready, announce), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True, start_new_session=True)
                     self.addCleanup(self.stop_verify, process)
-                    output, errors = process.communicate(timeout=5)
+                    try:
+                        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    except subprocess.TimeoutExpired:
+                        self.fail("The token renewer did not stop and return the inherited job status.")
                     self.assertEqual(process.returncode, 0, output + errors)
                     self.assertEqual(output, "owned child stopped; inherited job kept\n")
                 finally:

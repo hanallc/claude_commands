@@ -44,7 +44,7 @@ from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.process_start import Gone, ProcessStart, Started, proc_table_start
 from scripts.lib.sizes import MIB, gib
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.mac_test import floor_claims
 from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -6890,7 +6890,7 @@ raise SystemExit(int(os.environ[variable]))
             messages.append(message)
             if len(messages) == 1:
                 sending.set()
-                if not finish_send.wait(5):
+                if not finish_send.wait(TEST_HANG_GUARD_SECS):
                     raise AssertionError("the competing floor operation did not release the delayed send")
             return DELIVERED_NATEDEV_ALERT
 
@@ -6901,9 +6901,10 @@ raise SystemExit(int(os.environ[variable]))
         with mock.patch.object(sweep, "send_floor_alert", side_effect=send), ThreadPoolExecutor(2) as workers:
             first = workers.submit(sweep.alert_floor_lock, str(path), 2 * GIB, 300 * GIB)
             try:
-                self.assertTrue(sending.wait(5), "the first overdue hold must reach the send")
+                self.assertTrue(sending.wait(TEST_HANG_GUARD_SECS), "the first overdue hold must reach the send")
                 second = workers.submit(run_competing)
-                self.assertTrue(competing_started.wait(5))
+                self.assertTrue(competing_started.wait(TEST_HANG_GUARD_SECS),
+                                "the competing floor operation did not start")
                 try:
                     _ = second.result(timeout=1)
                 except TimeoutError:
@@ -6911,8 +6912,8 @@ raise SystemExit(int(os.environ[variable]))
                     pass
             finally:
                 finish_send.set()
-            _ = first.result(timeout=5)
-            _ = second.result(timeout=5)
+            _ = LauncherHangGuard("first floor operation after the send release").result(first)
+            _ = LauncherHangGuard("competing floor operation after the send release").result(second)
         return messages
 
     def test_overlapping_waiters_deliver_one_alert_for_the_same_hold(self) -> None:
