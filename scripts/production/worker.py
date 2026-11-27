@@ -428,7 +428,7 @@ def _read_transcript(entries: Iterable[str | dict[str, object] | worker_admissio
                         for state in states:
                             state.compacted()
                         continue
-                    if not entry and isinstance(cursor, TranscriptCursor) and _transcript_turn_boundary(fields):
+                    if not entry and isinstance(cursor, TranscriptCursor) and worker_panes.transcript_turn_boundary(fields):
                         for state in states:
                             state.turn_ended(cursor)
             if not entry.startswith(("user:\n", "assistant:\n")):
@@ -444,16 +444,6 @@ def _read_transcript(entries: Iterable[str | dict[str, object] | worker_admissio
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return str(error) or type(error).__name__, frozenset(matched)
     return "", frozenset(matched)
-
-
-def _transcript_turn_boundary(fields: dict[str, object]) -> bool:
-    if fields.get("type") == "system" and fields.get("subtype") == "turn_duration":
-        return True
-    if fields.get("type") == "event_msg":
-        payload = fields.get("payload")
-        return (isinstance(payload, dict)
-                and cast(dict[str, object], payload).get("type") in ("task_complete", "turn_aborted"))
-    return False
 
 
 def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
@@ -814,6 +804,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
         return reply
     covered_by_reply = {run_id for run_id, result in deliveries.items()
                         if isinstance(verified, VerifiedPassDone)
+                        and result.delivered_at is not detached_runs.WorkerResultDeliverySuppressed.STOP_CANCELED
                         and verified.covers_run(result.run, result.finished_at) == detached_runs.ResultDoneCoverage.COVERED}
     covered = {run_id for run_id, result in deliveries.items()
                if result.delivered_at is detached_runs.WorkerResultCovered.BY_DONE} | covered_by_reply
@@ -842,7 +833,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
                     return DispatchSubmitted(reply.last_reply)
                 return reply
     unseen = {run_id for run_id in deliveries.keys() - received - covered - reap_required
-              if deliveries[run_id].delivered_at is not detached_runs.WorkerResultDeliverySuppressed.SUCCESS_ONLY}
+              if not isinstance(deliveries[run_id].delivered_at, detached_runs.WorkerResultDeliverySuppressed)}
     pending = unseen | live_ids | reap_required
     pending.update(run_id for run_id, result in deliveries.items()
                    if result.requires_done_after_finish and run_id not in covered)
@@ -1671,6 +1662,15 @@ def _admit_completion(row: staff.StaffRow, recovery: CompletionRecovery) -> Exit
     return ExitCode.OK
 
 
+def _recover_stop_before_assignment(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
+    recorded = progress_history.recorded_dispatch_run(row.id)
+    if isinstance(recorded, progress_history.RecordedDispatchRun):
+        passed = worker_panes.worker_pass(row, recorded.directory, record=record)
+        instance = passed.get("instance_id")
+        if passed.get("status") in ("active", "refused") and isinstance(instance, str) and instance:
+            detached_runs.recover_stop_canceled_worker_pass(recorded.directory, row, instance)
+
+
 def admit_dispatch(parent: StaffId, name: WorkerName | progress_history.DispatchTargetAtUse, role: WorkerRole, prompt: Path, *,
                    session_dir: Path, slot: str, phase: str, launcher_command: list[str],
                    work: progress_history.DispatchWork, prompt_source: Path | bytes, record: staff.StaffSnapshot,
@@ -1763,6 +1763,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         notice_delivery = notices if isinstance(notices, ExitStack) else after_dispatch
         expected = (worker_admission.find_worker(staff.snapshot(), parent, name.value)
                     if isinstance(lock, worker_panes.WorkerLockAtUse) else None)
+        if expected is not None:
+            _recover_stop_before_assignment(expected, record)
         hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
             return _busy_dispatch(hold.blocker)
@@ -2564,6 +2566,11 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                           result.cause if isinstance(result, worker_panes.UnpublishedWorker) else result.reason)
                 print(f"anomaly: {default_role}: {detail}", file=sys.stderr)
             record = staff.snapshot()
+        if not name:
+            for candidate in record.find(kind="worker", parent=parent):
+                if _role_number(candidate.name, role):
+                    _recover_stop_before_assignment(candidate, record)
+            record = staff.snapshot()
         runs = unit_runs.LauncherRunDirectories({}, {}) if name else _assignment_runs(
             record, parent, role, additional=(session_dir,))
         chosen = WorkerName.parse(name) if name else select_worker(parent, role, record, runs=runs)
@@ -2573,6 +2580,8 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                 return ExitCode.BUSY
             return startup_result(WorkerName.parse(role), chosen)
         selected_row = worker_admission.find_worker(record, parent, chosen.value)
+        if name and selected_row is not None:
+            _recover_stop_before_assignment(selected_row, record)
         hold = operations.enter_context(worker_panes.worker_lock(parent, chosen))
         if isinstance(hold, worker_panes.Kept):
             source = prompt.resolve()
@@ -2704,7 +2713,7 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
         if entry.startswith("user:\n"):
             body = entry.removeprefix("user:\n")
             accepted |= _answer_digest(script_prompt(body)) == saved.get("answer_digest")
-        elif accepted and (entry.startswith("assistant:\n") or _transcript_turn_boundary(fields)):
+        elif accepted and (entry.startswith("assistant:\n") or worker_panes.transcript_turn_boundary(fields)):
             next_request = True
     if not number or number < boundary:
         return AnswerBlocked.UNAVAILABLE

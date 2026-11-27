@@ -270,8 +270,14 @@ class TurnEndTests(unittest.TestCase):
                       finished_at=datetime.now().astimezone().isoformat(timespec="microseconds"),
                       completion_pending=True)
         atomic_file.write_text_atomic(path, json.dumps(record))
-        with patch.object(worker, "restore_parked_worker", return_value=False) as restore:
+        with (patch.object(worker, "restore_parked_worker", return_value=False) as restore,
+              patch.object(subprocess, "Popen") as spawn):
             _ = self.case.finish(kind=turn_end.EventKind.RUN_FINISHED)
+            self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], detached_runs.RESULT_RELAY_PENDING)
+            spawn.assert_called_once()
+            command = cast(list[str], spawn.call_args.args[0])
+            self.assertEqual(command[2:], ["deliver-deferred", str(path)])
+            self.assertEqual(detached_runs.main(command[2:]), 0)
         restore.assert_not_called()
         result = worker_lifecycle.read_json_object(path)
         self.assertEqual(result.get("delivery"), "sent: private director")
@@ -3107,7 +3113,8 @@ class TurnEndTests(unittest.TestCase):
 
                 with (patch.object(self.case.fixture.world, "run", side_effect=submit),
                       patch.object(self.case.fixture.world, "wait_turn_end", side_effect=wait_for_idle),
-                      patch.object(detached_runs, "_retry_result_delivery"),
+                      patch.object(detached_runs, "_retry_result_delivery",
+                                   side_effect=worker_lifecycle.read_json_object),
                       patch.object(detached_runs, "_stopped_group_has_ended", return_value=True),
                       patch.object(detached_runs, "_run", return_value=143 if self_stop else 0),
                       patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver)):
@@ -3126,8 +3133,7 @@ class TurnEndTests(unittest.TestCase):
                         with patch.object(detached_runs, "_result_received", side_effect=OSError("fixture read failure")):
                             self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
                         saved = worker_lifecycle.read_json_object(path)
-                        self.assertEqual(saved.get("delivery"),
-                                         "deferred: worker transcript is unavailable: fixture read failure")
+                        self.assertEqual(saved.get("delivery"), detached_runs.WORKER_READINESS_PENDING)
                         self.assertNotIn("delivered_at", saved)
                         self.assertEqual(len(self.case.agent.notices), notices)
                         with patch.object(worker_panes, "observe", return_value=(worker_panes.ClosedWorker(row),)):

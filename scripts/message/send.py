@@ -153,7 +153,7 @@ from scripts.herdr import herdr_types, message_proof as _message_proof
 from scripts.lib import process_group
 from scripts.message.address import CODEX_PREFIX, SESSION_PREFIX, SOCKET_PREFIX, STAFF_PREFIX, USER as USER, WORKER_PREFIX
 from scripts.production import session_staff, staff, unit_lookup, unit_names
-from scripts.lib import conf, models_registry, process_start
+from scripts.lib import conf, file_lock, models_registry, process_start
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_bytes_atomic
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
@@ -5687,12 +5687,26 @@ WorkerResultReceipt = WorkerResultProbe
 
 
 @dataclass(frozen=True)
+class WorkerResultTranscript:
+    """The exact transcript file read at the submission boundary."""
+
+    path: Path
+    identity: str
+
+
+class UnverifiedWorkerResultTranscript(Enum):
+    UNAVAILABLE = "the submission has no verified transcript file"
+
+
+@dataclass(frozen=True)
 class WorkerResultSubmission:
-    """Request pane input with confirmation of a new transcript occurrence."""
+    """Confirm new pane input and record when the input call returns."""
 
     wait_for_idle: bool = False
     before_input: Callable[[], object] = lambda: None
     worker_only: bool = False
+    at_boundary: Callable[[float, WorkerResultTranscript | UnverifiedWorkerResultTranscript], object] = (
+        lambda _submitted_at, _transcript: None)
 
 
 class NoResultTranscript(Enum):
@@ -5727,18 +5741,35 @@ def _result_transcript_cursors(source: Path, stream: str
         yield entry, cursor
 
 
+def _result_transcript_identity(source: Path) -> WorkerResultTranscript | UnverifiedWorkerResultTranscript:
+    try:
+        resolved = source.resolve(strict=True)
+        return WorkerResultTranscript(resolved, file_lock.device_key(resolved))
+    except (OSError, ValueError, RuntimeError):
+        return UnverifiedWorkerResultTranscript.UNAVAILABLE
+
+
+@dataclass(frozen=True)
+class WorkerResultSubmissionBoundary:
+    cursor: worker_panes.TranscriptCursor
+    transcript: WorkerResultTranscript | UnverifiedWorkerResultTranscript
+
+
 def _result_submission_boundary(worker: staff.StaffRow, membership: staff.StaffSnapshot
-                                ) -> worker_panes.TranscriptCursor:
+                                ) -> WorkerResultSubmissionBoundary:
     from scripts.herdr import worker_panes
 
     source = _result_transcript_source(worker, membership)
     if isinstance(source, NoResultTranscript):
         raise ValueError(source.value)
+    transcript = _result_transcript_identity(source)
     stream = worker_panes.transcript_stream(worker, source)
     boundary = worker_panes.TranscriptCursor(stream, 0, hashlib.sha256().hexdigest())
     for _, boundary in _result_transcript_cursors(source, stream):
         pass
-    return boundary
+    if _result_transcript_identity(source) != transcript:
+        transcript = UnverifiedWorkerResultTranscript.UNAVAILABLE
+    return WorkerResultSubmissionBoundary(boundary, transcript)
 
 
 @dataclass(frozen=True)
@@ -5864,6 +5895,8 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
             checking_target = False
             attempting_input = False
             boundary: worker_panes.TranscriptCursor | NoResultTranscript = NoResultTranscript.UNRECORDED
+            transcript: WorkerResultTranscript | UnverifiedWorkerResultTranscript = (
+                UnverifiedWorkerResultTranscript.UNAVAILABLE)
             ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
 
             def check_readiness() -> None:
@@ -5877,16 +5910,18 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     raise _WorkerResultReadinessFailure("worker is not ready for input")
 
             def require_idle() -> None:
-                nonlocal checking_target, attempting_input, boundary
+                nonlocal checking_target, attempting_input, boundary, transcript
                 checking_target = False
                 check_readiness()
                 assert isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission))
                 _ = receipt.before_input()
                 if isinstance(receipt, WorkerResultSubmission):
                     try:
-                        boundary = _result_submission_boundary(worker, membership)
+                        captured = _result_submission_boundary(worker, membership)
                     except (OSError, ValueError, subprocess.SubprocessError) as error:
                         raise _WorkerResultReadinessFailure(f"worker transcript is unavailable: {error}") from error
+                    boundary = captured.cursor
+                    transcript = captured.transcript
                     check_readiness()
                 attempting_input = True
 
@@ -5896,11 +5931,12 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     raise herdr_types.HerdrFailure(f"worker is {status.value}")
 
             submission = herdr.TrackedPromptSubmission(check_message_status)
+            result_submission = herdr.TrackedPromptSubmission(require_idle)
 
             if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                 wait_for_idle = receipt.wait_for_idle and state.status == herdr.AgentStatus.WORKING
                 can_prompt = state.status.idle or wait_for_idle
-                on_submission = require_idle
+                on_submission = result_submission
             else:
                 wait_for_idle = False
                 can_prompt = state.status in ordinary_states
@@ -5934,10 +5970,16 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                                 + "The message may already have arrived. Do not resend it.")
                     elif (isinstance(receipt, WorkerResultSubmission)
                             or isinstance(error, (herdr_types.HerdrFailure, OSError))):
-                        if not attempting_input or isinstance(error, (herdr.HerdrCommandNotStarted, herdr.AgentBlocked)):
+                        if (not attempting_input or isinstance(error, (herdr.HerdrCommandNotStarted, herdr.AgentBlocked))
+                                or (isinstance(error, herdr_types.HerdrFailure)
+                                    and error.code in ("pane_not_found", "agent_not_found"))):
+                            result_submission.may_have_submitted = False
                             return WorkerResultNotSubmitted("retry", reason)
                     else:
                         raise
+                finally:
+                    if isinstance(receipt, WorkerResultSubmission) and result_submission.may_have_submitted:
+                        _ = receipt.at_boundary(time.time(), transcript)
                 if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                     try:
                         if isinstance(receipt, WorkerResultSubmission):

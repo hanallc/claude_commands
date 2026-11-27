@@ -6863,7 +6863,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                             if name == "local-relay-failed" and owner == "worker":
                                 targets.append(director.id)
                             if name == "pane-unconfirmed" and owner != "director":
-                                self.assertEqual(receipt_checks, [] if retired_after_input else [row.id])
+                                self.assertEqual(receipt_checks, [director.id] if retired_after_input else [row.id, row.id])
                             else:
                                 self.assertEqual(receipt_checks, targets * 3)
                             self.assertIn("The result may have arrived.", alerts[0])
@@ -6994,7 +6994,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         spawn.assert_called_once()
         self.assertEqual(self.notices, [])
         argv = cast(list[str], spawn.call_args.args[0])
-        self.assertEqual(detached_runs.main(argv[2:]), 0)
+        self.finish_unconfirmed_retry(argv, pane)
         saved = worker_lifecycle.read_json_object(path)
         self.assertTrue(str(saved["delivery"]).startswith(detached_runs.UNCONFIRMED_WORKER_RESULT))
         self.assertEqual(len(self.inputs), 1)
@@ -7005,8 +7005,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn("exit 0", alert)
         self.assertIs(saved["push_alert_attempted"], True)
 
-        _ = turn_end.run_finished(row.id, dispatch)
-        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        with patch.object(subprocess, "Popen"):
+            _ = turn_end.run_finished(row.id, dispatch)
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
         self.assertEqual(len(self.inputs), 1)
         self.assertEqual(self.notices, [(recipient, alert)])
 
@@ -7043,13 +7044,26 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertEqual(self.notices, [])
             spawn.assert_called_once()
             argv = cast(list[str], spawn.call_args.args[0])
-            self.assertEqual(detached_runs.main(argv[2:]), 0)
+            self.finish_unconfirmed_retry(argv, pane)
             _ = turn_end.run_finished(row.id, dispatch)
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
         self.assertEqual(attempts, 1)
         (recipient, alert), = self.notices
         self.assertEqual(recipient, self.fixture.parent.id)
         self.assertIn("Result delivery is unconfirmed.", alert)
+
+    def finish_unconfirmed_retry(self, argv: list[str], pane: str) -> None:
+        checks = 0
+
+        def close_after_alert(_seconds: float) -> None:
+            nonlocal checks
+            checks += 1
+            self.assertLessEqual(checks, conf.read("detached_runs").whole("result_push_retries") + 2)
+            if self.notices and pane in self.fixture.world.locations:
+                self.fixture.world.remove_pane(pane)
+
+        with patch.object(time, "sleep", side_effect=close_after_alert):
+            self.assertEqual(detached_runs.main(argv[2:]), 0)
 
     def test_late_result_read_error_before_input_keeps_the_result_pending(self) -> None:
         row = self.fixture.worker("late-read-error", family="codex")
@@ -7127,10 +7141,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
               patch.object(detached_runs, "scope_prefix", return_value=[]),
               patch.object(detached_runs, "deliver_in_fresh_process", side_effect=defer_before_completion),
               patch.object(detached_run_process, "supervises", return_value=True) as live,
+              patch.object(subprocess, "Popen") as spawn,
               patch.object(self.fixture.world, "run", side_effect=refuse_first_prompt),
               patch.object(time, "sleep", side_effect=before_retry) as delay):
             self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
-        live.assert_not_called()
+        live.assert_called_once_with(os.getpid(), path)
+        spawn.assert_not_called()
         delay.assert_called_once_with(5)
         self.assertEqual(attempts, 2)
         self.assertEqual(len(self.inputs), 1)

@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Protocol, Literal, cast, final
 
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
-from scripts.lib import conf, models_registry, nix_env, unit_runs
+from scripts.lib import conf, file_lock, models_registry, nix_env, unit_runs
 from scripts.lib.transcripts import uncompressed_path
 from scripts.whoami import quota_state
 from scripts.production import session_staff, staff, worker_admission
@@ -41,6 +41,7 @@ from scripts.production.production_doc import EnrolledPaths, ProductionPathsErro
 from scripts.production.staff import serving_merge_unit
 from scripts.agents import detached_run_process, pane_record, shutdown_record, worker_lifecycle
 from scripts.direct import phase_reservation, progress_history, recorder_state
+from scripts.usage import rollouts
 
 if TYPE_CHECKING:
     from scripts.accounts import accounts
@@ -1009,6 +1010,43 @@ def transcript_record_cursors[T: str | dict[str, object] | worker_admission.Torn
         data = None if isinstance(entry, worker_admission.TornTranscriptRecord) else entry
         prefix.update(json.dumps(data, sort_keys=True).encode() + b"\n")
         yield entry, TranscriptCursor(stream, position, prefix.hexdigest())
+
+
+def transcript_turn_boundary(fields: dict[str, object]) -> bool:
+    if fields.get("type") == "system" and fields.get("subtype") == "turn_duration":
+        return True
+    if fields.get("type") == "event_msg":
+        payload = fields.get("payload")
+        return (isinstance(payload, dict)
+                and cast(dict[str, object], payload).get("type") in ("task_complete", "turn_aborted"))
+    return False
+
+
+def transcript_shows_turn_end_without_result(source: Path, identity: str, run_id: str, attempted_at: float) -> bool:
+    """Check the transcript that the send recorded for a later turn end and no receipt."""
+    if not source.is_absolute() or not identity:
+        return False
+    marker = f"Detached run: {run_id}"
+    ended = False
+    try:
+        if file_lock.device_key(source) != identity:
+            return False
+        records = worker_admission.transcript_records(
+            source, boundary=worker_admission.TranscriptRecordBoundary.COMPLETE_LINES_WITH_TAIL)
+        for fields in records:
+            if isinstance(fields, worker_admission.TornTranscriptRecord):
+                return False
+            if fields.get("isMeta") is True:
+                continue
+            entry = worker_admission.transcript_entry(fields, set())
+            if entry.startswith("user:\n") and marker in entry.splitlines()[1:]:
+                return False
+            if transcript_turn_boundary(fields):
+                at = rollouts.parse_timestamp(fields.get("timestamp"))
+                ended |= at is not None and at.timestamp() > attempted_at
+        return ended and file_lock.device_key(source) == identity
+    except (OSError, ValueError, OverflowError, subprocess.SubprocessError):
+        return False
 
 
 def _transcript_messages(row: staff.StaffRow) -> list[str] | Kept:
