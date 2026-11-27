@@ -321,8 +321,11 @@ def studio_question_action(item: review_items.ReviewItem, record: update_registr
     page = change_page.UserQuestionPage(record.path, document, (record.path.stem,), '', saved)
 
     def save() -> None:
-        change_browser.save_question_record(route.production, question, action, words,
-                                            change_browser.SelectedQuestionSave(), before_write=lambda: None)
+        with the_list.locked_item(target.keeper, f'L{target.number}') as current:
+            if current.owner != target.owner:
+                raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
+            change_browser.save_question_record(route.production, question, action, words,
+                                                change_browser.SelectedQuestionSave(), before_write=lambda: None)
 
     return save_delivery(page, target.owner, save, status, opened), words
 
@@ -432,12 +435,12 @@ def _save_review_park(item: review_items.ReviewItem, until: datetime, words: str
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
 
 
-def studio_later(target: StudioQuestionTarget, value: str, words: str, *,
+def studio_later(target: StudioQuestionTarget, value: str, words: str, request: str, *,
                  verify_revision: Callable[[], object]
                  ) -> tuple[ListFeedbackDelivery | change_page.NoMessageDelivery, str]:
     identity = f'L{target.number}'
     zone = user_zone()
-    request = secrets.token_hex(16)
+    request = request or secrets.token_hex(16)
 
     def save(until: datetime, check: Callable[[datetime], None]
              ) -> tuple[ListFeedbackDelivery | change_page.NoMessageDelivery, str]:
@@ -841,6 +844,7 @@ def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestion
         try:
             _ = save()
         except BaseException:
+            _ = status.request_attempts.pop(attempt, None)
             status.write_slots(previous_page, row, previous_slots)
             raise
         page = replace(page,saved={**page.saved,'saved':True})

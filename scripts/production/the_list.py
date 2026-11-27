@@ -1045,6 +1045,13 @@ def _store(keeper: staff.StaffId) -> record_store.NumberedRecords:
     return list_draft.list_records(keeper, ListError)
 
 
+@contextmanager
+def locked_item(keeper: staff.StaffId, identity: str) -> Generator[ListItem]:
+    """Read the item and hold its List write lock."""
+    with _store(keeper).locked():
+        yield load(keeper, identity)
+
+
 def folder(keeper: staff.StaffId) -> Path:
     return _store(keeper).folder()
 

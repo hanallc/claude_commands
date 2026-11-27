@@ -6712,6 +6712,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         with patch.object(feature_log, 'land_review', side_effect=fail_closeout) as closeout:
             saved = cache.save(case.card_body(cache.get(), key, 'works'), case.status)
+            assert isinstance(saved.delivery, (change_page.MessageDelivery, change_page.NoMessageDelivery))
             _ = change_page.finish_verdict_cleanup(saved.delivery, case.status)
             self.assertEqual(closeout.call_count, 2)
         self.assertNotIn(key, cache.get().records)
@@ -6960,6 +6961,48 @@ class ReviewLinksServerTests(unittest.TestCase):
         send.assert_not_called()
         self.assertEqual(the_list.load(row.keeper, row.item.id), reassigned)
 
+    def test_studio_question_rechecks_owner_when_saving_after_validation(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        snapshot = self.server.review_cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        new_owner = fixture_member("producer", name="new-layout-owner")
+        action = review_actions.studio_question_action
+
+        def reassign_then_save(*args: object) -> object:
+            _ = the_list.update(row.keeper, row.item.id, {"owner": new_owner.id}, source="nate")
+            return cast(Callable[..., object], action)(*args)
+
+        with (capture_sender("send_to_staff") as send,
+              patch.object(review_actions, "studio_question_action", side_effect=reassign_then_save) as save):
+            for outcome in ("answer", "question"):
+                with self.subTest(outcome=outcome):
+                    _ = the_list.update(row.keeper, row.item.id, {"owner": row.item.owner}, source="nate")
+                    body = case.body(key, outcome, "Check the mobile layout.") + "&" + urlencode({"revision": shown[1].decode()})
+                    status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+                    self.assertEqual(status, 409, reply)
+            self.assertEqual(save.call_count, 2)
+        send.assert_not_called()
+        self.assertEqual(the_list.load(row.keeper, row.item.id).filed_exchanges, row.item.filed_exchanges)
+
+    def test_review_links_a_pending_studio_question_to_its_list_item(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        snapshot = self.server.review_cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        body = case.body(key, "question", "Does the wide layout fit on a laptop?") + "&" + urlencode({"revision": shown[1].decode()})
+        with capture_sender("send_to_staff"):
+            status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+        self.assertEqual(status, 200, reply)
+        current = self.server.review_cache.get()
+        self.assertIs(current.records[key].state, review_items.ReviewState.WAITING)
+        detail = current.body(key).decode()
+        destination = studio_page.PAGE_PATH + page_frame.list_item_fragment(row.keeper, row.item.number)
+        self.assertIn(f'href="{destination}">Open question on List item {row.item.number}</a>', detail)
+        self.assertNotIn("data-review-form", detail)
+
     def test_studio_later_delivers_new_words_at_the_same_deadline(self) -> None:
         case, key, row = self.filed_studio_team_question()
         until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
@@ -6978,6 +7021,24 @@ class ReviewLinksServerTests(unittest.TestCase):
         notice, = the_list.feedback_requests(saved).values()
         self.assertEqual((notice.form_words, notice.state), (words, "sent"))
 
+    def test_studio_later_keeps_a_pending_send_unconfirmed(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        body = case.body(key, "later", "Wait for the desktop check.") + "&" + urlencode({
+            "revision": shown[1].decode(), "later": until.isoformat()})
+        with patch.object(change_page, "send_to_staff", return_value="pending"):
+            status, reply = self.post(review_page.PAGE_PATH, body, headers={review_page.DELIVERY_RESULT_HEADER: "1"})
+        self.assertEqual(status, 200, reply)
+        result = cast(dict[str, object], json.loads(reply))
+        self.assertEqual(result.get("send_failure"), "The sender has not confirmed delivery.")
+        saved = the_list.load(row.keeper, row.item.id)
+        self.assertEqual(saved.parked_until, until)
+        notice, = the_list.feedback_requests(saved).values()
+        self.assertEqual(notice.state, "pending")
+
     def test_submit_snapshot_returns_the_studio_later_delivery(self) -> None:
         case, key, row = self.filed_studio_team_question()
         snapshot = self.server.review_cache.get()
@@ -6992,6 +7053,61 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual((delivery.keeper, delivery.identity), (row.keeper, row.item.id))
         saved = the_list.load(row.keeper, row.item.id)
         self.assertEqual(the_list.feedback_requests(saved)[delivery.request].form_words, words)
+
+    def test_studio_later_save_survives_delivery_write_error_and_retry(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        request = send_hold.new_hold_id()
+        body = case.body(key, "later", "Wait for the desktop check.") + "&" + urlencode({
+            "revision": shown[1].decode(), "later": until.isoformat(), "request": request})
+        save = the_list._save  # pyright: ignore[reportPrivateUsage]
+        fail_result = True
+
+        def save_item(store: record_store.NumberedRecords, item: the_list.ListItem, **options: object) -> None:
+            notice = the_list.feedback_requests(item).get(request)
+            if fail_result and notice is not None and notice.state == "sent":
+                raise OSError("The delivery result could not save.")
+            cast(Callable[..., None], save)(store, item, **options)
+
+        headers = {review_page.DELIVERY_RESULT_HEADER: "1"}
+        with (patch.object(the_list, "_save", side_effect=save_item),
+              patch.object(change_page, "send_to_staff", side_effect=[None, "skipped"]) as send):
+            status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(status, 200, reply)
+            result = cast(dict[str, object], json.loads(reply))
+            self.assertEqual(result.get("send_failure"), "The sender has not confirmed delivery.")
+            parked = the_list.load(row.keeper, row.item.id)
+            self.assertEqual(parked.parked_until, until)
+            self.assertEqual(the_list.feedback_requests(parked)[request].state, "pending")
+            fail_result = False
+            status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(status, 200, reply)
+            self.assertNotIn(b"send_failure", reply)
+        first, second = send.call_args_list
+        self.assertEqual(cast(object, first.kwargs["key"]), cast(object, second.kwargs["key"]))
+        saved = the_list.load(row.keeper, row.item.id)
+        self.assertEqual(list(the_list.feedback_requests(saved)), [request])
+        self.assertEqual(the_list.feedback_requests(saved)[request].state, "sent")
+
+    def test_studio_later_returns_the_same_delivery_from_submit_and_cache(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        cache = self.server.review_cache
+        snapshot = cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        request = send_hold.new_hold_id()
+        body = case.body(key, "later", "Wait for the desktop check.") + "&" + urlencode({
+            "revision": shown[1].decode(), "later": until.isoformat(), "request": request})
+        result = review_page.submit(case.root, body, case.status, snapshot=snapshot)
+        self.assertEqual(result.delivery, review_actions.ListFeedbackDelivery(row.keeper, row.item.id, request))
+        saved = cache.save(body, case.status)
+        self.assertEqual(saved.delivery, result.delivery)
+        self.assertEqual(saved.answer, result.answer)
 
     def test_legacy_change_reply_retry_files_the_saved_answer(self) -> None:
         case = self.review_fixture(changes=1)
@@ -7618,7 +7734,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         saved = [cache.save(case.card_body(cache.get(), key, 'works'), case.status)
                  for key in ('page-owner/C1', 'page-owner/C2', 'page-owner/C3')]
-        _ = change_page.finish_verdict_cleanup(saved[0].delivery, case.status)
+        first = saved[0].delivery
+        assert isinstance(first, (change_page.MessageDelivery, change_page.NoMessageDelivery))
+        _ = change_page.finish_verdict_cleanup(first, case.status)
         _ = feature_log.drop_review('page-owner/C3', 'The proposal was dropped.')
         alerts: list[tuple[staff.StaffId, str]] = []
         refused_states: list[str] = []

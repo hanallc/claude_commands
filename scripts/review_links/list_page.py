@@ -1999,7 +1999,7 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
         key = change_page.review_delivery_key(source, item.id, feedback.request)
         recipients = feedback.recipient_ids(delivery.keeper)
         repair = feedback.action is the_list.ReportVerdict.NOT_FIXED
-        confirm = repair or (feedback.action == "read" and feedback.origin is the_list.PageNoticeOrigin.STUDIO)
+        confirm = repair or (feedback.action in ("read", "park") and feedback.origin is the_list.PageNoticeOrigin.STUDIO)
         failures = change_page.send_with_retries(change_page.SENDER, recipients, message,
                                                  tries, settings.number("delivery_pause_seconds"), key=key,
                                                  confirm=confirm)
@@ -2017,10 +2017,11 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
     if not attempted:
         item = the_list.load(delivery.keeper, delivery.identity)
         feedback = the_list.feedback_requests(item).get(delivery.request)
-        if feedback is not None and feedback.action is the_list.ReportVerdict.NOT_FIXED:
-            if feedback.state == "sent":
+        if feedback is not None:
+            if feedback.state == "sent" and (feedback.action is the_list.ReportVerdict.NOT_FIXED or (
+                    feedback.action == "park" and feedback.origin is the_list.PageNoticeOrigin.STUDIO)):
                 return change_page.DeliveryConfirmed()
-            if feedback.state == "alerted":
+            if feedback.state == "alerted" and feedback.action is the_list.ReportVerdict.NOT_FIXED:
                 source = the_list.folder(delivery.keeper) / f"{item.id}.md"
                 return change_page.FailedDelivery(feedback.request, source, item.id,
                                                   "The owner or producer did not receive Not fixed.")
@@ -3136,20 +3137,27 @@ async function loadStudioQuestion(item,card,view){
   bindStudioQuestion(item,card,form,view);
   showActionFailure(card.querySelector('[data-send-status]'),view.actionNotice(item));
  }catch(error){
-  if(current()) showActionFailure(notice,error.message);
+  if(current()) showActionFailure(notice,view.actionNotice(item) || error.message);
  }finally{
   if(card.dataset.loaded==='loading') delete card.dataset.loaded;
  }
 }
 function bindStudioQuestion(item,card,form,view){
  const showNotice=text=>showActionFailure(card.querySelector('[data-send-status]'),text);
+ let laterRequest;
  const send=async(data,button)=>{
   if(view.openItem!==item || cardSubmitBlocked(form,view.rowFading(item.dataset.key))) return;
   const action=data.get('outcome'),key=item.dataset.key;
+  if(action==='later' && data.get('feedback').trim()){
+   const intent=data.toString();
+   if(laterRequest?.intent!==intent) laterRequest={intent,id:heldFetch.newId()};
+   data.set('request',laterRequest.id);
+  }
   const draftKey=reviewFormKey(form), submittedDraft=rememberReviewDraft(form);
   const hold=holdCard(item,hidden=>{if(hidden) view.applyAction();});
   const resultItem=view===tableView ? item : rowIn(content,key);
   const submission=resultItem && tableView.startAction(resultItem);
+  const overlaySubmission=view!==tableView ? view.startAction(item) : undefined;
   let saved=false,deliveryResult;
   startListSave();
   showNotice('');
@@ -3158,6 +3166,7 @@ function bindStudioQuestion(item,card,form,view){
    sending:()=>setCardSubmitting(form,true),
    confirmedSave:()=>{
     saved=true;
+    if(action==='later') laterRequest=undefined;
     if(reviewDrafts.get(draftKey)===submittedDraft) reviewDrafts.delete(draftKey);
    },
    saved:result=>{
@@ -3170,7 +3179,10 @@ function bindStudioQuestion(item,card,form,view){
     }
    },
    failed:reason=>showNotice('Not saved: '+reason),
-   undone:message=>{showNotice(message);form.elements.feedback.focus({preventScroll:true});},
+   undone:message=>{
+    if(action==='later') laterRequest=undefined;
+    showNotice(message);form.elements.feedback.focus({preventScroll:true});
+   },
    displayFailed:()=>showNotice('Saved; the item could not refresh.'),
    recover:async reason=>{
     await loadStudioQuestion(item,card,view);
@@ -3184,7 +3196,7 @@ function bindStudioQuestion(item,card,form,view){
      else if(form.isConnected){setCardSubmitting(form,false);syncControls();}
      if(deliveryResult){
       if(resultItem) tableView.showActionResult(resultItem,submission,'Item #'+item.dataset.number,deliveryResult);
-      if(card.isConnected) showNotice(deliveryResult.message);
+      if(view!==tableView) view.showActionResult(item,overlaySubmission,'Item #'+item.dataset.number,deliveryResult);
      }
      view.applyAction();
     });
@@ -4588,9 +4600,12 @@ function closeListCard({resume=true}={}){
 }
 
 function listOverlayView(item){
- let request;
+ let request,actionMessage='';
  const current=()=>activeListCard?.item===item;
- const notice=message=>showActionFailure(recordDetails(item).querySelector('[data-send-status]'),message);
+ const notice=message=>{
+  actionMessage=message;
+  showActionFailure(recordDetails(item).querySelector('[data-send-status]'),message);
+ };
  const update=change=>{
   change(item,recordDetails(item));
   nameOverlayFields(item);
@@ -4601,7 +4616,7 @@ function listOverlayView(item){
   opened:new Set([item.dataset.key]),
   canSubmit:(form,key)=>current() && key===item.dataset.key && recordDetails(item).contains(form),
   rowFading:()=>false,
-  actionNotice:()=>'',
+  actionNotice:()=>actionMessage,
   preserveRecordRowTop:change=>change(),
   updateItemDetail:(_item,change)=>update((_row,detail)=>change(detail)),
   presentItemRevision:(_item,_revision,render)=>{if(current()) update(render);},

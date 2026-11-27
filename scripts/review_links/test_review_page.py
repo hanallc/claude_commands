@@ -230,6 +230,11 @@ class ReviewPageTests(unittest.TestCase):
         entry, = review_page.filter_index([unknown], staff.snapshot())
         self.assertEqual((entry['ownerHtml'], entry['sourceHtml']), ('nate', 'unknown-source'))
 
+    def deliver_review_message(self, delivery: review_page.ReviewActionDelivery,
+                               status: change_page.DeliveryStatus) -> None:
+        assert isinstance(delivery, (change_page.MessageDelivery, change_page.NoMessageDelivery))
+        change_page.deliver(delivery, status)
+
     def card_details(self, item: review_items.ReviewItem) -> str:
         snapshot = review_page.build_snapshot(self.root)
         assets: dict[str, str] = {}
@@ -1145,7 +1150,7 @@ window.fetch=(url,options)=>{
         self.assertNotEqual(displayed[1], match[1])
         resent = self.card_body(moved, change, 'question', words)+'&'+urlencode({'receiver': displayed[1]})
         delivery, _ = review_page.submit(self.root, resent, self.status, snapshot=moved)
-        change_page.deliver(delivery, self.status)
+        self.deliver_review_message(delivery, self.status)
         self.assertEqual([recipient for recipient, _, message in self.fixture.messages if words in message],
                          [displayed[1]])
 
@@ -3516,7 +3521,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         self.assertEqual(answer,'Use the first layout.')
         question = next(item for item in review_items.read(self.root) if item.key == key)
         self.assertIn('Use the first layout.',question.log[-1].words)
-        change_page.deliver(delivery,self.status)
+        self.deliver_review_message(delivery,self.status)
         self.assertTrue(any('Use the first layout.' in message for _,_,message in self.fixture.messages))
         self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == key),review_items.ReviewState.DONE)
         ready = self.investigation()
@@ -3764,7 +3769,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         review_later.save(other, legacy_time)
         with patch.object(time, 'time', return_value=1794902400):
             delivery, _ = review_page.submit(self.root, self.body(key, 'validate'), self.status)
-        change_page.deliver(delivery, self.status)
+        self.deliver_review_message(delivery, self.status)
         with self.subTest(later='cleared by hand-off'):
             self.assertNotIn(key, review_later.times())
             self.assertEqual(review_later.stored_times(review_later.path())[other], legacy_time.isoformat())
@@ -3817,7 +3822,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         sent = cache.save(fields, self.status)
         self.assertEqual(sent.answer, 'question saved')
         with patch.object(change_page, 'send_message', side_effect=RuntimeError('The recipient is offline.')):
-            change_page.deliver(sent.delivery, self.status)
+            self.deliver_review_message(sent.delivery, self.status)
         self.assertEqual(self.fixture.messages, [])
         reopened_status = change_page.DeliveryStatus(self.root)
         unsent = reopened_status.slots(check.page, check.row).question
@@ -3908,7 +3913,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         change_page.deliver(check, self.status)
         current, _ = cache.publish_record(cache.get(), fault_key)
         pending = cache.save(self.card_body(current, fault_key, 'question', question), self.status)
-        change_page.deliver(pending.delivery, self.status)
+        self.deliver_review_message(pending.delivery, self.status)
         result = change_review.save_verdict(check.page.review_list, check.row, 'not works: the gate failed',
                                             self.fixture.production, validation_id=check.attempt)
         self.assertIsInstance(result, change_review.VerdictSaved)
@@ -4101,7 +4106,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
     def test_showrunner_check_returns_a_fault_and_closes_a_success(self) -> None:
         key = 'page-owner/C1'
         delivery,_ = review_page.submit(self.root,self.body(key,'validate'),self.status)
-        change_page.deliver(delivery,self.status)
+        self.deliver_review_message(delivery,self.status)
         self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == key),review_items.ReviewState.VALIDATING)
         assert isinstance(delivery, change_page.MessageDelivery)
         now = datetime.now(user_zone())
@@ -5826,7 +5831,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         _ = self.investigation(False)
         _ = investigation.mark_read(ready.owner, ready.id)
         delivery, _ = review_page.submit(self.root, self.body(question_key, 'answer', 'Use the first layout.'), self.status)
-        change_page.deliver(delivery, self.status)
+        self.deliver_review_message(delivery, self.status)
         _ = change_review.save_verdict(self.fixture.review_list, 'C1', 'works', self.fixture.production)
         all_items = review_items.read(self.root)
         members = staff.snapshot()
@@ -6139,7 +6144,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                              if isinstance(item.source, review_items.QuestionSource) and item.owner == child.id)
             for key in (question, child_key):
                 delivery, _ = review_page.submit(self.root,self.body(key,'question','Check this exact record.'),self.status)
-                change_page.deliver(delivery,self.status)
+                self.deliver_review_message(delivery,self.status)
             child_record = next(item.source.record for item in review_items.read(self.root)
                                 if item.key == child_key and isinstance(item.source, review_items.QuestionSource))
             child_before = child_record.path.read_bytes()
@@ -6171,7 +6176,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         for key in keys:
             opened = next(item for item in review_items.read(self.root) if item.key == key)
             delivery, _ = review_page.submit(self.root, self.body(key, 'question', 'Check the old case.'), self.status)
-            change_page.deliver(delivery, self.status)
+            self.deliver_review_message(delivery, self.status)
             waiting = next(item for item in review_items.read(self.root) if item.key == key)
             with self.subTest(kind=opened.type):
                 self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
@@ -6210,7 +6215,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                     before = next(item for item in review_items.read(case.root) if item.key == key)
                     self.assertEqual(before.state, review_items.ReviewState.WAITING)
                     delivery, _ = review_page.submit(case.root, case.body(key, action, 'Use the new case.'), case.status)
-                    change_page.deliver(delivery, case.status)
+                    self.deliver_review_message(delivery, case.status)
                     updated = next(item for item in review_items.read(case.root) if item.key == key)
                     expected = review_items.ReviewState.WAITING if action in ('question', 'validate') else review_items.ReviewState.DONE
                     self.assertEqual(updated.state, expected)
@@ -6699,7 +6704,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 event = review_events.ReviewLog(read_at, 'nate', 'validate')
                 with patch.object(change_review, 'datetime', EventClock):
                     delivery, _ = review_page.submit(self.root, self.body(key, 'validate'), self.status)
-                change_page.deliver(delivery, self.status)
+                self.deliver_review_message(delivery, self.status)
             previous = new_reply if row == 'C6' else old_reply
             events = [review_events.ReviewLog(before, 'page-owner', 'Answer: ' + previous, 'older')]
             if read:
@@ -6738,7 +6743,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             event = review_events.ReviewLog(read_at, 'nate', 'validate')
             with patch.object(change_review, 'datetime', EventClock):
                 delivery, _ = review_page.submit(self.root, self.body(key, 'validate'), self.status)
-            change_page.deliver(delivery, self.status)
+            self.deliver_review_message(delivery, self.status)
             events = [replace(old_answer, time=reply_time, feedback_request_id='older')]
             if row != 'C7':
                 events.append(review_events.ReviewLog(after, 'nate', 'question: ' + question, 'current'))
@@ -6769,7 +6774,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 with (patch.object(change_review, 'datetime', EventClock),
                       patch.object(time, 'time', return_value=read_at.timestamp())):
                     delivery, _ = review_page.submit(self.root, self.body(key, 'validate'), self.status)
-                    change_page.deliver(delivery, self.status)
+                    self.deliver_review_message(delivery, self.status)
                 event = replace(owner_answer, time=after)
             with patch.object(change_review, 'datetime', EventClock):
                 save_log(path, row, words, production, who, feedback_request_id=feedback_request_id, **saved_time)
@@ -7415,7 +7420,7 @@ window.fetch=async(url,options={})=>{
     def test_question_answer_words_remain_after_the_answer_archive_expires(self) -> None:
         key = self.question()
         delivery,_ = review_page.submit(self.root,self.body(key,'answer','Keep these exact answer words.'),self.status)
-        change_page.deliver(delivery,self.status)
+        self.deliver_review_message(delivery,self.status)
         future = datetime.now(user_zone())+timedelta(days=3)
         _ = update_registration.answered_items(self.fixture.temporary/'outstanding.json',future)
         item = next(item for item in review_items.read(self.root) if item.key == key)
@@ -8247,7 +8252,7 @@ window.fetch=async(url,options)=>{
         toast, body = cast(tuple[str, str], json.loads(results[-1]))
         snapshot = review_page.build_snapshot(self.root)
         delivery, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
-        change_page.deliver(delivery, self.status)
+        self.deliver_review_message(delivery, self.status)
         receivers = [recipient for recipient, _, message in self.fixture.messages if 'Keep these words.' in message]
         self.assertIn(producer.name, receivers)
         self.assertCountEqual(receivers, toast.removeprefix('Sent to ').removesuffix('.').split(' and '))

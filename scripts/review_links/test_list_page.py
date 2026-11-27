@@ -3179,6 +3179,32 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(saved.state, the_list.ItemState.WORKING)
 
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_overlay_keeps_question_delivery_failure_after_form_reload(self) -> None:
+        item = self.studio_team_question()
+        source = self.add("Read the linked question", number=2)
+        _ = the_list.update(MORTY.id, source.id, {"related_to": (item.number,)}, source="morty")
+        failure = change_page.FailedDelivery("attempt", self.root / "question.md", item.id, "The owner is offline.")
+        with (patch.object(serve.ReviewLinksHandler, "deliver_review", return_value=failure),
+              self.studio_review_server() as origin):
+            self.open_studio_review_fixture(origin)
+            self.studio_review_check(r"""
+ row(2).querySelector('.list-toggle').click();
+ recordDetails(row(2)).querySelector('[data-list-linked-card]').click();
+ const overlay=dialog.querySelector('[data-list-linked-overlay] [data-list-item]');
+ const form=()=>recordDetails(overlay).querySelector('[data-studio-question-card] [data-review-form]');
+ await until(form);
+ const original=form(),words=original.elements.feedback;
+ words.value='Does this layout fit on a phone?';words.dispatchEvent(new Event('input'));
+ original.querySelector('[value="question"]').click();
+ await until(()=>form() && form()!==original);
+ const status=form().querySelector('[data-send-status]');
+ check(dialog.open && !status.hidden && status.textContent.includes('Saved. Delivery failed: The owner is offline.'),
+  'The new form keeps the delivery failure.');
+ close();
+ check(!dialog.open,'Close dismisses the overlay.');
+""")
+
     def studio_team_question(self) -> the_list.ListItem:
         members = staff.snapshot()
         parts = update_registration.QuestionParts(

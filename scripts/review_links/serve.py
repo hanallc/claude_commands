@@ -2245,7 +2245,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, RuntimeError, change_page.Refusal) as error:
             self.browser_failure(503, "The answer could not be saved.", error)
             return
-        action_delivery = saved.action_delivery
+        action_delivery = saved.delivery
         pending = not isinstance(action_delivery, change_page.NoMessageDelivery)
         result: dict[str, object] = {'answer':saved.answer, 'version':saved.version, 'delivery_pending':pending}
         if isinstance(saved.detail, review_page.ConfirmedReviewDetail):
@@ -2261,7 +2261,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                           later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
         def deliver_saved(*, report_outcome: bool = False) -> change_page.DeliveryOutcome:
             if isinstance(action_delivery, review_actions.ListFeedbackDelivery):
-                return list_page.deliver_with_outcome(action_delivery)
+                try:
+                    return list_page.deliver_with_outcome(action_delivery)
+                except OSError as error:
+                    print(f"review-links delivery result {action_delivery.identity}: {error}", file=sys.stderr)
+                    return change_page.DeliveryUnconfirmed()
             delivery = change_page.finish_verdict_cleanup(action_delivery, server.delivery_status)
             return self.deliver_review(server, delivery, report_outcome=report_outcome)
 
