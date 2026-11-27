@@ -1555,6 +1555,28 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(staff.retire_pending(), ())
         self.assertIsNone(staff.by_id(unit.id))
 
+        git("switch", "-c", "published-work")
+        _ = (checkout / "file").write_text("published work\n")
+        git("add", "file")
+        git("commit", "-m", "Add the published unit work")
+        git("push", "origin", "published-work:main")
+        for local_merge in ("behind", "absent"):
+            if local_merge == "absent":
+                git("branch", "-D", "main")
+            for operation in ("seed", "pending"):
+                with self.subTest(local_merge=local_merge, operation=operation):
+                    name = f"{operation}-{local_merge}"
+                    candidate = fixture_member("unit", name=name, parent=runner.id, worktree=staff.RemovedWorktree(
+                        "natedev", self.root / name, staff.ParkedBranch("published-work")))
+                    if operation == "seed":
+                        record = staff.apply_seed(staff.SeedInput((), (staff.SeedRetirement(candidate.id, runner.id),)))
+                    else:
+                        staff.defer_retire((candidate.id,))
+                        _ = staff.retire_pending()
+                        record = staff.authority_snapshot()
+                    self.assertIsNone(record.by_id(candidate.id))
+                    self.assertEqual(record.by_id(runner.id), runner)
+
     def test_staff_accessors_list_the_current_shutdown_writes(self) -> None:
         document = (CHECKOUT / "docs/as-built/staff-accessors.md").read_text(encoding="utf-8")
         row = next(line for line in document.splitlines() if line.startswith("| `scripts/agents/shutdown.py`"))

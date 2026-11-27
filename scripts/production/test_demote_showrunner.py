@@ -18,6 +18,7 @@ from unittest import mock
 
 from scripts.accounts import accounts
 from scripts.herdr import herdr
+from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.shell_test_support import fixture_zsh_environment
@@ -586,6 +587,30 @@ class DemoteShowrunnerTests(StaffTestCase):
         _ = self.git("push", "origin", "--delete", "handoff-a", "handoff-b")
         self.assertEqual(self.run_command("--check")[0], 0)
         self.assert_no_actions(before)
+
+        with self.subTest(remote="origin moves before fetch while the local tip is unmerged"):
+            ref = "refs/heads/handoff-a"
+            origin = str(self.root / "origin.git")
+            local_tip = self.git("commit-tree", f"{commit}^{{tree}}", "-p", commit, "-m", "Unmerged local work")
+            advertised = self.git("-C", origin, "commit-tree", f"{commit}^{{tree}}", "-p", commit, "-m", "Origin work")
+            _ = self.git("update-ref", ref, local_tip)
+            _ = self.git("-C", origin, "update-ref", ref, advertised)
+            retirement_git = shutdown.retirement_git
+
+            def advance_origin(unit: shutdown.RetiringUnit, *args: str,
+                               settings: conf.ConfigRead) -> subprocess.CompletedProcess[str]:
+                result = retirement_git(unit, *args, settings=settings)
+                if args[0] == "ls-remote" and args[-1] == ref:
+                    self.assertEqual(result.stdout.split()[0], advertised)
+                    _ = self.git("-C", origin, "update-ref", ref, commit, advertised)
+                return result
+
+            with mock.patch.object(shutdown, "retirement_git", side_effect=advance_origin):
+                code, _, errors = self.run_command("--check")
+            self.assertEqual(self.git("-C", origin, "rev-parse", ref), commit)
+            self.assertEqual(code, 2, errors)
+            self.assertIn("unmerged branches: handoff-a", errors)
+            self.assert_no_actions(before)
 
     def test_unknown_retirement_facts_print_one_anomaly_without_refusal(self) -> None:
         row = fixture_member("unit", name="unknown", parent=self.child.id,

@@ -571,29 +571,42 @@ def retirement_tips_landed(unit: shutdown.RetiringUnit, tips: shutdown.BranchTip
         return True
     run = partial(shutdown.retirement_git, unit, settings=settings)
     target_ref = f"refs/heads/{unit.production.merge_branch}"
-    local_target = shutdown.retirement_local_tip(unit, target_ref, settings=settings)
+    unmerged: set[str] = set()
+    errors: list[str] = []
 
-    def landed(tip: str, target: str) -> bool:
-        if not branch_is_landed(unit.production.checkout, tip, target):
-            return False
-        merges = good(run("rev-list", "--merges", "--max-count=1", tip, "--not", target), "retire")
-        return not merges or git_merge_tree.leaves_target_unchanged(run, tip, target)
+    def compare(target: str) -> None:
+        for tip in tuple(remaining):
+            try:
+                landed = branch_is_landed(unit.production.checkout, tip, target)
+                if landed and good(run("rev-list", "--merges", "--max-count=1", tip, "--not", target), "retire"):
+                    landed = git_merge_tree.leaves_target_unchanged(run, tip, target)
+                if landed:
+                    remaining.remove(tip)
+                else:
+                    unmerged.add(tip)
+            except RETIREMENT_BRANCH_ERRORS as error:
+                errors.append(str(error))
 
-    if local_target:
-        remaining = {tip for tip in remaining if not landed(tip, local_target)}
-        if not remaining:
-            return True
-    if fetch_url:
+    local_target = ""
+    try:
+        local_target = shutdown.retirement_local_tip(unit, target_ref, settings=settings)
+        if local_target:
+            compare(local_target)
+    except RETIREMENT_BRANCH_ERRORS as error:
+        errors.append(str(error))
+    if remaining and fetch_url:
         try:
             origin_target = fetch_retirement_tip(run, fetch_url, target_ref, local_target)
             if origin_target and origin_target != local_target:
-                return all(landed(tip, origin_target) for tip in remaining)
-        except RETIREMENT_BRANCH_ERRORS:
-            if not local_target:
-                raise
-    if not local_target:
-        raise ValueError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
-    return False
+                compare(origin_target)
+        except RETIREMENT_BRANCH_ERRORS as error:
+            errors.append(str(error))
+    if remaining & unmerged:
+        return False
+    if remaining:
+        reason = errors[0] if errors else f"merge branch {unit.production.merge_branch} is absent from origin and this clone"
+        raise ValueError(reason)
+    return True
 
 
 def retirement_branch_state(unit: shutdown.RetiringUnit, settings: conf.ConfigRead) -> RetirementBranch:
