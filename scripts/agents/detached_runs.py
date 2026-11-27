@@ -1199,6 +1199,20 @@ def _clear_completion_pending(path: Path) -> None:
             write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
+def stage_worker_stop_results(run: Path, row: staff.StaffRow, instance: str) -> None:
+    """Save undelivered stop results before the worker completion is final."""
+    runs = run / DETACHED_RUNS_DIR
+    for record in _registered_runs(runs, row.id):
+        delivery = record.get("delivery", "")
+        if (record["staff_id"] == row.id and record.get("pane_dispatch_id") == instance
+                and Path(record["session_dir"]).resolve() == run.resolve()
+                and _stop_canceled_before_receipt(record, row)):
+            _stage_stop_result_notice(run, instance, record)
+            path = runs / f"{record['run_id']}.json"
+            if _save_delivery(path, ENDED_PASS_RESULT_QUEUED, if_current=delivery) == ENDED_PASS_RESULT_QUEUED:
+                _clear_completion_pending(path)
+
+
 def acknowledge_worker_completion(run: Path, row: staff.StaffRow, passed: dict[str, object]) -> CompletionReplay:
     """Clear covered result flags after the worker pane closes."""
     instance = passed.get("instance_id")
@@ -1210,14 +1224,6 @@ def acknowledge_worker_completion(run: Path, row: staff.StaffRow, passed: dict[s
     evidence: ResultDoneEvidence | ResultTranscriptUnknown | Literal[ResultDoneCoverage.NEEDS_DELIVERY] | None = None
     for record in _registered_runs(runs, row.id):
         delivery = record.get("delivery", "")
-        if (record["staff_id"] == row.id and record.get("pane_dispatch_id") == instance
-                and Path(record["session_dir"]).resolve() == run.resolve()
-                and _stop_canceled_before_receipt(record, row)):
-            _stage_stop_result_notice(run, instance, record)
-            path = runs / f"{record['run_id']}.json"
-            if _save_delivery(path, ENDED_PASS_RESULT_QUEUED, if_current=delivery) == ENDED_PASS_RESULT_QUEUED:
-                _clear_completion_pending(path)
-            continue
         if (record["staff_id"] != row.id or record["status"] != "finished"
                 or record.get("completion_pending") is not True or not delivery):
             continue

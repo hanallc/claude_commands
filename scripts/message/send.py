@@ -5534,7 +5534,7 @@ class UnverifiedWorkerResultTranscript(Enum):
 
 @dataclass(frozen=True)
 class WorkerResultSubmission:
-    """Request pane input with confirmation of a new transcript occurrence."""
+    """Confirm new pane input and record when the input call returns."""
 
     wait_for_idle: bool = False
     before_input: Callable[[], object] = lambda: None
@@ -5719,10 +5719,12 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         if isinstance(state, worker_panes.OpenWorker):
             attempting_input = False
             boundary: worker_panes.TranscriptCursor | NoResultTranscript = NoResultTranscript.UNRECORDED
+            transcript: WorkerResultTranscript | UnverifiedWorkerResultTranscript = (
+                UnverifiedWorkerResultTranscript.UNAVAILABLE)
             ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
 
             def require_idle() -> None:
-                nonlocal attempting_input, boundary
+                nonlocal attempting_input, boundary, transcript
                 readiness = prompt_client.readiness(state.pane)
                 if not (readiness["agent_status"].idle and readiness["interactive_ready"]):
                     raise herdr_types.HerdrFailure("worker is not ready for input")
@@ -5738,8 +5740,6 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         transcript = captured.transcript
                     else:
                         boundary = captured
-                        transcript = UnverifiedWorkerResultTranscript.UNAVAILABLE
-                    _ = receipt.at_boundary(time.time(), transcript)
                 attempting_input = True
 
             def check_message_status() -> None:
@@ -5785,6 +5785,9 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                             return WorkerResultNotSubmitted("retry", reason)
                     else:
                         raise
+                else:
+                    if isinstance(receipt, WorkerResultSubmission) and attempting_input:
+                        _ = receipt.at_boundary(time.time(), transcript)
                 if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                     try:
                         if isinstance(receipt, WorkerResultSubmission):

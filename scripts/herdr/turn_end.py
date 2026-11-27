@@ -648,11 +648,14 @@ def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
     elif isinstance(pane, worker.CloseCompletedPane):
         _ = pass_notices.deliver_diagnostics(run, instance)
     if closed and completion.recording_done:
+        has_done = completion.outcome in (TurnOutcome.DONE, TurnOutcome.LATE_DONE)
+        if has_done:
+            detached_runs.stage_worker_stop_results(run, row, instance)
         progress_history.save_hook_completion(run, instance, replace(completion, finished=True))
         pending = worker.pending_done_path(run, row.id)
         if worker_lifecycle.read_json_object(pending).get("instance") == instance:
             pending.unlink(missing_ok=True)
-        if completion.outcome in (TurnOutcome.DONE, TurnOutcome.LATE_DONE):
+        if has_done:
             passed = worker_panes.worker_pass(row, run)
             if (passed.get("instance_id") == instance
                     and detached_runs.acknowledge_worker_completion(run, row, passed) == detached_runs.CompletionReplay.RETRY):
@@ -1639,10 +1642,10 @@ def _handle_locked(event: WorkerEvent,
             if receipt.finished:
                 if needs_verification:
                     pending_path.unlink(missing_ok=True)
-                if (receipt.pane_closed and receipt.outcome in (TurnOutcome.DONE, TurnOutcome.LATE_DONE)
-                        and detached_runs.acknowledge_worker_completion(run, row, passed)
-                        == detached_runs.CompletionReplay.RETRY):
-                    return TurnOutcome.RETRY_EVIDENCE
+                if receipt.pane_closed and receipt.outcome in (TurnOutcome.DONE, TurnOutcome.LATE_DONE):
+                    detached_runs.stage_worker_stop_results(run, row, instance)
+                    if detached_runs.acknowledge_worker_completion(run, row, passed) == detached_runs.CompletionReplay.RETRY:
+                        return TurnOutcome.RETRY_EVIDENCE
                 if isinstance(state, worker_panes.ClosedWorker):
                     _remove_completed_restart(row, delivery)
                 return ignore_turn("the hook completion is already finished")

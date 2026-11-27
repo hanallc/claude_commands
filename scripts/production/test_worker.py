@@ -4880,6 +4880,59 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertTrue(detached_runs._cancels_pass(stopped))  # pyright: ignore[reportPrivateUsage]
         self.assertIn("Result: STOPPED (exit 7)", detached_runs.result_text(stopped, detached_runs.command_result(stopped)))
 
+    def test_stop_recovery_keeps_a_turn_end_before_input_returns(self) -> None:
+        row, _, _ = self.save_stop_canceled_worker_runs()
+        parked, _ = self.detached_record(row, "parked-stop")
+        parked.unlink()
+        path, _ = self.detached_record(row, "unreceived-stop")
+        record = cast(detached_runs.RunRecord, cast(object, worker_lifecycle.read_json_object(path)))
+        record["delivery"] = detached_runs.PARKED_WORKER_RESULT
+        atomic_file.write_text_atomic(path, json.dumps(record))
+
+        def end_turn_during_input(*_args: object, **_kwargs: object) -> None:
+            self.append_stop_recovery_turn_end(row, time.time())
+
+        with patch.object(self.fixture.world, "_prompt", side_effect=end_turn_during_input) as prompt:
+            result = detached_runs.deliver(record, detached_runs.command_result(record))
+        self.assertTrue(result.startswith(detached_runs.UNCONFIRMED_WORKER_RESULT), result)
+        prompt.assert_called_once()
+        receipt = self.receipt()
+        assert isinstance(receipt, worker.DispatchWaitingForRuns)
+        self.assertEqual(receipt.runs, ("unreceived-stop",))
+        saved = cast(detached_runs.PaneResultAttempt, worker_lifecycle.read_json_object(path)["worker_result_attempt"])
+        self.append_stop_recovery_turn_end(row, saved["submitted_at"] + 1)
+        self.assertIsInstance(self.receipt(), worker.DispatchSubmitted)
+
+    def test_done_stages_the_stop_result_before_saving_finished(self) -> None:
+        row, pane, instance = self.save_stop_canceled_worker_runs()
+        other, _ = self.detached_record(row, "unreceived-stop")
+        other.unlink()
+        self.agent.complete(pane)
+        save = progress_history.save_hook_completion
+
+        def stop_after_finishing(run: Path, pass_id: str, completion: progress_history.HookCompletion) -> None:
+            save(run, pass_id, completion)
+            if completion.finished:
+                raise KeyboardInterrupt
+
+        with patch.object(progress_history, "save_hook_completion", side_effect=stop_after_finishing):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = self.finish()
+
+        completion = progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir))
+        assert isinstance(completion, progress_history.HookCompletion)
+        self.assertTrue(completion.finished)
+        key = "detached-result:parked-stop"
+        notices = pass_notices.read(self.run_dir, instance)
+        assert notices is not None
+        self.assertIn(key, notices.notices)
+        self.assertIn("Result: STOPPED (exit 143)", notices.notices[key].text)
+
+        _ = self.finish(kind=turn_end.EventKind.RUN_FINISHED)
+        pass_notices.retry(self.run_dir)
+        alerts = [text for text in self.agent.notices if "Detached run: parked-stop\n" in text]
+        self.assertEqual(len(alerts), 1)
+
     def test_answer_recovers_an_interrupted_result_turn_before_assignment(self) -> None:
         row, pane, path, assign_next = self.ended_pass_with_result("interrupted", "already delivered: late-result")
         self.agent.append(pane, "user", "Detached run: late-result\nRun finished: private verification")
