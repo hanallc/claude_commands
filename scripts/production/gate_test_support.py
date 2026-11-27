@@ -32,7 +32,7 @@ from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
-from scripts.lib import build_folders, conf
+from scripts.lib import build_folders, testing_folders
 from scripts.lib.git_test_support import fixture_git_environment, write_fixture_git_config
 from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
@@ -289,11 +289,6 @@ def suites_for_case(case: unittest.TestCase) -> tuple[str, ...]:
     return cast(tuple[str, ...], getattr(method, "gate_test_suites", ("hooks",)))
 
 
-def pin_gate_root(configuration: Path, root: Path) -> None:
-    """Keep the fixture gate in its private folder."""
-    _ = write_config_fixture(configuration, f"roots.gate={root}\nroots.gate.{conf.local_host_key_name()}={root}\n")
-
-
 def wait_for_file(path: Path) -> None:
     wait_until(path.exists, path.parent, timeout=TEST_HANG_GUARD_SECS)
 
@@ -334,21 +329,20 @@ class MergeGateFixture(unittest.TestCase):
 
     @classmethod
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
-        environment = config_environment(directory)
-        pin_gate_root(directory / "build_folders.conf", Path("/tmp").resolve())
-        return environment
+        return config_environment(directory)
 
     @classmethod
     @override
     def setUpClass(cls) -> None:
+        test_runs = testing_folders.prepare_test_runs_parent(SCRIPT.parents[2])
         configuration = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="gate-config-", dir="/tmp")))
         environment = fixture_git_environment(configuration)
         for key in ("BASH_ENV", "STAFF_CONFIG"):
             _ = environment.pop(key, None)
         environment.update(cls.fixture_configuration(configuration))
         _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, environment, clear=True)))
-        tmpfs = build_folders.tmpfs_temporary_parent()
-        private = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="mg-", dir=tmpfs)))
+        private = cls.enterClassContext(build_folders.temporary_build_folder(
+            build_folders.UniqueBuildFolder("mg-", build_folders.ExplicitBuildParent(test_runs))))
         parent = gate.gate_test_parent(private)
         parent.mkdir(mode=0o700)
         directory = cls.enterClassContext(build_folders.temporary_build_folder(
@@ -389,10 +383,8 @@ class MergeGateFixture(unittest.TestCase):
             # to the seed's original path, with its private origin and refs.
             _ = shutil.copytree(self.fixture_seeds[folders].snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
-        pin_gate_root(Path(self.environment["CONF_DIR"]) / "build_folders.conf", self.fixture_root.parent)
-        pin_gate_root(self.root / "build_folders.conf", self.fixture_root.parent)
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
-                                 f"roots.gate={self.fixture_root.parent}\nroots.build={self.fixture_root / 'build'}\n"
+                                 f"roots.build={self.fixture_root / 'build'}\n"
                                  + f"roots.build.natedev={self.fixture_root / 'build'}\n")
         self.configure_gate("program_first_peak_gib.gate=4\n")
         seed = self.fixture_seeds[folders]
@@ -467,6 +459,7 @@ class MergeGateFixture(unittest.TestCase):
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             "GATE_TEST_STATE": str(self.state),
             "CLAUDE_DISABLE_DATACLASS_CODE_CACHE": "1",
+            "TMPDIR": str(self.fixture_root.parent),
             "GATE_FIXTURE_TMP": str(self.fixture_root.parent),
             "GATE_TEST_REPO": str(SCRIPT.parents[2]),
             "GATE_PYTHON": str(self.bin / "suite-python"),

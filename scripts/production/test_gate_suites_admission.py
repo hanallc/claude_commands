@@ -124,51 +124,51 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         self.assertEqual(adjusted.remaining_need, recorded_use)
         self.assert_gate_released()
 
-    def test_suites_refuse_unwritable_memory_parent_before_admission(self) -> None:
-        gate_root = self.root
+    def test_suites_refuse_an_unwritable_test_runs_parent_before_admission(self) -> None:
+        parent = self.root / "test-runs"
         access = os.access
 
         def writable(path: str | os.PathLike[str], mode: int) -> bool:
-            return False if Path(path) == gate_root else access(path, mode)
+            return False if Path(path) == parent else access(path, mode)
 
-        with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(build_folders, "configured_gate_root", return_value=gate_root), \
-             mock.patch.object(os, "access", side_effect=writable), \
-             mock.patch.object(gate, "gate_reservation") as admission:
-            with self.assertRaisesRegex(GateRefused,
-                                        f"requires a writable gate folder at {gate_root}"):
+        with (mock.patch.dict(os.environ, {**self.environment, "TMPDIR": str(self.root)}),
+              mock.patch.object(os, "access", side_effect=writable),
+              mock.patch.object(gate, "gate_reservation") as admission):
+            with self.assertRaisesRegex(GateRefused, f"requires a writable gate folder at {parent}"):
                 _ = gate.run_suites(self.checkout)
             admission.assert_not_called()
         self.assert_gate_released()
 
-    def test_suites_report_old_gate_folders_and_keep_their_records(self) -> None:
-        tmpfs = self.root / "gate-tmpfs"
-        parent = gate.gate_test_parent(tmpfs)
-        parent.mkdir(parents=True)
-        held = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            "merge-gate-test-", build_folders.ExplicitBuildParent(parent)))
+    def test_suites_sweep_only_free_allocations_in_test_runs(self) -> None:
+        parent = self.root / "test-runs"
+        parent.mkdir()
         release = cast(Callable[[Path], None], getattr(build_folders, "_release_build_folder"))
+        held = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            "g-", build_folders.ExplicitBuildParent(parent)))
         self.addCleanup(release, held)
         free = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            "merge-gate-", build_folders.ExplicitBuildParent(parent)))
+            "t-", build_folders.ExplicitBuildParent(parent)))
         release(free)
-        # The shared parent also holds a folder from another program.
-        foreign = tmpfs / "foreign"
-        foreign.mkdir()
-        (tmpfs / "foreign.lock").touch()
-        with (mock.patch.dict(os.environ, self.environment),
-              mock.patch.object(build_folders, "configured_gate_root", return_value=tmpfs),
+        outside = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            "g-", build_folders.ExplicitBuildParent(self.root)))
+        release(outside)
+        children = gate.gate_test_parent(parent / "mg-fixture")
+        children.mkdir(parents=True)
+        retained = children / "gate-test-kept"
+        retained.mkdir()
+        with (mock.patch.dict(os.environ, {**self.environment, "TMPDIR": str(self.root)}),
               mock.patch.object(gate, "gate_reservation", side_effect=GateRefused("stopped at admission")),
               redirect_stderr(io.StringIO()) as report):
             with self.assertRaisesRegex(GateRefused, "stopped at admission"):
                 _ = gate.run_suites(self.checkout)
-        self.assertTrue(free.is_dir())
-        self.assertTrue(free.with_name(free.name + ".lease.json").is_file())
+        self.assertFalse(free.exists())
+        self.assertFalse(build_folders.lease_path(free).exists())
         self.assertTrue(held.is_dir())
-        self.assertTrue(foreign.is_dir())
-        self.assertCountEqual(report.getvalue().splitlines(), [
-            f"kept for a manual removal list: {folder} (gate, an earlier test fixture created this folder)"
-            for folder in (held, free)
+        self.assertTrue(outside.is_dir())
+        self.assertTrue(build_folders.lease_path(outside).is_file())
+        self.assertTrue(retained.is_dir())
+        self.assertEqual(report.getvalue().splitlines(), [
+            f"kept for a manual removal list: {retained} (gate, an earlier test fixture created this folder)"
         ])
         self.assert_gate_released()
 

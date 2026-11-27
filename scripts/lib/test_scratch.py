@@ -32,6 +32,7 @@ from scripts.lib import build_folders, build_copies, cargo_output, copy_record, 
 from scripts.lint import sweep
 
 from scripts.lib import conf
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import sessions
 from scripts.production import staff
@@ -566,7 +567,7 @@ class ScratchTests(unittest.TestCase):
         task = "gate:remote-timeout"
         path, _ = self.copy_with_published_head("remote-timeout", task)
         self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
-        address = self.base / "remote.sock"
+        address = Path(self.enterContext(short_socket_directory())) / "remote.sock"
         self.stall_remote_advertisement(path, address)
         previous_objects = self.git_object_files(path)
         with (socket.socket(socket.AF_UNIX) as server,
@@ -726,7 +727,7 @@ class ScratchTests(unittest.TestCase):
         task = "gate:stopped-remote"
         path, _ = self.copy_with_published_head("stopped-remote", task)
         self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
-        address = self.base / "stopped.sock"
+        address = Path(self.enterContext(short_socket_directory())) / "stopped.sock"
         self.stall_remote_advertisement(path, address)
         scratch.busy_path(path).touch()
         previous_files = set(path.rglob("*"))

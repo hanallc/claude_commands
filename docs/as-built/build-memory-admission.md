@@ -367,7 +367,8 @@ The sweep also reads old six-character shell suffixes until 2026-12-03.
 `ExplicitBuildParent` retains an explicit parent.
 `SystemTemporaryParent` uses the short system parent for socket and index folders.
 `UnitRunParent` reads the current root from `unit_runs.run_roots()`.
-The gate checks `/dev/shm` before allocation and uses an explicit parent without a disk fallback.
+The gate checks the checkout’s `test-runs` parent before admission.
+The native Mac gate uses `/private/tmp` until it has a fixed build folder.
 
 Shell callers use these forms:
 

@@ -41,6 +41,7 @@ from scripts.lib.build_steps import (
 )
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.process_start import Gone
+from scripts.lib.socket_test_support import short_socket_address_examples
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, promotion, staff
 from scripts.production.gate_modules import GateRefused, discover_test_modules
@@ -50,6 +51,90 @@ from scripts.production.staff_test_support import (
 )
 from scripts.production.gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 from scripts.production.test_gate_default_placement import placed
+
+
+class GateFolderGuardTests(unittest.TestCase):
+    def test_gate_module_folders_leave_room_for_unix_sockets(self) -> None:
+        config = Path(__file__).resolve().parents[2] / "config"
+        guest_copy = Path("/home/guest/build/claude/01234567-89ab-4def-8123-456789abcdef/1")
+        guest_home = guest_copy / "target/mac-linux/home"
+        aws_checkout = Path("/var/lib/gate-trial/repo")
+        cases = (
+            (guest_home, guest_copy / "target/test-runs"),
+            (Path("/home/gate-trial"), aws_checkout / "test-runs"),
+        )
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config), "HOME": "/home/original", "TMPDIR": "/tmp"}):
+            expected = short_socket_address_examples()
+            for home, parent in cases:
+                with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                    self.assertEqual(short_socket_address_examples(), expected)
+                    for module in (parent / "g-abcdefgh/m0001", parent / "nested/t-abcdefgh/m0001"):
+                        with (self.subTest(home=home, module=module),
+                              mock.patch.dict(os.environ, {"TMPDIR": str(module)})):
+                            self.assertEqual(short_socket_address_examples(), expected)
+            longest = max(len(os.fsencode(address)) + 1 for address in expected)
+            self.assertLess(longest, 104)
+
+    def test_only_legacy_move_native_mac_and_guest_isolation_name_the_old_roots(self) -> None:
+        # Split the search strings so this test cannot match its own declarations.
+        memory = "/dev/" + "shm"
+        gate_key = "roots." + "gate"
+        mac_key = gate_key + ".nates-macbook-pro-2023"
+        root_reader = "configured_" + "gate_root"
+        # List 542 tip B removes these lines.
+        move_worker = {
+            ("config/build_folders.conf", f"{gate_key}={memory}"),
+            ("scripts/lib/build_folders.py", f"def {root_reader}() -> Path:"),
+            ("scripts/lib/build_folders.py", f'return Path(_settings().text("{gate_key}"))'),
+            ("scripts/disks/cleanup_old_folders.py", f"gate = build_folders.{root_reader}()"),
+        }
+        # The L365 follow-on removes these lines.
+        native_mac = {
+            ("config/build_folders.conf", f"{mac_key}=/private/tmp"),
+            ("scripts/mac_test/mac_gate.py", f'root = conf.read_or_repository("build_folders").text("{mac_key}")'),
+        }
+        # Keep these lines for sandbox isolation. They do not select a test folder.
+        guest_isolation = {
+            ("scripts/build_targets/mac_linux.py",
+             f"'--proc', '/proc', '--bind', str(tmp), '/tmp', '--tmpfs', '{memory}', '--', *command]"),
+            ("scripts/build_targets/test_mac_linux.py",
+             f"'--proc', '/proc', '--bind', os.environ['TMPDIR'], '/tmp', '--tmpfs', '{memory}', '--']"),
+            ("scripts/build_targets/test_mac_linux.py",
+             f"assert os.stat('{memory}').st_dev != shm_device, 'The suite {memory} must have its own file system.'"),
+            ("scripts/build_targets/test_mac_linux.py",
+             f"Path('{memory}/suite-output').write_text('shared memory output')"),
+            ("scripts/build_targets/test_mac_linux.py", f"str(os.stat('{memory}').st_dev),"),
+        }
+        # Keep this mount for the removal sandbox.
+        removal_isolation = {
+            ("scripts/lib/removal_bwrap_test_support.py",
+             f'LINUX_PRIVATE_PATHS = tuple(Path(name) for name in ("/home", "/tmp", "/build", "/session", "{memory}", "/var/tmp"))'),
+        }
+        # List 542 tip B removes these lines.
+        move_fixtures = {
+            ("scripts/disks/test_cleanup_old_folders.py",
+             r'f"roots.build={self.build}\n' + gate_key
+             + r'={self.gate}\n# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")'),
+        }
+        allowed = move_worker | native_mac | guest_isolation | removal_isolation | move_fixtures
+        checkout = Path(__file__).resolve().parents[2]
+        excluded = {".git", "__pycache__", "docs", "node_modules", "target", "test-runs", "typecheck-venv"}
+        source_suffixes = {".bash", ".conf", ".js", ".json", ".mjs", ".nix", ".py", ".rs", ".sh", ".toml",
+                           ".ts", ".yaml", ".yml", ".zsh"}
+        found: list[tuple[str, str]] = []
+        for directory, names, files in os.walk(checkout):
+            names[:] = [name for name in names if name not in excluded]
+            for name in files:
+                path = Path(directory) / name
+                relative = path.relative_to(checkout)
+                is_source = (path.suffix in source_suffixes or relative.parts[0] == "config"
+                             or not path.suffix and os.access(path, os.X_OK))
+                if path.is_symlink() or not is_source:
+                    continue
+                for line in path.read_text(errors="replace").splitlines():
+                    if memory in line or gate_key in line or root_reader in line:
+                        found.append((relative.as_posix(), line.strip()))
+        self.assertCountEqual(found, allowed)
 
 
 class GateModuleOwnerTests(unittest.TestCase):
@@ -1009,45 +1094,38 @@ gate.run_gate_suites = fail_suites
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
         self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
 
-    def test_gate_uses_configured_root_when_module_folder_is_missing(self) -> None:
-        gate_root = self.fixture_root.parent
-        missing = gate_root / "missing-module"
-        with (mock.patch.dict(self.environment, {gate.GATE_MODULE_TEMP_DIR: str(missing)}),
-              mock.patch.object(gate, "gate_temporary", wraps=gate.gate_temporary) as allocate):
-            result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        allocate.assert_called_once_with(mock.ANY, "g", gate_root)
-        self.assert_all_modules_started()
-
-    def test_nested_gate_uses_the_inherited_module_folder_only_under_the_gate_root(self) -> None:
-        gate_root = self.fixture_root.parent
-        module = gate_root / "inherited-module"
-        module.mkdir()
-        outside = gate_root.parent / f"{gate_root.name}-outside"
-        outside.mkdir()
-        self.addCleanup(outside.rmdir)
-        for inherited, parent in ((module, module.resolve()), (outside, gate_root)):
-            with self.subTest(inherited=inherited.name):
-                with (mock.patch.dict(self.environment, {gate.GATE_MODULE_TEMP_DIR: str(inherited)}),
-                      mock.patch.object(gate, "gate_temporary", wraps=gate.gate_temporary) as allocate):
-                    result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+    def test_gate_ignores_the_inherited_module_folder_for_placement(self) -> None:
+        temporary = self.fixture_root.parent
+        parent = temporary / "test-runs"
+        existing = parent / "inherited-module"
+        existing.mkdir(parents=True)
+        for inherited in (temporary / "missing-module", existing, self.root):
+            with (self.subTest(inherited=inherited),
+                  mock.patch.dict(self.environment, {gate.GATE_MODULE_TEMP_DIR: str(inherited)}),
+                  mock.patch.object(gate, "gate_temporary", wraps=gate.gate_temporary) as allocate):
+                self.clear_gate_events()
+                result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 allocate.assert_called_once_with(mock.ANY, "g", parent)
+                self.assert_all_modules_started()
+        self.assertTrue(existing.is_dir())
 
     @gate_suites("hooks", "message")
-    def test_gate_and_affected_module_folders_leave_room_for_unix_sockets(self) -> None:
+    def test_gate_and_affected_modules_use_the_checkout_test_runs(self) -> None:
         prepare = gate.test_module_environment
+        output = self.root / "build/fixture/verify/deadbeef"
+        output.mkdir(parents=True)
+        (self.checkout / "target").symlink_to(output, target_is_directory=True)
+        expected = output / "test-runs"
         gate_root = self.fixture_root.parent
-        legacy_run = Path("test-runs/test-run-abcdefgh")
-        inherited_run = gate_root / legacy_run
+        inherited_run = gate_root / "test-runs/test-run-abcdefgh"
         inherited_run.mkdir(parents=True)
         deep_tmpdir = gate_root / "gate-invocation-abcdefghijklmnopqrstuvwxyz"
         deep_tmpdir.mkdir()
-        sockets = (Path(".com.google.Chrome.123456/SingletonSocket"),
-                   Path("style-socket-abcdefgh/outside.sock"))
         for flag in ("--tests-only", "--affected"):
             for inherited in (gate_root, inherited_run, deep_tmpdir):
                 with self.subTest(mode=flag, inherited=inherited):
+                    self.clear_gate_events()
                     job_folders: list[Path] = []
 
                     def prepare_module(root: Path, environment: dict[str, str]) -> dict[str, str]:
@@ -1060,14 +1138,12 @@ gate.run_gate_suites = fail_suites
                           mock.patch.object(gate, "test_module_environment", side_effect=prepare_module)):
                         result = self.run_gate(flag, "--module", "hooks/test_first.py", "--module", "message/test_first.py")
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assert_all_modules_started()
                     self.assertCountEqual([root.name for root in job_folders], ["m0001", "m0002"])
                     for root in job_folders:
-                        self.assertEqual(root.parent.parent, gate_root)
-                        relative = root.relative_to(gate_root)
-                        for platform_root, limit in ((Path("/dev/shm"), 108), (Path("/private/tmp"), 104)):
-                            for suffix in sockets:
-                                socket_path = platform_root / relative / legacy_run / suffix
-                                self.assertLessEqual(len(os.fsencode(socket_path)) + 1, limit, str(socket_path))
+                        self.assertEqual(root.parent.parent, expected)
+                        self.assertRegex(root.parent.name, r"^[gt]-[a-z0-9_]{8}$")
+                        self.assertFalse(root.exists())
 
     def test_folders_without_test_modules_and_cached_files_are_not_suites(self) -> None:
         scripts = self.checkout / "scripts"

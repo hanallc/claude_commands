@@ -140,7 +140,7 @@ changes.default=no branch
 }
 
 
-def pin_ledger_settings(directory: Path, root: Path, gate: Path) -> None:
+def pin_ledger_settings(directory: Path, root: Path) -> None:
     """Give the gate and admission caller fixed settings in their private folders."""
     directory.mkdir(parents=True, exist_ok=True)
     for stem, contents in LEDGER_SETTINGS.items():
@@ -172,7 +172,6 @@ request_slow_seconds=0.25
     _ = (directory / "build_folders.conf").write_text(
         f"""roots.system=/tmp
 roots.temporary=${{TMPDIR}}/builds
-roots.gate={gate}
 roots.build={root / 'build'}
 roots.build.{conf.local_host_key_name()}={root / 'build'}
 roots.workspace={root / 'workspaces'}
@@ -265,7 +264,7 @@ class MergeGateLedgerTests(MergeGateFixture):
     @override
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
         environment = super().fixture_configuration(directory)
-        pin_ledger_settings(directory, directory, Path("/tmp").resolve())
+        pin_ledger_settings(directory, directory)
         return {**environment, "STAFF_CONFIG": str(directory / "staff.conf")}
 
     @override
@@ -281,8 +280,8 @@ class MergeGateLedgerTests(MergeGateFixture):
     def restore_fixture(self, folders: tuple[str, ...]) -> None:
         super().restore_fixture(folders)
         # Keep the host override keys from the shared config templates out of the test.
-        pin_ledger_settings(self.root, self.root, self.root.parent)
-        pin_ledger_settings(self.root / "config", self.root, self.root.parent)
+        pin_ledger_settings(self.root, self.root)
+        pin_ledger_settings(self.root / "config", self.root)
 
     @override
     def build_fixture(self, root: Path) -> None:

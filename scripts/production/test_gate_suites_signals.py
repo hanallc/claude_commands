@@ -17,10 +17,9 @@ from typing import cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation, conf
+from scripts.lib import build_folders, cancellation
 from scripts.lib.process_start import Gone, Started, Unreadable, Zombie
 from scripts.lib.python_startup.sitecustomize import GATE_PARENT_SOURCE_FD
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.production import gate, gate_suites_test_support
 from scripts.production.gate_modules import GateRefused
@@ -348,9 +347,6 @@ sys.stdin.read(1)
         parent = self.root / "nested-temporary"
         parent.mkdir()
         self.environment["TMPDIR"] = str(parent)
-        host = conf.local_host_key_name()
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
-                                 f"roots.gate.{host}={parent}\n")
         record = self.state / "nested-folders.json"
         module = self.checkout / "scripts" / "hooks" / "test_first.py"
         program = f'''import json
@@ -392,7 +388,8 @@ gate.run_suites(Path.cwd(), full=True)
         self.assertTrue(outer.is_relative_to(parent), str(outer))
         self.assertTrue(nested.is_relative_to(parent), str(nested))
         self.assertFalse(nested.exists())
-        self.assertEqual(list(parent.iterdir()), [])
+        self.assertEqual(list(parent.iterdir()), [parent / "test-runs"])
+        self.assertEqual(list((parent / "test-runs").iterdir()), [])
 
     def test_cancellation_sends_term_to_all_jobs_before_reaping(self) -> None:
         jobs: list[gate.RunningGateJob] = []
@@ -423,17 +420,59 @@ gate.run_suites(Path.cwd(), full=True)
             self.assertIsNotNone(job.process.returncode)
 
     def test_gate_removes_its_folder_on_normal_exit(self) -> None:
-        parent = self.root / "gate-temporary"
-        parent.mkdir()
-        with mock.patch.dict(os.environ, self.environment, clear=True):
+        temporary = self.root / "gate-temporary"
+        temporary.mkdir()
+        environment = {**self.environment, "TMPDIR": str(temporary)}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            parent = gate.gate_suite_parent(self.checkout, gate.CHECKOUT_TEST_RUNS)
+            self.assertEqual(parent, temporary / "test-runs")
             with gate.private_gate_recovery(self.checkout, parent) as recovery:
-                with gate.gate_temporary(recovery, "merge-gate", parent) as folder:
+                self.assertEqual(recovery.path.parent.parent, parent)
+                self.assertTrue(recovery.path.parent.name.startswith("gate-recovery-"))
+                with gate.gate_temporary(recovery, "g", parent) as folder:
+                    self.assertEqual(folder.parent, parent)
                     self.assertTrue(folder.is_dir())
                     self.assertEqual(recovery.folders, [str(folder)])
                     self.assertEqual(build_folders.build_folder_state(folder), "held")
                 self.assertFalse(folder.exists())
                 saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
                 self.assertEqual(saved["folders"], [])
+        self.assertEqual(list(parent.iterdir()), [])
+
+    def test_next_whole_machine_run_sweeps_recovery_after_a_forced_stop(self) -> None:
+        marker = self.state / "private-recovery"
+        temporary = self.root / "guest-temporary"
+        temporary.mkdir()
+        self.environment["TMPDIR"] = str(temporary)
+        placement = f"""checkout = Path({str(self.checkout)!r})
+result = gate.run_suites(checkout, full=True, machine=gate.WholeMachine())
+raise SystemExit(int(not result.passed))
+"""
+        stop = f"""save = gate.GateRecovery.save
+
+def force_stop(recovery):
+    save(recovery)
+    if recovery.path.name == "run.json":
+        Path({str(marker)!r}).write_text(str(recovery.path))
+        signal.raise_signal(signal.SIGKILL)
+
+gate.GateRecovery.save = force_stop
+"""
+        stopped = subprocess.run(self.gate_command(preamble=stop + placement), cwd=self.root, env=self.environment,
+                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stdout + stopped.stderr)
+        record = Path(marker.read_text())
+        recovery = record.parent
+        parent = temporary / "test-runs"
+        self.assertEqual(recovery.parent, parent)
+        self.assertTrue(record.is_file())
+        self.assertTrue(build_folders.lease_path(recovery).is_file())
+        self.assertTrue(recovery.with_suffix(".lock").is_file())
+
+        finished = subprocess.run(self.gate_command(preamble=placement), cwd=self.root, env=self.environment,
+                                  capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        self.assert_all_modules_started()
         self.assertEqual(list(parent.iterdir()), [])
 
     def test_gate_keeps_its_folder_and_record_when_removal_refuses(self) -> None:
@@ -504,15 +543,13 @@ gate.run_suites(Path.cwd(), full=True)
         parent = self.root / "gate-temporary"
         parent.mkdir()
         self.environment["TMPDIR"] = str(parent)
-        host = conf.local_host_key_name()
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
-                                 f"roots.gate.{host}={parent}\n")
         self.write(self.state / "red-hooks", "red")
 
         result = self.run_gate(own_process=True)
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(list(parent.iterdir()), [], result.stdout + result.stderr)
+        self.assertEqual(list(parent.iterdir()), [parent / "test-runs"], result.stdout + result.stderr)
+        self.assertEqual(list((parent / "test-runs").iterdir()), [], result.stdout + result.stderr)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
 
@@ -641,7 +678,7 @@ gate._sweep_nightly_build_folders = lambda: Path({str(sweep_started)!r}).touch()
 
     @gate_suites("hooks", "lib")
     def test_stop_with_pending_modules_returns_owned_slot_and_reservation(self) -> None:
-        self.assertTrue(self.fixture_root.is_relative_to(Path("/tmp").resolve()))
+        self.assertEqual(self.fixture_root.parents[3].name, "test-runs")
         self.supply_jobserver(b"S")
         self.write(self.state / "hold-module", "hold")
         process = subprocess.Popen(
@@ -780,7 +817,8 @@ gate.run_gate_suites = whole_gate
                     if sig == signal.SIGTERM:
                         self.assertFalse(record_path.exists())
                     else:
-                        self.assertTrue(all(folder.is_dir() for folder in folders))
+                        for folder in folders:
+                            self.assertEqual(build_folders.temporary_allocation_entries(folder), ())
                         saved = cast(dict[str, object], json.loads(record_path.read_text()))
                         self.assertEqual(saved["folders"], record["folders"])
                         self.assertIs(saved["finished"], True)

@@ -309,7 +309,12 @@ On natedev it also reads the Mac list over SSH. When SSH fails, the command show
 The Mac slot folder is list-only. Bob handles its removal by hand.
 `/build/sccache` is a shared tool cache from the system configuration. The cleanup lists it and keeps it.
 
-The command lists each direct entry under `roots.gate`.
+Current gate suites use the checkout output’s `test-runs` folder through `test_runs_parent`.
+The native Mac gate uses `/private/tmp` until it has a fixed build folder.
+The next run sweeps unlocked temporary allocations in the same `test-runs` folder.
+The next process’s first socket allocation sweeps unlocked entries in `test-sockets` (`scripts/lib/socket_test_support.py`, `socket_parent`).
+
+The command lists each direct entry under the legacy root `roots.gate`.
 The list shows `t-` and `targeted-test-` rows first.
 A row includes its lock and lease files and shows its kind, size, newest modification time, lease state, and live use.
 The newest time includes the lock and lease files.

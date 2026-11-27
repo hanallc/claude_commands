@@ -172,7 +172,9 @@ if phase == 'prepare':
         f'{close} >{log} 2>&1; rc=$?; printf "%s" "$rc" >{pending}; {shlex.quote(sys.executable)} -c "import os, sys; os.replace(*sys.argv[1:])" {pending} {status}; exit "$rc"')
 elif phase == 'guest':
     try:
-        mac_gate.run_guest(folder, full=True)
+        with patch.object(mac_gate, 'native_mac_gate_parent',
+                          return_value=mac_gate.gate.NativeMacGateParent(root / 'gate-root')):
+            mac_gate.run_guest(folder, full=True)
     except KeyboardInterrupt:
         record = cloud_gate.read(folder / 'run.json')
         cloud_gate.save(root / 'interrupted', record)
@@ -1198,7 +1200,6 @@ print(json.dumps(sys.argv[1:]))
                        'MAC_GATE_FIXTURE_ROOT': str(Path(__file__).resolve().parents[2])}
         gate_root = root / 'gate-root'
         gate_root.mkdir()
-        _ = write_config_fixture(root / 'config/build_folders.conf', f'roots.gate={gate_root}\n')
         callback = root / 'callback'
         _ = callback.write_text(f'#!{sys.executable}\n' + LOCAL_MAC)
         callback.chmod(0o755)

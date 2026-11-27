@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.lib import time_limit
+from scripts.lib.socket_test_support import short_socket_directory
 
 
 class TimeLimitTests(unittest.TestCase):
@@ -60,7 +61,7 @@ from scripts.lib import time_limit
 result = time_limit.capture(sys.argv[1:], deadline=time.monotonic() + 2, env=os.environ)
 raise SystemExit(result.returncode)
 """
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, short_socket_directory() as sockets:
             root = Path(directory)
             remote = root / "remote.git"
             _ = subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
@@ -68,7 +69,7 @@ raise SystemExit(result.returncode)
                 modes = ("success", "failure") if inherited == "neither" else ("success", "failure", "caller terminated")
                 for mode in modes:
                     with self.subTest(inherited=inherited, mode=mode), socket.socket(socket.AF_UNIX) as server:
-                        address = root / "child.sock"
+                        address = Path(sockets) / "child.sock"
                         server.bind(str(address))
                         self.addCleanup(address.unlink, missing_ok=True)
                         server.listen()
@@ -99,8 +100,9 @@ raise SystemExit(result.returncode)
                         address.unlink()
 
     def test_capture_ends_its_reads_when_the_runner_keeps_its_streams_open(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, socket.socket(socket.AF_UNIX) as server:
-            address = Path(directory) / "runner.sock"
+        with (tempfile.TemporaryDirectory() as directory, short_socket_directory() as sockets,
+              socket.socket(socket.AF_UNIX) as server):
+            address = Path(sockets) / "runner.sock"
             launcher = Path(directory) / "stalled-runner"
             _ = launcher.write_text(f"""#!{sys.executable}
 import signal

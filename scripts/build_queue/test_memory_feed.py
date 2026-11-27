@@ -2733,13 +2733,13 @@ process.stdout.write(JSON.stringify({
         """))
         chrome.chmod(0o755)
         proof = self.root / "proof"
-        for ending in ('exit', 'kill', 'request'):
+        for ending, options in (("exit", ()), ("kill", ("--kill-control",)), ("request", ())):
             with self.subTest(ending=ending), tempfile.TemporaryDirectory(dir=self.root) as directory:
                 caller = Path(directory)
                 environment = {**os.environ, "TMPDIR": str(caller), "PYTHON": sys.executable,
                     "CHROME": str(chrome), "CHROME_REPORT": str(report), "CHROME_END": ending}
                 result = run_process_group([executable, str(Path(memory_feed.__file__).with_name("memory_page_proof.mjs")),
-                    str(proof)], env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                    str(proof), *options], env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertNotEqual(result.returncode, 0)
                 if ending == 'request':
                     self.assertRegex(result.stderr, "Chrome (closed during a debugger request|debugger connection closed)")
@@ -2749,10 +2749,38 @@ process.stdout.write(JSON.stringify({
                 if ending == 'request':
                     self.assertEqual(record['request'], 'Target.createTarget')
                 profile, temporary, allocated = (Path(record[key]) for key in ("profile", "temporary", "allocated"))
+                with mock.patch.dict(os.environ, {"TMPDIR": str(caller)}):
+                    system_root = Path(conf.read_or_repository("build_folders").text("roots.system")).expanduser()
+                self.assertEqual(profile.parent, system_root)
+                self.assertFalse(profile.is_relative_to(caller))
                 self.assertTrue(temporary.is_relative_to(profile))
                 self.assertTrue(allocated.is_relative_to(temporary))
                 self.assertFalse(profile.exists())
                 self.assertEqual(list(caller.iterdir()), [])
+
+    def test_live_aws_cost_proof_starts_chrome_without_python_fixture_setup(self) -> None:
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        source = self.root / "live"
+        source.mkdir()
+        _ = (source / "memory_live.html").write_text("<html></html>")
+        _ = (source / "memory.json").write_text("{}")
+        _ = (source / "report.json").write_text("{}")
+        python = self.root / "unexpected-python"
+        _ = python.write_text('#!/bin/sh\ntouch "$PYTHON_REPORT"\nexit 1\n')
+        python.chmod(0o755)
+        chrome = self.root / "chrome"
+        _ = chrome.write_text('#!/bin/sh\ntouch "$CHROME_REPORT"\nexit 1\n')
+        chrome.chmod(0o755)
+        python_report = self.root / "python-started"
+        chrome_report = self.root / "chrome-started"
+        environment = {**os.environ, "PYTHON": str(python), "PYTHON_REPORT": str(python_report),
+                       "CHROME": str(chrome), "CHROME_REPORT": str(chrome_report)}
+        result = run_process_group([executable, str(Path(memory_feed.__file__).with_name("memory_page_proof.mjs")),
+                                    str(self.root / "proof"), "--aws-cost-shots", str(source)],
+                                   env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertFalse(python_report.exists())
+        self.assertTrue(chrome_report.is_file(), result.stderr)
+        self.assertIn("Chrome closed before its debugger started", result.stderr)
 
     def test_an_interrupted_page_publication_preserves_the_previous_page(self) -> None:
         self.output.mkdir()
