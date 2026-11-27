@@ -74,7 +74,7 @@ from scripts.review_links import (
     reply_tokens, review_events, review_link, review_submissions,
 )
 from scripts.review_links import (
-    accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
+    accounts_page, answer_sources, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
     placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, studio_page, test_review_page,
 )
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, session_folder, urgency
@@ -2136,6 +2136,86 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(list(target.iterdir()), [])
         notice, = read_new_item_notices(log)
         self.assertEqual(notice["rows"], [])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_numeric_studio_reservation_defers_a_conflicting_current_link(self) -> None:
+        case = self.review_fixture()
+        former = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        original_route = route.read_bytes()
+        original_question = saved.path.read_bytes()
+        _ = reservation.write_text("1\n")
+
+        distinct = fixture_member("producer", name="other-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={distinct.id}\n")
+        row = the_list.add(distinct.id, "Other item", owner=owner.id, source="nate", changes={})
+        key = review_items.submission_review_key(saved)
+        row = the_list.link(distinct.id, row.id, (key,), source="nate")
+        self.assertEqual(row.number, 1)
+        restarted = change_page.DeliveryStatus(case.root)
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        with (new_item_notice_log(self.root, former.id) as log,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            with redirect_stderr(StringIO()) as errors:
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_not_called()
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            self.assertIn("the List reservation conflicts with another destination", errors.getvalue())
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(reservation.read_text(), "1\n")
+            self.assertEqual(route.read_bytes(), original_route)
+            self.assertEqual(saved.path.read_bytes(), original_question)
+            self.assertEqual(the_list.records(former.id, include_closed=True), [])
+            self.assertEqual(the_list.records(distinct.id, include_closed=True), [row])
+            self.assertEqual(read_new_item_notices(log), [])
+
+            _ = the_list.unlink(distinct.id, row.id, (key,), source="nate")
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        self.assertEqual(the_list.review_reservation(reservation), investigation.ListDestination(former.id, 1))
+        self.assertEqual(len(read_new_item_notices(log)), 1)
+
+    def test_studio_claim_accepts_exchange_readback_through_an_alias(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        review_actions.ensure_submission_list_item(saved.address)
+        row, = the_list.records(keeper.id, include_closed=True)
+        reservation = review_submissions.list_filing_reservation(saved)
+        destination = investigation.ListDestination(keeper.id, row.number)
+        before = reservation.read_bytes()
+        alias = staff.StaffId("000-list-alias")
+        alias_folder = the_list.folder(alias)
+        alias_folder.parent.mkdir(parents=True)
+        alias_folder.symlink_to(the_list.folder(keeper.id), target_is_directory=True)
+        entry, = list_page.records(include_closed=True)
+        self.assertEqual(entry.keeper, alias)
+        file_source = answer_sources.file_source
+
+        def readback(plan: answer_sources.FilingPlan, members: staff.StaffSnapshot,
+                     reload: answer_sources.ReloadExchanges) -> investigation.ListDestination | answer_sources.NoExchangeFiling:
+            filed = file_source(plan, members, reload)
+            self.assertIsInstance(filed, investigation.ListDestination)
+            return entry.destination
+
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log,
+              patch.object(answer_sources, "file_source", side_effect=readback) as file):
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        file.assert_called_once()
+        self.assertEqual(the_list.review_reservation(reservation), destination)
+        self.assertEqual(reservation.read_bytes(), before)
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [row])
+        self.assertEqual(len(read_new_item_notices(log)), 1)
         self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
 
     def test_studio_preserves_a_broken_reserved_row_symlink(self) -> None:

@@ -988,7 +988,7 @@ function presentNewDetail(item,children,wasMissing){
 }
 // The open row keeps its node through a new snapshot and takes the new data.
 function keepOpenRow(){
- const item=openItem,key=item?.dataset.key;
+ const item=openItem,key=item && resolveItem(item.dataset.key);
  const next=inlineView && options.itemRevision && item && !item.isConnected && opened.has(key) && itemWithKey(key);
  if(!next) return;
  for(const {name} of [...item.attributes]) if(!next.hasAttribute(name)) item.removeAttribute(name);
@@ -1066,7 +1066,7 @@ function itemWithKey(key){
 }
 function readPlace(params,followingItemLink=false){
  placeHash=location.hash;
- keys=new Set(params.getAll('key'));
+ keys=new Set(params.getAll('key').map(resolveItem));
  owner=ownerQueryKeys.map(key=>params.get(key)).find(Boolean) || '';show=params.get('show') || defaultShow;query=params.get('q') || '';
  sort=params.get('sort') || '';direction=params.get('dir')==='desc' ? 'desc' : 'asc';
  type=params.get('type') || '';
@@ -1075,10 +1075,11 @@ function readPlace(params,followingItemLink=false){
  if(!options.shows.includes(show)) show=defaultShow;
  show=options.selectShow?.(show,type) ?? show;
  if(!columns.includes(sort)) sort='';
- const item=params.get('item');
+ const item=params.has('item') ? resolveItem(params.get('item')) : null;
  const saved=followingItemLink ? null : history.state?.recordTable;
  if(saved){
-  const key=saved.opened.includes(item) ? item : saved.opened[0];
+  const savedKeys=saved.opened.map(resolveItem);
+  const key=savedKeys.includes(item) ? item : savedKeys[0];
   if(key) openCard(key);else opened.clear();
  }else if(!followingItemLink && item){
   if(keys.size) keys.add(item);
@@ -1090,9 +1091,10 @@ function readPlace(params,followingItemLink=false){
  }else if(inlineView && !followingItemLink) opened.clear();
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
+ if(linkedItem) linkedItem=resolveItem(linkedItem);
  pendingItem=Boolean(options.resolveItem && linkedItem && saved?.pendingItem);
  const reveal=options.revealLinked && params.get('reveal')==='1';
- revealedLinkedItem=reveal || saved?.revealedLinkedItem===linkedItem ? linkedItem : '';
+ revealedLinkedItem=reveal || (saved?.revealedLinkedItem && resolveItem(saved.revealedLinkedItem)===linkedItem) ? linkedItem : '';
  owner=options.resolveOwner?.(owner) ?? owner;
  if(sharedWords()) filterControl.setWords(words(),query);
  return saved?.top;
@@ -1444,6 +1446,7 @@ function saveDeparturePlace(){
 }
 function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,preserveFilters=false,unresolved=false,
  keepItemOnMissing=options.keepItemOnMissingLink}={}){
+ key=resolveItem(key);
  if(pushPlace) saveDeparturePlace();
  const target=itemWithKey(key);
  linkedItem=options.missingItem ? key : '';
@@ -1613,6 +1616,14 @@ return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updat
   for(const gap of windowGaps.splice(0)) gap.remove();
   for(const node of mounted.values()){resize?.unobserve(node);options.unmount?.(node);node.remove();}
   mounted.clear();measured.clear();content=contentProxy();
+  if(options.resolveItem){
+   const resolved=[...opened].map(resolveItem);
+   opened.clear();
+   resolved.forEach(key=>opened.add(key));
+   keys=new Set([...keys].map(resolveItem));
+   if(linkedItem) linkedItem=resolveItem(linkedItem);
+   if(revealedLinkedItem) revealedLinkedItem=resolveItem(revealedLinkedItem);
+  }
   keepOpenRow();
   if(sharedWords()){query=previous;filterControl.setWords(words(),query);}
   bind();if(draw) applyRows(query!==previousQuery);

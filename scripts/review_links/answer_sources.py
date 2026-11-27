@@ -1462,10 +1462,12 @@ def _native_question_exchanges(record: update_registration.QuestionRecord, key: 
 
 
 def _studio_question_route(folder: Path, origin: the_list.NativeQuestionItem,
-                           verified: tuple[investigation.ListDestination, ...]
+                           verified: tuple[investigation.ListDestination, ...],
+                           current: tuple[investigation.ListDestination, ...]
                            ) -> ResolvedQuestionDestination | Literal[QuestionRoute.NEW, QuestionRoute.STAGED_STUDIO]:
     """Read the saved Studio route and its List reservation."""
-    destination = the_list.review_reservation(folder / "list-number", verified=verified)
+    destination = the_list.review_reservation(folder / "list-number",
+                                              source_destinations=verified, current_links=current)
     path = folder / "list-filing.json"
     if not record_store.saved_path_exists(path):
         if destination is the_list.NextNumber.AVAILABLE:
@@ -1560,9 +1562,10 @@ def resolve_legacy_question_destination(
             if isinstance(record, update_registration.QuestionRecord):
                 source_keys.append(new_item_dialog.submission_key(
                     new_item_dialog.SubmissionKind.QUESTION, record.owner, record.item.get("review_id", ""), request))
-            verified = the_list.unique_destinations((*_linked_destinations(links.created, source_keys),
-                                                    *_linked_destinations(links.current, source_keys)))
-            saved_route = _studio_question_route(folder, origin, verified)
+            verified = the_list.unique_destinations(entry.destination for key in source_keys
+                for entry in links.created.get(key, ()) if the_list.original_question_link(entry.item))
+            current = _linked_destinations(links.current, source_keys)
+            saved_route = _studio_question_route(folder, origin, verified, current)
         except (OSError, ValueError):
             return QuestionRoute.UNRESOLVED
         if isinstance(saved_route, ResolvedQuestionDestination):
@@ -1646,7 +1649,7 @@ def resolve_legacy_question_destination(
     if has_receipt and filing is the_list.QuestionFiling.HISTORY:
         return studio_route if studio_route is QuestionRoute.STAGED_STUDIO else QuestionRoute.UNRESOLVED
     current = _linked_destinations(links.current, keys)
-    if len(current) == 1:
+    if len(current) == 1 and studio_route is QuestionRoute.NEW:
         return ResolvedQuestionDestination(current[0], the_list.NoQuestionItem.ORDINARY)
     return QuestionRoute.UNRESOLVED if current else studio_route
 
@@ -1771,9 +1774,9 @@ def _read_exchanges(root: Path, members: staff.StaffSnapshot, zone: ZoneInfo,
     for destination, row in links.keyless.items():
         origin = _keyless_question_origin(destination, links, review_questions, row)
         keyless.append(KeylessQuestionMigration(destination, row, origin))
-    unresolved_rows = {migration.destination for migration in keyless if migration.origin is the_list.NoQuestionItem.ORDINARY}
-    unresolved_paths = {the_list.destination_key(destination) for destination in unresolved_rows}
-    blocked = {origin.source_key for destination in unresolved_rows for origin in links.keyless[destination].candidate_origins}
+    unresolved_rows = [migration for migration in keyless if migration.origin is the_list.NoQuestionItem.ORDINARY]
+    unresolved_paths = {the_list.destination_key(migration.destination) for migration in unresolved_rows}
+    blocked = {origin.source_key for migration in unresolved_rows for origin in migration.row.candidate_origins}
     for item in reviews:
         key = _review_source_key(item)
         history = the_list.combine_exchange_history(tuple(previous.get(key, ())), the_list.pending_exchanges(key))
@@ -1785,7 +1788,7 @@ def _read_exchanges(root: Path, members: staff.StaffSnapshot, zone: ZoneInfo,
             reload[key] = partial(_reload_review, root, item, members, zone, filing=the_list.QuestionFiling.HISTORY)
             exchanges.extend(candidates)
     for entry in entries:
-        if investigation.ListDestination(entry.keeper, entry.item.number) in unresolved_rows:
+        if the_list.destination_key(entry.destination) in unresolved_paths:
             continue
         candidates = tuple(_list_exchanges(entry, members, zone))
         if candidates:
@@ -1843,9 +1846,9 @@ class FilingPlan:
 
 def _plans(exchanges: Iterable[Exchange], filed: Iterable[tuple[investigation.ListDestination, list_exchange.FiledExchange]]
            ) -> Iterator[FilingPlan]:
-    existing: dict[str, set[investigation.ListDestination]] = defaultdict(set)
+    existing: dict[str, dict[tuple[Path, int], investigation.ListDestination]] = defaultdict(dict)
     for destination, exchange in filed:
-        existing[exchange.source_key].add(destination)
+        _ = existing[exchange.source_key].setdefault(the_list.destination_key(destination), destination)
     groups: dict[str, list[Exchange]] = defaultdict(list)
     for exchange in exchanges:
         if _eligible(exchange) or exchange.source_key in existing:
@@ -1856,7 +1859,7 @@ def _plans(exchanges: Iterable[Exchange], filed: Iterable[tuple[investigation.Li
             destinations: tuple[ListLink, ...] = (route.destination,)
         elif route is QuestionRoute.ORDINARY:
             links = (link for exchange in group for link in exchange.list_links)
-            destinations = _unique_links((*links, *existing[key]))
+            destinations = _unique_links((*links, *existing[key].values()))
         else:
             destinations = ()
         yield FilingPlan(tuple(group), destinations, bool(existing[key]))
@@ -2012,11 +2015,13 @@ def move_question_wait(root: Path, item: review_items.ReviewItem, members: staff
                         return investigation.NoListDestination.ABSENT
                 elif current.key not in previous.reviews or previous.state is the_list.ItemState.CLOSED:
                     return investigation.NoListDestination.ABSENT
+            report = the_list.ListReport(the_list.ReportKind.QUESTION, current.key, record.item["text"])
             destination = the_list.file_report(
-                keeper, the_list.ListReport(the_list.ReportKind.QUESTION, current.key, record.item["text"]),
+                keeper, report,
                 ' '.join(current.title.split()), owner=current.owner or the_list.UnassignedOwner.NOT_RECORDED,
                 producer=route.producer, unit=route.unit, source='moved from Review',
                 state=the_list.ItemState.WORKING, reservation=target)
+            the_list.verify_report_destination(destination, report)
             update_registration.record_review_log(record, f'moved to List item {destination.number}')
             return destination
 
@@ -2119,10 +2124,11 @@ def file_list_submission_question(record: update_registration.QuestionRecord,
                                           studio=StudioRouteOwner.STUDIO_SEND)
 
     filed = ((destination, exchange) for entry in entries
-             if entry.keeper == destination.keeper and entry.item.number == destination.number
+             if the_list.same_destination(entry.destination, destination)
              for exchange in entry.item.filed_exchanges)
     for plan in _plans(reload(), filed):
-        if file_source(plan, members, reload) == destination:
+        filed_at = file_source(plan, members, reload)
+        if isinstance(filed_at, investigation.ListDestination) and the_list.same_destination(filed_at, destination):
             break
     else:
         if update_registration.pending_review_reply(record):
@@ -2234,6 +2240,10 @@ def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, 
                 reports[report.submission_scope].append(entry)
     projected: list[review_items.ReviewItem] = []
     for item in items:
+        if review_items.pending_list_move(item) is not investigation.NoListMove.ABSENT:
+            projected.append(replace(item, exchange_handoff=review_items.NoFiledReviewExchange.ABSENT,
+                                     moved_report=investigation.NoListDestination.ABSENT))
+            continue
         handoff = review_items.NoFiledReviewExchange.ABSENT
         key = keys.get(item.key, "")
         filed = index.get(key, ())
@@ -2354,10 +2364,11 @@ def migrate(inventory: ExchangeInventory, members: staff.StaffSnapshot, *, apply
         try:
             with record_store.list_destination_lock():
                 entries, links = _migration_list_records()
+                keyless_paths = {the_list.destination_key(destination) for destination in links.keyless}
                 for entry in entries:
                     item = entry.item
-                    destination = investigation.ListDestination(entry.keeper, item.number)
-                    if destination in links.keyless:
+                    destination = entry.destination
+                    if the_list.destination_key(destination) in keyless_paths:
                         continue
                     origin = item.native_question
                     if origin is the_list.NoQuestionItem.ORDINARY and item.report is the_list.NoListReport.ABSENT:

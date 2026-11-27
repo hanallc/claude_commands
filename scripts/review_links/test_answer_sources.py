@@ -740,6 +740,45 @@ class AnswerSourceTests(unittest.TestCase):
                     self.assertGreater(second.destination.number, fresh.number)
                     _ = write_config_fixture(config, f"page.list.owner={KEEPER.id}\n")
 
+    def test_corrected_list_batch_uses_the_sequence_recovered_by_another_call(self) -> None:
+        key = self.native("interrupted-batch", {"since": FILED, "text": "Choose a plan", "question": "Which plan?"})
+        with patch.object(record_store.NumberedRecords, "finish_reserved_number",
+                          side_effect=OSError("The counter write stopped.")):
+            self.assertEqual(self.migrate(apply=True)[0], 1)
+        alias = the_list.folder(OWNER.id)
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        alias.symlink_to(the_list.folder(KEEPER.id), target_is_directory=True)
+        _ = write_config_fixture(self.root / "config" / "console.conf", f"page.list.owner={OWNER.id}\n")
+
+        def draft(number: int) -> the_list.ListItem:
+            return the_list._new_item(number, "Batch row", OWNER.id, OWNER.id, "nate", {})  # pyright: ignore[reportPrivateUsage]
+
+        retired = replace(KEEPER, retirement=staff.RetiredProducer("claude:sonnet:high"))
+        authority = staff.StaffSnapshot((ASKER, OWNER, retired))
+
+        with patch.object(the_list, "scan_list_records", side_effect=AssertionError("Unexpected source scan.")):
+            with self.assertRaisesRegex(the_list.ListError, "next available number is L2"):
+                _ = the_list.add(OWNER.id, "Reserved", owner=OWNER.id, source="nate", changes={}, number=1)
+            self.assertFalse((record_store.state_root() / ".list-exchange-allocation").exists())
+            with self.assertRaisesRegex(the_list.ListError, "next available number is L2"):
+                the_list.create_records(OWNER.id, (draft(1),))
+            with self.assertRaisesRegex(the_list.ListError, "item numbers must be unique"):
+                the_list.create_records(OWNER.id, (draft(2), draft(2)))
+            with self.assertRaisesRegex(the_list.ListError, "L9: no list item"):
+                the_list.create_records(OWNER.id, (replace(draft(2), related_to=(9,)),))
+            with (patch.object(staff, "authority_snapshot", return_value=authority),
+                  self.assertRaises(the_list.RetiredListProducer)):
+                the_list.create_records(OWNER.id, (replace(draft(2), producer=KEEPER.id),))
+            the_list.create_records(OWNER.id, (draft(2),))
+        saved = investigation.ListDestination(KEEPER.id, 1)
+        self.assertEqual(the_list.exchange_reservation(key), the_list.ExchangeDestination(saved, True))
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        self.assertEqual([row.number for row in the_list.records(OWNER.id, include_closed=True)], [1, 2])
+        for row in alias.glob("L*.md"):
+            row.unlink()
+        with self.assertRaisesRegex(the_list.ListError, "already has a number sequence"):
+            the_list.create_records(OWNER.id, (draft(3),))
+
     def test_list_alias_shares_the_lock_destination_and_receipt(self) -> None:
         key = self.native("alias-question", {"since": FILED, "text": "Choose a plan", "question": "Which plan?"})
         with patch.object(the_list, "_save_exchange_reservation", side_effect=OSError("The reservation write stopped.")):

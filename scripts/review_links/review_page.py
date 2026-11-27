@@ -551,8 +551,9 @@ def moved_report_evidence(members: staff.StaffSnapshot, sources: ReviewSourceSta
         folders = record_store.known_folders(kind, owner, sources=sources)
         for path in review_items.store_paths(folders, sources):
             with guard_source(path, sources):
-                header = record_store.read_header(path, keys=frozenset(('state', 'list_destination')), strict=True)
-                if header.get('state') == [investigation.InvestigationState.READ] and header.get('list_destination'):
+                header = record_store.read_header(path, keys=frozenset(('state', 'list_destination', 'list_move')), strict=True)
+                if (header.get('state') == [investigation.InvestigationState.READ]
+                        and (header.get('list_destination') or header.get('list_move'))):
                     record = investigation.read_review_record(path)
                     items.append(review_items.investigation_item(record, members, path, zone=zone))
     return items
@@ -933,8 +934,8 @@ class ReviewSnapshotCache:
         sources = ReviewSourceStamps()
         if isinstance(item, ReviewRecordNotPublished) or (
                 item.state == ReviewState.DONE and item.type != ReviewType.FOR_YOU
-                and not review_items.on_list(item) and not (
-                    isinstance(item.source, review_items.InvestigationSource)
+                and not review_items.on_list(item) and review_items.pending_list_move(item) is investigation.NoListMove.ABSENT
+                and not (isinstance(item.source, review_items.InvestigationSource)
                     and isinstance(item.source.record.list_destination, investigation.ListDestination))
                 and not (item.type in review_items.QUESTION_TYPES
                          and any(review_items.list_move_event(event) for event in item.log))):
@@ -1502,6 +1503,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     def validate_revision(current: ReviewItem, members: staff.StaffSnapshot, *,
                           question_route: change_browser.QuestionRoute | change_browser.QuestionRouteReading =
                               change_browser.QuestionRouteReading.RESOLVE) -> ReviewItem:
+        if review_items.pending_list_move(current) is not investigation.NoListMove.ABSENT:
+            raise review_items.ReviewRecordChanged(investigation.LIST_MOVE_PENDING)
         handoff = current.exchange_handoff
         if review_items.on_list(current) and (
                 not isinstance(handoff, review_items.FiledReviewExchange) or not handoff.open_staff_question
@@ -1681,6 +1684,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
         item = next((item for item in review_items.read(root) if item.key == key), None)
         if item is None:
             raise question_record.AnswerRefused('this item is not on the page')
+        if review_items.pending_list_move(item) is not investigation.NoListMove.ABSENT:
+            raise review_items.ReviewRecordChanged(investigation.LIST_MOVE_PENDING)
         if outcome == 'later':
             if isinstance(item.source, review_items.ChangeSource):
                 source = item.source
