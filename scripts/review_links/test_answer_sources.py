@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from collections.abc import Generator
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -191,13 +191,15 @@ class AnswerSourceTests(unittest.TestCase):
                           {"followup": "Then what?", "reply": "The second answer."}],
             "reply_log_positions": {"0": 0, "1": 3}, "review_log": encode(log),
         }, asker=OWNER.id)
-        first, second = answer_sources.read_exchanges(self.review, members=MEMBERS).exchanges
+        first, second, pending = answer_sources.read_exchanges(self.review, members=MEMBERS).exchanges
         self.assertEqual(first.source_key, "submission/question/request-1234567890")
         self.assertEqual(second.source_key, first.source_key)
         self.assertEqual((first.asked_at, first.answer), (START,
                          answer_sources.ExchangeAnswer("The first answer.", FIRST_REPLY, answer_sources.AnswerRead.READ)))
         self.assertEqual((second.asked_at, second.answer), (SECOND_ASK,
                          answer_sources.ExchangeAnswer("The second answer.", SECOND_REPLY, answer_sources.AnswerRead.UNREAD)))
+        self.assertEqual((pending.source_key, pending.question, pending.answer),
+                         (first.source_key, "What next?", list_exchange.QuestionWithoutAnswer.OPEN))
 
     def test_scoped_proposal_reply_requires_an_explicit_question(self) -> None:
         log = (ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The verdict was applied."),
@@ -397,10 +399,11 @@ class AnswerSourceTests(unittest.TestCase):
                     answer_sources.file_saved_question(current, MEMBERS)
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(answer_sources.migrate(before, MEMBERS, apply=True), 0)
-                filed = [exchange for item in the_list.records(KEEPER.id) for exchange in item.filed_exchanges
-                         if exchange.source_key == key]
-                self.assertEqual([exchange.answer for exchange in filed],
+                filed = [(item, exchange) for item in the_list.records(KEEPER.id, include_closed=True)
+                         for exchange in item.filed_exchanges if exchange.source_key == key]
+                self.assertEqual([exchange.answer for _, exchange in filed],
                     [answer_sources.QuestionWithoutAnswer.CLOSED] if file_open_first else [])
+                self.assertTrue(all(item.state is the_list.ItemState.CLOSED for item, _ in filed))
 
     def test_withdrawal_serializes_with_the_first_list_save(self) -> None:
         key = self.native("withdraw-during-save", {"since": FILED, "text": "Choose a plan",
@@ -446,7 +449,8 @@ class AnswerSourceTests(unittest.TestCase):
         _ = withdrawal.result()
         current, = update_registration.selected_question_records([path], (), None)
         self.assertEqual(current.status, "closed")
-        row, = the_list.records(KEEPER.id)
+        row, = the_list.records(KEEPER.id, include_closed=True)
+        self.assertIs(row.state, the_list.ItemState.CLOSED)
         self.assertEqual([exchange.answer for exchange in row.filed_exchanges],
                          [answer_sources.QuestionWithoutAnswer.CLOSED])
 
@@ -880,14 +884,30 @@ class AnswerSourceTests(unittest.TestCase):
         key = self.native("answered-after-filing", fields)
         self.assertEqual(self.migrate(apply=True)[0], 0)
         before, = the_list.records(KEEPER.id)
+        self.assertIs(before.state, the_list.ItemState.WAITING_FOR_NATE)
+        self.assertEqual(before.log[-1].what, the_list.FieldChange("Updated", {"state": before.state}))
+        command = ["close", "--id", before.id, "--words", "Used plan A.", "--source", ASKER.name]
+        with patch.object(staff, "caller_identity", return_value=ASKER.id), redirect_stderr(io.StringIO()):
+            self.assertEqual(the_list.main(command), 1)
         _ = self.native("answered-after-filing", {**fields, "review_log": encode((
             ReviewLog(FIRST_REPLY, "nate", "answer: Use plan A."),))}, status="closed")
         self.assertEqual(self.migrate(apply=True)[0], 0)
         after, = the_list.records(KEEPER.id)
+        self.assertIs(after.state, the_list.ItemState.WORKING)
+        self.assertEqual(after.log[len(before.log):][-1].what, the_list.FieldChange("Updated", {"state": after.state}))
         saved, = after.filed_exchanges
         self.assertEqual((before.id, before.filed_exchanges[0].exchange_id), (after.id, saved.exchange_id))
         self.assertEqual(saved.source_key, key)
         self.assertEqual(saved.answer, list_exchange.ExchangeAnswer("Use plan A.", FIRST_REPLY, list_exchange.AnswerRead.NOT_TRACKED))
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        self.assertEqual(the_list.load(KEEPER.id, after.id), after)
+        with patch.object(staff, "caller_identity", return_value=OWNER.id), redirect_stderr(io.StringIO()):
+            self.assertEqual(the_list.main(command), 1)
+        with patch.object(staff, "caller_identity", return_value=ASKER.id):
+            self.assertEqual(the_list.main(command), 0)
+        closed = the_list.load(KEEPER.id, after.id)
+        self.assertIs(closed.state, the_list.ItemState.CLOSED)
+        self.assertEqual(closed.log[-1].what, the_list.FieldChange("Closed", {"closing_words": "Used plan A."}))
 
     def test_filed_reply_round_trips_its_verified_origins(self) -> None:
         log = (ReviewLog(START, "nate", "question: Which side?", "saved"),
@@ -1285,7 +1305,8 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertEqual({item.key for item in review_items.read(self.review, members=MEMBERS)}, set(keys))
         for _ in range(2):
             self.assertEqual(self.migrate(apply=True)[0], 0)
-            exchanges = [entry for item in the_list.records(KEEPER.id) for entry in item.filed_exchanges]
+            items = the_list.records(KEEPER.id, include_closed=True)
+            exchanges = [entry for item in items for entry in item.filed_exchanges]
             self.assertEqual({entry.source_key for entry in exchanges}, set(keys))
             self.assertEqual(len(exchanges), len(keys))
             for entry in exchanges:

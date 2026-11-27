@@ -831,6 +831,13 @@ class ExchangeVerifier:
             self.verified_handoff_ids.add(identity)
             yield Exchange(source, key, identity, Direction.ANSWER_TO_NATE, reply["followup"],
                            asked_at, Nate.USER, author, answer, links, binding=binding)
+        if source is Source.SCOPED_REPLY and not closed and (pending := fields.get("followup")) is not None:
+            identity = f"followup:{len(replies) + 1}"
+            self.verified_handoff_ids.add(identity)
+            yield Exchange(source, key, identity, Direction.ANSWER_TO_NATE, pending["text"],
+                           review_items.moment(pending["sent"], zone), Nate.USER, record.owner,
+                           QuestionWithoutAnswer.OPEN, links,
+                           binding=ExchangeBinding(QuestionRecord(identity), ReplyWithoutEvent.NO_ANSWER))
 
     def _native_positions(self) -> dict[int, VerifiedReply]:
         record = self.source
@@ -1196,7 +1203,8 @@ class ExchangeVerifier:
         filed_investigation_answer = bool(self.report is not None and self.report.answer and (
             (self.log[self.answers[-1]].words == "Answer: " + self.report.answer
              and offset + self.answers[-1] in events) if self.answers else "initial" in ids))
-        hides_card = (bool(verified) and item.state is not review_items.ReviewState.WAITING
+        sent_question = native and "review_submission" in source.item
+        hides_card = (bool(verified) and (sent_question or item.state is not review_items.ReviewState.WAITING)
                       and all(offset + position in events for position in self.answers)
                       and (self._filed_native_content(verified, filed_investigation_answer) if card_can_move
                            else self._single_change_slot_card(item, slot_id, accepted)))
@@ -1225,8 +1233,13 @@ class ExchangeVerifier:
                 return False
             words = {value.exchange_id: (value.question, value.answer.text)
                      for value in saved if isinstance(value.answer, ExchangeAnswer)}
-            return all(words.get(f"followup:{index}") == (pair["followup"], pair["reply"])
-                       for index, pair in enumerate(record.item.get("followups", []), 1))
+            replies = record.item.get("followups", [])
+            pending = record.item.get("followup")
+            return (all(words.get(f"followup:{index}") == (pair["followup"], pair["reply"])
+                        for index, pair in enumerate(replies, 1))
+                    and ("review_submission" not in record.item or pending is None or any(
+                        row.exchange_id == f"followup:{len(replies) + 1}" and row.question == pending["text"]
+                        and row.answer is QuestionWithoutAnswer.OPEN for row in saved)))
         return False
 
     def _handoff_content(self, exchange: list_exchange.FiledExchange) -> list_exchange.FiledExchange | None:
@@ -1632,8 +1645,6 @@ def _linked_items(key: str, entries: Iterable[list_page.ListRecord]) -> tuple[Li
 
 
 def file_saved_question(record: update_registration.QuestionRecord, members: staff.StaffSnapshot) -> None:
-    if "review_submission" in record.item and not record.item.get("followups"):
-        return
     physical = review_items.question_record_key(record)
     with review_items.after_store_write(physical):
         entries = list_page.records(include_closed=True)

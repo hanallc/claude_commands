@@ -789,7 +789,9 @@ Questions without an owner remain visible under Owner unavailable.
 These questions have the state Open and retain their previous count totals.
 They have no answer control until an owner becomes available.
 
-The Type row has All, For you, Questions, Responses, Changes, Investigations, Proposals and Efficiencies.
+The Type row has All, For you, Changes, Investigations, Proposals and Efficiencies.
+The Studio shows filed questions and answers. Review retains unresolved legacy replies under All.
+An old Question or Response filter link still selects that filter for legacy records.
 Legacy Bug records remain visible under All and in searches by ID.
 Review opens old Bug filter links with All types selected.
 Only a Question filed through the dialog appears as a Response after an answer.
@@ -1060,7 +1062,7 @@ A proposal body includes its issue text without front matter.
 An item fragment selects its summary before any body request.
 An efficiency card shows its ledger line.
 
-Questions offer Answer and Send feedback in the closing group.
+Legacy Questions in Review offer Answer and Send feedback in the closing group.
 A Response shows the original Question, the owner's latest answer, its time and the log.
 **Got it** closes the native Question.
 **Ask a follow-up** sends Your words to the same owner with a new reply token for the same key.
@@ -2407,8 +2409,23 @@ Run `./scripts/lib/py -m scripts.review_links.answer_sources migrate` to preview
 Add `--apply` to file the exchanges and print their List numbers.
 Each source question has one List item.
 Follow-ups use that item and keep their own read state.
-An existing List item keeps its state and links.
+An ordinary List item that receives an exchange keeps its state and links.
 Closed staff questions without a saved answer stay outside the migration.
+
+#### Question items in the Studio
+
+A question to Nate starts in **Waiting for nate** and appears under **Questions**.
+**Answer question** opens the answer window in the item.
+After Nate answers, the item shows **Working** until the asker closes it.
+The asker can use `the_list close` on that question.
+A question Nate sends from **New item** starts in **Working**.
+The recipient's reply returns to that item and changes its state to **Answered**.
+The item appears under **Answers** with an unread mark.
+**Mark read** closes the item and sends any words beside the button to the question owner.
+The browser keeps those words until it receives confirmation of the save.
+The saved request keeps one delivery record so a retry sends the same words only once.
+Each state change adds one state entry to the item log.
+The Studio uses the same row and **Working** badge for questions and other work.
 
 New questions and answers use the same writer after the source saves.
 The writer keeps the source key, exchange ID, and question and reply origins.

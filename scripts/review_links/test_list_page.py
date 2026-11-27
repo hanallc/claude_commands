@@ -41,7 +41,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result, sessions
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
-from scripts.production import (change_review, change_routing, delivery_state, investigation, record_store, repeat_rule,
+from scripts.production import (change_review, change_routing, delivery_state, investigation, list_exchange, record_store, repeat_rule,
                                 session_pane, session_staff, showrunners, staff, the_list, unrouted_alert)
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import (browser_test_support, console, go_ledger, list_page, page_frame, serve, staff_names,
@@ -2751,6 +2751,53 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
  await paint();
  check(windowTop()>first && Math.abs(windowTop()-bottom()-16)<1,
   'The open window moves when the frozen top grows.');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_question_chips_and_mark_read_confirmation(self) -> None:
+        members = staff.snapshot()
+        incoming = list_exchange.Exchange(list_exchange.Source.STAFF_QUESTION, "question/incoming", "initial",
+            list_exchange.Direction.QUESTION_TO_NATE, "Which layout?", NOW, OWNER.id, list_exchange.Nate.USER,
+            list_exchange.QuestionWithoutAnswer.OPEN)
+        outgoing = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, "submission/question/outgoing", "followup:1",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which width?", NOW, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.QuestionWithoutAnswer.OPEN)
+        answered = replace(outgoing, source_key="submission/question/answered",
+            answer=list_exchange.ExchangeAnswer("Use 800 pixels.", NOW, list_exchange.AnswerRead.UNREAD))
+        for exchange in (incoming, outgoing, answered):
+            with the_list.lock_exchange_source(exchange.source_key) as source:
+                _ = the_list.file_exchanges(source, (exchange,), exchange.question, linked=the_list.NextNumber.AVAILABLE,
+                                            owner=OWNER.id, members=members)
+        with self.studio_review_server() as origin:
+            self.open_studio_review_fixture(origin)
+            self.studio_review_check(r"""
+ const show=value=>document.querySelector('[data-filter-row="show"] button[data-filter-value="'+value+'"]');
+ for(const [chip,number,label] of [['questions',1,'Waiting for nate'],['working',2,'Working'],['answers',3,'Answered']]){
+  show(chip).click();await paint();
+  check(row(number).querySelector('[data-label="State"] .list-state').textContent===label,'The row shows '+label+'.');
+  check([1,2,3].filter(index=>!row(index).hidden).join()===String(number),'Only the matching item appears under '+chip+'.');
+ }
+ const item=row(3);
+ check(item.querySelector('[data-new-answer]'),'The answer is unread.');
+ item.querySelector('.list-toggle').click();await paint();
+ const form=recordDetails(item).querySelector('[data-question-read]'),words=form.elements.words;
+ const submit=form.querySelector('[value="read"]');
+ document.querySelector('[data-list]').dataset.undoSeconds='0';
+ const originalFetch=window.fetch.bind(window);
+ let posts=0;
+ window.fetch=(url,options)=>{
+  if(url!==location.pathname || options?.method!=='POST') return originalFetch(url,options);
+  check(options.body.get('words')==='I will use that width.','Mark read sends the words beside it.');
+  if(++posts===1) return Promise.resolve(Response.json({state:'read'}));
+  return Promise.resolve(Response.json({words_saved:true,item_state:'Closed',unread:'false',detail_closed:true}));
+ };
+ words.value='I will use that width.';words.dispatchEvent(new Event('input',{bubbles:true}));
+ submit.click();
+ await until(()=>form.querySelector('[data-send-status]').textContent.includes('unconfirmed'));
+ check(words.value==='I will use that width.','An unconfirmed save keeps the draft.');
+ submit.click();
+ await until(()=>item.dataset.state==='Closed');
+ check(words.value==='' && posts===2,'A confirmed save clears the submitted words.');
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")

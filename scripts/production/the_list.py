@@ -75,6 +75,7 @@ class RetiredListProducer(ListError):
 class ItemState(StrEnum):
     NEW = "New"
     WORKING = "Working"
+    ANSWERED = "Answered"
     SCHEDULED = "Scheduled"
     BLOCKED = "Blocked"
     WAITING_FOR_NATE = "Waiting for nate"
@@ -760,6 +761,32 @@ class ListItem:
             if isinstance(entry.what, FieldChange) and "latest_status" in entry.what.fields:
                 return entry.time
         return NoTimestamp.UNSET
+
+
+class NoQuestionItem(Enum):
+    ORDINARY = "ordinary List item"
+
+
+def _question_exchange(item: ListItem) -> list_exchange.FiledExchange | NoQuestionItem:
+    if not item.log or isinstance(item.report, ListReport):
+        return NoQuestionItem.ORDINARY
+    origin = item.log[0].source
+    for exchange in item.filed_exchanges:
+        if origin == PAGE_SOURCE and exchange.source in (list_exchange.Source.STAFF_QUESTION,
+                                                         list_exchange.Source.SCOPED_REPLY):
+            return exchange
+        if (origin in ("nate via New item", "nate via /new_item")
+                and exchange.source_key.startswith("submission/question/")
+                and exchange.direction is list_exchange.Direction.ANSWER_TO_NATE
+                and item.reviews and item.reviews[0].startswith("question/")):
+            return exchange
+    return NoQuestionItem.ORDINARY
+
+
+def question_item(item: ListItem) -> list_exchange.Direction | NoQuestionItem:
+    """Identify the question that created the item."""
+    question = _question_exchange(item)
+    return question if isinstance(question, NoQuestionItem) else question.direction
 
 
 class AllItems(StrEnum):
@@ -2047,6 +2074,8 @@ def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[
         if item.id != identity or not changes:
             raise ListError("the item number must match its path and the log must not be empty")
         _validate(item)
+        if item.state is ItemState.NEW and question_item(item) is not NoQuestionItem.ORDINARY:
+            return _advance_question_item(item, item.log[-1].time)
         return item
     except (ValueError, KeyError, TypeError) as error:
         raise store.invalid(identity, error) from None
@@ -2408,11 +2437,52 @@ def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.FiledEx
             returns.append(ItemChange(answer.time, ReturnedAnswer(ReturnedAnswerId(*key), answer.text), source))
     changed = replace(item, filed_exchanges=tuple(saved.values()))
     if not returns:
-        return changed
+        return _advance_question_item(changed, now())
     returns.sort(key=lambda entry: entry.time)
     latest = returns[-1].time
     unread_since = max(item.unread_since, latest) if isinstance(item.unread_since, datetime) else latest
-    return replace(changed, log=(*item.log, *returns), updated=max(item.updated, latest), unread_since=unread_since)
+    changed = replace(changed, log=(*item.log, *returns), updated=max(item.updated, latest), unread_since=unread_since)
+    return _advance_question_item(changed, latest)
+
+
+def _advance_question_item(item: ListItem, moment: datetime) -> ListItem:
+    primary = _question_exchange(item)
+    if isinstance(primary, NoQuestionItem) or item.state not in (
+            ItemState.NEW, ItemState.WORKING, ItemState.ANSWERED, ItemState.WAITING_FOR_NATE):
+        return item
+    exchange = next(exchange for exchange in reversed(item.filed_exchanges)
+                    if exchange.source_key == primary.source_key and exchange.direction is primary.direction)
+    state = question_exchange_state(exchange)
+    unread = item.unread_since
+    if state in (ItemState.WAITING_FOR_NATE, ItemState.ANSWERED):
+        unread = item.unread_since if isinstance(item.unread_since, datetime) else moment
+    elif primary.direction is list_exchange.Direction.QUESTION_TO_NATE and item.state is ItemState.WAITING_FOR_NATE:
+        unread = NoTimestamp.UNSET
+    if state is ItemState.CLOSED:
+        return _close_question_item(item, moment, PAGE_SOURCE)
+    if state is item.state:
+        return item
+    fields: LogFields = {"state": state}
+    entry = ItemChange(moment, FieldChange("Updated", fields), PAGE_SOURCE)
+    return replace(item, state=state, unread_since=unread, updated=max(moment, item.updated), log=(*item.log, entry))
+
+
+def question_exchange_state(exchange: list_exchange.Exchange) -> ItemState:
+    answer = exchange.answer
+    if answer is list_exchange.QuestionWithoutAnswer.CLOSED:
+        return ItemState.CLOSED
+    if exchange.direction is list_exchange.Direction.QUESTION_TO_NATE:
+        return ItemState.WAITING_FOR_NATE if answer is list_exchange.QuestionWithoutAnswer.OPEN else ItemState.WORKING
+    if isinstance(answer, list_exchange.ExchangeAnswer):
+        return ItemState.CLOSED if answer.read is list_exchange.AnswerRead.READ else ItemState.ANSWERED
+    return ItemState.WORKING
+
+
+def _close_question_item(item: ListItem, moment: datetime, source: str) -> ListItem:
+    words = "Question closed."
+    entry = ItemChange(moment, FieldChange("Closed", {"closing_words": words}), source)
+    return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words, updated=max(moment, item.updated),
+                   unread_since=NoTimestamp.UNSET, parked_until=NoTimestamp.UNSET, log=(*item.log, entry))
 
 
 @dataclass(frozen=True)
@@ -2920,6 +2990,14 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
                     assert not isinstance(item.owner, UnassignedOwner)
                     pending = replace(pending, recipient=item.producer, additional_recipient=item.owner)
                 entries.append(ItemChange(moment, pending, PAGE_SOURCE))
+            elif request.action == "read" and changed.state is ItemState.CLOSED and item.state is ItemState.ANSWERED:
+                if request.words and not isinstance(item.owner, UnassignedOwner):
+                    notice = PageFeedback(request.request, request.words, action="read", form_words=request.words,
+                                          recipient=item.owner,
+                                          origin=PageNoticeOrigin.STUDIO)
+                    entries.append(ItemChange(moment, notice, PAGE_SOURCE))
+                else:
+                    entries.insert(0, ItemChange(moment, request, PAGE_SOURCE))
             elif request.action == "read" and changed.state != item.state:
                 notice = _next_step_notice(keeper, request.request, "nate read", changed, form_words=request.words)
                 entries.append(ItemChange(moment, notice, PAGE_SOURCE))
@@ -3910,13 +3988,28 @@ def unpark(keeper: staff.StaffId, identity: str, *, source: str,
     return _change(keeper, identity, edit, Unparked(), source, page_action=notice, assigned_to=assigned_to)
 
 
+@dataclass(frozen=True)
+class ListCloseCaller:
+    member: staff.StaffRow
+
+
 def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
-          assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
+          assigned_to: staff.StaffId | AllItems | ListCloseCaller = AllItems.INCLUDED,
           schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED,
           expected_schedule: ScheduleExpectation | UseCurrentSchedule = UseCurrentSchedule.AT_WRITE) -> ListItem:
     _validate_closing_words(words)
     def edit(item: ListItem, moment: datetime) -> ListItem:
+        if isinstance(assigned_to, ListCloseCaller):
+            caller = assigned_to.member
+            question = _question_exchange(item)
+            is_asker = (not isinstance(question, NoQuestionItem)
+                        and question.direction is list_exchange.Direction.QUESTION_TO_NATE
+                        and question.asker == caller.id and item.state in (ItemState.WORKING, ItemState.CLOSED))
+            if not is_asker and (caller.kind != "producer" or item.producer != caller.id):
+                if caller.kind != "producer":
+                    raise ListError("Only the asker can close this question after Nate answers.")
+                raise ListError(f"{identity} is assigned to another producer. A producer can change only its own items.")
         schedule = _remove_schedule(item.schedule, schedule_scope, expected_schedule, words=words)
         if isinstance(schedule, ScheduledSeries):
             return replace(item, schedule=schedule)
@@ -3936,8 +4029,9 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
             return FieldChange("Updated", {})
         return FieldChange("Closed", {"closing_words": words})
 
+    producer_access = AllItems.INCLUDED if isinstance(assigned_to, ListCloseCaller) else assigned_to
     return _change(keeper, identity, edit, close_event, source,
-                   unread=False, page_action=notice, assigned_to=assigned_to).item
+                   unread=False, page_action=notice, assigned_to=producer_access).item
 
 
 def reopen(keeper: staff.StaffId, identity: str, *, source: str,
@@ -4045,6 +4139,15 @@ def mark_read_edit(keeper: staff.StaffId, identity: str, *, source: str,
     The same write saves a notice that asks the item's producer for the next step.
     """
     def edit(item: ListItem, moment: datetime) -> ListItem:
+        if question_item(item) is not NoQuestionItem.ORDINARY:
+            if item.state is not ItemState.ANSWERED or (
+                    update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update):
+                raise ListError("The question changed. Check it again before marking it read.")
+            if isinstance(page_request, PageRequest) and page_request.words:
+                if isinstance(item.owner, UnassignedOwner):
+                    raise ListError("The question has no owner for your words.")
+                console_text.require(page_request.words, "list field", refusal=ListError)
+            return _close_question_item(item, moment, source)
         if update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update:
             return item
         read = _clear_unread(item)
@@ -5034,7 +5137,7 @@ def main(argv: list[str] | None = None) -> int:
             confirm_scheduled(keeper, identity, caller, run_key=cast(str, args.run))
             print(f"confirmed {identity}")
             return 0
-        if caller.kind != "producer":
+        if caller.kind != "producer" and name != "close":
             raise ListError("the current session must be a producer")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
@@ -5201,8 +5304,9 @@ def main(argv: list[str] | None = None) -> int:
         elif name == "close":
             words = cast(str, args.words)
             console_text.require(words, "list field", refusal=ListError)
-            _ = close(keeper, cast(str, args.id), words, source=source,
-                      assigned_to=assigned_to, schedule_scope=schedule_scope)
+            close_access = AllItems.INCLUDED if assigned_to is AllItems.INCLUDED else ListCloseCaller(caller)
+            _ = close(keeper, cast(str, args.id), words, source=source if caller.kind == "producer" else caller.name,
+                      assigned_to=close_access, schedule_scope=schedule_scope)
         elif name == "reopen":
             _ = reopen(keeper, cast(str, args.id), source=source, assigned_to=assigned_to)
         else:

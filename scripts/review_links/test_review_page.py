@@ -8944,9 +8944,10 @@ window.fetch=async(_url,options={})=>{
     'F007: Open counts only Open records');
   check(!document.querySelector('[data-filter-row="show"] [data-filter-value="Validating"]'),
     'The Show row has no Validating chip.');
-  document.querySelector('[data-filter-row="type"] [data-filter-value="question"]').click();
-  choose('list-search','Q1','input');check(shown().length===1,'type and ID filters');
-  choose('list-search','','input');document.querySelector('[data-filter-row="type"] [data-filter-value="all"]').click();
+  check(document.querySelector('[data-filter-row="type"] [data-filter-value="question"]').hidden,
+   'The legacy Question filter stays hidden under All.');
+  choose('list-search','Q1','input');check(shown().length===1,'Search finds the legacy Question by ID.');
+  choose('list-search','','input');
   const question=rows().find(row=>row.dataset.type==='question');question.querySelector('.list-toggle').click();await readyReviewCard(question);
   const title=question.querySelector('.review-title'),titleHeight=title.getBoundingClientRect().height;
   title.textContent='A long review title '.repeat(20);

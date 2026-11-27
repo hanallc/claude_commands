@@ -124,6 +124,8 @@ def item_text_html(text: str, *, paragraphs: bool = False, link_urls: bool = Tru
 class ListChip(StrEnum):
     ALL = "all"
     NEEDS_ME = "needs-me"
+    QUESTIONS = "questions"
+    ANSWERS = "answers"
     PRODUCER_ANSWERING = "producer-answering"
     WORKING = "working"
     BLOCKED = "blocked"
@@ -138,6 +140,7 @@ class ListChip(StrEnum):
 QUEUE_BY_STATE = {
     the_list.ItemState.NEW: question_path.Queue.WORKING,
     the_list.ItemState.WORKING: question_path.Queue.WORKING,
+    the_list.ItemState.ANSWERED: question_path.Queue.NEEDS_ME,
     the_list.ItemState.BLOCKED: question_path.Queue.BLOCKED,
     the_list.ItemState.WAITING_FOR_NATE: question_path.Queue.NEEDS_ME,
     the_list.ItemState.REPAIRED: question_path.Queue.NEEDS_ME,
@@ -207,12 +210,19 @@ SHOW_ALIASES = show_aliases()
 
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
               unread_delivery: bool = False, unread_answer: bool = False, open_ask: bool = False,
-              report: bool = False) -> ListChip:
+              report: bool = False, question_item: bool = False) -> ListChip:
     """Find the one status chip for this item."""
     if state is the_list.ItemState.SCHEDULED:
         return ListChip.SCHEDULED
     if state == the_list.ItemState.REPAIRED:
         return ListChip.NEEDS_ME
+    if question_item and not parked:
+        if state is the_list.ItemState.WAITING_FOR_NATE:
+            return ListChip.QUESTIONS
+        if state is the_list.ItemState.ANSWERED:
+            return ListChip.ANSWERS
+        if state is the_list.ItemState.WORKING:
+            return ListChip.WORKING
     base = question_path.Queue.DONE if report and state == the_list.ItemState.DELIVERED else QUEUE_BY_STATE[state]
     queue = question_path.queue(base, unread_answer=unread_answer or open_ask, later=parked,
                                 unread_delivery=unread_delivery, waiting_for_answer=open_question)
@@ -246,6 +256,7 @@ class TopPriorityMark(Enum):
 
 
 STATE_TONES = {the_list.ItemState.WAITING_FOR_NATE: "warning", the_list.ItemState.BLOCKED: "error",
+               the_list.ItemState.ANSWERED: "room",
                the_list.ItemState.WORKING: "accent", the_list.ItemState.REPAIRED: "warning",
                the_list.ItemState.DELIVERED: "room",
                the_list.ItemState.DONE: "room", the_list.ItemState.SCHEDULED: "scheduled"}
@@ -663,7 +674,7 @@ def request_token(root: Path, keeper: str, identity: str, prefix: str) -> str:
 
 def signed_item_request(entry: ListRecord, secret: str) -> tuple[str, str]:
     request = ListFormRequestPrefix(secrets.token_hex(16), the_list.unread_update(entry.item),
-                                    entry.item.producer, entry.item.repair_revision).format()
+                                    feedback_recipient(entry.item), entry.item.repair_revision).format()
     return request, signed_token(secret, entry.keeper, entry.item.id, request)
 
 
@@ -672,6 +683,13 @@ def signed_form_fields(entry: ListRecord, secret: str) -> str:
     fields = {"keeper": entry.keeper, "id": entry.item.id, "request": request, "token": token}
     return ''.join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
                    for name, value in fields.items())
+
+
+def feedback_recipient(item: the_list.ListItem) -> staff.StaffId:
+    if (the_list.question_item(item) is not the_list.NoQuestionItem.ORDINARY
+            and not isinstance(item.owner, the_list.UnassignedOwner)):
+        return item.owner
+    return item.producer
 
 
 REPEAT_CHOICES = (
@@ -735,7 +753,18 @@ def repair_buttons(*, repaired: bool) -> str:
 def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapshot, parking_label: str,
                   schedule: DisplayedSchedule, today: datetime, mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
     hidden = signed_form_fields(entry, secret)
-    read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
+    if (the_list.question_item(entry.item) is not the_list.NoQuestionItem.ORDINARY
+            and entry.item.state is the_list.ItemState.ANSWERED):
+        receiver = html.escape(owner_name(members, entry.item.owner), quote=True)
+        label = f"Your words for {receiver}"
+        return (f'<form method="post" data-feedback-form data-question-read data-recipient-name="{receiver}">'
+                + hidden + '<input type="hidden" name="until" value="">'
+                + f'<textarea name="words" rows="4" maxlength="10000" placeholder="{label}" aria-label="{label}"></textarea>'
+                + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
+                + '<button name="action" value="read">Mark read</button></div></form>')
+    read = ('<button name="action" value="read">Mark read</button>'
+            if isinstance(entry.item.unread_since, datetime)
+            and the_list.question_item(entry.item) is the_list.NoQuestionItem.ORDINARY else '')
     top = top_button(mark)
     key = html.escape(entry.key.replace('/', '-'), quote=True)
     scheduled = not isinstance(schedule, the_list.NoSchedule)
@@ -747,9 +776,9 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
                  if isinstance(schedule, (the_list.ScheduledRun, UpcomingSeriesRun)) else '')
     zone = user_zone()
     schedule_editor = schedule_fields(entry, schedule, members, key, zone)
-    producer_name = owner_name(members, entry.item.producer)
-    producer_label = html.escape(producer_name, quote=True)
-    words_label = html.escape(f"Your words for {producer_name} about this item", quote=True)
+    recipient_name = owner_name(members, feedback_recipient(entry.item))
+    recipient_label = html.escape(recipient_name, quote=True)
+    words_label = html.escape(f"Your words for {recipient_name} about this item", quote=True)
     repair = ''
     repair_receiver = ''
     if isinstance(entry.item.report, the_list.ListReport):
@@ -757,10 +786,10 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
         if repaired:
             words_label = "Your words about this repair"
         owner = owner_name(members, entry.item.owner)
-        recipients = html.escape(" and ".join(dict.fromkeys((owner, producer_name))), quote=True)
+        recipients = html.escape(" and ".join(dict.fromkeys((owner, recipient_name))), quote=True)
         repair_receiver = f' data-repair-receiver="{recipients}"'
         repair = repair_buttons(repaired=repaired)
-    return (f'<form method="post" data-feedback-form data-recipient-name="{producer_label}"{repair_receiver}>' + hidden
+    return (f'<form method="post" data-feedback-form data-recipient-name="{recipient_label}"{repair_receiver}>' + hidden
             + f'<p data-parked-detail{parked}>{note}</p>'
             + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read + top
             + f'<div class="list-parking-actions">{start_now}<button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
@@ -771,7 +800,7 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
             + f'placeholder="{words_label}" aria-label="{words_label}"></textarea>'
             + repair + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
             + ('' if scheduled else '<button name="action" value="question" disabled>Ask question</button>')
-            + f'<button name="action" value="tell" disabled>Tell {producer_label}</button></div>'
+            + f'<button name="action" value="tell" disabled>Tell {recipient_label}</button></div>'
             + '<template data-schedule-template>' + schedule_editor + '</template></form>')
 
 
@@ -874,7 +903,7 @@ def filed_exchange_sections(item: the_list.ListItem, today: datetime, names: sta
         asked = time_html(exchange.asked_at, today) if isinstance(exchange.asked_at, datetime) else ""
         body = f'<h3>Question from {asker}</h3>{asked}<p>{item_text_html(exchange.question)}</p>'
         answer = exchange.answer
-        if (answer is list_exchange.QuestionWithoutAnswer.OPEN
+        if (item.state is not the_list.ItemState.CLOSED and answer is list_exchange.QuestionWithoutAnswer.OPEN
                 and exchange.direction is list_exchange.Direction.QUESTION_TO_NATE):
             body += '<p>' + review_card_link(exchange.source_key, "Answer question", studio_question=True) + '</p>'
         if (isinstance(answer, list_exchange.ExchangeAnswer)
@@ -882,7 +911,9 @@ def filed_exchange_sections(item: the_list.ListItem, today: datetime, names: sta
             actor = exchange.answerer
             answerer = html.escape(actor.name) if isinstance(actor, list_exchange.RecordedAnswerer) else names.html(actor, owner_name(names.members, staff.StaffId(actor)))
             answered = time_html(answer.time, today) if isinstance(answer.time, datetime) else ""
-            unread = ' <span class="question-unread">Unread</span>' if answer.read is list_exchange.AnswerRead.UNREAD else ""
+            unread = (' <span class="question-unread">Unread</span>'
+                      if item.state is not the_list.ItemState.CLOSED and answer.read is list_exchange.AnswerRead.UNREAD
+                      else "")
             body += f'<h3>Answer from {answerer}{unread}</h3>{answered}<p>{item_text_html(answer.text)}</p>'
         sections.append('<section class="page-question">' + body + '</section>')
     return ''.join(sections)
@@ -1165,6 +1196,7 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
                         and progress.latest_status.strip() == item.report.words.strip())
     state_stamp = report_state_time(item, today)
     eta, _ = displayed_work(item, schedule)
+    question = the_list.question_item(item) is not the_list.NoQuestionItem.ORDINARY
     fields = ''.join(
         f'<section class="list-field-{field}"><h3>'
         + ('How to try' if field == "next_step" and item.state == the_list.ItemState.REPAIRED else FIELD_LABELS[field])
@@ -1173,7 +1205,8 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
         + (' · ' + state_stamp if field == "state" and state_stamp else '') + '</section>'
         for field, value in (("state", item.state), ("eta", eta), ("latest_status", progress.latest_status),
                              ("next_step", item.next_step), ("done_when", item.done_when))
-        if (field != "latest_status" or not duplicate_status) and (field != "next_step" or progress.show_next_step))
+        if (field != "latest_status" or not duplicate_status) and (field != "next_step" or progress.show_next_step)
+        and (not question or value and value is not the_list.EtaStatus.NOT_ASKED))
     report = review_page.list_report_details(item.report) if isinstance(item.report, the_list.ListReport) else ''
     links = item_links_html(entry, log, progress.next_step)
     return ('<div class="list-panel"><div>' + report + asks + '<div class="list-item-fields">' + fields
@@ -1288,8 +1321,10 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     sections = review_links(item, reviews, today)
     failed: frozenset[str] = visibility.failed if isinstance(visibility, the_list.QuestionAttention) else frozenset()
     questions = panel_questions(item, today, unread_answers, failed) if isinstance(schedule, the_list.NoSchedule) else ''
-    form = feedback_form(entry, secret, members=names.members, parking_label=parking_label,
-                         schedule=schedule, today=today, mark=mark)
+    waits_for_answer = (the_list.question_item(item) is list_exchange.Direction.QUESTION_TO_NATE
+                        and item.state is the_list.ItemState.WAITING_FOR_NATE)
+    form = '' if waits_for_answer else feedback_form(
+        entry, secret, members=names.members, parking_label=parking_label, schedule=schedule, today=today, mark=mark)
     return waiting_note(entry, names, hidden=True) + detail_panel(
         entry, sections + questions + form, today, names, unread_answers, progress, ask_boxes(entry, secret, names),
         schedule=schedule, linked_items=linked_items)
@@ -1333,6 +1368,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     }
     if isinstance(item.report, the_list.ListReport):
         attributes["report"] = item.report.kind.value
+    if the_list.question_item(item) is not the_list.NoQuestionItem.ORDINARY:
+        attributes["question-item"] = ""
     if item.reviews:
         attributes["list-review-keys"] = json.dumps(item.reviews, ensure_ascii=False)
     if item.state is the_list.ItemState.CLOSED:
@@ -1881,10 +1918,11 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
         key = change_page.review_delivery_key(source, item.id, feedback.request)
         recipients = feedback.recipient_ids(delivery.keeper)
         repair = feedback.action is the_list.ReportVerdict.NOT_FIXED
+        confirm = repair or (feedback.action == "read" and feedback.origin is the_list.PageNoticeOrigin.STUDIO)
         failures = change_page.send_with_retries(change_page.SENDER, recipients, message,
                                                  tries, settings.number("delivery_pause_seconds"), key=key,
-                                                 confirm=repair)
-        if repair and any(isinstance(failure, change_page.UnconfirmedDelivery) for failure in failures):
+                                                 confirm=confirm)
+        if confirm and any(isinstance(failure, change_page.UnconfirmedDelivery) for failure in failures):
             return feedback
         if not failures:
             outcome = change_page.DeliveryConfirmed()
@@ -2312,6 +2350,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         open_ask = bool(the_list.answerable_asks(entry.item, members))
         chip = list_chip(entry.item.state, parked=parked, open_question=open_question, open_ask=open_ask,
                          report=isinstance(entry.item.report, the_list.ListReport),
+                         question_item=the_list.question_item(entry.item) is not the_list.NoQuestionItem.ORDINARY,
                          unread_delivery=the_list.unread_delivery(entry.item), unread_answer=bool(unread_answers))
         owner_cell, owner_sort, owner_search = owner_display(entry.item.owner)
         search_text = SearchText(owner_search, normalize_search_text(entry.item.title),
@@ -2701,6 +2740,11 @@ const chipFor=data=>{
  if(data.state==='Repaired') return 'needs-me';
  if(data.state==='Scheduled') return 'scheduled';
  const parked=isParked(data);
+ if(data.questionItem!==undefined && !parked){
+  if(data.state==='Waiting for nate') return 'questions';
+  if(data.state==='Answered') return 'answers';
+  if(data.state==='Working') return 'working';
+ }
  const queue=data.report && data.state==='Delivered' ? queuesByState.Done : queuesByState[data.state];
  return chipsByQueue[questionQueue(queue,data.openAsk==='true' || data.unread==='true' && data.unreadAnswer==='true',
   parked,data.unreadDelivery==='true',data.openQuestion==='true')];
@@ -2934,15 +2978,15 @@ function syncUnread(item,form,unread,unreadSort){
   if(!dot){const mark=document.createElement('span');mark.className='list-dot';mark.setAttribute('role','img');
    mark.setAttribute('aria-label','Unread update');update.prepend(mark);}
   if(!form) return;
-  const canRead=!form.hasAttribute('data-waiting-actions') ||
-   item.dataset.unreadDelivery==='true' || item.dataset.unreadAnswer==='true';
+  const canRead=item.dataset.questionItem!==undefined ? item.dataset.state==='Answered'
+   : !form.hasAttribute('data-waiting-actions') || item.dataset.unreadDelivery==='true' || item.dataset.unreadAnswer==='true';
   if(!canRead) read?.remove();
   if(canRead && !read){
    const button=document.createElement('button');button.name='action';button.value='read';
    button.textContent='Mark read';button.disabled=Boolean(form.dataset.sending);
    const remove=form.querySelector('[value="remove"]');
    if(remove) remove.after(button);
-   else form.querySelector('.list-actions').prepend(button);
+   else form.querySelector('.list-actions,.list-tell')?.prepend(button);
   }
  }else{
   dot?.remove();read?.remove();
@@ -3052,7 +3096,8 @@ const tableView=createRecordTable({content:()=>content,
  filterFacets,
  counts:(items,count,{counts})=>{
   const open=items.filter(item=>item.dataset.state!=='Closed');
-  return count+' of '+open.length+' items shown · '+(counts.show['needs-me'] ?? 0)+' need you · '+
+  const needYou=['needs-me','questions','answers'].reduce((total,chip)=>total+(counts.show[chip] ?? 0),0);
+  return count+' of '+open.length+' items shown · '+needYou+' need you · '+
    open.filter(item=>item.dataset.unread==='true').length+' unread';
  },
 });
@@ -3427,6 +3472,7 @@ function bindFeedbackForm(form){
   const unpark=form.querySelector('[value="unpark"]'),parkedDetail=form.querySelector('[data-parked-detail]');
   showActionFailure(notice,tableView.actionNotice(item));
   const waitingForm=form.hasAttribute('data-waiting-actions');
+  const questionRead=form.hasAttribute('data-question-read');
   const zone=content.dataset.zone;
   const confirmation=()=>({state:item.dataset.state,parked:item.dataset.parked,
    unread:item.dataset.unread==='true',unreadDelivery:item.dataset.unreadDelivery,unreadAnswer:item.dataset.unreadAnswer,
@@ -3437,7 +3483,7 @@ function bindFeedbackForm(form){
    item.dataset.parked=confirmed.parked;
    item.dataset.unreadDelivery=confirmed.unreadDelivery;
    item.dataset.unreadAnswer=confirmed.unreadAnswer;
-   if(!metadataOnly) unpark.hidden=confirmed.state!=='Scheduled' && (!isParked(confirmed) || confirmed.state==='Closed');
+   if(!metadataOnly && unpark) unpark.hidden=confirmed.state!=='Scheduled' && (!isParked(confirmed) || confirmed.state==='Closed');
    syncUnread(item,metadataOnly ? null : form,confirmed.unread,confirmed.unreadSort);
   };
   const applySavedState=(result,{keepDetailFocus=false,hasDetail=false,metadataOnly=false}={})=>{
@@ -3462,7 +3508,7 @@ function bindFeedbackForm(form){
    }
    syncConfirmed(metadataOnly);
    const state=item.querySelector('.list-state');state.textContent=item.dataset.state;
-   state.className='list-state '+({'Waiting for nate':'warning',Repaired:'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room',Scheduled:'scheduled'}[item.dataset.state] || 'muted');
+   state.className='list-state '+(''' + json.dumps(STATE_TONES) + r'''[item.dataset.state] || 'muted');
    const stamp=item.querySelector('[data-list-state-time]');
    if(stamp && typeof result.state_time_html==='string') stamp.innerHTML=result.state_time_html;
    const sortValues=JSON.parse(item.dataset.sortValues);sortValues[4]=item.dataset.state.toLowerCase();
@@ -3488,7 +3534,7 @@ function bindFeedbackForm(form){
    if(typeof result.parked_until==='string'){
     let note=item.querySelector('[data-parked-note]');
     const text=result.parked_until ? 'Parked until '+result.parked_until : '';
-    if(!metadataOnly){
+    if(!metadataOnly && parkedDetail){
      parkedDetail.textContent=result.scheduled_note ?? text;
      parkedDetail.hidden=!parkedDetail.textContent;
     }
@@ -3560,7 +3606,7 @@ function bindFeedbackForm(form){
   const unconfirmed=draft?.unconfirmed ?? new Set();
   const parkSettings=()=>JSON.parse(content.dataset.parking);
   const edit=()=>{draftStamp++;retain();persistDraft();};
-  const scheduleEditor=waitingForm ? null : bindScheduleFields(form,until,zone,draft?.schedule,edit);
+  const scheduleEditor=waitingForm || questionRead ? null : bindScheduleFields(form,until,zone,draft?.schedule,edit);
   const matching=(action,scheduleKey)=>[...unconfirmed].findLast(attempt=>attempt.words===words.value &&
    (attempt.action==='park-until-delivered' || attempt.until===until.value) &&
    (scheduleKey===undefined || attempt.scheduleKey===scheduleKey) &&
@@ -3570,7 +3616,7 @@ function bindFeedbackForm(form){
   const retainDraft=()=>{
    if(retiredDraft) return;
    drafts.set(key,{words:waitingForm ? draft?.words ?? '' : words.value,
-    stamp:draftStamp,unconfirmed,schedule:waitingForm ? draft?.schedule : scheduleEditor.draft()});
+    stamp:draftStamp,unconfirmed,schedule:waitingForm ? draft?.schedule : scheduleEditor?.draft()});
    identity(matching() ?? fresh);
   };
   const retain=()=>{retainDraft();syncTell();};
@@ -3585,7 +3631,7 @@ function bindFeedbackForm(form){
   words.addEventListener('input',edit);until.addEventListener('input',edit);
   const parkToggle=form.querySelector('[data-later-toggle]');
   const formatParkingTime=listPickerSummary(zone);
-  if(!waitingForm) bindDateTimePicker(form,{zone,settings:parkSettings,summaryPrefix:'',
+  if(scheduleEditor) bindDateTimePicker(form,{zone,settings:parkSettings,summaryPrefix:'',
    prepareMenu:scheduleEditor.attach,openCustom:scheduleEditor.scheduled,
    formatSummary:at=>(scheduleEditor.words() ? 'Starts ' : 'Parks until ')+formatParkingTime(at),
    retryTime:()=>Date.parse((scheduleEditor.words() ?
@@ -3733,14 +3779,18 @@ function bindFeedbackForm(form){
      ? hold.post(actionPath,{...options,requestTimeoutSeconds},saveAction ? null : receiver)
      : fetch(actionPath,{...options,signal:listRequestSignal()}));
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parkingReceipt && action!=='remove'));
-    if(!parkingReceipt) saved=response.ok;
-    if(saved && tableView.currentItemRequest(request) && usesWords &&
+    if(!parkingReceipt) saved=response.ok && !questionRead;
+    const result=await response.json();
+    if(questionRead && response.ok && result.words_saved!==true){
+     throw new Error('The save is unconfirmed.');
+    }
+    if(questionRead) saved=response.ok;
+    if(saved && tableView.currentItemRequest(request) && (usesWords || questionRead) &&
        draftStamp===stampAtSubmit && words.value===attempt.words){
      words.value='';
      retainDraft();
      persistDraft();
     }
-    const result=await response.json();
     stale=!tableView.currentItemRequest(request);
     if(item.listRequest!==request) return;
     delete item.dataset.undoPending;

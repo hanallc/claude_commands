@@ -45,7 +45,7 @@ CARD_COLUMNS = ('<colgroup><col style="width:17%"><col style="width:13%"><col st
                 '<col style="width:37%"><col style="width:12%"><col style="width:7%"></colgroup>')
 TYPES = tuple(ReviewType)
 WIRE_TYPES = tuple(kind for kind in TYPES if kind != ReviewType.RESPONSE)
-TYPE_CHIPS = (ReviewType.FOR_YOU, *review_items.QUESTION_TYPES,
+TYPE_CHIPS = (ReviewType.FOR_YOU,
               *(kind for kind in TYPES
                 if kind not in (*review_items.QUESTION_TYPES, ReviewType.FOR_YOU, ReviewType.BUG)))
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
@@ -1224,8 +1224,10 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     handoff = ''
     exchange = ''
     filed = item.exchange_handoff
+    studio_card = inputs.view is ReviewBodyView.STUDIO_QUESTION
     filed_followups: frozenset[int] = (filed.filed_followup_indices
-                                     if isinstance(filed, review_items.FiledReviewExchange) else frozenset())
+                                     if isinstance(filed, review_items.FiledReviewExchange)
+                                     and not (studio_card and filed.hides_card) else frozenset())
     response = item.response
     if response is not None:
         body = section('You asked', response.question)
@@ -2245,7 +2247,7 @@ function updateReviewChips(rows,filters,matches,shown){
  }
  for(const button of filterControl.buttons(typeRow)){
   const value=filterControl.value(button),kind=value==='all' ? '' : value;
-  if(kind==='investigations') button.hidden=type!=='investigations';
+  if(['investigations','question','response'].includes(kind)) button.hidden=type!==kind;
   // A Show reset checks the current Type before the new Type applies.
   const resetsShow=typeChipShow(show,kind)!==show;
   const resetsOwner=owner && (!ownerTypes.has(kind) || resetsShow && !ownerTypes.has(type));
@@ -2873,6 +2875,8 @@ SHELL_SEARCH = (
     '<div class="record-filter-words"><label class="list-search-label" for="list-search">Search</label>'
     + '<input type="search" id="list-search" placeholder="Filter by id or words" data-reload-safe></div>')
 SHELL_TYPE_CHIPS = (*(record_table.Chip(kind, icon(kind) + LABELS[kind]) for kind in TYPE_CHIPS),
+                    *(record_table.Chip(kind, icon(kind) + LABELS[kind], hidden=True)
+                      for kind in review_items.QUESTION_TYPES),
                     record_table.Chip('investigations', 'Investigations and Bugs', hidden=True))
 SHELL_FILTERS = ('<div class="review-queue">'
                  + record_table.chip_row('Type', SHELL_TYPE_CHIPS, 'all')
