@@ -71,6 +71,20 @@ def run_gate_step(case: unittest.TestCase, argv: list[str]) -> subprocess.Comple
 
 
 class CheckpointGateTests(unittest.TestCase):
+    def test_gate_module_argument_to_another_script_uses_the_nextest_parser(self) -> None:
+        command = ["python3", "other.py", "-m", "scripts.production.gate"]
+        output = "    FAIL [  0.1s] (1/1) bin checks::failed\n--- lib/test_gate.py exit=1 ---\n"
+        names = frozenset({"checks::failed"})
+        self.assertEqual(checkpoint_gate.red_names(command, output), names)
+        self.assertEqual(checkpoint_gate.only_tests(command, names), [*command, "-E", "test(=checks::failed)"])
+
+    def test_env_unset_keeps_the_gate_parser(self) -> None:
+        command = ["env", "-u", "PYTHONUNBUFFERED", *GATE]
+        output = "    FAIL [  0.1s] (1/1) bin checks::failed\n--- lib/test_gate.py exit=1 ---\n"
+        names = frozenset({"lib/test_gate.py"})
+        self.assertEqual(checkpoint_gate.red_names(command, output), names)
+        self.assertEqual(checkpoint_gate.only_tests(command, names), [*command, "--module", "lib/test_gate.py"])
+
     def test_merge_gate_uses_the_committed_copy_for_the_initial_run_and_flake_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary).resolve()
