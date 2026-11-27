@@ -1354,8 +1354,15 @@ thread.join()
         assert isinstance(uses, tmp_sweep.ProcessUsesKnown)
         self.assertIn((str(held), pid, tmp_sweep.HOLDS_FILE), uses.paths)
 
-    @unittest.skipUnless(os.uname().machine in {"x86_64", "aarch64"}, "The kcmp syscall number is unknown")
     def test_process_scan_skips_a_thread_that_shares_both_resources(self) -> None:
+        kcmp = tmp_sweep._kcmp_syscall()  # pyright: ignore[reportPrivateUsage]
+        if kcmp is None:
+            self.skipTest("kcmp is unavailable")
+        number, syscall = kcmp
+        self_pid = os.getpid()
+        if syscall(number, self_pid, self_pid, tmp_sweep.KCMP_FILES, 0, 0) != 0:
+            self.skipTest("kcmp cannot compare this process's descriptor table")
+
         pid, tid, held = self.start_thread("shared")
         leader = f"{tmp_sweep.PROC_DIR}/{pid}"
         thread = f"{leader}/task/{tid}"
