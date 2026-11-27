@@ -628,8 +628,7 @@ class GuestFactCacheTests(unittest.TestCase):
         environment = {'HOME': str(self.home)}
         if state is not None:
             environment['GATE_STATE_DIR'] = state
-        return mac_linux._guest_fact_cache(  # pyright: ignore[reportPrivateUsage]
-            'claude', self.root, self.root / 'tmp', environment)
+        return mac_linux._guest_fact_cache('claude', environment)  # pyright: ignore[reportPrivateUsage]
 
     def seed(self) -> None:
         self.kept.parent.mkdir(parents=True)
@@ -640,18 +639,17 @@ class GuestFactCacheTests(unittest.TestCase):
         with self.cache():
             self.assertEqual(self.run_cache.read_bytes(), self.kept.read_bytes())
 
-    def test_guest_cache_uses_the_selected_gate_state_folder(self) -> None:
+    def test_guest_cache_is_off_when_gate_state_dir_is_set(self) -> None:
         self.seed()
-        for setting, folder in ((str(self.root / 'absolute'), self.root / 'absolute'),
-                                ('relative', self.root / 'relative'), ('~/selected', self.home / 'selected'),
-                                ('/tmp/selected', self.root / 'tmp/selected')):
-            with self.subTest(setting=setting):
-                selected = folder / self.kept.name
-                with self.cache(setting):
-                    self.assertFalse(self.run_cache.exists())
-                    self.assertEqual(selected.read_bytes(), self.kept.read_bytes())
-                    _ = selected.write_bytes(setting.encode())
-                self.assertEqual(self.kept.read_bytes(), setting.encode())
+        selected = self.home / 'selected' / self.kept.name
+        with redirect_stderr(io.StringIO()) as errors, self.cache(str(selected.parent)):
+            for cache in (selected, self.run_cache):
+                self.assertFalse(cache.parent.exists())
+                cache.parent.mkdir(parents=True)
+                _ = cache.write_bytes(b'run facts')
+        self.assertEqual(self.kept.read_bytes(), b'kept facts')
+        self.assertFalse(self.kept.with_suffix('.lock').exists())
+        self.assertEqual(errors.getvalue(), 'Guest fact cache is off because GATE_STATE_DIR is set.\n')
 
     def test_replaced_run_cache_updates_the_kept_file(self) -> None:
         self.seed()
@@ -4649,11 +4647,11 @@ with (patch.object(conf, 'read', read_config),
     def test_command_request_runs_the_argv_in_the_numbered_copy_and_proves_the_end(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
         state = Path(land_runs.DEFAULT_STATE_DIR)
-        cache_name = affected_modules.FACT_CACHE_NAME
-        kept = self.guest_home / 'build/claude/main' / state.name / cache_name
+        cache = Path(*state.parts[1:], affected_modules.FACT_CACHE_NAME)
+        kept = self.guest_home / 'build/claude/main' / state.name / cache.name
         for status in (0, 4):
             program = ('import os, sys\nfrom pathlib import Path\n'
-                       + f'cache = Path(os.environ["GATE_STATE_DIR"]).expanduser() / {cache_name!r}\n'
+                       + f'cache = Path.home() / {str(cache)!r}\n'
                        + ('assert cache.read_bytes() == b"0"\n' if status else 'assert not cache.exists()\n')
                        + f'cache.write_bytes({str(status).encode()!r})\n'
                        + f'print("guest ran in", os.getcwd(), flush=True)\nsys.exit({status})\n')
@@ -4661,7 +4659,8 @@ with (patch.object(conf, 'read', read_config),
             _ = script.write_text(program, encoding='utf-8')
             command = mac_linux.GuestCommand(settings)
             try:
-                with patch.dict(os.environ, {'GATE_STATE_DIR': '~/selected-state'}):
+                with patch.dict(os.environ):
+                    _ = os.environ.pop('GATE_STATE_DIR', None)
                     process = command.start(self.repo, ['python3', 'scripts/fixture/hand.py'], work='hand-made',
                                             unit='caller', bootstrap=self.root / 'bootstrap.tar',
                                             checked={script: program.encode()})

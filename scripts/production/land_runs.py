@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from collections.abc import Collection, Generator, Mapping, Sequence
+from collections.abc import Collection, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
@@ -50,17 +50,11 @@ class LandResult(TypedDict):
     time: str
 
 
-def _state_path(path: str, home: str | None) -> Path:
-    if home is not None and (path == '~' or path.startswith('~/')):
-        return Path(home.rstrip('/') + path[1:] or '/')
-    return Path(path).expanduser()
-
-
-def default_state_dir(home: str | None = None) -> Path:
+def default_state_dir() -> Path:
     """Return the default gate state folder after the deploy move."""
-    directory = _state_path(DEFAULT_STATE_DIR, home)
+    directory = Path(DEFAULT_STATE_DIR).expanduser()
     # Chunk 6 removes this guard and the old folder path.
-    old = _state_path("~/.local/state/merge-gate", home)
+    old = Path("~/.local/state/merge-gate").expanduser()
     if os.path.lexists(old) and not os.path.lexists(directory):
         raise GateStateMoveRequired(
             "Gate state move required: set /build:hold drain natedev, then run "
@@ -68,13 +62,10 @@ def default_state_dir(home: str | None = None) -> Path:
     return directory
 
 
-def state_dir(environment: Mapping[str, str] | None = None) -> Path:
-    """Return the gate state folder for the supplied or current environment."""
-    if environment is None:
-        environment = os.environ
-    selected = environment.get("GATE_STATE_DIR")
-    home = environment.get("HOME")
-    return default_state_dir(home) if selected is None else _state_path(selected, home)
+def state_dir() -> Path:
+    """Return the selected gate state folder."""
+    selected = os.environ.get("GATE_STATE_DIR")
+    return default_state_dir() if selected is None else Path(selected).expanduser()
 
 
 def lands_dir() -> Path:

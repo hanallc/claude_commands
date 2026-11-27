@@ -3019,25 +3019,25 @@ def _publish_guest_fact_cache(source: Path, kept: Path, original: os.stat_result
 
 
 @contextmanager
-def _guest_fact_cache(repository: str, copy: Path, tmp: Path, environment: Mapping[str, str]) -> Generator[None]:
+def _guest_fact_cache(repository: str, environment: Mapping[str, str]) -> Generator[None]:
     """Copy the kept facts into the run and publish its new snapshot when the run ends."""
+    if 'GATE_STATE_DIR' in environment:
+        print('Guest fact cache is off because GATE_STATE_DIR is set.', file=sys.stderr)
+        yield
+        return
+
     from scripts.production import affected_modules, land_runs
 
+    state = Path(land_runs.DEFAULT_STATE_DIR)
+    home = Path(environment['HOME'])
+    source = home.joinpath(*state.parts[1:], affected_modules.FACT_CACHE_NAME)
     with ExitStack() as lease:
         try:
-            state = copy / land_runs.state_dir(environment)
-            root = copy
-            if not state.is_relative_to(copy):
-                # The limited command sees the run temp folder as /tmp.
-                state = tmp / state.relative_to(TEMP)
-                root = tmp
-            requested = state / affected_modules.FACT_CACHE_NAME
-            source = Path(os.path.normpath(requested))
-            if not source.is_relative_to(root) or requested.resolve() != source:
-                raise ValueError('The run cache path leaves its private folder or contains a link.')
+            if source.resolve() != source:
+                raise ValueError('The run cache path contains a link.')
             main = lease.enter_context(build_folders.leased_build_folder(build_folders.MainOutput(repository)))
             build_folders.mark_folder_use(main)
-            kept = main / Path(land_runs.DEFAULT_STATE_DIR).name / source.name
+            kept = main / state.name / source.name
             source.parent.mkdir(parents=True, exist_ok=True)
             if kept.exists():
                 _copy_guest_fact_cache(kept, source)
@@ -3045,7 +3045,7 @@ def _guest_fact_cache(repository: str, copy: Path, tmp: Path, environment: Mappi
             with suppress(FileNotFoundError):
                 original = source.stat()
             _ = lease.callback(_publish_guest_fact_cache, source, kept, original)
-        except (OSError, RuntimeError, ValueError, land_runs.GateStateMoveRequired) as error:
+        except (OSError, ValueError) as error:
             print(f'Guest fact cache copy in failed: {error}', file=sys.stderr)
         yield
 
@@ -3083,7 +3083,7 @@ def run_guest(request_path: Path) -> int:
                 refusal = command_refusal(copy.path, command, request['checked'], environment['PATH'])
                 if refusal:
                     return refuse_run(refusal, request['attempt'])
-                with _guest_fact_cache(copy.repository, copy.path, tmp, environment):
+                with _guest_fact_cache(copy.repository, environment):
                     return run_limited(tmp, command, copy.path, environment, request['attempt'])
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
