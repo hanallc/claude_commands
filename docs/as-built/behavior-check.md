@@ -20,6 +20,8 @@ It reads the head and base again before merge and supplies the checked head to G
 
 A clear record names the saved reviewer reply.
 The reviewer filters transcript files before parsing them and runs each command in one tool call without `write_stdin`.
+For a `requested` finding, the reviewer quotes one source message.
+If several messages contain relevant words, the reviewer quotes the newest message that sets the behavior.
 The gate checks the finding for each changed test.
 Source verification applies only to `requested` findings.
 The check accepts typed Claude turns, sent List Tell feedback from Nate, and Nate's saved List or Question answers.
