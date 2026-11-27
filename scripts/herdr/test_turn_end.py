@@ -189,6 +189,38 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual(passed["status"], "canceled")
         self.assertFalse(progress_history.parked_worker_pass(passed))
 
+    def test_agents_stop_cancels_a_closed_workers_pass_waiting_for_a_reply(self) -> None:
+        self.case.agent.without_done = True
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane, _ = self.case.agent.submitted[-1]
+        row = self.case.agent.row(pane)
+        run = self.case.run_dir
+        instance = str(worker_panes.worker_pass(row, run)["instance_id"])
+        path, result = self.case.detached_record(row, "finished-before-close")
+        result.update(pane_dispatch_id=instance, delivery=f"sent: worker {row.name} at {pane}", exit_code=0,
+                      finished_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
+        atomic_file.write_text_atomic(path, json.dumps(result))
+        self.case.agent.append(pane, "user", "Detached run: finished-before-close\nRun finished: private verification")
+        self.case.fixture.world.remove_pane(pane)
+        self.assertIsInstance(worker_panes.observe_worker(self.case.fixture.parent.id, row, staff.snapshot()),
+                              worker_panes.ClosedWorker)
+        self.assertIsInstance(progress_history.active_dispatch(row.id, run), progress_history.ActiveDispatch)
+        receipt = self.case.receipt()
+        assert isinstance(receipt, worker.DispatchWaitingForRuns)
+        self.assertIsInstance(receipt.reply, worker.DispatchAwaitingReply)
+        self.assertFalse(receipt.has_live_run)
+
+        following = run / "next-prompt.md"
+        atomic_file.write_text_atomic(following, "Start the next assignment.\n")
+        assign_next = ("assign", "impl", str(following), "--name", row.name, "--slot", "impl", "--phase", "8",
+                       "--kind", "assign", "--session-dir", str(run), "--launcher-command", '["assign.sh"]')
+        self.case.assert_assign_waits_for_result_reply(assign_next)
+
+        self.assertEqual(self.stop_closed_worker(row), f"{row.name}: ended 1 open pass as canceled\n")
+        self.assertEqual(worker_panes.worker_pass(row, run)["status"], "canceled")
+        self.assertEqual(self.case.command(*assign_next), (0, "submitted\n", ""))
+        self.assertNotEqual(worker_panes.worker_pass(row, run)["instance_id"], instance)
+
     def test_result_for_a_canceled_parked_pass_does_not_restore_the_worker(self) -> None:
         row, path, record = self.parked_worker_with_run()
         pane = self.case.agent.submitted[-1][0]
