@@ -3295,7 +3295,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               redirect_stderr(errors)):
             response = self.new_item_http(self.new_item_body(request), finished=True)
         self.assertEqual(response.status, 200, response.body)
-        self.assertEqual(events, ["delivery", "evidence"])
+        self.assertEqual(events, ["evidence", "delivery"])
         key = cast(dict[str, str], json.loads(response.body))["key"]
         self.assertIn(key, cache.get().records)
         self.assertEqual(len(investigation.records(request.recipient_id)), 1)
