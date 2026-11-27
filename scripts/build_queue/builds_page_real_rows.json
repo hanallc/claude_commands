@@ -293,7 +293,7 @@
    ],
    "because": "direct cargo command",
    "mac_text": "",
-   "call": "merge_gate.py --checkout . --tests-only",
+   "call": "gate.py --checkout . --tests-only",
    "about": "Runs every test module",
    "changes": "no branch",
    "machine": "natedev",
@@ -500,7 +500,7 @@
    "place": 2,
    "free": 10.394727325066924,
    "why": "its turn",
-   "call": "targeted_test.py --repo . --affected",
+   "call": "gate.py --affected --repo .",
    "runs_on": "natedev only",
    "targets": [
     "natedev"
@@ -596,7 +596,7 @@
    "place": 4,
    "free": 10.394727325066924,
    "why": "its turn",
-   "call": "targeted_test.py --checkout '{tree}'",
+   "call": "gate.py --affected --checkout '{tree}'",
    "runs_on": "natedev only",
    "targets": [
     "natedev"
@@ -644,7 +644,7 @@
    "place": 5,
    "free": 10.394727325066924,
    "why": "its turn",
-   "call": "targeted_test.py --repo newalways",
+   "call": "gate.py --affected --repo newalways",
    "runs_on": "natedev only",
    "targets": [
     "natedev"

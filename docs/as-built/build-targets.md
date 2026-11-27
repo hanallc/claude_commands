@@ -553,7 +553,7 @@ Record lookup returns `Registered`, `NotRegistered` or `UnreadableRecord(reason)
 
 Holders create `.claude-busy` and use a shared flock for the whole run. Judges and dry runs do not create the mark. 
 The affected gate takes the shared lock after it accepts the prepared copy.
-The merge gate takes the shared lock before tests start.
+The integrate job takes the shared lock before tests start.
 The tmp sweep takes an exclusive lock on existing busy marks without waiting before it lists a copy.
 The floor sweep also checks existing busy marks before it lists build output.
 Scratch end records task completion and keeps the folders.
