@@ -2736,7 +2736,7 @@ def file_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId,
             if any(list_folder_identity(match.keeper) != list_folder_identity(keeper) for match in matches):
                 raise ListError("The Review link conflicts with the saved List route.")
             matches = tuple(investigation.ListDestination(keeper, match.number) for match in matches)
-        destinations = unique_destinations((reserved, *matches) if isinstance(reserved, investigation.ListDestination)
+        destinations = unique_destinations((reserved,) if isinstance(reserved, investigation.ListDestination)
                                            else matches)
         if len(destinations) > 1:
             raise ListError("The Review source has two List destinations.")
