@@ -986,6 +986,8 @@ def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, 
     rules = question_part_digest((prompt, schema, CODE_RULES, PART_RULES, review_date_and_zone))
     fingerprints = {number: question_part_digest((rules, part, parts[:number - 1].count(part)))
                     for number, part in enumerate(parts, 1)}
+    # The reviewer sees the exact draft text, including the space between parts.
+    draft_fingerprint = fingerprints[1] if whole else question_part_digest((rules, "draft", parts, draft.body))
 
     try:
         with lock_question_verdicts(path, deadline):
@@ -1002,6 +1004,9 @@ def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, 
                 return combine_question_verdicts(draft, list(reused.values()), metadata())
             pending = {number: part for number, part in enumerate(parts, 1) if number not in reused}
             if not whole:
+                if not pending and draft_fingerprint in saved:
+                    draft_verdict = part_verdict(_object(saved[draft_fingerprint]), draft)
+                    return combine_question_verdicts(draft, [draft_verdict, *reused.values()], metadata())
                 fields = json.dumps({"draft": draft.body, "parts": pending}, ensure_ascii=False)
                 draft_prompt = f"{review_date_and_zone}\nConsole text kind: question\n{fields}"
             answer = ask(schema, prompt, draft_prompt)
@@ -1031,12 +1036,15 @@ def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, 
             combined = combine_question_verdicts(draft, [draft_verdict, *(latest[n] for n in sorted(latest))], metadata())
             if isinstance(combined, Failed):
                 return combined
+            verdicts_by_fingerprint = {fingerprints[number]: verdict for number, verdict in latest.items()}
+            if not whole:
+                verdicts_by_fingerprint[draft_fingerprint] = draft_verdict
             saved = {
-                fingerprints[number]: {
+                fingerprint: {
                     "questions": verdict.questions,
                     "failed_rules": [{"rule": failure.rule, "quote": failure.quote} for failure in verdict.failures],
                 }
-                for number, verdict in latest.items()
+                for fingerprint, verdict in verdicts_by_fingerprint.items()
             }
             write_text_atomic(path, json.dumps(saved) + "\n", new_file_mode=0o600)
             return combined

@@ -394,8 +394,11 @@ class LocalReviewTests(unittest.TestCase):
             ])
 
         with mock.patch.object(review, "structured_call", side_effect=judge):
-            self.assertEqual(review.review_question(key, question, runner=guide, console_kind="question"),
-                             review.QuestionReviewFailed(question, (), (failure,)))
+            for attempt in ("first review", "unchanged draft"):
+                with self.subTest(attempt=attempt):
+                    self.assertEqual(review.review_question(key, question, runner=guide, console_kind="question"),
+                                     review.QuestionReviewFailed(question, (), (failure,)))
+                    self.assertEqual(len(requests), 1)
             revised_title = "Finish the download?"
             revised = question.replace(title, revised_title).replace(point, "The connection stopped the download.")
             key = replace(key, text=revised_title)
@@ -427,13 +430,25 @@ class LocalReviewTests(unittest.TestCase):
             failures = [review.RuleFailureRecord(rule=failure.rule, quote=failure.quote)] if request["draft"] == revised else []
             return question_batch(request, failures=failures)
 
+        held = review.QuestionReviewFailed(revised, (), (failure,))
         with mock.patch.object(review, "structured_call", side_effect=judge):
-            self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
-                             review.QuestionAccepted(draft))
+            for text, expected, calls in (
+                    (draft, review.QuestionAccepted(draft), 1),
+                    (revised, held, 2),
+                    (revised, held, 2)):
+                with self.subTest(text=text, calls=calls):
+                    self.assertEqual(review.review_question(key, text, runner=runner, console_kind="question"),
+                                     expected)
+                    self.assertEqual(len(requests), calls)
+
+            # Keep only the passing part verdicts to reproduce a file from before this change.
+            cache_path, = (review.state_path() / "question-verdicts").glob("*.json")
+            saved = cast(dict[str, object], json.loads(cache_path.read_text()))
+            parts_only = {fingerprint: record for fingerprint, record in saved.items()
+                          if record == {"questions": [], "failed_rules": []}}
+            _ = cache_path.write_text(json.dumps(parts_only))
             self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"),
-                             review.QuestionReviewFailed(revised, (), (failure,)))
-            self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"),
-                             review.QuestionReviewFailed(revised, (), (failure,)))
+                             held)
             self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
                              review.QuestionAccepted(draft))
         self.assertEqual([list(request["parts"]) for request in requests], [["1", "2", "3"], ["2"], [], ["2"]])
