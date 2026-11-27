@@ -69,7 +69,7 @@ from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import (
     console_tune, go_check, go_ledger, new_item_dialog, page_frame, page_question, question_record, record_table,
-    reply_tokens, review_link, review_submissions,
+    reply_tokens, review_events, review_link, review_submissions,
 )
 from scripts.review_links import (
     accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
@@ -6012,6 +6012,169 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertIn(b"<div data-review-card ", card.body)
             self.assertIn(b"Use the wide layout.", card.body)
             self.assertNotIn(b"<dialog data-list-review-dialog ", card.body)
+
+    def test_review_card_shows_only_the_unfiled_answer(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="layout-owner")
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = case.submission_request(kind, owner.id)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+        sent = cast(dict[str, str], json.loads(created.body))
+        key = sent["key"]
+        question = cache.get().records[key].source
+        assert isinstance(question, review_items.QuestionSource)
+        origin = review_items.submission_origin(cache.get().records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        older = "The old layout reply stays in Review."
+        older_reply = review_events.ReviewLog(datetime.now(timezone.utc) - timedelta(days=1), owner.id, "Answer: " + older)
+        record = question.record
+        log = review_events.decode(record.item.get("review_log", ""))
+        record = replace(record, item={**record.item, "review_log": review_events.encode((older_reply, *log))})
+        update_registration.write_question_record(record)
+
+        reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], request.request_id)
+        words = "Use the compact layout on narrow screens."
+        self.assertTrue(change_page.answer_item(reply, words, origin.reply_token, case.status))
+        snapshot = review_page.build_snapshot(case.root)
+        self.assertIn(key, {row["key"] for row in snapshot.entries})
+        handoff = snapshot.records[key].exchange_handoff
+        assert isinstance(handoff, review_items.FiledReviewExchange)
+        self.assertEqual(handoff.exchange_ids, {"followup:1"})
+        self.assertEqual(len(handoff.answer_events), 1)
+        page = list_page.render(case.root, include_counts=False)
+        log_html = page.partition(b'class="list-log-scroll"')[2].partition(b'</ol>')[0]
+        self.assertEqual(log_html.count(words.encode()), 1)
+        card = snapshot.body(key, view=review_page.ReviewBodyView.CARD)
+        self.assertIn(older.encode(), card)
+        self.assertFalse(words.encode() in card, "The Review card repeats the filed reply.")
+
+        followup = "Which layout works on wide screens?"
+        with capture_sender("send_to_staff"):
+            delivery, _ = review_page.submit(case.root, case.body(key, "question", followup), case.status)
+            assert isinstance(delivery, change_page.MessageDelivery)
+            change_page.deliver(delivery, case.status)
+        waiting = review_page.build_snapshot(case.root)
+        self.assertIs(waiting.records[key].state, review_items.ReviewState.WAITING)
+        card = waiting.body(key, view=review_page.ReviewBodyView.CARD)
+        self.assertIn(older.encode(), card)
+        self.assertIn(followup.encode(), card)
+        self.assertFalse(words.encode() in card, "The Waiting card repeats the filed reply.")
+
+    def test_review_answer_returns_to_the_linked_list_log_once(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="layout-owner")
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        item = the_list.add(keeper.id, "Select a layout", owner=owner.id, source="nate", changes={})
+        _ = the_list.park(keeper.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = case.submission_request(kind, owner.id)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+        sent = cast(dict[str, str], json.loads(created.body))
+        key = sent["key"]
+        _ = the_list.link(keeper.id, item.id, (key,), source="nate")
+        origin = review_items.submission_origin(cache.get().records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], request.request_id)
+        words = "Use the compact layout on narrow screens."
+
+        def fail_receipt(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            if path.suffix == ".saved":
+                raise OSError("Could not save the List receipt.")
+            atomic_file.write_text_atomic(path, text, new_file_mode=new_file_mode)
+
+        with patch.object(the_list, "write_text_atomic", side_effect=fail_receipt), redirect_stderr(StringIO()) as errors:
+            self.assertTrue(change_page.answer_item(reply, words, origin.reply_token, case.status))
+        self.assertIn("Could not save the List receipt.", errors.getvalue())
+        first, = the_list.records(keeper.id)
+        self.assertEqual(first.id, item.id)
+        exchange, = first.filed_exchanges
+        answer_id = the_list.ReturnedAnswerId(exchange.source_key, exchange.exchange_id)
+        saved_answer, = (entry for entry in first.log if isinstance(entry.what, the_list.ReturnedAnswer))
+        self.assertEqual((saved_answer.what, saved_answer.source), (the_list.ReturnedAnswer(answer_id, words), owner.id))
+
+        destination = investigation.ListDestination(keeper.id, item.number)
+        self.assertFalse(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)))
+        snapshot = review_page.build_snapshot(case.root)
+        self.assertNotIn(key, {row["key"] for row in snapshot.entries})
+        target = review_page.report_url(destination)
+        self.assertEqual(snapshot.filed_item_url(case.root, key), target)
+        page = list_page.render(case.root, include_counts=False, query="show=needs-me")
+        self.assertRegex(page, rb'<tbody data-list-item[^>]*data-unread-answer="true"[^>]*><tr')
+        self.assertIn(b'<small data-new-answer>New answer</small>', page)
+        log = page.partition(b'class="list-log-scroll"')[2].partition(b'</ol>')[0]
+        self.assertRegex(log, rb'<strong>Answer</strong>[^<]*<small>[^<]*<span[^>]*>layout-owner</span>')
+        self.assertEqual(log.count(words.encode()), 1)
+        self.assertEqual(page.count(words.encode()), 1)
+
+        self.assertFalse(change_page.answer_item(reply, words, origin.reply_token, case.status))
+        self.assertEqual(the_list.load(keeper.id, item.id), first)
+        self.assertEqual(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)), {exchange})
+        snapshot, _ = cache.publish_record(cache.get(), key)
+        self.assertEqual(snapshot.filed_item_url(case.root, key), target)
+
+        read = the_list.mark_read(keeper.id, item.id, source=the_list.PAGE_SOURCE)
+        self.assertFalse(change_page.answer_item(reply, words, origin.reply_token, case.status))
+        self.assertEqual(the_list.load(keeper.id, item.id), read)
+        self.assertEqual(the_list.unread_answer_ids(read), frozenset())
+        self.assertIs(read.parked_until, the_list.ParkUntilDelivered.DELIVERED)
+        page = list_page.render(case.root, include_counts=False)
+        row = page.partition(b'<tbody data-list-item')[2].partition(b'</tbody>')[0]
+        self.assertIn(b'data-unread-answer="false"', row)
+        self.assertNotIn(b'<small data-new-answer>New answer</small>', row)
+        self.assertEqual(row.count(words.encode()), 1)
+
+    def test_proposal_reply_retry_saves_the_missing_list_receipt(self) -> None:
+        case = self.review_fixture()
+        key, _ = case.decisions()
+        proposal = review_page.build_snapshot(case.root).records[key]
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        item = the_list.add(keeper.id, "Select the checks", owner=proposal.owner, source="nate", changes={})
+        _ = the_list.link(keeper.id, item.id, (key,), source="nate")
+        with capture_sender("send_to_staff"):
+            delivery, _ = review_page.submit(case.root, case.body(key, "question", "Which checks stay?"), case.status)
+            assert isinstance(delivery, change_page.MessageDelivery)
+            change_page.deliver(delivery, case.status)
+        question = case.status.slots(delivery.page, delivery.row).question
+        assert isinstance(question, change_page.OpenQuestion)
+        words = "Keep the layout checks."
+
+        def fail_receipt(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            if path.suffix == ".saved":
+                raise OSError("Could not save the List receipt.")
+            atomic_file.write_text_atomic(path, text, new_file_mode=new_file_mode)
+
+        with patch.object(the_list, "write_text_atomic", side_effect=fail_receipt), redirect_stderr(StringIO()) as errors:
+            self.assertTrue(change_page.answer_item(key, words, question.question_id, case.status))
+        self.assertIn("Could not save the List receipt.", errors.getvalue())
+        destination = investigation.ListDestination(keeper.id, item.number)
+        first = the_list.load(keeper.id, item.id)
+        exchange, = first.filed_exchanges
+        self.assertEqual(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)), frozenset())
+        answer, = (entry.what for entry in first.log if isinstance(entry.what, the_list.ReturnedAnswer))
+        self.assertEqual(answer.words, words)
+        snapshot = review_page.build_snapshot(case.root)
+        self.assertIn(key, {row["key"] for row in snapshot.entries})
+        self.assertFalse(snapshot.records[key].unread_answer)
+        self.assertNotIn(words.encode(), snapshot.body(key))
+
+        self.assertFalse(change_page.answer_item(key, words, question.question_id, case.status))
+        self.assertEqual(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)), {exchange})
+        self.assertEqual(the_list.load(keeper.id, item.id), first)
+        snapshot = review_page.build_snapshot(case.root)
+        self.assertFalse(snapshot.records[key].unread_answer)
+        self.assertNotIn(words.encode(), snapshot.body(key))
 
     def test_review_waits_for_directory_sync_and_list_commit_before_feature_closeout(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)

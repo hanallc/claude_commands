@@ -490,6 +490,9 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
     elif isinstance(content, the_list.QuestionAnswered):
         question = "Answer"
         body = " to question " + html.escape(content.question_id) + by
+    elif isinstance(content, the_list.ReturnedAnswer):
+        question = "Answer"
+        body = by + item_text_html(content.words, paragraphs=True)
     elif isinstance(content, the_list.QuestionClosed):
         question = "Question"
         body = (" " + html.escape(content.question.question_id) + " closed with the item" + by
@@ -536,7 +539,7 @@ class ItemLog(NamedTuple):
 
 
 def item_log(record: ListRecord, today: datetime, names: staff_names.StaffNames,
-             unread_answers: frozenset[str]) -> ItemLog:
+             unread_answers: frozenset[the_list.UnreadAnswerId]) -> ItemLog:
     item = record.item
     row_id = html.escape(record.key.replace("/", "-"), quote=True)
     answers = {question.question_id for question in item.questions if question.answer is not None}
@@ -840,7 +843,7 @@ def question_time_html(stamp: str, today: datetime) -> str:
     return time_html(datetime.fromisoformat(stamp), today)
 
 
-def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: frozenset[str],
+def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: frozenset[the_list.UnreadAnswerId],
                     failed: frozenset[str] = NO_FAILED_QUESTIONS) -> str:
     sections: list[str] = []
     for question in item.questions:
@@ -862,6 +865,7 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
 
 
 def filed_exchange_sections(item: the_list.ListItem, today: datetime, names: staff_names.StaffNames) -> str:
+    returned = {entry.what.identity for entry in item.log if isinstance(entry.what, the_list.ReturnedAnswer)}
     sections: list[str] = []
     for exchange in item.filed_exchanges:
         if exchange.source is list_exchange.Source.LIST:
@@ -873,7 +877,8 @@ def filed_exchange_sections(item: the_list.ListItem, today: datetime, names: sta
         if (answer is list_exchange.QuestionWithoutAnswer.OPEN
                 and exchange.direction is list_exchange.Direction.QUESTION_TO_NATE):
             body += '<p>' + review_card_link(exchange.source_key, "Answer question", studio_question=True) + '</p>'
-        if isinstance(answer, list_exchange.ExchangeAnswer):
+        if (isinstance(answer, list_exchange.ExchangeAnswer)
+                and the_list.ReturnedAnswerId(exchange.source_key, exchange.exchange_id) not in returned):
             actor = exchange.answerer
             answerer = html.escape(actor.name) if isinstance(actor, list_exchange.RecordedAnswerer) else names.html(actor, owner_name(names.members, staff.StaffId(actor)))
             answered = time_html(answer.time, today) if isinstance(answer.time, datetime) else ""
@@ -1043,6 +1048,8 @@ def log_link_text(content: the_list.LogContent) -> Iterable[tuple[str, str]]:
         yield "Feedback", content.words
     elif isinstance(content, the_list.QuestionClosed):
         yield "Question", content.question.words
+    elif isinstance(content, the_list.ReturnedAnswer):
+        yield "Answer", content.words
     elif isinstance(content, (the_list.AskOpened, the_list.GoGiven, the_list.GoNotDelivered)):
         yield "What", content.ask.what
         yield "Why", content.ask.why
@@ -1147,7 +1154,7 @@ def linked_items_html(entry: ListRecord, linked_records: Mapping[tuple[staff.Sta
 
 
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
-                 unread_answers: frozenset[str], progress: ListProgress, asks: str = "",
+                 unread_answers: frozenset[the_list.UnreadAnswerId], progress: ListProgress, asks: str = "",
                  *, schedule: DisplayedSchedule = the_list.NoSchedule.UNSET, linked_items: str = "") -> str:
     log = item_log(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
@@ -1256,7 +1263,7 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *,
 
 
 def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
-                    unread_answers: frozenset[str], secret: str,
+                    unread_answers: frozenset[the_list.UnreadAnswerId], secret: str,
                     reviews: ReviewDisplay, parking_label: str, mark: TopPriorityMark, progress: ListProgress,
                     *, linked_items: str) -> str:
     sections = (waiting_note(entry, names) + '<div data-waiting-questions>'
@@ -1270,7 +1277,7 @@ def waiting_details(entry: ListRecord, today: datetime, names: staff_names.Staff
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
             names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
-            unread_answers: frozenset[str], *, parking_label: str,
+            unread_answers: frozenset[the_list.UnreadAnswerId], *, parking_label: str,
             schedule: DisplayedSchedule, mark: TopPriorityMark, progress: ListProgress, linked_items: str = "") -> str:
     item = entry.item
     if item.state is the_list.ItemState.CLOSED:
@@ -1299,7 +1306,7 @@ def original_request_words(item: the_list.ListItem) -> str:
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
               reviews: ReviewDisplay, *, owner_cell: str, owner_sort: str, search_text: SearchText, parked: bool,
               open_question: bool, open_ask: bool, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
-              unread_answers: frozenset[str],
+              unread_answers: frozenset[the_list.UnreadAnswerId],
               schedule: DisplayedSchedule, mark: TopPriorityMark, hidden: bool = False, linked_items: str = "") -> str:
     item = entry.item
     producer = owner_name(names.members, item.producer)

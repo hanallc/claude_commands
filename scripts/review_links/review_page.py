@@ -1223,15 +1223,21 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     validator = owner if item.state == ReviewState.VALIDATING and isinstance(source, review_items.ChangeSource) else ''
     handoff = ''
     exchange = ''
+    filed = item.exchange_handoff
+    filed_followups: frozenset[int] = (filed.filed_followup_indices
+                                     if isinstance(filed, review_items.FiledReviewExchange) else frozenset())
     response = item.response
     if response is not None:
-        timestamp = ''
-        if response.answered_at is not None:
-            time = review_items.aware(response.answered_at, inputs.zone).astimezone(inputs.zone)
-            timestamp = f'<time datetime="{time.isoformat()}">{time:%b %d at %H:%M %Z}</time>'
-        body = (section('You asked', response.question)
-                +'<section class="response-answer"><h3>Answer from '
-                +names.html(item.owner, owner)+'</h3>'+timestamp+change_browser.answer_html(response.answer)+'</section>')
+        body = section('You asked', response.question)
+        hides_answer = (isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource))
+                        and len(source.record.item.get('followups', ())) - 1 in filed_followups)
+        if not hides_answer:
+            timestamp = ''
+            if response.answered_at is not None:
+                time = review_items.aware(response.answered_at, inputs.zone).astimezone(inputs.zone)
+                timestamp = f'<time datetime="{time.isoformat()}">{time:%b %d at %H:%M %Z}</time>'
+            body += ('<section class="response-answer"><h3>Answer from '
+                     +names.html(item.owner, owner)+'</h3>'+timestamp+change_browser.answer_html(response.answer)+'</section>')
     elif isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
         question = source.record.item
         ask = question['parts']['ask'] if 'parts' in question else change_browser.question_text(question)[0]
@@ -1239,6 +1245,9 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
         body_question = question.copy()
         if 'parts' in question:
             body_question['text'] = ask
+        if filed_followups:
+            body_question['followups'] = [pair for index, pair in enumerate(question.get('followups', ()))
+                                          if index not in filed_followups]
         content, choices = change_browser.question_parts(body_question)
         lead = change_page.review_text_html(ask, inline=True)
         body = '<section><h3>Question</h3>'+lead+content+choices+'</section>'
@@ -1298,7 +1307,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     body += inputs.assets.get('question-delivery:'+item.key, '')
     body += inputs.assets.get('submission:'+item.key, '')
     log_id = html.escape('review-log-'+item.key.replace('/', '-'), quote=True)
-    if isinstance(filed := item.exchange_handoff, review_items.FiledReviewExchange):
+    if isinstance(filed, review_items.FiledReviewExchange):
         body += f'<p><a href="{report_url(filed.destination)}">Open answer on List item {filed.destination.number}</a></p>'
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div>'
             +'<div class="review-log-column">'+record_table.log_panel(log_id, log_html(item, inputs, owner))+exchange+'</div>'

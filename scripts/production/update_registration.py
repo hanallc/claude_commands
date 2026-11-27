@@ -1173,12 +1173,20 @@ def find_review_question_in_folder(folder: QuestionFolder,
     return None
 
 
-def read_review_question(path: Path, owner: str = "") -> QuestionRecord:
-    """Read one sent question at its native path."""
+def read_question_record(path: Path, owner: str = "") -> QuestionRecord:
+    """Read one question at its native path."""
     records = _question_records([Issue(path, record_store.read_header(path, strict=True))], legacy_owner=owner)
-    if len(records) != 1 or "review_submission" not in records[0].item:
+    if len(records) != 1:
         raise OSError(f"Cannot read a saved question at {path}.")
     return records[0]
+
+
+def read_review_question(path: Path, owner: str = "") -> QuestionRecord:
+    """Read one sent question at its native path."""
+    record = read_question_record(path, owner)
+    if "review_submission" not in record.item:
+        raise OSError(f"Cannot read a saved question at {path}.")
+    return record
 
 
 def selected_question_records(paths: list[Path], statuses: tuple[str, ...], owner_ids: set[staff.StaffId] | None,
