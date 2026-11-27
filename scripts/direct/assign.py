@@ -981,7 +981,7 @@ def execute_durable(args: Arguments) -> int:
     target = worker_panes.DurableDesignRole(staff.StaffId(args.parent), name, role)
     policy = pane_policy(args.policy, model=args.model, effort=args.effort)
     if not args.prompt:
-        current = launch(target, policy)
+        current = launch(target, policy, phase=args.phase or None)
         if not isinstance(current, worker_panes.OpenWorker):
             return staff_worker.startup_result(name, current)
         print(json.dumps(current.row.to_json()))
