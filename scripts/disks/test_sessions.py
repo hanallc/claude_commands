@@ -48,7 +48,7 @@ class ReadSessionsTests(unittest.TestCase):
             def state(session_id: str) -> State:
                 return states.get(session_id, "unknown")
 
-            report = sessions.read_sessions(root, data, holds, mounts, state)
+            report = sessions.read_sessions(root, session_folder.session_folders(root), data, holds, mounts, state)
         self.assertEqual(report["root"], str(root))
         self.assertEqual([(row["name"], row["size"], row["state"]) for row in report["sessions"]],
                          [("fps", 28 * GIB, "running"), ("lfo", 7 * GIB, "ended"), ("bare", 0, "unknown"),
@@ -63,20 +63,14 @@ class ReadSessionsTests(unittest.TestCase):
             for name in ("fps", "lfo"):
                 (root / name).mkdir()
                 session_folder.write_record(root / name, {"owner": name, "session_id": name + "-id"})
-            with (mock.patch.object(session_folder, "session_root", return_value=root),
-                  mock.patch.object(measure, "read_data", return_value=None),
+            with (mock.patch.object(measure, "read_data", return_value=None),
                   mock.patch.object(scratch, "holds", return_value={}),
                   mock.patch.object(session_records, "read_registry",
                                     return_value=session_records.RegistryRead((), ())) as registry):
-                report = sessions.session_report()
+                report = sessions.session_report(root, session_folder.session_folders(root))
         self.assertEqual(registry.call_count, 1)
-        self.assertEqual([(row["name"], row["state"]) for row in report["sessions"]] if report else None,
+        self.assertEqual([(row["name"], row["state"]) for row in report["sessions"]],
                          [("fps", "ended"), ("lfo", "ended")])
-
-    def test_no_session_root_gives_no_report(self) -> None:
-        with mock.patch.object(session_folder, "session_root", return_value=None):
-            self.assertIsNone(sessions.session_report())
-
 
 if __name__ == "__main__":
     _ = unittest.main()
