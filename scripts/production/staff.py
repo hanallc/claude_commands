@@ -1156,17 +1156,8 @@ def wait_for_upkeep_row(row: StaffRow, deadline: float) -> None:
 
 
 @contextmanager
-def session_operation(session: str, *, native_key: str, join_recovery: bool = False) -> Generator[StaffSnapshot]:
+def session_operation(session: str, *, native_key: str) -> Generator[StaffSnapshot]:
     """Lock the native session before its staff row, if it has one."""
-    if join_recovery:
-        if not _joined_operation(*_row_lock(native_key)):
-            raise StaffRefused("recovery did not pass the native session lock")
-        record = initial_snapshot()
-        row = record.by_current_session(session)
-        if row is None or not _joined_operation(*_row_lock(row.id)):
-            raise StaffRefused("recovery did not pass the staff row lock")
-        yield record
-        return
     with slot_operation(native_key, session, join=False), ExitStack() as locks:
         record = initial_snapshot()
         row = record.by_current_session(session)
@@ -2077,7 +2068,7 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
             doc = _document_for_owner(rows, native_id(runtime_id), doc)
     if existing is not None:
         if isinstance(existing.retirement, RetiredProducer):
-            raise StaffRefused(f"{name}: retired; use agents resume {name} --retired")
+            raise StaffRefused(f"{name}: producer is retired")
         if unit_type is not None and existing.unit_type != UnitDetails(unit_type):
             raise StaffRefused(f"{existing.id}: existing unit_type conflicts with admission")
         if not isinstance(worktree, WorktreeUnfilled) and not isinstance(existing.worktree, WorktreeUnfilled) and existing.worktree != worktree:
@@ -2344,27 +2335,6 @@ def publish_native_ids(expected: StaffSnapshot, identities: Mapping[StaffId, Sta
         pending.update(retired)
         return StaffSnapshot(tuple(sorted(rows, key=lambda row: row.id)),
                              tuple(sorted(pending)))
-    return _record_transaction(edit)
-
-
-def restore_unit(staff_id: StaffId, worktree: PresentWorktree) -> StaffRow:
-    """Reactivate the retained unit in place, preserving its identity and parent."""
-    if not is_owner():
-        return _remote_row(["restore-unit", staff_id, "--machine", worktree.machine, "--path", str(worktree.path)])
-
-    def edit(rows: list[StaffRow], pending: set[StaffId]) -> StaffRow:
-        existing = _required(rows, staff_id)
-        if existing.kind != "unit":
-            raise StaffRefused("restore-unit requires a unit")
-        if isinstance(existing.worktree, WorktreeUnfilled):
-            raise StaffRefused(f"{existing.name}: staff worktree is unfilled")
-        if (existing.worktree.machine, existing.worktree.path) != (worktree.machine, worktree.path):
-            raise StaffRefused(f"{existing.name}: restore worktree conflicts with retained location")
-        pending.discard(staff_id)
-        restored = replace(existing, worktree=_keep_location_fields(worktree, existing.worktree))
-        rows[rows.index(existing)] = restored
-        return restored
-
     return _record_transaction(edit)
 
 
@@ -2669,6 +2639,37 @@ def retire(staff_id: StaffId) -> StaffRow | None:
     if removed is not None:
         _forget_restart([staff_id])
     return removed
+
+
+def remove_retired_unit(expected: StaffRow) -> None:
+    """Remove a retired unit and its stopped workers in one staff write."""
+    if expected.kind != "unit" or not isinstance(expected.worktree, RemovedWorktree):
+        raise StaffRefused(f"{expected.name}: removal requires a retired unit")
+    if not is_owner():
+        _ = _remote(["remove-retired-unit"], input_text=json.dumps(expected.to_json()))
+        return
+
+    with slot_operation(expected.id, expected.name), ExitStack() as locks:
+        record = authority_snapshot()
+        unit = _required(list(record.rows), expected.id)
+        if unit.to_json() != expected.to_json():
+            raise StaffRefused(f"{expected.name}: the unit changed before removal")
+        workers = record.find(kind="worker", parent=unit.id)
+        for worker in workers:
+            _ = locks.enter_context(slot_operation(worker.id, worker.name))
+        members = {member.id: member.to_json() for member in (unit, *workers)}
+        for identity in members:
+            require_stopped(identity)
+
+        def edit(rows: list[StaffRow], pending: set[StaffId]) -> None:
+            current = {row.id: row.to_json() for row in rows if row.id == unit.id or row.reports_to(unit.id)}
+            if current != members:
+                raise StaffRefused(f"{unit.name}: the unit or its workers changed before removal")
+            rows[:] = [row for row in rows if row.id not in members]
+            pending.difference_update(members)
+
+        _record_transaction(edit)
+    _forget_restart(list(members))
 
 
 def _forget_restart(staff_ids: list[StaffId]) -> None:
@@ -3039,10 +3040,6 @@ def _parser() -> argparse.ArgumentParser:
         _ = director.add_argument("--json", action="store_true")
         if command == "demote-showrunner":
             _ = director.add_argument("--unit-type", choices=UNIT_TYPES, default="direct")
-    restore_parser = verbs.add_parser("restore-unit", help=argparse.SUPPRESS)
-    _ = restore_parser.add_argument("target")
-    _ = restore_parser.add_argument("--machine", required=True)
-    _ = restore_parser.add_argument("--path", required=True)
     rename_parser = verbs.add_parser("rename", help=argparse.SUPPRESS)
     _ = rename_parser.add_argument("target")
     _ = rename_parser.add_argument("--name", required=True)
@@ -3054,6 +3051,8 @@ def _parser() -> argparse.ArgumentParser:
     _ = retire_parser.add_argument("target")
     _ = retire_parser.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
     _ = retire_parser.add_argument("--worker-row", action="store_true", help=argparse.SUPPRESS)
+    retired_unit_parser = verbs.add_parser("remove-retired-unit", help=argparse.SUPPRESS)
+    _ = retired_unit_parser.add_argument("--json", action="store_true")
     apply_parser = verbs.add_parser("apply-seed", help=argparse.SUPPRESS)
     defer_parser = verbs.add_parser("defer-retire", help=argparse.SUPPRESS)
     _ = defer_parser.add_argument("ids", nargs="*")
@@ -3079,7 +3078,7 @@ def _parser() -> argparse.ArgumentParser:
             if command == "verify-doc-change":
                 _ = location_parser.add_argument("--conditional", action="store_true")
         location_parsers.append(location_parser)
-    for verb in (*location_parsers, show, get, add, restore_parser, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
+    for verb in (*location_parsers, show, get, add, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
         _ = verb.add_argument("--json", action="store_true")
     return parser
 
@@ -3161,6 +3160,8 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         return defer_retire(tuple(StaffId(value) for value in arguments.ids))
     if arguments.verb == "retire-pending":
         return retire_pending()
+    if arguments.verb == "remove-retired-unit":
+        return remove_retired_unit(StaffRow.from_json(_decode(seed_text)))
     if arguments.verb == "ensure":
         assert arguments.kind is not None
         # The record decoder owns the location JSON boundary and wrong-kind checks.
@@ -3180,8 +3181,6 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         assert arguments.parent is not None
         return change_director(StaffId(arguments.target), UnitRole(arguments.name, StaffId(arguments.parent),
                                PresentWorktree(arguments.machine, Path(arguments.path)), arguments.unit_type or "direct"))
-    if arguments.verb == "restore-unit":
-        return restore_unit(StaffId(arguments.target), PresentWorktree(arguments.machine, Path(arguments.path)))
     if arguments.verb == "rename":
         return rename(StaffId(arguments.target), arguments.name)
     if arguments.verb == "move":
@@ -3278,7 +3277,7 @@ def _main(arguments: _Arguments) -> int:
     if arguments.row_write and not (arguments.verb in ("retire", "ensure-worker", "update-current-session") or
                                     arguments.verb == "ensure" and arguments.kind == "worker"):
         raise StaffRefused("row writes are for worker admission and retirement")
-    seed_text = sys.stdin.read() if arguments.verb == "apply-seed" else ""
+    seed_text = sys.stdin.read() if arguments.verb in ("apply-seed", "remove-retired-unit") else ""
     with operation() if is_owner() and not arguments.row_write and arguments.verb not in ("set-worker-role", "set-home", "set-run", "clear-run", "transfer-producer") else nullcontext():
         result = _mutate(arguments, seed_text)
     if isinstance(result, tuple):

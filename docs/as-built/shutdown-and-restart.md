@@ -541,7 +541,7 @@ The command removes the producer key after a final read confirms that no open Li
 The staff row keeps the profile in `retired_producer`.
 Active staff lookups omit retired producers.
 The fixed-id lookup supplies their names for closed List items.
-`agents resume NAME --retired` restores the profile, clears the mark and resumes the same conversation.
+`agents resume NAME` refuses a retired producer.
 
 ### First start
 
@@ -965,7 +965,7 @@ Upkeep, account moves, watchdog recovery, and named resume share this removal.
 Named resume also removes a row after a successful continuation message.
 Retired recovery removes a row after it proves the resumed native session.
 These removals and restart cleanup occur before the row locks release.
-Native resume, continuation messages, restart, retired recovery, and pruning use `shutdown_record.remove_started`.
+Native resume, continuation messages, restart, and pruning use `shutdown_record.remove_started`.
 A failed start adds the row to the list.
 A refused row lock changes no saved row.
 `--only` leaves other saved rows on the list.
@@ -983,7 +983,7 @@ The record holds only rows that a restart starts:
 - `restart` removes a saved id with no staff row or a saved worker that `worker.not_restored` names.
 - The report names the removed entry and gives the reason.
 - `restart --dry-run` prints the same line with `would leave the restart record` and changes nothing.
-- `staff.retire`, a worker pane close in `worker_panes.close`, and the Codex worker stop in `worker_capacity.py` remove the id with `shutdown_record.forget`.
+- Staff removal, `worker_panes.close`, and the Codex worker stop in `worker_capacity.py` remove IDs with `shutdown_record.forget`.
 - An id stays only after a failure that a retry can fix, such as an unreadable dispatch record.
 `shutdown_record.update` holds the record lock for each change.
 Unscoped `held-sessions` prunes confirmed live entries after a complete liveness read.

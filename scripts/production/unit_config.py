@@ -574,27 +574,3 @@ def park(unit: StaffId, worktree: Path, retired: RetiredSession) -> Published | 
             if saved.retired != retired:
                 raise ConfigRefused(f"{source_path} and {saved_path}: retired differs; no file was changed")
         return write_parked(unit, desired)
-
-
-def restore(unit: StaffId, worktree: Path) -> None:
-    """Restore the live configuration and keep retirement facts until launch succeeds."""
-    with writer_lock():
-        live_path, saved_path = worktree / ".unit.toml", parked_path(unit)
-        saved, live = _read_file(saved_path), _read_file(live_path)
-        if isinstance(saved, ConfigMissing):
-            if isinstance(live, UnitConfig):
-                git_exclude.require_untracked_ignored(worktree, ".unit.toml")
-                return
-            raise ConfigRefused(saved.reason)
-        if isinstance(live, UnitConfig):
-            _check_pair(live_path, saved_path, live, saved)
-        _ = write(worktree, replace(saved, retired=NoRetiredSession()))
-
-
-def discard_parked(unit: StaffId) -> None:
-    """Remove the retained facts only after the caller has proved the resumed launch."""
-    with writer_lock():
-        path = parked_path(unit)
-        if path.exists():
-            path.unlink()
-            atomic_file.sync_folder(path.parent)

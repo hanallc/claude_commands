@@ -1,6 +1,6 @@
 ---
 description: Show, pause, exit, retire, rename, move, resume, stop, restart, or reboot sessions.
-argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME [--keep-workers] --why TEXT | pause --production SHOWRUNNER [--except UNIT ...] [--keep-workers] --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | reboot [--dry-run] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION | transfer NAME [--model MODEL --effort EFFORT]'
+argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME [--keep-workers] --why TEXT | pause --production SHOWRUNNER [--except UNIT ...] [--keep-workers] --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--why TEXT] [--to ACCOUNT] | reboot [--dry-run] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION | transfer NAME [--model MODEL --effort EFFORT]'
 ---
 
 Use the `agents` program.
@@ -17,13 +17,13 @@ Use the `agents` program.
   For a Codex director, the command refuses `--keep-workers` and offers the default pause.
   A production pause reports each refusal and pauses the other selected directors.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
-- `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
+- `agents resume NAME [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
 - `agents clone NAME --as NEW`: fork a live Claude or Codex session beside its source tab.
 - Use `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]` to rename a staff member.
 - `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]`: move Claude sessions to a numbered account.
-- `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
-- `agents resume NAME --retired`: restore a retired unit and its retained workers.
-- Before running `--retired`, ask the user yes or no. Run it only after yes.
+- Use `agents retire NAME` to retire an active unit and keep its staff record.
+- Use `agents retire NAME` on a retired unit to remove its staff record and its worker records.
+  The command keeps the records if the local branch or the branch on the fetch origin has unmerged work or cannot be read.
 - Run `agents reboot [--dry-run]` from a terminal outside Herdr. See Reboot below.
 - `agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]`: restore saved rows or restart local live rows with `--all`.
 - `agents stop SESSION [--dry-run]`: stop the session and its workers. Keep their rows, conversations, and panes at the shell.
@@ -101,7 +101,6 @@ The command stops the conversation and closes its tab before it moves open List 
 Open List items move to the selected producer, or to morty by default.
 Use `--to` only with a producer whose conversation is live.
 The command retains the conversation and document folder.
-Use `agents resume NAME --retired` to restore the profile and conversation.
 You cannot rename or retire morty.
 
 Pause and exit record the time, caller, and reason. The board shows `paused` or `exited`.
@@ -115,7 +114,7 @@ Codex uses the `workers` account. Claude units, showrunners, and producers use t
 Other Claude sessions use the units account; `--to ACCOUNT` overrides the account.
 The default reason is `resumed by name`.
 Retired units do not appear in active status or the board.
-Resume without `--retired` refuses a retired unit.
+Resume refuses a retired unit and gives the command to remove its record.
 When resume selects a running conversation, it prints `unchanged` and returns status 0.
 A closed tab uses the existing restore path.
 An empty current pane can resume its own saved session.
@@ -123,7 +122,7 @@ Resume restores retained workers with their native conversations.
 In no-worker mode, resume brings back the director alone and keeps every Codex worker stopped.
 The director's resume message then carries the no-worker notice and no worker lines.
 Resume of a Codex worker row is refused in no-worker mode.
-The short form `resume NAME [--retired] [--why TEXT] [--to ACCOUNT]` stays available from any directory.
+The short form `resume NAME [--why TEXT] [--to ACCOUNT]` stays available from any directory.
 
 Use a staff id, a staff path, or a unique name for rename.
 A bare name first selects the calling showrunner or unit and its direct children.

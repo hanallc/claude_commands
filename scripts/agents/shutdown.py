@@ -21,7 +21,7 @@ def _usage() -> str:
   agents pause NAME [--finish-step] [--keep-workers] --why TEXT
   agents exit NAME [--finish-step] --why TEXT
   agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] [--keep-workers] --why TEXT
-  agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
+  agents resume NAME [--why TEXT] [--to ACCOUNT]
   agents resume PRODUCER --resend-opening-prompt
   agents resume --production SHOWRUNNER
   agents clone NAME --as NEW
@@ -45,6 +45,7 @@ if __name__ == "__main__" and sys.argv[1:2] == ["status"]:
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -58,7 +59,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, NamedTuple, NotRequired, cast
 
-from scripts.accounts import accounts, moves
+from scripts.accounts import accounts
 from scripts.build_hold import override_guard
 from scripts.herdr import herdr_types
 from scripts.agents import set_model
@@ -66,7 +67,7 @@ from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.herdr import herdr, pane_launch, worker_panes
-from scripts.lib import process_group, process_start, conf, berth_board, git_exclude, git_files, git_merge_tree, session_move, unit_runs, build_folders, waiting_rows
+from scripts.lib import process_group, process_start, conf, berth_board, git_exclude, git_files, git_merge_tree, session_move, unit_runs, waiting_rows
 from scripts.lib.file_lock import exclusive
 from scripts.lib.conf import UseConfiguredValue
 from scripts.message import sessions, session_send, send_budget, send_result
@@ -74,12 +75,9 @@ from scripts.production import (
     staff,
     staff_sources,
     unit_config,
-    unit_lookup,
     unit_move,
-    completion_receipt,
     production_admission,
     worker,
-    add_unit,
     unit_names,
 )
 from scripts.production.production_doc import (
@@ -132,7 +130,6 @@ class CommandLine(argparse.Namespace):
     excluded: list[str] = []
     finish_step: bool = False
     keep_workers: bool = False
-    retired: bool = False
     resend_opening_prompt: bool = False
     old: str = ""
     new: str = ""
@@ -648,7 +645,7 @@ def _lifecycle(options: CommandLine) -> int:
                     continue
                 row = current
                 if isinstance(row.worktree, staff.RemovedWorktree):
-                    print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
+                    print(f"{row.name} is retired. Use agents retire {row.name} to remove the record.", file=sys.stderr)
                     code = 2
                     continue
                 if isinstance(row.resume_pending, staff.ResumePending):
@@ -789,7 +786,6 @@ def main(argv: list[str] | None = None) -> int:
         _ = selection.add_argument("--production", default="")
         if verb == "resume":
             _ = command.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
-            _ = command.add_argument("--retired", action="store_true")
             _ = command.add_argument("--resend-opening-prompt", action="store_true")
             _ = command.add_argument("--to")
             _ = command.add_argument("--why", default="resumed by name")
@@ -849,7 +845,7 @@ def main(argv: list[str] | None = None) -> int:
 
             return clone_session.run(options.session, options.new)
         if options.command == "resume" and options.resend_opening_prompt:
-            if options.production or options.retired:
+            if options.production:
                 raise ValueError("--resend-opening-prompt needs one producer name and an active pane")
             return _result_code(stop_resume.resend_producer_opening(options.session, to=options.to or ""))
         if options.command == "remove-stray":
@@ -935,12 +931,6 @@ def main(argv: list[str] | None = None) -> int:
             if options.to:
                 raise ValueError("--to is only for producer retirement")
             return retire_named_unit(options.session)
-        if options.command == "resume" and options.retired:
-            if producer_lifecycle.lookup(options.session, staff.initial_snapshot()) is not None:
-                return _result_code(producer_lifecycle.restore(options.session, to=options.to, why=options.why))
-            recovery_account = (accounts.NamedAccount(options.to, accounts.account_dir(options.to))
-                                if options.to else accounts.CURRENT_ACCOUNT_SETTINGS)
-            return recover_named_unit(options.session, account=recovery_account)
         if options.command in ("pause", "exit", "resume"):
             return _lifecycle(options)
         record = staff.initial_snapshot()
@@ -1322,9 +1312,12 @@ def retirement_find_unit(production_name: str, given: str, *,
     location = member.worktree
     if isinstance(location, staff.WorktreeUnfilled):
         raise ValueError(f"{member.name}: staff worktree is unfilled")
-    branch = location.branch.value if isinstance(location, staff.RemovedWorktree) and isinstance(location.branch, staff.ParkedBranch) else ""
-    if unit_machine_is_local(location.machine) and location.path.is_dir():
-        branch = retirement_branch(location.path) or branch
+    branch = ""
+    if isinstance(location, staff.RemovedWorktree):
+        if isinstance(location.branch, staff.ParkedBranch):
+            branch = location.branch.value
+    elif unit_machine_is_local(location.machine) and location.path.is_dir():
+        branch = retirement_branch(location.path)
     return RetiringUnit(production, member.name, location.path, branch, member)
 
 def retirement_last_session(unit: RetiringUnit) -> str:
@@ -1347,6 +1340,99 @@ def retirement_branch_commits(unit: RetiringUnit, branch: str, *, settings: conf
             raise OSError(retirement_failure(fetched))
         commits.append(remote.stdout.split()[0])
     return commits
+
+
+@dataclass(frozen=True)
+class RetirementBranchTips:
+    commits: dict[str, str]
+    unreadable: dict[str, str]
+
+
+def retired_branch_tips(run: git_merge_tree.GitRunner, branch: str) -> RetirementBranchTips:
+    """Read exact local and origin tips without updating Git refs."""
+    ref = f"refs/heads/{branch}"
+    if run("check-ref-format", ref).returncode:
+        raise ValueError(f"invalid branch name {branch!r}")
+    commits: dict[str, str] = {}
+    unreadable: dict[str, str] = {}
+    try:
+        local = run("show-ref", "--exists", ref)
+        if local.returncode != 2:
+            if local.returncode:
+                raise OSError(retirement_failure(local))
+            commit = run("rev-parse", "--verify", f"{ref}^{{commit}}")
+            if commit.returncode:
+                raise OSError(retirement_failure(commit))
+            commits["local"] = commit.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        unreadable["local"] = str(error)
+    try:
+        origin = run("ls-remote", "--exit-code", "--heads", "origin", ref)
+        if origin.returncode != 2:
+            if origin.returncode:
+                raise OSError(retirement_failure(origin))
+            advertised = [line.partition("\t")[0] for line in origin.stdout.splitlines()
+                          if line.partition("\t")[2] == ref]
+            if len(advertised) > 1:
+                raise ValueError(f"origin advertised {ref} more than once")
+            if advertised:
+                tip = advertised[0]
+                if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tip):
+                    raise ValueError(f"origin advertised an invalid commit for {ref}")
+                commit = run("cat-file", "-t", tip)
+                if commit.returncode:
+                    fetched = run("fetch", "--no-tags", "--no-prune", "--no-write-fetch-head",
+                                  "--no-recurse-submodules", "--no-auto-maintenance", "--refmap=", "-q", "origin", tip)
+                    # Git can store the object before a corrupt local ref makes fetch fail.
+                    commit = run("cat-file", "-t", tip)
+                    if commit.returncode and fetched.returncode:
+                        raise OSError(retirement_failure(fetched))
+                if commit.returncode or commit.stdout.strip() != "commit":
+                    raise OSError(f"{tip} is not a readable commit")
+                commits["origin"] = tip
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        unreadable["origin"] = str(error)
+    return RetirementBranchTips(commits, unreadable)
+
+
+def retired_tip_is_merged(run: git_merge_tree.GitRunner, tip: str, target: str) -> bool:
+    ancestor = run("merge-base", "--is-ancestor", tip, target)
+    if ancestor.returncode not in (0, 1):
+        raise OSError(retirement_failure(ancestor))
+    return ancestor.returncode == 0 or git_merge_tree.leaves_target_unchanged(run, tip, target)
+
+
+def retired_branch_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
+    if not unit.branch:
+        return [f"{unit.name}: the retired record has no branch"]
+    run = partial(retirement_git, unit, settings=settings)
+    tips = retired_branch_tips(run, unit.branch)
+    unreadable = [f"cannot read {source} branch {unit.branch}: {reason}"
+                  for source, reason in tips.unreadable.items()]
+    if tips.commits:
+        target = unit.production.merge_branch
+        targets = retired_branch_tips(run, target)
+        if not targets.commits:
+            reasons = ", ".join(f"{source}: {reason}" for source, reason in targets.unreadable.items())
+            return [*unreadable, f"cannot check branch {unit.branch} against {target}: {reasons or 'merge branch is absent'}"]
+        for source, tip in tips.commits.items():
+            errors: list[str] = []
+            for target_tip in dict.fromkeys(targets.commits.values()):
+                try:
+                    if retired_tip_is_merged(run, tip, target_tip):
+                        break
+                except (OSError, subprocess.SubprocessError) as error:
+                    errors.append(str(error))
+            else:
+                if not errors:
+                    return [f"unmerged commits on {unit.branch} ({source})"]
+                unreadable.append(f"cannot check {source} branch {unit.branch}: {errors[0]}")
+    if unreadable:
+        return unreadable
+    if (rebasing := retirement_rebase(unit, settings=settings)) is not None:
+        return [f"branch {unit.branch} is rebasing in {rebasing}"]
+    return []
+
 
 def retirement_rebase(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Path | None:
     """Find a checkout that is rebasing the unit branch."""
@@ -1823,11 +1909,15 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
     row = unit.staff_member
     if isinstance(row.worktree, staff.WorktreeUnfilled):
         raise ValueError(f"{row.id}: staff worktree is unfilled")
+    if isinstance(row.worktree, staff.RemovedWorktree):
+        refused = retired_branch_refusals(unit, settings=settings)
+        if refused:
+            print("\n".join(f"refused: {reason}" for reason in refused))
+            return 1
+        staff.remove_retired_unit(row)
+        print(f"{unit.name}: retired record removed")
+        return 0
     if not unit_machine_is_local(row.worktree.machine):
-        if isinstance(row.worktree, staff.RemovedWorktree):
-            _ = unit_remote_command("retire-complete", row, record)
-            print("unchanged")
-            return 0
         outcome = unit_remote_command("retire", row, record, merge_branch=unit.production.merge_branch, zone=unit.production.zone.key)
         if outcome["code"]:
             return outcome["code"]
@@ -1840,23 +1930,6 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
         print(f"{unit.name} retired")
         return 0
     pane = retirement_pane(row, record)
-    if isinstance(row.worktree, staff.RemovedWorktree) and not unit.worktree.exists():
-        if unit.branch:
-            refused = retirement_refusals(unit, settings=settings, check_absent_branch=True)
-            if refused:
-                print("\n".join(f"refused: {reason}" for reason in refused))
-                return 1
-            failed = retirement_remove(unit, settings=settings)
-            if failed:
-                print("\n".join(f"anomaly: {reason}" for reason in failed))
-                return 1
-        try:
-            copies.remove_trees(str(row.id))
-        except copies.CopyError as error:
-            print(f"anomaly: {error}".replace("\n", " "))
-        print("unchanged")
-        retirement_close_idle_shell(pane, row, record)
-        return 0
     refused = retirement_refusals(unit, settings=settings)
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
@@ -1881,177 +1954,6 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
     print(f"{unit.name} retired")
     retirement_close_idle_shell(pane, row, record)
     return 0
-
-ADD_UNIT = SCRIPTS / "production" / "add_unit.py"
-
-class RecoveryRefused(Exception):
-    pass
-
-class RecoveryFactsMissing(RecoveryRefused):
-    """The configuration must be filled before preview or apply."""
-
-@dataclass(frozen=True)
-class NoRecoveryRequired:
-    production: Production
-    name: str
-
-@dataclass(frozen=True)
-class RetiredUnitRecovery:
-    production: Production
-    name: str
-    worktree: Path
-    branch: str
-    plan: unit_config.PlanFile | unit_config.StandbyPlan | unit_config.PermanentPlan
-    session_id: str
-    account: accounts.NamedAccount | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS
-
-    def __post_init__(self) -> None:
-        if not self.session_id.strip():
-            raise RecoveryRefused(f"{self.name}: recovery requires a session id")
-
-def recovery_find_unit(production_name: str, given: str, *, record: staff.StaffSnapshot | None = None) -> RetiredUnitRecovery | NoRecoveryRequired:
-    record = staff.initial_snapshot() if record is None else record
-    production = retirement_production_of(production_name, record=record)
-    row = record.by_id(staff.StaffId(given))
-    member = (staff_sources.MemberFound(row) if row is not None and row.kind == "unit" else
-              staff_sources.member(staff_sources.UnitMember(production.name, given), record))
-    name = member.row.name if isinstance(member, staff_sources.MemberFound) else given
-    if isinstance(member, staff_sources.NoSuchMember):
-        raise RecoveryRefused(f"{name}: no staff row")
-    location = member.row.worktree
-    if isinstance(location, staff.WorktreeUnfilled):
-        raise RecoveryRefused(f"{name}: staff worktree is unfilled")
-    if location.machine != remote.local_machine():
-        raise RecoveryRefused(f"{name}: staff worktree belongs to {location.machine}; run resume there")
-    worktree = location.path
-    saved = unit_config.read_parked(member.row.id, cleanup=False)
-    current = unit_config.read(worktree, cleanup=False)
-    if isinstance(saved, unit_config.ConfigMissing) and isinstance(current, unit_config.ConfigMissing):
-        raise RecoveryFactsMissing(f"{name}: no .unit.toml in {worktree} or {unit_config.parked_path(member.row.id)}; "
-                               + "ask the showrunner")
-    if isinstance(saved, unit_config.ConfigMissing):
-        if isinstance(location, staff.RemovedWorktree) or not isinstance(current, unit_config.UnitConfig):
-            raise RecoveryRefused(f"{name}: parked retirement facts are missing")
-        return NoRecoveryRequired(production, name)
-    pair = unit_config.place(member.row.id, worktree, cleanup=False)
-    if isinstance(pair, unit_config.Both) and not pair.same:
-        raise RecoveryRefused(f"{pair.worktree} and {pair.parked}: configurations differ; no file was changed")
-    branch = (location.branch.value if isinstance(location, staff.RemovedWorktree)
-              and isinstance(location.branch, staff.ParkedBranch) else member.row.name)
-    return RetiredUnitRecovery(production, name, worktree, branch, saved.plan, member.row.current_session)
-
-def recovery_resume_record(production: Production, name: str) -> Path:
-    try:
-        return git_files.locate(production.checkout).git_dir / "resume-units" / name
-    except git_files.GitFilesError as error:
-        raise RecoveryRefused(f"cannot find the resume record: {error}") from error
-
-def recovery_git(unit: RetiredUnitRecovery, *arguments: str) -> str:
-    result = retirement_run(["git", "-C", str(unit.production.checkout), *arguments])
-    return result.stdout.strip() if result.returncode == 0 else ""
-
-def recovery_has_worktree(unit: RetiredUnitRecovery) -> bool:
-    """Whether the worktree path holds the unit's worktree on its branch."""
-    return ((unit.worktree / ".git").is_file()
-            and retirement_branch(unit.worktree) == unit.branch)
-
-def recovery_has_transcript(unit: RetiredUnitRecovery) -> bool:
-    return bool(sessions.transcript_locations(unit.session_id))
-
-def recovery_is_running(unit: RetiredUnitRecovery) -> bool:
-    """Whether the unit's mark is on a live Claude that is the session it resumes."""
-    try:
-        found = unit_lookup.labeled_session(unit.production.name, unit.name)
-    except OSError as error:
-        raise RecoveryRefused(f"{unit.name}: cannot tell whether Claude is running: {error}") from error
-    return (found is not None and isinstance(found.claude, unit_lookup.LiveClaude)
-            and found.claude.session_id == unit.session_id)
-
-def recovery_refusals(unit: RetiredUnitRecovery) -> list[str]:
-    refused: list[str] = []
-    try:
-        if not recovery_has_transcript(unit):
-            refused.append(f"{unit.name}: no account has the transcript of session {unit.session_id}")
-    except (RetirementRefused, OSError) as error:
-        refused.append(f"{unit.name}: {error}")
-    pending = worktrees.pending_checkout(unit.worktree, unit.production.checkout, unit.branch)
-    if os.path.lexists(unit.worktree) and not (pending or recovery_has_worktree(unit)):
-        refused.append(f"{unit.worktree} exists and is not {unit.name}'s worktree on {unit.branch}")
-    elif pending or not unit.worktree.exists():
-        if not pending and recovery_git(unit, "branch", "--list", unit.branch):
-            refused.append(f"branch {unit.branch} still exists; retire did not finish")
-        if recovery_git(unit, "ls-remote", "--heads", "origin", unit.branch):
-            refused.append(f"origin {unit.branch} still exists; retire did not finish")
-    return refused
-
-def recovery_launch_command(unit: RetiredUnitRecovery) -> list[str]:
-    arguments = [sys.executable, str(ADD_UNIT), "--production", unit.production.name, unit.name,
-                 "--resume", unit.session_id, "--cwd", str(unit.worktree), "--join-recovery-locks",
-                 *unit_config.plan_arguments(unit.plan)]
-    if isinstance(unit.account, accounts.NamedAccount):
-        arguments.extend(["--account", unit.account.label])
-    return arguments
-
-def recovery_make_worktree(unit: RetiredUnitRecovery) -> None:
-    had_checkout = recovery_has_worktree(unit)
-    branch = (build_folders.ExistingWorktreeBranch(unit.branch)
-              if recovery_git(unit, "branch", "--list", unit.branch)
-              else build_folders.NewWorktreeBranch(unit.branch, unit.production.merge_branch))
-    try:
-        record = worktree_records.checkout_record(unit.worktree)
-        layout = (record.layout if record is not None and record.stage is worktree_records.MakeStage.MAKING
-                  else worktrees.unit_checkout_output(
-                      unit.worktree, build_folders.repo_word(unit.production.checkout), unit.name))
-        _ = worktrees.create_checkout(unit.worktree, unit.production.checkout, branch,
-                                      layout, owner=unit.name, merge_branch=unit.production.merge_branch,
-                                      allow_existing=True)
-    except (OSError, ValueError, worktree_records.Refused) as error:
-        raise RecoveryRefused(f"worktree {unit.worktree}: {error}") from error
-    if not had_checkout:
-        print(f"made: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
-
-def recovery_launch(unit: RetiredUnitRecovery) -> None:
-    if recovery_is_running(unit) and not add_unit.pending_opening(unit.production, unit.name, unit.session_id):
-        return
-    result = retirement_run(recovery_launch_command(unit))
-    if result.stdout.strip():
-        print(result.stdout.strip())
-    if result.returncode:
-        raise RecoveryRefused(f"add_unit.py --resume: {retirement_failure(result)}")
-    print(f"resumed: session {unit.session_id} in {unit.worktree}")
-
-def recovery_resumed_session_proven(production_name: str, name: str, session_id: str, row: staff.StaffRow) -> bool:
-    marked = unit_lookup.labeled_session(production_name, name)
-    if marked is None or not isinstance(marked.claude, unit_lookup.LiveClaude):
-        return False
-    entry = pane_record.read(marked.place.session).get(marked.place.pane)
-    return (marked.claude.session_id == session_id and entry is not None
-            and entry.get("staff_id") == row.id and session_id == row.current_session)
-
-def recovery_resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> int:
-    staff.validate_unit_name_for_write(unit.name)
-    refused = recovery_refusals(unit)
-    if refused:
-        print("\n".join(f"refused: {reason}" for reason in refused))
-        return 1
-    member = staff_sources.member(staff_sources.UnitMember(unit.production.name, unit.name), record)
-    if isinstance(member, staff_sources.NoSuchMember):
-        raise RecoveryRefused(f"{unit.name}: no retained staff row")
-    recovery_make_worktree(unit)
-    unit_config.restore(member.row.id, unit.worktree)
-    row = staff.restore_unit(member.row.id, staff.PresentWorktree(remote.local_machine(), unit.worktree))
-    recovery_launch(unit)
-    if not recovery_resumed_session_proven(unit.production.name, unit.name, unit.session_id, row):
-        raise RecoveryRefused(f"{unit.name}: resumed native session identity is not proven; parked facts kept")
-    shutdown_record.remove_started([str(row.id)])
-    completed = recovery_resume_record(unit.production, unit.name).with_suffix(".done")
-    completion_receipt.write_receipt(completed, row.id, {"session_id": unit.session_id,
-                                                   "doc": str(unit.production.doc), "unit": unit.name})
-    unit_config.discard_parked(row.id)
-    code = worker.restore(row.id)
-    print(f"{unit.name} resumed")
-    return int(code)
-
 
 def named_staff_unit(name: str, record: staff.StaffSnapshot) -> staff.StaffRow:
     matches = [member for member in record.rows if member.kind == "unit" and member.name == name]
@@ -2083,49 +1985,6 @@ def retire_named_unit(name: str) -> int:
             return 1
     with staff.operation():
         return staff.cli_result(apply)
-
-
-def recover_named_unit(name: str, *,
-                       account: accounts.NamedAccount | accounts.ReadCurrentAccountSettings) -> int:
-    with staff.operation():
-        return staff.cli_result(lambda: recovery_apply(name, account=account))
-
-
-def recovery_apply(name: str, *,
-                   account: accounts.NamedAccount | accounts.ReadCurrentAccountSettings) -> int:
-    try:
-        record = staff.initial_snapshot()
-        row = named_staff_unit(name, record)
-        with staff.session_operation(row.current_session, native_key=moves.native_row_key(row.current_session)) as record:
-            current = record.by_current_session(row.current_session)
-            if current is None or current.id != row.id:
-                raise RecoveryRefused(f"{row.name}: recovery could not lock the current staff row")
-            unit = recovery_find_unit(unit_production_name(row, record), str(row.id), record=record)
-            completed = completion_receipt.read_receipt(recovery_resume_record(unit.production, unit.name).with_suffix(".done"),
-                                                    record)
-            if (isinstance(unit, NoRecoveryRequired) and isinstance(completed, completion_receipt.OwnedReceipt)
-                    and completed.owner.kind == "unit" and completed.fields.get("doc") == str(unit.production.doc)
-                    and completed.fields.get("unit") == unit.name
-                    and isinstance(completed.owner.worktree, staff.PresentWorktree)
-                    and isinstance(completed.fields.get("session_id"), str)
-                    and recovery_resumed_session_proven(unit.production.name, unit.name,
-                        cast(str, completed.fields["session_id"]), completed.owner)):
-                shutdown_record.remove_started([str(completed.owner.id)])
-                code = worker.restore(completed.owner.id)
-                print(f"{unit.name} already resumed")
-                return int(code)
-            if isinstance(unit, NoRecoveryRequired):
-                raise RecoveryRefused(f"{unit.name} is not retired")
-            return recovery_resume(replace(unit, account=account), record)
-    except (staff.StaffRefused, staff.StaffUnreadable):
-        raise
-    except RecoveryFactsMissing as error:
-        print(str(error))
-        return 1
-    except (RecoveryRefused, RetirementRefused, Refusal, unit_names.BadName, ValueError,
-            conf.Unusable, subprocess.SubprocessError, OSError) as error:
-        print(f"refused: {error}")
-        return 1
 
 
 @dataclass(frozen=True)

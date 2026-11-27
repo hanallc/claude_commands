@@ -19,7 +19,6 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Thread, current_thread
 from typing import cast, final, override
 from collections.abc import Generator
-from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
 from scripts.agents.test_support import ShutdownSendLeaf, ShutdownTestCase
@@ -27,8 +26,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_worker
 from scripts.agents import shutdown, restart, shutdown_record, stop_resume, inventory, remote, status_entry
 from scripts.accounts import role_map
 from scripts.herdr import herdr, worker_panes
-from scripts.production import staff, session_staff, completion_receipt, unit_config, worker
-from scripts.production.production_doc import Production
+from scripts.production import staff, session_staff
 from scripts.whoami.account import UnreadableAccount
 from scripts.agents.inventory import Inventory
 from scripts.agents.stop_results import ClaudeStartState
@@ -196,34 +194,6 @@ class ShutdownStatusTests(ShutdownTestCase):
             self.assertEqual(shutdown.main(["resume", str(row.id)]), 0)
         self.assertEqual(stopped_again, [str(row.id)])
         self.assertEqual(shutdown_record.read(), [str(row.id)])
-
-    def test_retired_resume_clears_only_a_proven_native_session(self) -> None:
-        owner = fixture_member("showrunner", name="recovery-owner")
-        row = fixture_member("unit", name="recovery", parent=owner.id,
-                             worktree=staff.PresentWorktree("natedev", self.root / "unit"))
-        production = Production(self.root / "production.md", owner.name, "production", self.root,
-                                self.root / "log.md", ZoneInfo("UTC"), owner)
-        unit = shutdown.RetiredUnitRecovery(production, row.name, self.root / "unit", row.name,
-                                            unit_config.StandbyPlan(), row.current_session)
-        receipt = completion_receipt.OwnedReceipt(row, {"session_id": row.current_session,
-                                                       "doc": str(production.doc), "unit": row.name})
-        for already, proven in ((False, False), (False, True), (True, True)):
-            with self.subTest(already=already, proven=proven):
-                shutdown_record.save(["earlier", str(row.id)])
-                with (patch.object(shutdown, "recovery_find_unit", return_value=
-                                   shutdown.NoRecoveryRequired(production, row.name) if already else unit),
-                      patch.object(shutdown, "recovery_resume_record", return_value=self.root / "resume"),
-                      patch.object(completion_receipt, "read_receipt", return_value=receipt),
-                      patch.object(shutdown, "recovery_refusals", return_value=[]),
-                      patch.object(shutdown, "recovery_make_worktree"),
-                      patch.object(unit_config, "restore"), patch.object(unit_config, "discard_parked"),
-                      patch.object(staff, "restore_unit", return_value=row),
-                      patch.object(shutdown, "recovery_launch"),
-                      patch.object(shutdown, "recovery_resumed_session_proven", return_value=proven),
-                      patch.object(completion_receipt, "write_receipt"),
-                      patch.object(worker, "restore", return_value=worker.ExitCode.OK)):
-                    self.assertEqual(shutdown.main(["resume", str(row.id), "--retired"]), 0 if proven else 1)
-                self.assertEqual(shutdown_record.read(), ["earlier"] if proven else ["earlier", str(row.id)])
 
     def test_paused_resume_removes_the_row_only_after_a_delivered_continuation(self) -> None:
         from scripts.whoami import quota_state
