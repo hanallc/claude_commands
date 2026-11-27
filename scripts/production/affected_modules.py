@@ -8,7 +8,8 @@ import ast
 from collections import defaultdict
 from collections.abc import Generator, Iterator, Sequence
 from contextlib import ExitStack, closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 import fcntl
 from functools import cache
 from hashlib import sha256
@@ -25,6 +26,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from time import monotonic
 from typing import cast
 
 from scripts.lib import conf
@@ -49,16 +51,58 @@ class NoCertifiedBase:
     pass
 
 
+class FactCacheLock(Enum):
+    NOT_USED = "not used"
+    UNAVAILABLE = "unavailable"
+    BUSY = "busy, no snapshot"
+    BUSY_SNAPSHOT = "busy, read old snapshot"
+    TAKEN = "taken"
+    PUBLISHED = "taken, published"
+    PUBLISH_FAILED = "taken, publish failed"
+
+
+@dataclass
+class SelectionRun:
+    cache_hits: int = 0
+    cache_misses: int = 0
+    extracted_files: int = 0
+    cache_read_s: float = 0.0
+    extraction_s: float = 0.0
+    graph_s: float = 0.0
+    total_s: float = 0.0
+    lock: FactCacheLock = FactCacheLock.NOT_USED
+
+    @property
+    def other_s(self) -> float:
+        return self.total_s - self.cache_read_s - self.extraction_s - self.graph_s
+
+    @contextmanager
+    def graph_build(self) -> Generator[None]:
+        started = monotonic()
+        extraction_before = self.extraction_s
+        try:
+            yield
+        finally:
+            self.graph_s += (monotonic() - started) - (self.extraction_s - extraction_before)
+
+
+@dataclass(frozen=True)
+class SelectionNotRun:
+    pass
+
+
 @dataclass(frozen=True)
 class AffectedSelection:
     base: CertifiedBase
     changed_files: tuple[str, ...]
     modules: tuple[Path, ...]
+    run: SelectionRun | SelectionNotRun = field(default_factory=SelectionNotRun, compare=False)
 
 
 @dataclass(frozen=True)
 class FullSuite:
     reason: str
+    run: SelectionRun | SelectionNotRun = field(default_factory=SelectionNotRun, compare=False)
 
 
 class GraphError(Exception):
@@ -74,7 +118,7 @@ def git_output(repo: Path, *arguments: str) -> str:
 
 
 # Bump the extractor version whenever source-fact semantics change.
-CACHE_FORMAT_VERSION = 3
+CACHE_FORMAT_VERSION = 4
 EXTRACTOR_VERSION = 11
 FACT_CACHE_NAME = "affected-module-facts.sqlite"
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_.\-/]+")
@@ -140,11 +184,14 @@ class ScanCall:
     keywords: tuple[tuple[str, ScanPath | UnrootedPath], ...]
 
 
+type SourceBindings = tuple[tuple[str, ScanPath | UnrootedPath], ...]
+
+
 @dataclass(frozen=True)
 class ScanScope:
     name: str
     parameters: tuple[str, ...]
-    bindings: tuple[tuple[str, ScanPath | UnrootedPath], ...]
+    bindings: SourceBindings
     scans: tuple[ScanPattern, ...]
     calls: tuple[ScanCall, ...]
 
@@ -238,23 +285,16 @@ def scan_path(node: ast.AST, bindings: dict[str, ScanPath | UnrootedPath],
     return UnrootedPath()
 
 
-def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
-    """Keep parameters, paths, and scan calls in their lexical scopes."""
-    definitions: dict[str, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = {"": tree}
+type ScanNode = ast.Import | ast.ImportFrom | ast.Assign | ast.AnnAssign | ast.Call
+type ScopeDefinition = ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
 
-    def definitions_in(node: ast.AST, prefix: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                name = f"{prefix}.{child.name}".lstrip(".")
-                definitions[name] = child
-                definitions_in(child, name)
-            else:
-                definitions_in(child, prefix)
 
-    definitions_in(tree, "")
+def source_scan_scopes(definitions: dict[str, tuple[ScopeDefinition, list[ScanNode]]],
+                       ls_files_calls: set[ast.Call]) -> tuple[ScanScope, ...]:
+    """Resolve each scope after the walk records all definitions."""
     scopes: list[ScanScope] = []
     environments: dict[str, tuple[dict[str, ScanPath | UnrootedPath], dict[str, str]]] = {}
-    for name, definition in definitions.items():
+    for name, (definition, nodes) in definitions.items():
         parent = name.rpartition(".")[0]
         inherited, imported = environments.get(parent, ({}, {}))
         bindings = dict(inherited)
@@ -268,52 +308,122 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
             bindings.update((parameter, ScanPath(ParameterRoot(parameter))) for parameter in parameters)
         scans: list[ScanPattern] = []
         calls: list[ScanCall] = []
-        for statement in definition.body:
-            for node in scope_nodes(statement):
-                if isinstance(node, ast.Import):
-                    aliases.update((alias.asname or alias.name, alias.name) for alias in node.names)
-                elif isinstance(node, ast.ImportFrom):
-                    module = "." * node.level + (node.module or "")
-                    aliases.update((alias.asname or alias.name, module + ("." if node.module else "") + alias.name)
-                                   for alias in node.names)
-                elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-                    value = scan_path(node.value, bindings, aliases)
-                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                    bindings.update((ast.unparse(target), value) for target in targets
-                                    if isinstance(target, (ast.Name, ast.Attribute)))
-                elif isinstance(node, ast.Call):
-                    target = ast.unparse(node.func)
-                    if target.startswith(("self.", "cls.")):
-                        target = parent + "." + target.split(".", 1)[1]
-                    for alias, imported_name in aliases.items():
-                        if target == alias or target.startswith(alias + "."):
-                            target = imported_name + target.removeprefix(alias)
-                            break
-                    for prefix in (name, parent):
-                        if f"{prefix}.{target}".lstrip(".") in definitions:
-                            target = f"{prefix}.{target}".lstrip(".")
-                            break
-                    arguments = tuple(scan_path(argument, bindings, aliases) for argument in node.args)
-                    keywords = tuple((keyword.arg, scan_path(keyword.value, bindings, aliases))
-                                     for keyword in node.keywords if keyword.arg is not None)
-                    if target in definitions or any(isinstance(value, ScanPath) for value in (*arguments, *(item[1] for item in keywords))):
-                        calls.append(ScanCall(target, arguments, keywords))
-                    if isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"}:
-                        directory = scan_path(node.func.value, bindings, aliases)
-                        pattern = node.args[0] if node.args else ast.Constant("*")
-                        if isinstance(pattern, ast.Constant) and isinstance(pattern.value, str):
-                            scans.append(ScanPattern(directory, pattern.value, node.func.attr == "rglob"))
-                        else:
-                            scans.append(ScanPattern(directory, "*", True))
-                    elif target.endswith(".walk") and arguments:
-                        scans.append(ScanPattern(arguments[0], "*", True))
-                    elif any(isinstance(part, ast.Constant) and part.value == "ls-files" for part in ast.walk(node)):
-                        directories = [value for key, value in keywords if key == "cwd"] or list(arguments)
-                        if directories:
-                            scans.append(ScanPattern(directories[0], "*", True))
+        for node in nodes:
+            if isinstance(node, ast.Import):
+                aliases.update((alias.asname or alias.name, alias.name) for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                module = "." * node.level + (node.module or "")
+                aliases.update((alias.asname or alias.name, module + ("." if node.module else "") + alias.name)
+                               for alias in node.names)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                value = scan_path(node.value, bindings, aliases)
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                bindings.update((ast.unparse(target), value) for target in targets
+                                if isinstance(target, (ast.Name, ast.Attribute)))
+            elif isinstance(node, ast.Call):
+                target = ast.unparse(node.func)
+                if target.startswith(("self.", "cls.")):
+                    target = parent + "." + target.split(".", 1)[1]
+                for alias, imported_name in aliases.items():
+                    if target == alias or target.startswith(alias + "."):
+                        target = imported_name + target.removeprefix(alias)
+                        break
+                for prefix in (name, parent):
+                    if f"{prefix}.{target}".lstrip(".") in definitions:
+                        target = f"{prefix}.{target}".lstrip(".")
+                        break
+                arguments = tuple(scan_path(argument, bindings, aliases) for argument in node.args)
+                keywords = tuple((keyword.arg, scan_path(keyword.value, bindings, aliases))
+                                 for keyword in node.keywords if keyword.arg is not None)
+                if target in definitions or any(isinstance(value, ScanPath) for value in (*arguments, *(item[1] for item in keywords))):
+                    calls.append(ScanCall(target, arguments, keywords))
+                if isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"}:
+                    directory = scan_path(node.func.value, bindings, aliases)
+                    pattern = node.args[0] if node.args else ast.Constant("*")
+                    if isinstance(pattern, ast.Constant) and isinstance(pattern.value, str):
+                        scans.append(ScanPattern(directory, pattern.value, node.func.attr == "rglob"))
+                    else:
+                        scans.append(ScanPattern(directory, "*", True))
+                elif target.endswith(".walk") and arguments:
+                    scans.append(ScanPattern(arguments[0], "*", True))
+                elif node in ls_files_calls:
+                    directories = [value for key, value in keywords if key == "cwd"] or list(arguments)
+                    if directories:
+                        scans.append(ScanPattern(directories[0], "*", True))
         environments[name] = bindings, aliases
         scopes.append(ScanScope(name, parameters, tuple(bindings.items()), tuple(scans), tuple(calls)))
     return tuple(scopes)
+
+
+class _SourceFactWalk:
+    def __init__(self, tree: ast.Module, config_reads: set[str]) -> None:
+        self.definitions: dict[str, tuple[ScopeDefinition, list[ScanNode]]] = {"": (tree, [])}
+        self.imports_by_depth: dict[int, list[ast.Import | ast.ImportFrom]] = defaultdict(list)
+        self.config_calls: list[tuple[ast.expr, str]] = []
+        self.ls_files_calls: set[ast.Call] = set()
+        self.walk(tree, config_reads)
+
+    def walk(self, tree: ast.Module, config_reads: set[str]) -> None:
+        stack: list[tuple[ast.AST, int, str, list[ScanNode] | None, bool] | None] = [
+            (tree, 0, "", self.definitions[""][1], False)
+        ]
+        active_calls: list[ast.Call] = []
+        while stack:
+            entry = stack.pop()
+            if entry is None:
+                _ = active_calls.pop()
+                continue
+            node, depth, name, scope, in_copy_source = entry
+            child_depth = depth + 1
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{name}.{node.name}".lstrip(".")
+                body: list[ScanNode] = []
+                self.definitions[name] = node, body
+                # Scans use only the body. Imports and definitions can also occur in other fields.
+                fields = list(cast(Iterator[tuple[str, object]], ast.iter_fields(node)))
+                for field, value in reversed(fields):
+                    children = cast(list[object], value) if isinstance(value, list) else [value]
+                    child_scope = body if field == "body" else None
+                    for child in reversed(children):
+                        if isinstance(child, ast.AST):
+                            stack.append((child, child_depth, name, child_scope, in_copy_source))
+                continue
+
+            if isinstance(node, ast.Lambda):
+                scope = None
+            copy_source: ast.expr | None = None
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                self.imports_by_depth[depth].append(node)
+                if scope is not None:
+                    scope.append(node)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                if scope is not None:
+                    scope.append(node)
+            elif isinstance(node, ast.Call):
+                if scope is not None:
+                    scope.append(node)
+                active_calls.append(node)
+                # Pop the active call after its children.
+                stack.append(None)
+                if node.args:
+                    first = node.args[0]
+                    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                        self.config_calls.append((node.func, first.value))
+                    if isinstance(node.func, ast.Attribute) and node.func.attr == "copytree":
+                        copy_source = first
+            elif isinstance(node, ast.Constant):
+                if node.value == "ls-files":
+                    self.ls_files_calls.update(active_calls)
+                if in_copy_source and node.value == "config":
+                    config_reads.add("*")
+                continue
+            elif isinstance(node, ast.JoinedStr) and any(
+                    isinstance(part, ast.Constant) and isinstance(part.value, str) and part.value.endswith(".conf")
+                    for part in node.values):
+                config_reads.add("*")
+
+            for child in reversed(list(ast.iter_child_nodes(node))):
+                stack.append((child, child_depth, name, scope, in_copy_source or child is copy_source))
 
 
 def extract_facts(text: str, path: str) -> SourceFacts:
@@ -323,24 +433,23 @@ def extract_facts(text: str, path: str) -> SourceFacts:
         tree = ast.parse(text, filename=path)
     except SyntaxError as error:
         return SourceFacts((), tokens, frozenset(config_reads), InvalidPython(error.msg))
+    walk = _SourceFactWalk(tree, config_reads)
     imports: list[tuple[int, str, tuple[str, ...]]] = []
     conf_modules: set[str] = set()
     conf_functions: set[str] = set()
-    for node in ast.walk(tree):
+    # Group the imports by depth to preserve breadth-first order.
+    for node in chain.from_iterable(walk.imports_by_depth[depth] for depth in sorted(walk.imports_by_depth)):
         if isinstance(node, ast.Import):
             imports.extend((0, alias.name, ()) for alias in node.names)
             conf_modules.update(alias.asname or alias.name for alias in node.names
                                 if alias.name in {"conf", "scripts.lib.conf"})
-        elif isinstance(node, ast.ImportFrom):
+        else:
             imports.append((node.level, node.module or "", tuple(alias.name for alias in node.names)))
             if not node.level and node.module == "scripts.lib":
                 conf_modules.update(alias.asname or alias.name for alias in node.names if alias.name == "conf")
             elif not node.level and node.module == "scripts.lib.conf":
                 conf_functions.update(alias.asname or alias.name for alias in node.names)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not node.args:
-            continue
-        function = node.func
+    for function, first in walk.config_calls:
         reader = isinstance(function, ast.Name) and function.id in conf_functions
         if isinstance(function, ast.Attribute):
             parts: list[str] = []
@@ -350,20 +459,10 @@ def extract_facts(text: str, path: str) -> SourceFacts:
                 module = module.value
             if isinstance(module, ast.Name):
                 reader = ".".join((module.id, *reversed(parts))) in conf_modules
-        first = node.args[0]
-        if reader and isinstance(first, ast.Constant) and isinstance(first.value, str):
-            config_reads.add(Path(first.value).name.removesuffix(".conf"))
-    # A computed config name or a copied config folder can read any config file.
-    if any(isinstance(node, ast.JoinedStr) and any(
-            isinstance(part, ast.Constant) and isinstance(part.value, str) and part.value.endswith(".conf")
-            for part in node.values) for node in ast.walk(tree)):
-        config_reads.add("*")
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "copytree" and node.args
-                and any(isinstance(part, ast.Constant) and part.value == "config" for part in ast.walk(node.args[0]))):
-            config_reads.add("*")
-    return SourceFacts(tuple(imports), tokens, frozenset(config_reads), scan_scopes=source_scan_scopes(tree))
+        if reader:
+            config_reads.add(Path(first).name.removesuffix(".conf"))
+    return SourceFacts(tuple(imports), tokens, frozenset(config_reads),
+                       scan_scopes=source_scan_scopes(walk.definitions, walk.ls_files_calls))
 
 
 def indexed_files(repo: Path) -> tuple[set[str], dict[str, str]]:
@@ -434,7 +533,7 @@ def decoded_scan_path(value: object) -> ScanPath | UnrootedPath:
     return ScanPath(origin, scan_strings(parts))
 
 
-def decoded_scan_scopes(value: object, encoded_paths: object) -> tuple[ScanScope, ...]:
+def decoded_scan_scopes(value: object, encoded_paths: object, encoded_bindings: object) -> tuple[ScanScope, ...]:
     if not isinstance(encoded_paths, list):
         raise ValueError("invalid scan paths")
     directories = tuple(decoded_scan_path(path) for path in cast(list[object], encoded_paths))
@@ -444,16 +543,23 @@ def decoded_scan_scopes(value: object, encoded_paths: object) -> tuple[ScanScope
             raise ValueError("invalid scan path index")
         return directories[index]
 
-    result: list[ScanScope] = []
-    for name, parameters, bindings, scans, calls in scan_rows(value, 5):
-        if not isinstance(name, str):
-            raise ValueError("invalid scan scope name")
+    if not isinstance(encoded_bindings, list):
+        raise ValueError("invalid scan bindings")
+    bindings: list[SourceBindings] = []
+    for encoded in cast(list[object], encoded_bindings):
         paths: list[tuple[str, ScanPath | UnrootedPath]] = []
-        for key, path in scan_rows(bindings, 2):
-            directory = directory_at(path)
+        for key, path in scan_rows(encoded, 2):
             if not isinstance(key, str):
                 raise ValueError("invalid scan binding")
-            paths.append((key, directory))
+            paths.append((key, directory_at(path)))
+        bindings.append(tuple(paths))
+
+    result: list[ScanScope] = []
+    for name, parameters, binding, scans, calls in scan_rows(value, 5):
+        if not isinstance(name, str):
+            raise ValueError("invalid scan scope name")
+        if type(binding) is not int or not 0 <= binding < len(bindings):
+            raise ValueError("invalid scan binding index")
         patterns: list[ScanPattern] = []
         for path, pattern, recursive in scan_rows(scans, 3):
             directory = directory_at(path)
@@ -470,26 +576,30 @@ def decoded_scan_scopes(value: object, encoded_paths: object) -> tuple[ScanScope
                     raise ValueError("invalid scan keyword")
                 named.append((key, directory_at(path)))
             invocations.append(ScanCall(target, tuple(directory_at(path) for path in cast(list[object], arguments)), tuple(named)))
-        result.append(ScanScope(name, scan_strings(parameters), tuple(paths), tuple(patterns), tuple(invocations)))
+        result.append(ScanScope(name, scan_strings(parameters), bindings[binding], tuple(patterns), tuple(invocations)))
     return tuple(result)
 
 
-def encoded_scans(scopes: tuple[ScanScope, ...]) -> tuple[list[object], list[object]]:
+def encoded_scans(scopes: tuple[ScanScope, ...]) -> tuple[list[object], list[object], list[object]]:
     # Store each scan path once per blob, including repeated call arguments.
     paths: dict[ScanPath | UnrootedPath, int] = {}
+    bindings: dict[SourceBindings, int] = {}
 
     def path_index(path: ScanPath | UnrootedPath) -> int:
         return paths.setdefault(path, len(paths))
 
     rows: list[object] = [
         [scope.name, scope.parameters,
-         [[name, path_index(path)] for name, path in scope.bindings],
+         bindings.setdefault(scope.bindings, len(bindings)),
          [[path_index(scan.directory), scan.pattern, scan.recursive] for scan in scope.scans],
          [[call.target, [path_index(path) for path in call.arguments],
            [[name, path_index(path)] for name, path in call.keywords]] for call in scope.calls]]
         for scope in scopes
     ]
-    return rows, [encoded_scan_path(path) for path in paths]
+    binding_rows: list[object] = []
+    for binding in bindings:
+        binding_rows.append([[name, path_index(path)] for name, path in binding])
+    return rows, [encoded_scan_path(path) for path in paths], binding_rows
 
 
 def decoded_facts(value: object) -> SourceFacts:
@@ -516,7 +626,7 @@ def decoded_facts(value: object) -> SourceFacts:
         decoded.append((level, module, tuple(cast(list[str], names))))
     syntax = InvalidPython(syntax_error) if isinstance(syntax_error, str) else ValidPython()
     return SourceFacts(tuple(decoded), frozenset(cast(list[str], tokens)), frozenset(cast(list[str], config_reads)),
-                       syntax, decoded_scan_scopes(row.get("scan_scopes"), row.get("scan_paths")))
+                       syntax, decoded_scan_scopes(row.get("scan_scopes"), row.get("scan_paths"), row.get("scan_bindings")))
 
 
 def read_fact_cache(path: Path) -> dict[str, SourceFacts] | None:
@@ -550,21 +660,22 @@ def fact_digest(blob: str, payload: bytes) -> bytes:
 
 
 def fact_row(blob: str, facts: SourceFacts) -> tuple[str, bytes, bytes]:
-    scopes, paths = encoded_scans(facts.scan_scopes)
+    scopes, paths, bindings = encoded_scans(facts.scan_scopes)
     payload = json.dumps({"imports": facts.imports, "tokens": sorted(facts.tokens),
                           "config_reads": sorted(facts.config_reads),
-                          "scan_scopes": scopes, "scan_paths": paths,
+                          "scan_scopes": scopes, "scan_paths": paths, "scan_bindings": bindings,
                           "syntax_error": facts.syntax.message if isinstance(facts.syntax, InvalidPython) else None},
                          separators=(",", ":")).encode("utf-8")
     return blob, payload, fact_digest(blob, payload)
 
 
 def write_fact_cache(path: Path, facts: dict[str, SourceFacts], published: set[str] | None,
-                     retained: set[str]) -> None:
+                     retained: set[str]) -> bool:
     original = published if published is not None else set[str]()
     current = facts.keys() & retained
     added = current - original
     removed = original - current
+    saved = False
     try:
         with tempfile.TemporaryDirectory(prefix=".affected-facts-", dir=path.parent) as directory:
             temporary = Path(directory) / path.name
@@ -579,9 +690,11 @@ def write_fact_cache(path: Path, facts: dict[str, SourceFacts], published: set[s
                 _ = database.executemany("DELETE FROM facts WHERE blob = ?", ((blob,) for blob in removed))
                 _ = database.executemany("INSERT INTO facts VALUES (?, ?, ?)", (fact_row(blob, facts[blob]) for blob in added))
             os.replace(temporary, path)
+            saved = True
     except (OSError, sqlite3.Error):
-        # Selection can proceed if the cache cannot be published.
+        # A cleanup error after replacement leaves the new snapshot published.
         pass
+    return saved
 
 
 @dataclass
@@ -589,14 +702,17 @@ class FactCache:
     facts: dict[str, SourceFacts]
     writable_path: Path | None = None
     published: set[str] | None = None
+    run: SelectionRun | None = None
 
     def retain(self, blobs: set[str]) -> None:
         if self.writable_path is not None and (self.facts.keys() & blobs) != self.published:
-            write_fact_cache(self.writable_path, self.facts, self.published, blobs)
+            saved = write_fact_cache(self.writable_path, self.facts, self.published, blobs)
+            if self.run is not None:
+                self.run.lock = FactCacheLock.PUBLISHED if saved else FactCacheLock.PUBLISH_FAILED
 
 
 @contextmanager
-def fact_cache(state_dir: Path | None) -> Generator[FactCache]:
+def fact_cache(state_dir: Path | None, run: SelectionRun | None = None) -> Generator[FactCache]:
     if state_dir is None:
         yield FactCache({})
         return
@@ -604,17 +720,27 @@ def fact_cache(state_dir: Path | None) -> Generator[FactCache]:
     path = state_dir / FACT_CACHE_NAME
     with ExitStack() as stack:
         writable_path: Path | None = None
+        lock_result = FactCacheLock.UNAVAILABLE
         try:
             state_dir.mkdir(parents=True, exist_ok=True)
             lock = stack.enter_context(path.with_suffix(".lock").open("ab"))
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             writable_path = path
+            lock_result = FactCacheLock.TAKEN
+        except BlockingIOError:
+            lock_result = FactCacheLock.BUSY
         except OSError:
             # Readers can use either published snapshot during an atomic replace.
             pass
+        started = monotonic()
         snapshot = read_fact_cache(path)
+        if run is not None:
+            run.cache_read_s = monotonic() - started
+            if lock_result is FactCacheLock.BUSY and snapshot is not None:
+                lock_result = FactCacheLock.BUSY_SNAPSHOT
+            run.lock = lock_result
         published = set(snapshot) if writable_path is not None and snapshot is not None else None
-        yield FactCache(snapshot if snapshot is not None else {}, writable_path, published)
+        yield FactCache(snapshot if snapshot is not None else {}, writable_path, published, run)
 
 
 def module_dependencies(module: str, tracked: set[str]) -> set[str]:
@@ -947,15 +1073,25 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
 
 
 def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
-                    cached: dict[str, SourceFacts], *, worktree: bool
+                    cached: dict[str, SourceFacts], *, worktree: bool, run: SelectionRun | None = None
                     ) -> SourceGraph:
     bare_modules: dict[str, set[str]] = defaultdict(set)
     for path in paths:
         name = Path(path).parent.name if Path(path).name == "__init__.py" else Path(path).stem
         bare_modules[name].add(path)
     sources = sorted(paths)
-    missing = {blobs[path] for path in sources if path in blobs and blobs[path] not in cached}
-    texts = blob_texts(repo, missing) if not worktree and missing else {}
+    texts: dict[str, str] = {}
+    if not worktree:
+        missing = {blobs[path] for path in sources if path in blobs and blobs[path] not in cached}
+        if missing:
+            if run is not None:
+                run.cache_misses += len(missing)
+            started = monotonic()
+            try:
+                texts = blob_texts(repo, missing)
+            finally:
+                if run is not None:
+                    run.extraction_s += monotonic() - started
     external = set(sys.stdlib_module_names) | set(packages_distributions())
     graph: dict[str, set[str]] = {}
     tokens: dict[str, frozenset[str]] = {}
@@ -965,10 +1101,21 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
         blob = blobs.get(path) if path not in dirty else None
         facts = cached.get(blob) if blob is not None else None
         if facts is None:
-            text = (repo / path).read_text(encoding="utf-8") if worktree else texts[blobs[path]]
-            facts = extract_facts(text, path)
+            if worktree and run is not None:
+                run.cache_misses += 1
+            started = monotonic()
+            try:
+                text = (repo / path).read_text(encoding="utf-8") if worktree else texts[blobs[path]]
+                if run is not None:
+                    run.extracted_files += 1
+                facts = extract_facts(text, path)
+            finally:
+                if run is not None:
+                    run.extraction_s += monotonic() - started
             if blob is not None:
                 cached[blob] = facts
+        elif run is not None:
+            run.cache_hits += 1
         if isinstance(facts.syntax, InvalidPython) and is_test_module(path):
             raise SyntaxError(f"{facts.syntax.message} ({path})")
         if worktree:
@@ -1221,6 +1368,8 @@ def script_callers(repo: Path, candidates: set[str], changed: set[str]) -> set[s
 def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                     modules: Sequence[Path], dirty: set[str], *,
                     state_dir: Path | None = None) -> AffectedSelection | FullSuite:
+    started = monotonic()
+    run = SelectionRun()
     try:
         settings = conf.read("gate")
         declarations = declared_scan_roots(repo, modules, settings.values().get("scan_roots", "").split())
@@ -1236,7 +1385,7 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                 at = git_output(repo, "show", "-s", "--format=%cI", commit).strip()
                 candidates[commit] = CertifiedBase(commit, at)
         if not candidates:
-            return FullSuite("no certified base")
+            return FullSuite("no certified base", run)
         differences: list[tuple[CertifiedBase, set[str]]] = []
         for candidate in candidates.values():
             changes = git_output(repo, "diff", "--name-only", "-z", "--no-renames", candidate.commit, "HEAD")
@@ -1244,8 +1393,9 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         base, committed_changes = min(differences, key=lambda item: len(item[1]))
         changed = committed_changes | dirty
         paths, blobs = worktree_files(repo, dirty)
-        with fact_cache(state_dir) as cached:
-            graph = graph_for_files(repo, paths, blobs, dirty, cached.facts, worktree=True)
+        with fact_cache(state_dir, run) as cached:
+            with run.graph_build():
+                graph = graph_for_files(repo, paths, blobs, dirty, cached.facts, worktree=True, run=run)
             config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
             configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
             recorded = latest_module_reads() if changed else {}
@@ -1261,7 +1411,8 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             if removed:
                 old_blobs = base_blobs if has_folder_records else revision_files(repo, base.commit)
                 old_paths = {path for path in old_blobs if path.endswith(".py")}
-                old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached.facts, worktree=False).imports
+                with run.graph_build():
+                    old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached.facts, worktree=False, run=run).imports
                 retained.update(source_blobs(old_paths, old_blobs))
             cached.retain(retained)
         folder_stems: dict[str, set[str]] = defaultdict(set)
@@ -1295,6 +1446,8 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                 text = module.read_text(encoding="utf-8")
                 if any(re.search(rf"\b{re.escape(stem)}\b", text) for stem in stems):
                     selected.append(module)
-        return AffectedSelection(base, tuple(sorted(changed)), tuple(selected))
+        return AffectedSelection(base, tuple(sorted(changed)), tuple(selected), run)
     except (GraphError, OSError, ValueError, SyntaxError, sqlite3.Error) as error:
-        return FullSuite(f"graph error: {error}")
+        return FullSuite(f"graph error: {error}", run)
+    finally:
+        run.total_s = monotonic() - started

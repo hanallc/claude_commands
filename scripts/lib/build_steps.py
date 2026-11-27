@@ -102,6 +102,7 @@ GATE_PROGRAMS = {
     "merge-gate": MERGE_GATE_PROGRAMS,
     "targeted-test": ("targeted_test.py",),
 }
+GATE_STEPS = frozenset(GATE_PROGRAMS)
 GATE_SCRIPTS = frozenset(script for programs in GATE_PROGRAMS.values() for script in programs)
 # The assigned target started no tests. A claim failure can allow the queue to place the gate again.
 GATE_PRELAUNCH_REFUSED_STATUS = 79
