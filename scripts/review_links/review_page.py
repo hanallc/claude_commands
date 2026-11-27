@@ -18,7 +18,7 @@ from collections.abc import Callable, Mapping
 from importlib import import_module
 from pathlib import Path
 from types import MappingProxyType
-from typing import NotRequired, TypedDict, cast
+from typing import NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode
 from zoneinfo import ZoneInfo
 
@@ -38,6 +38,7 @@ from scripts.review_links.review_items import source_stamp as source_stamp
 from scripts.statusline import rebuild_row
 
 PAGE_PATH = REVIEW_PATH
+DELIVERY_RESULT_HEADER = 'X-Review-Delivery-Result'
 NEW_ITEM_PATH = '/console/review/new-item'
 ATTACHMENT_PATH = '/console/review/attachment'
 HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
@@ -68,6 +69,10 @@ class ReviewBodyView(Enum):
     CARD = 'card'
     STUDIO_QUESTION = 'studio-question'
     STUDIO_INLINE = 'studio-inline'
+
+
+class NoStudioQuestion(Enum):
+    ABSENT = 'absent'
 
 
 def studio_question_open(item: ReviewItem) -> bool:
@@ -110,7 +115,8 @@ class ReviewIndexEntry(TypedDict):
 def record_revision(item: ReviewItem, assets: Mapping[str, str],
                     members: staff.StaffSnapshot | staff_names.NameReading = staff_names.NameReading.CURRENT, *,
                     question_route: change_browser.QuestionRoute | change_browser.QuestionRouteReading =
-                        change_browser.QuestionRouteReading.RESOLVE) -> str:
+                        change_browser.QuestionRouteReading.RESOLVE,
+                    studio_target: review_actions.StudioQuestionTarget | NoStudioQuestion = NoStudioQuestion.ABSENT) -> str:
     """Identify the complete retained record and its displayed assets."""
     source = item.source
     if isinstance(source, review_items.ChangeSource):
@@ -126,7 +132,7 @@ def record_revision(item: ReviewItem, assets: Mapping[str, str],
             question_route = change_browser.shown_question_route(source.record, members)
         route = (question_route.revision if isinstance(question_route, change_browser.QuestionRoute) else
                  (question_route, change_browser.receiver_names(members, (source.record.owner,))))
-        record = (item, route)
+        record = (item, route, studio_target.owner) if isinstance(studio_target, review_actions.StudioQuestionTarget) else (item, route)
     else:
         record = item
     retained = (record, assets.get(item.key, ''), assets.get('image:'+item.key, ''),
@@ -679,17 +685,29 @@ class ReviewDetailUnavailable:
 
 
 ReviewActionDetail = ConfirmedReviewDetail | ClosedReviewDetail | ReviewDetailUnavailable
+ReviewActionDelivery = change_page.MessageDelivery | change_page.NoMessageDelivery | review_actions.ListFeedbackDelivery
+
+
+class ReviewActionResult(NamedTuple):
+    delivery: ReviewActionDelivery
+    answer: str
 
 
 @dataclass(frozen=True)
 class ReviewSave:
     """The saved record, its published version and any message to deliver."""
-    delivery: change_page.MessageDelivery | change_page.NoMessageDelivery
+    action_delivery: ReviewActionDelivery
     answer: str
     version: str
     item: ReviewItem | ReviewRecordNotPublished
     detail: ReviewActionDetail = field(default_factory=ReviewDetailUnavailable)
-    list_notice: review_actions.ListFeedbackDelivery | None = None
+
+    @property
+    def delivery(self) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+        """Return the delivery that uses the Review store."""
+        if isinstance(self.action_delivery, review_actions.ListFeedbackDelivery):
+            return change_page.NoMessageDelivery()
+        return self.action_delivery
 
 
 @dataclass(frozen=True)
@@ -764,9 +782,8 @@ class ReviewSnapshotCache:
         key = fields['row'][0]
         with self._save_lock:
             current = self.get()
-            list_notices: list[review_actions.ListFeedbackDelivery] = []
             try:
-                delivery, answer = submit_snapshot(self.root, current, fields, status, list_notice=list_notices.append)
+                delivery, answer = submit_snapshot(self.root, current, fields, status)
             except review_items.ReviewRecordChanged:
                 try:
                     if key in current.records:
@@ -806,7 +823,7 @@ class ReviewSnapshotCache:
                 logging.getLogger(__name__).warning('Review saved %s. Publication will retry: %s', key, error)
             finally:
                 self.invalidate()
-            return ReviewSave(delivery, answer, version, item, detail, next(iter(list_notices), None))
+            return ReviewSave(delivery, answer, version, item, detail)
 
     def publish_delivery_result(self, key: str) -> None:
         """Publish the delivery result before reporting that delivery ended."""
@@ -1196,7 +1213,9 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
             names = names if names is not None else staff_names.StaffNames(staff.StaffSnapshot(()))
             heading = 'Sends to ' + names.role_label('showrunner', 'showrunner')
         groups = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading_html=heading)
-    return ('<form method="post" data-review-form>'+hidden+words+groups+acknowledge
+    later_receiver = change_browser.receiver_field(receivers.get('later', page_frame.SendWithoutName.UNAVAILABLE))
+    later_route = f' data-studio-later-receiver="{html.escape(later_receiver, quote=True)}"' if inline else ''
+    return ('<form method="post" data-review-form'+later_route+'>'+hidden+words+groups+acknowledge
             +'<span role="status" data-send-status hidden></span></form>')
 
 
@@ -1290,12 +1309,10 @@ def review_receivers(item: ReviewItem, members: staff.StaffSnapshot, *,
     return labels
 
 
-def studio_question_receivers(item: ReviewItem, members: staff.StaffSnapshot) -> dict[str, page_frame.SendReceiver]:
-    _, row = review_actions.studio_question_row(item)
-    owner = row.owner
-    assert not isinstance(owner, the_list.UnassignedOwner)
-    receiver = change_browser.receiver_names(members, (owner,))
-    return dict.fromkeys(('answer', 'question'), receiver)
+def studio_question_receivers(target: review_actions.StudioQuestionTarget,
+                              members: staff.StaffSnapshot) -> dict[str, page_frame.SendReceiver]:
+    receiver = change_browser.receiver_names(members, (target.owner,))
+    return dict.fromkeys(('answer', 'question', 'later'), receiver)
 
 
 def details(item: ReviewItem, inputs: ReviewBodyInputs, *,
@@ -1393,8 +1410,11 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs, *,
         body = ''
     if isinstance(source, review_items.QuestionSource) and question_route is change_browser.QuestionRouteReading.RESOLVE:
         question_route = change_browser.shown_question_route(source.record, inputs.members)
-    revision = record_revision(item, inputs.assets, inputs.members, question_route=question_route)
-    receivers = (studio_question_receivers(item, inputs.members) if studio_card and studio_question_open(item)
+    studio_target = (review_actions.studio_question_target(item) if studio_card and studio_question_open(item)
+                     else NoStudioQuestion.ABSENT)
+    revision = record_revision(item, inputs.assets, inputs.members, question_route=question_route, studio_target=studio_target)
+    receivers = (studio_question_receivers(studio_target, inputs.members)
+                 if isinstance(studio_target, review_actions.StudioQuestionTarget)
                  else review_receivers(item, inputs.members, question_route=question_route))
     actions = form(item, inputs.browser, inputs.words_rows, revision, owner=owner, validator=validator,
                    receivers=receivers, names=names, view=inputs.view,
@@ -1540,9 +1560,7 @@ def submit_response(item: ReviewItem, outcome: str, words: str, status: change_p
 
 
 def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list[str]],
-                    status: change_page.DeliveryStatus, *,
-                    list_notice: Callable[[review_actions.ListFeedbackDelivery], None] | None = None
-                    ) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
+                    status: change_page.DeliveryStatus) -> ReviewActionResult:
     key, token, outcome, words = (fields[field][0] for field in ('row', 'token', 'outcome', 'feedback'))
     if not secrets.compare_digest(token, change_browser.row_token(snapshot.browser, key)):
         raise question_record.AnswerRefused('row or page token does not match this page')
@@ -1552,11 +1570,12 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
 
     def validate_revision(current: ReviewItem, members: staff.StaffSnapshot, *,
                           question_route: change_browser.QuestionRoute | change_browser.QuestionRouteReading =
-                              change_browser.QuestionRouteReading.RESOLVE) -> ReviewItem:
+                              change_browser.QuestionRouteReading.RESOLVE
+                          ) -> review_actions.StudioQuestionTarget | NoStudioQuestion:
         if review_items.pending_list_move(current) is not investigation.NoListMove.ABSENT:
             raise review_items.ReviewRecordChanged(investigation.LIST_MOVE_PENDING)
-        if (review_items.on_list(current)
-                and not (studio_question_open(current) and outcome in ('answer', 'question', 'later'))):
+        studio_open = studio_question_open(current) and outcome in ('answer', 'question', 'later')
+        if review_items.on_list(current) and not studio_open:
             raise review_items.ReviewRecordChanged('Open the report on the List.')
         if current.state == ReviewState.DONE:
             raise review_items.ReviewRecordChanged('This item is already Done.')
@@ -1568,26 +1587,30 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         source = current.source
         if isinstance(source, review_items.QuestionSource) and question_route is change_browser.QuestionRouteReading.RESOLVE:
             question_route = change_browser.shown_question_route(source.record, members)
+        studio_target = review_actions.studio_question_target(current) if studio_open else NoStudioQuestion.ABSENT
         revision = fields.get('revision', [''])[0]
-        if revision != record_revision(current, assets, members, question_route=question_route) and not (
+        if revision != record_revision(current, assets, members, question_route=question_route, studio_target=studio_target) and not (
                 outcome == 'feedback' and _matches_feedback_retry(current, assets, revision, token, words, members)):
             raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
         shown = fields.get('receiver')
-        if shown is not None and outcome != 'later':
+        if shown is not None and (outcome != 'later' or studio_open):
             assignee = fields.get('assignee', [''])[0]
             if outcome == 'approve' and assignee:
                 receiver = change_browser.receiver_names(members, (staff.StaffId(assignee),))
             else:
-                receivers = (studio_question_receivers(current, members) if studio_question_open(current)
+                receivers = (studio_question_receivers(studio_target, members)
+                             if isinstance(studio_target, review_actions.StudioQuestionTarget)
                              else review_receivers(current, members, question_route=question_route))
                 receiver = change_browser.action_receiver(receivers, outcome, words)
             if shown[0] != change_browser.receiver_field(receiver):
                 raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
-        return current
+        return studio_target
 
     def validate() -> ReviewItem:
         members = staff.snapshot()
-        return validate_revision(review_items.read_current(root, retained, members), members)
+        current = review_items.read_current(root, retained, members)
+        _ = validate_revision(current, members)
+        return current
 
     if retained.type == ReviewType.FOR_YOU:
         members = staff.snapshot()
@@ -1597,7 +1620,7 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
                 or source.row.kind != 'action'):
             raise question_record.AnswerRefused('Choose an action on this card.')
         if source.row.status == 'done':
-            return change_page.NoMessageDelivery(), 'Done'
+            return ReviewActionResult(change_page.NoMessageDelivery(), 'Done')
         _ = validate_revision(item, members)
         store = ActionStore()
         try:
@@ -1609,7 +1632,7 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
                 completed = False
             if not completed:
                 raise
-        return change_page.NoMessageDelivery(), 'Done'
+        return ReviewActionResult(change_page.NoMessageDelivery(), 'Done')
 
     retained_source = retained.source
     if (isinstance(retained_source, review_items.QuestionSource) and retained.type == ReviewType.QUESTION
@@ -1621,14 +1644,15 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
             source = item.source
             assert isinstance(source, review_items.QuestionSource)
             route = change_browser.question_route(source.record, members)
-            _ = validate_revision(item, members, question_route=route)
+            studio_target = validate_revision(item, members, question_route=route)
             if outcome not in item.actions:
                 raise question_record.AnswerRefused('choose an action on this card')
             if not words.strip():
                 raise question_record.AnswerRefused('enter an answer')
             action = cast(change_page.QuestionOutcome, outcome)
-            if studio_question_open(item) and outcome in ('answer', 'question'):
-                delivery, answer = review_actions.studio_question_action(item, source.record, outcome, words, status, route)
+            if isinstance(studio_target, review_actions.StudioQuestionTarget) and outcome in ('answer', 'question'):
+                delivery, answer = review_actions.studio_question_action(
+                    item, source.record, outcome, words, status, route, studio_target)
             elif 'review_submission' in source.record.item:
                 delivery, answer = review_actions.sent_question_action(
                     item, source.record, route.production, action, words, status)
@@ -1638,35 +1662,33 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
                 delivery, answer = change_browser.submit_question(
                     question, action, words, status, save=change_browser.SelectedQuestionSave(), route=route)
             if outcome == 'question':
-                if studio_question_open(item):
-                    return delivery, 'question sent'
-                with review_items.after_store_write(item.key):
-                    delivery = review_actions.track_question(delivery, key, words, status)
-                return delivery, 'question sent'
+                if studio_target is NoStudioQuestion.ABSENT:
+                    with review_items.after_store_write(item.key):
+                        delivery = review_actions.track_question(delivery, key, words, status)
+                return ReviewActionResult(delivery, 'question sent')
         if outcome == 'answer':
             with review_items.after_store_write(key):
                 members = staff.snapshot()
                 file_exchange = cast(Callable[[ReviewItem, staff.StaffSnapshot, Path], None],
                                      import_module("scripts.review_links.answer_sources").file_saved_review)
                 file_exchange(review_items.read_current(root, item, members), members, root)
-        return delivery, 'feedback sent' if outcome == 'feedback' else answer
+        return ReviewActionResult(delivery, 'feedback sent' if outcome == 'feedback' else answer)
 
-    item = validate()
+    members = staff.snapshot()
+    item = review_items.read_current(root, retained, members)
+    studio_target = validate_revision(item, members)
     if outcome == 'read' and can_acknowledge_answer(item):
-        return acknowledge_answer(root, item, validate)
+        return ReviewActionResult(*acknowledge_answer(root, item, validate))
     if item.type == ReviewType.RESPONSE:
-        return submit_response(item, outcome, words, status, validate)
+        return ReviewActionResult(*submit_response(item, outcome, words, status, validate))
     if waiting_change(item) or (item.state == ReviewState.VALIDATING and outcome != 'question'):
         raise change_page.ChangeHandoffRefused(change_page.WITH_SHOWRUNNER)
     if outcome == 'later':
-        if list_notice is not None and studio_question_open(item):
-            notice, answer = review_actions.studio_later(
-                item, fields.get('later', [''])[0], words, verify_revision=validate)
-            if isinstance(notice, review_actions.ListFeedbackDelivery):
-                list_notice(notice)
-            return change_page.NoMessageDelivery(), answer
-        return change_page.NoMessageDelivery(), review_actions.later(
-            item, fields.get('later', [''])[0], words, verify_revision=validate, root=root)
+        until = fields.get('later', [''])[0]
+        if isinstance(studio_target, review_actions.StudioQuestionTarget):
+            return ReviewActionResult(*review_actions.studio_later(studio_target, until, words, verify_revision=validate))
+        return ReviewActionResult(change_page.NoMessageDelivery(), review_actions.later(
+            item, until, words, verify_revision=validate, root=root))
     if outcome not in item.actions:
         raise question_record.AnswerRefused('choose an action on this card')
     source = item.source
@@ -1680,14 +1702,14 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
             with review_items.after_store_write(item.key):
                 change_review.record_review_log(delivery.page.review_list, delivery.row,
                                                 label+(': '+words if words else ''), delivery.page.production)
-        return delivery, {'validate':'asked the showrunner to check', 'question':'question saved',
-                          'feedback':'feedback sent'}.get(outcome, outcome)
+        return ReviewActionResult(delivery, {'validate':'asked the showrunner to check', 'question':'question saved',
+                                            'feedback':'feedback sent'}.get(outcome, outcome))
     if isinstance(source, review_items.InvestigationSource):
         delivery, answer = review_actions.investigation_action(item, outcome, words, status, verify_revision=validate)
     else:
         delivery, answer = review_actions.decision_action(
             item, outcome, words, status, assignee=fields.get('assignee', [''])[0], verify_revision=validate)
-    return delivery, 'feedback sent' if outcome == 'feedback' else answer
+    return ReviewActionResult(delivery, 'feedback sent' if outcome == 'feedback' else answer)
 
 
 def can_acknowledge_answer(item: ReviewItem) -> bool:
@@ -1705,19 +1727,29 @@ def acknowledge_answer(root: Path, item: ReviewItem, verify_revision: Callable[[
 
 def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
            snapshot: ReviewSnapshot | None = None) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
+    """Save a Review action for callers that use the Review delivery store."""
     fields = review_fields(body)
-    if snapshot is not None:
-        return submit_snapshot(root, snapshot, fields, status)
-    if 'receiver' in fields:
-        return submit_snapshot(root, build_snapshot(root), fields, status)
-    browser = change_page.ReviewBrowser(*change_browser.browser_manifest(change_page.console_folder(root)))
+    outcome, words = fields['outcome'][0], fields['feedback'][0]
     key = fields['row'][0]
+
+    def submit_review_action(current: ReviewSnapshot) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
+        item = current.records.get(key)
+        if outcome == 'later' and item is not None and studio_question_open(item):
+            raise question_record.AnswerRefused('Use the Studio form to park this question.')
+        delivery, answer = submit_snapshot(root, current, fields, status)
+        assert not isinstance(delivery, review_actions.ListFeedbackDelivery)
+        return delivery, answer
+
+    if snapshot is not None or 'receiver' in fields:
+        return submit_review_action(snapshot if snapshot is not None else build_snapshot(root))
+    browser = change_page.ReviewBrowser(*change_browser.browser_manifest(change_page.console_folder(root)))
     if not secrets.compare_digest(fields['token'][0],change_browser.row_token(browser,key)):
         raise question_record.AnswerRefused('row or page token does not match this page')
-    outcome, words = fields['outcome'][0], fields['feedback'][0]
     if key.startswith('question/'):
         question_item = next((item for item in review_items.read(root, kinds=review_items.QUESTION_TYPES)
                               if item.key == key), None)
+        if question_item is not None and studio_question_open(question_item) and outcome in ('answer', 'question', 'later'):
+            return submit_review_action(build_snapshot(root))
         if question_item is not None and repeats_response_followup(question_item, outcome, words, status):
             raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
         if (question_item is not None and question_item.type == ReviewType.RESPONSE
@@ -2087,14 +2119,16 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
   refreshError(error);
  }
 }
-async function saveReviewAction(data,{url=location.pathname,hold,button,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
+async function saveReviewAction(data,{url=location.pathname,hold,button,reportDelivery=false,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
  let conflict=false,confirmed=false;
  try{
-  const outcome=data.get('outcome'), receiver=sendReceiver(button);
-  if(outcome!=='later') data.set('receiver',receiver ?? '');
+  const outcome=data.get('outcome'),later=outcome==='later';
+  const receiver=later ? button.form.dataset.studioLaterReceiver : sendReceiver(button);
+  if(!later || receiver!==undefined) data.set('receiver',receiver ?? '');
   sending?.();
-  const response=await hold.post(url,{method:'POST',body:data},
-   outcome==='later' || outcome==='validate' ? null : receiver);
+  const headers=reportDelivery ? {'X-Review-Delivery-Result':'1'} : undefined;
+  const response=await hold.post(url,{method:'POST',body:data,headers},
+   outcome==='validate' || (later && (!receiver || !data.get('feedback').trim())) ? null : receiver);
   conflict=response.status===409;
   confirmed=response.ok;
   if(confirmed) confirmedSave?.();

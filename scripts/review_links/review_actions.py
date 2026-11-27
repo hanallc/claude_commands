@@ -280,7 +280,14 @@ def question_action(item: review_items.ReviewItem, action: change_page.QuestionO
     return change_browser.submit_question(question, action, words, status, save=change_browser.SelectedQuestionSave())
 
 
-def studio_question_row(item: review_items.ReviewItem) -> tuple[staff.StaffId, the_list.ListItem]:
+@dataclass(frozen=True)
+class StudioQuestionTarget:
+    keeper: staff.StaffId
+    number: int
+    owner: staff.StaffId
+
+
+def studio_question_target(item: review_items.ReviewItem) -> StudioQuestionTarget:
     handoff = item.exchange_handoff
     if not isinstance(handoff, review_items.FiledReviewExchange) or not handoff.open_staff_question:
         raise question_record.AnswerRefused('This question is no longer open on the Studio.')
@@ -288,16 +295,14 @@ def studio_question_row(item: review_items.ReviewItem) -> tuple[staff.StaffId, t
     row = the_list.load(destination.keeper, f'L{destination.number}')
     if isinstance(row.owner, the_list.UnassignedOwner):
         raise question_record.AnswerRefused('This item has no owner.')
-    return destination.keeper, row
+    return StudioQuestionTarget(destination.keeper, row.number, row.owner)
 
 
 def studio_question_action(item: review_items.ReviewItem, record: update_registration.QuestionRecord,
                            action: Literal['answer', 'question'], words: str,
-                           status: change_page.DeliveryStatus, route: change_browser.QuestionRoute
+                           status: change_page.DeliveryStatus, route: change_browser.QuestionRoute,
+                           target: StudioQuestionTarget
                            ) -> tuple[change_page.MessageDelivery, str]:
-    _, row = studio_question_row(item)
-    owner = row.owner
-    assert not isinstance(owner, the_list.UnassignedOwner)
     question = change_browser.WaitingQuestion(item.key, '', record, update_registration.question_source(route.production),
                                               record.owner, '')
     message = change_browser.question_message(action, route.production.name, item.title, route.relay.unit, words, item.key)
@@ -319,7 +324,7 @@ def studio_question_action(item: review_items.ReviewItem, record: update_registr
         change_browser.save_question_record(route.production, question, action, words,
                                             change_browser.SelectedQuestionSave(), before_write=lambda: None)
 
-    return save_delivery(page, owner, save, status, opened), words
+    return save_delivery(page, target.owner, save, status, opened), words
 
 
 @dataclass(frozen=True)
@@ -411,18 +416,6 @@ def _save_review_park(item: review_items.ReviewItem, until: datetime, words: str
                       check_deadline: Callable[[datetime], None],
                       verify_revision: Callable[[], object] | None, root: Path | None) -> str:
     event = 'Later until '+question_path.write_later(until)+(': '+words if words else '')
-    handoff = item.exchange_handoff
-    if isinstance(handoff, review_items.FiledReviewExchange) and handoff.open_staff_question:
-        def check_studio_deadline(moment: datetime) -> None:
-            if verify_revision is not None:
-                _ = verify_revision()
-            check_deadline(moment)
-
-        destination = handoff.destination
-        _ = the_list.park(destination.keeper, f"L{destination.number}", until, source=the_list.PAGE_SOURCE,
-                          note='Later: '+words if words else '', check_deadline=check_studio_deadline)
-        return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
-
     def record_later(publish_deadline: Callable[[], None]) -> None:
         def check_and_publish() -> None:
             if verify_revision is not None:
@@ -439,12 +432,10 @@ def _save_review_park(item: review_items.ReviewItem, until: datetime, words: str
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
 
 
-def studio_later(item: review_items.ReviewItem, value: str, words: str, *,
+def studio_later(target: StudioQuestionTarget, value: str, words: str, *,
                  verify_revision: Callable[[], object]
                  ) -> tuple[ListFeedbackDelivery | change_page.NoMessageDelivery, str]:
-    keeper, row = studio_question_row(item)
-    owner = row.owner
-    assert not isinstance(owner, the_list.UnassignedOwner)
+    identity = f'L{target.number}'
     zone = user_zone()
     request = secrets.token_hex(16)
 
@@ -452,21 +443,19 @@ def studio_later(item: review_items.ReviewItem, value: str, words: str, *,
              ) -> tuple[ListFeedbackDelivery | change_page.NoMessageDelivery, str]:
         until = until.astimezone(zone)
         label = 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
-        message = f'Studio: nate parked item {row.number} {label}.\n\n{words}'
-        notice = (the_list.PageItemNotice(request, message, 'park', words, recipient=owner,
+        message = f'Studio: nate parked item {target.number} {label}.\n\n{words}'
+        notice = (the_list.PageItemNotice(request, message, 'park', words, recipient=target.owner,
                                           origin=the_list.PageNoticeOrigin.STUDIO)
                   if words.strip() else the_list.NoPageRequest.ABSENT)
 
         def check_current(moment: datetime) -> None:
             _ = verify_revision()
-            if the_list.load(keeper, row.id).owner != owner:
-                raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
             check(moment)
 
-        saved = the_list.park(keeper, row.id, until, source=the_list.PAGE_SOURCE, notice=notice,
-                              note='Later: '+words if words.strip() else '', check_deadline=check_current)
-        delivery = (ListFeedbackDelivery(keeper, row.id, request)
-                    if request in the_list.feedback_requests(saved) else change_page.NoMessageDelivery())
+        _ = the_list.park(target.keeper, identity, until, source=the_list.PAGE_SOURCE, notice=notice,
+                          note='Later: '+words if words.strip() else '', check_deadline=check_current)
+        delivery = (ListFeedbackDelivery(target.keeper, identity, request)
+                    if isinstance(notice, the_list.PageItemNotice) else change_page.NoMessageDelivery())
         return delivery, label
 
     return save_timed_park(value, zone, save)

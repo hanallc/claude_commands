@@ -3709,7 +3709,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
                 changed = replace(changed, parked_until=NoTimestamp.UNSET)
                 entries.append(ItemChange(moment, UnparkedForDelivery(ItemDelivered.RECORDED), source))
         if isinstance(request, PageRequest):
-            if entries and isinstance(page_action, PageItemNotice):
+            if isinstance(page_action, PageItemNotice) and (
+                    entries or page_action.action == "park" and page_action.origin is PageNoticeOrigin.STUDIO):
                 pending = PageFeedback(page_action.request, page_action.words, action=page_action.action,
                                        form_words=request.form_words, parked_until=request.parked_until,
                                        recipient=page_action.recipient, origin=page_action.origin)
@@ -5305,7 +5306,6 @@ class _ListQuestionStore:
     def save_request(self, item: ListItem, request: PageRequest, question: question_record.Question) -> None:
         moment = now()
         if self.followup and item.state is ItemState.ANSWERED:
-            item = replace(item, log=(*item.log, ItemChange(moment, MarkedRead(), PAGE_SOURCE)))
             item = _move_question(item, QuestionMove.FOLLOW_UP, ItemState.WORKING, moment)
         receipt = ItemChange(moment, QuestionRequestReceipt(request, question.question_id, self.followup), PAGE_SOURCE)
         _ = _save_page_request(_store(self.keeper), self.keeper, replace(item, log=(*item.log, receipt)), request)

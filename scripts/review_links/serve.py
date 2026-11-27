@@ -2245,7 +2245,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, RuntimeError, change_page.Refusal) as error:
             self.browser_failure(503, "The answer could not be saved.", error)
             return
-        pending = saved.list_notice is not None or isinstance(saved.delivery, change_page.MessageDelivery)
+        action_delivery = saved.action_delivery
+        pending = not isinstance(action_delivery, change_page.NoMessageDelivery)
         result: dict[str, object] = {'answer':saved.answer, 'version':saved.version, 'delivery_pending':pending}
         if isinstance(saved.detail, review_page.ConfirmedReviewDetail):
             result.update(detail_html=saved.detail.body, detail_revision=saved.detail.revision)
@@ -2259,12 +2260,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             result.update(state=state, type=saved.item.type,
                           later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
         def deliver_saved(*, report_outcome: bool = False) -> change_page.DeliveryOutcome:
-            if saved.list_notice is not None:
-                return list_page.deliver_with_outcome(saved.list_notice)
-            delivery = change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status)
+            if isinstance(action_delivery, review_actions.ListFeedbackDelivery):
+                return list_page.deliver_with_outcome(action_delivery)
+            delivery = change_page.finish_verdict_cleanup(action_delivery, server.delivery_status)
             return self.deliver_review(server, delivery, report_outcome=report_outcome)
 
-        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
+        if (self.headers.get(send_hold.REPLAY_HEADER) == "1"
+                or self.headers.get(review_page.DELIVERY_RESULT_HEADER) == "1"):
             outcome = deliver_saved(report_outcome=True)
             result.update(held_delivery_result(outcome, not pending))
             result['delivery_pending'] = False

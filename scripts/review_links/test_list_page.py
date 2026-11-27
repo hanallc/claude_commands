@@ -1839,6 +1839,50 @@ if(example.filterOn){
 """, add_item=False, reduced_motion=True, open_number=2)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_linked_overlay_receives_deferred_review_content(self) -> None:
+        target = self.add("Check the linked result", number=1)
+        target = the_list.link(MORTY.id, target.id, ("sdlc/C1",), source="morty")
+        source = self.add("Read the first result", number=2)
+        _ = the_list.update(MORTY.id, source.id, {"related_to": (target.number,)}, source="morty")
+        key = list_page.ListRecord(MORTY.id, target).key
+        counts = (f'<template data-list-review-key="{key}" data-list-review-version="{list_page.review_version(target)}">'
+                  '<span data-list-review-summary>1 change for you</span>'
+                  '<div data-list-review-links><a href="/console/?page=review">sdlc/C1</a></div></template>')
+        markup = list_page.render(self.root / "reviews", defer_counts=True,
+                                  review_records=list_page.LinkedReviewRead.AFTER_RENDER).decode()
+        setup = """<script>
+let sendCounts;
+window.fetch=()=>new Promise(resolve=>{
+ sendCounts=()=>resolve({ok:true,text:async()=>COUNTS});
+});
+</script>""".replace("COUNTS", json.dumps(counts))
+        self.browser_actions(markup, setup, r"""
+<script>
+(async()=>{
+ const failures=[],check=(value,message)=>{if(!value) failures.push(message);};
+ try{
+  const row=number=>document.querySelector('[data-list-item][data-number="'+number+'"]');
+  row(2).querySelector('.list-toggle').click();
+  recordDetails(row(2)).querySelector('[data-list-linked-card]').click();
+  const overlay=document.querySelector('[data-list-linked-overlay] [data-list-item]');
+  const words=recordDetails(overlay).querySelector('textarea');
+  words.value='Keep these words.';words.dispatchEvent(new Event('input'));
+  check(overlay.dataset.listReviewVersion===row(1).dataset.listReviewVersion,'The overlay starts with the same revision.');
+  sendCounts();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  for(const item of [row(1),overlay]){
+   check(item.querySelector('[data-list-review-summary]').textContent==='1 change for you','The summary updates.');
+   check(recordDetails(item).querySelector('[data-list-review-links] a')?.textContent==='sdlc/C1','The Review link updates.');
+  }
+  check(recordDetails(overlay).querySelector('textarea')===words && words.value==='Keep these words.',
+   'The overlay keeps the draft.');
+ }catch(error){failures.push(String(error));}
+ const result=document.createElement('p');result.id='probe-results';
+ result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>""", reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_tab_filters_the_rows_to_its_producer(self) -> None:
         _ = self.fixture_items()
         _ = self.studio_avatars(DWIGHT.id)
@@ -3110,6 +3154,30 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         exchange, = saved.filed_exchanges
         assert isinstance(exchange.answer, list_exchange.ExchangeAnswer)
         self.assertEqual(exchange.answer.text, "Use the wide layout.")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_studio_question_shows_delivery_failure_with_undo_disabled(self) -> None:
+        item = self.studio_team_question()
+        failure = change_page.FailedDelivery("attempt", self.root / "question.md", item.id, "The owner is offline.")
+        with (patch.object(serve.ReviewLinksHandler, "deliver_review", return_value=failure) as deliver,
+              self.studio_review_server() as origin):
+            self.open_studio_review_fixture(origin, "#show=questions")
+            self.studio_review_check(r"""
+ const item=row(1);
+ item.querySelector('.list-toggle').click();
+ const form=()=>recordDetails(item).querySelector('[data-studio-question-card] [data-review-form]');
+ await until(form);
+ form().elements.feedback.value='Use the wide layout.';
+ form().querySelector('[value="answer"]').click();
+ await until(()=>!recordIsOpen(item));
+ const status=document.querySelector('[data-hidden-action-status]');
+ check(!status.hidden && status.textContent.includes('Saved. Delivery failed: The owner is offline.'),
+  'The closed row reports that the answer saved and delivery failed.');
+""")
+        deliver.assert_called_once()
+        self.assertIs(cast(object, deliver.call_args.kwargs["report_outcome"]), True)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.state, the_list.ItemState.WORKING)
 
     def studio_team_question(self) -> the_list.ListItem:
         members = staff.snapshot()

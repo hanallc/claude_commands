@@ -213,10 +213,10 @@ def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
               unread_delivery: bool = False, unread_answer: bool = False, open_ask: bool = False,
               report: bool = False, question_item: bool = False, open_followup: bool = False) -> ListChip:
     """Find the one status chip for this item."""
-    if question_item and (state is the_list.ItemState.ANSWERED or unread_answer):
-        return ListChip.ANSWERS
     if open_followup:
         return ListChip.QUESTIONS
+    if question_item and (state is the_list.ItemState.ANSWERED or unread_answer):
+        return ListChip.ANSWERS
     if state is the_list.ItemState.SCHEDULED:
         return ListChip.SCHEDULED
     if state == the_list.ItemState.REPAIRED:
@@ -2849,8 +2849,8 @@ const questionNeedsRead=data=>data.questionItem!==undefined &&
  (data.state==='Answered' || data.unreadAnswer==='true');
 const chipFor=data=>{
  if(data.undoPending==='true' || data.sendHeld!==undefined) return;
- if(questionNeedsRead(data)) return 'answers';
  if(data.openFollowup==='true') return 'questions';
+ if(questionNeedsRead(data)) return 'answers';
  if(data.state==='Closed') return;
  if(data.state==='Repaired') return 'needs-me';
  if(data.state==='Scheduled') return 'scheduled';
@@ -3134,6 +3134,7 @@ async function loadStudioQuestion(item,card,view){
   card.dataset.loaded='ready';
   if(view!==tableView) nameOverlayFields(item);
   bindStudioQuestion(item,card,form,view);
+  showActionFailure(card.querySelector('[data-send-status]'),view.actionNotice(item));
  }catch(error){
   if(current()) showActionFailure(notice,error.message);
  }finally{
@@ -3147,17 +3148,27 @@ function bindStudioQuestion(item,card,form,view){
   const action=data.get('outcome'),key=item.dataset.key;
   const draftKey=reviewFormKey(form), submittedDraft=rememberReviewDraft(form);
   const hold=holdCard(item,hidden=>{if(hidden) view.applyAction();});
-  let saved=false;
+  const resultItem=view===tableView ? item : rowIn(content,key);
+  const submission=resultItem && tableView.startAction(resultItem);
+  let saved=false,deliveryResult;
   startListSave();
   showNotice('');
   await saveReviewAction(data,{
-   url:reviewPagePath,hold,button,
+   url:reviewPagePath,hold,button,reportDelivery:true,
    sending:()=>setCardSubmitting(form,true),
    confirmedSave:()=>{
     saved=true;
     if(reviewDrafts.get(draftKey)===submittedDraft) reviewDrafts.delete(draftKey);
    },
-   saved:()=>{},
+   saved:result=>{
+    if(result.send_failure){
+     deliveryResult={kind:'failure',message:'Saved. '+result.send_failure};
+    }else if(!result.no_message && result.delivery_pending===false){
+     const receiver=data.get('receiver');
+     const message=receiver ? 'Sent to '+receiver+'.' : 'Sent.';
+     deliveryResult={kind:'success',message,hiddenMessage:'Item #'+item.dataset.number+': '+message};
+    }
+   },
    failed:reason=>showNotice('Not saved: '+reason),
    undone:message=>{showNotice(message);form.elements.feedback.focus({preventScroll:true});},
    displayFailed:()=>showNotice('Saved; the item could not refresh.'),
@@ -3171,6 +3182,10 @@ function bindStudioQuestion(item,card,form,view){
     view.preserveRecordRowTop(()=>{
      if(saved && (action==='answer' || action==='later')) view.closeCard(key,{focusShow:true});
      else if(form.isConnected){setCardSubmitting(form,false);syncControls();}
+     if(deliveryResult){
+      if(resultItem) tableView.showActionResult(resultItem,submission,'Item #'+item.dataset.number,deliveryResult);
+      if(card.isConnected) showNotice(deliveryResult.message);
+     }
      view.applyAction();
     });
     if(saved && action==='question') void loadStudioQuestion(item,card,view);
@@ -3938,7 +3953,8 @@ function bindFeedbackForm(form,view=tableView){
    if(hadFocus) document.addEventListener('focusin',trackFocus);
    let saved=false,refused=false,retried=false,stale=false,focusParkedAfterClose=false,focusDraft=false,nextForm;
    let repairDelivered=false;
-   const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
+   const clearsUnread=action==='read' || usesWords && (!asksQuestion || item.dataset.questionItem===undefined);
+   const unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    const releasesLink=action==='read' || parks || scheduleWrite || action==='remove' || (action==='unpark' && heldSave);
    let restoreLink;
    const submission=view.preserveRecordRowTop(()=>{
@@ -4255,10 +4271,11 @@ document.addEventListener('submit',async event=>{
 });
 let listCounts=null,reviewSaveVersion=0;
 const listCountsSource=()=>content.querySelector('[data-list-counts-url]');
-function presentReviewLinks(row,links){
+function presentReviewLinks(row,links,view=tableView){
  const target=recordDetails(row).querySelector('[data-list-review-links]');
  if(target && links && target.innerHTML!==links.innerHTML)
-  tableView.updateItemDetail(row,detail=>detail.querySelector('[data-list-review-links]').replaceChildren(...links.childNodes));
+  view.updateItemDetail(row,detail=>detail.querySelector('[data-list-review-links]').replaceChildren(
+   ...links.cloneNode(true).childNodes));
 }
 function rowIn(root,key){
  key=resolveListKey(root,key);
@@ -4303,23 +4320,28 @@ function fillListCounts(footer,markup){
  return updates;
 }
 function updateLinkedRows(rows,updates){
+ const overlay=activeListCard?.item;
  for(const row of rows){
   const version=row.dataset.listReviewVersion;
   if(!version) continue;
   const update=updates.get(row.dataset.key);
-  const summary=row.querySelector('[data-list-review-summary]');
-  if(!update || update.dataset.listReviewVersion!==version){
-   if(summary) summary.textContent=summary.dataset.listReviewSummary;
-   continue;
-  }
-  if(summary){
-   summary.replaceChildren(...update.content.querySelector('[data-list-review-summary]').childNodes);
-   summary.dataset.listReviewSummary='';
-  }
-  const links=update.content.querySelector('[data-list-review-links]');
-  presentReviewLinks(row,links);
-  delete row.dataset.listReviewVersion;
+  applyLinkedReviewUpdate(row,update,tableView);
+  if(overlay?.dataset.key===row.dataset.key && overlay.dataset.listReviewVersion===version)
+   applyLinkedReviewUpdate(overlay,update,activeListCard.view);
  }
+}
+function applyLinkedReviewUpdate(row,update,view){
+ const summary=row.querySelector('[data-list-review-summary]');
+ if(!update || update.dataset.listReviewVersion!==row.dataset.listReviewVersion){
+  if(summary) summary.textContent=summary.dataset.listReviewSummary;
+  return;
+ }
+ if(summary){
+  summary.replaceChildren(...update.content.querySelector('[data-list-review-summary]').cloneNode(true).childNodes);
+  summary.dataset.listReviewSummary='';
+ }
+ presentReviewLinks(row,update.content.querySelector('[data-list-review-links]'),view);
+ delete row.dataset.listReviewVersion;
 }
 function keepRowBelowHeader(update){
  tableView.preserveRecordRowTop(()=>{

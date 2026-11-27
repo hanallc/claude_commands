@@ -47,7 +47,7 @@ from unittest.mock import ANY, Mock, call, patch
 
 
 from typing import IO, Literal, TextIO, TypedDict, cast, override
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 from xml.etree import ElementTree
@@ -6941,6 +6941,58 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(current, review_items.QuestionSource)
         self.assertEqual(current.record.item.get("followup", {}).get("text"), ask)
 
+    def test_studio_question_refuses_actions_after_the_list_owner_changes(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        snapshot = self.server.review_cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        new_owner = fixture_member("producer", name="new-layout-owner")
+        reassigned = the_list.update(row.keeper, row.item.id, {"owner": new_owner.id}, source="nate")
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        with capture_sender("send_to_staff") as send:
+            for action in ("later", "answer", "question"):
+                with self.subTest(action=action):
+                    body = case.body(key, action, "Check the desktop layout.") + "&" + urlencode({
+                        "revision": shown[1].decode(), "later": until.isoformat()})
+                    status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+                    self.assertEqual(status, 409, reply)
+        send.assert_not_called()
+        self.assertEqual(the_list.load(row.keeper, row.item.id), reassigned)
+
+    def test_studio_later_delivers_new_words_at_the_same_deadline(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        _ = the_list.park(row.keeper, row.item.id, until, source=the_list.PAGE_SOURCE)
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        words = "Check the mobile layout too."
+        body = case.body(key, "later", words) + "&" + urlencode({"revision": shown[1].decode(), "later": until.isoformat()})
+        with capture_sender("send_to_staff") as send:
+            status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+        self.assertEqual(status, 200, reply)
+        self.assert_studio_question_message(send, row, words)
+        saved = the_list.load(row.keeper, row.item.id)
+        self.assertEqual(saved.parked_until, until)
+        notice, = the_list.feedback_requests(saved).values()
+        self.assertEqual((notice.form_words, notice.state), (words, "sent"))
+
+    def test_submit_snapshot_returns_the_studio_later_delivery(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        snapshot = self.server.review_cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        words = "Wait for the desktop check."
+        body = case.body(key, "later", words) + "&" + urlencode({"revision": shown[1].decode(), "later": until.isoformat()})
+        delivery, _ = review_page.submit_snapshot(case.root, snapshot, parse_qs(body), case.status)
+        assert isinstance(delivery, review_actions.ListFeedbackDelivery)
+        self.assertEqual((delivery.keeper, delivery.identity), (row.keeper, row.item.id))
+        saved = the_list.load(row.keeper, row.item.id)
+        self.assertEqual(the_list.feedback_requests(saved)[delivery.request].form_words, words)
+
     def test_legacy_change_reply_retry_files_the_saved_answer(self) -> None:
         case = self.review_fixture(changes=1)
         page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, ("C1",), "")
@@ -7062,6 +7114,31 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(the_list.unread_answer_ids(closed), frozenset())
             self.assertEqual(sum(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Closed"
                                  for entry in closed.log), 1)
+
+    def test_studio_followup_keeps_two_replies_unread_under_questions(self) -> None:
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        item = self.working_studio_question(keeper.id, owner.id)
+        status = self.server.delivery_status
+        with (patch.object(change_page, "send_question", return_value=question_outcome()),
+              redirect_stdout(StringIO())):
+            for words in ("Which width fits?", "Which margin fits?"):
+                request = the_list.PageRequest(uuid4().hex, "question", words)
+                change_page.deliver(the_list.ask_question(keeper.id, item.id, request, status), status)
+            with patch.object(staff, "caller_identity", return_value=keeper.current_session):
+                for question, words in (("Q1", "Use 800 pixels."), ("Q2", "Use 16 pixels.")):
+                    self.assertEqual(the_list.main(["answer", item.id, "--question", question, "--text", words]), 0)
+            answered = the_list.load(keeper.id, item.id)
+            self.assertEqual(the_list.unread_answer_ids(answered), {"Q1", "Q2"})
+            followup = the_list.PageRequest(uuid4().hex, "question", "What fits on a phone?")
+            change_page.deliver(the_list.ask_question(keeper.id, item.id, followup, status), status)
+        pending = the_list.load(keeper.id, item.id)
+        self.assertEqual(the_list.unread_answer_ids(pending), {"Q1", "Q2"})
+        self.assertEqual(self.list_filter_markup("?show=answers")[0], [])
+        self.assertEqual(self.list_filter_markup("?show=questions")[0], [str(item.number)])
+        read = the_list.mark_read(keeper.id, item.id, source=the_list.PAGE_SOURCE)
+        self.assertEqual(the_list.unread_answer_ids(read), frozenset())
+        self.assertTrue(the_list.has_open_followup(read))
 
     def test_studio_asks_two_followups_on_the_same_answered_item(self) -> None:
         keeper = self.configure_list_keeper()
