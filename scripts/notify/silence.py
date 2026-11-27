@@ -83,6 +83,7 @@ class KeptPush(TypedDict):
     reference: NotRequired[push_reference.PushReference]
     due: NotRequired[str]
     need: NotRequired[str]
+    header: NotRequired[str]
     source: str
     priority: str
     title: str
@@ -167,9 +168,10 @@ def parse_push(text: str) -> KeptPush | None:
         return None
     record = cast(dict[str, object], value)
     # A line kept before pushes had a key or a text id reads as key "" and text id "" (free text).
-    found = {name: record.get(name) for name in KeptPush.__annotations__ if name not in {"due", "need", "reference", "silence_policy"}} | {
+    found = {name: record.get(name) for name in KeptPush.__annotations__
+             if name not in {"due", "need", "header", "reference", "silence_policy"}} | {
         "key": record.get("key", ""), "text_id": record.get("text_id", "")}
-    for name in ("due", "need"):
+    for name in ("due", "need", "header"):
         if name in record:
             found[name] = record[name]
     if not all(isinstance(item, str) for item in found.values()):

@@ -646,7 +646,9 @@ The module reads `PROCESS_TABLE_PS` at import and uses only the standard library
 - `ActionRequired(text)`, `NoActionRequired()`, `UserAction = ActionRequired | NoActionRequired`, `ActionUnstated()`, `ActionRefused(reason)`, `ActionAllowed()`.
 - `parse_user_action(action, no_action) -> UserAction | ActionUnstated | ActionRefused` refuses both flags together, empty text and placeholder text (`none`, `n/a`, `nothing`, `no action`, `-`, any case).
 - `refused_at(action, priority) -> ActionAllowed | ActionRefused` refuses `NoActionRequired` above priority 0.
-- `first_line(action, session)`: `Action: <text>` or `No action needed.`, with an optional `Session: <name>` line above it (`SessionLine | NoSessionLine`); `FIX` is the recovery text and `REFUSED_BEFORE_SENDING` the stderr marker.
+- `notification_header(action, session)` includes a line for each session or action present. The session line comes first.
+- `notification_message(action, body, session)` joins the header and body with a line break when both are present.
+- `FIX` gives the recovery text. `REFUSED_BEFORE_SENDING` gives the stderr marker.
 
 `scripts/notify/pushover.py --text-id ID --value k=v…` is the direct phone boundary.
 It refuses a missing template before review, credentials, claims, or posting.
