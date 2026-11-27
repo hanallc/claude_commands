@@ -170,6 +170,25 @@ def dispatch_run_fields(parent: StaffId, run: Path, *, record: staff.StaffSnapsh
     return fields
 
 
+def _lock_dispatch_run(owner: staff.StaffRow, run: Path, paths: EnrolledPaths | OrdinaryWorkerOwner,
+                       recorder_lock: ExitStack) -> dict[str, object] | AdmissionRefused:
+    try:
+        path = pass_recorder.recorder_lock_path(run)
+        if isinstance(paths, EnrolledPaths):
+            worker = cast(progress_history.RunArtifactFactory, cast(object, import_module("scripts.production.worker")))
+            recorder = recorder_lock.enter_context(worker.CompletionArtifacts(owner, run).append(path))
+        else:
+            recorder = recorder_lock.enter_context(path.open("a+", encoding="utf-8"))
+        # Keep the worker lock. Finish-run checks it without waiting.
+        fcntl.flock(recorder.fileno(), fcntl.LOCK_SH)
+        fields = dispatch_run_fields(owner.id, run, record=staff.snapshot())
+    except (OSError, ValueError, staff.StaffUnreadable) as error:
+        return AdmissionRefused(str(error))
+    if not isinstance(fields, AdmissionRefused) and unit_runs.terminal_run(fields):
+        return AdmissionRefused(f"{run}: the run has ended dispatch admission")
+    return fields
+
+
 @dataclass(frozen=True)
 class CreatedWorkerPane:
     """This start created the pane with this terminal."""
@@ -1723,23 +1742,9 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             if unit_runs.terminal_run(fields):
                 return AdmissionRefused(f"{run}: the run has ended dispatch admission")
             if isinstance(dispatch_run, DispatchRun):
-                try:
-                    path = pass_recorder.recorder_lock_path(run)
-                    if isinstance(paths, EnrolledPaths):
-                        worker = cast(progress_history.RunArtifactFactory, cast(object,
-                            import_module("scripts.production.worker")))
-                        recorder = recorder_lock.enter_context(worker.CompletionArtifacts(owner, run).append(path))
-                    else:
-                        recorder = recorder_lock.enter_context(path.open("a+", encoding="utf-8"))
-                    # Keep the worker lock while holding the recorder lock. Finish-run probes the worker lock without waiting.
-                    fcntl.flock(recorder.fileno(), fcntl.LOCK_SH)
-                    fields = dispatch_run_fields(parent, run, record=staff.snapshot())
-                except (OSError, ValueError, staff.StaffUnreadable) as error:
-                    return AdmissionRefused(str(error))
+                fields = _lock_dispatch_run(owner, run, paths, recorder_lock)
                 if isinstance(fields, AdmissionRefused):
                     return fields
-                if unit_runs.terminal_run(fields):
-                    return AdmissionRefused(f"{run}: the run has ended dispatch admission")
             phase = _worker_phase(fields, owner, existing, record) if phase is None else phase
             berth_session = (phase_reservation.phase_session_id(owner.current_session, phase)
                              if phase and phase not in ("ad hoc", "adhoc", pass_recorder.AS_BUILT_PHASE) else "")
@@ -1835,6 +1840,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     backend = staff.backend(row) if row is not None else staff.BACKEND_UNAVAILABLE
     switching = not isinstance(backend, staff.BackendUnavailable) and backend.family != policy.settings.kind
     explicit = isinstance(dispatch_run, DispatchRun)
+    recheck_run_before_restart = False
     if row is not None and not lock.owns(row):
         return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
@@ -1904,6 +1910,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 state = next((item for item in recovered.states if item.row.id == row.id), None)
                 if isinstance(state, OpenWorker) and berth_session:
                     current, evidence = state, recovered
+                    recheck_run_before_restart = explicit
                 elif isinstance(state, (OpenWorker, ProcessUnknownWorker, UncertainWorker)):
                     _layout_after_open(owner.id, recovered, publish_lock_seconds)
                     return state
@@ -1957,6 +1964,10 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         closable = can_close(current, lock=lock, legacy_proof=proof)
         if isinstance(closable, Kept):
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
+        if recheck_run_before_restart:
+            fields = _lock_dispatch_run(owner, allowed.run, paths, recorder_lock)
+            if isinstance(fields, AdmissionRefused):
+                return fields
     elif switching and current is not None:
         closable = can_close(current, lock=lock)
         if isinstance(closable, Kept):

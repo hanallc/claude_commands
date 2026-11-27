@@ -2484,6 +2484,38 @@ class WorkerCommandTests(unittest.TestCase):
         first_turn.assert_called_once()
         self.assertIsInstance(result, worker_panes.OpenWorker)
 
+    def test_interrupted_start_cannot_restart_for_a_new_berth_after_run_end(self) -> None:
+        parent = self.fixture.parent
+        world = self.fixture.world
+        run = self.run_dir
+        name = staff.WorkerName.parse("impl")
+        policy = worker_panes.launch_policy("impl", family="codex")
+        with patch.object(worker_admission, "publish", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = worker_panes.start_or_resume(parent.id, name, "impl", policy=policy,
+                    dispatch_run=worker_panes.DispatchRun(run), phase="7")
+        self.assertEqual(world.requests[-1][2]["CARGO_BERTH_SESSION_ID"], f"{parent.current_session}.phase-7")
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=parent.id), [])
+        native_session = cast(Callable[..., str], world.native_session)
+
+        def finish_during_recovery(pane: str, *args: object, **kwargs: object) -> str:
+            self.assertEqual(len(world.launches), 1)
+            with file_lock.exclusive(pass_recorder.recorder_lock_path(run), wait=False) as recorder:
+                self.assertIs(recorder, file_lock.LockResult.ACQUIRED)
+            _ = progress_history.end_run(run, progress_history.RunEndRequested("completed"))
+            self.assertTrue(unit_runs.terminal_run(unit_runs.read_run_fields(run)))
+            self.agent.append(pane, "assistant", "Ready.")
+            return native_session(pane, *args, **kwargs)
+
+        with patch.object(world, "native_session", side_effect=finish_during_recovery) as recovery:
+            result = worker_panes.start_or_resume(parent.id, name, "impl", policy=policy,
+                dispatch_run=worker_panes.DispatchRun(run), phase="8")
+
+        recovery.assert_called_once()
+        self.assertEqual(len(world.launches), 1)
+        self.assertEqual(result, worker_panes.AdmissionRefused(f"{run}: the run has ended dispatch admission"))
+        self.assertEqual(world.stops, [])
+
     def test_dispatch_refuses_a_run_without_a_saved_owner_before_launch(self) -> None:
         fields = unit_runs.read_run_fields(self.run_dir)
         del fields[unit_runs.OWNER_FIELD]
