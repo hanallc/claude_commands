@@ -7,6 +7,7 @@ import io
 import json
 import os
 import platform
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,7 @@ from scripts.notify import question_pushes
 from scripts.message import escalate, send
 from scripts.notify import silence
 from scripts.notify.test_review import FakeReviewer, verdict, with_footer
+from scripts.production import record_store
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
                          NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, first_line, parse_user_action, refused_at)
 from scripts.whoami import agent_accounts
@@ -484,6 +486,104 @@ class PushoverTests(unittest.TestCase):
             post.assert_called_once()
             cancel.assert_not_called()
         self.assertEqual(question_pushes.read_binding(question_pushes.binding_path(binding.source, binding.key)), binding)
+
+    def test_unbound_clear_check_cancels_the_tag_it_posted(self) -> None:
+        path = self.keys.parent / "question.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        push: silence.KeptPush = {"source": "drawer", "key": "same key", "priority": "2", "title": "Alert",
+            "message": "Details", "detail": "", "text_id": "alert.blocked"}
+        calls: list[tuple[str, dict[str, list[str]]]] = []
+
+        def post(url: str, body: bytes) -> tuple[int, bytes]:
+            calls.append((url, urllib.parse.parse_qs(body.decode())))
+            return 200, b'{"status":1}'
+
+        def channel(argv: list[str], _stdin: str, _timeout: float) -> tuple[int, str, str]:
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                if argv[0] == "ssh":
+                    code = send.main(shlex.split(argv[-1].removeprefix(send.REMOTE + " ")))
+                else:
+                    self.assertEqual(argv[1:3], [str(send.USER_CHANNEL), "cancel"])
+                    code = pushover.cancel(argv[3:], self.keys, post)
+            return code, output.getvalue(), errors.getvalue()
+
+        self.assertEqual(pushover.deliver_here({**push, "reference": reference}, self.keys, post), 0)
+        self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+        binding = question_pushes.Binding(push["source"], push["key"], reference, True)
+        self.assertEqual([fields["tags"] for _url, fields in calls],
+                         [[pushover.push_tag(binding.tag_key)], [pushover.push_tag(push["key"])]])
+        tag = calls[-1][1]["tags"][0]
+        for host in (send.machine(), "other-host"):
+            with self.subTest(host=host), mock.patch.object(send, "run", side_effect=channel):
+                at = send.now()
+                send.record_emergency(send.Emergency(key=push["key"], sender=push["source"], check="true",
+                    machine=host, sent=at.isoformat(), expires=(at + send.emergency_lifetime()).isoformat()))
+                self.assertEqual(send.clear_check()[0], 0)
+                self.assertEqual(calls[-1][0], pushover.CANCEL_URL.format(tag=tag))
+                self.assertEqual(send.read_emergencies(), [])
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(question_pushes.read_binding(question_pushes.binding_path(binding.source, binding.key)), binding)
+
+    def test_silence_retries_release_after_the_question_lock_is_free(self) -> None:
+        path = self.keys.parent / "question.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        push: silence.KeptPush = {"source": "drawer", "key": "question key", "priority": "1", "title": "Choose",
+            "message": "Details", "detail": "", "text_id": "decision.choices", "reference": reference}
+        self.silence_on()
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+        record = silence.read_state()
+        assert record is not None
+        with silence.locked():
+            silence.write_state({**record, "timer": "fixture"})
+        with (record_store.record_number_lock(record_store.RecordKind.QUESTION),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post),
+                                        timer="fixture"), 1)
+        post.assert_not_called()
+        self.assertIsNone(silence.read_state())
+        self.assertEqual(silence.read_kept(), [push])
+
+        def deliver(kept: silence.KeptPush) -> int:
+            return pushover.post_kept(kept, self.keys, post)
+
+        with mock.patch.object(silence, "post_kept", side_effect=deliver):
+            self.assertEqual(send.main(["question-push-release"]), 0)
+            self.assertEqual(send.main(["question-push-release"]), 0)
+        post.assert_called_once()
+        self.assertEqual(silence.read_kept(), [])
+
+    def test_question_drain_counts_inventory_time_against_the_budget(self) -> None:
+        path = self.keys.parent / "question.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening")
+        with silence.locked():
+            for index in range(13):
+                _ = question_pushes.bind_locked("drawer", f"key {index}", reference, emergency=False)
+        budget = conf.read("send").number("user_cancel_timeout")
+        clock = 0.0
+        read_binding = question_pushes.read_binding
+
+        def read(path: Path) -> question_pushes.Binding | None:
+            nonlocal clock
+            clock += budget / 6
+            return read_binding(path)
+
+        def kept(*, strict: bool) -> list[silence.KeptPush]:
+            nonlocal clock
+            self.assertTrue(strict)
+            clock += budget / 3
+            return []
+
+        with (mock.patch.object(time, "monotonic", side_effect=lambda: clock),
+              mock.patch.object(question_pushes, "read_binding", side_effect=read) as bindings,
+              mock.patch.object(silence, "read_kept", side_effect=kept),
+              mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.keys.parent / "notifier")})):
+            self.assertEqual(question_pushes.drain(), 1)
+        self.assertLessEqual(clock, budget)
+        self.assertEqual(bindings.call_count, 4)
 
     def test_question_retry_gives_the_next_binding_a_turn_after_timeout(self) -> None:
         path = self.keys.parent / "question.md"

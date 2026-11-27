@@ -48,6 +48,7 @@ from enum import Enum
 from pathlib import Path
 from typing import NotRequired, Protocol, TypedDict, cast
 
+from scripts.lib import operation_deadline
 from scripts.lib.user_zone import user_zone, zone_label  # noqa: E402
 from scripts.notify import push_reference
 
@@ -147,6 +148,8 @@ def write_state(record: SilenceRecord) -> None:
 
 def read_kept(*, strict: bool = False) -> list[KeptPush]:
     try:
+        if strict:
+            operation_deadline.check()
         lines = kept_file().read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         return []
@@ -156,6 +159,8 @@ def read_kept(*, strict: bool = False) -> list[KeptPush]:
         return []
     kept: list[KeptPush] = []
     for line in lines:
+        if strict:
+            operation_deadline.check()
         push = parse_push(line)
         if push is not None:
             kept.append(push)
@@ -371,10 +376,13 @@ def claim(when: Callable[[SilenceRecord], bool] | None = None, *,
     return record, kept
 
 
-def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, deliver: Deliver, opening: str) -> int:
+def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, deliver: Deliver, opening: str, *,
+            only_if_off: bool = False) -> int:
     _ = stop_timer(record["timer"] if record else None, runner)
     failed = delivered = dropped = 0
     with locked():
+        if only_if_off and read_state() is not None:
+            return 0
         pending = read_kept()
         for push in kept:
             # Another release may already have posted this push since claim read it.
@@ -425,15 +433,21 @@ def off(runner: Run, deliver: Deliver | None = None, timer: str = "") -> int:
 
 
 def end_if_past(runner: Run | None = None, deliver: Deliver | None = None) -> int:
-    """End a silence whose end passed without its timer firing, as `off` does."""
+    """End expired silence or retry its pending Question pushes."""
     try:
-        claimed = claim(past_end)
+        claimed = claim(past_end, release_if_off=True)
     except OSError as error:
         print(f"silence: end event append failed: {error}", file=sys.stderr)
         return 1
     if claimed is None:
         return 0
-    return release(*claimed, runner or run, deliver or post_kept, "silence ended at its end time")
+    record, kept = claimed
+    if record is not None:
+        return release(record, kept, runner or run, deliver or post_kept, "silence ended at its end time")
+    questions = [push for push in kept if push.get("reference", push_reference.NO_REFERENCE)["kind"] == "question"]
+    if not questions:
+        return 0
+    return release(None, questions, runner or run, deliver or post_kept, "silence release retried", only_if_off=True)
 
 
 def status() -> int:
