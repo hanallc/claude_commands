@@ -6357,7 +6357,8 @@ class BuildsPageProofTests(unittest.TestCase):
             _ = lease.write_text(json.dumps({"work": "test-nightly"}), encoding="utf-8")
             self.assertTrue(needs_all_page_proof_views(checkout))
 
-    def run_page_proof(self, *, gate: bool, mode: str | None = None) -> tuple[Path, dict[str, object]]:
+    def run_page_proof(self, *, gate: bool, mode: str | None = None,
+                       kill_cell: str = "") -> tuple[Path, dict[str, object]]:
         source = Path(__file__).resolve()
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         proof = source.with_name("memory_page_proof.mjs")
@@ -6366,6 +6367,8 @@ class BuildsPageProofTests(unittest.TestCase):
         command = [executable, str(proof), *(["--gate"] if gate else []), str(directory)]
         if mode is not None:
             command.append(mode)
+        if kill_cell:
+            command.append(kill_cell)
         environment = {**os.environ, "PYTHON": sys.executable}
         for setting in ("MEMORY_PAGE_SHOT", "SWAP_BEFORE_PAGE", "STEADY_BASELINE"):
             _ = environment.pop(setting, None)
@@ -6390,6 +6393,56 @@ class BuildsPageProofTests(unittest.TestCase):
         directory, verdict = self.run_page_proof(gate=True, mode="--kill-control")
         self.assertEqual(verdict.get("proof"), "Kill control")
         self.assertEqual(list(directory.glob("*.png")), [])
+
+    def check_kill_cell(self, cell: str) -> None:
+        _, verdict = self.run_page_proof(gate=True, mode="--kill-cell", kill_cell=cell)
+        self.assertEqual(verdict.get("cell"), cell)
+
+    def test_failed_kill_read_without_submission_shows_unavailable(self) -> None:
+        self.check_kill_cell("A1")
+
+    def test_failed_kill_read_with_open_post_shows_unavailable(self) -> None:
+        self.check_kill_cell("A2")
+
+    def test_failed_kill_read_hides_the_submission_error(self) -> None:
+        self.check_kill_cell("A3")
+
+    def test_kill_row_with_only_an_offer_shows_the_button(self) -> None:
+        self.check_kill_cell("B1")
+
+    def test_first_kill_shows_stopping_before_the_save(self) -> None:
+        self.check_kill_cell("B2")
+
+    def test_kill_error_without_a_record_survives_a_redraw(self) -> None:
+        self.check_kill_cell("B3")
+
+    def test_kill_strip_shows_the_same_status_as_the_table(self) -> None:
+        _, verdict = self.run_page_proof(gate=True, mode="--kill-strip")
+        self.assertEqual(verdict.get("cells"), ["B2", "B3", "C1", "C2", "C3", "D1", "D2", "D3"])
+
+    def test_kill_error_without_an_offer_stays_without_a_button(self) -> None:
+        self.check_kill_cell("B3-no-offer")
+
+    def test_saved_unconfirmed_kill_without_an_item_shows_the_result(self) -> None:
+        self.check_kill_cell("C1")
+
+    def test_kill_retry_with_the_old_record_shows_stopping(self) -> None:
+        self.check_kill_cell("C2")
+
+    def test_kill_retry_error_overrides_the_old_record(self) -> None:
+        self.check_kill_cell("C3")
+
+    def test_new_saved_kill_without_an_item_shows_the_result(self) -> None:
+        self.check_kill_cell("D1")
+
+    def test_new_saved_kill_overrides_a_stalled_post(self) -> None:
+        self.check_kill_cell("D2")
+
+    def test_new_unconfirmed_kill_permits_retry_while_the_first_post_is_open(self) -> None:
+        self.check_kill_cell("D2-retry")
+
+    def test_new_saved_kill_hides_the_refused_post_error(self) -> None:
+        self.check_kill_cell("D3")
 
     def test_gate_flag_keeps_the_queue_rows_proof_mode(self) -> None:
         directory, verdict = self.run_page_proof(gate=True, mode="--queue-rows")
