@@ -907,9 +907,9 @@ A missing folder uses its nearest existing parent until the folder appears.
   The [Console text standard](../console_text_standard.md) applies to `ask` and to answers and replies from the writer.
   The fast check tests text patterns before the existing model reviewer reads the draft.
   The model checks how the parts of a structured question relate and returns a draft verdict.
-  The cache saves a passed draft verdict and reuses it when the draft text, rules, date, and time zone match.
-  The model reviews a held draft again.
-  The model also reviews the draft again when any part or other draft text changes.
+  The cache reuses an approval when the title, exact draft text, rules, date, time zone, and caption layout match.
+  The model reviews a held split draft again.
+  Changes to the draft, including spaces between parts, require a new draft verdict.
   The cache reuses independent verdicts for unchanged parts with the same rules, date, and time zone.
   It keeps the latest valid verdicts and removes drafts inactive for seven days.
   If a cache lock stays busy until the deadline, the filing command holds the draft.
