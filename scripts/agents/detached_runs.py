@@ -107,6 +107,7 @@ class PaneDispatchUnavailable(TypedDict):
 
 class StopFields(TypedDict, total=False):
     stop_reason: str
+    command_exited_before_stop: bool
     scope_error: str
     hold_stop_requests: list[str]
     stop_pass_requested: Literal[True]
@@ -117,6 +118,11 @@ class DetachedRunKind(StrEnum):
     DETECT = "detect"
     PYTHON_TESTS = "python-tests"
     OTHER = "other"
+
+
+class PaneResultAttempt(TypedDict):
+    session: str
+    started_at: float
 
 
 class RunRecord(StopFields):
@@ -153,6 +159,7 @@ class RunRecord(StopFields):
     delivered_at: NotRequired[float]
     ended_pass_result_released: NotRequired[Literal[True]]
     worker_result_receipt: NotRequired[object]
+    worker_result_attempt: NotRequired[PaneResultAttempt]
     blocked_notice_accepted: NotRequired[Literal[True]]
     push_retries: NotRequired[int]
     push_alert_attempted: NotRequired[Literal[True]]
@@ -252,7 +259,9 @@ def _write_record_locked(path: Path, record: RunRecord) -> RunRecord:
         fields.update(current)
     if delivery := current.get("delivery"):
         fields["delivery"] = delivery
-    stop_fields = ("stop_reason", "hold_stop_requests", "stop_pass_requested", "self_stop")
+    if attempt := current.get("worker_result_attempt"):
+        fields["worker_result_attempt"] = attempt
+    stop_fields = ("stop_reason", "command_exited_before_stop", "hold_stop_requests", "stop_pass_requested", "self_stop")
     if _has_saved_cgroup(current):
         stop_fields += ("scope_error", "slice_leftovers", "slice_cleanup_pending", "stop_notice_id",
                         "pending_hold_stop_requests")
@@ -314,6 +323,7 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                         and _is_hold_stop_requests(raw["pending_hold_stop_requests"])))
                     and ("delivered_at" not in raw or type(raw["delivered_at"]) in (int, float))
                     and ("completion_pending" not in raw or isinstance(raw["completion_pending"], bool))
+                    and ("command_exited_before_stop" not in raw or isinstance(raw["command_exited_before_stop"], bool))
                     and ("command_slice" not in raw or process_stop.is_slice_identity(raw["command_slice"]))
                     and all(key not in raw or raw[key] is True
                             for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded",
@@ -338,6 +348,8 @@ def _read_stop_fields(path: Path, run_id: object) -> StopFields:
             or any(key in saved and saved[key] is not True for key in ("stop_pass_requested", "self_stop"))):
         raise worker_lifecycle.WorkerStateUnreadable(path, "invalid stop fields")
     fields: StopFields = {"stop_reason": reason}
+    if isinstance(exited := saved.get("command_exited_before_stop"), bool):
+        fields["command_exited_before_stop"] = exited
     if isinstance(error := saved.get("scope_error"), str):
         fields["scope_error"] = error
     if requests:
@@ -421,6 +433,7 @@ def stop_with_reason(
         staged = path.with_suffix(STAGED_STOP_SUFFIX)
         confirmed = path.with_suffix(CONFIRMED_STOP_SUFFIX)
         stopping = {**record, "stop_reason": reason}
+        stopping["command_exited_before_stop"] = record.get("command_exited_before_stop", "exit_code" in record)
         if unconfirmed:
             stopping["scope_error"] = unconfirmed
         if hold_request_id:
@@ -590,7 +603,7 @@ def _stop_slice_command(
             if ended and (not recovered_commit or new_hold_request):
                 return False
             if not recovered_commit:
-                record.update(stop_reason=reason, stop_pass_requested=True)
+                record.update(stop_reason=reason, stop_pass_requested=True, command_exited_before_stop="exit_code" in record)
                 if stop_notice_id:
                     record["stop_notice_id"] = stop_notice_id
             if new_hold_request:
@@ -859,8 +872,20 @@ def _stopped_group_has_ended(record: RunRecord) -> bool:
         record, record["pid"])
 
 
+def _stop_preserves_command_result(record: RunRecord) -> bool:
+    watcher = record.get("stop_reason") == SUPERVISOR_GONE_REASON
+    if not watcher and record.get("pane_dispatch_id") == "":
+        return False
+    if "command_exited_before_stop" in record:
+        return record["command_exited_before_stop"]
+    code = record.get("exit_code")
+    # Older watcher records have no stop order. A normal exit remains a result.
+    return watcher and code is not None and code not in (128 + signal.SIGTERM, 128 + signal.SIGKILL)
+
+
 def _cancels_pass(record: RunRecord) -> bool:
-    return bool(record.get("stop_pass_requested") and not record.get("self_stop") and not record.get("scope_error"))
+    return bool(record.get("stop_pass_requested") and not record.get("self_stop") and not record.get("scope_error")
+                and not _stop_preserves_command_result(record))
 
 
 def _retired_worker_result(record: RunRecord) -> bool:
@@ -991,8 +1016,8 @@ def _reap_orphans_locked(runs: Path, worker: str = "", *, only: Path | None = No
                         if newer:
                             record["orphan_result_superseded"] = True
                     else:
-                        record["delivery"] = (SUPERSEDED_ORPHAN_DELIVERY if newer and not record.get("self_stop")
-                                              else ORPHAN_RESULT_PENDING)
+                        superseded = newer and not (record.get("self_stop") or _stop_preserves_command_result(record))
+                        record["delivery"] = SUPERSEDED_ORPHAN_DELIVERY if superseded else ORPHAN_RESULT_PENDING
                 record.update(status="finished", ended="supervisor gone", completion_pending=True)
                 record = _write_record_locked(path, record)
             result.queue_completion(path, record)
@@ -1053,7 +1078,7 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
             if _result_push_failed(deliver(record, command_result(record))):
                 return CompletionReplay.RETRY
         else:
-            if delivery == ORPHAN_RESULT_PENDING:
+            if delivery == ORPHAN_RESULT_PENDING or (not delivery and _stop_preserves_command_result(record)):
                 delivery = deliver(record, command_result(record))
                 if _worker_result_pending(delivery) and delivery != PARKED_WORKER_RESULT:
                     return CompletionReplay.RETRY
@@ -1100,7 +1125,12 @@ def _complete_stopped_run(path: Path, record: RunRecord) -> str | Literal[Comple
         # The caller holds the worker lock before it takes admission and the recorder lock.
         with (runs / ".start.lock").open("a") as admission:
             fcntl.flock(admission, fcntl.LOCK_EX)
-            if not _stopped_group_has_ended(record):
+            current = _read_record(path)
+            delivery = current.get("delivery", "")
+            if delivery not in ("", ORPHAN_RESULT_PENDING) and not _stop_canceled_before_receipt(current):
+                yield worker_panes.Kept("the result delivery still needs a worker reply")
+                return
+            if not _stopped_group_has_ended(current):
                 yield worker_panes.Kept("the command group has no confirmed end")
                 return
             now = time.time()
@@ -1500,14 +1530,35 @@ FAILED_RESULT_PUSH = "result push failed: "
 UNCONFIRMED_RESULT_PUSH = UNCONFIRMED_WORKER_RESULT + "result push: "
 
 
-def _stop_canceled_before_receipt(record: RunRecord) -> bool:
+def _stop_canceled_before_receipt(record: RunRecord, worker: staff.StaffRow | None = None) -> bool:
     if (record["status"] != "finished" or record.get("self_stop") or record.get("scope_error")
-            or "worker_result_receipt" in record or "delivered_at" in record):
+            or "worker_result_receipt" in record or "delivered_at" in record or _stop_preserves_command_result(record)):
         return False
     stopped = (_cancels_pass(record) or (record.get("ended") == "supervisor gone"
                                        and record.get("stop_reason") == SUPERVISOR_GONE_REASON))
-    return stopped and record.get("delivery") in (
-        PARKED_WORKER_RESULT, UNCONFIRMED_WORKER_RESULT + "the worker transcript has no result receipt")
+    if not stopped:
+        return False
+    delivery = record.get("delivery", "")
+    if delivery == PARKED_WORKER_RESULT:
+        return True
+    if not delivery.startswith(UNCONFIRMED_WORKER_RESULT) or delivery.startswith(UNCONFIRMED_RESULT_PUSH):
+        return False
+    attempt: object = record.get("worker_result_attempt")
+    match attempt:
+        case {"session": str(session), "started_at": int() | float() as started_at}:
+            if isinstance(started_at, bool) or not 0 < started_at < math.inf:
+                return False
+        case _:
+            return False
+    from scripts.herdr import worker_panes
+
+    if worker is None:
+        try:
+            worker = staff.local_snapshot().by_id(staff.StaffId(record["staff_id"]))
+        except staff.StaffUnreadable:
+            return False
+    return (worker is not None and worker.current_session == session
+            and worker_panes.transcript_shows_turn_end_without_result(worker, record["run_id"], started_at))
 
 
 def recover_stop_canceled_worker_pass(run: Path, worker: staff.StaffRow, instance: str) -> None:
@@ -1516,7 +1567,7 @@ def recover_stop_canceled_worker_pass(run: Path, worker: staff.StaffRow, instanc
     for record in _registered_runs(runs, worker.id):
         if (record["staff_id"] == worker.id and record.get("pane_dispatch_id") == instance
                 and Path(record["session_dir"]).resolve() == run.resolve() and _cancels_pass(record)
-                and _stop_canceled_before_receipt(record)):
+                and _stop_canceled_before_receipt(record, worker)):
             _ = _finish_record(runs / f"{record['run_id']}.json", record)
             return
 
@@ -1820,7 +1871,7 @@ def worker_results(runs: Path, worker: staff.StaffRow, *, since: float, pane_dis
         stop_fallback = _stop_fallback_delivered(record, delivery)
         if delivery == COVERED_BY_DONE:
             results[record["run_id"]] = WorkerRunReceipt(record, finished, WorkerResultCovered.BY_DONE)
-        elif _stop_canceled_before_receipt(record):
+        elif _stop_canceled_before_receipt(record, worker):
             results[record["run_id"]] = WorkerRunReceipt(record, finished, WorkerResultDeliverySuppressed.STOP_CANCELED)
         elif not delivery or _worker_result_pending(delivery):
             results[record["run_id"]] = WorkerRunReceipt(record, finished, WorkerResultDeferred.PENDING)
@@ -2379,7 +2430,7 @@ def _success_only_delivery(result: CommandResult) -> str:
 
 def result_text(record: RunRecord, result: CommandResult) -> str:
     exit_code = result.code if isinstance(result, CompletedCommand) else result
-    stop_reason = record.get("stop_reason", "")
+    stop_reason = "" if _stop_preserves_command_result(record) else record.get("stop_reason", "")
     if record.get("scope_error"):
         verdict = f"FAIL (cleanup; {_exit_words(result)})"
     elif stop_reason:
@@ -2753,7 +2804,11 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                     and isinstance(parked_launch, progress_history.ParkedWorkerLaunch)
                     and parked_launch.thread == worker.current_session):
                 park_acceptance = ParkedAssignmentAcceptance.VERIFIED
-            _ = _save_delivery(path, pane_checkpoint)
+            with record_lock(path):
+                current_record = _read_record(path)
+                current_record["delivery"] = pane_checkpoint
+                current_record["worker_result_attempt"] = {"session": worker.current_session, "started_at": time.time()}
+                write_text_atomic(path, json.dumps(current_record, indent=2, sort_keys=True))
 
         def before_holder() -> None:
             _ = validate_transport()
@@ -3161,7 +3216,8 @@ def _checkpoint_command_exit(path: Path, exit_code: int, *, scoped_only: bool = 
         if record["status"] == "finished" or (scoped_only and not _has_saved_cgroup(record)):
             return record
         updated = record.copy()
-        updated["exit_code"] = exit_code
+        if not (record.get("command_exited_before_stop") and "exit_code" in record):
+            updated["exit_code"] = exit_code
         if _has_saved_cgroup(record):
             updated["slice_cleanup_pending"] = True
             _ = updated.pop("finished_at", None)
@@ -3416,6 +3472,8 @@ def command_record_exit(args: argparse.Namespace) -> int:
             return 0
         started = _saved_process(caller, record.get("command_started"))
         if not isinstance(started, process_start.Started):
+            return 0
+        if record.get("command_exited_before_stop") and "exit_code" in record:
             return 0
         record["exit_code"] = int(getattr(args, "exit_code", 0))
         write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))

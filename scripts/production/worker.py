@@ -428,7 +428,7 @@ def _read_transcript(entries: Iterable[str | dict[str, object] | worker_admissio
                         for state in states:
                             state.compacted()
                         continue
-                    if not entry and isinstance(cursor, TranscriptCursor) and _transcript_turn_boundary(fields):
+                    if not entry and isinstance(cursor, TranscriptCursor) and worker_panes.transcript_turn_boundary(fields):
                         for state in states:
                             state.turn_ended(cursor)
             if not entry.startswith(("user:\n", "assistant:\n")):
@@ -444,16 +444,6 @@ def _read_transcript(entries: Iterable[str | dict[str, object] | worker_admissio
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return str(error) or type(error).__name__, frozenset(matched)
     return "", frozenset(matched)
-
-
-def _transcript_turn_boundary(fields: dict[str, object]) -> bool:
-    if fields.get("type") == "system" and fields.get("subtype") == "turn_duration":
-        return True
-    if fields.get("type") == "event_msg":
-        payload = fields.get("payload")
-        return (isinstance(payload, dict)
-                and cast(dict[str, object], payload).get("type") in ("task_complete", "turn_aborted"))
-    return False
 
 
 def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
@@ -2539,6 +2529,11 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                           result.cause if isinstance(result, worker_panes.UnpublishedWorker) else result.reason)
                 print(f"anomaly: {default_role}: {detail}", file=sys.stderr)
             record = staff.snapshot()
+        if not name:
+            for candidate in record.find(kind="worker", parent=parent):
+                if _role_number(candidate.name, role):
+                    _recover_stop_before_assignment(candidate, record)
+            record = staff.snapshot()
         runs = unit_runs.LauncherRunDirectories({}, {}) if name else _assignment_runs(
             record, parent, role, additional=(session_dir,))
         chosen = WorkerName.parse(name) if name else select_worker(parent, role, record, runs=runs)
@@ -2548,7 +2543,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                 return ExitCode.BUSY
             return startup_result(WorkerName.parse(role), chosen)
         selected_row = worker_admission.find_worker(record, parent, chosen.value)
-        if selected_row is not None:
+        if name and selected_row is not None:
             _recover_stop_before_assignment(selected_row, record)
         hold = operations.enter_context(worker_panes.worker_lock(parent, chosen))
         if isinstance(hold, worker_panes.Kept):
@@ -2681,7 +2676,7 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
         if entry.startswith("user:\n"):
             body = entry.removeprefix("user:\n")
             accepted |= _answer_digest(script_prompt(body)) == saved.get("answer_digest")
-        elif accepted and (entry.startswith("assistant:\n") or _transcript_turn_boundary(fields)):
+        elif accepted and (entry.startswith("assistant:\n") or worker_panes.transcript_turn_boundary(fields)):
             next_request = True
     if not number or number < boundary:
         return AnswerBlocked.UNAVAILABLE

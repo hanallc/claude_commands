@@ -41,6 +41,7 @@ from scripts.production.production_doc import EnrolledPaths, ProductionPathsErro
 from scripts.production.staff import serving_merge_unit
 from scripts.agents import detached_run_process, pane_record, shutdown_record, worker_lifecycle
 from scripts.direct import progress_history, recorder_state
+from scripts.usage import rollouts
 
 if TYPE_CHECKING:
     from scripts.accounts import accounts
@@ -949,6 +950,43 @@ def transcript_record_cursors[T: str | dict[str, object] | worker_admission.Torn
         data = None if isinstance(entry, worker_admission.TornTranscriptRecord) else entry
         prefix.update(json.dumps(data, sort_keys=True).encode() + b"\n")
         yield entry, TranscriptCursor(stream, position, prefix.hexdigest())
+
+
+def transcript_turn_boundary(fields: dict[str, object]) -> bool:
+    if fields.get("type") == "system" and fields.get("subtype") == "turn_duration":
+        return True
+    if fields.get("type") == "event_msg":
+        payload = fields.get("payload")
+        return (isinstance(payload, dict)
+                and cast(dict[str, object], payload).get("type") in ("task_complete", "turn_aborted"))
+    return False
+
+
+def transcript_shows_turn_end_without_result(row: staff.StaffRow, run_id: str, attempted_at: float) -> bool:
+    """Check for a later turn end and no receipt in the delivery session."""
+    backend = staff.backend(row)
+    if isinstance(backend, staff.BackendUnavailable):
+        return False
+    marker = f"Detached run: {run_id}"
+    ended = False
+    try:
+        source = worker_admission.transcript_source(row, backend)
+        records = worker_admission.transcript_records(
+            source, boundary=worker_admission.TranscriptRecordBoundary.COMPLETE_LINES_WITH_TAIL)
+        for fields in records:
+            if isinstance(fields, worker_admission.TornTranscriptRecord):
+                return False
+            if fields.get("isMeta") is True:
+                continue
+            entry = worker_admission.transcript_entry(fields, set())
+            if entry.startswith("user:\n") and marker in entry.splitlines()[1:]:
+                return False
+            if transcript_turn_boundary(fields):
+                at = rollouts.parse_timestamp(fields.get("timestamp"))
+                ended |= at is not None and at.timestamp() > attempted_at
+    except (OSError, ValueError, OverflowError):
+        return False
+    return ended
 
 
 def _transcript_messages(row: staff.StaffRow) -> list[str] | Kept:
