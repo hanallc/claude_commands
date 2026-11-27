@@ -1788,7 +1788,7 @@ class WorkerPaneTests(StaffTestCase):
     def test_fresh_codex_publishes_the_first_turn_report_and_sends_no_second_turn(self) -> None:
         cases = (("current", "OpenWorker", "none", "yes"),
                  ("cached", "OpenWorker", "none", "yes"),
-                 ("starting", "ClosedWorker", "starting", "no"),
+                 ("starting", "ClosedWorker", "pane is starting", "no"),
                  ("stopped", "StoppedWorker", "none", "yes"),
                  ("missing", "ClosedWorker", "none", "no"))
         for mode, state_kind, scan_reason, parent_tab in cases:
