@@ -1131,12 +1131,13 @@ The command sends to the current owner session.
 It refuses unknown items and items that no longer wait for a reply.
 
 Run `scripts/lib/py -m scripts.review_links.review_submissions move-reply-proofs --dry-run` to preview the move.
-The preview prints three lines.
+The preview starts with three lines.
 
 1. The number of notes and legacy fields to move.
 2. The number of those notes with uncommitted changes or without a tracked Git path.
 3. The number of those notes that are open items.
 
+The preview then prints one path per production backup that Git does not recognize as a repository.
 The preview validates the same byte changes as the move.
 The preview takes the writer locks that already exist.
 It reads a note without its lock when the lock file is absent.
@@ -1183,8 +1184,11 @@ Both check pending legacy transfers and the numbered record metadata that a rewr
 The report reads `review-reply-proof-backups/rewrites.jsonl` in the showrunner state folder.
 The journal has mode `0600`.
 Before each rewrite, the move appends the note path and field names and syncs the journal.
-A restart uses the same journal and reuses entries for notes that still need the rewrite.
-If an append stops before it writes a complete line, the next move discards the incomplete line and retries.
+After the scan, the move appends each skipped backup path as a `skipped_backup` entry.
+The journal keeps one entry per skipped backup path.
+Before scanning notes, the move discards an incomplete last line from the journal.
+The move syncs the journal and its folder before it uses existing entries.
+A restart reuses entries for notes that still need the rewrite.
 The proof store keeps a verifier for each legacy raw token.
 A failed move stops the server before it can serve requests.
 Run the move before serving notes that still hold proof fields.

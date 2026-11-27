@@ -530,6 +530,7 @@ def _outside_git(paths: dict[Path, tuple[str, ...]]) -> int:
 
 
 _REWRITE_JOURNAL_NAME = "rewrites.jsonl"
+_JOURNAL_WRITE_FLAGS = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
 
 
 def move_journal_path() -> Path:
@@ -537,10 +538,11 @@ def move_journal_path() -> Path:
 
 
 @dataclass
-class ProofRewriteJournal:
-    """Index complete journal lines by note path."""
+class ProofMoveJournal:
+    """Index complete journal lines for rewrites and skipped backups."""
 
     fields_by_path: dict[Path, tuple[str, ...]] = field(default_factory=dict, init=False)
+    skipped_backups: set[Path] = field(default_factory=set, init=False)
     _end: int = field(default=0, init=False)
     _parent_synced: bool = field(default=False, init=False)
     _checked: bool = field(default=False, init=False)
@@ -555,6 +557,13 @@ class ProofRewriteJournal:
             if not isinstance(entry, dict):
                 raise ValueError("The Review proof move journal entry must be an object.")
             record = cast(dict[str, object], entry)
+            if "skipped_backup" in record:
+                backup = record["skipped_backup"]
+                if len(record) != 1 or not isinstance(backup, str) or not Path(backup).is_absolute():
+                    raise ValueError("The Review proof move journal backup path is invalid.")
+                self.skipped_backups.add(Path(backup))
+                self._end += len(line)
+                continue
             path, names = record.get("path"), record.get("fields")
             if (not isinstance(path, str) or not Path(path).is_absolute()
                     or not isinstance(names, list) or not names
@@ -574,43 +583,71 @@ class ProofRewriteJournal:
         self.read(stream)
         return status.st_size
 
-    def check(self, journal: Path) -> None:
-        """Read and validate the existing journal once without changing it."""
+    def _recover_tail(self, stream: BinaryIO) -> None:
+        size = self._read_saved(stream)
+        if self._end < size:
+            os.ftruncate(stream.fileno(), self._end)
+
+    def _sync(self, journal: Path, stream: BinaryIO) -> None:
+        os.fsync(stream.fileno())
+        if not self._parent_synced:
+            atomic_file.sync_folder(journal.parent)
+            self._parent_synced = True
+
+    def check(self, journal: Path, *, dry_run: bool) -> None:
+        """Validate the journal once. In a move, also recover and sync it."""
         if self._checked:
             return
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK if dry_run else _JOURNAL_WRITE_FLAGS
         try:
-            descriptor = os.open(journal, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            descriptor = os.open(journal, flags)
         except FileNotFoundError:
             pass
         else:
-            with os.fdopen(descriptor, "rb") as stream:
-                _ = self._read_saved(stream)
+            with os.fdopen(descriptor, "rb" if dry_run else "r+b") as stream:
+                if dry_run:
+                    _ = self._read_saved(stream)
+                else:
+                    self._recover_tail(stream)
+                    self._sync(journal, stream)
         self._checked = True
+
+    @contextmanager
+    def _writable(self, journal: Path) -> Generator[BinaryIO]:
+        descriptor = os.open(journal, _JOURNAL_WRITE_FLAGS | os.O_CREAT, 0o600)
+        with os.fdopen(descriptor, "r+b") as stream:
+            self._recover_tail(stream)
+            yield stream
+            self._sync(journal, stream)
+
+    @staticmethod
+    def _write_lines(stream: BinaryIO, lines: bytes) -> None:
+        if lines and os.write(stream.fileno(), lines) != len(lines):
+            raise OSError("Cannot append the complete Review proof move journal line.")
 
     def append(self, journal: Path, path: Path, names: tuple[str, ...]) -> None:
         """Sync new field names before the note changes. Hold the transfer lock."""
-        descriptor = os.open(journal, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "r+b") as stream:
-            size = self._read_saved(stream)
-            if self._end < size:
-                # Discard only the incomplete last line of an interrupted append.
-                os.ftruncate(descriptor, self._end)
+        with self._writable(journal) as stream:
             previous = self.fields_by_path.get(path, ())
             added = tuple(name for name in names if name not in previous)
             line = (json.dumps({"path": str(path), "fields": added}) + "\n").encode() if added else b""
-            if line and os.write(descriptor, line) != len(line):
-                raise OSError("Cannot append the complete Review proof move journal line.")
-            os.fsync(descriptor)
-            if not self._parent_synced:
-                atomic_file.sync_folder(journal.parent)
-                self._parent_synced = True
-            self.fields_by_path[path] = previous + added
-            self._end += len(line)
+            self._write_lines(stream, line)
+        self.fields_by_path[path] = previous + added
+        self._end += len(line)
+
+    def append_skipped_backups(self, journal: Path, paths: tuple[Path, ...]) -> None:
+        """Sync the skipped backup paths. Hold the transfer lock."""
+        with self._writable(journal) as stream:
+            added = tuple(path for path in paths if path not in self.skipped_backups)
+            lines = "".join(json.dumps({"skipped_backup": str(path)}) + "\n" for path in added).encode()
+            self._write_lines(stream, lines)
+        self.skipped_backups.update(added)
+        self._end += len(lines)
 
 
 def read_move_report() -> dict[Path, tuple[str, ...]]:
     """Read the field names recorded for each note in the durable journal."""
-    report = ProofRewriteJournal()
+    report = ProofMoveJournal()
     try:
         stream = move_journal_path().open("rb")
     except FileNotFoundError:
@@ -640,7 +677,7 @@ class ProofMoveRun:
     _entries: dict[Path, tuple[str, ...]] = field(default_factory=dict, init=False)
     _open_items: int = field(default=0, init=False)
     _backup: Path | None = field(default=None, init=False)
-    _journal: ProofRewriteJournal = field(default_factory=ProofRewriteJournal, init=False)
+    _journal: ProofMoveJournal = field(default_factory=ProofMoveJournal, init=False)
     _planned_proofs: dict[NoteIdentity, NoteProof] = field(default_factory=dict, init=False, repr=False)
 
     @cached_property
@@ -666,21 +703,25 @@ class ProofMoveRun:
 
     def check_journal(self) -> None:
         """Check the journal under the transfer lock before processing notes."""
-        self._journal.check(self._checked_backup_parent / _REWRITE_JOURNAL_NAME)
+        self._journal.check(self._checked_backup_parent / _REWRITE_JOURNAL_NAME, dry_run=self.dry_run)
 
-    def _backup_folder(self) -> Path:
-        if self._backup is not None:
-            return self._backup
-        self.check_journal()
+    def _prepare_backup_parent(self) -> Path:
         parent = self._checked_backup_parent
         state = parent.parent
         state.mkdir(parents=True, exist_ok=True)
         parent.mkdir(mode=0o700, exist_ok=True)
         _check_backup_folder(parent)
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
-        self._backup = Path(tempfile.mkdtemp(prefix=stamp + "-", dir=parent))
         atomic_file.sync_folder(state.parent)
         atomic_file.sync_folder(state)
+        return parent
+
+    def _backup_folder(self) -> Path:
+        if self._backup is not None:
+            return self._backup
+        self.check_journal()
+        parent = self._prepare_backup_parent()
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+        self._backup = Path(tempfile.mkdtemp(prefix=stamp + "-", dir=parent))
         atomic_file.sync_folder(parent)
         return self._backup
 
@@ -712,6 +753,16 @@ class ProofMoveRun:
         for path, names in pending.items():
             self._journal.append(backup.parent / _REWRITE_JOURNAL_NAME, path, names)
         self._entries.update(pending)
+
+    def record_skipped_backups(self, paths: tuple[Path, ...]) -> None:
+        """Add new path entries after a completed scan."""
+        if self.dry_run or not paths:
+            return
+        self.check_journal()
+        if self._journal.skipped_backups.issuperset(paths):
+            return
+        parent = self._prepare_backup_parent()
+        self._journal.append_skipped_backups(parent / _REWRITE_JOURNAL_NAME, paths)
 
     def _plan_rewrite(self, path: Path, fields: tuple[str, ...], proofs: list[tuple[NoteIdentity, NoteProof]],
                       check_write: Callable[[], None]) -> None:
