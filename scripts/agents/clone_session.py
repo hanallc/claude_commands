@@ -12,7 +12,7 @@ from typing import Literal, cast
 
 from scripts.agents import pane_record, producer_creation, producer_lifecycle, remote, set_model, stop_resume
 from scripts.herdr import herdr, herdr_types, pane_launch
-from scripts.lib import codex_models_cache
+from scripts.lib import codex_models_cache, models_registry
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
@@ -189,7 +189,8 @@ def _arguments(source: CloneSource, settings: LiveForkSettings, name: str) -> li
 
 
 def _admit_clone(name: str, source: CloneSource, client: herdr.Herdr, launched: herdr.ForkLaunched,
-                 prepared: herdr.PreparedAgentEnvironment, environment: dict[str, str], home: Path) -> str:
+                 prepared: herdr.PreparedAgentEnvironment, environment: dict[str, str], home: Path,
+                 settings: LiveForkSettings) -> str:
     pane, terminal = launched.pane, launched.terminal
     try:
         native = stop_resume.wait_for_native_session(client, pane,
@@ -216,8 +217,9 @@ def _admit_clone(name: str, source: CloneSource, client: herdr.Herdr, launched: 
             try:
                 machine = remote.local_machine()
                 if isinstance(source.producer_clone, staff.ProducerClone):
-                    row = staff.create_producer_clone(name, native, source.producer_clone,
-                                                      staff.PresentWorktree(machine, prepared.directory), staff.SessionHome(home))
+                    row = staff.create_producer_clone(
+                        name, native, source.producer_clone, staff.PresentWorktree(machine, prepared.directory),
+                        staff.SessionHome(home), profile=models_registry.ProducerProfile(source.kind, settings.model, settings.effort))
                 else:
                     row = staff.create_session(name, native, staff.SessionLaunchFolder(machine, prepared.directory),
                                                staff.SessionHome(home))
@@ -273,7 +275,7 @@ def run(reference: str, name: str) -> int:
         if not isinstance(launched, herdr.ForkLaunched):
             raise ValueError(f"{name}: cannot prove the fork terminal")
         try:
-            native = _admit_clone(name, source, client, launched, prepared, environment, home)
+            native = _admit_clone(name, source, client, launched, prepared, environment, home, settings)
         except _AdmissionUnconfirmed as error:
             raise ValueError(str(error)) from error
     print(f"{name}: cloned {source.name} as {native} in pane {launched.pane}")

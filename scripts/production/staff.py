@@ -36,6 +36,7 @@ if __name__ == "__main__":
 if TYPE_CHECKING:
     import argparse
     from scripts.accounts import role_map
+    from scripts.lib.models_registry import ProducerProfile
 
 OWNER_MACHINE = "natedev"
 StaffId = NewType("StaffId", str)
@@ -2170,16 +2171,29 @@ def create_session(name: str, identity: str, folder: SessionLaunchFolder, home: 
 
 
 def create_producer_clone(name: str, identity: str, clone_of: ProducerClone,
-                          folder: PresentWorktree, home: SessionHome) -> StaffRow:
-    """Admit a new producer with its clone source, folder, and account."""
+                          folder: PresentWorktree, home: SessionHome, *, profile: ProducerProfile) -> StaffRow:
+    """Publish the launch profile before admitting the producer clone."""
+    from scripts.agents import producer_creation, producer_lifecycle
+    from scripts.lib import models_registry
+
     validate_name("session", name)
+    producer_lifecycle.check_name(name)
     if not home.path.is_absolute():
         raise StaffRefused(f"{name}: the session home must be absolute")
     if not is_owner():
-        return _remote_row(["create-producer-clone", identity, f"--name={name}", "--clone-of", clone_of.source,
-                            "--machine", folder.machine, "--path", str(folder.path), "--home", str(home.path)])
+        row = _remote_row(["create-producer-clone", identity, f"--name={name}", "--clone-of", clone_of.source,
+                           "--machine", folder.machine, "--path", str(folder.path), "--home", str(home.path),
+                           "--profile", profile.value()])
+        try:
+            producer_creation.sync_profile(name)
+        except (OSError, ValueError) as error:
+            raise StaffUnreadable(f"{name}: cannot read the shared launch profile: {error}") from error
+        return row
+
+    profile_saved = False
 
     def edit(rows: list[StaffRow]) -> StaffRow:
+        nonlocal profile_saved
         source = _row_by_id(rows, clone_of.source)
         if source is None or source.kind != "producer":
             raise StaffRefused(f"{clone_of.source}: producer clone source is unavailable")
@@ -2188,9 +2202,28 @@ def create_producer_clone(name: str, identity: str, clone_of: ProducerClone,
         row = _ensure_row(rows, "producer", name, STAFF_ROOT, worktree=folder, runtime_id=identity)
         clone = replace(row, home=home, clone_of=clone_of)
         rows[rows.index(row)] = clone
+        _ = models_registry.store_producer(name, *profile)
+        profile_saved = True
         return clone
 
-    return _transaction(edit)
+    with slot_operation("producer-marker-" + name.casefold(), name):
+        try:
+            _ = producer_creation.require_record(name, {})
+            registry = models_registry.parse_registry(models_registry.registry_text())
+            if any(key.casefold() == name.casefold() for key in registry.get("producers", {})):
+                raise StaffRefused(f"{name}: the registry already has a producer key")
+            if (profile.family == "claude" and profile.model.startswith("claude-")
+                    and profile.model not in registry.get("claude.agents", {})):
+                # The registry can use a model alias when it has no key for the exact model ID.
+                alias = profile.model.removeprefix("claude-").partition("-")[0]
+                profile = models_registry.ProducerProfile(profile.family, alias, profile.effort)
+            return _transaction(edit)
+        except StaffRefused:
+            if profile_saved:
+                models_registry.remove_producer(name, profile)
+            raise
+        except ValueError as error:
+            raise StaffRefused(str(error)) from error
 
 
 def ensure_worker(identity: StaffId, name: str, parent: StaffId) -> StaffRow:
@@ -3045,6 +3078,7 @@ def _parser() -> argparse.ArgumentParser:
             _ = create.add_argument(f"--{field_name}", required=True)
         if verb == "create-producer-clone":
             _ = create.add_argument("--clone-of", required=True)
+            _ = create.add_argument("--profile", required=True)
         _ = create.add_argument("--json", action="store_true")
     worker_parser = verbs.add_parser("ensure-worker", help=argparse.SUPPRESS)
     _ = worker_parser.add_argument("target")
@@ -3178,8 +3212,11 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         return create_session(arguments.name, arguments.target,
                               SessionLaunchFolder(arguments.machine, Path(arguments.path)), SessionHome(Path(arguments.home)))
     if arguments.verb == "create-producer-clone":
+        from scripts.lib import models_registry
+
         return create_producer_clone(arguments.name, arguments.target, ProducerClone(StaffId(arguments.clone_of)),
-                                     PresentWorktree(arguments.machine, Path(arguments.path)), SessionHome(Path(arguments.home)))
+                                     PresentWorktree(arguments.machine, Path(arguments.path)), SessionHome(Path(arguments.home)),
+                                     profile=models_registry.parse_producer_profile(arguments.profile))
     if arguments.verb == "ensure-worker":
         assert arguments.parent is not None
         return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))
