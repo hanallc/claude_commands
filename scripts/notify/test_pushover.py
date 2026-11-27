@@ -607,6 +607,63 @@ class PushoverTests(unittest.TestCase):
             self.assertEqual(question_pushes.drain(path), 0)
         cancel.assert_called_once_with(identity)
 
+    def test_releasing_an_older_question_emergency_preserves_the_newer_one(self) -> None:
+        old_path, older = self.kept_question()
+        older["need"] = "blocked"
+        new_path = old_path.with_name("new-question.md")
+        open_question = '---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n'
+        _ = new_path.write_text(open_question)
+        reference = push_reference.QuestionReference(kind="question", path=str(new_path), since="opening")
+        newer: silence.KeptPush = {**older, "priority": "2", "title": "New question", "reference": reference}
+        old_identity, new_identity = silence.push_identity(older), silence.push_identity(newer)
+        binding_path = question_pushes.binding_path(new_identity.sender, new_identity.key)
+        expected_binding = question_pushes.Binding(new_identity, emergency=True)
+        calls: list[tuple[str, dict[str, list[str]]]] = []
+
+        def post(url: str, body: bytes) -> tuple[int, bytes]:
+            calls.append((url, urllib.parse.parse_qs(body.decode())))
+            return 200, b'{"status":1}'
+
+        def cancel(identity: push_reference.PushIdentity) -> tuple[int, str]:
+            code = pushover.cancel(["--exact-tag-key", "--source", identity.sender, identity.tag_key],
+                                   self.keys, post)
+            return code, "cancelled"
+
+        with (mock.patch.object(send, "cancel_user_push", side_effect=cancel),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            self.assertEqual(pushover.deliver_here(older, self.keys, post), 0)
+            self.assertEqual(silence.read_kept(), [older])
+            self.assertEqual(pushover.deliver_here(newer, self.keys, post), 0)
+            # Restore a kept copy from before replacement.
+            self.assertIsInstance(silence.keep_here(older), silence.Kept)
+            saved_at = send.now().isoformat()
+            with send.key_states() as states:
+                states[new_identity.key] = {"last": {new_identity.state_slot: saved_at}}
+            release = silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post))
+        self.assertEqual(release, 0)
+        self.assertEqual([(url, fields.get("tags")) for url, fields in calls], [
+            (pushover.API_URL, [pushover.push_tag(new_identity.tag_key)]),
+            (pushover.API_URL, [pushover.push_tag(old_identity.tag_key)]),
+        ])
+        self.assertEqual(question_pushes.read_binding(binding_path), expected_binding)
+        with send.key_states() as states:
+            self.assertEqual(states[new_identity.key]["last"], {new_identity.state_slot: saved_at})
+        self.assertEqual(silence.read_kept(), [])
+
+        with (mock.patch.object(send, "cancel_user_push", side_effect=cancel),
+              mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.keys.parent / "notifier")}),
+              redirect_stdout(io.StringIO())):
+            _ = old_path.write_text(open_question.replace("status: open", "status: closed"))
+            self.assertEqual(question_pushes.drain(old_path), 0)
+            self.assertEqual(question_pushes.read_binding(binding_path), expected_binding)
+            self.assertEqual(calls[-1][0], pushover.CANCEL_URL.format(tag=pushover.push_tag(old_identity.tag_key)))
+            with send.key_states() as states:
+                self.assertEqual(states[new_identity.key]["last"], {new_identity.state_slot: saved_at})
+            _ = new_path.write_text(open_question.replace("status: open", "status: closed"))
+            self.assertEqual(question_pushes.drain(new_path), 0)
+        self.assertEqual(calls[-1][0], pushover.CANCEL_URL.format(tag=pushover.push_tag(new_identity.tag_key)))
+        self.assertIsNone(question_pushes.read_binding(binding_path))
+
     def test_silence_retries_release_after_the_question_lock_is_free(self) -> None:
         path = self.keys.parent / "question.md"
         _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"opening"}\n---\n')

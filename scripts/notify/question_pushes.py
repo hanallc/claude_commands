@@ -51,6 +51,11 @@ def binding_path(source: str, key: str) -> Path:
     return directory() / f"{digest}.json"
 
 
+def _released_binding_path(identity: PushIdentity) -> Path:
+    digest = hashlib.sha256(identity.tag_key.encode()).hexdigest()
+    return directory() / f"released-{digest}.json"
+
+
 def read_binding(path: Path) -> Binding | None:
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
@@ -61,8 +66,10 @@ def read_binding(path: Path) -> Binding | None:
         reference = push_reference.read_reference(fields.get("reference"))
         source, key, emergency = fields.get("source"), fields.get("key"), fields.get("emergency")
         if (reference["kind"] == "question" and isinstance(source, str) and source and isinstance(key, str)
-                and key and isinstance(emergency, bool) and path == binding_path(source, key)):
-            return Binding(PushIdentity(source, key, reference), emergency)
+                and key and isinstance(emergency, bool)):
+            identity = PushIdentity(source, key, reference)
+            if path == binding_path(source, key) or (emergency and path == _released_binding_path(identity)):
+                return Binding(identity, emergency)
     raise ValueError(f"invalid Question push binding {path}")
 
 
@@ -93,10 +100,14 @@ def settled(reference: push_reference.QuestionReference) -> str:
     return "question closed" if current.status == "closed" else ""
 
 
-def retire_locked(identity: PushIdentity, *, emergency: bool) -> str:
-    """Retire the current binding under the silence lock."""
-    result = retire_copies(identity, emergency=emergency)
-    binding_path(identity.sender, identity.key).unlink()
+def _retire_binding_locked(path: Path, identity: PushIdentity, *, emergency: bool) -> str:
+    """Retire the binding that the caller read under the silence lock."""
+    released_path = _released_binding_path(identity)
+    released = path != released_path and read_binding(released_path) is not None
+    result = retire_copies(identity, emergency=emergency or released)
+    if released:
+        released_path.unlink()
+    path.unlink()
     return result
 
 
@@ -126,12 +137,16 @@ def bind_locked(identity: PushIdentity, *, emergency: bool, allow_unreadable: bo
     previous = read_binding(path)
     unreadable = _opening_unreadable(reference, allow_unreadable=allow_unreadable)
     if previous is not None and previous.identity != identity:
-        _ = retire_locked(previous.identity, emergency=previous.emergency)
+        _ = _retire_binding_locked(path, previous.identity, emergency=previous.emergency)
         previous = None
         unreadable = _opening_unreadable(reference, allow_unreadable=allow_unreadable)
-    bound = Binding(identity, emergency or (previous is not None and previous.emergency))
+    released_path = _released_binding_path(identity)
+    released = read_binding(released_path) is not None
+    bound = Binding(identity, emergency or released or (previous is not None and previous.emergency))
     if bound != previous:
         _write_binding(path, bound)
+    if released:
+        released_path.unlink()
     if unreadable:
         print(f"{push_reference.UNREADABLE_QUESTION_REPORT}{reference['path']!r}.", file=sys.stderr)
     return bound
@@ -148,7 +163,9 @@ def bind_released_emergency_locked(identity: PushIdentity) -> None:
     path = binding_path(identity.sender, identity.key)
     previous = read_binding(path)
     if previous is not None and previous.identity != identity:
-        _ = retire_locked(previous.identity, emergency=previous.emergency)
+        # Keep the active binding for the newer push.
+        path = _released_binding_path(identity)
+        previous = read_binding(path)
     binding = Binding(identity, emergency=True)
     if binding != previous:
         _write_binding(path, binding)
@@ -160,7 +177,10 @@ def retire_matching(identity: PushIdentity, *, emergency: bool = False) -> str:
     with silence.locked():
         binding = read_binding(path)
         if binding is not None and binding.identity == identity:
-            return retire_locked(identity, emergency=emergency or binding.emergency)
+            return _retire_binding_locked(path, identity, emergency=emergency or binding.emergency)
+        released_path = _released_binding_path(identity)
+        if read_binding(released_path) is not None:
+            return _retire_binding_locked(released_path, identity, emergency=True)
         return retire_copies(identity, emergency=emergency)
 
 
@@ -250,7 +270,7 @@ def _drain(question: Path | None) -> int:
                     continue
                 terminal = True
                 if isinstance(entry, Path):
-                    report(retire_locked(binding.identity, emergency=binding.emergency))
+                    report(_retire_binding_locked(entry, binding.identity, emergency=binding.emergency))
                 else:
                     dropped = silence.drop_locked(binding.identity)
                     if dropped:
