@@ -515,10 +515,11 @@ def run_smoke_folder(source: Path, unit: str, commit: str, bundle: str, ref: str
     from scripts.mac_test import floor_claims
 
     machine = remote.this_machine()
+    registration = build_folders.FixedCheckoutRegistration.MAC_SMOKE
+    checkout_source = build_folders.FixedCheckoutSource(source, registration)
     with (build_folders.fixed_repository_build_folder(build_folders.repo_word(source), machine=machine,
-                                                       unit=unit) as checkout,
-          copies.local_mirror_lease(checkout, unit, create_tree=False),
-          tempfile.TemporaryDirectory(prefix=".smoke-git-", dir=checkout.parent) as git_directory):
+                                                       unit=unit, checkout_source=checkout_source) as checkout,
+          copies.local_mirror_lease(checkout, unit, create_tree=False)):
         locks = tuple(dict.fromkeys((*build_folders.held_build_folder_descriptors(), *copies.COMMAND_LOCKS.get())))
         timeout = build_folders.repository_git_timeout()
         episode = os.environ["MAC_PLACEMENT"].partition("/")[0]
@@ -566,7 +567,7 @@ def run_smoke_folder(source: Path, unit: str, commit: str, bundle: str, ref: str
             for descriptor in copies.COMMAND_LOCKS.get():
                 _ = inherited.enter_context(build_folders.inherit_build_lock(descriptor))
             build_copies.prepare_fixed_checkout(source, checkout, commit, reserved=reserved,
-                                               registration_parent=Path(git_directory))
+                                               registration=registration)
         status = subprocess.run(command, cwd=checkout, env=environment, pass_fds=locks, check=False).returncode
         if os.path.lexists(marker):
             return status or 4

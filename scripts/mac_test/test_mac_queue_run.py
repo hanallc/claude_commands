@@ -23,7 +23,8 @@ from uuid import uuid4
 
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import build_copies, build_folders, conf, removal_guard, scratch
-from scripts.lib.build_copies_test_support import private_copy_config
+from scripts.lib.build_copies_test_support import (FixedRegistrationKillPoint, fixed_registration_snapshot,
+                                                   kill_fixed_registration, private_copy_config)
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_group import send_process_group
@@ -198,6 +199,104 @@ class QueueRunTests(unittest.TestCase):
 
     def events(self, root: Path) -> list[list[str]]:
         return [cast(list[str], json.loads(line)) for line in (root / "events").read_text().splitlines()]
+
+    def test_smoke_uses_a_fixed_registration_staging_name(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        private = private_copy_config(root)
+        source = root / "source"
+        source.mkdir()
+        placement = f"{uuid4().hex}/{uuid4().hex}"
+        with mock.patch.dict(os.environ, {**private.environment, "HOME": str(root), "MAC_PLACEMENT": placement}):
+            _ = subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
+            _ = subprocess.run(["git", "-C", str(source), "remote", "add", "origin", "https://example.test/widget.git"],
+                               check=True, capture_output=True)
+            _ = (source / "tracked").write_text("source")
+            revision = commit_repository(source, "source")
+            with build_folders.fixed_repository_build_folder("widget", machine="mac", unit="verify") as folder:
+                (folder / "target").mkdir()
+                _ = (folder / "target/cache").write_text("Cargo output")
+            with (mock.patch("scripts.agents.remote.this_machine", return_value="mac"),
+                  mock.patch.object(sys, "stdin", io.StringIO("+")),
+                  mock.patch.object(build_folders, "linked_build_checkout",
+                                    wraps=build_folders.linked_build_checkout) as verify,
+                  redirect_stdout(io.StringIO())):
+                command = [sys.executable, "-c", "pass"]
+                result = mac_queue_run.run_smoke_folder(source, "verify", revision, "", "", "fixture", command)
+            self.assertEqual(result, 4)
+            stage = source / ".git/mac-smoke-worktree"
+            verify.assert_any_call(stage / "checkout", source)
+            self.assertFalse(stage.exists())
+            self.assertEqual((folder / "target/cache").read_text(), "Cargo output")
+
+    def test_smoke_refuses_current_and_legacy_staging_before_writing_records(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        private = private_copy_config(root)
+        source = root / "source"
+        source.mkdir()
+        episode = uuid4().hex
+        placement = f"{episode}/{uuid4().hex}"
+        with mock.patch.dict(os.environ, {**private.environment, "HOME": str(root), "MAC_PLACEMENT": placement}):
+            _ = subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
+            _ = subprocess.run(["git", "-C", str(source), "remote", "add", "origin", "https://example.test/widget.git"],
+                               check=True, capture_output=True)
+            _ = (source / "tracked").write_text("source")
+            revision = commit_repository(source, "source")
+            folder = root / "build/widget/mac"
+            (folder / "target").mkdir(parents=True)
+            _ = (folder / "target/cache").write_text("Cargo output")
+            _ = (folder / "local-work").write_text("fixed folder work")
+            stage = source / ".git/mac-smoke-worktree"
+            legacy = folder.parent / ".smoke-git-previous"
+            for path in (stage, legacy):
+                path.mkdir()
+                _ = (path / "data").write_bytes(b"saved work")
+            record_dir = mac_queue_run.smoke_folder_record(episode).parent
+            record_dir.mkdir(parents=True)
+            _ = (record_dir / f"{uuid4().hex}.json").write_bytes(b"previous run")
+            before = fixed_registration_snapshot(root / "build", source, record_dir)
+            output = io.StringIO()
+            with (mock.patch("scripts.agents.remote.this_machine", return_value="mac"),
+                  mock.patch.object(sys, "stdin", io.StringIO("+")),
+                  redirect_stdout(output),
+                  self.assertRaises(build_folders.IncompleteFixedRegistration) as refused):
+                _ = mac_queue_run.run_smoke_folder(source, "retry", revision, "", "", "fixture", [])
+            message = str(refused.exception)
+            self.assertIn(f"  staging folder: {stage}", message)
+            self.assertIn(f"  staging folder: {legacy}", message)
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(fixed_registration_snapshot(root / "build", source, record_dir), before)
+
+    def test_smoke_refuses_a_registration_killed_after_the_start_mark(self) -> None:
+        self.assert_smoke_refuses_killed_registration(FixedRegistrationKillPoint.BEFORE_GIT)
+
+    def test_smoke_refuses_a_registration_killed_during_rescue(self) -> None:
+        self.assert_smoke_refuses_killed_registration(FixedRegistrationKillPoint.DURING_RESCUE)
+
+    def assert_smoke_refuses_killed_registration(self, point: FixedRegistrationKillPoint) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        private = private_copy_config(root)
+        source = root / "source"
+        source.mkdir()
+        episode = uuid4().hex
+        placement = f"{episode}/{uuid4().hex}"
+        with mock.patch.dict(os.environ, {**private.environment, "HOME": str(root), "MAC_PLACEMENT": placement}):
+            _ = subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
+            _ = subprocess.run(["git", "-C", str(source), "remote", "add", "origin", "https://example.test/widget.git"],
+                               check=True, capture_output=True)
+            _ = (source / "tracked").write_bytes(b"source")
+            revision = commit_repository(source, "source")
+            folder = root / "build/widget/mac"
+            kill_fixed_registration(source, folder, revision, os.environ, point)
+            record = mac_queue_run.smoke_folder_record(episode)
+            attempt = source / ".git/mac-linux-folder.retry"
+            before = fixed_registration_snapshot(root / "build", source, record.parent, attempt)
+            output = io.StringIO()
+            with (mock.patch("scripts.agents.remote.this_machine", return_value="mac"), redirect_stdout(output),
+                  self.assertRaises(build_folders.IncompleteFixedRegistration) as refused):
+                _ = mac_queue_run.run_smoke_folder(source, "retry", revision, "", "", "fixture", [])
+            self.assertIn(f"  registration start mark: {build_folders.lease_path(folder)}", str(refused.exception))
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(fixed_registration_snapshot(root / "build", source, record.parent, attempt), before)
 
     def test_rows_81_82_smoke_refuses_untracked_directories_before_checkout(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()

@@ -15,6 +15,8 @@ from unittest.mock import patch
 
 from scripts.lib.process_start import Started, process_start
 from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, gate
+from scripts.production.gate_rename_deploy import deploy_gate_rename
+from scripts.production.gate_rename_deploy.rename_step_names import Direction
 
 
 class LandRunTests(unittest.TestCase):
@@ -52,6 +54,21 @@ class LandRunTests(unittest.TestCase):
                     self.assertFalse(new.exists())
                 else:
                     self.assertEqual(land_runs.state_dir(), new)
+
+    def test_deploy_checks_the_shared_state_default_in_the_installed_tree(self) -> None:
+        source = Path(__file__).resolve().parents[2]
+        names = ("scripts/production/land_runs.py", "scripts/production/gate.py",
+                 "scripts/production/gate_routes.py", "scripts/lib/gate_state_paths.py")
+        for name in names:
+            destination = self.root / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = destination.write_bytes((source / name).read_bytes())
+
+        deploy_gate_rename.require_installed_code(self.root, Direction.FORWARD)
+        paths = self.root / "scripts/lib/gate_state_paths.py"
+        _ = paths.write_text('DEFAULT_GATE_STATE_DIR = "~/wrong"\n')
+        with self.assertRaises(deploy_gate_rename.DeploymentFailed):
+            deploy_gate_rename.require_installed_code(self.root, Direction.FORWARD)
 
     def test_a_land_is_running_only_while_its_process_holds_the_record(self) -> None:
         self.assertEqual(gate.gate_state_dir(), self.root)

@@ -102,7 +102,7 @@ class FolderFormTests(unittest.TestCase):
 
     def test_repo_word_refuses_missing_or_invalid_names(self) -> None:
         self.init_repository()
-        with self.assertRaises(folders.InvalidFolderForm):
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "Git could not read the origin URL: .*origin"):
             _ = folders.repo_word(self.root)
         self.set_origin("https://example.invalid/")
         with self.assertRaises(folders.InvalidFolderForm):
@@ -117,6 +117,18 @@ class FolderFormTests(unittest.TestCase):
                 [], 0, stdout="git@example.invalid:team/widget.git\n")) as git:
             self.assertEqual(folders.repo_word(self.root), "widget")
         self.assertEqual(git.call_args.kwargs["timeout"], 10)
+
+    def test_repo_word_reports_git_timeout_and_invalid_timeout_setting(self) -> None:
+        timeout = subprocess.TimeoutExpired("git", 10, stderr=b"waiting for Git config\n")
+        with (mock.patch.object(subprocess, "run", side_effect=timeout),
+              self.assertRaisesRegex(folders.InvalidFolderForm,
+                                     "Git timed out after 10 s while reading the origin URL: waiting for Git config")):
+            _ = folders.repo_word(self.root)
+        with (mock.patch.object(folders, "repository_git_timeout", side_effect=ValueError("invalid git_timeout_seconds")),
+              mock.patch.object(subprocess, "run") as git,
+              self.assertRaisesRegex(folders.InvalidFolderForm, "Git timeout setting.*invalid git_timeout_seconds")):
+            _ = folders.repo_word(self.root)
+        git.assert_not_called()
 
     def test_held_copy_reports_kernel_identity_and_missing_or_partial_lease(self) -> None:
         from scripts.lib import build_copies, process_start

@@ -195,6 +195,33 @@ def objects_in_git_directory(git_dir: Path, *, on_link: Callable[[Path], None] |
     return _common_directory(_folder(git_dir, git_dir, on_link=on_link), on_link).path / "objects"
 
 
+def _git_file_location(path: Path, entry: str) -> str:
+    prefix, separator, location = entry.strip().partition(":")
+    if not separator or prefix != "gitdir" or not location.strip():
+        raise UnreadableGitFiles(path, "expected a gitdir: line")
+    return location.strip()
+
+
+def worktree_back_pointer(registration: Path, *, parent: int) -> Path:
+    """Read the checkout that a worktree registration names."""
+    pointer = registration / "gitdir"
+    directory = os.open(registration.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        descriptor = os.open("gitdir", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise UnreadableGitFiles(pointer, "expected a regular gitdir file")
+            with os.fdopen(descriptor, encoding="utf-8", errors="surrogateescape", closefd=False) as stream:
+                target = stream.read().removesuffix("\n")
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+    if not target:
+        raise UnreadableGitFiles(pointer, "empty gitdir path")
+    return (registration / target).resolve()
+
+
 def at(toplevel: Path, *, on_link: Callable[[Path], None] | None = None) -> Checkout:
     """Read the checkout whose `.git` entry is in this folder, with no search of parent folders."""
     dot_git = toplevel / ".git"
@@ -207,10 +234,7 @@ def at(toplevel: Path, *, on_link: Callable[[Path], None] | None = None) -> Chec
     if isinstance(entry, _ResolvedGitDirectory):
         git_dir = entry
     else:
-        entry = entry.strip()
-        location = entry.removeprefix("gitdir:").strip()
-        if not entry.startswith("gitdir:") or not location:
-            raise UnreadableGitFiles(dot_git, "expected a gitdir: line")
+        location = _git_file_location(dot_git, entry)
         git_dir = _folder(toplevel / location, dot_git, missing=MissingReferencedGitDirectory, on_link=on_link)
     common_dir = _common_directory(git_dir, on_link)
     return Checkout(toplevel.resolve(), git_dir.path, common_dir.path, git_dir.status, common_dir.status)

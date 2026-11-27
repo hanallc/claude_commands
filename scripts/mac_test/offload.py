@@ -3467,8 +3467,6 @@ def claimed_run(
     request: OffloadRequest,
     repository: KnownRepository,
     started: float,
-    *,
-    scripts_ready: bool = False,
 ) -> MacOffloadResult:
     from scripts.aws_target.hana_placement import HanaControlTransport
 
@@ -3503,7 +3501,7 @@ def claimed_run(
             if isinstance(expected, UnavailableToolParity):
                 return declined("state", started)
             config = replace(config, values={**config.values, **{f"parity.{key}": value for key, value in expected.items()}})
-            if not scripts_ready and not copy_tracked_scripts(controller, config):
+            if not copy_tracked_scripts(controller, config):
                 return DeclinedMacRun("copy", elapsed_seconds(started), controller.copy_failure_detail)
             copy_started = time.monotonic()
             copied = copy_tree_with_key(controller, config, request, repository)
@@ -4420,7 +4418,6 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         repository = KnownRepository(saved.mirror_name, saved.key)
     selected = replace(request, slot=claim.slot)
     target = request.target or "mac"
-    scripts_ready = False
     fixed = False
     released: ClaimReleaseConfirmed | ClaimReleaseUnconfirmed = ClaimReleaseConfirmed()
     try:
@@ -4428,11 +4425,6 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
             try:
                 if target in ("mac", "mac-linux") and isinstance(
                         build_folders.build_folder_form(target), build_folders.FixedRepositoryBuildFolders):
-                    if linux:
-                        if not copy_tracked_scripts(controller, config):
-                            _ = release_claim(controller, request.target)
-                            return DeclinedMacRun("copy", elapsed_seconds(started), controller.copy_failure_detail)
-                        scripts_ready = True
                     _ = remote_folder.enter_context(remote_fixed_folder(controller, config, selected, repository))
                     fixed = True
             except (OSError, ValueError, subprocess.SubprocessError, copies.CopyError) as error:
@@ -4443,7 +4435,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
                 if isinstance(error, (BlockingIOError, copies.BusyRemoteMirror)):
                     return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
                 return DeclinedMacRun("state", elapsed_seconds(started), str(error))
-            result = claimed_run(controller, config, selected, repository, started, scripts_ready=scripts_ready)
+            result = claimed_run(controller, config, selected, repository, started)
     finally:
         if fixed and controller.attempt_evidence.cleanup == "confirmed":
             released = finish_offload_claim(controller, request.target,

@@ -53,11 +53,13 @@ scripts/lib/build_copies.py
 scripts/lib/build_steps.py
 scripts/lib/cancellation.py
 scripts/lib/cargo_output.py
+scripts/lib/cargo_target_config.py
 scripts/lib/conf.py
 scripts/lib/conf_reads.py
 scripts/lib/copy_record.py
 scripts/lib/dev_shell.py
 scripts/lib/file_lock.py
+scripts/lib/gate_state_paths.py
 scripts/lib/git_files.py
 scripts/lib/git_index.py
 scripts/lib/git_rescue.py

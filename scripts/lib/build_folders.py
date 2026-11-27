@@ -18,6 +18,7 @@ import os
 import errno
 import re
 import secrets
+import shlex
 import signal
 import stat
 import subprocess
@@ -36,6 +37,7 @@ from urllib.parse import urlsplit
 from scripts.lib import atomic_file, build_folder_lock, cargo_target_config, git_files, process_start
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.conf import HostOverride, Unusable, UseConfiguredValue
+from scripts.lib.gate_state_paths import DEFAULT_GATE_STATE_DIR, LEGACY_GATE_STATE_DIR
 
 if TYPE_CHECKING:
     from scripts.lib.conf import ConfigRead
@@ -582,11 +584,174 @@ def _fixed_path_is_within(path: Path, parent: Path) -> bool:
     return False
 
 
-def _fixed_linked_checkout(path: Path) -> bool:
+class FixedCheckoutRegistration(Enum):
+    """Select the staging name for a fixed checkout."""
+
+    MAC_LINUX = "mac-linux-worktree"
+    MAC_SMOKE = "mac-smoke-worktree"
+
+
+@dataclass(frozen=True)
+class FixedCheckoutSource:
+    """The repository and staging name for a fixed checkout."""
+
+    repository: Path
+    registration: FixedCheckoutRegistration
+
+
+@dataclass(frozen=True)
+class FixedCheckoutNotRegistered:
+    """The fixed folder has no checkout registration."""
+
+
+@dataclass(frozen=True)
+class FixedCheckoutRegistering:
+    """The lease names a registration that started but did not finish."""
+
+    source: FixedCheckoutSource
+    common_dir: Path
+
+
+@dataclass(frozen=True)
+class FixedCheckoutIdentity:
+    """The fixed checkout, its source, and its Git directory identities."""
+
+    checkout: Path
+    source: Path
+    checkout_identity: CopyDirectoryIdentity
+    common_dir: Path
+    common_identity: CopyDirectoryIdentity
+    git_dir: Path
+    git_identity: CopyDirectoryIdentity
+
+    @classmethod
+    def from_fields(cls, fields: Mapping[str, object]) -> FixedCheckoutIdentity:
+        identity = cls(
+            _recorded_path(fields, "copy_path"), _recorded_path(fields, "source_path"),
+            _recorded_directory(fields, "copy"), _recorded_path(fields, "common_directory"),
+            _recorded_directory(fields, "common"), _recorded_path(fields, "git_directory"),
+            _recorded_directory(fields, "git"),
+        )
+        if (any("\0" in str(path) for path in (identity.checkout, identity.source, identity.common_dir, identity.git_dir))
+                or identity.lease_fields() != fields):
+            raise ValueError("invalid fixed checkout identity")
+        return identity
+
+    def lease_fields(self) -> dict[str, object]:
+        return {
+            "copy_path": str(self.checkout), "source_path": str(self.source),
+            "copy_device": self.checkout_identity.device, "copy_inode": self.checkout_identity.inode,
+            "common_directory": str(self.common_dir),
+            "common_device": self.common_identity.device, "common_inode": self.common_identity.inode,
+            "git_directory": str(self.git_dir),
+            "git_device": self.git_identity.device, "git_inode": self.git_identity.inode,
+        }
+
+
+@dataclass(frozen=True)
+class FixedCheckoutRegistered:
+    """The lease records the identity of the linked checkout."""
+
+    identity: FixedCheckoutIdentity
+
+
+FixedCheckoutRegistrationState = FixedCheckoutNotRegistered | FixedCheckoutRegistering | FixedCheckoutRegistered
+_FIXED_CHECKOUT_NOT_REGISTERED = FixedCheckoutNotRegistered()
+
+
+def fixed_lease_registration(path: Path, lease: Mapping[str, object]) -> FixedCheckoutRegistrationState:
+    """Read the lease registration state, including old source records."""
+    record = lease.get("registration")
+    if "registration" not in lease:
+        if "source" not in lease:
+            return FixedCheckoutNotRegistered()
+        legacy = lease["source"]
+        if isinstance(legacy, dict):
+            return _registered_fixed_checkout(path, cast(dict[str, object], legacy))
+    elif "source" not in lease and isinstance(record, dict):
+        fields = cast(dict[str, object], record)
+        match fields:
+            case {"state": "not-registered"} if len(fields) == 1:
+                return FixedCheckoutNotRegistered()
+            case {"state": "registered", "source": identity} if len(fields) == 2 and isinstance(identity, dict):
+                return _registered_fixed_checkout(path, cast(dict[str, object], identity))
+            case {"state": "registering", "repository": str() as repository,
+                  "common_dir": str() as common, "staging": str() as staging} if len(fields) == 4:
+                if ("\0" not in repository and "\0" not in common
+                        and Path(repository).is_absolute() and Path(common).is_absolute()
+                        and staging in (FixedCheckoutRegistration.MAC_LINUX.value, FixedCheckoutRegistration.MAC_SMOKE.value)):
+                    source = FixedCheckoutSource(Path(repository), FixedCheckoutRegistration(staging))
+                    return FixedCheckoutRegistering(source, Path(common))
+            case _:
+                pass
+    raise InvalidFixedBuildRoot(f"{lease_path(path)}: invalid fixed checkout registration state")
+
+
+def _registered_fixed_checkout(path: Path, fields: Mapping[str, object]) -> FixedCheckoutRegistered:
+    try:
+        return FixedCheckoutRegistered(FixedCheckoutIdentity.from_fields(fields))
+    except ValueError as error:
+        raise InvalidFixedBuildRoot(f"{lease_path(path)}: invalid fixed checkout source identity: {error}") from error
+
+
+def _set_fixed_lease_registration(
+    lease: dict[str, object], registration: FixedCheckoutRegistrationState,
+) -> None:
+    _ = lease.pop("source", None)
+    match registration:
+        case FixedCheckoutNotRegistered():
+            lease["registration"] = {"state": "not-registered"}
+        case FixedCheckoutRegistering(source, common_dir):
+            lease["registration"] = {"state": "registering", "repository": str(source.repository),
+                                     "common_dir": str(common_dir), "staging": source.registration.value}
+        case FixedCheckoutRegistered(identity):
+            lease["registration"] = {"state": "registered", "source": identity.lease_fields()}
+
+
+@dataclass(frozen=True)
+class FixedRegistrationLeftover:
+    """An entry that prevents a new fixed checkout registration."""
+
+    kind: Literal[".git entry", "staging folder", "worktree registration", "registration start mark", "temporary file"]
+    path: Path
+
+
+@dataclass(frozen=True)
+class FixedRegistrationReadFailure:
+    """The scan could not inspect a registration path."""
+
+    path: Path
+    reason: str
+
+
+FixedRegistrationFinding = FixedRegistrationLeftover | FixedRegistrationReadFailure
+
+
+class IncompleteFixedRegistration(InvalidFixedBuildRoot):
+    """The fixed checkout has registration files that require review."""
+
+    def __init__(self, checkout: Path, source: Path, findings: Sequence[FixedRegistrationFinding]) -> None:
+        command = shlex.join(("git", "-C", str(source), "worktree", "list", "--porcelain"))
+        super().__init__("\n".join((
+            f"{checkout}: incomplete fixed checkout registration",
+            *(f"  {entry.kind}: {entry.path}" if isinstance(entry, FixedRegistrationLeftover)
+              else f"  Cannot read {entry.path}: {entry.reason}" for entry in findings),
+            "A person must decide what to keep. Inspect the registrations with this command.",
+            command,
+        )))
+
+
+def _fixed_checkout_can_use_allocator(path: Path) -> bool:
     try:
         lease = folder_lease_fields(path)
         if (lease.get("machine") != path.name or lease.get("repository") != path.parent.name
                 or "last_use" in lease):
+            return False
+        registration = fixed_lease_registration(path, lease)
+        if isinstance(registration, FixedCheckoutRegistering):
+            # The allocator reports this mark while it holds the folder lock.
+            return True
+        if isinstance(registration, FixedCheckoutNotRegistered):
             return False
         checkout = git_files.at(path)
         identity = CopyDirectoryIdentity.from_stat(checkout.common_dir_status)
@@ -596,18 +761,35 @@ def _fixed_linked_checkout(path: Path) -> bool:
         return False
 
 
+def _fixed_placement_scratch_paths() -> list[Path]:
+    """List scratch roots that do not come from the checkout settings."""
+    from scripts.lib import session_folder
+    from scripts.build_targets import target_config
+
+    paths = [
+        Path("/tmp/claude"), session_folder.former_root(),
+        target_config.ssh_target_state_directory("mac") / "fetched", target_config.build_targets_state_root(),
+        Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier"),
+        Path(DEFAULT_GATE_STATE_DIR), Path(LEGACY_GATE_STATE_DIR),
+    ]
+    for name in ("SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "GATE_STATE_DIR"):
+        if value := os.environ.get(name):
+            paths.append(Path(value))
+    if value := os.environ.get("SCRATCH_ROOT"):
+        paths.extend(Path(value).parent / name for name in ("unit", "delegate"))
+    return paths
+
+
 def _check_fixed_build_root(root: Path, settings: ConfigRead, *, allow_managed_checkout: bool = False) -> Path:
     """Check the placement before fixed checkouts can use the root."""
     from scripts.lib import session_folder
-    from scripts.build_targets import target_config
-    from scripts.production.land_runs import DEFAULT_STATE_DIR
 
     if not root.is_absolute():
         raise InvalidFixedBuildRoot(f"{root}: the fixed build root must be absolute")
     try:
         canonical = root.resolve()
         cwd = os.getcwd()
-        cargo_home = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
+        cargo_home = os.environ.get("CARGO_HOME") or str(Path.home() / ".cargo")
         for key, output in cargo_target_config.cargo_folder_settings([], cwd, os.environ).items():
             try:
                 target = (Path(cargo_target_config.cargo_build_folder(output, [], cwd, cargo_home))
@@ -621,17 +803,12 @@ def _check_fixed_build_root(root: Path, settings: ConfigRead, *, allow_managed_c
                     or _entry_exists(ancestor / ".rustc_info.json")):
                 raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a Cargo target directory ({ancestor})")
             if (_entry_exists(ancestor / ".git")
-                    and not (allow_managed_checkout and ancestor == canonical and _fixed_linked_checkout(canonical))):
+                    and not (allow_managed_checkout and ancestor == canonical
+                             and _fixed_checkout_can_use_allocator(canonical))):
                 raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a Git checkout ({ancestor})")
             if _CI_ADMISSION_DIRECTORY.match(ancestor.name) or ancestor.name == "typecheck-venv":
                 raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a scratch root ({ancestor})")
 
-        scratch_roots = [
-            Path("/tmp/claude"), session_folder.former_root(),
-            target_config.ssh_target_state_directory("mac") / "fetched", target_config.build_targets_state_root(),
-            Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier"),
-            Path(DEFAULT_STATE_DIR), Path("~/.local/state/merge-gate"),
-        ]
         configured_roots: list[Path] = []
         session = os.environ.get(session_folder.ROOT_ENV) or settings.value("roots.session", str, default="")
         if session:
@@ -640,12 +817,7 @@ def _check_fixed_build_root(root: Path, settings: ConfigRead, *, allow_managed_c
             if value := settings.value(key, str, default=""):
                 configured_roots.append(Path(os.path.expandvars(
                     value.replace("${TMPDIR}", str(inherited_temporary_parent())))))
-        for name in ("SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "GATE_STATE_DIR"):
-            if value := os.environ.get(name):
-                scratch_roots.append(Path(value))
-        if value := os.environ.get("SCRATCH_ROOT"):
-            scratch_roots.extend(Path(value).parent / name for name in ("unit", "delegate"))
-        for location in (*scratch_roots, *configured_roots):
+        for location in (*_fixed_placement_scratch_paths(), *configured_roots):
             scratch = location.expanduser().resolve()
             if _fixed_path_is_within(canonical, scratch):
                 raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a scratch root ({scratch})")
@@ -697,17 +869,32 @@ def build_folder_form(machine: str, *, settings: ConfigRead | UseConfiguredValue
 def repo_word(repository: Path) -> str:
     """Read the repository name from origin and apply its configured alias."""
     try:
+        timeout = repository_git_timeout()
+    except (OSError, ValueError) as error:
+        raise InvalidFolderForm(f"{repository}: cannot read the Git timeout setting for the origin URL: {error}") from error
+    try:
         origin = subprocess.run(
             ["git", "-C", str(repository), "remote", "get-url", "origin"],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True,
-            timeout=repository_git_timeout(),
+            timeout=timeout,
         ).stdout.rstrip("\n")
+    except subprocess.CalledProcessError as error:
+        detail = (cast(str | None, error.stderr) or "").strip() or str(error)
+        raise InvalidFolderForm(f"{repository}: Git could not read the origin URL: {detail}") from error
+    except subprocess.TimeoutExpired as error:
+        stderr = error.stderr
+        detail = stderr.decode(errors="replace").strip() if stderr else ""
+        message = f"{repository}: Git timed out after {timeout:g} s while reading the origin URL"
+        raise InvalidFolderForm(f"{message}: {detail}" if detail else message) from error
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise InvalidFolderForm(f"{repository}: cannot run Git to read the origin URL: {error}") from error
+    try:
         if "://" in origin:
             location = urlsplit(origin).path
         else:
             location = re.sub(r"^(?:[^/:]+@)?(?:\[[^\]]+\]|[^/:]+):", "", origin, count=1)
-    except (OSError, subprocess.SubprocessError, ValueError) as error:
-        raise InvalidFolderForm(f"{repository}: cannot read the origin URL") from error
+    except ValueError as error:
+        raise InvalidFolderForm(f"{repository}: invalid origin URL: {error}") from error
     return build_repository_name(location.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git"))
 
 
@@ -1307,15 +1494,16 @@ def folder_lease_fields(path: Path) -> dict[str, object]:
         return _read_folder_lease(path, directory)
 
 
-def _is_configured_fixed_build_folder(path: Path, root: Path) -> bool:
+def _is_configured_fixed_build_folder(path: Path, root: Path, *,
+                                      settings: ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> bool:
     if path.parent.parent == root:
         with suppress(InvalidFolderForm):
-            return isinstance(build_folder_form(path.name), FixedRepositoryBuildFolders)
+            return isinstance(build_folder_form(path.name, settings=settings), FixedRepositoryBuildFolders)
     return False
 
 
-def _has_fixed_build_lease(path: Path, parent: int, *, layout: Path, build: Path) -> bool:
-    if not _is_configured_fixed_build_folder(layout, build):
+def _has_fixed_build_lease(path: Path, parent: int, *, layout: Path, configured: bool) -> bool:
+    if not configured:
         # The marked sibling identifies lease metadata under a former build root.
         lock = path.name + ".lock"
         try:
@@ -1343,7 +1531,7 @@ def is_fixed_build_folder(path: Path) -> bool:
         return True
     try:
         with build_folder_lock.folder_parent(folder, folder.parent, create=False) as parent:
-            return _has_fixed_build_lease(folder, parent, layout=folder, build=build)
+            return _has_fixed_build_lease(folder, parent, layout=folder, configured=False)
     except FileNotFoundError:
         return False
 
@@ -1355,22 +1543,73 @@ class FixedBuildFolderRemovalRefused(PermissionError):
         super().__init__(f"{folder}: cannot remove a fixed build folder")
 
 
-def _require_no_fixed_leases(path: Path, parent: int, entries: Iterable[str], *, layout: Path, build: Path) -> None:
-    for name in entries:
-        if name.endswith(".lease.json"):
-            source = path / name.removesuffix(".lease.json")
-            original = layout / source.name
-            if _has_fixed_build_lease(source, parent, layout=original, build=build):
-                raise FixedBuildFolderRemovalRefused(original)
+def _open_directory_path(descriptor: int, requested: Path) -> Path:
+    """Read the path of an open directory."""
+    try:
+        if sys.platform == "linux":
+            return Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        if sys.platform == "darwin":
+            result = fcntl.fcntl(descriptor, 50, bytes(1024))
+            return Path(os.fsdecode(result.split(b"\0", 1)[0]))
+    except OSError:
+        pass
+    return requested.resolve()
+
+
+def _build_root_path(root: Path) -> Path:
+    try:
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return root.resolve()
+    try:
+        return _open_directory_path(descriptor, root)
+    finally:
+        os.close(descriptor)
+
+
+@dataclass(frozen=True)
+class FixedFolderRemovalLayout:
+    """Resolve the source and build root before a removal scan."""
+
+    source: Path
+    build: Path
+    settings: ConfigRead
+
+    @classmethod
+    def read(cls, source: Path) -> FixedFolderRemovalLayout:
+        settings = _settings()
+        return cls(source.parent.resolve() / source.name, build_root(settings=settings).resolve(), settings)
+
+    @classmethod
+    def from_open_parent(cls, source: Path, parent: int) -> FixedFolderRemovalLayout:
+        settings = _settings()
+        directory = _open_directory_path(parent, source.parent)
+        return cls(directory / source.name, _build_root_path(build_root(settings=settings)), settings)
+
+    def configured(self, path: Path) -> bool:
+        return _is_configured_fixed_build_folder(path, self.build, settings=self.settings)
+
+    def check_leases(self, folder: Path, parent: int, entries: Iterable[str], *, original: Path) -> None:
+        for name in entries:
+            if name.endswith(".lease.json"):
+                source = folder / name.removesuffix(".lease.json")
+                layout = original / source.name
+                if _has_fixed_build_lease(source, parent, layout=layout, configured=self.configured(layout)):
+                    raise FixedBuildFolderRemovalRefused(layout)
+
+    def check_root(self, tree: Path, parent: int, *, legacy_stage: bool) -> None:
+        if self.configured(self.source) or _has_fixed_build_lease(
+                self.source, parent, layout=self.source, configured=False):
+            raise FixedBuildFolderRemovalRefused(self.source)
+        if legacy_stage and _HIDDEN_REMOVAL.fullmatch(tree.name) is not None:
+            self.check_leases(tree.parent, parent, os.listdir(parent), original=self.source.parent)
 
 
 def require_no_fixed_build_folders(path: Path, *, include_root: bool = True, dir_fd: int | None = None,
                                    original_path: Path | None = None, repair_access: bool = False) -> None:
     """Refuse deletion of a fixed folder or the lease that identifies it."""
-    build = build_root().resolve()
     tree = path.resolve() if dir_fd is None else path
-    source = tree if original_path is None else original_path
-    layout = source.parent.resolve() / source.name
+    layout = FixedFolderRemovalLayout.read(tree if original_path is None else original_path)
 
     def visit(folder: Path, parent: int, original: Path, *, check_form: bool) -> None:
         try:
@@ -1379,7 +1618,7 @@ def require_no_fixed_build_folders(path: Path, *, include_root: bool = True, dir
             return
         if not stat.S_ISDIR(info.st_mode):
             return
-        if check_form and _is_configured_fixed_build_folder(original, build):
+        if check_form and layout.configured(original):
             raise FixedBuildFolderRemovalRefused(original)
         with ExitStack() as opened:
             directory = _open_removal_directory(folder, parent, info, opened, repair_access=repair_access)
@@ -1391,7 +1630,7 @@ def require_no_fixed_build_folders(path: Path, *, include_root: bool = True, dir
                         leases.append(entry.name)
                     if entry.is_dir(follow_symlinks=False):
                         children.append(entry.name)
-            _require_no_fixed_leases(folder, directory, leases, layout=original, build=build)
+            layout.check_leases(folder, directory, leases, original=original)
             for name in children:
                 visit(folder / name, directory, original / name, check_form=True)
 
@@ -1402,13 +1641,8 @@ def require_no_fixed_build_folders(path: Path, *, include_root: bool = True, dir
             except FileNotFoundError:
                 return
         if include_root:
-            if (_is_configured_fixed_build_folder(layout, build)
-                    or _has_fixed_build_lease(source, dir_fd, layout=layout, build=build)):
-                raise FixedBuildFolderRemovalRefused(layout)
-            if original_path is None and _HIDDEN_REMOVAL.fullmatch(tree.name) is not None:
-                # A legacy stage can have its original lease next to it.
-                _require_no_fixed_leases(tree.parent, dir_fd, os.listdir(dir_fd), layout=tree.parent, build=build)
-        visit(tree, dir_fd, layout, check_form=False)
+            layout.check_root(tree, dir_fd, legacy_stage=original_path is None)
+        visit(tree, dir_fd, layout.source, check_form=False)
 
 
 def require_build_tree_move_allowed(path: Path) -> None:
@@ -1500,7 +1734,7 @@ def _recorded_directory(fields: Mapping[str, object], key: str) -> CopyDirectory
     return CopyDirectoryIdentity(device, inode)
 
 
-def _recorded_path(fields: dict[str, object], key: str) -> Path:
+def _recorded_path(fields: Mapping[str, object], key: str) -> Path:
     value = fields.get(key)
     if not isinstance(value, str) or not Path(value).is_absolute():
         raise ValueError(f"missing {key} path")
@@ -2160,17 +2394,15 @@ def numbered_copy_records() -> Iterator[NumberedSourceEvidence]:
 
 
 def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released: bool = False,
-                 ready: bool = True, copy_fields: Iterable[tuple[str, object]] = ()) -> None:
+                 ready: bool = True, copy_fields: Iterable[tuple[str, object]] = (),
+                 registration: FixedCheckoutRegistrationState = _FIXED_CHECKOUT_NOT_REGISTERED) -> None:
     now = datetime.now(timezone.utc).isoformat()
     record: dict[str, object] = {"showrunner": spec.showrunner, "unit": spec.unit or spec.owner,
               "work": spec.work, "purpose": spec.purpose, "pid": spec.owner_pid or os.getpid(),
               "start_time": now}
     if spec.kind == "fixed-repository":
         record.update(machine=spec.machine, repository=spec.repository)
-        with suppress(FileNotFoundError):
-            previous = _read_folder_lease(path, directory)
-            if "source" in previous:
-                record["source"] = previous["source"]
+        _set_fixed_lease_registration(record, registration)
     if spec.kind == "copy" and isinstance(spec.copy_checkout, CopyCheckout):
         if released:
             record = _read_folder_lease(path, directory)
@@ -2228,6 +2460,7 @@ class _FixedRepositoryFolder:
     parent: Path
     repository: str
     unit: str
+    checkout_source: FixedCheckoutSource | Literal["folder-only"]
 
 
 _AllocationRequest = BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest | _FixedRepositoryFolder
@@ -2334,6 +2567,7 @@ def _create_build_folder(request: _AllocationRequest,
                 made_inode: os.stat_result | None = None
                 allocated: os.stat_result | None = None
                 new_folder = False
+                registration: FixedCheckoutRegistrationState = FixedCheckoutNotRegistered()
                 try:
                     if not _take_lock(descriptor, fcntl.LOCK_SH if stable and not exclusive_copy and not editable_repository else fcntl.LOCK_EX,
                                       wait=not exclusive_copy and not isinstance(original, UniqueBuildFolder)):
@@ -2354,8 +2588,16 @@ def _create_build_folder(request: _AllocationRequest,
                         if spec.kind == "copy":
                             del directories[path.parent]
                         continue
-                    if spec.kind == "fixed-repository" and _copy_is_kept(path, directory):
-                        raise BlockingIOError(errno.EWOULDBLOCK, "the build folder is kept for cleanup", str(path))
+                    if isinstance(original, _FixedRepositoryFolder):
+                        try:
+                            registration = fixed_lease_registration(path, _read_folder_lease(path, directory))
+                        except FileNotFoundError:
+                            pass
+                        if isinstance(registration, FixedCheckoutRegistering):
+                            _require_new_fixed_registration(path, registration.source, registration.common_dir, started=True)
+                        _check_unregistered_fixed_checkout(path, original.checkout_source, registration)
+                        if _copy_is_kept(path, directory):
+                            raise BlockingIOError(errno.EWOULDBLOCK, "the build folder is kept for cleanup", str(path))
                     try:
                         existing = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
                     except FileNotFoundError:
@@ -2393,7 +2635,7 @@ def _create_build_folder(request: _AllocationRequest,
                                                      str(spec.copy_checkout.source)) from error
                     new_folder = existing is None
                     if spec.kind != "copy":
-                        _write_lease(path, directory, allocation)
+                        _write_lease(path, directory, allocation, registration=registration)
                     if existing is None:
                         mode = original.mode if isinstance(original, StableOwnerFolder) else 0o777 if stable and spec.kind != "main" else 0o700
                         try:
@@ -2636,8 +2878,8 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result, *,
     review_root = path.absolute() if review_temporary else None
     with ExitStack() as leases:
         try:
-            refusal = _hold_child_leases(path, directory, leases, wait=wait, held=held,
-                                         repair_access=repair_access, review_root=review_root)
+            refusal = hold_child_leases_at(path, directory, leases, FixedFolderRemovalLayout.read(path),
+                                           wait=wait, held=held, repair_access=repair_access, review_root=review_root)
             current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
         except (OSError, ValueError):
             return False
@@ -2665,9 +2907,9 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result, *,
                 renamed = os.stat(hidden.name, dir_fd=directory, follow_symlinks=False)
                 if not os.path.samestat(renamed, allocated) or not may_remove_folder_tree(hidden):
                     return False
-                refusal = _hold_child_leases(
-                    hidden, directory, leases, wait=False, held=held, repair_access=repair_access,
-                    review_root=review_root, original_path=path)
+                refusal = hold_child_leases_at(
+                    hidden, directory, leases, FixedFolderRemovalLayout.read(path), wait=False, held=held,
+                    repair_access=repair_access, review_root=review_root, legacy_stage=False)
             except (OSError, ValueError):
                 return False
             if isinstance(refusal, RefusedRemovalLease):
@@ -2974,34 +3216,34 @@ def hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True, check_
     """Check child leases and inspect a folder before a claim."""
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        return _hold_child_leases(path, parent, stack, wait=wait, check_owners=check_owners,
-                                  review_root=path.absolute() if review_temporary else None, inspect=inspect)
+        return hold_child_leases_at(path, parent, stack, FixedFolderRemovalLayout.from_open_parent(path, parent),
+                                    wait=wait, check_owners=check_owners,
+                                    review_root=path.absolute() if review_temporary else None, inspect=inspect)
     finally:
         os.close(parent)
 
 
-def _hold_child_leases(path: Path, parent: int, stack: ExitStack, *, wait: bool = True,
-                       probe_fds: list[int] | None = None, held: set[tuple[int, int]] | None = None,
-                       repair_access: bool = False, check_owners: bool = False,
-                       review_root: Path | None = None,
-                       inspect: Callable[[Path, set[str], set[str]], None] | None = None,
-                       original_path: Path | None = None) -> RefusedRemovalLease | None:
+def hold_child_leases_at(path: Path, parent: int, stack: ExitStack, layout: FixedFolderRemovalLayout, *,
+                        wait: bool = True, check_owners: bool = False,
+                        probe_fds: list[int] | None = None, held: set[tuple[int, int]] | None = None,
+                        repair_access: bool = False, review_root: Path | None = None,
+                        inspect: Callable[[Path, set[str], set[str]], None] | None = None,
+                        legacy_stage: bool = True) -> RefusedRemovalLease | None:
     """Hold child leases through the open parent. Skip inodes already held."""
     scan_root = path
-    require_no_fixed_build_folders(path, dir_fd=parent, original_path=original_path, repair_access=repair_access)
+    layout.check_root(path, parent, legacy_stage=legacy_stage)
 
-    def visit(path: Path, parent: int) -> RefusedRemovalLease | None:
+    def visit(path: Path, parent: int, original: Path, *, check_form: bool) -> RefusedRemovalLease | None:
         try:
             expected = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:
             return None
         if not stat.S_ISDIR(expected.st_mode):
             return None
+        if check_form and layout.configured(original):
+            raise FixedBuildFolderRemovalRefused(original)
         with ExitStack() as opened:
-            try:
-                directory = _open_removal_directory(path, parent, expected, opened, repair_access=repair_access)
-            except FileNotFoundError:
-                return None
+            directory = _open_removal_directory(path, parent, expected, opened, repair_access=repair_access)
             folders: set[str] = set()
             files: set[str] = set()
             links: set[str] = set()
@@ -3018,14 +3260,15 @@ def _hold_child_leases(path: Path, parent: int, stack: ExitStack, *, wait: bool 
                         files.add(entry.name)
             entries = files | links
             children = folders | links
+            layout.check_leases(path, directory, entries | folders, original=original)
             if review_root is not None:
-                original = review_root / path.relative_to(scan_root)
-                if ("pack" in folders or git_files.has_git_storage(original, folders, entries)
+                review_path = review_root / path.relative_to(scan_root)
+                if ("pack" in folders or git_files.has_git_storage(review_path, folders, entries)
                         or any(len(name) in (38, 40, 62, 64) and _LOOSE_OBJECT_HASH.fullmatch(name) for name in files)):
                     raise TemporaryFolderReview(git_files.GIT_STORAGE_REASON)
                 for name in links:
                     target = Path(os.readlink(name, dir_fd=directory))
-                    if _link_can_leave_folder(review_root, original, target):
+                    if _link_can_leave_folder(review_root, review_path, target):
                         raise TemporaryFolderReview(EXTERNAL_LINK_REASON)
             if inspect is not None:
                 inspect(path, children, entries)
@@ -3061,12 +3304,18 @@ def _hold_child_leases(path: Path, parent: int, stack: ExitStack, *, wait: bool 
                     if name + ".lease.json" in entries and _lease_owner_state(child, directory) is not LeaseOwnerState.ENDED:
                         return RemovalLockHeld(lease_path(child))
             for child in folders:
-                refusal = visit(path / child, directory)
+                refusal = visit(path / child, directory, original / child, check_form=True)
                 if refusal is not None:
                     return refusal
         return None
 
-    return visit(path, parent)
+    try:
+        return visit(path, parent, layout.source, check_form=False)
+    except TemporaryFolderReview:
+        # Check the full tree for fixed folders before publishing a review reason.
+        require_no_fixed_build_folders(path, dir_fd=parent, original_path=None if legacy_stage else layout.source,
+                                       repair_access=repair_access)
+        raise
 
 
 @contextmanager
@@ -3106,7 +3355,8 @@ def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = Tru
                 elif children:
                     child_locks: list[int] = []
                     with suppress(FileNotFoundError):
-                        refusal = _hold_child_leases(folder, directory, stack, wait=wait, probe_fds=child_locks)
+                        refusal = hold_child_leases_at(folder, directory, stack, FixedFolderRemovalLayout.read(folder),
+                                                       wait=wait, probe_fds=child_locks)
                         lease = refusal if refusal is not None else replace(lease, child_locks=tuple(child_locks))
                     if probe_fds is not None:
                         probe_fds.extend(child_locks)
@@ -3143,7 +3393,9 @@ def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder | MainOutput |
         _release_build_folder(path)
 
 
-def check_fixed_repository_placement(repo: str, *, machine: str) -> Path:
+def check_fixed_repository_placement(
+    repo: str, *, machine: str, checkout_source: FixedCheckoutSource | Literal["folder-only"] = "folder-only",
+) -> Path:
     """Check the configured location of a fixed repository folder."""
     settings = _settings()
     form = build_folder_form(machine, settings=settings)
@@ -3157,79 +3409,205 @@ def check_fixed_repository_placement(repo: str, *, machine: str) -> Path:
     if _CI_ADMISSION_DIRECTORY.match(machine) or machine == "typecheck-venv":
         raise InvalidFixedBuildRoot(f"{parent / machine}: the fixed checkout cannot use a scratch directory name")
     checkout = parent / machine
+    if isinstance(checkout_source, FixedCheckoutSource) and checkout.resolve() == checkout:
+        try:
+            registration = fixed_lease_registration(checkout, folder_lease_fields(checkout))
+        except FileNotFoundError:
+            registration = FixedCheckoutNotRegistered()
+        _check_unregistered_fixed_checkout(checkout, checkout_source, registration)
     if _check_fixed_build_root(checkout, settings, allow_managed_checkout=True) != checkout:
         raise InvalidFixedBuildRoot(f"{checkout}: the fixed checkout must not be a symbolic link")
     return checkout
 
 
 @contextmanager
-def fixed_repository_build_folder(repo: str, *, machine: str, unit: str) -> Generator[Path]:
+def fixed_repository_build_folder(
+    repo: str, *, machine: str, unit: str,
+    checkout_source: FixedCheckoutSource | Literal["folder-only"] = "folder-only",
+) -> Generator[Path]:
     """Hold the fixed repository folder on the machine that runs the build."""
-    checkout = check_fixed_repository_placement(repo, machine=machine)
+    checkout = check_fixed_repository_placement(repo, machine=machine, checkout_source=checkout_source)
     request = _FixedRepositoryFolder(FixedRepositoryBuildFolders(machine), checkout.parent.parent,
-                                     checkout.parent.name, _unit_name(unit))
+                                     checkout.parent.name, _unit_name(unit), checkout_source)
     with leased_build_folder(request) as path:
         yield path
 
 
-def _register_fixed_build_checkout(source: Path, checkout: Path, commit: str,
-                                   registration_parent: Path | Literal["allocate"]) -> None:
-    """Link a fixed folder to its source and preserve any existing files."""
+def _check_unregistered_fixed_checkout(
+    checkout: Path, source: FixedCheckoutSource | Literal["folder-only"], registration: FixedCheckoutRegistrationState,
+) -> None:
+    if isinstance(source, FixedCheckoutSource) and isinstance(registration, FixedCheckoutNotRegistered):
+        repository = source.repository.resolve(strict=True)
+        source = FixedCheckoutSource(repository, source.registration)
+        _require_new_fixed_registration(checkout, source, git_files.at(repository).common_dir)
+
+
+def _worktree_registration_leftovers(
+    checkout: Path, staging: Path, *, plan: FixedCheckoutRegistration,
+) -> Iterator[FixedRegistrationFinding]:
+    registry = staging.parent / "worktrees"
+    try:
+        parent = os.open(registry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        yield FixedRegistrationReadFailure(registry, str(error))
+        return
+    try:
+        with os.scandir(parent) as entries:
+            for entry in sorted(entries, key=lambda entry: entry.name):
+                registration = registry / entry.name
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError as error:
+                    yield FixedRegistrationReadFailure(registration, str(error))
+                    continue
+                try:
+                    target = git_files.worktree_back_pointer(registration, parent=parent)
+                except (OSError, ValueError, RuntimeError) as error:
+                    yield FixedRegistrationReadFailure(registration / "gitdir", str(error))
+                else:
+                    legacy_stage = target.parent.parent
+                    if not (
+                        target in (checkout / ".git", staging / "checkout/.git")
+                        or (plan is FixedCheckoutRegistration.MAC_SMOKE and target.name == ".git"
+                            and legacy_stage.parent == checkout.parent and legacy_stage.name.startswith(".smoke-git-"))
+                    ):
+                        continue
+                yield FixedRegistrationLeftover("worktree registration", registration)
+    except OSError as error:
+        yield FixedRegistrationReadFailure(registry, str(error))
+    finally:
+        os.close(parent)
+
+
+def _fixed_registration_leftover(entry: FixedRegistrationLeftover) -> Iterator[FixedRegistrationFinding]:
+    try:
+        if _entry_exists(entry.path):
+            yield entry
+    except OSError as error:
+        yield FixedRegistrationReadFailure(entry.path, str(error))
+
+
+_FIXED_LEASE_TEMPORARY = re.compile(r"[0-9a-f]{16}\.tmp")
+
+
+def _fixed_registration_siblings(
+    checkout: Path, *, plan: FixedCheckoutRegistration,
+) -> Iterator[FixedRegistrationFinding]:
+    lease_prefix = lease_path(checkout).name + "."
+    try:
+        with os.scandir(checkout.parent) as entries:
+            for entry in sorted(entries, key=lambda entry: entry.name):
+                if plan is FixedCheckoutRegistration.MAC_SMOKE and entry.name.startswith(".smoke-git-"):
+                    yield FixedRegistrationLeftover("staging folder", checkout.parent / entry.name)
+                if entry.name.startswith(lease_prefix) and _FIXED_LEASE_TEMPORARY.fullmatch(
+                    entry.name.removeprefix(lease_prefix)
+                ):
+                    yield FixedRegistrationLeftover("temporary file", checkout.parent / entry.name)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        yield FixedRegistrationReadFailure(checkout.parent, str(error))
+    try:
+        with os.scandir(checkout) as entries:
+            for entry in sorted(entries, key=lambda entry: entry.name):
+                if atomic_file.temporary_target(entry.name) == ".git":
+                    yield FixedRegistrationLeftover("temporary file", checkout / entry.name)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        yield FixedRegistrationReadFailure(checkout, str(error))
+
+
+def _require_new_fixed_registration(
+    checkout: Path, source: FixedCheckoutSource, common_dir: Path, *, started: bool = False,
+) -> None:
+    staging = common_dir / source.registration.value
+    findings: list[FixedRegistrationFinding] = []
+    if started:
+        findings.append(FixedRegistrationLeftover("registration start mark", lease_path(checkout)))
+    findings.extend(_fixed_registration_leftover(FixedRegistrationLeftover(".git entry", checkout / ".git")))
+    findings.extend(_fixed_registration_leftover(FixedRegistrationLeftover("staging folder", staging)))
+    findings.extend(_fixed_registration_siblings(checkout, plan=source.registration))
+    findings.extend(_worktree_registration_leftovers(checkout, staging, plan=source.registration))
+    if findings:
+        raise IncompleteFixedRegistration(checkout, source.repository, findings)
+
+
+def _register_fixed_build_checkout(source: Path, checkout: Path, commit: str, staging: Path) -> None:
+    """Link the fixed folder to its source and preserve existing files."""
     locks = held_build_folder_descriptors()
     timeout = repository_git_timeout()
 
-    def git(path: Path, *words: str) -> None:
-        _ = subprocess.run(["git", "-C", str(path), *words], check=True, capture_output=True,
+    def git(*words: str) -> None:
+        _ = subprocess.run(["git", "-C", str(source), *words], check=True, capture_output=True,
                            text=True, stdin=subprocess.DEVNULL, pass_fds=locks, timeout=timeout)
 
     if not any(checkout.iterdir()):
-        git(source, "worktree", "add", "--detach", str(checkout), commit)
-    else:
-        # Register the checkout without moving the existing Cargo output.
-        with ExitStack() as cleanup:
-            if registration_parent == "allocate":
-                registration_parent = Path(cleanup.enter_context(
-                    tempfile.TemporaryDirectory(prefix="mac-linux-worktree-", dir=source / ".git")))
-            staging = registration_parent / "checkout"
-            git(source, "worktree", "add", "--detach", "--no-checkout", str(staging), commit)
-            directory = linked_build_checkout(staging, source).git_dir
-            pointer = checkout.resolve() / ".git"
-            atomic_file.write_text_atomic(directory / "gitdir", str(pointer) + "\n")
-            atomic_file.write_text_atomic(pointer, f"gitdir: {directory}\n")
+        git("worktree", "add", "--detach", str(checkout), commit)
+        return
+
+    try:
+        staging.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise IncompleteFixedRegistration(
+            checkout, source, (FixedRegistrationLeftover("staging folder", staging),),
+        ) from error
+    temporary = staging / "checkout"
+    git("worktree", "add", "--detach", "--no-checkout", str(temporary), commit)
+    directory = linked_build_checkout(temporary, source).git_dir
+    pointer = checkout / ".git"
+    atomic_file.write_text_atomic(directory / "gitdir", str(pointer) + "\n")
+    atomic_file.write_text_atomic(pointer, f"gitdir: {directory}\n")
+    # Keep the staging files inside the registration.
+    _ = (temporary / ".git").rename(staging / "pointer")
+    _ = staging.rename(directory / "registration-stage")
 
 
-def fixed_build_checkout_source(source: Path, path: Path, commit: str, *,
-                                registration_parent: Path | Literal["allocate"] = "allocate") -> git_files.Checkout:
-    """Verify the leased checkout and record its source before use."""
+@contextmanager
+def fixed_build_checkout_preparation(
+    source: Path, path: Path, commit: str, *, registration: FixedCheckoutRegistration,
+) -> Generator[git_files.Checkout]:
+    """Verify the checkout and record its source after the first preparation."""
     source = source.resolve(strict=True)
     with build_folder_lock.folder_parent(path, build_root(), create=False) as directory:
         _current_copy_lock(path, directory)
         lease = _read_folder_lease(path, directory)
         if lease.get("machine") != path.name or lease.get("repository") != path.parent.name or "last_use" in lease:
             raise ValueError(f"{path}: the fixed build folder lease changed")
-        fields: dict[str, object] = {}
-        _copy_creation_fields(path, path.stat(), source, fields)
+        state = fixed_lease_registration(path, lease)
+        checkout_source = FixedCheckoutSource(source, registration)
+        if isinstance(state, FixedCheckoutRegistering):
+            _require_new_fixed_registration(path, state.source, state.common_dir, started=True)
+        checkout_identity = CopyDirectoryIdentity.from_stat(path.stat())
+        repository = git_files.at(source)
+        common_identity = CopyDirectoryIdentity.from_stat(repository.common_dir_status)
+        if isinstance(state, FixedCheckoutNotRegistered):
+            if not may_remove_folder_tree(path):
+                raise ValueError(f"{path}: cannot verify the fixed checkout source")
+            require_no_fixed_build_folders(path, include_root=False)
+            common_dir = repository.common_dir
+            _require_new_fixed_registration(path, checkout_source, common_dir)
+            _set_fixed_lease_registration(lease, FixedCheckoutRegistering(checkout_source, common_dir))
+            _publish_lease(path, directory, lease)
+            _register_fixed_build_checkout(source, path, commit, common_dir / registration.value)
         try:
             checkout = linked_build_checkout(path, source)
-        except git_files.NotACheckout:
-            if "source" in lease or not may_remove_folder_tree(path):
-                raise ValueError(f"{path}: cannot verify the fixed checkout source") from None
-            require_no_fixed_build_folders(path, include_root=False)
-            _register_fixed_build_checkout(source, path, commit, registration_parent)
-            checkout = linked_build_checkout(path, source)
-        else:
-            if "source" not in lease:
-                raise ValueError(f"{path}: the fixed checkout has no saved source record")
+        except git_files.NotACheckout as error:
+            raise ValueError(f"{path}: cannot verify the fixed checkout source") from error
         if not may_remove_folder_tree(path, checkout.git_dir):
             raise ValueError(f"{path}: the fixed checkout contains a mount")
         git_identity = CopyDirectoryIdentity.from_stat(checkout.git_dir_status)
-        fields.update(git_directory=str(checkout.git_dir), git_device=git_identity.device, git_inode=git_identity.inode)
-        if "source" in lease and lease["source"] != fields:
+        identity = FixedCheckoutIdentity(path.absolute(), source, checkout_identity, repository.common_dir,
+                                         common_identity, checkout.git_dir, git_identity)
+        if isinstance(state, FixedCheckoutRegistered) and state.identity != identity:
             raise ValueError(f"{path}: the fixed checkout source changed")
-        if "source" not in lease:
-            lease["source"] = fields
+        yield checkout
+        if isinstance(state, FixedCheckoutNotRegistered):
+            _set_fixed_lease_registration(lease, FixedCheckoutRegistered(identity))
             _publish_lease(path, directory, lease)
-        return checkout
 
 
 def cargo_target_argument(words: Sequence[str]) -> str:
@@ -3597,8 +3975,8 @@ def _recover_staged_folder(path: Path, directory: int, *, wait: bool,
                     _publish_lease(path, directory, _staging_identity(original))
                 elif recorded != _staging_identity(original):
                     return False
-                refusal = _hold_child_leases(path, directory, leases, wait=wait, repair_access=True,
-                                             original_path=source)
+                refusal = hold_child_leases_at(path, directory, leases, FixedFolderRemovalLayout.read(source or path),
+                                               wait=wait, repair_access=True, legacy_stage=source is None)
                 if isinstance(refusal, RefusedRemovalLease):
                     return False
         except (OSError, ValueError):

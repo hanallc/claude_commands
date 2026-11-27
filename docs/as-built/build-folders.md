@@ -24,6 +24,19 @@ The holder retires the start fence when it clears the folder.
 A busy start fence prevents folder clearance.
 A retained keep file prevents allocation until cleanup confirms clearance.
 The smoke runner preserves the Cargo output when it prepares the requested commit.
+An offload run replaces the content of the fixed folder with the sent source, as it does with the mirror on main. A file that a sender copied there is kept only if a smoke or guest run rescues it first; a KILL in that rescue can lose it.
+
+Allocation can create parent directories and lock files before it checks the registration state.
+
+If fixed checkout registration refuses, run the printed `git worktree list --porcelain` command.
+
+1. Check each listed path for work. Use `git -C <path> --no-optional-locks status` and `git -C <path> log -1` in each associated checkout.
+2. If the start mark has no associated checkout, list the fixed folder files and compare them with the source.
+3. If a check fails, stop and keep the registration.
+4. Save the work you want to keep.
+5. Stop Git and offload work on the repository.
+6. Clear each leftover, including the registration start mark in the lease.
+
 Each smoke upload uses its own directory.
 Cleanup renames the directory before deletion to prevent a late upload.
 Recovery can remove the renamed directory if deletion stops.
@@ -35,6 +48,7 @@ It prints the binary path from the output folder that the runner reports.
 
 Drain native Mac runs before this route change.
 Confirm that the old claims and leases are clear.
+Install the new folder holder and its allocator before you enable the route.
 Confirm that the Hana output and its new parent share one APFS volume.
 Move the Hana `target/` directory under the new folder lease before you enable the route.
 Check the Cargo rebuild list after the move.

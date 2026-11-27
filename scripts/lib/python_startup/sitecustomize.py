@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/python_startup/sitecustomize.py")
 TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
+                     "scripts/lib/cargo_target_config.py", "scripts/lib/gate_state_paths.py",
                      "scripts/lib/removal_guard.py", "scripts/lib/atomic_file.py",
                      "scripts/buildlog/repository.py", "scripts/buildlog/store.py", "scripts/production/staff.py",
                      "scripts/production/production_names.py",

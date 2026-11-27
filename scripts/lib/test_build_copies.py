@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import shutil
 import socket
@@ -22,7 +23,7 @@ from unittest import mock
 
 from scripts.copies import copies
 from scripts.lib import build_copies, build_folder_lock, build_folders, copy_record, file_lock, git_files, git_rescue, scratch, session_folder
-from scripts.lib.build_copies_test_support import private_copy_config
+from scripts.lib.build_copies_test_support import fixed_registration_snapshot, private_copy_config
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_group import send_process_group
@@ -461,6 +462,25 @@ class BuildCopiesTests(unittest.TestCase):
             self.assertEqual(scan.call_count, 2)
             self.assertTrue(all(call.kwargs.get("dir_fd") is not None for call in status.call_args_list))
             link_status.assert_not_called()
+
+    def test_inventory_refuses_a_fixed_descendant_before_reviewing_the_temporary_folder(self) -> None:
+        temporary = self.make_temporary()
+        fixed = temporary / "hana" / "mac"
+        fixed.mkdir(parents=True)
+        _ = build_folders.lease_path(fixed).write_text(json.dumps({"repository": "hana", "machine": "mac"}))
+        with build_folder_lock.folder_parent(fixed, temporary, create=False) as parent:
+            descriptor = build_folder_lock.open_lock(fixed, parent, create=True)
+            try:
+                build_folder_lock.mark_lock(descriptor)
+            finally:
+                os.close(descriptor)
+        (temporary / "outside").symlink_to(self.source, target_is_directory=True)
+
+        with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            self.assertEqual(self.unused_build_folders(), [])
+            with self.assertRaisesRegex(build_copies.BuildFolderInUse, "cannot remove a fixed build folder"), (
+                    build_copies.claim_unused_build_folder(temporary)):
+                self.fail("The claim admitted a temporary folder with a fixed descendant")
 
     def test_inventory_and_claim_keep_a_temporary_folder_with_a_live_owner(self) -> None:
         path = self.make_temporary()
@@ -1151,9 +1171,169 @@ with folders.temporary_build_folder(request) as path:
             _ = tracked.write_text("prior checkout content\n")
             build_copies.prepare_fixed_checkout(self.source, path, self.base, reserved=reserved)
             self.assertEqual(tracked.read_text(), "first commit\n")
-            self.assertIn("source", self.lease(path))
+            self.assertIsInstance(build_folders.fixed_lease_registration(path, self.lease(path)),
+                                  build_folders.FixedCheckoutRegistered)
+            self.assertNotIn("source", self.lease(path))
         saved, = self.rescue_refs().splitlines()
         self.assertEqual(self.git(self.source, "show", f"{saved}:change.txt"), "prior checkout content")
+
+    def fixed_registration_path(self) -> Path:
+        return self.root / "build/widget/mac-linux"
+
+    def assert_registration_refuses_without_changes(
+        self, *leftovers: tuple[str, Path], unreadable: Sequence[Path] = (),
+    ) -> None:
+        path = self.fixed_registration_path()
+        build = path.parents[1]
+        guest = self.source / ".git/mac-linux-folder.attempt"
+        smoke = self.root / ".local/state/mac-queue/smoke-folders"
+        before = fixed_registration_snapshot(build, self.source, guest, smoke)
+        source = build_folders.FixedCheckoutSource(self.source, build_folders.FixedCheckoutRegistration.MAC_LINUX)
+        with (self.assertRaises(build_folders.IncompleteFixedRegistration) as refused,
+              build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="retry",
+                                                          checkout_source=source)):
+            self.fail("The allocator admitted a folder with registration leftovers")
+        command = shlex.join(("git", "-C", str(self.source), "worktree", "list", "--porcelain"))
+        lines = str(refused.exception).splitlines()
+        read_failures = [line for line in lines if line.startswith("  Cannot read ")]
+        self.assertEqual(len(read_failures), len(unreadable))
+        for failure, entry in zip(read_failures, unreadable, strict=True):
+            self.assertTrue(failure.startswith(f"  Cannot read {entry}:"), failure)
+        self.assertEqual([line for line in lines if line not in read_failures], [
+            f"{path}: incomplete fixed checkout registration",
+            *(f"  {kind}: {entry}" for kind, entry in leftovers),
+            "A person must decide what to keep. Inspect the registrations with this command.",
+            command,
+        ])
+        self.assertEqual(fixed_registration_snapshot(build, self.source, guest, smoke), before)
+
+    def test_fixed_registration_refuses_a_git_pointer_without_a_source_record(self) -> None:
+        with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue") as path:
+            _ = self.git(self.source, "worktree", "add", "--detach", str(path), self.base)
+            _ = (path / "change.txt").write_text("staged file")
+            _ = self.git(path, "add", "change.txt")
+            _ = (path / "change.txt").write_text("local edit")
+            registration = git_files.at(path).git_dir
+        self.assert_registration_refuses_without_changes((".git entry", path / ".git"),
+                                                         ("worktree registration", registration))
+
+    def test_fixed_registration_refuses_a_staging_folder(self) -> None:
+        stage = self.source / ".git/mac-linux-worktree"
+        stage.mkdir()
+        checkout = stage / "checkout"
+        _ = self.git(self.source, "worktree", "add", "--detach", str(checkout), self.base)
+        _ = (checkout / "change.txt").write_bytes(b"staged work")
+        admin = git_files.at(checkout).git_dir
+        path = self.fixed_registration_path()
+        (path / "target").mkdir(parents=True)
+        _ = (path / "target/cache").write_text("Cargo output")
+        _ = (path / "change.txt").write_text("fixed folder work")
+        self.assert_registration_refuses_without_changes(("staging folder", stage), ("worktree registration", admin))
+
+    def test_fixed_registration_refuses_an_incomplete_worktree_registration(self) -> None:
+        registration = self.source / ".git/worktrees/registration"
+        registration.mkdir(parents=True)
+        _ = (registration / "locked").write_text("initializing")
+        path = self.fixed_registration_path()
+        stage = self.source / ".git/mac-linux-worktree"
+        pointer = registration / "gitdir"
+        for target in (path / ".git", stage / "checkout/.git"):
+            with self.subTest(target=target):
+                _ = pointer.write_text(str(target) + "\n")
+                self.assert_registration_refuses_without_changes(("worktree registration", registration))
+        pointer.unlink()
+        self.assert_registration_refuses_without_changes(("worktree registration", registration), unreadable=(pointer,))
+
+    def test_fixed_registration_refuses_an_empty_gitdir(self) -> None:
+        registration = self.source / ".git/worktrees/registration"
+        registration.mkdir(parents=True)
+        pointer = registration / "gitdir"
+        pointer.touch()
+        self.assert_registration_refuses_without_changes(("worktree registration", registration), unreadable=(pointer,))
+
+    def test_fixed_registration_refuses_an_unreadable_gitdir(self) -> None:
+        registration = self.source / ".git/worktrees/registration"
+        pointer = registration / "gitdir"
+        pointer.mkdir(parents=True)
+        self.assert_registration_refuses_without_changes(("worktree registration", registration), unreadable=(pointer,))
+
+    def test_fixed_registration_refuses_a_git_directory_without_removing_anything(self) -> None:
+        path = self.fixed_registration_path()
+        path.mkdir(parents=True)
+        _ = self.git(path, "init", "-q")
+        _ = (path / "user-work").write_bytes(b"local work")
+        _ = commit_repository(path, "keep this commit")
+        self.assert_registration_refuses_without_changes((".git entry", path / ".git"))
+
+    def test_fixed_registration_refuses_a_foreign_git_file_without_removing_anything(self) -> None:
+        foreign = self.root / "foreign"
+        foreign.mkdir()
+        _ = self.git(foreign, "init", "-q")
+        _ = (foreign / "work").write_bytes(b"foreign work")
+        revision = commit_repository(foreign, "keep this commit")
+        path = self.fixed_registration_path()
+        path.parent.mkdir(parents=True)
+        _ = self.git(foreign, "worktree", "add", "--detach", str(path), revision)
+        _ = (path / "work").write_bytes(b"staged foreign work")
+        _ = self.git(path, "add", "work")
+        before = fixed_registration_snapshot(path.parents[1], foreign)
+        self.assert_registration_refuses_without_changes((".git entry", path / ".git"))
+        self.assertEqual(fixed_registration_snapshot(path.parents[1], foreign), before)
+
+    def test_fixed_registration_lists_leftovers_when_the_registry_is_unreadable(self) -> None:
+        path = self.fixed_registration_path()
+        path.mkdir(parents=True)
+        pointer = path / ".git"
+        pointer.touch()
+        stage = self.source / ".git/mac-linux-worktree"
+        stage.mkdir()
+        registry = self.source / ".git/worktrees"
+        registry.touch()
+        self.assert_registration_refuses_without_changes(
+            (".git entry", pointer), ("staging folder", stage), unreadable=(registry,),
+        )
+
+    def test_fixed_registration_lists_temporary_pointer_and_lease_files(self) -> None:
+        path = self.fixed_registration_path()
+        path.mkdir(parents=True)
+        temporary_pointer = path / "..git.1234.abcd.tmp"
+        temporary_lease = build_folders.lease_path(path).with_suffix(".json.1234567890abcdef.tmp")
+        temporary_pointer.touch()
+        temporary_lease.touch()
+        self.assert_registration_refuses_without_changes(("temporary file", temporary_lease),
+                                                         ("temporary file", temporary_pointer))
+
+    def test_fixed_lease_refuses_a_start_mark_and_a_legacy_source(self) -> None:
+        path = self.fixed_registration_path()
+        path.parent.mkdir(parents=True)
+        lease = build_folders.lease_path(path)
+        _ = lease.write_text(json.dumps({
+            "machine": path.name, "repository": path.parent.name, "source": {},
+            "registration": {"state": "registering", "repository": str(self.source),
+                             "common_dir": str(self.source / ".git"), "staging": "mac-linux-worktree"},
+        }))
+        before = lease.read_bytes()
+        with (self.assertRaisesRegex(build_folders.InvalidFixedBuildRoot, "invalid fixed checkout registration state"),
+              build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="retry")):
+            self.fail("The allocator accepted both marks")
+        self.assertEqual(lease.read_bytes(), before)
+        self.assertFalse(path.exists())
+
+    def test_fixed_lease_reads_and_migrates_a_legacy_source(self) -> None:
+        with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="first") as path:
+            build_copies.prepare_fixed_checkout(self.source, path, self.base, reserved=("target",))
+        lease = self.lease(path)
+        registered = build_folders.fixed_lease_registration(path, lease)
+        assert isinstance(registered, build_folders.FixedCheckoutRegistered)
+        del lease["registration"]
+        lease["source"] = registered.identity.lease_fields()
+        _ = build_folders.lease_path(path).write_text(json.dumps(lease))
+        self.assertEqual(build_folders.fixed_lease_registration(path, lease), registered)
+        with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="retry") as checkout:
+            self.assertEqual(checkout, path)
+            build_copies.prepare_fixed_checkout(self.source, checkout, self.base, reserved=("target",))
+            self.assertEqual(build_folders.fixed_lease_registration(checkout, self.lease(checkout)), registered)
+            self.assertNotIn("source", self.lease(checkout))
 
     def test_row_28_fixed_reuse_refuses_a_changed_source_record(self) -> None:
         reserved = ("target", build_folders.COPY_USE_STAMP)
@@ -1161,12 +1341,45 @@ with folders.temporary_build_folder(request) as path:
             build_copies.prepare_fixed_checkout(self.source, path, self.base, reserved=reserved)
             _ = (path / "change.txt").write_text("keep after refusal")
         lease = self.lease(path)
-        lease["source"] = {}
+        registered = build_folders.fixed_lease_registration(path, lease)
+        assert isinstance(registered, build_folders.FixedCheckoutRegistered)
+        identity = registered.identity.lease_fields()
+        identity["source_path"] = str(self.root / "different-source")
+        lease["registration"] = {"state": "registered", "source": identity}
         _ = build_folders.lease_path(path).write_text(json.dumps(lease))
         with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue") as reused:
             with self.assertRaisesRegex(ValueError, "fixed checkout source changed"):
                 build_copies.prepare_fixed_checkout(self.source, reused, self.base, reserved=reserved)
         self.assertEqual((path / "change.txt").read_text(), "keep after refusal")
+
+    def test_fixed_lease_refuses_an_empty_or_partial_source_identity(self) -> None:
+        reserved = ("target", build_folders.COPY_USE_STAMP)
+        with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue") as path:
+            build_copies.prepare_fixed_checkout(self.source, path, self.base, reserved=reserved)
+            _ = (path / "change.txt").write_text("keep after refusal")
+        lease = self.lease(path)
+        registered = build_folders.fixed_lease_registration(path, lease)
+        assert isinstance(registered, build_folders.FixedCheckoutRegistered)
+        partial = registered.identity.lease_fields()
+        del partial["git_inode"]
+        checkout_source = build_folders.FixedCheckoutSource(self.source, build_folders.FixedCheckoutRegistration.MAC_LINUX)
+        for identity in ({}, partial):
+            for state in ({"registration": {"state": "registered", "source": identity}}, {"source": identity}):
+                with self.subTest(state=state):
+                    fields = {key: value for key, value in lease.items() if key != "registration"}
+                    fields.update(state)
+                    _ = build_folders.lease_path(path).write_text(json.dumps(fields))
+                    before = fixed_registration_snapshot(path.parents[1], self.source)
+                    with self.assertRaisesRegex(build_folders.InvalidFixedBuildRoot, "invalid fixed checkout source identity"):
+                        _ = build_folders.fixed_lease_registration(path, fields)
+                    with (self.assertRaises(build_folders.InvalidFixedBuildRoot),
+                          build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue")):
+                        self.fail("The folder-only allocator admitted an incomplete source identity")
+                    with (self.assertRaisesRegex(build_folders.InvalidFixedBuildRoot, "invalid fixed checkout source identity"),
+                          build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue",
+                                                                      checkout_source=checkout_source)):
+                        self.fail("The source-aware allocator admitted an incomplete source identity")
+                    self.assertEqual(fixed_registration_snapshot(path.parents[1], self.source), before)
 
     def test_row_28_fixed_reuse_refuses_a_missing_source_record(self) -> None:
         reserved = ("target", build_folders.COPY_USE_STAMP)
@@ -1174,16 +1387,16 @@ with folders.temporary_build_folder(request) as path:
             build_copies.prepare_fixed_checkout(self.source, path, self.base, reserved=reserved)
             tracked = path / "change.txt"
             _ = tracked.write_text("keep after refusal")
+            registration = git_files.at(path).git_dir
         lease = self.lease(path)
-        del lease["source"]
+        del lease["registration"]
         _ = build_folders.lease_path(path).write_text(json.dumps(lease))
 
-        with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue") as reused:
-            with self.assertRaisesRegex(ValueError, "no saved source record"):
-                build_copies.prepare_fixed_checkout(self.source, reused, self.base, reserved=reserved)
+        self.assert_registration_refuses_without_changes((".git entry", path / ".git"),
+                                                         ("worktree registration", registration))
 
         self.assertEqual(tracked.read_text(), "keep after refusal")
-        self.assertNotIn("source", self.lease(path))
+        self.assertNotIn("registration", self.lease(path))
 
     def test_a_damaged_copy_index_and_source_edits_restore_from_the_rescue_before_reset(self) -> None:
         for number, damaged in enumerate((b"damaged index\x00\xff", b"DIRC\x00\x00\x00\xff")):

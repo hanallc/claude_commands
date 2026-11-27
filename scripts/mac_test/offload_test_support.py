@@ -440,10 +440,11 @@ class OffloadCommandFixture(unittest.TestCase):
         self.sync_config()
         self.sync_fixture()
         write_mac_target_registry(self.root, self.config_path.name)
-        _ = write_config_fixture(self.root / "build_folders.conf",
-                                 "roots.build=~/build.fixture\nroots.build.natedev=~/build.fixture\n")
-        _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
         home = self.root / "home"
+        _ = write_config_fixture(self.root / "build_folders.conf",
+                                 "roots.build=~/build.fixture\nroots.build.natedev=~/build.fixture\n"
+                                 + f"roots.gate={home / 'gate.fixture'}\n")
+        _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
         install_saved_folder_recovery(home)
         self.environment = {
             **os.environ, **interpreter_cache_environment(self.root / "cache"),

@@ -50,6 +50,8 @@ else:
     from scripts.buildlog import store as buildlog_store
 from scripts.lib import build_folders, conf, conf_reads, session_folder
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.build_copies_test_support import FixedRegistrationKillPoint, fixed_registration_snapshot, kill_fixed_registration
+from scripts.lib.checkout_test_support import copy_runtime
 from scripts.production.cli_fixture import invoke_cli
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
@@ -1209,7 +1211,9 @@ class FixedFolderRouteTests(unittest.TestCase):
         self.environment = {**os.environ, **copies_environment(self.root), "HOME": str(home), "CONF_DIR": str(self.root),
                             "TMPDIR": str(self.root), "GIT_CONFIG_GLOBAL": os.devnull,
                             "GIT_CONFIG_NOSYSTEM": "1", "PYTHONDONTWRITEBYTECODE": "1"}
-        _ = write_config_fixture(self.root / "build_folders.conf", "roots.build=~/build\nroots.build.natedev=~/build\n")
+        _ = write_config_fixture(self.root / "build_folders.conf",
+                                 "roots.build=~/build\nroots.build.natedev=~/build\n"
+                                 + f"roots.gate={home / 'gate.fixture'}\n")
         _ = write_config_fixture(self.root / "copies.conf")
         # The fixture runs the Mac entry point on Linux.
         _ = (self.root / "machines.conf").write_text("aliases=mac\nmac.platform=linux\nmac.hosts=fixture\n")
@@ -1506,8 +1510,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         _ = (self.root / "machines.conf").write_text("aliases=mac\nmac.platform=linux\nmac.hosts=fixture\n")
         home = Path(self.environment["HOME"])
         installed = home / ".claude"
-        installed.mkdir(parents=True, exist_ok=True)
-        (installed / "scripts").symlink_to(Path(offload.__file__).resolve().parents[1])
+        copy_runtime(installed, configuration=False)
         source = self.repository / "source.txt"
         _ = source.write_text("fixture source\n")
         fixture = self.stub_directory
@@ -1562,6 +1565,7 @@ os.execv(fallback, [fallback, *sys.argv[1:]])
 import fcntl, os, shutil, subprocess, sys
 from pathlib import Path
 fixture = Path({str(fixture)!r})
+(fixture / "rsync-started").touch()
 claim = Path({str(self.claim_file)!r})
 dispatch = Path.home() / ".local/state/mac-test/dispatch-fences"
 arguments = sys.argv[1:]
@@ -1620,6 +1624,31 @@ else:
         self.assertFalse(build_folders.copy_keep_file(checkout).exists())
         dispatch = Path(self.environment["HOME"]) / ".local/state/mac-test/dispatch-fences"
         self.assertEqual(list(dispatch.rglob("*.folder")), [])
+
+    def test_offload_refuses_a_registration_killed_after_the_start_mark_before_rsync(self) -> None:
+        self.assert_offload_refuses_killed_registration(FixedRegistrationKillPoint.BEFORE_GIT)
+
+    def test_offload_refuses_a_registration_killed_during_rescue_before_rsync(self) -> None:
+        self.assert_offload_refuses_killed_registration(FixedRegistrationKillPoint.DURING_RESCUE)
+
+    def assert_offload_refuses_killed_registration(self, point: FixedRegistrationKillPoint) -> None:
+        self.install_real_fixed_folder_transport()
+        home = Path(self.environment["HOME"])
+        source = self.repository
+        folder = home / "build/hana/mac"
+        revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+        kill_fixed_registration(source, folder, revision, {**os.environ, **self.environment}, point)
+        records = home / ".local/state/mac-test/dispatch-fences"
+        smoke = home / ".local/state/mac-queue/smoke-folders"
+        attempt = source / ".git/mac-linux-folder.retry"
+        before = fixed_registration_snapshot(home / "build", source, records, smoke, attempt)
+
+        result = self.command(call_id="fixed-holder-killed", subprocess_cli=True)
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"  registration start mark: {build_folders.lease_path(folder)}", result.stdout)
+        self.assertFalse((self.stub_directory / "rsync-started").exists(), result.stdout)
+        self.assertEqual(fixed_registration_snapshot(home / "build", source, records, smoke, attempt), before)
 
     def test_delayed_post_fetch_cleanup_cannot_remove_the_next_build_output(self) -> None:
         self.install_real_fixed_folder_transport(delay_cleanup=True)

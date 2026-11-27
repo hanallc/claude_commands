@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from scripts.buildlog.store import host_name
@@ -203,15 +203,16 @@ def _prepare_copy_contents(path: Path, git_directory: Path, descriptor: int,
 
 
 def prepare_fixed_checkout(source: Path, path: Path, revision: str, *, reserved: Sequence[str],
-                           registration_parent: Path | Literal["allocate"] = "allocate") -> None:
+                           registration: build_folders.FixedCheckoutRegistration = build_folders.FixedCheckoutRegistration.MAC_LINUX
+                           ) -> None:
     """Prove the checkout source and rescue files before replacing them."""
     descriptor = build_folders.build_folder_lock_fd(path)
     if _git(source, "ls-tree", revision, "--", *reserved, pass_fds=(descriptor,)):
         raise ValueError(f"{revision}: the commit tracks a reserved build path")
-    checkout = build_folders.fixed_build_checkout_source(source, path, revision, registration_parent=registration_parent)
-    _prepare_copy_contents(path, checkout.git_dir, descriptor, lambda: None, reserved=reserved)
-    _ = _git(path, "checkout", "--force", "--detach", revision, pass_fds=(descriptor,))
-    _ = _git(path, "clean", "-ff", *(f"--exclude=/{name}" for name in reserved), pass_fds=(descriptor,))
+    with build_folders.fixed_build_checkout_preparation(source, path, revision, registration=registration) as checkout:
+        _prepare_copy_contents(path, checkout.git_dir, descriptor, lambda: None, reserved=reserved)
+        _ = _git(path, "checkout", "--force", "--detach", revision, pass_fds=(descriptor,))
+        _ = _git(path, "clean", "-ff", *(f"--exclude=/{name}" for name in reserved), pass_fds=(descriptor,))
 
 
 def _enable_worktree_config(path: Path, common_dir: Path, descriptor: int) -> None:

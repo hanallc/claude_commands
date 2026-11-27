@@ -433,6 +433,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         host_key = conf.local_host_key_name()
         _ = write_config_fixture(config / "build_folders.conf",
             f"roots.workspace={self.trees}\nroots.build={build}\nroots.build.{host_key}={build}\n"
+            + f"roots.gate={self.root / 'gate'}\n"
             + f"roots.scratch={scratch_root}\nroots.scratch.{host_key}={scratch_root}\n"
             + f"roots.session={session_root}\nroots.session.{host_key}={session_root}\n"
             + f"folders.check={mode}\n# range: 0..1\nlocks.probe_wait_seconds=0.01\n"
