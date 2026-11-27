@@ -27,7 +27,7 @@ import time
 from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from itertools import chain
 from pathlib import Path
@@ -245,13 +245,22 @@ class SudoCleanupUser:
         return {**os.environ, "HOME": str(self.home), "USER": self.name, "LOGNAME": self.name}
 
 
+class CleanupRequest(Enum):
+    LIST = "list folders"
+    CONFIRM_MOVE = "confirm a move"
+
+
 class Arguments(argparse.Namespace):
-    go: str | None = None
+    go: str | CleanupRequest = CleanupRequest.LIST
     host_list: bool = False
     json: bool = False
 
 
 SshRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+MoveConfirmationReader = Callable[[str], str]
+MOVE_COMMAND = ('To move these folders, run: sudo "$(command -v python3)" -IB '
+                + '"$HOME/.claude/scripts/disks/cleanup_old_folders.py" --go')
+MOVE_TERMINAL_REQUIRED = "--go needs a terminal for the typed yes. Nothing moved."
 REMOTE_COMMAND = "~/.claude/scripts/lib/py ~/.claude/scripts/disks/cleanup_old_folders.py --host-list"
 MAC_UNREACHABLE = "mac unreachable"
 PROC_ROOT = "/proc"
@@ -1751,6 +1760,11 @@ class WorkerRunResult(TypedDict):
     status: int
 
 
+class WorkerMoveResult(WorkerRunResult):
+    moved_paths: tuple[str, ...]
+    stayed: int
+
+
 class WorkerRemovalResult(TypedDict):
     kind: Literal["removal-result"]
     output: str
@@ -1760,6 +1774,13 @@ def message_object(raw: object) -> dict[str, object]:
     if not isinstance(raw, dict):
         raise ValueError("expected a cleanup message object")
     return cast(dict[str, object], raw)
+
+
+def unique_message_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ValueError("invalid cleanup message: duplicate key")
+    return fields
 
 
 def message_array(raw: object) -> list[object]:
@@ -1780,6 +1801,10 @@ def unreadable_records(raw: object) -> tuple[tuple[int, str], ...]:
     return tuple((cast(int, pid), cast(str, name)) for pid, name in message_rows(raw, (int, str)))
 
 
+class WorkerDisconnected(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class WorkerChannel:
     incoming: TextIO
@@ -1792,8 +1817,8 @@ class WorkerChannel:
     def receive(self) -> dict[str, object]:
         line = self.incoming.readline()
         if not line:
-            raise ValueError("the masked cleanup worker stopped before it sent a result")
-        return message_object(cast(object, json.loads(line)))
+            raise WorkerDisconnected("the masked cleanup worker stopped before it sent a result")
+        return message_object(cast(object, json.loads(line, object_pairs_hook=unique_message_fields)))
 
     def check_process_use(self, paths: Sequence[Path], check_links: bool, fds: frozenset[int],
                           gate_root: Path | GateRootNotSelected) -> CleanupProcessReview:
@@ -3125,103 +3150,179 @@ def require_unchanged_gate_sidecars(target: Path, parent: int, verified: Verifie
         raise removal_guard.ChangedEntry("the published copy changed during verification")
 
 
-def publish_gate_copy(target: Path, parent: int, stage_name: str, stage: int, sidecars: WorktreeSidecars) -> None:
+class GatePublication(Enum):
+    NOT_STARTED = "no copy publication was attempted"
+
+
+class GateMoveOutcome(Enum):
+    STAYED = "the source stayed and no copy remains at the target"
+    INCOMPLETE = "the move left an incomplete result"
+    MOVED_WITH_ERROR = "the folder moved and another step failed"
+
+
+@dataclass
+class GateMoveAttempt:
+    source: Path
+    target: Path
+    publication: GatePublication | removal_guard.Identity = GatePublication.NOT_STARTED
+
+    def outcome_after_failure(self, error: Exception) -> GateMoveOutcome:
+        original = move_entry(self.source)
+        if self.publication is not GatePublication.NOT_STARTED:
+            target = move_entry(self.target)
+            if (original is None and target is not None and stat.S_ISDIR(target.st_mode)
+                    and removal_guard.identity(target) == self.publication):
+                return GateMoveOutcome.MOVED_WITH_ERROR
+            if target is not None or any(move_entry(self.target.with_name(name)) is not None
+                                         for name in worktree_sidecar_names(self.target)):
+                return GateMoveOutcome.INCOMPLETE
+        if (original is not None and stat.S_ISDIR(original.st_mode)
+                and not isinstance(error, removal_guard.PartialCleanup)):
+            return GateMoveOutcome.STAYED
+        return GateMoveOutcome.INCOMPLETE
+
+
+def move_entry(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+
+def return_gate_copy(parent: int, stage: int, entries: Sequence[tuple[str, removal_guard.Identity]]) -> None:
     from scripts.lib import session_move
 
+    failures: list[str] = []
+    for name, identity in reversed(entries):
+        try:
+            staged = session_move.stat_at(stage, name)
+            if staged is not None and removal_guard.identity(staged) == identity:
+                continue
+            removal_guard.require_identity(parent, name, identity)
+            session_move.rename_exclusive(parent, name, stage, name)
+        except (OSError, ValueError, removal_guard.Refused) as error:
+            failures.append(f"{name}: {removal_guard.single_line(error)}")
+    if failures:
+        raise removal_guard.ChangedEntry(
+            f"cannot return the published paths to staging: {', '.join(failures)}")
+
+
+def publish_gate_copy(move: GateMoveAttempt, parent: int, stage_name: str, stage: int,
+                      sidecars: WorktreeSidecars) -> list[tuple[str, removal_guard.Identity]]:
+    from scripts.lib import session_move
+
+    target = move.target
     require_gate_move_parent_owner(parent)
     session_move.require_parent_path(target.parent, parent)
     session_move.require_parent_path(target.parent / stage_name, stage)
     require_vacant_move_target(target, parent)
     attempted: list[tuple[str, removal_guard.Identity]] = []
+    move.publication = removal_guard.identity(os.stat(target.name, dir_fd=stage, follow_symlinks=False))
     try:
         for name in (target.name, *sidecars.stamps):
             identity = removal_guard.identity(os.stat(name, dir_fd=stage, follow_symlinks=False))
-            # The rename helper can fail when it syncs a directory after the rename.
+            # A sync can fail after the rename.
             attempted.append((name, identity))
             session_move.rename_exclusive(stage, name, parent, name)
         os.fsync(stage)
         os.fsync(parent)
-        session_move.require_parent_path(target.parent / stage_name, stage)
-        os.rmdir(stage_name, dir_fd=parent)
-    except (OSError, ValueError) as error:
-        failures: list[str] = []
-        for name, identity in reversed(attempted):
-            try:
-                staged = session_move.stat_at(stage, name)
-                if staged is not None and removal_guard.identity(staged) == identity:
-                    continue
-                removal_guard.require_identity(parent, name, identity)
-                session_move.rename_exclusive(parent, name, stage, name)
-            except (OSError, ValueError, removal_guard.Refused) as rollback_error:
-                failures.append(f"{name}: {removal_guard.single_line(rollback_error)}")
-        if failures:
-            detail = ", ".join(failures)
+    except Exception as error:
+        try:
+            return_gate_copy(parent, stage, attempted)
+        except (OSError, ValueError, removal_guard.Refused) as rollback:
             raise removal_guard.ChangedEntry(
-                f"{removal_guard.single_line(error)}. Cannot return the published paths to staging: {detail}") from error
+                f"{removal_guard.single_line(error)}. {removal_guard.single_line(rollback)}") from error
         raise
+    return attempted
 
 
-def move_gate_folder(path: Path, guard: CleanupGuard, approval: WouldMove, details: GateDetails) -> None:
+def require_copy_unchanged_since_staging(target: Path, parent: int, destination: int,
+                                         staged: VerifiedGateCopy) -> None:
     from scripts.lib import session_move
 
-    target = gate_move_target(path, guard.bounds)
-    if not guard.bounds.is_gate_child(path) or target != approval.target:
+    session_move.require_parent_path(target, destination)
+    expected = staged.source.destination_stamps
+    actual = {path: entry_stamp(info) for path, _parent, info, _kind in
+              session_move.tree_entries(destination, session_move.mount_identity(destination))}
+    root = Path(".")
+    # Rename changes the ctime of the folder and the sidecars.
+    if (actual != {path: stamp for path, stamp in expected.items() if path != root}
+            or entry_stamp(os.fstat(destination))[:-1] != expected[root][:-1]):
+        raise removal_guard.ChangedEntry("the published copy changed after staging")
+    for name in worktree_sidecar_names(target):
+        current = session_move.stat_at(parent, name)
+        if current is None and name not in staged.sidecars:
+            continue
+        if (current is None or name not in staged.sidecars
+                or entry_stamp(current)[:-1] != staged.sidecars[name][:-1]):
+            raise removal_guard.ChangedEntry(f"the published sidecar changed after staging: {name}")
+
+
+def move_gate_folder(move: GateMoveAttempt, guard: CleanupGuard, approval: WouldMove, details: GateDetails) -> None:
+    from scripts.lib import session_move
+
+    path, target = move.source, move.target
+    if not guard.bounds.is_gate_child(path) or target != gate_move_target(path, guard.bounds):
         raise removal_guard.ChangedEntry("the approved move path changed")
     related = related_sidecars(path, Machine.NATEDEV, guard.bounds)
-    with guard.check(path) as checked:
+    with ExitStack() as stack:
+        checked = stack.enter_context(guard.check(path))
         if checked.info.st_uid != os.geteuid():
             raise removal_guard.ChangedEntry(GATE_OTHER_OWNER)
         sidecars = inspect_sidecars(checked.parent, guard, related)
         fds = [checked.parent]
-        with build_folders.folder_removal_lease(path, children=True, wait=False, create=True, transient_lock=True,
-                                                probe_fds=fds, root=Path("/")) as lease:
-            if not isinstance(lease, build_folders.HeldFolderRemovalLease):
-                raise removal_guard.ChangedEntry("a folder lock is held or unreadable")
-            locked_sidecars = inspect_sidecars(checked.parent, guard, related)
-            lock_name = worktree_sidecar_names(path)[1]
-            existing = {name: stamp for name, stamp in locked_sidecars.stamps.items()
-                        if not (lease.created and name == lock_name)}
-            if existing != sidecars.stamps or (lease.created and lock_name in sidecars.stamps):
-                raise removal_guard.ChangedEntry("worktree sidecars changed")
-            entries: dict[Path, CleanupEntry] = {}
-            tree = inspect_cleanup_tree(checked, entries, mode=CleanupMode.MOVE_GATE_GIT)
-            git_files = require_movable_gate(checked, details.kind, tree, entries)
-            checked_git_files = frozenset(git_file.checked for git_file in git_files)
-            if sidecars.bind(tree.fingerprint) != approval.fingerprint:
-                raise removal_guard.ChangedEntry("identity or contents changed since the list was checked")
+        lease = stack.enter_context(build_folders.folder_removal_lease(
+            path, children=True, wait=False, create=True, transient_lock=True, probe_fds=fds, root=Path("/")))
+        if not isinstance(lease, build_folders.HeldFolderRemovalLease):
+            raise removal_guard.ChangedEntry("a folder lock is held or unreadable")
+        locked_sidecars = inspect_sidecars(checked.parent, guard, related)
+        lock_name = worktree_sidecar_names(path)[1]
+        existing = {name: stamp for name, stamp in locked_sidecars.stamps.items()
+                    if not (lease.created and name == lock_name)}
+        if existing != sidecars.stamps or (lease.created and lock_name in sidecars.stamps):
+            raise removal_guard.ChangedEntry("worktree sidecars changed")
+        entries: dict[Path, CleanupEntry] = {}
+        tree = inspect_cleanup_tree(checked, entries, mode=CleanupMode.MOVE_GATE_GIT)
+        git_files = require_movable_gate(checked, details.kind, tree, entries)
+        checked_git_files = frozenset(git_file.checked for git_file in git_files)
+        if sidecars.bind(tree.fingerprint) != approval.fingerprint:
+            raise removal_guard.ChangedEntry("identity or contents changed since the list was checked")
 
-            def recheck_move_source(descriptors: Sequence[int]) -> None:
-                confirm_sidecars(checked, guard, related, lease, locked_sidecars)
-                leases = gate_move_leases(path, tree)
-                for reviewed in leases:
-                    if isinstance(reviewed.keep, removal_guard.Kept):
-                        raise removal_guard.ChangedEntry(reviewed.keep.reason)
-                states = tuple(reviewed.status for reviewed in leases if reviewed.status.state is not LeaseState.ABSENT)
-                if states != details.leases:
-                    raise removal_guard.ChangedEntry("lease state changed since the list was checked")
-                require_no_process_use(path, descriptors, sidecars=related, gate_root=guard.bounds.gate)
+        def recheck_move_source(descriptors: Sequence[int]) -> None:
+            confirm_sidecars(checked, guard, related, lease, locked_sidecars)
+            leases = gate_move_leases(path, tree)
+            for reviewed in leases:
+                if isinstance(reviewed.keep, removal_guard.Kept):
+                    raise removal_guard.ChangedEntry(reviewed.keep.reason)
+            states = tuple(reviewed.status for reviewed in leases if reviewed.status.state is not LeaseState.ABSENT)
+            if states != details.leases:
+                raise removal_guard.ChangedEntry("lease state changed since the list was checked")
+            require_no_process_use(path, descriptors, sidecars=related, gate_root=guard.bounds.gate)
 
-            recheck_move_source(fds)
-            with (session_move.child_directory(checked.parent, checked.name, mount=int(checked.mount)) as source,
-                  gate_move_parent(target, guard.bounds, create=True) as target_parent):
-                if entry_stamp(os.fstat(source)) != entries[path].stamp:
-                    raise removal_guard.ChangedEntry("source folder changed before the copy")
-                require_vacant_move_target(target, target_parent)
-                mount = session_move.mount_identity(target_parent)
-                stage_name = ".gate-move-" + secrets.token_hex(16)
-                os.mkdir(stage_name, mode=0o700, dir_fd=target_parent)
-                with (session_move.child_directory(target_parent, stage_name, mount=mount) as stage,
-                      session_move.child_directory(stage, target.name, create=True, mount=mount) as destination):
-                    copy_gate_tree(source, destination)
-                    for name, expected in sidecars.stamps.items():
-                        copy_gate_sidecar(checked.parent, stage, name, expected)
-                    sync_gate_copy(destination, stage)
-                    _ = verify_gate_copy(checked, source, destination, stage, entries, sidecars,
-                                         target_path=target.parent / stage_name / target.name,
-                                         checked_git_files=checked_git_files)
-                    publish_gate_copy(target, target_parent, stage_name, stage, sidecars)
+        recheck_move_source(fds)
+        with ExitStack() as copy_stack:
+            source = copy_stack.enter_context(session_move.child_directory(
+                checked.parent, checked.name, mount=int(checked.mount)))
+            target_parent = copy_stack.enter_context(gate_move_parent(target, guard.bounds, create=True))
+            if entry_stamp(os.fstat(source)) != entries[path].stamp:
+                raise removal_guard.ChangedEntry("source folder changed before the copy")
+            require_vacant_move_target(target, target_parent)
+            mount = session_move.mount_identity(target_parent)
+            stage_name = ".gate-move-" + secrets.token_hex(16)
+            os.mkdir(stage_name, mode=0o700, dir_fd=target_parent)
+            with (session_move.child_directory(target_parent, stage_name, mount=mount) as stage,
+                  session_move.child_directory(stage, target.name, create=True, mount=mount) as destination):
+                copy_gate_tree(source, destination)
+                for name, expected in sidecars.stamps.items():
+                    copy_gate_sidecar(checked.parent, stage, name, expected)
+                sync_gate_copy(destination, stage)
+                staged = verify_gate_copy(checked, source, destination, stage, entries, sidecars,
+                                          target_path=target.parent / stage_name / target.name,
+                                          checked_git_files=checked_git_files)
+                published = publish_gate_copy(move, target_parent, stage_name, stage, sidecars)
 
-                    check_protected_masks()
+                check_protected_masks()
+                try:
                     verified = verify_gate_copy(checked, source, destination, target_parent, entries, sidecars,
                                                 target_path=target, checked_git_files=checked_git_files)
 
@@ -3236,26 +3337,106 @@ def move_gate_folder(path: Path, guard: CleanupGuard, approval: WouldMove, detai
                     removal_guard.remove_proved_copy(
                         checked, verified.source, approval.target, before_delete=before_delete,
                         after_copy_check=lambda: require_unchanged_gate_sidecars(target, target_parent, verified))
-            if sidecars.stamps:
-                finish_sidecars(path, guard, lease, locked_sidecars, ignored_fds=fds)
+                except (removal_guard.PartialCleanup, ProtectedMaskChanged):
+                    raise
+                except Exception as error:
+                    try:
+                        checked.recheck()
+                        check_protected_masks()
+                        require_gate_move_parent_owner(target_parent)
+                        session_move.require_parent_path(target.parent, target_parent)
+                        session_move.require_parent_path(target.parent / stage_name, stage)
+                        require_copy_unchanged_since_staging(target, target_parent, destination, staged)
+                        return_gate_copy(target_parent, stage, published)
+                    except ProtectedMaskChanged:
+                        raise
+                    except (OSError, ValueError, removal_guard.Refused) as rollback:
+                        raise removal_guard.ChangedEntry(
+                            f"{removal_guard.single_line(error)}. Copy kept: {removal_guard.single_line(rollback)}"
+                        ) from error
+                    raise
+                session_move.require_parent_path(target.parent / stage_name, stage)
+                os.rmdir(stage_name, dir_fd=target_parent)
+        if sidecars.stamps:
+            finish_sidecars(path, guard, lease, locked_sidecars, ignored_fds=fds)
+
+
+@dataclass(frozen=True)
+class GateMoveResult:
+    status: int
+    moved_paths: tuple[Path, ...]
+    stayed: int
+
+    def summary(self, moves: tuple[Row, ...]) -> str:
+        paths = frozenset(self.moved_paths)
+        moved_bytes = sum(row.size or 0 for row in moves if row.path in paths)
+        moved = f"Moved {folder_count(len(paths))}, {moved_bytes / (1 << 30):.1f} GiB."
+        return moved + f" {folder_count(self.stayed)} changed and stayed." if self.stayed else moved
+
+
+def folder_count(count: int) -> str:
+    return f"{count} folder" if count == 1 else f"{count} folders"
+
+
+def reviewed_moves(review: HostList) -> tuple[Row, ...]:
+    return tuple(row for row in review.rows if isinstance(row.outcome, WouldMove))
+
+
+def apply_gate_moves(review: HostList, bounds: CleanupBounds) -> GateMoveResult:
+    guard = read_cleanup_guard(frozenset(row.path for row in review.rows), bounds)
+    status = stayed = 0
+    moved_paths: list[Path] = []
+    for row in review.rows:
+        if not isinstance(row.outcome, WouldMove):
+            continue
+        path = row.path
+        move = GateMoveAttempt(path, row.outcome.target)
+        try:
+            if review.machine is not Machine.NATEDEV or not isinstance(row.gate, GateDetails):
+                raise ValueError("only a natedev gate folder can move")
+            move_gate_folder(move, guard, row.outcome, row.gate)
+        except Exception as error:
+            reason = removal_guard.single_line(error)
+            try:
+                outcome = move.outcome_after_failure(error)
+            except OSError as check_error:
+                outcome = GateMoveOutcome.INCOMPLETE
+                reason += f". Cannot check the move result: {removal_guard.single_line(check_error)}"
+            if outcome is GateMoveOutcome.STAYED:
+                report_removal(f"kept {str(path)!r}: {reason}")
+                stayed += 1
+                continue
+            status = 1
+            if isinstance(error, removal_guard.PartialCleanup):
+                report_partial_removal(path, error, error.deleted)
+            elif outcome is GateMoveOutcome.MOVED_WITH_ERROR:
+                if not isinstance(error, ProtectedMaskChanged):
+                    report_partial_removal(path, error, (path,))
+            else:
+                report_removal(f"kept {str(path)!r}: {reason}")
+            if outcome is GateMoveOutcome.MOVED_WITH_ERROR:
+                report_removal(f"moved {str(path)!r} to {str(move.target)!r}")
+                moved_paths.append(path)
+            if isinstance(error, ProtectedMaskChanged):
+                break
+        else:
+            report_removal(f"moved {str(path)!r} to {str(move.target)!r}")
+            moved_paths.append(path)
+    return GateMoveResult(status, tuple(moved_paths), stayed)
 
 
 def apply(review: HostList, bounds: CleanupBounds, *, mode: CleanupMode = CleanupMode.STANDARD) -> int:
     """Recheck each approved row while holding its removal leases."""
+    if mode is CleanupMode.MOVE_GATE_GIT:
+        return apply_gate_moves(review, bounds).status
     guard = read_cleanup_guard(frozenset(row.path for row in review.rows), bounds)
     status = 0
     for row in review.rows:
-        if isinstance(row.outcome, removal_guard.Kept):
-            continue
-        if mode is not (CleanupMode.MOVE_GATE_GIT if isinstance(row.outcome, WouldMove) else CleanupMode.STANDARD):
+        if not isinstance(row.outcome, WouldRemove):
             continue
         path = row.path
         try:
-            if isinstance(row.outcome, WouldMove):
-                if review.machine is not Machine.NATEDEV or not isinstance(row.gate, GateDetails):
-                    raise removal_guard.ChangedEntry("only a natedev gate folder can move")
-                move_gate_folder(path, guard, row.outcome, row.gate)
-            elif row.place is CleanupPlace.LINK:
+            if row.place is CleanupPlace.LINK:
                 remove_worktree_link(path, guard, row.outcome)
             elif row.place in (CleanupPlace.FOLDER, CleanupPlace.GATE_FOLDER):
                 remove_configured_folder(path, guard, review.machine, row.outcome)
@@ -3268,10 +3449,7 @@ def apply(review: HostList, bounds: CleanupBounds, *, mode: CleanupMode = Cleanu
             report_removal(f"kept {str(path)!r}: {removal_guard.single_line(error)}")
             status = 1
         else:
-            if isinstance(row.outcome, WouldMove):
-                report_removal(f"moved {str(path)!r} to {str(row.outcome.target)!r}")
-            else:
-                report_removal(f"removed {str(path)!r}")
+            report_removal(f"removed {str(path)!r}")
     return status
 
 
@@ -3452,7 +3630,7 @@ def show_gate_totals(review: HostList, mode: CleanupMode) -> None:
         print(f"Gate rows on {review.machine.value}: " + "; ".join(totals))
 
 
-def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, approval: str, *,
+def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, *,
          mode: CleanupMode = CleanupMode.STANDARD) -> None:
     uid = os.geteuid()
     if uid == 0:
@@ -3495,7 +3673,6 @@ def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, ap
         show_gate_totals(review, mode)
     if isinstance(mac, MacListUnavailable):
         print("mac total: unknown")
-    print(f"Digest: {approval}")
 
 
 def table_text(text: str) -> str:
@@ -3510,13 +3687,28 @@ def local_machine() -> Machine:
     raise ValueError("cleanup_old_folders runs only on natedev and the Mac")
 
 
-def parse_arguments(argv: Sequence[str]) -> Arguments:
+class GoOnce(argparse.Action):
+    @override
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
+                 values: object, option_string: str | None = None) -> None:
+        assert isinstance(namespace, Arguments)
+        if namespace.go is not CleanupRequest.LIST:
+            raise argparse.ArgumentError(self, "may only be used once")
+        assert isinstance(values, str) or values is CleanupRequest.CONFIRM_MOVE
+        namespace.go = values
+
+
+def parse_arguments(argv: Sequence[str], *, mode: CleanupMode = CleanupMode.STANDARD) -> Arguments:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("--go", metavar="DIGEST", help="apply the review by hand")
+    if mode is CleanupMode.STANDARD:
+        _ = parser.add_argument("--go", metavar="DIGEST", help="apply the review by hand")
+    else:
+        _ = parser.add_argument("--go", action=GoOnce, nargs="?", const=CleanupRequest.CONFIRM_MOVE,
+                                help="type yes to move the folders")
     _ = parser.add_argument("--host-list", action="store_true", help="read only this machine")
     _ = parser.add_argument("--json", action="store_true", help="print the local list as JSON")
     args = parser.parse_args(argv, namespace=Arguments())
-    if args.json and (not args.host_list or args.go is not None):
+    if args.json and (not args.host_list or args.go is not CleanupRequest.LIST):
         parser.error("--json requires --host-list without --go")
     return args
 
@@ -3527,12 +3719,6 @@ def read_gate_device(root: Path) -> int | GateDeviceUnavailable:
     except OSError:
         return GateDeviceUnavailable.UNKNOWN
     return info.st_dev if stat.S_ISDIR(info.st_mode) else GateDeviceUnavailable.UNKNOWN
-
-
-def move_only_list(review: HostList) -> HostList:
-    rows = tuple(replace(row, outcome=STANDARD_CLEANUP_ONLY) if isinstance(row.outcome, WouldRemove) else row
-                 for row in review.rows)
-    return replace(review, rows=rows)
 
 
 def review_local(machine: Machine, *, mode: CleanupMode = CleanupMode.STANDARD) -> tuple[HostList, CleanupBounds]:
@@ -3548,27 +3734,16 @@ def review_local(machine: Machine, *, mode: CleanupMode = CleanupMode.STANDARD) 
 
 
 def show_apply_command(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, approval: str, *,
-                       mode: CleanupMode, host_list: bool) -> None:
-    sudo = mode is CleanupMode.MOVE_GATE_GIT
-    outcome = WouldMove if sudo else WouldRemove
-    rows = chain(local.rows, mac.rows) if not sudo and isinstance(mac, HostList) else local.rows
-    applied = [row for row in rows if isinstance(row.outcome, outcome)]
-    if applied:
-        prefix = "sudo " if sudo else ""
+                       host_list: bool) -> None:
+    rows = chain(local.rows, mac.rows) if isinstance(mac, HostList) else local.rows
+    if any(isinstance(row.outcome, WouldRemove) for row in rows):
         scope = " --host-list" if host_list else ""
-        if sudo:
-            gib = sum(row.size or 0 for row in applied) / (1 << 30)
-            unknown = sum(row.size is None for row in applied)
-            note = f" (size unknown for {unknown})" if unknown else ""
-            folders = "folder" if len(applied) == 1 else "folders"
-            print(f"{len(applied)} {folders}, {gib:.2f} GiB{note}, would move from memory to disk.")
-        print(f"To {'move' if sudo else 'remove'} these folders, run:")
-        print(f'{prefix}"$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"'
+        print("To remove these folders, run:")
+        print('"$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"'
               + f"{scope} --go {approval}")
 
 
-def finish_cleanup(args: Arguments, local: HostList, run_ssh: SshRunner, apply_local: Callable[[], int], *,
-                   mode: CleanupMode = CleanupMode.STANDARD) -> int:
+def finish_cleanup(args: Arguments, local: HostList, run_ssh: SshRunner, apply_local: Callable[[], int]) -> int:
     local_record = local.record()
     if args.json:
         print(json.dumps(local_record))
@@ -3577,23 +3752,66 @@ def finish_cleanup(args: Arguments, local: HostList, run_ssh: SshRunner, apply_l
            else LocalListOnly.REQUESTED)
     approval = local_record["digest"]
     if isinstance(mac, HostList):
-        if mode is CleanupMode.MOVE_GATE_GIT:
-            mac = move_only_list(mac)
         approval = digest((approval, mac.record()["digest"]))
     elif isinstance(mac, MacListUnavailable):
         approval = digest((approval, MAC_UNREACHABLE))
-    if args.go is None:
-        show(local, mac, approval, mode=mode)
-        show_apply_command(local, mac, approval, mode=mode, host_list=args.host_list)
+    if args.go is CleanupRequest.LIST:
+        show(local, mac)
+        print(f"Digest: {approval}")
+        show_apply_command(local, mac, approval, host_list=args.host_list)
         return 0
     if isinstance(mac, MacListUnavailable):
         print(mac.message(), file=sys.stderr)
-    if not DIGEST.fullmatch(args.go) or not hmac.compare_digest(args.go, approval):
+    if not isinstance(args.go, str) or not DIGEST.fullmatch(args.go) or not hmac.compare_digest(args.go, approval):
         print("cleanup_old_folders refused: the list digest changed", file=sys.stderr)
         return 1
-    if mode is CleanupMode.STANDARD and isinstance(mac, HostList) and remove_remote(mac, run_ssh):
+    if isinstance(mac, HostList) and remove_remote(mac, run_ssh):
         return 1
     return apply_local()
+
+
+def read_move_confirmation(prompt: str) -> str:
+    with open("/dev/tty", encoding="utf-8", errors="replace", newline="\n") as terminal:
+        if not terminal.isatty():
+            raise OSError(MOVE_TERMINAL_REQUIRED)
+        with open("/dev/tty", "a", encoding="utf-8") as display:
+            if not display.isatty():
+                raise OSError(MOVE_TERMINAL_REQUIRED)
+            print(prompt, end="", file=display, flush=True)
+        return terminal.readline().removesuffix("\n")
+
+
+def finish_gate_move(args: Arguments, local: HostList,
+                     apply_local: Callable[[tuple[Row, ...]], GateMoveResult],
+                     read_confirmation: MoveConfirmationReader) -> int:
+    if args.json:
+        print(json.dumps(local.record()))
+        return 0
+    show(local, LocalListOnly.REQUESTED, mode=CleanupMode.MOVE_GATE_GIT)
+    moves = reviewed_moves(local)
+    if not moves:
+        return 0
+    folders = folder_count(len(moves))
+    gib = sum(row.size or 0 for row in moves) / (1 << 30)
+    if args.go is CleanupRequest.LIST:
+        unknown = sum(row.size is None for row in moves)
+        note = f" (size unknown for {unknown})" if unknown else ""
+        print(f"{folders}, {gib:.2f} GiB{note}, would move from memory to disk.")
+        print(MOVE_COMMAND)
+        return 0
+    _ = sys.stdout.flush()
+    try:
+        selection = f"this {folders}" if len(moves) == 1 else f"these {folders}"
+        answer = read_confirmation(f"Type yes to move {selection} ({gib:.2f} GiB) from memory to disk: ")
+    except OSError:
+        print(f"cleanup_old_folders refused: {MOVE_TERMINAL_REQUIRED}", file=sys.stderr)
+        return 1
+    if answer != "yes":
+        print("Nothing moved.")
+        return 0
+    result = apply_local(moves)
+    print(result.summary(moves))
+    return result.status
 
 
 def main(argv: Sequence[str], *, run_ssh: SshRunner = run_remote) -> int:
@@ -3627,15 +3845,22 @@ def serve_masked_cleanup(channel: WorkerChannel, build: Path, mounts: frozenset[
         local, bounds = review_local(Machine.NATEDEV, mode=mode)
         check_protected_masks()
         channel.send(worker_review(local))
-        line = channel.incoming.readline()
-        check_protected_masks()
-        if not line:
+        try:
+            approval = channel.receive()
+        except WorkerDisconnected:
+            check_protected_masks()
             return 0
-        if message_object(cast(object, json.loads(line))) != {"kind": "apply"}:
+        check_protected_masks()
+        if approval != {"kind": "apply"}:
             raise ValueError("invalid cleanup approval message")
-        status = apply(local, bounds, mode=mode) if mode is CleanupMode.MOVE_GATE_GIT else apply(local, bounds)
-        result: WorkerRunResult = {"kind": "applied", "status": status}
-        channel.send(result)
+        if mode is CleanupMode.MOVE_GATE_GIT:
+            moved = apply_gate_moves(local, bounds)
+            result: WorkerMoveResult = {"kind": "applied", "status": moved.status,
+                                        "moved_paths": tuple(map(str, moved.moved_paths)), "stayed": moved.stayed}
+            channel.send(result)
+        else:
+            removed: WorkerRunResult = {"kind": "applied", "status": apply(local, bounds)}
+            channel.send(removed)
         return 0
     finally:
         MASKS_IN_FORCE.reset(mask_token)
@@ -3674,8 +3899,28 @@ def finish_worker(child: subprocess.Popen[str], channel: WorkerChannel) -> None:
         raise ValueError("the masked cleanup worker failed")
 
 
+def decode_gate_move_result(report: dict[str, object], moves: tuple[Row, ...]) -> GateMoveResult:
+    status, stayed = report.get("status"), report.get("stayed")
+    if (report.keys() != {"kind", "status", "moved_paths", "stayed"} or report["kind"] != "applied"
+            or type(status) is not int or status not in (0, 1) or type(stayed) is not int):
+        raise ValueError("invalid cleanup move result")
+    reviewed_paths = {str(row.path): row.path for row in moves}
+    moved_paths: list[Path] = []
+    seen: set[Path] = set()
+    for value in message_array(report["moved_paths"]):
+        if not isinstance(value, str) or (path := reviewed_paths.get(value)) is None or path in seen:
+            raise ValueError("invalid moved folder path")
+        moved_paths.append(path)
+        seen.add(path)
+    reported = len(moved_paths) + stayed
+    if stayed < 0 or reported > len(moves) or (status == 0 and reported != len(moves)):
+        raise ValueError("invalid cleanup move totals")
+    return GateMoveResult(status, tuple(moved_paths), stayed)
+
+
 def run_masked_cleanup(command: Sequence[str], args: Arguments, run_ssh: SshRunner, *,
-                       user: SudoCleanupUser | InheritedCleanupUser = InheritedCleanupUser.CURRENT) -> int:
+                       user: SudoCleanupUser | InheritedCleanupUser = InheritedCleanupUser.CURRENT,
+                       read_confirmation: MoveConfirmationReader = read_move_confirmation) -> int:
     environment = None
     if isinstance(user, SudoCleanupUser):
         command = user.command(command)
@@ -3687,20 +3932,30 @@ def run_masked_cleanup(command: Sequence[str], args: Arguments, run_ssh: SshRunn
         report = receive_worker_report(channel, "review")
         local = HostList(Machine.NATEDEV, decode_cleanup_rows(report.get("rows"), Machine.NATEDEV),
                          unreadable_records(report.get("unreadable")))
-        if args.go is None:
+        if args.go is CleanupRequest.LIST:
             finish_worker(child, channel)
 
-        def apply_local() -> int:
+        def apply_worker() -> dict[str, object]:
             channel.send({"kind": "apply"})
             result = receive_worker_report(channel, "applied")
-            status = result.get("status")
-            if type(status) is not int or status not in (0, 1):
-                raise ValueError("invalid cleanup apply result")
             finish_worker(child, channel)
-            return status
+            return result
 
-        mode = CleanupMode.MOVE_GATE_GIT if isinstance(user, SudoCleanupUser) else CleanupMode.STANDARD
-        return finish_cleanup(args, local, run_ssh, apply_local, mode=mode)
+        if isinstance(user, SudoCleanupUser):
+            status = finish_gate_move(args, local, lambda moves: decode_gate_move_result(apply_worker(), moves),
+                                      read_confirmation)
+        else:
+            def apply_standard() -> int:
+                result = apply_worker()
+                status = result.get("status")
+                if type(status) is not int or status not in (0, 1):
+                    raise ValueError("invalid cleanup apply result")
+                return status
+
+            status = finish_cleanup(args, local, run_ssh, apply_standard)
+        if not channel.outgoing.closed:
+            finish_worker(child, channel)
+        return status
 
 
 def sudo_cleanup_ids() -> tuple[int, int]:
@@ -3730,13 +3985,16 @@ def sudo_cleanup_user() -> SudoCleanupUser:
     return SudoCleanupUser(uid_number, gid_number, account.pw_name, Path(account.pw_dir), setpriv)
 
 
-def run_cli(argv: Sequence[str], *, run_ssh: SshRunner = run_remote) -> int:
+def run_cli(argv: Sequence[str], *, run_ssh: SshRunner = run_remote,
+            read_confirmation: MoveConfirmationReader = read_move_confirmation) -> int:
     if sys.platform != "linux":
         return main(argv, run_ssh=run_ssh)
-    args = parse_arguments(argv)
+    mode = CleanupMode.MOVE_GATE_GIT if os.geteuid() == 0 else CleanupMode.STANDARD
+    args = parse_arguments(argv, mode=mode)
     try:
-        user = sudo_cleanup_user() if os.geteuid() == 0 else InheritedCleanupUser.CURRENT
-        mode = CleanupMode.MOVE_GATE_GIT if isinstance(user, SudoCleanupUser) else CleanupMode.STANDARD
+        user = sudo_cleanup_user() if mode is CleanupMode.MOVE_GATE_GIT else InheritedCleanupUser.CURRENT
+        if mode is CleanupMode.MOVE_GATE_GIT and isinstance(args.go, str):
+            raise ValueError("the move takes no digest; run --go and type yes")
         _ = local_machine()
         checkout = Path(__file__).absolute().parents[2]
         child = (
@@ -3751,9 +4009,7 @@ def run_cli(argv: Sequence[str], *, run_ssh: SshRunner = run_remote) -> int:
         mounts = protected_mounts(home, LINUX_BUILD_ROOT)
         command = masked_cleanup_command(mounts, (sys.executable, "-B", "-c", child, str(checkout),
                                                   str(LINUX_BUILD_ROOT), mode.value, *map(str, mounts)))
-        if isinstance(user, SudoCleanupUser) and run_ssh is run_remote:
-            run_ssh = lambda arguments: run_remote(arguments, user=user)
-        return run_masked_cleanup(command, args, run_ssh, user=user)
+        return run_masked_cleanup(command, args, run_ssh, user=user, read_confirmation=read_confirmation)
     except (OSError, ValueError) as error:
         print(f"cleanup_old_folders refused: {removal_guard.single_line(error)}", file=sys.stderr)
         return 1

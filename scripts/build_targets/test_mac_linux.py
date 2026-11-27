@@ -35,18 +35,18 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNot
 from scripts.build_queue.snapshot_codec import UNKNOWN_CALLER
 from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
-from scripts.buildlog import store, treekey
+from scripts.buildlog import machine_facts, store, treekey
 from scripts.copies import copies
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start, scratch
 from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.mac_test import claim_state, eligibility, mac_test
+from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.production import checkpoint_gate, gate
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateResultUnknown, GateRun, GuestGateBlocked, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.production.test_checkpoint_gate import GatePlacementFixture
-from scripts.test_times.gate_record import NoGateTimeLimit
+from scripts.test_times.gate_record import NoGateTimeLimit, WallClockSpan
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -126,6 +126,7 @@ if fault in ('reset-before-lock', 'forged-marker'):
     sys.exit(254 if fault == 'forged-marker' else 255)
 home = Path(os.environ['FIXTURE_GUEST_HOME'])
 if scenario == 'offline' or scenario == 'main-probe-failure' and probe and not identity:
+    print('ssh: connect to host fixture-mac port 22: Connection refused', file=sys.stderr)
     print('fixture SSH refused the connection', file=sys.stderr)
     sys.exit(255)
 environment = dict(os.environ, HOME=str(home))
@@ -298,8 +299,8 @@ from time import sleep
 
 from scripts.copies import copies
 from scripts.production.gate_modules import discover_test_modules
-from scripts.production.gate_routes import GateJobKind, GateJobResult, GateRun, SelectedModules, SuiteMode
-from scripts.test_times.gate_record import TYPE_CHECK_JOB
+from scripts.production.gate_routes import AllModules, GateJobKind, GateJobResult, GateRun, SelectedModules, SuiteMode
+from scripts.test_times.gate_record import TYPE_CHECK_JOB, WallClockSpan
 
 
 def checked_git(repo, *args):
@@ -346,7 +347,7 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
     assert int(checked_git(repo, 'rev-list', '--count', 'main', 'origin/main')) >= 2
     assert checked_git(repo, 'rev-parse', 'main') == os.environ['FIXTURE_EXPECTED_MAIN']
     assert checked_git(repo, 'rev-parse', 'origin/main') == os.environ['FIXTURE_EXPECTED_MAIN']
-    assert full == (mode is SuiteMode.GATE)
+    assert full == (mode is SuiteMode.GATE or isinstance(selected, AllModules))
     print('A guest log line must stay outside the JSON result.')
     scenario = os.environ['FIXTURE_GUEST_RESULT']
     if scenario == 'child-stdout':
@@ -375,6 +376,13 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
     jobs = tuple(GateJobResult(suite, path.name, int(scenario == 'red'), 1.3, 'fixture module output',
                                cpu_seconds=1.0, times=dict(timing, skipped=int(path.name == 'test_second.py')),
                                peak_mib=22) for suite, path in paths)
+    if scenario == 'sequential':
+        first, second, other = jobs
+        assert [job.suite for job in jobs] == ['fixture', 'fixture', 'other']
+        jobs = (replace(first, seconds=1, wall_clock=WallClockSpan(1000, 1001)),
+                replace(second, seconds=1, wall_clock=WallClockSpan(1001, 1002)),
+                replace(other, seconds=4, wall_clock=WallClockSpan(1005, 1009)))
+        return GateRun(jobs, 9, 30)
     if type_dirs:
         result = subprocess.run([os.environ['GATE_BASEDPYRIGHT'], *type_dirs], cwd=repo,
                                 capture_output=True, text=True)
@@ -965,9 +973,12 @@ class MacLinuxRouteTests(unittest.TestCase):
             'aliases=natedev mac\nnatedev.platform=linux\nnatedev.hosts=natedev\n'
             + 'mac.platform=darwin\nmac.hosts=fixture-mac\n', encoding='utf-8')
         _ = write_config_fixture(config / 'build_folders.conf')
+        _ = write_config_fixture(config / 'test_times.conf')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             'GATE_STATE_DIR': str(self.root / 'gate-state'),
             'GATE_PASSED_DIR': str(self.root / 'gate-passes'),
+            'BUILDLOG_DIR': str(self.root / 'buildlog'),
+            'MACHINE_FACTS_FILE': str(self.root / 'machine-facts.json'),
             'BUILD_TARGETS_STATE_DIR': str(self.root / 'target-state'),
             'MAC_TEST_STATE_DIR': str(self.root / 'mac-state'),
             'CONF_DIR': str(config), 'PATH': str(binaries) + os.pathsep + os.environ['PATH'],
@@ -1534,6 +1545,12 @@ fi
         self.assertIsInstance(mac_linux.settlement(episode, 23), placement.Pending)
 
         mac_linux.reconcile_guest_end(episode, 23)
+        self.assertIsInstance(mac_linux.settlement(episode, 23), placement.Pending)
+        self.assertEqual(self.trace.read_text().splitlines(), ['fence'])
+
+        delay = conf.read('mac_test').number('unreachable_backoff_s')
+        with patch.object(mac_linux, 'time', return_value=time.time() + delay + 1):
+            mac_linux.reconcile_guest_end(episode, 23)
         self.assertEqual(mac_linux.settlement(episode, 23), placement.Settled())
         self.assert_guest_clean('fence', 'fence')
         path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
@@ -2031,6 +2048,43 @@ fi
             mac_linux.reconcile_guest_end(episode, attempt)
         self.assertEqual(prove.call_args_list, [call(armed)] * 3)
         self.assertEqual(errors.getvalue().splitlines(), ['Mac Linux guest reconcile failed: guest unavailable'])
+
+    def test_guest_end_check_skips_ssh_during_backoff(self) -> None:
+        attempt = 23
+        episode = self.placed.episode
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        armed = mac_linux.ArmedGuestAttempt('guest-run', 'f' * 32, 'boot-id', 10, settings.guest_user, '/fixture')
+        journal = target_config.mac_linux_end_proof_journal()
+        journal.parent.mkdir(exist_ok=True)
+        saved = {'attempt': execution_identity.attempt_key(episode, f'{attempt:032x}'), 'claim': 'fixture-claim',
+                 'result': 'unproven', 'detail': 'The guest did not answer', 'written_at': time.time(),
+                 'armed': armed.to_record()}
+        _ = journal.write_text(json.dumps(saved) + '\n', encoding='utf-8')
+        delay = conf.read('mac_test').number('unreachable_backoff_s')
+        now = time.time()
+        self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+
+        failed = subprocess.CompletedProcess(['ssh'], 255, '', 'ssh: connect to host fixture-mac port 22: Connection timed out')
+        held = subprocess.CompletedProcess(['ssh'], mac_linux.GUEST_END_PENDING_STATUS, '',
+                                          'The guest run lock is still held.\n')
+        ended = subprocess.CompletedProcess(['ssh'], 0, 'ended\n', '')
+        with (patch.object(mac_linux, 'run_guest_ssh', side_effect=[failed, held, ended]) as ssh,
+              patch.object(mac_linux, 'time', return_value=now) as clock, redirect_stderr(io.StringIO())):
+            mac_linux.reconcile_guest_end(episode, attempt)
+            self.assertIs(eligibility.read_backoff(now + delay - 1, mac_linux.TARGET), eligibility.ACTIVE_BACKOFF)
+            mac_linux.reconcile_guest_end(episode, attempt)
+            self.assertEqual(ssh.call_count, 1, 'The end-proof check used SSH during guest backoff.')
+            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+
+            clock.return_value = now + delay + 1
+            mac_linux.reconcile_guest_end(episode, attempt)
+            self.assertEqual(ssh.call_count, 2)
+            self.assertFalse(eligibility.backoff_path(mac_linux.TARGET).exists())
+            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+
+            mac_linux.reconcile_guest_end(episode, attempt)
+            self.assertEqual(ssh.call_count, 3)
+            self.assertEqual(mac_linux.settlement(episode, attempt), placement.Settled())
 
     def test_reconcile_unproven_does_not_warn_for_an_existing_submission(self) -> None:
         attempt = 23
@@ -2740,6 +2794,67 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual(self.not_started(self.route()), 'guest unreachable during retry backoff')
         self.assert_guest_clean('probe')
 
+    def test_guest_main_skips_ssh_after_connection_failure(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        delay = conf.read('mac_test').number('unreachable_backoff_s')
+        now = time.time()
+        failed = subprocess.CompletedProcess(['ssh'], 255, '', 'ssh: connect to host fixture-mac port 22: Connection timed out')
+        with (patch.object(mac_linux, 'run_guest_ssh', return_value=failed) as ssh,
+              patch.object(mac_linux, 'time', return_value=now)):
+            with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'Connection timed out'):
+                _ = mac_linux.read_guest_main(settings)
+            with self.assertRaises(mac_linux.GuestUnavailable):
+                _ = mac_linux.read_guest_main(settings)
+        self.assertEqual(ssh.call_count, 1, 'The failed guest main read did not stop the next SSH call.')
+        self.assertIs(eligibility.read_backoff(now + delay - 1, mac_linux.TARGET), eligibility.ACTIVE_BACKOFF)
+        self.assertIs(eligibility.read_backoff(now + delay + 1, mac_linux.TARGET), eligibility.NO_BACKOFF)
+
+    def test_guest_main_backoff_for_pre_authentication_transport_failure(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        backoff = eligibility.backoff_path(mac_linux.TARGET)
+        for diagnostic, expected in (
+            ('Connection timed out during banner exchange\nConnection to fixture-mac port 22 timed out',
+             eligibility.ACTIVE_BACKOFF),
+            ('banner exchange: Connection to 127.0.0.1 port 31022: Broken pipe', eligibility.ACTIVE_BACKOFF),
+            ('kex_exchange_identification: Connection closed by remote host', eligibility.ACTIVE_BACKOFF),
+            ('kex_exchange_identification: read: Connection reset by peer', eligibility.ACTIVE_BACKOFF),
+            ('fixture-guest: Permission denied (publickey).', eligibility.NO_BACKOFF),
+            ('Host key verification failed.', eligibility.NO_BACKOFF),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                backoff.unlink(missing_ok=True)
+                failed = subprocess.CompletedProcess(['ssh'], 255, '', diagnostic + '\n')
+                with (patch.object(mac_linux, 'run_guest_ssh', return_value=failed),
+                      self.assertRaises(mac_linux.GuestUnavailable) as error):
+                    _ = mac_linux.read_guest_main(settings)
+                self.assertIn(diagnostic, str(error.exception))
+                self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), expected)
+
+    def test_guest_main_invalid_reply_does_not_start_backoff(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        invalid = subprocess.CompletedProcess(['ssh'], 0, 'invalid commit ID\n', '')
+        valid = subprocess.CompletedProcess(['ssh'], 0, 'a' * 40 + '\n', '')
+        with patch.object(mac_linux, 'run_guest_ssh', side_effect=[invalid, valid]) as ssh:
+            with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'invalid commit ID'):
+                _ = mac_linux.read_guest_main(settings)
+            self.assertFalse(eligibility.backoff_path(mac_linux.TARGET).exists())
+            self.assertEqual(mac_linux.read_guest_main(settings), mac_linux.GuestMain('a' * 40))
+        self.assertEqual(ssh.call_count, 2)
+
+    def test_guest_main_first_success_clears_backoff(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        offload.write_backoff(time.time(), mac_linux.TARGET, strict=True)
+        backoff = eligibility.backoff_path(mac_linux.TARGET)
+        self.assertTrue(backoff.is_file())
+        commit = 'a' * 40
+        good = subprocess.CompletedProcess(['ssh'], 0, commit + '\n', '')
+        with patch.object(mac_linux, 'run_guest_ssh', return_value=good) as ssh:
+            self.assertEqual(mac_linux.read_guest_main(settings), mac_linux.GuestMain(commit))
+            cleared_after_first = not backoff.exists()
+            self.assertEqual(mac_linux.read_guest_main(settings), mac_linux.GuestMain(commit))
+        self.assertEqual(ssh.call_count, 2, 'Both guest main reads must use SSH.')
+        self.assertTrue(cleared_after_first, 'The first good answer left the backoff record.')
+
     def test_route_records_backoff_for_a_guest_outside_the_placement_lists(self) -> None:
         _ = write_config_fixture(self.registry, 'targets=hana-aws,mac,natedev\npinned_targets=hana-gpu\n')
         registry = conf.read(self.registry)
@@ -2833,6 +2948,7 @@ with (patch.object(conf, 'read', read_config),
         with patch.dict(os.environ, {'FIXTURE_GUEST_PATH': str(binaries)}):
             result = self.not_started(self.route())
         self.assertIn('bwrap is absent from the guest PATH', result)
+        self.assertFalse(eligibility.backoff_path(mac_linux.TARGET).exists())
         self.assert_guest_clean('probe')
         self.assertFalse((self.guest_home / '.claude').exists())
 
@@ -3423,6 +3539,18 @@ with (patch.object(conf, 'read', read_config),
             self.assertEqual(hop[-4:], alive)
             self.assertEqual([word for word in hop if word.startswith('ServerAlive')], alive[1::2])
 
+    def test_kept_guest_end_banner_timeout_starts_backoff(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        armed = mac_linux.ArmedGuestAttempt('kept-attempt', 'f' * 32, 'boot-id', 10, settings.guest_user, '/fixture')
+        diagnostic = 'Connection timed out during banner exchange\nConnection to fixture-mac port 22 timed out'
+        failed = subprocess.CompletedProcess(['ssh'], 255, '', diagnostic + '\n')
+        with patch.object(mac_linux, 'run_guest_ssh', return_value=failed) as ssh:
+            self.assertEqual(mac_linux.prove_kept_guest_end(armed), mac_linux.GuestEndPending(diagnostic))
+            self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.ACTIVE_BACKOFF)
+            self.assertEqual(mac_linux.prove_kept_guest_end(armed),
+                             mac_linux.GuestEndPending('guest unreachable during retry backoff'))
+            ssh.assert_called_once()
+
     def test_kept_guest_end_proof_refuses_unreadable_settings(self) -> None:
         settings_user = mac_linux.read_settings(conf.read(self.registry)).guest_user
         settings = self.registry.with_name('mac_linux.conf')
@@ -3450,6 +3578,7 @@ with (patch.object(conf, 'read', read_config),
                   patch.object(subprocess, 'run',
                                return_value=subprocess.CompletedProcess(command, status, stdout, stderr)) as ssh):
                 environment = {key: value for key, value in os.environ.items() if key != 'BUILDLOG_PLACEMENT_SIDECAR'}
+                environment['LC_ALL'] = 'C'
                 self.assertEqual(mac_linux.prove_kept_guest_end(armed), expected)
                 ssh.assert_called_once_with(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                             errors='replace', timeout=settings.unreachable_wait_seconds,
@@ -3798,6 +3927,89 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual(result.module_skips, {'scripts/fixture/test_first.py': 0, 'scripts/fixture/test_second.py': 1})
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
+    def recorded_guest_gate(self) -> dict[str, object]:
+        paths = sorted((store.root() / mac_linux.TARGET).glob('*.jsonl'))
+        self.assertEqual(len(paths), 1, 'The guest gate did not save a buildlog file.')
+        line, = paths[0].read_text(encoding='utf-8').splitlines()
+        return cast(dict[str, object], json.loads(line))
+
+    def write_mac_load(self, load: float, cpus: int, written: float) -> None:
+        facts: machine_facts.SavedFacts = {'version': machine_facts.VERSION, 'written': written,
+                                         'machines': {'mac': machine_facts.facts('read', load=load, cpus=cpus)}}
+        _ = machine_facts.state_path().write_text(json.dumps(facts), encoding='utf-8')
+
+    def test_green_guest_saves_each_module_time(self) -> None:
+        result = self.route()
+        assert isinstance(result, GateRun) and result.passed, result
+        row = self.recorded_guest_gate()
+        self.assertEqual((row['kind'], row['host'], row['status']), ('gate_run', mac_linux.TARGET, 0))
+        self.assertEqual(row['max_jobs'], 2)
+        self.assertNotIn('vcpus', row)
+        modules = cast(list[dict[str, object]], row['modules'])
+        self.assertEqual([(module['suite'], module['module'], module['wall_s'], module['cpu_s']) for module in modules],
+                         [('fixture', 'test_first.py', 1.3, 1.0), ('fixture', 'test_second.py', 1.3, 1.0)])
+
+    def test_guest_affected_full_records_full_selection(self) -> None:
+        with patch.dict(os.environ, {'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main')}):
+            result = gate.run_gate_suites(self.repo, full=True, mode=SuiteMode.TARGETED, module_time_limit_s=3,
+                                          target=gate.MacLinuxAssignment(self.placed))
+        self.assertTrue(result.passed)
+        self.assertEqual([job.module for job in result.jobs], ['test_first.py', 'test_second.py'])
+        row = self.recorded_guest_gate()
+        self.assertEqual(row['step'], 'test-affected')
+        self.assertEqual(row['selection'], 'full')
+
+    def test_guest_records_each_suite_wall_time(self) -> None:
+        other = self.repo / 'scripts/other'
+        other.mkdir()
+        (other / 'test_other.py').touch()
+        result = self.route('sequential')
+        assert isinstance(result, GateRun) and result.passed, result
+        self.assertEqual([job.wall_clock for job in result.jobs],
+                         [WallClockSpan(1000, 1001), WallClockSpan(1001, 1002), WallClockSpan(1005, 1009)])
+        row = self.recorded_guest_gate()
+        self.assertEqual(row['wall_s'], 9)
+        self.assertEqual(row['suites'], [{'suite': 'fixture', 'wall_s': 2, 'status': 0},
+                                         {'suite': 'other', 'wall_s': 4, 'status': 0}])
+
+    def test_named_guest_run_writes_no_gate_record(self) -> None:
+        with patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'pass',
+                                     'FIXTURE_MODULE_SECONDS': '7',
+                                     'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main')}):
+            result = gate.run_gate_suites(self.repo, mode=SuiteMode.TARGETED, target=gate.MacLinuxAssignment(self.placed),
+                                          named=('fixture/test_first.py', 'fixture/test_second.py'))
+        self.assertTrue(result.passed)
+        self.assertEqual([job.module for job in result.jobs], ['test_first.py', 'test_second.py'])
+        self.assertEqual(list((store.root() / mac_linux.TARGET).glob('*.jsonl')), [])
+
+    def test_guest_saves_distinct_start_and_end_mac_load(self) -> None:
+        start = time.time() - 2
+        end = start + 1
+        self.write_mac_load(4.75, 12, start)
+
+        def update_facts(*_args: object, **_options: object) -> None:
+            self.write_mac_load(8.25, 12, end)
+
+        with patch.object(mac_linux, 'start_guest_report', side_effect=update_facts) as report:
+            result = self.route()
+        assert isinstance(result, GateRun) and result.passed, result
+        report.assert_called_once()
+        row = self.recorded_guest_gate()
+        self.assertEqual(row['mac_load_start'], {'state': 'read', 'load': 4.75, 'cpus': 12, 'written': start})
+        self.assertEqual(row['mac_load_end'], {'state': 'read', 'load': 8.25, 'cpus': 12, 'written': end})
+
+    def test_guest_saves_absent_mac_load_with_its_reason(self) -> None:
+        def expire_facts(*_args: object, **_options: object) -> None:
+            self.write_mac_load(4.75, 12, time.time() - machine_facts.STALE_SECONDS - 1)
+
+        with patch.object(mac_linux, 'start_guest_report', side_effect=expire_facts) as report:
+            result = self.route()
+        assert isinstance(result, GateRun) and result.passed, result
+        report.assert_called_once()
+        row = self.recorded_guest_gate()
+        self.assertEqual(row['mac_load_start'], {'state': 'absent', 'reason': 'The machine facts file is missing or invalid.'})
+        self.assertEqual(row['mac_load_end'], {'state': 'absent', 'reason': 'The machine facts reading is stale.'})
+
     def test_child_text_on_standard_output_leaves_the_reply_clean(self) -> None:
         result = self.route('child-stdout')
         assert isinstance(result, mac_linux.MacLinuxGateRun), result
@@ -3821,6 +4033,10 @@ with (patch.object(conf, 'read', read_config),
         assert isinstance(result, GateRun), result
         self.assertFalse(result.passed)
         self.assertEqual([job.returncode for job in result.jobs], [1, 1])
+        row = self.recorded_guest_gate()
+        self.assertEqual((row['kind'], row['host'], row['status']), ('gate_run', mac_linux.TARGET, 1))
+        modules = cast(list[dict[str, object]], row['modules'])
+        self.assertEqual([(module['wall_s'], module['status']) for module in modules], [(1.3, 1), (1.3, 1)])
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_guest_runner_failure_returns_reason_and_cleans(self) -> None:

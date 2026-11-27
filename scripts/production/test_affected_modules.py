@@ -18,6 +18,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.buildlog import index as buildlog_index
+from scripts.mac_test.eligibility import MAC_LINUX_TARGET
 from scripts.production import affected_modules as affected
 from scripts.test_times.gate_record_test_support import gate_run
 
@@ -454,7 +455,7 @@ FILES = collect(Path(__file__).parent)
             for statement in buildlog_index.schema_statements():
                 _ = connection.execute(statement)
             plan = cast(list[tuple[int, int, int, str]],
-                        connection.execute("EXPLAIN QUERY PLAN " + query).fetchall())
+                        connection.execute("EXPLAIN QUERY PLAN " + query, (MAC_LINUX_TARGET,)).fetchall())
             details = [row[3] for row in plan]
             self.assertIn("SEARCH gate_modules USING INDEX sqlite_autoindex_gate_modules_1 (run_id=?)", details)
             self.assertFalse(any(detail.startswith("SCAN gate_modules") for detail in details), details)
@@ -471,7 +472,7 @@ FILES = collect(Path(__file__).parent)
             insert = ("INSERT INTO gate_modules (run_id, suite, module, attempt, config_reads, folder_scans, "
                       + "content_reads) VALUES (?, 'checks', 'test_reader.py', ?, ?, ?, ?)")
             _ = connection.execute(insert, ("shared", 1, '["shared"]', '[]', '["assets/x"]'))
-            shared = cast(list[tuple[object, ...]], connection.execute(query).fetchall())
+            shared = cast(list[tuple[object, ...]], connection.execute(query, (MAC_LINUX_TARGET,)).fetchall())
             self.assertCountEqual(shared, cast(list[tuple[object, ...]], connection.execute(old_query).fetchall()))
             self.assertEqual(shared, [("checks", "test_reader.py", '["shared"]', '[]', '["assets/x"]')])
 
@@ -484,7 +485,7 @@ FILES = collect(Path(__file__).parent)
                 ("aborted", 1, '[]', '[]', '[]'),
                 ("affected", 1, '[]', '[]', '[]'),
             ))
-            separate = cast(list[tuple[object, ...]], connection.execute(query).fetchall())
+            separate = cast(list[tuple[object, ...]], connection.execute(query, (MAC_LINUX_TARGET,)).fetchall())
             self.assertCountEqual(separate, cast(list[tuple[object, ...]], connection.execute(old_query).fetchall()))
             self.assertCountEqual(separate, [
                 ("checks", "test_reader.py", None, None, '["assets/x"]'),
@@ -521,6 +522,22 @@ FILES = collect(Path(__file__).parent)
             self.write("assets/new.txt", "added\n")
             self.assertEqual({module.name for module in self.selection().modules},
                              {"test_config.py", "test_folder.py", "test_unrecorded.py"})
+
+    def test_newer_guest_gate_does_not_supply_module_reads(self) -> None:
+        module = {"suite": "checks", "module": "test_reader.py", "attempt": 1}
+        run = {**gate_run(), "kind": "gate_run", "v": 1, "id": "full", "host": "mac",
+               "selection": "full", "aborted": False, "started_at": "2026-01-01T00:00:00Z",
+               "modules": [{**module, "config_reads": ["limits"], "folder_scans": ["assets"],
+                            "content_reads": ["docs/index.md"]}]}
+        self.write(".git/buildlog/mac/fixture.jsonl", json.dumps(run) + "\n")
+        expected = affected.latest_module_reads()
+        self.assertEqual(set(expected), {"scripts/checks/test_reader.py"})
+
+        guest_module: dict[str, object] = {**module, "config_reads": [], "folder_scans": [], "content_reads": []}
+        guest: dict[str, object] = {**run, "id": "guest-full", "host": "mac-linux", "source": "mac-linux",
+                                    "started_at": "2026-01-02T00:00:00Z", "modules": [guest_module]}
+        self.write(".git/buildlog/mac-linux/2026-01.jsonl", json.dumps(guest) + "\n")
+        self.assertEqual(affected.latest_module_reads(), expected)
 
     def test_landing_bases_exclude_changes_that_already_passed_the_gate(self) -> None:
         self.write("scripts/landed/subject.py", "VALUE = 1\n")
