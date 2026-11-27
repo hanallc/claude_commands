@@ -22,8 +22,10 @@ import sys
 import time
 from tempfile import mkdtemp
 from collections.abc import Mapping
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import cast
 
 from scripts.astra import astra_work, design_roles  # noqa: E402
@@ -35,6 +37,7 @@ from scripts.lib.atomic_file import write_text_atomic
 
 MODEL = "gpt-6-astra"
 REASONING = "xhigh"
+INDEPENDENT_STAFF_OPEN = nullcontext()
 # Lines of Codex's own output a failure prints.
 ERROR_TAIL_LINES = 40
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -138,7 +141,8 @@ def _managed_review(review: Path, log: Path, target: str, cwd: Path,
 
 
 def run_review(review: Path, prompt: str, log: Path, *, cwd: Path | None = None,
-               dispatch_lock: file_lock.ExclusiveLock | None = None) -> int:
+               dispatch_lock: file_lock.ExclusiveLock | None = None,
+               staff_open_lock: Lock | nullcontext[None] = INDEPENDENT_STAFF_OPEN) -> int:
     """Run each review through its explicit assign.sh target."""
     manager = staff.runtime_id()
     caller = staff.snapshot().by_current_session(manager) if manager else None
@@ -146,7 +150,9 @@ def run_review(review: Path, prompt: str, log: Path, *, cwd: Path | None = None,
     if caller is not None and caller.kind in ("unit", "showrunner"):
         target = "staff-worker"
     write_text_atomic(log.parent / "prompt.md", prompt)
-    return _managed_review(review, log, target, cwd if cwd is not None else Path.cwd(), dispatch_lock)
+    # Staff assign returns after submission. Consultation assign waits for the reply.
+    with staff_open_lock if target == "staff-worker" else nullcontext():
+        return _managed_review(review, log, target, cwd if cwd is not None else Path.cwd(), dispatch_lock)
 
 
 submitted_review = design_roles.submitted_review

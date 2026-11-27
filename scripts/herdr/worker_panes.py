@@ -1877,7 +1877,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 recovered = read_evidence(staff.snapshot())
                 state = next((item for item in recovered.states if item.row.id == row.id), None)
                 if isinstance(state, (OpenWorker, ProcessUnknownWorker, UncertainWorker)):
-                    _layout(owner.id, recovered)
+                    _layout_after_open(owner.id, recovered, publish_lock_seconds)
                     return state
                 return _uncertain(row, "retained launch proof is incomplete")
     if isinstance(current, OpenWorker):
@@ -1917,7 +1917,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     same_account = running_home == selected_home
             if matches and same_run and same_account:
                 recorder_lock.close()
-                _layout(owner.id, evidence)
+                _layout_after_open(owner.id, evidence, publish_lock_seconds)
                 return current
             changing_run = explicit and not same_run
         if explicit and not current.status.idle:
@@ -2139,7 +2139,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     herdr.forget_pane_evidence(client.session, launched.pane)
     fresh = read_evidence(staff.snapshot())
     result = next((state for state in fresh.states if state.row.id == row.id), None)
-    _layout(owner.id, fresh)
+    _layout_after_open(owner.id, fresh, publish_lock_seconds)
     if isinstance(result, (OpenWorker, ProcessUnknownWorker)):
         return replace(result, created_pane=created_pane())
     if isinstance(result, UncertainWorker):
@@ -2270,7 +2270,14 @@ def forget_restart(row: staff.StaffRow) -> None:
         print(f"{row.name}: restart record anomaly: {' '.join(str(error).split())}", file=sys.stderr)
 
 
-def _layout(parent: StaffId, evidence: PaneEvidence) -> None:
+def _layout_after_open(parent: StaffId, evidence: PaneEvidence, publish_lock_seconds: float) -> None:
+    try:
+        _layout(parent, evidence, layout_deadline=time.monotonic() + publish_lock_seconds)
+    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"herdr {parent}: skipped worker layout. {' '.join(str(error).splitlines())}", file=sys.stderr)
+
+
+def _layout(parent: StaffId, evidence: PaneEvidence, *, layout_deadline: float | Literal["no_wait"] = "no_wait") -> None:
     client = _client()
     parent_tabs = {_text(pane, "tab_id") for pane in evidence.scan.found.get(parent, [])} - {""}
     selected = {item.terminal for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
@@ -2281,7 +2288,15 @@ def _layout(parent: StaffId, evidence: PaneEvidence) -> None:
     tabs = {pane.get("tab_id", "") for pane in panes if pane.get("terminal_id", "") in selected}
     for tab in tabs - {""}:
         key = hashlib.sha256(f"layout:{client.session}:{tab}".encode()).hexdigest()
-        with staff.slot_operation(key, "worker layout"):
+        with ExitStack() as locks:
+            try:
+                _ = locks.enter_context(staff.slot_operation(key, "worker layout", layout_deadline=layout_deadline))
+            except staff.StaffRefused as error:
+                if layout_deadline == "no_wait":
+                    raise
+                holder = " ".join(error.holder.split()) or "an unknown process"
+                print(f"herdr {client.session}:{tab}: skipped worker layout. The slot holder is {holder}.", file=sys.stderr)
+                continue
             layout = herdr.json_object(client.socket_request("layout.export", tab_id=tab).get("layout"), "worker layout")
             terminals = {pane["pane_id"] for pane in panes
                          if pane.get("terminal_id", "") in selected and pane.get("tab_id", "") == tab}
