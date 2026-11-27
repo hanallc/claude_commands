@@ -1598,6 +1598,12 @@ def _needs_pane_input_retry(record: RunRecord) -> bool:
         _pane_submission_not_started(delivery) or delivery.startswith(DEFERRED_WORKER_RESULT))
 
 
+def _needs_stopped_result_completion(record: RunRecord) -> bool:
+    delivery = record.get("delivery", "")
+    return record["status"] == "finished" and _cancels_pass(record) and (
+        delivery == ORPHAN_RESULT_PENDING or (not delivery and record.get("completion_pending") is True))
+
+
 def _result_send_not_started(record: RunRecord, detail: str) -> str:
     if (record["run_id"].endswith(f"@{record['staff_id']}") or record.get("pane_dispatch_id")
             or record.get("self_stop")):
@@ -3181,7 +3187,8 @@ def _needs_external_result_delivery(record: RunRecord) -> bool:
 
 
 def _result_retry_pending(record: RunRecord) -> bool:
-    if record.get("push_alert_delivery") or _needs_push_retry(record) or _awaits_pane_receipt(record):
+    if (record.get("push_alert_delivery") or _needs_push_retry(record) or _awaits_pane_receipt(record)
+            or _needs_stopped_result_completion(record)):
         return True
     return _needs_pane_input_retry(record) and not (_failed_pane_attempt(record) and record.get("push_alert_attempted"))
 
@@ -3270,7 +3277,10 @@ def _send_failed_push_alert(path: Path, record: RunRecord, *, check_receipt: boo
             except worker_lifecycle.WorkerStateUnreadable as error:
                 fields = {}
                 lookup_error = str(error)
-            owner = unit_runs.run_owner(fields, membership)
+            try:
+                owner = unit_runs.run_owner(fields, membership)
+            except staff.StaffUnreadable as error:
+                raise worker_admission.RunOwnerUnavailable(str(error)) from error
             director = owner if isinstance(owner, staff.StaffRow) else membership.owner_of(record["staff_id"])
             if director is None or director.kind not in ("unit", "showrunner"):
                 raise worker_admission.RunOwnerUnavailable(lookup_error or f"{state_path}: no director staff row")
@@ -3396,7 +3406,8 @@ def _retry_result_delivery(path: Path) -> RunRecord | SupervisedResultPruned:
                 return SupervisedResultPruned.REMOVED
             retries = record.get("push_retries", 0)
             staged_alert = bool(record.get("push_alert_delivery"))
-            relay_retry = not (_needs_pane_input_retry(record) or _awaits_pane_receipt(record))
+            relay_retry = not (_needs_pane_input_retry(record) or _awaits_pane_receipt(record)
+                               or _needs_stopped_result_completion(record))
             if relay_retry and not staged_alert and not _needs_push_retry(record):
                 return record
             if relay_retry and (staged_alert or retries >= limit):
@@ -3434,8 +3445,9 @@ def _retry_result_delivery(path: Path) -> RunRecord | SupervisedResultPruned:
                     current = _read_record(path)
                     if not current.get("push_alert_delivery"):
                         return current
-            elif _needs_pane_input_retry(current) or (relay_retry and _needs_push_retry(current)):
-                if _cancels_pass(current) and current.get("delivery") == ORPHAN_RESULT_PENDING:
+            elif (_needs_stopped_result_completion(current) or _needs_pane_input_retry(current)
+                  or (relay_retry and _needs_push_retry(current))):
+                if _needs_stopped_result_completion(current):
                     _ = _finish_record(path, current)
                 else:
                     delivery = deliver(current, command_result(current))

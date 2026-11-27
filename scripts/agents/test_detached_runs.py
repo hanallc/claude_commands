@@ -6703,6 +6703,41 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn(str(state_path), errors.getvalue())
         alert.assert_called_once()
 
+    def test_alert_retry_distinguishes_an_unreadable_snapshot_from_a_missing_recorded_director(self) -> None:
+        record = self.record(self.fixture.parent, "missing-recorded-director")
+        path = Path(record["log"]).with_suffix(".json")
+        failure = detached_runs.FAILED_RESULT_PUSH + "fixture refusal"
+        record.update(status="finished", exit_code=7, delivery=failure, push_alert_delivery=failure)
+        write_text_atomic(path, json.dumps(record))
+        membership = staff.snapshot()
+        state_path = self.run_dir / unit_runs.STATE_FILE
+        director_state = state_path.read_text()
+        missing_director = fixture_runtime_id("missing-director")
+        write_text_atomic(state_path, json.dumps({"owner_staff_id": missing_director}))
+        retries = 0
+
+        def read_staff() -> staff.StaffSnapshot:
+            if retries < 2:
+                raise staff.StaffUnreadable("fixture staff snapshot failed")
+            return membership
+
+        def restore_director(_seconds: float) -> None:
+            nonlocal retries
+            retries += 1
+            self.assertLessEqual(retries, 4)
+            if retries == 4:
+                write_text_atomic(state_path, director_state)
+
+        with (patch.object(staff, "snapshot", new=read_staff), patch.object(time, "sleep", new=restore_director),
+              patch.object(send, "send", return_value=send.Result("sent", "director received the alert")) as alert,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            _ = detached_runs._retry_result_delivery(path)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(retries, 4)
+        self.assertEqual(errors.getvalue().count("anomaly:"), 2)
+        self.assertIn("fixture staff snapshot failed", errors.getvalue())
+        self.assertIn(f"run owner {missing_director}: unit staff row is unavailable", errors.getvalue())
+        alert.assert_called_once()
+
     def test_result_delivery_matrix(self) -> None:
         all_owners = ("worker", "director", "retired", "self-stop")
         relay_owners = ("worker", "director", "retired")
@@ -7223,6 +7258,43 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.fixture.world.add(row, "w1:p1", family="codex")
         self.assertIsInstance(detached_runs.submit_finished_worker_result(self.run_dir, row,
             worker_input=detached_runs.WorkerResultInput.TYPE), detached_runs.ConfirmedPaneResult)
+
+    def test_reap_retries_a_stopped_run_without_delivery_after_a_staff_read_failure(self) -> None:
+        record = self.record(self.fixture.parent, "orphan-stop-staff-read")
+        record.update(pid=DEAD_PID, exit_code=143, stop_pass_requested=True, stop_reason="fixture stop")
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        read_staff = staff.snapshot
+        failures = 0
+
+        def read_staff_after_failure() -> staff.StaffSnapshot:
+            nonlocal failures
+            if failures < 2:
+                failures += 1
+                raise staff.StaffUnreadable("fixture staff lookup failed")
+            return read_staff()
+
+        with (patch.object(staff, "snapshot", new=read_staff_after_failure),
+              patch.object(send, "send", return_value=send.Result("sent", "director received the result")) as push,
+              contextlib.redirect_stderr(io.StringIO()), patch.object(subprocess, "Popen") as spawn):
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [path.stem])
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved["status"], "finished")
+            self.assertIs(saved["completion_pending"], True)
+            self.assertNotIn("delivery", saved)
+            push.assert_not_called()
+            spawn.assert_called_once()
+            argv = cast(list[str], spawn.call_args.args[0])
+            self.assertEqual(argv[2:4], ["deliver-deferred", str(path)])
+            with patch.object(time, "sleep") as delay:
+                self.assertEqual(detached_runs.main(argv[2:]), 0)
+            self.assertEqual(delay.call_args_list, [call(5), call(5)])
+
+        self.assertEqual(failures, 2)
+        push.assert_called_once()
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["delivery"], "sent: director received the result")
+        self.assertIs(saved["completion_pending"], False)
 
     def test_reap_alerts_once_when_a_director_result_push_fails(self) -> None:
         for retired in (False, True):
