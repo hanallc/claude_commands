@@ -29,7 +29,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
-                          "message": "No action needed.\nThe build passed.", "detail": "", "key": "", "text_id": ""}
+                          "message": "The build passed.", "detail": "", "key": "", "text_id": ""}
 
 
 class SilenceTests(unittest.TestCase):
@@ -130,7 +130,8 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
             self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
             delivery, = [cast(dict[str, list[str]], json.loads(line)) for line in posted.read_text().splitlines()]
             self.assertEqual(delivery["title"], [results[-1].title])
-            self.assertTrue(delivery["message"][0].startswith(results[-1].message + "\n"))
+            self.assertEqual(results[-1].message, "")
+            self.assertEqual(delivery["message"], ["Sent by: nightly · Template: nightly.result"])
             self.assertEqual(silence.read_kept(), [])
             self.assertIsNone(silence.read_state())
 
