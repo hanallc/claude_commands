@@ -1184,14 +1184,13 @@ class SlotLockWait(Enum):
 def _wait_for_slot(lock: IO[bytes], path: Path, name: str, deadline: float) -> None:
     from scripts.agents import worker_lifecycle
 
-    holder = None
     try:
-        try:
-            # The slot deadline limits the wait after contention.
-            worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return
-        except BlockingIOError:
-            holder = _slot_holder(lock)
+        # The deadline limits the wait for a held slot.
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    except BlockingIOError:
+        holder = _slot_holder(lock)
+    try:
         worker_lifecycle.acquire_flock(lock, deadline=deadline)
     except worker_lifecycle.OperationDeadlineExpired as error:
         holder = _slot_holder(lock) or holder
