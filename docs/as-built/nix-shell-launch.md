@@ -171,6 +171,9 @@ and the environment before `stop_resume.resume`. Account exec loads the shell
 through the normal account launch path. Pending recoveries run before new broken
 sessions, including sessions that have left the live registry.
 
+`heal.py sweep --no-restart` never stops or starts a session and leaves a pending restart as it is.
+It alerts the owning showrunner once for each broken session, with the cause that the healer does not restart sessions.
+
 from server starts, pane overlays and agent-start CLI processes, including explicit
 environment overrides. Later panes cannot inherit another session's proof from
 the server. Unit restores through `add_unit` consume the same handoff
@@ -242,13 +245,22 @@ The local five-minute sweep is a notifier timer named `nix-heal`. It does not ru
 - natedev: the timer was registered on 2026-10-28. Its stored `RUN` keeps a literal `$HOME`, which `notifier.sh` does not expand. Each run exits 127 (`no such file or directory: $HOME/.claude/scripts/lib/py`), so the healer has never run.
 - Mac: no `nix-heal` timer exists.
 
-A working registration names absolute paths, because `notifier.sh` splits `RUN` into words and does no parameter expansion:
+A working registration names absolute paths, because `notifier.sh` splits `RUN` into words and does no parameter expansion.
+nate chooses the form (List 329). Neither form is registered. On natedev, `new` on the existing `nix-heal` name replaces its stored settings.
+
+The restart form:
 
 ```sh
 ~/.claude/scripts/message/notifier.sh new nix-heal --every 5 --run "/home/natepiano/.claude/scripts/lib/py /home/natepiano/.claude/scripts/nix_env/heal.py sweep"
 ```
 
-On the Mac the paths start with `/Users/natemccoy`. A timer with restart power needs nate's go before it is registered (List 329).
+The no-restart form:
+
+```sh
+~/.claude/scripts/message/notifier.sh new nix-heal --every 5 --run "/home/natepiano/.claude/scripts/lib/py /home/natepiano/.claude/scripts/nix_env/heal.py sweep --no-restart"
+```
+
+On the Mac the paths start with `/Users/natemccoy`.
 
 The showrunner still owns the bare `claude` and `codex` PATH wrappers in
 `/etc/nixos`; each must call this helper with the real absolute executable.

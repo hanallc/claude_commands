@@ -346,6 +346,51 @@ class HealTests(NixFixture):
         self.assertIn("--only fixture --check", command[command.index("--clears-when") + 1])
         self.assertEqual([entry["action"] for entry in self.records()], ["refused", "refused"])
 
+    def test_no_restart_alerts_the_showrunner_once_and_never_stops_or_loads(self) -> None:
+        owner, unit, _ = self.showrunner_fixture()
+        session = replace(self.session, session_id=str(unit.current_session), name=unit.name)
+        held, ensure, run = self.install_sweep([session])
+        self.assertEqual(heal.sweep(no_restart=True), 0)
+        run.assert_called_once()
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--to") + 1], owner.id)
+        self.assertEqual(command[command.index("--from") + 1], "nix-heal")
+        self.assertIn("The healer does not restart sessions. A restart of the session loads its nix shell.", command[-1])
+        ensure.assert_not_called()
+        held.assert_not_called()
+        actions = [(entry["action"], entry["reason"]) for entry in self.records()]
+        self.assertEqual(actions, [("refused", heal.NO_RESTART_REASON), ("showrunner_alerted", owner.name)])
+        self.assertEqual(heal.sweep(no_restart=True), 0)
+        run.assert_called_once()
+        self.assertEqual(len(self.records()), 2)
+
+    def test_no_restart_leaves_a_saved_pending_restart_untouched(self) -> None:
+        held, _, run = self.install_sweep([self.session])
+        complete = cast(Callable[..., subprocess.CompletedProcess[str]], run.side_effect)
+
+        def stop_then_hold(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if "stop" in command:
+                held.return_value = "build hold: acquired after stop"
+            return complete(command, **kwargs)
+
+        run.side_effect = stop_then_hold
+        self.assertEqual(heal.sweep(), 0)
+        state = heal.state_directory() / "state.json"
+        saved = cast(dict[str, dict[str, object]], json.loads(state.read_text()))
+        self.assertEqual(cast(dict[str, object], saved[self.session.session_id]["pending"])["kind"], "stopping")
+        held.return_value = ""
+        with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead(())),
+              patch.object(heal, "resume_pending") as resume):
+            self.assertEqual(heal.sweep(no_restart=True), 0)
+        resume.assert_not_called()
+        self.assertEqual(json.loads(state.read_text()), saved)
+        self.assertEqual(run.call_count, 1)
+
+    def test_recovery_commands_refuse_no_restart(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit_code:
+            _ = heal.main(["retry", "--only", "fixture", "--no-restart"])
+        self.assertEqual(exit_code.exception.code, 2)
+
     def test_unit_and_worker_alert_the_nearest_showrunner(self) -> None:
         owner, unit, worker = self.showrunner_fixture()
         raw = f"nix_env: {self.work}: .envrc loaded but no nix shell (IN_NIX_SHELL unset)"

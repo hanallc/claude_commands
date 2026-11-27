@@ -387,7 +387,12 @@ def log(directory: Path, session: HealSession | PendingSession, history: HealHis
     history["action"], history["reason"] = action, reason
 
 
+NO_RESTART_REASON = "session has no nix shell; the healer does not restart sessions"
+
+
 def alert_cause(reason: str) -> str:
+    if reason == NO_RESTART_REASON:
+        return "The healer does not restart sessions. A restart of the session loads its nix shell."
     if reason.endswith(".envrc loaded but no nix shell (IN_NIX_SHELL unset)"):
         return "The automatic restart could not fix it. The .envrc file loaded, but no nix shell started."
     if reason == "session still has no nix shell after its heal restart":
@@ -679,7 +684,24 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
     resume_pending(directory, limits, session, pending, history, histories)
 
 
-def sweep(only: str = "", check: bool = False) -> int:
+def report_one(directory: Path, limits: HealLimits, session: HealSession, history: HealHistory) -> None:
+    """Alert the owning showrunner once about a broken session; never stop or start it."""
+    observation = inspect(session)
+    if isinstance(observation, Healthy):
+        history.update(healthy_since_restart=True, notified=False, showrunner_alert_key="")
+        return
+    if isinstance(observation, Gone):
+        return
+    if isinstance(observation, Unavailable):
+        log(directory, session, history, "skip", observation.reason)
+        return
+    if history["notified"]:
+        return
+    log(directory, session, history, "refused", NO_RESTART_REASON)
+    alert(directory, limits, session, history, NO_RESTART_REASON)
+
+
+def sweep(only: str = "", check: bool = False, no_restart: bool = False) -> int:
     """Keep one bad record or launch from preventing other sessions' recovery."""
     try:
         reading = list_sessions()
@@ -708,7 +730,7 @@ def sweep(only: str = "", check: bool = False) -> int:
             # before considering any new live session, including after a hold.
             for session_id, history in histories.items():
                 pending = history["pending"]
-                if pending["kind"] == "none" or (only and only != session_id):
+                if no_restart or pending["kind"] == "none" or (only and only != session_id):
                     continue
                 pending_ids.add(session_id)
                 home = pane_launch.config_home({**pending, "session_id": session_id})
@@ -733,7 +755,10 @@ def sweep(only: str = "", check: bool = False) -> int:
                     continue
                 history = histories.setdefault(session.session_id, new_history())
                 try:
-                    heal_one(directory, limits, session, history, histories)
+                    if no_restart:
+                        report_one(directory, limits, session, history)
+                    else:
+                        heal_one(directory, limits, session, history, histories)
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                     log(directory, session, history, "refused", str(error))
                 finally:
@@ -793,6 +818,7 @@ class HealArguments(argparse.Namespace):
         self.command: str = ""
         self.only: str = ""
         self.check: bool = False
+        self.no_restart: bool = False
 
 
 def main(arguments: list[str]) -> int:
@@ -800,11 +826,13 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("command", choices=("sweep", "retry", "escalate"))
     _ = parser.add_argument("--only", default="")
     _ = parser.add_argument("--check", action="store_true")
+    _ = parser.add_argument("--no-restart", action="store_true",
+                            help="alert the owning showrunner about a broken session; never stop or start it")
     parsed = parser.parse_args(arguments, namespace=HealArguments())
     if parsed.command == "sweep":
-        return sweep(parsed.only, parsed.check)
-    if not parsed.only or parsed.check:
-        parser.error(f"{parsed.command} requires --only and does not accept --check")
+        return sweep(parsed.only, parsed.check, parsed.no_restart)
+    if not parsed.only or parsed.check or parsed.no_restart:
+        parser.error(f"{parsed.command} requires --only and does not accept --check or --no-restart")
     return update_recovery(parsed.command, parsed.only)
 
 
