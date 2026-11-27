@@ -1288,9 +1288,12 @@ esac
         _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
         _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
+        scopes = [{"kind": "file", "path": "alpha.txt"}]
         alpha = {"reservation_id": "alpha-reservation", "target": "refs/heads/production",
                  "holder": {"worktree_root": str(self.alpha), "branch": "alpha-branch"},
-                 "scopes": ["file:alpha.txt"], "lifecycle": "active", "edit_blocking_status": "blocking"}
+                 "source": {"kind": "explicit"}, "scopes": scopes,
+                 "merge_extent": {"status": "not_derived", "protection": scopes},
+                 "lifecycle": "active", "edit_blocking_status": "blocking"}
         unrelated = {**alpha, "reservation_id": "other-reservation",
                      "holder": {"worktree_root": str(self.root / "other"), "branch": "other"}}
         empty: dict[str, object] = {"journal_position": {}, "entries": []}

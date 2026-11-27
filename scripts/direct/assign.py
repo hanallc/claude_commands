@@ -896,17 +896,19 @@ def launch(target: worker_panes.ConsultationPane, policy: worker_panes.LaunchPol
 def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
            policy: worker_panes.LaunchPolicy, *,
            lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+           phase: str | None = None,
            ) -> worker_panes.WorkerStart: ...
 
 
 def launch(target: worker_panes.PaneTarget, policy: worker_panes.LaunchPolicy, *,
            lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+           phase: str | None = None,
            ) -> side_pane.SidePane | worker_panes.WorkerStart:
     """Start the named target with the supplied policy."""
     if isinstance(target, worker_panes.ConsultationPane):
         return side_pane.open(target.label, policy, question=target.question, cwd=target.cwd, delivery=target.delivery)
     try:
-        started = staff_worker.launch(target, policy, lock=lock)
+        started = staff_worker.launch(target, policy, lock=lock, phase=phase)
     except staff.StaffRefused as error:
         started = worker_panes.AdmissionRefused(str(error))
     if isinstance(started, worker_panes.AdmissionRefused):
@@ -979,7 +981,7 @@ def execute_durable(args: Arguments) -> int:
     target = worker_panes.DurableDesignRole(staff.StaffId(args.parent), name, role)
     policy = pane_policy(args.policy, model=args.model, effort=args.effort)
     if not args.prompt:
-        current = launch(target, policy)
+        current = launch(target, policy, phase=args.phase or None)
         if not isinstance(current, worker_panes.OpenWorker):
             return staff_worker.startup_result(name, current)
         print(json.dumps(current.row.to_json()))
@@ -1030,7 +1032,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return staff_worker.ExitCode.BUSY
-        current = launch(target, policy, lock=hold)
+        current = launch(target, policy, lock=hold, phase="astra-review")
         staff_worker.arm_launch_cleanup(cleanup, before, current)
         if not isinstance(current, worker_panes.OpenWorker):
             return staff_worker.startup_result(target.name, current)

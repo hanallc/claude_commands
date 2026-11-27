@@ -139,7 +139,7 @@ argparse.ArgumentParser.exit = checked_exit
             starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
             self.assertEqual(starts, [("hooks", "test_first.py")])
             self.assertIn(f"affected: 1 of {self.module_count} modules (base {base[:12]}, ", result.stdout)
-            self.assertIn("), 1 changed files\nhooks/test_first.py\n", result.stdout)
+            self.assertRegex(result.stdout, r"\), 1 changed files, selected in [0-9]+\.[0-9] s\nhooks/test_first\.py\n")
             self.assertIn("message: skipped (not affected)", result.stdout)
             self.assertNotIn("tests reused from", result.stdout)
         self.assertEqual([record["kind"] for record in self.pass_records()], ["full", "affected", "affected"])
