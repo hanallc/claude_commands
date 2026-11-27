@@ -2249,7 +2249,6 @@ async function inspect(){
  check(columns===(ready.defaultView.innerWidth<800 ? 1 : 2),'The card changes columns at 800 pixels.');
  const phone=direct || document.querySelector('.mobile-header').getClientRects().length>0;
  check(phone===(direct || new URLSearchParams(location.search).has('phone')),'The List uses the expected layout.');
- // A top window starts at the bottom of the action area, or at the top of the view on a page without one.
  const area=dialog.querySelector('[data-page-window-actions]');
  const clear=area ? Math.max(area.getBoundingClientRect().top,
   ...[...area.children].map(control=>control.getBoundingClientRect().bottom)) : 0;
@@ -2263,9 +2262,11 @@ async function inspect(){
   check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the phone width.');
  }else{
   const box=dialog.getBoundingClientRect();
-  check(box.width<=1060 && Math.abs(box.left+box.right-win.innerWidth)<=20 && Math.abs(box.top-clear-16)<1,
-   'The desktop dialog is centered horizontally and starts 16 pixels below the action area. '
-   +JSON.stringify({box,clear}));
+  const frozenBottom=doc.querySelector('.page-top').getBoundingClientRect().bottom;
+  const top=Math.max(clear,frozenBottom)+16;
+  check(box.width<=1060 && Math.abs(box.left+box.right-win.innerWidth)<=20 && Math.abs(box.top-top)<1,
+   'The desktop dialog is centered horizontally and starts 16 pixels below the frozen top. '
+   +JSON.stringify({box,top}));
   check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the desktop width.');
  }
  if(short && !direct){
@@ -2720,6 +2721,37 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         self.assertNotIn("exceptionDetails", result, result)
         value = cast(dict[str, object], result["result"])
         self.assertEqual(value.get("value"), [])
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_studio_review_window_clears_frozen_controls(self) -> None:
+        review = investigation.file(OWNER.id, "Check the result", "Read the review.", waiting_why="Work continues.")
+        key = review_items.investigation_record_key(review)
+        for number in range(1, 19):
+            item = self.add(f"Item {number}", number=number)
+            if number == 10:
+                _ = the_list.link(MORTY.id, item.id, (key,), source="morty")
+        with self.studio_review_server() as origin:
+            self.open_studio_review_fixture(origin)
+            self.studio_review_check(r"""
+ const header=document.querySelector('.page-top');
+ const controls=header.querySelector('[data-page-top-controls]');
+ const summary=row(10).querySelector('.list-row');
+ const link=()=>summary.querySelector('a[data-list-review-card]');
+ const bottom=()=>header.getBoundingClientRect().bottom;
+ const windowTop=()=>dialog.getBoundingClientRect().top;
+ await until(link);
+ scrollBy({top:summary.getBoundingClientRect().top-bottom()-64,behavior:'instant'});
+ await paint();
+ check(scrollY>0 && controls.getBoundingClientRect().bottom>0,'The picture tabs stay visible after scrolling.');
+ await open(link());
+ await paint();
+ const first=windowTop();
+ check(Math.abs(first-bottom()-16)<1,'The review window clears the frozen top.');
+ controls.style.paddingBottom='24px';
+ await paint();
+ check(windowTop()>first && Math.abs(windowTop()-bottom()-16)<1,
+  'The open window moves when the frozen top grows.');
+""")
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_evidence_opens_only_reviews_linked_to_the_item(self) -> None:

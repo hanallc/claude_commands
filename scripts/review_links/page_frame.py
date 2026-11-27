@@ -264,13 +264,19 @@ ACTIONS_SCRIPT = """<script>
   dialog.addEventListener('close',()=>button.focus({preventScroll:true}),{once:true});
   dialog.showModal();
  });
- // A scroll does not change the left and right edges, so it only moves the copy and the value (measure=false).
+ let frozenBottom=0;
+ // On scroll, keep the last measured bottom of the frozen top and move the action copy.
  function place(measure=true){
   if(!windows.length) return;
   const home=pageActionsArea();
   if(!home) return;
   const box=home.getBoundingClientRect(), area=pageActionsBox(home);
   const top=Math.max(box.top,8);
+  if(measure){
+   const frozen=home.closest('.page-top:has(>[data-page-top-controls])');
+   frozenBottom=frozen?.getBoundingClientRect().bottom ?? 0;
+  }
+  const bottom=Math.max(top+area.height,frozenBottom);
   for(const entry of windows){
    const {dialog,copy}=entry;
    Object.assign(copy.style,{top:top+'px',left:box.left+'px',width:box.width+'px'});
@@ -286,7 +292,7 @@ ACTIONS_SCRIPT = """<script>
     entry.meets=meets() || (dialog.style.getPropertyValue('--page-window-top')!==''
      && (dialog.style.removeProperty('--page-window-top'),meets()));
    }
-   const value=entry.meets ? (top+area.height)+'px' : '';
+   const value=entry.meets ? bottom+'px' : '';
    if(dialog.style.getPropertyValue('--page-window-top')!==value) dialog.style.setProperty('--page-window-top',value);
   }
  }
