@@ -62,7 +62,8 @@ from scripts.build_queue.queue_lines import age, blocking_step_name, plain, step
 from scripts.build_queue.snapshot_codec import owner_name, row_what
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.build_queue.admission_jobs import HAND_MADE, StepJob
-from scripts.lib.build_steps import (GATE_PROGRAMS, RECORDED_STEP_NAMES,
+from scripts.lib.build_steps import GATE_STEPS as GATE_STEPS
+from scripts.lib.build_steps import (RECORDED_STEP_NAMES,
                                      CopiesRunCommand, OtherCommand, StepNames, build_call_arguments, command_script,
                                      copies_run_command, live_process_arguments,
                                      gate_job_from_process, process_arguments, read_step_names)
@@ -911,7 +912,6 @@ class RunRow(RowQueueNotes, NamedQueueRow, RunFolderField):
     program_memory: NotRequired[program_memory_feed.ProgramMemoryView]
 
 
-GATE_STEPS = frozenset(GATE_PROGRAMS)
 
 
 @dataclass(frozen=True)

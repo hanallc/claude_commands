@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from scripts.lib import file_lock
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
 
 class FileLockTests(unittest.TestCase):
@@ -52,9 +53,10 @@ class FileLockTests(unittest.TestCase):
             with file_lock.exclusive(path) as held:
                 self.assertIs(held, file_lock.LockResult.ACQUIRED)
                 contender = executor.submit(acquire)
-                self.assertTrue(entered.wait(5))
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS), "The lock contender did not start.")
                 self.assertFalse(acquired.is_set())
-            self.assertIs(contender.result(5), file_lock.LockResult.ACQUIRED)
+            guard = LauncherHangGuard("The lock contender did not return after the holder released the lock")
+            self.assertIs(guard.result(contender), file_lock.LockResult.ACQUIRED)
             self.assertTrue(acquired.is_set())
 
     def test_nonblocking_acquire_reports_a_busy_lock_without_entering_it(self) -> None:

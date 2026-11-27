@@ -619,6 +619,32 @@ class AppliedCheckTests(unittest.TestCase):
         self.assertEqual(check("old_name", "new_name", "src/lib.rs", "fn new_name() {}\n"), NoAppliedCheck("rename"))
 
 
+class SplitDestinationTests(unittest.TestCase):
+    def test_resolves_the_named_destination_to_a_repository_path(self) -> None:
+        cases = (
+            ("crates/port/src/scan/recurse.rs", "collect.rs", "crates/port/src/scan/collect.rs"),
+            ("crates/port/src/scan.rs", "src/collect.rs", "crates/port/src/collect.rs"),
+            ("crates/port/src/tests/a.rs", "tests/b.rs", "crates/port/tests/b.rs"),
+            ("crates/port/src/scan.rs", "benches/collect.rs", "crates/port/benches/collect.rs"),
+            ("crates/port/src/scan.rs", "examples/collect.rs", "crates/port/examples/collect.rs"),
+            ("crates/port/src/scan.rs", "crates/port/src/collect.rs", "crates/port/src/collect.rs"),
+            ("crates/port/src/scan/nested/scan/a.rs", "scan/b.rs", "crates/port/src/scan/nested/scan/b.rs"),
+            ("crates/outer/src/inner/src/a.rs", "new/b.rs", "crates/outer/src/inner/src/new/b.rs"),
+            ("tools/nested/a.rs", "tools/b.rs", "tools/b.rs"),
+            ("tools/nested/a.rs", "support/b.rs", "support/b.rs"),
+            ("src/a.rs", "tests/b.rs", "tests/b.rs"),
+        )
+        for path, name, expected in cases:
+            with self.subTest(path=path, name=name):
+                self.assertEqual(approved_renames.stated_split_destinations(
+                    "restructure", path, f"Move the function into {name}."), (expected,))
+
+        self.assertEqual(approved_renames.stated_split_destinations(
+            "restructure", "crates/cargo-port/src/enrichment.rs",
+            "Move language_enrichment_job unchanged into scan/language_stats/collect.rs beside language_measurement_job."),
+            ("crates/cargo-port/src/scan/language_stats/collect.rs",))
+
+
 class FileRenameTests(unittest.TestCase):
     def test_a_binding_with_division_is_an_item_rename(self) -> None:
         rename = approved_renames.classify_rename("src/lib.rs", "let old = total / count;", "let new = total / count;")

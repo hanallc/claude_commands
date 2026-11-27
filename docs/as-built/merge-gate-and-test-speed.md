@@ -148,8 +148,12 @@ On status 80, `copies.py run` requests settlement.
 For Mac Linux, the wrapper needs a no-run report before it requests a replacement.
 The wrapper writes the replacement assignment to the same file and runs the gate on the assigned machine.
 After a prelaunch refusal, another attempt on the same guest requires a fresh availability reading.
+When the queue needs a guest reading, it waits before it considers later machines in registry order.
+The first eligible machine in that order takes the run.
+A busy, blocked, off, or unreachable guest lets placement consider the next machine immediately.
 An eligible named machine can take the run while the guest is in backoff.
-A fresh reading that still excludes the guest keeps it out of placement.
+The queue waits at most 30 seconds for the reading.
+The next queue pass uses the result or treats the guest as unreachable.
 If placement fails, the wrapper reports `Gate placement blocked`.
 A confirmed test failure gives status 1.
 A gate command in Merge tests uses `copies.py run --commit <sha>` with the prepared merge commit.
@@ -555,6 +559,10 @@ A failed module can run once more alone.
 A named run on natedev has no time limit.
 On `mac-linux`, `run.time_limit_seconds` limits each module and the full run.
 Named runs on natedev or `mac-linux` create no gate record.
+For a full-suite request on `mac-linux`, the controller records both passing and failing guest results.
+It saves module times and Mac load readings in `${BUILDLOG_DIR:-~/.local/state/buildlog}/mac-linux/YYYY-MM.jsonl`.
+It saves failing module output in `mac-linux/logs/YYYY-MM/` under the same Buildlog root.
+The guest record omits the vCPU count, so the shared time-limit history skips it.
 The controller imports a `gate_run` record for a completed prepared named gate on AWS.
 Named runs create no pass certificate or passed-tree entry.
 The merge checkpoint uses this form to verify a failed module on its base. See [showrunner automation](showrunner-automation.md).
@@ -653,11 +661,19 @@ A passing full gate run removes the marker. An unreadable marker also requires t
 
 The selection reads three record kinds from the caller's build log: config reads, folder scans and content reads.
 Each kind comes from the newest full, non-aborted gate that recorded it.
+The selection skips records from `mac-linux`.
 A changed config file selects each module that reads it in its source or in its config read record. A module with no record is selected.
 The targeted gate keeps the caller's build log, and it writes its own gate record there. Each test module has its own private build log.
 Only a direct test run (`start_test_run`) moves an unset `BUILDLOG_DIR` into its run folder.
 
-Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files`.
+Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files, selected in S s`.
+The same line gives cache hits, cache misses, part times, and the cache lock result.
+A hit uses cached facts. A miss counts before the source read.
+The extraction count records each source file that starts extraction.
+The counts include current and base graph lookups when selection builds both graphs.
+The times show cache read, extraction, graph build, and other work in seconds to one decimal place.
+Extraction time includes source reads for both graphs.
+The lock result shows when selection publishes facts or reads the old snapshot with the lock busy.
 It prints module names when ten or fewer modules are selected.
 A full run prints `full suite: <reason>` and repeats the reason in the final `Gate tests:` summary.
 An untouched suite prints `skipped (not affected)`.

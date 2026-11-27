@@ -116,9 +116,8 @@ def _managed_review(review: Path, log: Path, target: str, cwd: Path,
                     dispatch_lock: file_lock.ExclusiveLock | None) -> int:
     """Run one managed review through assign.sh."""
     run = log.parent
-    name = f"astra-reviewer{os.getpid()}"
+    name = f"astra-reviewer-{run.name}" if dispatch_lock is not None else f"astra-reviewer{os.getpid()}"
     if dispatch_lock is not None and target == "consultation-pane":
-        name = f"astra-reviewer-{run.name}"
         write_text_atomic(run / "consultation-session", herdr.shared_session() + "\n", new_file_mode=0o600)
     # Keep the lock until the launcher exits if its caller stops.
     with log.open("w", encoding="utf-8") as output:
