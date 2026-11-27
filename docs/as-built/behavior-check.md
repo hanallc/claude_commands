@@ -21,13 +21,14 @@ It reads the head and base again before merge and supplies the checked head to G
 A clear record names the saved reviewer reply.
 The reviewer filters transcript files before parsing them and runs each command in one tool call without `write_stdin`.
 The gate checks the finding for each changed test.
+Source verification applies only to `requested` findings.
 The check accepts typed Claude turns, sent List Tell feedback from Nate, and Nate's saved List or Question answers.
 It matches consecutive full sentences or lines and treats each run of whitespace as one space.
-The check reports the date from the source. If the source cannot prove the author or quote, the finding needs a question.
+The check reports the date from the source. A `requested` finding needs a question if the source cannot prove the author or quote.
 Status fails if it cannot read or parse the saved proof for a clear record.
 For a Yes record, the gate reads the answer in the original question.
 
-The reviewer gives a verdict when it finds Nate's words to assess and the finding is not a request.
+The reviewer gives a verdict for each `specified` finding.
 Use `against` only when the change removes or changes behavior Nate explicitly asked for.
 A refinement of a term Nate did not define, such as "history", does not warrant `against`.
 The verdicts `against` and `unclear` need a question. The verdicts `follows` and `different` clear the finding.

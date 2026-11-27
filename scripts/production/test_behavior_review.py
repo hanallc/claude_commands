@@ -736,7 +736,34 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.reply(json.dumps([{**finding, "source": str(source)}]))
 
     def test_against_verdict_files_the_author_draft(self) -> None:
-        _ = self.filed_question()
+        source_change = {
+            **MOVE_FINDING,
+            "quote": "guided by history from model-study",
+            "date": "2026-10-17",
+            "change": "The last hour of use sets the wait.",
+            "reason": "The change replaces the named source for the wait.",
+        }
+        source_question = update_registration.QuestionParts(
+            ask="Use the last hour of use to set the wait before a move? (2026-10-17)",
+            context="You said the wait uses history from model-study.",
+            items=["The change uses the last hour of use."],
+            choices=["Yes (the change goes in with the last hour of use)", "No (the change stays out)"],
+            recommend="No, because the change replaces the source you named.",
+        )
+        for case, finding, parts in (
+            ("move timing", MOVE_FINDING, MOVE_QUESTION),
+            # Nate wrote these words at 09:12 PST on 2026-11-27.
+            # "i never explicitly asked for what usage history means"
+            # "i explicitly asked for the last hour to be what IS USED to calculate"
+            ("wrong assessment example for a replaced named source", source_change, source_question),
+        ):
+            with self.subTest(case=case):
+                folder = self.root / case
+                folder.mkdir()
+                with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(folder / "state")}),
+                      mock.patch.object(astra_review, "review_attempt_folder", return_value=folder),
+                      mock.patch.object(self, "folder", folder)):
+                    _ = self.filed_question(finding, parts)
 
     def test_unclear_verdict_files_the_author_draft(self) -> None:
         _ = self.filed_question({
@@ -769,26 +796,17 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         })
 
     def test_account_pace_refinement_clears_without_a_question(self) -> None:
-        last_hour_quote = (
-            "i never explicitly asked for what usage history means - in fact i explicitly asked for the last hour "
-            "to be what IS USED to calculate"
-        )
-        for case, quote, source_date, reason in (
-            ("account_pace last hour", last_hour_quote, "2026-11-27", "The wait uses the last hour as Nate asked."),
-            # Named wrong example. Nate corrected it at 09:12 PST on 2026-11-27.
-            ("replaced named source", "guided by history from model-study", "2026-10-17",
-             f'Nate said, "{last_hour_quote}".'),
-        ):
-            with self.subTest(case=case):
-                folder = self.root / case
-                folder.mkdir()
-                with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(folder / "state")}),
-                      mock.patch.object(astra_review, "review_attempt_folder", return_value=folder),
-                      mock.patch.object(self, "folder", folder)):
-                    self.assert_clear_verdict({
-                        **MOVE_FINDING, "quote": quote, "date": source_date, "change": "The last hour of use sets the wait.",
-                        "verdict": "follows", "reason": reason,
-                    })
+        self.assert_clear_verdict({
+            **MOVE_FINDING,
+            "quote": (
+                "i never explicitly asked for what usage history means - in fact i explicitly asked for the last hour "
+                "to be what IS USED to calculate"
+            ),
+            "date": "2026-11-27",
+            "change": "The last hour of use sets the wait.",
+            "verdict": "follows",
+            "reason": "The wait uses the last hour as Nate asked.",
+        })
 
     def test_specified_findings_require_a_known_verdict_and_a_one_line_reason(self) -> None:
         row: dict[str, object] = {"test": "test_fixture.py::test_move", "finding": "specified", "quote": MOVE_QUOTE,
