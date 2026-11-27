@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import enum
+import html
 import json
 import os
 import subprocess
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
 from scripts.build_queue import memory_files
-from scripts.lib import conf, file_lock
+from scripts.lib import conf, file_lock, session_folder
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
 from scripts.review_links import staff_names
@@ -86,6 +87,29 @@ def shared_step_tip(source: str) -> StepTip:
     return StepTip(parts[0], parts[1])
 
 
+def current_session_folders() -> list[session_folder.SessionFolder]:
+    """The session folders on this machine, or none when the session root cannot be read."""
+    try:
+        root = session_folder.session_root()
+        return session_folder.session_folders(root) if root is not None else []
+    except (OSError, conf.Unusable):
+        return []
+
+
+def session_name_registry(folders: Sequence[session_folder.SessionFolder]) -> dict[str, str]:
+    """Read current staff names and color session folders by their recorded owner."""
+    names = staff_names.read()
+    registry = names.registry()
+    for folder, record in folders:
+        if record is not None:
+            owner = names.members.by_member_reference(record['owner'])
+            if owner is not None:
+                registry[folder.name] = names.html(owner.id, folder.name)
+            elif folder.name in registry:
+                registry[folder.name] = html.escape(folder.name)
+    return registry
+
+
 def publish(folder: Path, settings: PageSettings) -> Path:
     source = Path(__file__).with_name(PAGE_NAME).read_text(encoding="utf-8")
     tip = shared_step_tip(memory_files.PAGE_SOURCE.read_text(encoding="utf-8"))
@@ -99,8 +123,7 @@ def publish(folder: Path, settings: PageSettings) -> Path:
     page = (page_frame.template(source, "Disks", "disks")
             .replace("__STEP_TIP_STYLE__", tip.style).replace("__STEP_TIP_SCRIPT__", tip.script)
             .replace("__DISKS_SETTINGS__", json.dumps(settings).replace("</", "<\\/")))
-    names = staff_names.read()
-    page = page.replace('</head>', staff_names.script(names.registry(), names.role_labels()) + '</head>', 1)
+    page = page.replace('</head>', staff_names.script(session_name_registry(current_session_folders())) + '</head>', 1)
     folder.mkdir(parents=True, exist_ok=True)
     page_path = folder / PAGE_NAME
     try:

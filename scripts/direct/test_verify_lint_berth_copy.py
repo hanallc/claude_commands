@@ -41,11 +41,14 @@ if "--manifest-path" in arguments:
 
 
 def snapshot(identity: str, root: Path, branch: str, *paths: str) -> dict[str, object]:
+    scopes = [{"kind": "file", "path": path} for path in paths]
     return {
         "reservation_id": identity,
         "target": {"ref": "refs/heads/main"},
         "holder": {"worktree_root": str(root), "branch": {"kind": "attached", "reference": branch}},
-        "scopes": [{"kind": "file", "path": path} for path in paths],
+        "source": {"kind": "explicit"},
+        "scopes": scopes,
+        "merge_extent": {"status": "not_derived", "protection": scopes},
         "lifecycle": {"stage": "active"}, "edit_blocking_status": "blocking",
     }
 
