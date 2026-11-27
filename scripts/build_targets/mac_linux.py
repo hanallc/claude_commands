@@ -72,7 +72,12 @@ GUEST_ACCEPTED = 'mac-linux command accepted'
 INNER_CONNECT_ERROR = re.compile(
     r'ssh: connect to host [^\s]+ port [0-9]+: Connection (?:reset by peer|refused)\r?\n?')
 SSH_CONNECT_ERROR = re.compile(
-    r'^ssh: (?:connect to host \S+ port [0-9]+: |Could not resolve hostname )', re.MULTILINE)
+    r'^ssh: (?:connect to host \S+ port [0-9]+: |Could not resolve hostname )'
+    + r'|^(?:Connection timed out during banner exchange'
+    + r'|(?:banner exchange: Connection to \S+ port [0-9]+: |kex_exchange_identification: (?:(?:read|write): )?)'
+    + r'(?:Broken pipe|Operation timed out|Connection (?:closed by remote host|reset by peer|timed out)))\r?$',
+    re.MULTILINE,
+)
 SSH_OPTIONS = ('-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no')
 # Allow time for setup, cleanup, and result transfer.
 TRANSFER_ALLOWANCE_SECONDS = 120

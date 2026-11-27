@@ -2799,6 +2799,27 @@ with (patch.object(conf, 'read', read_config),
         self.assertIs(eligibility.read_backoff(now + delay - 1, mac_linux.TARGET), eligibility.ACTIVE_BACKOFF)
         self.assertIs(eligibility.read_backoff(now + delay + 1, mac_linux.TARGET), eligibility.NO_BACKOFF)
 
+    def test_guest_main_backoff_for_pre_authentication_transport_failure(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        backoff = eligibility.backoff_path(mac_linux.TARGET)
+        for diagnostic, expected in (
+            ('Connection timed out during banner exchange\nConnection to fixture-mac port 22 timed out',
+             eligibility.ACTIVE_BACKOFF),
+            ('banner exchange: Connection to 127.0.0.1 port 31022: Broken pipe', eligibility.ACTIVE_BACKOFF),
+            ('kex_exchange_identification: Connection closed by remote host', eligibility.ACTIVE_BACKOFF),
+            ('kex_exchange_identification: read: Connection reset by peer', eligibility.ACTIVE_BACKOFF),
+            ('fixture-guest: Permission denied (publickey).', eligibility.NO_BACKOFF),
+            ('Host key verification failed.', eligibility.NO_BACKOFF),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                backoff.unlink(missing_ok=True)
+                failed = subprocess.CompletedProcess(['ssh'], 255, '', diagnostic + '\n')
+                with (patch.object(mac_linux, 'run_guest_ssh', return_value=failed),
+                      self.assertRaises(mac_linux.GuestUnavailable) as error):
+                    _ = mac_linux.read_guest_main(settings)
+                self.assertIn(diagnostic, str(error.exception))
+                self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), expected)
+
     def test_guest_main_invalid_reply_does_not_start_backoff(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
         invalid = subprocess.CompletedProcess(['ssh'], 0, 'invalid commit ID\n', '')
@@ -3507,6 +3528,18 @@ with (patch.object(conf, 'read', read_config),
             # ssh uses the first value of an option, so each hop names each keepalive option once.
             self.assertEqual(hop[-4:], alive)
             self.assertEqual([word for word in hop if word.startswith('ServerAlive')], alive[1::2])
+
+    def test_kept_guest_end_banner_timeout_starts_backoff(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        armed = mac_linux.ArmedGuestAttempt('kept-attempt', 'f' * 32, 'boot-id', 10, settings.guest_user, '/fixture')
+        diagnostic = 'Connection timed out during banner exchange\nConnection to fixture-mac port 22 timed out'
+        failed = subprocess.CompletedProcess(['ssh'], 255, '', diagnostic + '\n')
+        with patch.object(mac_linux, 'run_guest_ssh', return_value=failed) as ssh:
+            self.assertEqual(mac_linux.prove_kept_guest_end(armed), mac_linux.GuestEndPending(diagnostic))
+            self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.ACTIVE_BACKOFF)
+            self.assertEqual(mac_linux.prove_kept_guest_end(armed),
+                             mac_linux.GuestEndPending('guest unreachable during retry backoff'))
+            ssh.assert_called_once()
 
     def test_kept_guest_end_proof_refuses_unreadable_settings(self) -> None:
         settings_user = mac_linux.read_settings(conf.read(self.registry)).guest_user
