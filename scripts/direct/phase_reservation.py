@@ -60,6 +60,7 @@ import sys
 from collections.abc import Generator
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast, overload
 
@@ -123,6 +124,11 @@ class Acquisition(NamedTuple):
     reservation_id: str
     coordination_run_id: str
     phase_start_head: str
+
+
+class _UnownedAcquisition(Enum):
+    SIBLING = "sibling"
+    UNMAPPED = "unmapped"
 
 
 class CheckAnswer(NamedTuple):
@@ -243,27 +249,27 @@ def session_reservation(root: Path, session_id: str) -> tuple[str, str] | None:
 
 
 def _own_acquisition(answer: CheckAnswer, root: Path, phases: list[OpenPhase], session_id: str,
-                    phase: OpenPhase) -> Acquisition | None:
-    """Return this phase's acquisition without recording a sibling's reservation.
+                    phase: OpenPhase) -> Acquisition | _UnownedAcquisition | None:
+    """Identify this phase's acquisition or the reason it cannot record it.
 
-    Accept `left_unmapped` only when the bare session maps the reservation and run, and no other open phase holds the reservation.
-    A sibling holds it through an `Active` state, a pending release, or its berth session map.
+    Accept `left_unmapped` if the bare session maps the reservation and run and no sibling holds it.
+    A sibling can hold it through an `Active` state, a pending release, or its berth session map.
     """
     acquisition = answer.acquisition
     if answer.session_mapping != LEFT_UNMAPPED or acquisition is None:
         return acquisition
-    if session_reservation(root, session_id) != (acquisition.reservation_id, acquisition.coordination_run_id):
-        return None
     for sibling in phases:
         if sibling.directory == phase.directory:
             continue
         state = read_state(sibling.directory)
         pending = _object(state.get(PENDING_FIELD)) if _string(state.get("kind")) == PENDING else {}
         if acquisition.reservation_id in (_recorded(state), _string(pending.get("reservation_id"))):
-            return None
+            return _UnownedAcquisition.SIBLING
         mapped = session_reservation(root, phase_session_id(session_id, sibling.phase))
         if mapped is not None and mapped[0] == acquisition.reservation_id:
-            return None
+            return _UnownedAcquisition.SIBLING
+    if session_reservation(root, session_id) != (acquisition.reservation_id, acquisition.coordination_run_id):
+        return _UnownedAcquisition.UNMAPPED
     return acquisition
 
 
@@ -271,11 +277,12 @@ def record_own_acquisition(answer: CheckAnswer, root: Path, phases: list[OpenPha
                            phase: OpenPhase) -> Acquisition | None:
     """Record the acquisition under the phase lock."""
     with phase_lock(phase.directory):
-        return _record_own_acquisition_locked(answer, root, phases, session_id, phase)
+        acquisition = _record_own_acquisition_locked(answer, root, phases, session_id, phase)
+        return acquisition if isinstance(acquisition, Acquisition) else None
 
 
 def _record_own_acquisition_locked(answer: CheckAnswer, root: Path, phases: list[OpenPhase], session_id: str,
-                                   phase: OpenPhase) -> Acquisition | None:
+                                   phase: OpenPhase) -> Acquisition | _UnownedAcquisition | None:
     """Take the run lock after the phase lock for `left_unmapped` answers."""
     session_dir = phase.directory.parent.parent
     with ((session_dir / "phase_reservation.lock").open("a")
@@ -283,7 +290,7 @@ def _record_own_acquisition_locked(answer: CheckAnswer, root: Path, phases: list
         if lock is not None:
             worker_lifecycle.acquire_flock(lock)
         acquisition = _own_acquisition(answer, root, phases, session_id, phase)
-        if acquisition is not None:
+        if isinstance(acquisition, Acquisition):
             _ = _record_active_locked(phase.directory, acquisition)
         return acquisition
 
@@ -1129,7 +1136,14 @@ def _record_active_from_changes_locked(session_dir: Path, directory: Path, reque
         print(f"phase reservation: cargo-berth check answered {answer.status}: {answer.message}", file=sys.stderr)
         return 1
     acquisition = _record_own_acquisition_locked(answer, root, phases, session_id, phase)
-    if acquisition is None or acquisition.reservation_id == recorded:
+    if acquisition is _UnownedAcquisition.UNMAPPED:
+        message = f"phase reservation: the reservation is not mapped to a session: {answer.acquisition.reservation_id}"
+        if recorded:
+            print(f"{message}; {stale}", file=sys.stderr)
+            return 1
+        print(message)
+        return 0
+    if not isinstance(acquisition, Acquisition) or acquisition.reservation_id == recorded:
         if recorded:
             print(f"phase reservation: {stale}, and no live reservation of this phase replaces it", file=sys.stderr)
             return 1
@@ -1197,7 +1211,7 @@ def _claim_files_locked(session_dir: Path, directory: Path, root: Path) -> int:
         print(f"phase reservation: cargo-berth check answered {answer.status}: {answer.message}", file=sys.stderr)
         return 1
     acquisition = _record_own_acquisition_locked(answer, root, phases, session_id, phase)
-    if acquisition is None:
+    if not isinstance(acquisition, Acquisition):
         print("phase reservation: a sibling phase's reservation holds every file; still awaiting first touch")
         return 0
     print(f"phase reservation: Active, reservation {acquisition.reservation_id}")

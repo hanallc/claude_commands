@@ -589,6 +589,35 @@ class WorktreeAttributionTests(unittest.TestCase):
         check.assert_called_once_with(self.first, ["changed.txt"], mock.ANY)
         self.assertEqual(phase_reservation.read_state(directory)["kind"], phase_reservation.ACTIVE)
 
+    def test_record_active_reports_unmapped_and_sibling_reservations(self) -> None:
+        phase, sibling = self.phases({"1": self.first, "2": self.first})
+        _ = phase_reservation.enroll(phase.directory, phase.phase, "board_ready")
+        _ = phase_reservation.enroll(sibling.directory, sibling.phase, "board_ready")
+        changed = "scripts/direct/verify.sh"
+        _ = (sibling.directory / phase_reservation.FILES_FILE).write_text("sibling.txt\n")
+        path = self.first / changed
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("first touch\n")
+        held = phase_reservation.Acquisition("r1", "c1", phase_reservation.commit_id(self.first, "HEAD"))
+        answer = phase_reservation.CheckAnswer(phase_reservation.CLEAR, "", held, phase_reservation.LEFT_UNMAPPED)
+        args = ["record-active", "--session-dir", str(self.session), "--phase", phase.phase, "--repo", str(self.first)]
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "director"}), \
+                mock.patch.object(phase_reservation, "check", return_value=answer) as check:
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(phase_reservation.main(args), 0)
+            self.assertEqual(output.getvalue(),
+                             "phase reservation: the reservation is not mapped to a session: r1\n")
+
+            self.assertTrue(phase_reservation.record_active(sibling.directory, held))
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(phase_reservation.main(args), 0)
+            self.assertEqual(output.getvalue(),
+                             "phase reservation: a sibling phase's reservation holds every changed path; "
+                             + "still awaiting first touch\n")
+        self.assertEqual(check.call_args_list, [mock.call(self.first, [changed], "director.phase-1")] * 2)
+        self.assertEqual(phase_reservation.read_state(phase.directory)["kind"],
+                         phase_reservation.AWAITING_FIRST_TOUCH)
+
     def test_record_active_holds_the_phase_lock_during_the_check_and_write(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
         _ = phase_reservation.enroll(directory, "1", "board_ready")

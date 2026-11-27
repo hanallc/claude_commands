@@ -771,6 +771,8 @@ def _execute_herdr(args: Arguments, run: Path, phase: str, role: staff.WorkerRol
     _ = worker_env.pop(worker_panes.CLAIMED_WORKING_DIR_ENV, None)
     if claimed_cwd is not None:
         worker_env[worker_panes.CLAIMED_WORKING_DIR_ENV] = str(claimed_cwd)
+        if director_session := env.get("CLAUDE_CODE_SESSION_ID"):
+            _ = worker_env.setdefault(phase_reservation.SESSION_ENVIRONMENT, director_session)
     if enrolled:
         _ = worker_env.pop(progress_history.ASSIGN_STATUS_FILE_ENV, None)
         actions = replace(actions, status_file=str(status))
