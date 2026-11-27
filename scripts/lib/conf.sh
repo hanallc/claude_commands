@@ -79,7 +79,7 @@ conf_value() {
             [[ "$choices" == *,* ]] || break
             choices="${choices#*,}"
         done
-    elif [[ "$limit" == '# range:'* ]]; then
+    elif [[ "$limit" == '# range:'* || "$limit" == '# agent:'* ]]; then
         valid=0
     elif [[ "$limit" == '# whole:'* ]]; then
         line="${limit#\# whole:}"; line="${line//[[:space:]]/}"

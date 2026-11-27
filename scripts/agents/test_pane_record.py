@@ -20,7 +20,7 @@ from unittest import mock
 
 
 from scripts.agents import pane_record
-from scripts.lib.models_registry import LaunchSettings
+from scripts.lib.models_registry import LaunchModelConfiguration, LaunchSettings
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
@@ -31,6 +31,8 @@ from scripts.message import sessions
 from scripts.message import sessions as runtime_sessions
 from scripts.agents.test_pane_record_recovery import FakeClient
 from scripts.whoami import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
+
+NO_WINDOWS = LaunchModelConfiguration(Path("models.conf"), "", ())
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks/session-start-pane-record.py"
 BASH = shutil.which("bash") or "/bin/sh"
@@ -180,7 +182,8 @@ class PaneRecordTests(unittest.TestCase):
         for configured in (False, True):
             with self.subTest(configured=configured):
                 arguments = (pane_record.configured_resume_arguments(entry, "plugin-session", "current-name",
-                    LaunchSettings("claude", "current-model", "max", "")) if configured else pane_record.resume_arguments(entry))
+                    LaunchSettings("claude", "current-model", "max", ""), configuration=NO_WINDOWS)
+                    if configured else pane_record.resume_arguments(entry))
                 parsed = pane_record.parse_claude_arguments(["claude", *arguments])
                 self.assertEqual(parsed.plugin_directories, tuple(directories))
                 self.assertFalse(parsed.has_prompt)
@@ -226,7 +229,7 @@ class PaneRecordTests(unittest.TestCase):
                     _ = entry.pop("codex_policy", None)
                 if configured:
                     arguments = pane_record.configured_resume_arguments(entry, "current-thread", "current-name",
-                        LaunchSettings("codex", "current-model", "high", "priority"))
+                        LaunchSettings("codex", "current-model", "high", "priority"), configuration=NO_WINDOWS)
                     expected = ["resume", "current-thread", "--model", "current-model", "-c", 'model_reasoning_effort="high"',
                                 "-c", 'service_tier="priority"']
                     if recorded:

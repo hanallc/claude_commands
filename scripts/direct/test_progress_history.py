@@ -351,12 +351,12 @@ from unittest.mock import patch
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct import progress_history
 from scripts.direct import pass_record as pass_recorder
-from scripts.lib import user_zone
+from scripts.lib import conf
 
 root, working = map(Path, sys.argv[1:])
 caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
           pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
-          user_zone.CONF, {sig: signal.getsignal(sig) for sig in
+          conf.path('user_zone'), {sig: signal.getsignal(sig) for sig in
                           (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
 plan = working / 'cold-plan.md'
 plan.write_text('## Delegation Context\n\n- **Project:** Cold recorder\n')
@@ -395,12 +395,11 @@ for number in (1, 2):
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
                 pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
-                user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
+                conf.path('user_zone'), {sig: signal.getsignal(sig) for sig in caller[-1]})
     assert restored == caller, (restored, caller)
 print('two homes isolated; recorder lock retained; caller restored')
 '''
-        environment = {**os.environ, "HOME": str(caller),
-                       "USER_ZONE_CONF": str(caller / "zone.conf")}
+        environment = {**os.environ, "HOME": str(caller), "CONF_DIR": str(caller / "config")}
         result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, str(self.root), str(self.working_dir)],
                                 env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

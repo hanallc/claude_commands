@@ -17,7 +17,7 @@ import os
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from scripts.herdr import herdr, pane_launch
@@ -31,6 +31,7 @@ from scripts.production.showrunners import registered_showrunners, require_compl
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
 from scripts.production import staff  # noqa: E402
+from scripts.lib import models_registry
 from scripts.lib import names as display_names  # noqa: E402
 
 USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
@@ -178,11 +179,26 @@ def _launch(verb: str, arguments: list[str]) -> int:
         herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
         if candidate not in taken)
     if verb == "resume":
-        claude_arguments.extend(["--resume", options.session_id])
-    claude_arguments.extend(["-n", name])
-    launched = herdr.launch_agent(shared, name, name, str(folder), pane_environment,
-        kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000,
-        unset_environment=frozenset(unset_variables))
+        prepared = herdr.prepare_session_environment(options.session_id, str(folder), pane_environment,
+                                                     frozenset(unset_variables))
+        if isinstance(prepared, herdr.nix_env.Refused):
+            raise herdr_types.HerdrFailure(prepared.reason)
+        values = pane_launch.parse_claude_flags(claude_arguments).values
+        member = record.by_member_reference(options.session_id) if "--autocompact" not in values else None
+        if member is not None or values.keys() & pane_launch.MODEL_FLAGS:
+            configuration = models_registry.optional_launch_snapshot(prepared.env)
+            prepared = replace(prepared, model_configuration=configuration)
+            if member is not None and member.kind != "session":
+                claude_arguments.extend(models_registry.compact_window_arguments(
+                    member.kind, session_id=options.session_id, configuration=configuration))
+        claude_arguments.extend(["--resume", options.session_id, "-n", name])
+        launched = herdr.launch_prepared_agent(shared, herdr.NewTab(name, name), prepared,
+            kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000)
+    else:
+        claude_arguments.extend(["-n", name])
+        launched = herdr.launch_agent(shared, name, name, str(folder), pane_environment,
+            kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000,
+            unset_environment=frozenset(unset_variables))
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr_types.HerdrFailure(launched.reason)
     pane, outcome = launched.pane, launched.outcome

@@ -24,6 +24,7 @@ from scripts.disks import disks_page
 from scripts.production import staff
 from scripts.lib import file_lock, session_folder, test_hang_guard
 from scripts.lib.process_group import run_process_group
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links import page_frame, test_page_frame
 
 GIB = 1 << 30
@@ -63,8 +64,8 @@ class DisksPageTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
-        _ = (configuration / "statusline.conf").write_text(
+        _ = write_config_fixture(configuration / "disks.conf", "cache_seconds=600\n")
+        _ = write_config_fixture(configuration / "statusline.conf",
             "role.unit-director=#ffaf02\nrole.showrunner=#a379fd\nrole.producer=#90fe42\nrole.worker=#ff9898\n")
         staff_file = configuration / "staff.json"
         _ = staff_file.write_text('{"schema": 1, "rows": []}')
@@ -73,7 +74,9 @@ class DisksPageTests(unittest.TestCase):
         # Staff reads the machine list.
         _ = shutil.copy(Path(__file__).parents[2] / "config" / "machines.conf", configuration)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(configuration), "STAFF_FILE": str(staff_file), session_folder.ROOT_ENV: str(session_root)})))
+            "CONF_DIR": str(configuration), "STAFF_FILE": str(staff_file), session_folder.ROOT_ENV: str(session_root),
+            "USER_ZONE": "America/New_York",
+        })))
 
     def test_session_names_use_owner_roles_and_held_folder_names_stay_plain(self) -> None:
         members = staff.StaffSnapshot((

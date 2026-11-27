@@ -172,6 +172,7 @@ class KillActionTests(unittest.TestCase):
 
     def install_outside_stop_graces(self) -> None:
         _ = write_config_fixture(self.root / "shutdown.conf", "stop_grace_seconds=1\nkill_grace_seconds=1")
+        _ = write_config_fixture(self.root / "user_zone.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root)})))
 
     def outside_stop_fixture(self) -> Path:

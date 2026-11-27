@@ -18,7 +18,7 @@ This document describes the implementation and its constraints.
 | `scripts/accounts/role_map.py` | The shared role map, its transport, cache, locks, and change history. |
 | `scripts/accounts/next_moves.py` | Ordered moves, holds, positional edits, and validation. |
 | `scripts/accounts/refusal_watch.py` | Refusal detection, login renewal, queued moves, and automatic group moves. |
-| `scripts/accounts/login_sittings.py` | Weekly and safety reminders from stored Claude login end dates. |
+| `scripts/accounts/login_sittings.py` | Scheduled and safety reminders from stored Claude login end dates. |
 | `scripts/accounts/refusals.py` | Provider refusals and the freshness of usage readings. |
 | `scripts/accounts/moves.py` | Move outcomes, waits, assignment routing, and replay evidence. |
 | `scripts/accounts/unit_watchdog.py` | Recovery from pane launch records and fresh session liveness. |
@@ -74,9 +74,9 @@ A measurement at or below the limit clears the crossing and permits a new notice
 
 Natedev sends the Claude low quota and expiry pushes.
 The quota check uses saved weekly readings from `~/.local/state/agent-notes/readings.jsonl`.
-It divides the remaining percentage by the weighted use rate from `run_out.py`.
-It adds that duration to the time of the reading.
-The newest reading must be within the rate code's maximum gap.
+It divides the remaining percentage by the hourly usage rate from `run_out.py`.
+It adds that duration to the current time.
+The newest saved reading must be at most 15 minutes old.
 An in-use Claude account qualifies only if the forecast falls before its weekly reset and within the configured lead time.
 The lead time check uses a strict limit.
 Both pushes use the same scheduled move coverage rule.
@@ -107,9 +107,14 @@ It reads local dates through `accounts.read_status(source=StoredUsageOnly())`.
 It uses the same numbered Claude rows and `login_ends_at` values that stored status exports.
 Removed accounts cannot retain a date through an old usage-store directory link.
 This shared status path inspects account readiness but does not refresh usage.
-The peer command is `accounts.py status --stored --json` through `ssh -o BatchMode=yes` and `remote.other_machine()`.
-An attempt time limits peer reads, including failed reads.
-The last successful peer read time and dates remain available after a failed attempt.
+The timer runs `login_sittings exchange` through `ssh -o BatchMode=yes` and `remote.other_machine()`.
+One call sends the current reminder state and returns the peer's stored login dates.
+The peer writes and flushes the date record before it tries to save the copy.
+It writes `copy_status` on a separate last line.
+The timer saves a complete date record even if the copy status misses the deadline.
+It logs one line when the copy status indicates a problem.
+An attempt time limits peer calls, including failed calls.
+The last successful peer read time and dates remain available after a failed date read.
 
 `config/accounts.conf` supplies all reminder settings:
 
@@ -117,35 +122,59 @@ The last successful peer read time and dates remain available after a failed att
 | --- | --- | --- |
 | `login_sitting_machine` | `natedev` | The machine that sends reminders. |
 | `login_sitting_first` | `2026-11-17T10:00:00-05:00` | The first sitting. |
-| `login_sitting_interval_days` | `7` | The interval between sittings. |
-| `login_sitting_window_days` | `10` | The selection window after a sitting. |
+| `login_sitting_interval_days` | `5` | The interval between sittings. |
 | `login_safety_margin_days` | `3` | The immediate reminder margin. |
-| `login_peer_read_minutes` | `60` | The minimum interval between peer attempts. |
+| `login_peer_read_minutes` | `60` | The minimum interval between peer calls. |
 | `login_peer_read_timeout_seconds` | `30` | The peer command limit. |
 
 Each pass reads these settings through `conf.read`.
-The earliest end on either machine selects the account for a sitting.
-The sitting push includes both known machine dates for that account.
-When no account is within the window, the push selects the account with the earliest end.
-No known dates means no sitting push.
+The earliest unreported end on either machine selects one account for a sitting.
+The sitting push includes only unreported machine dates for that account.
+An accepted push marks its dates as reported.
+When a login renews, the old end leaves the list and the new end takes its place in date order.
+When all current dates are reported, the sitting sends no push.
 The latest sitting replaces any missed sittings.
+`next_login_request` selects the next batch and its due time for the timer and the Logins card.
+The safety margin can make a batch due before the next sitting.
+A due sitting takes precedence over a safety batch on the same pass.
 Safety pushes include only machine, account, and end-date combinations that no accepted push has named.
+Only a safety push can name more than one account.
 An unknown date never enters either list.
 
 The atomic state file is `accounts_home()/.local/state/accounts/login_sittings.json`.
-It holds the latest completed sitting, named login dates, peer dates, and peer read and attempt times.
-Each save removes a named record only when the same machine and account have a different known end date.
+It holds the latest completed sitting, named login dates, local and peer dates, peer read times, and peer attempt times.
+It also holds the last observed end for each machine and account, plus the key and dates of each accepted batch.
+When an end moves later, it saves the observation time and the new end.
+The difference gives the login lifetime from the observation time.
+The probe attempt file `login_renewals.json` tracks attempts to recover expired or missing logins.
+An observation removes a named record only when the same machine and account have a different known end date.
 A missing date keeps the named record.
 Cached peer dates remain current evidence until the next successful peer read replaces them.
+The peer command validates all timestamps before it saves `login_sittings_copy.json`.
+A rejected copy or failed file replacement leaves the last good copy in place.
+If the directory sync fails after replacement, the reply marks the new copy's durability as unconfirmed.
+The copy reflects the sending machine's state at the start of the call.
+The next call sends reminders that the timer records after the previous call starts.
+The Accounts page uses the timer's next request selector and reads only local data for the Logins card.
+The other machine uses the copied dates for the next request.
+The timer and card match login dates by SSH alias.
+A changed local date can clear its own reported row before the next copy.
+The copy expires after two peer intervals plus the peer timeout.
 The module saves each peer attempt and its result before it reads local dates.
 It contains no credential or login identity.
 `locked_history` holds the lock in `login_sittings/` beside the state file throughout each pass.
-The lock covers state reads, local and peer reads, sends, and saves.
-A busy pass performs no account reads or sends.
+The lock covers state reads, local and peer reads, sends, retirements, and saves.
+A busy pass performs no account reads, sends, or retirements.
 The module records a sitting after an accepted push or an empty selection.
 A failed push leaves its sitting and named dates unrecorded for another attempt.
 The `accounts.login_sitting` catalog entry supplies both push kinds as normal notes.
-The `login-sitting` and `login-safety` keys replace older retained pushes of the same kind.
+The key uses the push kind and the machine, account, and end date for each entry in the batch.
+A retry of the same batch uses the same key. Silence retains different batches under different keys.
+The timer checks saved observations after the read attempts, even if a read fails.
+It retires a batch when the saved end differs for every date in it.
+It uses `send.py retire` with the batch key and the same sender as the push.
+It removes the batch from state after successful retirement. A failed retirement keeps the batch for the next pass.
+It keeps a batch with a current or unknown date.
 Delivery uses `push_texts.user_send_argv` and checks `send_result.send_outcome`.
 It never sets `--through-silence`.
 The push formats dates in the user's zone.
@@ -198,6 +227,8 @@ Codex producers use the workers account.
 Claude producers use the producers account when it has a selection.
 They use the showrunners account until the first producers selection.
 `[producers]` in `config/models.conf` selects each producer's family, model, and effort.
+`[compact_windows]` sets the Claude auto-compact window by role when an account move starts a session.
+The unit session's recorded window takes precedence over its role setting.
 An explicit move saves a group selection.
 Status, launch, and preview reads never create a selection.
 
@@ -235,6 +266,20 @@ Units prefer the earliest weekly reset, then the most weekly allowance left.
 Showrunners prefer the most weekly allowance left.
 Labels provide a stable final ordering.
 Recorded provider refusals block a destination until the refusal resolves.
+`pick` and `placement` take the model family of the work to place.
+A refusal for one model family blocks only work of that family.
+When the family is not known, any unresolved family refusal blocks the destination.
+`group_family()` reads a group's family from the staff model setting in `config/models.conf`.
+The producers use their `[producers]` rows.
+Unit directors and showrunners use `director` and `showrunner` in `[production.claude]`.
+Producers on two families, or an unreadable setting, give an unknown family.
+Fable work needs room in the all-model weekly window and the Fable weekly window.
+This rule also applies to a group that launches Fable and other models.
+The existing Claude usage reader saves `limits.weekly_scoped` as `weekly_fable`.
+The picker checks the saved Fable window for the signed-in account.
+The reading must meet the usage age limit.
+An expired or unreadable Fable window blocks the candidate.
+Automatic group moves, their next-move target checks and group completion use the group's family.
 Codex selection also checks allowance and whether `codex_credit_accounts` lets the account spend credits.
 
 `_exec_codex_account()` serves both `codex` and numbered Codex aliases.
@@ -253,7 +298,24 @@ Account moves use the shared stop and resume API.
 Each recorded session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
 If the request append fails, the batch reports the error and refuses that member before any stop.
 Each attempt has its own move ID and cause.
-A session proved live on the target writes nothing.
+A session proved live on the target writes no request or outcome to the journal.
+The batch progress record in `~/.local/state/accounts/move-progress/` starts with the selected members in queue order.
+It records the initiator and a safe display reason once.
+The CLI records target and live process refusals through the batch recorder.
+Each result keeps the requested account before the row and process checks.
+A failure keeps its diagnostic and a kind for an active move, a missing saved session, or another failure.
+For older records, the reader recognizes the two saved diagnostics for an active move and a missing saved session.
+The console uses the kind to display a message.
+A member without a saved name appears as "unnamed session".
+The timer records its rule's account and threshold apart from its initiator.
+Each batch file has one writer. The parent can record a launch failure only after a confirmed refusal.
+The child adopts the same file and keeps the roster and earlier results.
+Each write replaces the file atomically. A failed write logs one line and the move continues.
+The writer prunes after it saves the end mark. It keeps unended batches and the three newest end marks.
+If an unended batch loses its writer, unfinished members show as interrupted.
+The Accounts page starts a standard hand move of one failed member to its recorded destination.
+The retry uses the same queue and wait limit as a hand move from a terminal.
+A hand move on the target returns "already on" without stopping the member.
 A failed live source read stops the move before it records a source or sends a signal.
 The stop checks that the live source PID and process start time still match.
 A Claude target needs a real account directory and a matching local sign-in.
@@ -330,6 +392,9 @@ A user command waits for the row, and at its limit it prints a fresh `batch --ta
 For a group request, it prints `batch --group` so the batch reads the current group target under the session lock.
 `retry` can run only a saved request.
 The detached child checks its request ID before it reports a member outcome.
+If the launcher fails before startup, the parent records the failure for each unfinished member and ends the batch.
+This includes a refusal from `systemd-run`.
+If the launcher cannot confirm whether the child started, the parent leaves the record for the child.
 The mover checks the request ID under the locks before stopping the member.
 It removes its file after success and leaves it after failure.
 A failed journal append restores the prior journal contents under the journal lock.
@@ -377,7 +442,8 @@ Its schedule history is `~/.local/state/agent-notes/group-completion/completed.j
 Natedev is the only authority on which groups a machine may complete.
 Each natedev refusal pass that is not a dry run or a proof writes `~/.local/state/accounts/completion_plan.json`.
 The plan holds the pass time `at` and, for each permitted group, `target`, `cause`, `why` and `selected_at`.
-The plan leaves out a skipped group, a legacy selection and a target with an unresolved refusal.
+The plan leaves out a skipped group, a legacy selection and a target with an unresolved refusal for the group's model family.
+The plan also leaves out a group whose selection changed or whose claim is busy.
 Legacy selections stay natedev's job, because natedev upgrades them in the role map.
 `accounts completion-plan-read` prints the plan on natedev, and the Mac reads it through the role map ssh transport.
 The Mac pass first reads its local group members and stops before ssh when no member is live.
@@ -404,13 +470,49 @@ The default wait boundary is strictly less than 20 minutes.
 An unknown reset or the exact boundary does not qualify for that wait.
 Failed continuation delivery retains the retry state.
 
+A Claude refusal entry gives its limit type and reset in `apiErrorParams.rate_limit_info` or in `quotaLimits`.
+`refusal_watch.claude_entry_refusal(entry, session_family, families)` reads one entry.
+The caller supplies the family of the session's prior model and `families`, the key set of `[claude.families]`.
+The prior model is the newest real assistant entry, even when its model is not a known family.
+`five_hour` gives an all-model five-hour refusal.
+A family name is a key of `[claude.families]` in `config/models.conf`; any other name is not a family.
+`weekly_scoped`, `seven_day_fable`, or the text “Fable limit” gives a `weekly_fable` refusal for Fable.
+“Fable limit” takes precedence over the generic `seven_day` and `weekly` types.
+Those generic types otherwise give an all-model weekly refusal.
+Other `seven_day_<family>` types give a weekly refusal for that model family.
+Another `seven_day_` type gives an all-model weekly refusal.
+`seven_day_overage_included` gives a weekly refusal for the family of the refused work.
+The text "reached your <Name> limit" names that family.
+Without a family in the text, the newest real assistant entry before the refusal names it: `message.model`, then `requestedModel`.
+Without either, the refusal applies to all models.
+The refused session's own family is used when the watcher places that session without a group.
+When a refused group member's own family differs from the group's family, the watcher places the group with an unknown family.
+
+`refusals.json` keeps one all-model record and one record for each model family for each account.
+A family record has the key `tool:login:family` and a `family` field.
+A newer refusal replaces only the record with the same key.
+A family refusal resolves at its reset.
+Without a known reset, it resolves 7 days after the refusal.
+
 Queued moves use group-local positions and stable internal identities.
 Only the head of each group can run.
 An unavailable target remains queued and blocks later entries.
+An automatic target for a group that launches Fable also needs room in the saved Fable window.
+If a required weekly reset has passed, the watcher claims a usage read for the checked target account.
+Fable groups check both the all-model weekly reset and the Fable weekly reset.
+The reader checks the sign-in before it claims usage.
+It ignores optional fields that do not describe usage windows.
+Each non-null reset in a usage window must parse as a timestamp with an offset.
+A failed read keeps the last valid usage and resets.
+Later groups can use the same claimed reading while it is valid at their decision time.
+If that reading becomes stale or its required reset passes, the target waits for the next pass.
+A held or failed read makes that target unavailable.
+A dry run treats the expired reading as unavailable and makes no live read.
 A changed head loses its old hold and notice state.
 `FixedHold` carries a duration; `HalfPointHold` requests a pace-based duration.
 `ResolvedHold` keeps the duration and its source.
-The half-point estimate uses the selected account's history, including other groups that share it.
+The half-point estimate uses the selected account's hourly usage rate.
+That rate includes usage by all groups that share the account.
 The default estimate is 40 minutes when no usable pace exists.
 The duration stays with the started hold rather than changing on each pass.
 
@@ -595,13 +697,11 @@ For a compressed file, the reader streams the records and caches the result in t
 The compressed cache evicts the least recently used result at `session_model_cache_entries`.
 A missing Claude transcript gives `unknown`.
 Live process options apply when the reader can establish that no turn was recorded.
-The peer count document carries model counts and session names by account and role.
+The Models table uses local role counts, model counts, and session names.
 The Models table puts the remainder of each role count in the `unknown` row.
 Hover over a positive count or focus it to see the session names in order.
 The tooltip uses the staff name or the Claude registry name.
 If neither name is available, the tooltip uses the first eight characters of the session ID.
-The tooltip includes the machine for each peer session.
-An older peer count adds a line such as `2 more on mac` for sessions without names.
 `config/statusline.conf` holds each account color under `account.<label>`.
 `ROLE_COLOR_KEYS` maps each role group to its color key:
 
@@ -640,9 +740,17 @@ When rows for one account are next to each other, the first row shows the accoun
 When sorting separates those rows, the account details appear at the start of each group.
 An account without a role has an empty role cell.
 The page and the Claude expiry push use `quota_alert.weekly_forecast` with the same usage history.
-The page starts its forecast from the displayed weekly reading.
-It excludes history before the current weekly window or the last refill.
-It shows the hourly rate for Claude and Codex when recent history gives a rate.
+The page uses the remaining quota from the displayed weekly reading.
+The forecast excludes history before the current weekly window.
+The page, expiry push, and half-point hold use the same hourly rate function.
+The key `rate.lookback_minutes` in `config/accounts.conf` sets the lookback to 60 minutes by default.
+The window ends at the current time.
+The rate needs a reading at or before the window start and a newest reading at most 15 minutes old.
+The reading at or before the window start can be any age.
+The rate divides the total usage rise by the observed hours in the window.
+It skips refills and gaps over 15 minutes, including gaps that cross the window start.
+It also skips spans that start at 100% used or have two readings at 0% used.
+The page shows the rate for Claude and Codex when the counted spans show a rise and the weekly reading is recent.
 If the rate is missing, both forecast cells show a dash with an explanation.
 If the quota lasts until the reset, the run-out cell shows a dash with that explanation.
 The page shows forecast times in the user's time zone.
@@ -657,7 +765,6 @@ The count columns are busy, idle and total. Each shows the total for the role ac
 A warning icon after the total names the paused and exited sessions of the role.
 `StatusRow.named_sessions_by_role` gives the staff name and state of each local session of a role.
 It is filled only for local sessions, and only when the read uses `include_models=True`.
-A peer count has no names, so the icon gives the count and `names unknown` for those sessions.
 The count tooltip lists counts by account when any observed sessions run outside the selected account.
 The tooltip also lists accounts outside the selected account when their counts are unknown.
 If the role has no selected account, the tooltip lists the count for each observed account.
@@ -713,15 +820,45 @@ The page pauses refresh while the chooser is open.
 A board line of a selected Claude group carries its account and group.
 The Accounts table shows each next move beside its role.
 Sorting keeps each next move with its role.
-A selected Claude group shows its first target, or `none`, and an arrow button opens its move menu.
+A selected Claude group shows its first target, or `none`, and an arrow button opens its move dialog.
 A selected Codex workers line shows its first target, or `auto`, without a button.
 While it shows `auto`, each spare Codex line also shows `auto`; together these lines are the codex pair.
 `background.codex-pair` in `config/statusline.conf` tints the pair rows on the Accounts page.
 Other assignments show a minus icon.
-`StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
-One queue read supplies the first targets for the Accounts page and the upcoming list for the text and JSON status output.
-Off the role-map host, first targets are unavailable.
-The menu marks the current target and can remove the group's first entry.
+`StatusReading.first_next_moves` contains each group's first entry or the reason the read failed.
+One queue read supplies those entries and the upcoming list for the text and JSON status output.
+The first entries are unavailable off the role-map host.
+The dialog reads the target, threshold, and quota measure from the group's first queued entry.
+Save keeps the hold mode, fallback accounts, and queue position.
+A change to the target, percent, or measure gives the rule a new ID.
+A change to the group, target, percent, or measure makes an old timer ineligible.
+The timer records these settings, the source account, and the selection ID.
+If a save stops after writing the queue, the watcher starts a new timer for the new rule.
+The watcher and list keep a matching hold's start and duration.
+The entry ID, hold mode, source account, selection ID, and percent must match.
+A hold without a saved target or measure matches only an all-models entry.
+The `measure` field in each Claude entry is `all-models` or `fable`.
+An older entry with no measure uses `all-models`.
+Use `accounts.py next add <group> <percent> <account> --measure fable` for a Fable threshold.
+The text list shows the measure only for a Fable entry.
+For a Fable threshold, the watcher checks the Fable weekly percent left on both accounts.
+If the source reading is unavailable, it reports `cannot read the Fable weekly window` and leaves the entry queued.
+**Move now** starts the hand group move. The click leaves the next-move log unchanged.
+The page checks active moves before launch.
+The role-map authority takes the same group claim for console, terminal, and watcher selections.
+A move on the authority keeps the claim while it requests its members.
+The authority also takes the claim when it receives a selection from the Mac.
+The claim covers the selection change on natedev. The Mac member requests run after the claim ends.
+A busy claim refuses a hand move with **Another move is in progress. Try again when it ends.**
+The Moves card shows this message for a refused console request.
+A watcher keeps its pending rule or refusal and tries again on its next pass.
+The watcher compares the account and transition under the claim before it writes a group decision.
+The claim does not yet cover inherited selections, member request admission, or the reset refresh.
+If either changed during the check, the watcher skips the decision and keeps the rule queued.
+Local completion checks the selection under the claim before it requests member moves.
+The member requests use the current account under the session row lock.
+An admitted hand move moves the group at once and restarts the last work.
+A later watcher pass can remove the first entry if its target is now the current account.
 Its `stale_at` is the next local midnight, when its reset text changes.
 The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
 Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.
@@ -735,7 +872,7 @@ JSON `problems` matches the text board's problem lines, with only the `* ` footn
 Each account row exports `sessions` beside `role_counts`.
 Each entry has a native `session` ID and a classified `state`: `busy`, `idle`, `paused`, or `exited`.
 The list reuses local count observations and reads no pane again.
-Peer caches provide aggregate counts only; the session list contains local members.
+The session list and assigned role counts contain local members only.
 Named problem causes and repair steps preserve the subject, fault, evidence, and action.
 Status attributes a session to its account independently of the current role selection.
 This preserves visible off-target members during a move.
@@ -766,7 +903,11 @@ One claim prevents concurrent fetches.
 The normal status path never waits for that fetch.
 The cache keeps each machine's counts separate and uses the `usage_stale_minutes` age limit from `config/accounts.conf`.
 Canonical `mac` and `natedev` names identify observations independently of a desktop hostname.
-The board sums available machine counts.
+The board uses local counts for each assigned role and for the total.
+Only an unreadable local Claude registry makes the Claude roles and the total unknown.
+An unreadable Claude registry in a fresh peer copy adds one Problems line.
+The JSON field `role_counts_by_machine` uses the local key for each assigned role.
+A peer key can supply a `spare` count for an existing spare row. The spare count cells stay blank.
 It shows the time and age of usable Mac counts after a failed fetch or once the copy is one minute old.
 It reports the peer as unavailable when no usable copy exists.
 

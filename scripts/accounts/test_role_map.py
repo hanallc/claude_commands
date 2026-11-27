@@ -19,10 +19,13 @@ from unittest.mock import Mock, patch
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts.move_test_support import write_claude_move_credentials
-from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
+from scripts.accounts import accounts, next_moves, refusal_watch, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.agents.test_support import write_machine_config
-from scripts.whoami import agent_accounts
+from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.whoami import agent_accounts, usage_store
+from scripts.whoami.account_test_support import store_usage
 
 send_role_map_command = role_map.ssh_role_map
 
@@ -289,6 +292,9 @@ class RoleMapTests(unittest.TestCase):
             pass
 
         self.seed(self.home, groups={"units": "claude1"})
+        config = conf.path("accounts")
+        _ = write_config_fixture(config, "rate.lookback_minutes=45\n")
+        account_config = conf.read(config)
         repair_at = RoleMapReadTime.now(timezone.utc)
         original_at = repair_at - timedelta(minutes=3)
         reset = (repair_at + timedelta(days=1)).isoformat()
@@ -317,13 +323,15 @@ class RoleMapTests(unittest.TestCase):
             label = accounts.claude_config_label(path)
             return agent_accounts.NumberedAccount(label, path, label + "@example.invalid")
 
-        reading = refusals.FreshReading(refusals.ReadingWindow(0,
-            refusals.KnownReset(repair_at + timedelta(days=1)), repair_at), refusals.NoWindow(), "")
+        weekly = usage_store.StoredWindow(left=0, at=repair_at.isoformat(), resets=reset)
+        for label in (first.to, second.to):
+            store_usage("Claude", f"{label}@example.invalid", usage_store.StoredUsage(weekly=weekly))
         with (patch.object(role_map, "is_role_map_host", return_value=True),
               patch.object(socket, "gethostname", return_value="natedev"),
               patch.object(role_map, "datetime", RoleMapReadTime),
+              patch.object(refusal_watch, "datetime", RoleMapReadTime),
               patch.object(accounts, "account_identity", side_effect=identity),
-              patch.object(refusals, "stored_reading_with_age", return_value=reading),
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("unexpected live usage read")),
               patch.object(refusal_watch, "_notify_blocked_head", return_value=False),
               patch.object(accounts, "prepared_account", side_effect=AssertionError("blocked target was prepared"))):
             with patch.object(Path, "mkdir", new=stop_after_selection):
@@ -334,10 +342,10 @@ class RoleMapTests(unittest.TestCase):
                 "window": "weekly", "why": "auto: " + first.id, "reset": reset, "at": change.at,
             })
 
-            _ = refusal_watch.run_auto_moves(repair_at)
+            _ = refusal_watch.run_auto_moves(repair_at, account_config=account_config)
 
             self.assertEqual(next_moves.read_next_moves(), (second,))
-            lines = refusal_watch.run_auto_moves(repair_at + timedelta(seconds=1))
+            lines = refusal_watch.run_auto_moves(repair_at + timedelta(seconds=1), account_config=account_config)
             self.assertTrue(any("claude2" in line and "at or below" in line for line in lines), lines)
             self.assertEqual(next_moves.read_next_moves(), (second,))
         rows = [json.loads(line) for line in history.read_text().splitlines()]

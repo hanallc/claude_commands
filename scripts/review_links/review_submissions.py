@@ -1,6 +1,7 @@
 """Store items sent from the New item dialog and their replies."""
 from __future__ import annotations
 
+import argparse
 import base64
 import binascii
 import hashlib
@@ -19,22 +20,23 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
+from functools import cache
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 
 from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
 from scripts.lib.file_lock import LockResult, exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import investigation, producer_map, proposal_issue, record_store, staff, unrouted_alert, update_registration
+from scripts.production import investigation, issues, producer_map, proposal_issue, record_store, staff, unrouted_alert, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
-from scripts.review_links import image_store, list_draft, new_item_dialog, page_frame, reply_tokens, review_events, review_link
+from scripts.review_links import image_store, list_draft, new_item_dialog, page_frame, reply_proofs, reply_tokens, review_events, review_later, review_link
 from scripts.review_links.new_item_dialog import (
     KEY_PREFIX as KEY_PREFIX, NATIVE_ID_PREFIX, check_recipient_id,
     ScopedSubmissionKey, read_submission_key, require_request_binding, submission_key as submission_key,
-    IMAGE_FORMATS, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES, ImageReference, max_base64_size,
-    read_kind, read_request_id, read_words, read_submission,
+    IMAGE_FORMATS, ImageReference, NewItemLimits, NoBugPageState,
+    read_kind, read_request_id, read_words,
     ByRequestId, BuildCell as BuildCell, BuildStepEvidence as BuildStepEvidence, Evidence as Evidence,
     MemoryReading as MemoryReading,
     MemorySegment as MemorySegment, MemoryTone as MemoryTone, NewItemRequest as NewItemRequest,
@@ -178,8 +180,8 @@ type NativeSubmittedRecord = update_registration.QuestionRecord | Issue | invest
 def native_origin(record: NativeSubmittedRecord) -> new_item_dialog.SubmissionOrigin:
     """Read the typed origin from a native record."""
     if isinstance(record, update_registration.QuestionRecord):
-        details = record.item.get("review_submission")
-        return read_submission(details) if details is not None else new_item_dialog.NoReviewSubmission()
+        return (update_registration.review_submission(record) if "review_submission" in record.item
+                else new_item_dialog.NoReviewSubmission())
     if isinstance(record, Issue):
         return proposal_issue.review_submission(record)
     return record.submission
@@ -233,6 +235,7 @@ class SavedSubmission(NativeSubmissionDestination):
     record: NativeSubmittedRecord = field(compare=False)
     reused: bool = field(default=False, compare=False)
     attachments: SavedAttachments = field(kw_only=True, compare=False)
+    details: ReviewSubmission = field(kw_only=True, compare=False, repr=False)
 
     @property
     def words(self) -> str:
@@ -248,13 +251,6 @@ class SavedSubmission(NativeSubmissionDestination):
     @property
     def key(self) -> str:
         return submission_key(self.kind, self.recipient_id, self.id, self.request_id)
-
-    @property
-    def details(self) -> ReviewSubmission:
-        details = native_origin(self.record)
-        if not isinstance(details, ReviewSubmission):
-            raise OSError(f"Cannot read the native Review origin for {self.id}.")
-        return details
 
     @property
     def awaiting_reply(self) -> bool:
@@ -306,10 +302,11 @@ type ListPreviewRequest = RequestedListPreview | NoRequestedListPreview
 
 @dataclass(frozen=True)
 class ListDraftSend:
-    """A List draft with fields to read for filing or retry comparison."""
+    """Read a List draft for filing or verify a retry against the saved item."""
 
     request_id: str
-    prepare: Callable[[], ListDraftFiling]
+    prepare: Callable[[NewItemLimits], ListDraftFiling]
+    check_first_send: Callable[[], None] = lambda: None
     preview: ListPreviewRequest = NoRequestedListPreview.ABSENT
 
 
@@ -324,26 +321,26 @@ class _ImageUpload:
         return hashlib.sha256(self.data).hexdigest()
 
 
-def _decode_images(images: tuple[PastedImage, ...]) -> tuple[_ImageUpload, ...]:
-    if len(images) > MAX_IMAGES:
-        raise SubmissionError(f"Paste up to {MAX_IMAGES} images.")
+def _decode_images(images: tuple[PastedImage, ...], limits: NewItemLimits) -> tuple[_ImageUpload, ...]:
+    if len(images) > limits.images:
+        raise SubmissionError(f"Paste up to {limits.images} images.")
     uploads: list[_ImageUpload] = []
     total = 0
     for image in images:
         extension = IMAGE_FORMATS.get(image.media_type)
         if extension is None:
             raise SubmissionError("Paste PNG, JPEG, GIF or WebP images.")
-        if len(image.base64_data) > max_base64_size():
-            raise SubmissionError("Each image must be at most 5 MiB.")
+        if len(image.base64_data) > limits.base64_image_chars:
+            raise SubmissionError(f"Each image must be at most {limits.image_bytes} bytes.")
         try:
             data = base64.b64decode(image.base64_data, validate=True)
         except (binascii.Error, ValueError):
             raise SubmissionError("The pasted image data is invalid.") from None
-        if not data or len(data) > MAX_IMAGE_BYTES:
-            raise SubmissionError("Each image must contain at most 5 MiB of image data.")
+        if not data or len(data) > limits.image_bytes:
+            raise SubmissionError(f"Each image must contain at most {limits.image_bytes} bytes of image data.")
         total += len(data)
-        if total > MAX_TOTAL_IMAGE_BYTES:
-            raise SubmissionError("The pasted images must total at most 12 MiB.")
+        if total > limits.total_image_bytes:
+            raise SubmissionError(f"The pasted images must total at most {limits.total_image_bytes} bytes.")
         reference = ImageReference(f"{len(uploads) + 1:012x}", f"image.{extension}")
         uploads.append(_ImageUpload(reference, extension, data))
     return tuple(uploads)
@@ -459,6 +456,7 @@ def _verify_saved_images(saved: NativeSubmissionDestination, record: NativeSubmi
     details = native_origin(record)
     if not isinstance(details, ReviewSubmission):
         raise OSError(f"Cannot read the native Review origin for {saved.id}.")
+    total_image_bytes = new_item_dialog.read_saved_item_limits().total_image_bytes
     images = image_folder(details)
     originals = dict(details.image_digests)
     candidates = {upload.reference: upload for upload in retry_uploads}
@@ -483,10 +481,10 @@ def _verify_saved_images(saved: NativeSubmissionDestination, record: NativeSubmi
         digest = originals.get(reference.id)
         try:
             with path.open("rb") as stream:
-                data = stream.read(MAX_TOTAL_IMAGE_BYTES + 1)
+                data = stream.read(total_image_bytes + 1)
         except FileNotFoundError:
             data = b""
-        if description is not None and 0 < len(data) <= MAX_TOTAL_IMAGE_BYTES:
+        if description is not None and 0 < len(data) <= total_image_bytes:
             if digest is not None:
                 if hashlib.sha256(data).hexdigest() == digest:
                     continue
@@ -661,7 +659,7 @@ def _legacy_draft_fingerprint(request_id: str, request: NewItemRequest, words: s
 def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[_ImageUpload, ...]) -> str:
     payload: list[object] = [request.kind, words, new_item_dialog.evidence_fields(request.evidence), _image_fingerprints(uploads)]
     if request.page:
-        payload.append(request.page)
+        payload.append("list" if new_item_dialog.is_list_submission_page(request.page) else request.page)
     if request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         payload.append(request.page_recipient)
     if request.page_recipient == new_item_dialog.PageRecipient.PRODUCER:
@@ -1167,10 +1165,13 @@ def _has_receipt_for(saved: NativeSubmissionDestination) -> bool:
 
 def _saved_submission(saved: NativeSubmissionDestination, record: NativeSubmittedRecord, *,
                       attachments: SavedAttachments, edited: bool = False) -> SavedSubmission:
+    details = native_origin(record)
+    if not isinstance(details, ReviewSubmission):
+        raise OSError(f"Cannot read the native Review origin for {saved.id}.")
     result = EditedSubmission if edited else SavedSubmission
     return result(saved.id, saved.kind, saved.recipient_id, saved.request_id, saved.payload_hash,
                   saved.path, saved.original_path, saved.owner, record, browser_token_digest=saved.browser_token_digest,
-                  has_capture_intent=saved.has_capture_intent, attachments=attachments)
+                  has_capture_intent=saved.has_capture_intent, attachments=attachments, details=details)
 
 
 def _complete_receipt(folder: Path, saved: NativeSubmissionDestination, hint: RequestFile,
@@ -1213,11 +1214,52 @@ def _stage_initial_delivery(folder: Path, address: SubmissionAddress,
         atomic_file.sync_folder(folder)
 
 
-class ListFilingRoute(TypedDict):
+class ListFilingFields(TypedDict):
     keeper: staff.StaffId
     owner: staff.StaffId
     producer: staff.StaffId
-    unit: str
+    source: str
+
+
+class ListFilingWithFixedUnit(ListFilingFields):
+    unit_kind: Literal["fixed-id"]
+    unit: Literal[""]
+    unit_id: staff.StaffId
+
+
+class LegacyListUnitName(str):
+    """The nonempty unit name from a legacy List filing plan."""
+
+    def __new__(cls, name: str) -> LegacyListUnitName:
+        if not name:
+            raise ValueError("A legacy List unit name must not be empty.")
+        return super().__new__(cls, name)
+
+
+class ListFilingWithLegacyUnit(ListFilingFields):
+    unit_kind: Literal["legacy-name"]
+    unit: LegacyListUnitName
+
+
+class ListFilingWithoutUnit(ListFilingFields):
+    unit_kind: Literal["no-unit"]
+    unit: Literal[""]
+
+
+type ListFilingRoute = ListFilingWithFixedUnit | ListFilingWithLegacyUnit | ListFilingWithoutUnit
+
+
+class NoListFilingUnit(Enum):
+    ABSENT = "no List unit"
+
+
+@dataclass(frozen=True)
+class PendingProducerFiling:
+    """Keep the selected List owner and producer while the keeper is unavailable."""
+
+    owner: staff.StaffId
+    producer: staff.StaffId
+    unit: staff.StaffId | LegacyListUnitName | NoListFilingUnit
     source: str
 
 
@@ -1226,17 +1268,23 @@ class ListFilingUnavailable:
     """The List row has no producer that can take it."""
 
     reason: str
+    retry: ListCommandAssignee | ListWindowAssignee | PendingProducerFiling = ListWindowAssignee.RECIPIENT
+
+
+@dataclass(frozen=True)
+class UnavailableListProducerMapping(ListFilingUnavailable):
+    """The producer map cannot supply a producer for this filing."""
 
 
 def _list_filing_producer(member: staff.StaffRow, members: staff.StaffSnapshot
-                         ) -> staff.StaffRow | ListFilingUnavailable:
+                         ) -> staff.StaffRow | UnavailableListProducerMapping:
     """Use the nearest map row or producer on the owner chain without Git recovery."""
     config = conf.read(producer_map.STEM)
     if not isinstance(config.settings, dict) and config.settings.missing:
         repository = Path(__file__).resolve().parents[2] / "config" / f"{producer_map.STEM}.conf"
         config = conf.read(repository)
     if not isinstance(config.settings, dict):
-        return ListFilingUnavailable(f"Cannot read the producer map at {config.source}: {config.settings.reason}")
+        return UnavailableListProducerMapping(f"Cannot read the producer map at {config.source}: {config.settings.reason}")
 
     keys = {key.lower(): key for key in config.settings}
     producers = {row.id: row for row in staff.active(members, "producer")}
@@ -1254,20 +1302,21 @@ def _list_filing_producer(member: staff.StaffRow, members: staff.StaffSnapshot
         try:
             name = config.value(key, str, recover_invalid=False, allow_blank=True)
         except conf.Unusable as error:
-            return ListFilingUnavailable(f"Cannot read the producer map at {error}")
+            return UnavailableListProducerMapping(f"Cannot read the producer map at {error}")
         identity = staff.StaffId(name.lower())
         if identity in producers:
             return producers[identity]
         stale = members.by_id(identity)
-        return ListFilingUnavailable(producer_map.StaleRow(holder, stale.name if stale is not None else identity).reason())
-    return ListFilingUnavailable(f"{member.name} has no producer yet.")
+        reason = producer_map.StaleRow(holder, stale.name if stale is not None else identity).reason()
+        return UnavailableListProducerMapping(reason)
+    return UnavailableListProducerMapping(f"{member.name} has no producer yet.")
 
 
 def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipient: staff.StaffRow,
                       members: staff.StaffSnapshot) -> ListFilingRoute | ListFilingUnavailable:
-    keeper = producer_map.find_member("morty", members, ("producer",))
-    if isinstance(keeper, producer_map.UnknownMember) or keeper.name != "morty":
-        return ListFilingUnavailable("The List needs one active producer named morty.")
+    keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+    if keeper is None:
+        return ListFilingUnavailable("The List has no active producer.", assignee)
     member = recipient
     source = "nate via New item"
     if isinstance(assignee, ListCommandAssignee):
@@ -1278,10 +1327,19 @@ def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipi
         source = "nate via /new_item"
     producer = _list_filing_producer(member, members)
     if isinstance(producer, ListFilingUnavailable):
-        return producer
-    unit = member.name if member.kind == "unit" else ""
-    return ListFilingRoute(keeper=keeper.id, owner=recipient.id, producer=producer.id,
-                           unit=unit, source=source)
+        return replace(producer, retry=assignee)
+    unit = member.id if member.kind == "unit" else NoListFilingUnit.ABSENT
+    return _list_filing_route(keeper.id, recipient.id, producer.id, source, unit)
+
+
+def _list_filing_route(keeper: staff.StaffId, owner: staff.StaffId, producer: staff.StaffId, source: str,
+                       unit: staff.StaffId | LegacyListUnitName | NoListFilingUnit) -> ListFilingRoute:
+    fields = ListFilingFields(keeper=keeper, owner=owner, producer=producer, source=source)
+    if isinstance(unit, LegacyListUnitName):
+        return ListFilingWithLegacyUnit(**fields, unit_kind="legacy-name", unit=unit)
+    if unit is NoListFilingUnit.ABSENT:
+        return ListFilingWithoutUnit(**fields, unit_kind="no-unit", unit="")
+    return ListFilingWithFixedUnit(**fields, unit_kind="fixed-id", unit="", unit_id=unit)
 
 
 def assigned_member(assignment: new_item_dialog.Assignment, recipient: staff.StaffRow,
@@ -1295,15 +1353,12 @@ def assigned_member(assignment: new_item_dialog.Assignment, recipient: staff.Sta
     return row
 
 
-def _plan_producer_filing(member: staff.StaffRow, recipient: staff.StaffRow, request: NewItemRequest,
+def _plan_producer_filing(filing: PendingProducerFiling,
                           members: staff.StaffSnapshot) -> ListFilingRoute | ListFilingUnavailable:
     keeper = list_producer(conf.read_or_repository("console"), members)
     if isinstance(keeper, PageOwnerUnavailable):
-        return ListFilingUnavailable("The List has no active producer.")
-    source = ("nate via /new_item" if isinstance(request.notice, new_item_dialog.SubmissionNotice)
-              and request.notice.from_command else "nate via New item")
-    return ListFilingRoute(keeper=keeper.id, owner=member.id, producer=recipient.id,
-                           unit=member.name if member.kind == "unit" else "", source=source)
+        return ListFilingUnavailable("The List has no active producer.", filing)
+    return _list_filing_route(keeper.id, filing.owner, filing.producer, filing.source, filing.unit)
 
 
 @dataclass(frozen=True)
@@ -1311,8 +1366,7 @@ class NoListFiling:
     """This request has no List row to write or skip."""
 
 
-def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUnavailable | NoListFiling:
-    """Read the List filing plan for the first Send."""
+def _list_filing_fields(saved: SavedSubmission) -> dict[str, object] | NoListFiling:
     folder = _request_folder(saved.request_id)
     try:
         routing = (folder / "list-filing.json").read_text(encoding="utf-8")
@@ -1321,19 +1375,73 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
     fields = cast(object, json.loads(routing))
     if not isinstance(fields, dict):
         raise OSError(f"Invalid List route for request {saved.request_id}.")
-    values = cast(dict[str, object], fields)
-    if isinstance(values.get("skipped"), str):
+    return cast(dict[str, object], fields)
+
+
+def list_filing_was_skipped(saved: SavedSubmission) -> bool:
+    """Read the final decision to keep the saved note in Review."""
+    values = _list_filing_fields(saved)
+    return isinstance(values, dict) and isinstance(values.get("skipped"), str)
+
+
+def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUnavailable | NoListFiling:
+    """Read the saved List filing route or the assignee that still needs a route."""
+    values = _list_filing_fields(saved)
+    if isinstance(values, NoListFiling) or isinstance(values.get("skipped"), str):
         return NoListFiling()
     reason = values.get("unavailable")
     if isinstance(reason, str):
-        return ListFilingUnavailable(reason)
+        if values.get("producer_mapping_unavailable") is True:
+            return UnavailableListProducerMapping(reason)
+        if "owner" in values:
+            owner, producer = values["owner"], values.get("producer")
+            unit, source = values.get("unit"), values.get("source")
+            if not (isinstance(owner, str) and isinstance(producer, str)
+                    and isinstance(unit, str) and isinstance(source, str)):
+                raise OSError(f"Invalid List route for request {saved.request_id}.")
+            return ListFilingUnavailable(reason, PendingProducerFiling(
+                staff.StaffId(owner), staff.StaffId(producer), _saved_list_filing_unit(unit, values, saved), source))
+        assignee = (list_command_assignee(values["assignee"]) if "assignee" in values
+                    else ListWindowAssignee.RECIPIENT)
+        return ListFilingUnavailable(reason, assignee)
     keeper, owner, producer = values.get("keeper"), values.get("owner"), values.get("producer")
     unit, source = values.get("unit"), values.get("source")
     if not (isinstance(keeper, str) and isinstance(owner, str) and isinstance(producer, str)
             and isinstance(unit, str) and isinstance(source, str)):
         raise OSError(f"Invalid List route for request {saved.request_id}.")
-    return ListFilingRoute(keeper=staff.StaffId(keeper), owner=staff.StaffId(owner), producer=staff.StaffId(producer),
-                           unit=unit, source=source)
+    return _list_filing_route(staff.StaffId(keeper), staff.StaffId(owner), staff.StaffId(producer),
+                              source, _saved_list_filing_unit(unit, values, saved))
+
+
+def _saved_list_filing_unit(unit: str, values: dict[str, object], saved: SavedSubmission
+                            ) -> staff.StaffId | LegacyListUnitName | NoListFilingUnit:
+    if "unit_id" in values:
+        unit_id = values["unit_id"]
+        if unit or not isinstance(unit_id, str) or not unit_id:
+            raise OSError(f"Invalid List unit reference for request {saved.request_id}.")
+        return staff.StaffId(unit_id)
+    return LegacyListUnitName(unit) if unit else NoListFilingUnit.ABSENT
+
+
+def retry_list_filing_route(saved: SavedSubmission, unavailable: ListFilingUnavailable,
+                            members: staff.StaffSnapshot) -> ListFilingRoute:
+    """Resolve the assignee again and save the route before reserving a List number."""
+    if isinstance(unavailable, UnavailableListProducerMapping):
+        raise new_item_dialog.PermanentListFilingRefusal(unavailable.reason)
+    retry = unavailable.retry
+    if isinstance(retry, PendingProducerFiling):
+        route = _plan_producer_filing(retry, members)
+    else:
+        recipient = members.by_id(saved.owner)
+        if recipient is None:
+            raise OSError(f"The recipient for {saved.id} is unavailable.")
+        route = _plan_list_filing(retry, recipient, members)
+    if isinstance(route, UnavailableListProducerMapping):
+        raise new_item_dialog.PermanentListFilingRefusal(route.reason)
+    if isinstance(route, ListFilingUnavailable):
+        raise OSError(f"Cannot file {saved.id} on the List: {route.reason}")
+    _write_request_file(_request_folder(saved.request_id) / "list-filing.json", route)
+    return route
 
 
 def list_filing_reservation(saved: SavedSubmission) -> Path:
@@ -1346,6 +1454,25 @@ def skip_list_filing(saved: SavedSubmission, reason: str) -> None:
     list_filing_reservation(saved).unlink(missing_ok=True)
     _write_request_file(_request_folder(saved.request_id) / "list-filing.json", {"skipped": reason})
     print(f"Review List filing {saved.id}: {reason}", file=sys.stderr)
+
+
+def _finish_skipped_native_report(saved: SavedSubmission, record: investigation.Investigation
+                                  ) -> investigation.Investigation:
+    """Complete a saved decision to send the notice from Review."""
+    reservation = list_filing_reservation(saved)
+    reservation.unlink(missing_ok=True)
+    atomic_file.sync_folder(reservation.parent)
+    store = investigation.Investigations(record.owner, "investigations", "I", "investigation",
+                                         investigation.InvestigationError)
+    fields, body = store.read(record.id, path=saved.path)
+    origin = cast(dict[str, object], json.loads(fields["review_submission"]))
+    if reply_proofs.has_legacy_submission(origin):
+        raise investigation.InvestigationError("Move the reply proof before editing this note.")
+    _ = fields.pop("purpose")
+    with investigation.investigation_numbers() as numbers:
+        with numbers.write(saved.path, record.id, record.owner, folder=store.folder()):
+            store.write(record.id, fields, body, path=saved.path)
+    return replace(record, purpose=investigation.InvestigationPurpose.INVESTIGATE)
 
 
 @dataclass(frozen=True)
@@ -1485,12 +1612,13 @@ def _page_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapshot) -> 
 def page_owners(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> PageOwners:
     """Resolve the owner to show and the recipient for new items."""
     key = f"page.{page}.owner"
-    label_key = f"page.{page}.label"
+    label_page = "studio" if page == "list" else page
+    label_key = f"page.{label_page}.label"
     values = settings.values(key, label_key, "owner.default")
     designated = staff.StaffId(values.get(key, ""))
     default = staff.StaffId(values.get("owner.default", ""))
     # A page outside the console navigation, such as rebuilds, has no label setting.
-    label = values.get(label_key) or page.replace("_", " ").title()
+    label = values.get(label_key) or label_page.replace("_", " ").title()
     route = _page_owner_route(label, designated, default, members)
     shown = members.rows_by_id.get(designated)
     if shown is not None and shown.kind in ("unit", "showrunner", "producer") and _page_owner_is_active(shown, members):
@@ -1561,28 +1689,16 @@ def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot,
     return PageOwnerUnavailable()
 
 
-def _configured_list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
-    configured = settings.origin("page.list.owner", str)
-    if isinstance(configured, conf.UnavailableValue):
-        return PageOwnerUnavailable()
-    row = members.by_id(staff.StaffId(configured.value))
-    return row if row is not None and row.kind == "producer" else PageOwnerUnavailable()
-
-
 def list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
     """Find the active producer that owns the List."""
-    row = _configured_list_producer(settings, members)
-    if (isinstance(row, PageOwnerUnavailable) or row.id not in members.rows_by_id
-            or not _page_owner_is_active(row, members)):
-        return PageOwnerUnavailable()
-    return row
+    return record_store.list_keeper(settings, members) or PageOwnerUnavailable()
 
 
 def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffSnapshot,
                     choice: new_item_dialog.PageRecipient) -> staff.StaffRow:
     identity = address.recipient_id
     if choice == new_item_dialog.PageRecipient.LIST_OWNER:
-        configured = _configured_list_producer(conf.read_or_repository("console"), members)
+        configured = record_store.configured_list_producer(conf.read_or_repository("console"), members)
         if not isinstance(configured, staff.StaffRow) or configured.id != identity:
             raise SubmissionConflict("The List owner is unavailable. Open New item again.")
     elif choice in (new_item_dialog.PageRecipient.SELECTED, new_item_dialog.PageRecipient.PRODUCER):
@@ -1590,7 +1706,7 @@ def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffS
         if choice == new_item_dialog.PageRecipient.PRODUCER and row.kind != "producer":
             raise SubmissionError("Pick a producer.")
         return row
-    elif page and page != "list":
+    elif page and not new_item_dialog.is_list_submission_page(page):
         configured = page_owner(page, conf.read_or_repository("console"), members)
         if isinstance(configured, PageOwnerUnavailable):
             raise SubmissionConflict("The page owner is unavailable. Open New item again.")
@@ -1718,7 +1834,7 @@ def new_item_routing(page: str, settings: conf.ConfigRead, members: staff.StaffS
             continue
     assignees = {row.id: row for row in members.rows if row.kind in ("showrunner", "unit")
                  and _page_owner_is_active(row, members)}
-    # The List owner keeps the List. The List does not choose an assignee.
+    # Old List requests have no preferred producer. The Studio uses its page owner.
     key = f"page.{page}.owner"
     designated = staff.StaffId(settings.values(key).get(key, "")) if page != "list" else staff.StaffId("")
     producer = producers.get(designated)
@@ -1739,7 +1855,7 @@ def new_item_routing(page: str, settings: conf.ConfigRead, members: staff.StaffS
         recipients=[_recipient_option(row, members) for row in producers.values()],
         assignees=[AssigneeOption(id=row.id, name=row.name) for row in ordered],
         page_owner=producer.id if producer is not None else staff.StaffId(""), page_owner_reason=reason,
-        page_assignee=owner.id if owner is not None else staff.StaffId(""))
+        page_assignee=owner.id if owner is not None and page != "studio" else staff.StaffId(""))
 
 
 def _file_question_for_remote_owner(recipient: staff.StaffRow, title: str, members: staff.StaffSnapshot,
@@ -1759,7 +1875,8 @@ def _file_question_for_remote_owner(recipient: staff.StaffRow, title: str, membe
     record = update_registration.QuestionRecord(path, owner, owner, item, "open")
     with staff.supplied_snapshot(members), update_registration.outstanding_lock(
             update_registration.outstanding_path_for_owner(owner)):
-        return update_registration._file_question(record, outgoing.before_write)  # pyright: ignore[reportPrivateUsage]
+        return update_registration._file_question(  # pyright: ignore[reportPrivateUsage]
+            record, outgoing.before_write, reply_proof=outgoing.details.reply_proof)
 
 
 def _file(kind: SubmissionKind, recipient: staff.StaffRow, title: str, words: str, details: ReviewSubmission,
@@ -2158,8 +2275,10 @@ def _browser_payload_hash(request: NewItemRequest, words: str, evidence: Evidenc
                           uploads: tuple[_ImageUpload, ...], screenshot: new_item_dialog.SubmissionScreenshot,
                           delivery: InitialDelivery | NoInitialDelivery) -> str:
     digest = "" if isinstance(screenshot, new_item_dialog.NoPageScreenshot) else screenshot.digest
+    # Keep the same fingerprint for a draft sent from the old List and from the Studio.
+    page = "list" if new_item_dialog.is_list_submission_page(request.page) else request.page
     fields: list[object] = [request.kind, request.recipient_id, words, new_item_dialog.evidence_fields(evidence),
-                            _image_fingerprints(uploads), request.page, request.page_recipient,
+                            _image_fingerprints(uploads), page, request.page_recipient,
                             asdict(request.page_state) if request.page_state else None, digest]
     if isinstance(delivery, InitialDelivery) and isinstance(delivery.list_assignee, ListCommandAssignee):
         fields.append(delivery.list_assignee.id)
@@ -2202,16 +2321,17 @@ class ListDraftReplay:
 
 
 def _list_draft_replay(folder: Path, send: ListDraftSend, intent: new_item_dialog.SubmissionCaptureIntent,
-                       item: LocatedSubmission, delivery: InitialDelivery | NoInitialDelivery) -> ListDraftReplay:
+                       item: LocatedSubmission, delivery: InitialDelivery | NoInitialDelivery,
+                       limits: NewItemLimits) -> ListDraftReplay:
     try:
-        filing = send.prepare()
+        filing = send.prepare(limits)
         request = filing.request
         if request.kind == SubmissionKind.PROPOSAL and request.page_recipient != new_item_dialog.PageRecipient.PRODUCER:
             request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
-        if request.page != "list" or request.request_id != send.request_id or filing.refusal is not None:
+        if not new_item_dialog.is_list_submission_page(request.page) or request.request_id != send.request_id or filing.refusal is not None:
             return ListDraftReplay()
-        evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
-        words = read_words(request.words, "Your words", kind=request.kind)
+        evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence), limits.page_data)
+        words = read_words(request.words, "Your words", limits.words_chars, kind=request.kind)
         screenshot = filing.screenshot
         committed = _committed_list_preview(folder)
         requested = send.preview
@@ -2224,7 +2344,7 @@ def _list_draft_replay(folder: Path, send: ListDraftSend, intent: new_item_dialo
                 return ListDraftReplay()
         elif isinstance(requested, RequestedListPreview) and isinstance(screenshot, new_item_dialog.NoPageScreenshot):
             return ListDraftReplay()
-        uploads = _decode_images(request.images)
+        uploads = _decode_images(request.images, limits)
         saved_digest = item.destination.payload_hash
         if item.destination.request_id.startswith(send.request_id + "-"):
             digest = _browser_payload_hash(request, words, evidence, uploads, screenshot, delivery)
@@ -2248,6 +2368,7 @@ def _list_draft_replay(folder: Path, send: ListDraftSend, intent: new_item_dialo
 
 
 def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None, *,
+                       limits: NewItemLimits,
                        capture_intent: new_item_dialog.SubmissionCaptureIntent,
                        capture_target: ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget,
                        initial_delivery: InitialDelivery | NoInitialDelivery) -> SavedSubmission:
@@ -2257,11 +2378,12 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
         with _locked_filed_draft(folder, members, on_list=True) as lookup:
             if isinstance(lookup, SubmissionLookup) and isinstance(lookup.native, LocatedSubmission):
                 item = lookup.native
-                if item.details.page != "list":
+                if not new_item_dialog.is_list_submission_page(item.details.page):
                     raise DraftAlreadyFiled(item.destination.id)
                 saved = item.destination
                 _check_capture_target(capture_target, saved)
-                replay = _list_draft_replay(folder, send, capture_intent, item, initial_delivery)
+                replay = _list_draft_replay(folder, send, capture_intent, item, initial_delivery,
+                                            new_item_dialog.read_saved_item_limits())
                 earlier = _is_earlier_native_draft(folder, saved)
                 receipt_folder = _request_folder(saved.request_id) if earlier else folder
                 completed = _complete_receipt(receipt_folder, saved, lookup.hint, item.record,
@@ -2272,11 +2394,12 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
                 return completed
         if isinstance(capture_target, ScopedSubmissionKey):
             raise SubmissionConflict("This screenshot belongs to another item.")
-        filing = send.prepare()
+        send.check_first_send()
+        filing = send.prepare(limits)
         request = filing.request
-        if request.page != "list" or request.request_id != send.request_id:
+        if not new_item_dialog.is_list_submission_page(request.page) or request.request_id != send.request_id:
             raise SubmissionError("Invalid List draft request.")
-        return _submit(request, members=members, screenshot=filing.screenshot,
+        return _submit(request, members=members, limits=limits, screenshot=filing.screenshot,
                        capture_requested=filing.capture_requested, refusal=filing.refusal,
                        capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery,
                        list_preview=send.preview)
@@ -2353,6 +2476,7 @@ def refuse_scheduled_draft_reuse(
 
 def submit(
     request: NewItemRequest | new_item_dialog.UnverifiedDraftRetry | ListDraftSend, *, members: staff.StaffSnapshot | None = None,
+    limits: NewItemLimits | None = None,
     screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
     capture_requested: bool = False, refusal: SubmissionError | None = None,
     capture_intent: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT,
@@ -2365,30 +2489,31 @@ def submit(
             capture_intent.submitted_draft_id != request.request_id
             or not new_item_dialog.capture_key_matches_draft(capture_intent.capture_key, request.request_id)
             or (DRAFT_ID.fullmatch(request.request_id)
-                and (not isinstance(request, NewItemRequest) or request.page != "list"))):
+                and (not isinstance(request, NewItemRequest) or not new_item_dialog.is_list_submission_page(request.page)))):
         raise SubmissionError("The screenshot belongs to another draft.")
     if isinstance(request, new_item_dialog.UnverifiedDraftRetry):
         return _recover_unverified_draft(request.request_id, members, request.error, capture_target=capture_target)
+    limits = limits if limits is not None else new_item_dialog.read_new_item_limits()
     if isinstance(request, ListDraftSend):
-        return _submit_list_draft(request, members, capture_intent=capture_intent, capture_target=capture_target,
+        return _submit_list_draft(request, members, limits=limits, capture_intent=capture_intent, capture_target=capture_target,
                                   initial_delivery=initial_delivery)
-    if request.page == "list":
+    if new_item_dialog.is_list_submission_page(request.page):
         if BROWSER_DRAFT_ID.fullmatch(request.request_id):
             filing = ListDraftFiling(request, screenshot, capture_requested, refusal)
-            return _submit_list_draft(ListDraftSend(request.request_id, lambda: filing), members,
+            return _submit_list_draft(ListDraftSend(request.request_id, lambda _: filing), members, limits=limits,
                                       capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
-        return _submit(request, members=members, screenshot=screenshot,
+        return _submit(request, members=members, limits=limits, screenshot=screenshot,
                        capture_requested=capture_requested, refusal=refusal,
                        capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
     try:
-        return _submit(request, members=members, screenshot=screenshot,
+        return _submit(request, members=members, limits=limits, screenshot=screenshot,
                        capture_requested=capture_requested, refusal=refusal,
                        capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
     except SubmissionError as error:
         return _recover_unverified_draft(request.request_id, members, error, capture_target=capture_target)
 
 
-def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
+def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None, limits: NewItemLimits,
             screenshot: new_item_dialog.SubmissionScreenshot, capture_requested: bool,
             refusal: SubmissionError | None, capture_intent: new_item_dialog.SubmissionCaptureIntent,
             capture_target: ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget,
@@ -2412,17 +2537,18 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
         request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
     legacy_draft = DRAFT_ID.fullmatch(request_id) is not None
     browser_draft = BROWSER_DRAFT_ID.fullmatch(request_id) is not None
-    list_draft = browser_draft and request.page == "list"
-    legacy_list_draft = legacy_draft and request.page == "list"
+    list_page_request = new_item_dialog.is_list_submission_page(request.page)
+    list_draft = browser_draft and list_page_request
+    legacy_list_draft = legacy_draft and list_page_request
     if producer_route and legacy_draft:
         raise SubmissionError("Open New item again to select a producer.")
     if request_id.startswith(("r2-", "r3-", "r4-", "r5-", "r6-")) and not (legacy_draft or browser_draft):
         raise SubmissionError("Invalid draft request ID.")
     address = (SubmissionAddress(kind, request.recipient_id, request_id) if legacy_draft or browser_draft
                else _request_address(kind, request.recipient_id, request_id))
-    words = read_words(request.words, "Your words", kind=request.kind)
-    evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
-    uploads = _decode_images(request.images)
+    words = read_words(request.words, "Your words", limits.words_chars, kind=request.kind)
+    evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence), limits.page_data)
+    uploads = _decode_images(request.images, limits)
     if list_draft:
         previous = _recover_pre_upgrade_native_draft(_request_folder(request_id), address, words, uploads, members,
                                                     request=request, capture_target=capture_target)
@@ -2445,7 +2571,8 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
         payload_hash = _submission_fingerprint(replace(request, evidence=evidence), words, uploads)
     if isinstance(screenshot, new_item_dialog.PageScreenshot):
         total = len(screenshot.png) + sum(len(upload.data) for upload in uploads)
-        if len(uploads) >= MAX_IMAGES or total > MAX_TOTAL_IMAGE_BYTES:
+        if (len(uploads) >= limits.images or len(screenshot.png) > limits.image_bytes
+                or total > limits.total_image_bytes):
             raise SubmissionError("The screenshot and pasted images exceed the attachment limits.")
         uploads = (*uploads, _ImageUpload(PAGE_SCREENSHOT, "png", screenshot.png))
         if kind != SubmissionKind.BUG and isinstance(evidence, new_item_dialog.PageDataEvidence):
@@ -2524,6 +2651,8 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                 raise SubmissionConflict("This screenshot belongs to another item.")
             if refusal is not None:
                 raise refusal
+            if isinstance(capture_intent, new_item_dialog.DeferredCaptureIntent) and len(uploads) >= limits.images:
+                raise SubmissionError("The screenshot and pasted images exceed the attachment limits.")
             if (folder / "receipt.json").is_file():
                 raise OSError(f"Cannot find the native record for request {request_id}.")
             if isinstance(hint, UnreadableRequestFile):
@@ -2550,15 +2679,19 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             if producer_route:
                 member = assigned_member(request.assignment, recipient, current)
                 if isinstance(initial_delivery, InitialDelivery):
-                    route = _plan_producer_filing(member, recipient, request, current)
-            elif request.page == "list" and isinstance(initial_delivery, InitialDelivery):
+                    source = ("nate via /new_item" if isinstance(notice, new_item_dialog.SubmissionNotice)
+                              and notice.from_command else "nate via New item")
+                    unit = member.id if member.kind == "unit" else NoListFilingUnit.ABSENT
+                    route = _plan_producer_filing(PendingProducerFiling(member.id, recipient.id, unit, source), current)
+            elif list_page_request and isinstance(initial_delivery, InitialDelivery):
                 route = _plan_list_filing(initial_delivery.list_assignee, recipient, current)
             pending_file = folder / "pending.json"
             images = tuple(upload.reference for upload in uploads)
             proof = reply_tokens.mint()
-            details = ReviewSubmission(request_id, payload_hash, evidence, images, proof.sha256,
-                                       page=request.page, page_state=request.page_state, capture_intent=capture_intent,
-                                       reply_token_nonce=proof.nonce, notice=notice, assignment=request.assignment,
+            details = ReviewSubmission(request_id, payload_hash, evidence, images,
+                                       page=request.page, page_state=request.page_state or NoBugPageState(),
+                                       capture_intent=capture_intent,
+                                       reply_proof=proof, notice=notice, assignment=request.assignment,
                                        image_digests=tuple((upload.reference.id, upload.digest) for upload in uploads))
             title = submission_title(words)
             destinations: list[NativeSubmissionDestination] = []
@@ -2591,9 +2724,21 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                     _write_draft_index(folder, ClaimedDraft(saved))
                 _write_location(pending_file, saved)
                 if isinstance(route, dict):
-                    _write_request_file(folder / "list-filing.json", route)
+                    fields = {key: value for key, value in route.items() if key != "unit_kind"}
+                    _write_request_file(folder / "list-filing.json", fields)
                 elif isinstance(route, ListFilingUnavailable):
-                    _write_request_file(folder / "list-filing.json", {"unavailable": route.reason})
+                    pending_route: dict[str, object] = {"unavailable": route.reason}
+                    retry = route.retry
+                    if isinstance(route, UnavailableListProducerMapping):
+                        pending_route["producer_mapping_unavailable"] = True
+                    elif isinstance(retry, ListCommandAssignee):
+                        pending_route["assignee"] = retry.id
+                    elif isinstance(retry, PendingProducerFiling):
+                        pending_route.update(owner=retry.owner, producer=retry.producer, source=retry.source)
+                        pending_route["unit"] = retry.unit if isinstance(retry.unit, LegacyListUnitName) else ""
+                        if isinstance(retry.unit, str) and not isinstance(retry.unit, LegacyListUnitName):
+                            pending_route["unit_id"] = retry.unit
+                    _write_request_file(folder / "list-filing.json", pending_route)
                 if isinstance(list_preview, RequestedListPreview) and isinstance(screenshot, new_item_dialog.PageScreenshot):
                     _write_request_file(folder / "list-preview.json",
                                         {"key": list_preview.key, "digest": screenshot.digest})
@@ -2610,6 +2755,15 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                     found = _read_native_submission(address, saved.path, saved.owner)
                     if isinstance(found, LocatedSubmission):
                         _check_same_request(found.destination, request, payload_hash, draft=legacy_draft)
+                        if isinstance(found.details.reply_proof, reply_tokens.MissingReplyProof):
+                            # The note can exist after a temporary file cleanup error.
+                            identity = found.details.proof_identity(found.destination.id)
+                            with reply_proofs.publishing(identity, reply_proofs.NoteProof(reply=proof), moving=True):
+                                pass
+                            restored = _read_native_submission(address, saved.path, saved.owner)
+                            if not isinstance(restored, LocatedSubmission):
+                                raise OSError("The saved Review record is unavailable.")
+                            found = restored
                         filed = replace(found.destination, browser_token_digest=saved.browser_token_digest)
                         return _complete_receipt(folder, filed, saved, found.record, first_send=True)
                 _discard_unfiled_send(folder)
@@ -2636,9 +2790,30 @@ class SavedSubmissionMissing(SubmissionError):
 def submission_for_delivery(address: SubmissionAddress) -> Generator[LocatedSubmission | NoNativeSubmission]:
     """Read the current native owner under the same locks as a move."""
     with _locked_request(address) as lookup:
-        if isinstance(lookup.native, NoNativeSubmission) and isinstance(lookup.hint, UnreadableRequestFile):
+        located = lookup.native
+        if isinstance(located, NoNativeSubmission) and isinstance(lookup.hint, UnreadableRequestFile):
             raise lookup.hint.error
-        yield lookup.native
+        if not isinstance(located, LocatedSubmission) or not isinstance(located.record, investigation.Investigation):
+            yield located
+            return
+        record = located.record
+        if not record.belongs_on_list or isinstance(record.list_destination, investigation.ListDestination):
+            yield located
+            return
+        saved = located.saved()
+        if list_filing_was_skipped(saved):
+            yield replace(located, record=_finish_skipped_native_report(saved, record))
+            return
+        try:
+            yield located
+        except (OSError, new_item_dialog.PermanentListFilingRefusal) as error:
+            refusal = error if isinstance(error, new_item_dialog.PermanentListFilingRefusal) else error.__cause__
+            if not isinstance(refusal, new_item_dialog.PermanentListFilingRefusal):
+                raise
+            reason = str(refusal)
+            _write_request_file(_request_folder(saved.request_id) / "list-filing.json", {"skipped": reason})
+            _ = _finish_skipped_native_report(saved, record)
+            print(f"Review List filing {saved.id}: {reason}", file=sys.stderr)
 
 
 @contextmanager
@@ -2679,31 +2854,35 @@ def committed_page_captures() -> Iterator[tuple[ScopedSubmissionKey, new_item_di
 def read_attached_page_screenshot(target: ScopedSubmissionKey, request: new_item_dialog.PageCaptureRequest
                                   ) -> new_item_dialog.PageScreenshot:
     """Read the PNG already attached to the native record."""
+    limit = new_item_dialog.read_stored_image_byte_limit()
     with scoped_submission(target) as located:
         if PAGE_SCREENSHOT not in located.details.images:
             raise SubmissionError("The screenshot is no longer attached.")
         path = image_folder(located.details) / PAGE_SCREENSHOT.id / PAGE_SCREENSHOT.file
         with path.open("rb") as stream:
-            image = stream.read(MAX_IMAGE_BYTES + 1)
-    if len(image) > MAX_IMAGE_BYTES or not image.startswith(b"\x89PNG\r\n\x1a\n"):
+            image = stream.read(limit + 1)
+    if len(image) > limit or not image.startswith(b"\x89PNG\r\n\x1a\n"):
         raise SubmissionError("The attached screenshot is invalid.")
     return new_item_dialog.PageScreenshot(image, new_item_dialog.PageViewport(request.width, request.height, request.dark))
 
 
 def current_reply_proof(key: str) -> reply_tokens.ReplyTokenProof:
-    """Read the proof from the current native note for a saved delivery."""
+    """Find the current native note and get its proof for a saved delivery."""
     scoped = read_submission_key(key)
     address = _request_address(scoped.kind, scoped.recipient_id, scoped.request_id)
     located = locate_native_submission(address, _request_hint(address))
     if not isinstance(located, LocatedSubmission) or located.destination.id != scoped.item_id:
         raise reply_tokens.UnavailableReplyToken("Cannot find the note for this reply token.")
-    return located.details.reply_proof
+    proof = located.details.reply_proof
+    if not isinstance(proof, reply_tokens.ReplyTokenProof):
+        raise reply_tokens.UnavailableReplyToken("The item has no proof for delivery.")
+    return proof
 
 
 def renew_legacy_reply(located: LocatedSubmission) -> SavedSubmission:
-    """Give a waiting legacy note a new proof while the caller holds the recipient locks."""
+    """Give a waiting legacy item a new proof while the caller holds its recipient locks."""
     saved = located.saved()
-    if not saved.awaiting_reply or saved.details.reply_token_nonce:
+    if not saved.awaiting_reply or not isinstance(saved.details.reply_proof, reply_tokens.LegacyReplyProof):
         return saved
     target = located.destination
     lock = (update_registration.wrap_question_locks(target.owner) if target.kind == SubmissionKind.QUESTION
@@ -2713,44 +2892,40 @@ def renew_legacy_reply(located: LocatedSubmission) -> SavedSubmission:
         current = _read_native_submission(target.address, target.path, target.owner)
         if not isinstance(current, LocatedSubmission) or current.destination.id != target.id:
             raise reply_tokens.UnavailableReplyToken("Cannot find the note for this reply token.")
-        record = current.record
-        if _awaiting_reply(record) and not current.details.reply_token_nonce:
-            proof = reply_tokens.mint()
-            match record:
-                case update_registration.QuestionRecord():
-                    fields = record.item.get("review_submission", {})
-                    _ = update_registration.write_review_submission(
-                        record, new_item_dialog.renewed_submission_fields(fields, proof))
-                case Issue():
-                    proposal_issue.renew_reply_proof(record, proof)
-                case investigation.Investigation():
-                    investigation.renew_reply_proof(target.path, record, proof)
-            updated = _read_native_submission(target.address, target.path, target.owner)
-            if not isinstance(updated, LocatedSubmission) or updated.destination.id != target.id:
+        if _awaiting_reply(current.record) and isinstance(current.details.reply_proof, reply_tokens.LegacyReplyProof):
+            identity = current.details.proof_identity(target.id)
+            with reply_proofs.publishing(identity, reply_proofs.NoteProof(reply=reply_tokens.mint())):
+                pass
+            current = _read_native_submission(target.address, target.path, target.owner)
+            if not isinstance(current, LocatedSubmission) or current.destination.id != target.id:
                 raise reply_tokens.UnavailableReplyToken("Cannot read the renewed reply proof.")
-            record = updated.record
-        return replace(saved, path=target.path, owner=target.owner, record=record)
+        return replace(saved, path=target.path, owner=target.owner, record=current.record, details=current.details)
 
 
 def _with_screenshot(details: ReviewSubmission, owner: staff.StaffId,
                      image: bytes | new_item_dialog.PageScreenshot) -> ReviewSubmission:
     """Store the screenshot and keep the page data for a Bug report."""
     state = details.page_state
-    evidence = details.evidence if state is not None else NoEvidence()
+    evidence = details.evidence if isinstance(state, new_item_dialog.BugPageState) else NoEvidence()
     if isinstance(image, new_item_dialog.PageScreenshot):
-        if state is not None:
+        if isinstance(state, new_item_dialog.BugPageState):
             state = replace(state, viewport=image.viewport, include_screenshot=True)
         evidence = details.evidence
         image = image.png
     reference = PAGE_SCREENSHOT
-    if ((details.page_state is None and not isinstance(details.evidence, (new_item_dialog.PageDataEvidence, NoEvidence)))
-            or len(details.images) >= MAX_IMAGES or reference in details.images):
+    if ((isinstance(details.page_state, NoBugPageState)
+         and not isinstance(details.evidence, (new_item_dialog.PageDataEvidence, NoEvidence)))
+            or reference in details.images):
+        return details
+    settings = conf.read("review_links")
+    if len(details.images) >= settings.whole_upper_bound("new_item.max_images"):
         return details
     images = image_folder(details)
     used = sum((images / item.id / item.file).stat().st_size for item in details.images)
     path = images / reference.id / reference.file
     size = path.stat().st_size if path.is_file() else len(image)
-    if used + size > MAX_TOTAL_IMAGE_BYTES:
+    if (size > settings.whole_upper_bound("new_item.max_image_bytes")
+            or used + size > settings.whole_upper_bound("new_item.max_total_image_bytes")):
         return details
     if not path.is_file():
         with tempfile.TemporaryDirectory(prefix=".screenshot-", dir=images.parent) as temporary:
@@ -2826,7 +3001,7 @@ def save_bug_page_state(saved: NativeSubmissionDestination, item_key: str, reque
             assert isinstance(report, investigation.Investigation)
             details = report.submission
             assert isinstance(details, ReviewSubmission)
-            added = details.page_state is None
+            added = isinstance(details.page_state, NoBugPageState)
             if added:
                 if request is None or request.page_state is None:
                     return False
@@ -2838,11 +3013,12 @@ def save_bug_page_state(saved: NativeSubmissionDestination, item_key: str, reque
                 details = replace(details, page=request.page, page_state=request.page_state, page_state_data=page_data)
                 _write_investigation_submission(located, details)
         state, data = details.page_state, details.bug_page_data
-        assert state is not None
+        assert isinstance(state, new_item_dialog.BugPageState)
         captured = PAGE_SCREENSHOT in details.images
         attached = False
         capture_error: OSError | ValueError | RuntimeError | None = None
-        if state.include_screenshot and not captured and len(details.images) < MAX_IMAGES:
+        if (state.include_screenshot and not captured
+                and len(details.images) < conf.read("review_links").whole_upper_bound("new_item.max_images")):
             try:
                 attached = screenshot(details.page, state)
             except (OSError, ValueError, RuntimeError) as error:
@@ -2871,7 +3047,7 @@ def record_deferred_bug_screenshot(target: new_item_dialog.ScopedSubmissionKey,
     if target.kind != SubmissionKind.BUG:
         return
     with scoped_submission(target) as located:
-        if located.details.page_state is None:
+        if isinstance(located.details.page_state, NoBugPageState):
             return
         saved = located.destination
     item_key = f"investigation/{saved.owner}/{saved.id}"
@@ -2913,44 +3089,207 @@ def answer(key: str, words: str, reply_token: str, *, members: staff.StaffSnapsh
         raise SubmissionError(str(error)) from error
 
 
-def scrub_reply_tokens(members: staff.StaffSnapshot) -> int:
-    """Convert legacy reply tokens in the native stores and archives."""
-    kinds = (record_store.RecordKind.QUESTION, record_store.RecordKind.PROPOSAL,
-             record_store.RecordKind.INVESTIGATION)
-    folders = tuple(folder for kind in kinds for folder in record_store.staff_store_folders(kind, members=members))
-    changed = 0
-    keys = frozenset(("record_type", "registration", "review_submission", "id", "owner"))
-    for path in record_store.stored_paths(folders, strict=True):
-        fields = Issue(path, record_store.read_header(path, strict=True, keys=keys))
-        if fields.value("record_type") == "question":
-            if '"reply_token"' not in fields.value("registration"):
-                continue
-            question = update_registration.read_review_question(path)
-            saved = update_registration.scrub_reply_token(path, question.owner)
-        elif not re.search(r'\breply_token\\?"\s*:', fields.value("review_submission")):
-            continue
-        elif fields.value("record_type") == "proposal":
-            saved = proposal_issue.scrub_reply_token(path)
-        elif fields.value("id") and fields.value("owner"):
-            saved = investigation.scrub_reply_token(path, staff.StaffId(fields.value("owner")), fields.value("id"))
+@dataclass(frozen=True)
+class LocalProofMove:
+    """Use local stores and resolve legacy owners as needed."""
+
+    review_root: Path
+    extra_roots: tuple[Path, ...] = ()
+
+
+class ProofMoveNoteFailure(OSError):
+    """A refused note path and a message without field values."""
+
+    def __init__(self, path: Path, error: Exception) -> None:
+        reason = str(error) if isinstance(error, reply_proofs.ProofMoveRefusal) else "Cannot move the Review proof."
+        super().__init__(f"{str(path)!r}: {reason}")
+
+
+@dataclass(frozen=True)
+class ProofMoveReport:
+    summary: reply_proofs.ProofMoveSummary
+    refusals: tuple[ProofMoveNoteFailure, ...]
+    skipped_backups: tuple[Path, ...]
+
+
+def _is_proposal_header(issue: Issue) -> bool:
+    return issue.value("record_type") == "proposal" or "proposal" in issue.fields.get("tags", [])
+
+
+def _numbered_header_has_legacy_proof(header: issues.IssueHeaderSource, issue: Issue) -> bool:
+    fields = issues.encoded_numbered_header_values(header, frozenset(("id", "kind", "review_submission")))
+    explicit_kind = "kind" in fields
+    for encoded in fields.get("kind" if explicit_kind else "id", []):
+        try:
+            value = issues.decode_numbered_field(encoded)
+        except ValueError:
+            value = issues.plain(encoded)
+        if explicit_kind:
+            supported = value in (investigation.InvestigationKind.INVESTIGATION, investigation.InvestigationKind.BUG)
         else:
-            continue
-        if saved:
-            changed += 1
-            print(f"Rewrote {path}")
-    return changed
+            supported = bool(re.fullmatch(r"I[1-9][0-9]*", value))
+        if supported:
+            return reply_proofs.numbered_header_has_legacy_proof(
+                header, fields.get("review_submission", []), issue.value("review_submission"))
+    return False
+
+
+def _proof_move_header(path: Path) -> Issue:
+    with path.open(encoding="utf-8", errors="surrogateescape", newline="") as stream:
+        header = issues.read_issue_header(stream)
+    keys = frozenset(("record_type", "registration", "review_submission", "id", "production_id", "tags"))
+    fields = header.located_fields(keys)
+    issue = Issue(path, issues.decoded_header_fields(fields))
+    layout = reply_proofs.ProofNoteLayout
+    if issue.value("record_type") == "question":
+        legacy = reply_proofs.issue_header_has_legacy_proof(fields, layout.QUESTION)
+    elif _is_proposal_header(issue):
+        legacy = reply_proofs.issue_header_has_legacy_proof(fields, layout.PROPOSAL)
+    elif "id" in fields and "review_submission" in fields:
+        with path.open(encoding="utf-8", errors="surrogateescape", newline="\n") as stream:
+            header = issues.read_numbered_header(stream)
+        legacy = _numbered_header_has_legacy_proof(header, issue)
+    else:
+        legacy = False
+    if legacy and not header.closing:
+        raise reply_proofs.ProofMoveRefusal("The Review note has no closing header fence.")
+    return issue if legacy else Issue(path, {})
+
+
+def _require_legacy_transfers_finished(root: Path) -> None:
+    with record_store.review_scan_input(conf.path("review_links")):
+        attachments = _attachment_root(root)
+    for journal in record_store.owner_state_paths(attachments, "move.json", review_scan=True):
+        with record_store.review_scan_input(journal):
+            move = _read_request_file(journal, journal.parent.name)
+        if isinstance(move, SubmissionMove):
+            for path in (move.source, move.path):
+                try:
+                    issue = _proof_move_header(path)
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError) as error:
+                    raise ProofMoveNoteFailure(path, error) from None
+                if issue.fields:
+                    raise ProofMoveNoteFailure(path, reply_proofs.ProofMoveRefusal(
+                        "The Review transfer must finish before its reply proof can move."))
+
+
+def _question_proof_roots(members: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[Path, ...]]:
+    question = record_store.RecordKind.QUESTION
+    return {
+        owner: record_store.known_folders(question, owner, document=record_store.local_document(row), review_scan=True)
+        for owner, row in record_store.store_owners(question, members, review_scan=True).items()
+        if owner
+    }
+
+
+def _question_proof_owners(path: Path, roots: Mapping[staff.StaffId, tuple[Path, ...]]) -> tuple[staff.StaffId, ...]:
+    return tuple(owner for owner, folders in roots.items() if path.parent in folders or
+                 any(path.is_relative_to(archive) for archive in record_store.archive_folders(folders)))
+
+
+def move_reply_proofs(discovery: staff.StaffSnapshot | LocalProofMove, *, dry_run: bool) -> tuple[int, int]:
+    report = _run_reply_proof_move(discovery, dry_run=dry_run)
+    if report.refusals:
+        raise OSError("\n".join(map(str, report.refusals)))
+    return report.summary.notes, report.summary.fields
+
+
+def _run_reply_proof_move(discovery: staff.StaffSnapshot | LocalProofMove, *, dry_run: bool) -> ProofMoveReport:
+    """Hold the same transfer lock as wrap through the complete move."""
+    run = reply_proofs.ProofMoveRun(dry_run, record_store.configured_review_vaults)
+    run.check_backup_location()
+    lock = atomic_file.existing_writer_lock(review_later.path().with_suffix(".lock")) if run.dry_run else review_later.locked()
+    with lock, record_store.collect_skipped_production_backups() as skipped:
+        run.check_journal()
+        refusals = _move_reply_proofs(discovery, run)
+        skipped_backups = tuple(sorted(skipped))
+        run.record_skipped_backups(skipped_backups)
+        return ProofMoveReport(run.summary(), refusals, skipped_backups)
+
+
+def _move_reply_proofs(discovery: staff.StaffSnapshot | LocalProofMove,
+                       run: reply_proofs.ProofMoveRun) -> tuple[ProofMoveNoteFailure, ...]:
+    if isinstance(discovery, LocalProofMove):
+        _require_legacy_transfers_finished(discovery.review_root)
+
+    @cache
+    def authority_roots() -> dict[staff.StaffId, tuple[Path, ...]]:
+        return _question_proof_roots(staff.initial_snapshot())
+
+    @cache
+    def local_owner_roots() -> dict[staff.StaffId, tuple[Path, ...]]:
+        if isinstance(discovery, staff.StaffSnapshot):
+            return _question_proof_roots(discovery)
+        if staff.is_owner():
+            return authority_roots()
+        return _question_proof_roots(record_store.local_review_staff())
+
+    extra_roots = discovery.extra_roots if isinstance(discovery, LocalProofMove) else ()
+    refusals: list[ProofMoveNoteFailure] = []
+    for path in record_store.local_review_paths(extra_roots):
+        try:
+            try:
+                issue = _proof_move_header(path)
+            except FileNotFoundError:
+                continue
+            if not issue.fields:
+                continue
+            if issue.value("record_type") == "question":
+                owner = staff.StaffId(issue.value("production_id"))
+                if not owner:
+                    candidates = _question_proof_owners(path, local_owner_roots())
+                    if len(candidates) != 1 and isinstance(discovery, LocalProofMove):
+                        candidates = _question_proof_owners(path, authority_roots())
+                    if len(candidates) != 1:
+                        raise reply_proofs.ProofMoveRefusal("Cannot resolve the owner of a legacy Question.")
+                    owner, = candidates
+                _ = update_registration.move_reply_proof(path, run=run, legacy_owner=owner)
+            elif _is_proposal_header(issue):
+                _ = proposal_issue.move_reply_proof(path, run=run)
+            elif "id" in issue.fields:
+                _ = investigation.move_reply_proof(path, run=run)
+            else:
+                raise reply_proofs.ProofMoveRefusal("Cannot identify the kind of note.")
+        except record_store.ReviewScanRefusal:
+            raise
+        except (OSError, ValueError, KeyError, RecursionError, Refusal,
+                update_registration.RegistrationFailure, update_registration.InputError) as error:
+            failure = ProofMoveNoteFailure(path, error)
+            if not run.dry_run:
+                raise failure from None
+            refusals.append(failure)
+    return tuple(refusals)
 
 
 def main(argv: list[str]) -> int:
-    if argv != ["scrub-reply-tokens"]:
-        print("usage: python -m scripts.review_links.review_submissions scrub-reply-tokens", file=sys.stderr)
-        return 2
+    parser = argparse.ArgumentParser(prog="python -m scripts.review_links.review_submissions")
+    commands = parser.add_subparsers(required=True)
+    move = commands.add_parser("move-reply-proofs")
+    _ = move.add_argument("--dry-run", action="store_true")
+    _ = move.add_argument("--root", action="append", type=Path, default=[], metavar="FOLDER")
+    options = parser.parse_args(argv)
+    discovery = LocalProofMove(review_link.review_root(), tuple(cast(list[Path], options.root)))
+    dry_run = cast(bool, options.dry_run)
     try:
-        _ = scrub_reply_tokens(staff.snapshot())
-    except (OSError, ValueError, update_registration.RegistrationFailure) as error:
-        print(f"Reply token scrub: {error}", file=sys.stderr)
+        report = _run_reply_proof_move(discovery, dry_run=dry_run)
+    except (ProofMoveNoteFailure, reply_proofs.ProofMoveRefusal, record_store.ReviewScanRefusal) as error:
+        print(error, file=sys.stderr)
         return 1
-    return 0
+    except (OSError, ValueError, update_registration.RegistrationFailure):
+        print("Could not process the legacy Review reply proof fields.", file=sys.stderr)
+        return 1
+    result = report.summary
+    print(f"{result.notes} notes, {result.fields} fields")
+    if dry_run:
+        print(f"{result.outside_git} notes not in git")
+        print(f"{result.open_items} open items")
+        for path in report.skipped_backups:
+            print(path)
+    for refusal in report.refusals:
+        print(refusal, file=sys.stderr)
+    return int(bool(report.refusals))
 
 
 if __name__ == "__main__":

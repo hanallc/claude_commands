@@ -19,7 +19,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager, nullco
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
@@ -34,6 +34,7 @@ if __name__ == "__main__":
     sys.modules["scripts.production.staff"] = sys.modules[__name__]
 # The status line imports this module on each refresh. Defer imports for other paths.
 if TYPE_CHECKING:
+    from scripts.lib import lock_holder
     import argparse
     from scripts.accounts import role_map
 
@@ -199,10 +200,11 @@ class StaffAbsent(StaffUnreadable):
 class StaffRefused(Exception):
     """A requested change would break the staff rules."""
 
-    def __init__(self, *args: object, holder: str = "") -> None:
+    def __init__(self, *args: object, holder: str = "", slot_key: str = "") -> None:
         super().__init__(*args)
         # The process that holds a busy row, as "pid N: command"; empty when unknown.
         self.holder: str = holder
+        self.slot_key: str = slot_key
 
 
 class UpkeepRowBusy(StaffRefused):
@@ -467,6 +469,34 @@ class NoTopItem:
 
 
 @dataclass(frozen=True)
+class PriorityRequestKey:
+    """Identify one priority request with the key of its words delivery."""
+
+    value: str = field(repr=False)
+
+    @classmethod
+    def read(cls, value: object) -> PriorityRequestKey:
+        if not isinstance(value, str) or re.fullmatch(r"review:[0-9a-f]{64}", value) is None:
+            raise StaffRefused("invalid priority request key")
+        return cls(value)
+
+
+class PriorityRequestOutcome(StrEnum):
+    SAVED = "saved"
+    NOT_SAVED = "not_saved"
+
+
+@dataclass(frozen=True)
+class ApplyPriorityRequest:
+    producer: StaffId
+    item: TopItem
+
+
+class RefuseUnappliedPriority(Enum):
+    REQUEST = "refuse an unapplied priority request"
+
+
+@dataclass(frozen=True)
 class StaffRow:
     id: StaffId
     kind: Kind
@@ -703,6 +733,8 @@ class StaffSnapshot:
     running_sessions: frozenset[str] | None = field(default=None, compare=False)
 
     retired_producers: tuple[StaffRow, ...] = field(default=(), kw_only=True)
+    priority_request_proofs: Mapping[PriorityRequestKey, PriorityRequestOutcome] = field(
+        default_factory=dict[PriorityRequestKey, PriorityRequestOutcome], kw_only=True, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         retired = tuple(row for row in self.rows if isinstance(row.retirement, RetiredProducer))
@@ -1065,7 +1097,9 @@ def row_operation(reference: str) -> Generator[None]:
 
 
 def _holder_fields() -> dict[str, object]:
-    return {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+    from scripts.lib import lock_holder
+
+    return lock_holder.own_fields()
 
 
 def _write_slot_holder(lock: IO[bytes]) -> None:
@@ -1080,20 +1114,24 @@ def _clear_slot_holder(lock: IO[bytes]) -> None:
         os.ftruncate(lock.fileno(), 0)
 
 
-def _slot_holder(lock: IO[bytes]) -> tuple[int, str] | None:
-    try:
-        _ = lock.seek(0)
-        line = lock.read(4096).partition(b"\n")[0]
-        holder = cast(object, json.loads(line))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(holder, dict):
-        return None
-    record = cast(dict[str, object], holder)
-    pid, command = record.get("pid"), record.get("command")
-    if type(pid) is not int or pid <= 0 or not isinstance(command, str) or not command:
-        return None
-    return pid, command
+def _slot_holder(lock: IO[bytes]) -> lock_holder.HolderRecord | None:
+    from scripts.lib import lock_holder
+
+    return lock_holder.read_record(lock)
+
+
+def prove_slot_holder(key: str) -> lock_holder.ProvedLockHolder | None:
+    """Prove a holder of the current row lock."""
+    from scripts.lib import lock_holder
+
+    path, _ = _row_lock(key)
+    with path.open("rb") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = _slot_holder(lock)
+            return lock_holder.prove(path, [holder] if holder is not None else [])
+    return None
 
 
 _UPKEEP_LOCK_WAIT: ContextVar[float | None] = ContextVar("_UPKEEP_LOCK_WAIT", default=None)
@@ -1108,15 +1146,15 @@ def upkeep_lock_wait(seconds: float) -> Generator[None]:
         _UPKEEP_LOCK_WAIT.reset(token)
 
 
-def _upkeep_pid(holder: tuple[int, str]) -> int | None:
+def _upkeep_pid(holder: lock_holder.HolderRecord) -> int | None:
     with suppress(ValueError):
-        arguments = shlex.split(holder[1])
+        arguments = shlex.split(holder.command)
         if "--work" in arguments and any(Path(arg).name == "herdr_upkeep.py" for arg in arguments):
-            return holder[0]
+            return holder.pid
     return None
 
 
-def _acquire_slot(lock: IO[bytes], name: str) -> None:
+def _acquire_slot(lock: IO[bytes], name: str, *, slot_key: str = "") -> None:
     seconds = _UPKEEP_LOCK_WAIT.get()
     deadline = time.monotonic() + seconds if seconds is not None else 0.0
     upkeep_pid: int | None = None
@@ -1135,9 +1173,9 @@ def _acquire_slot(lock: IO[bytes], name: str) -> None:
                         raise UpkeepRowBusy(f"Herdr upkeep still holds {name} (pid {upkeep_pid})") from error
                     time.sleep(min(0.05, remaining))
                     continue
-            named = f"pid {holder[0]}: {holder[1]}" if holder else ""
+            named = holder.description if holder else ""
             raise StaffRefused(f"{name}: another operation holds this row" + (f" ({named})" if named else ""),
-                               holder=named) from error
+                               holder=named, slot_key=slot_key) from error
 
 
 def wait_for_upkeep_row(row: StaffRow, deadline: float) -> None:
@@ -1188,7 +1226,7 @@ def slot_operation(key: str, name: str, *, join: bool = True) -> Generator[None]
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b", buffering=0) as lock:
-        _acquire_slot(lock, name)
+        _acquire_slot(lock, name, slot_key=key)
         previous = os.environ.get(variable)
         _write_slot_holder(lock)
         try:
@@ -1251,8 +1289,6 @@ def row_activity(key: str) -> RowAvailable | RowBusy | RowMoving:
 @contextmanager
 def mark_row_move(key: str, target: str) -> Generator[None]:
     """Publish the move while the caller holds the row lock."""
-    from scripts.lib import process_start
-
     path, variable = _row_lock(key)
     if not _joined_operation(path, variable):
         raise StaffRefused("the move does not hold the row")
@@ -1264,8 +1300,7 @@ def mark_row_move(key: str, target: str) -> Generator[None]:
             stream.flush()
 
         holder = _holder_fields()
-        owner = process_start.process_start(os.getpid())
-        write(holder | {"start": owner.start, "target": target} if isinstance(owner, process_start.Started) else holder)
+        write(holder | {"target": target} if holder.get("start") else holder)
         try:
             yield
         finally:
@@ -1606,10 +1641,19 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
                                          for path in cast(list[object], inputs)):
         raise StaffUnreadable("invalid staff input paths")
     rows = _rows(fields.get("rows"))
+    proofs = fields.get("priority_request_proofs", {})
+    if not isinstance(proofs, dict):
+        raise StaffUnreadable("invalid priority request proofs")
+    try:
+        priority_request_proofs = {PriorityRequestKey.read(key): PriorityRequestOutcome(outcome)
+                                   for key, outcome in cast(dict[object, str], proofs).items()}
+    except (StaffRefused, ValueError) as error:
+        raise StaffUnreadable("invalid priority request proofs") from error
     return StaffSnapshot(tuple(rows),
                          tuple(sorted({StaffId(item) for item in cast(list[str], pending)})),
                          tuple(cast(list[str], inputs)), cast(int, fields.get("schema", 2)),
-                         all("current_session" in item for item in cast(list[dict[str, object]], fields.get("rows", []))))
+                         all("current_session" in item for item in cast(list[dict[str, object]], fields.get("rows", []))),
+                         priority_request_proofs=priority_request_proofs)
 
 
 def _remote(arguments: list[str], *, input_text: str | None = None, machine: str = OWNER_MACHINE) -> object:
@@ -1931,7 +1975,8 @@ def _location_paths(row: StaffRow) -> tuple[Path, ...]:
                  if isinstance(location, (LiveDoc, WrappedDoc, PresentWorktree, RemovedWorktree, SessionLaunchFolder)))
 
 
-def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
+def _store(rows: list[StaffRow], pending: set[StaffId],
+           priority_request_proofs: Mapping[PriorityRequestKey, PriorityRequestOutcome]) -> None:
     from scripts.lib import atomic_file
 
     retained = cast(dict[str, object], _decode(_file().read_text(encoding="utf-8"))) if _file().exists() else {}
@@ -1940,6 +1985,8 @@ def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
     document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows] + unknown}
     if pending:
         document["pending_retire"] = sorted(pending)
+    if priority_request_proofs:
+        document["priority_request_proofs"] = {key.value: outcome for key, outcome in priority_request_proofs.items()}
     atomic_file.write_text_atomic(_file(), json.dumps(document, indent=2, sort_keys=True) + "\n")
     _copy_to_mac()
 
@@ -1986,7 +2033,8 @@ mv -f "$temporary" "$directory/staff.json"
         print(f"staff: Mac copy failed: {' '.join(str(error).split())}", file=sys.stderr)
 
 
-def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
+def _staff_transaction(edit: Callable[
+        [list[StaffRow], set[StaffId], dict[PriorityRequestKey, PriorityRequestOutcome]], _Result]) -> _Result:
     from scripts.lib import atomic_file
     from scripts.agents import worker_lifecycle
 
@@ -2000,7 +2048,8 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
             original = _load(initial=True)
             proposed = list(original.all_rows)
             pending = set(original.pending_retire)
-            result = edit(proposed, pending)
+            proofs = dict(original.priority_request_proofs)
+            result = edit(proposed, pending, proofs)
             if path.resolve() == _default_file().resolve():
                 previous = {row.id: row for row in original.all_rows}
                 for row in proposed:
@@ -2012,12 +2061,13 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
                         if any(identity[14:15] == "5" for identity in (row.id, row.current_session)):
                             raise StaffRefused("fixture runtime id cannot enter the real staff record")
             proposed.sort(key=lambda row: row.id)
-            if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.all_rows) and pending == set(original.pending_retire):
+            if (original.schema == 2 and original.current_sessions_recorded and proposed == list(original.all_rows)
+                    and pending == set(original.pending_retire) and proofs == original.priority_request_proofs):
                 # A prior replace may have succeeded before its folder sync failed.
                 atomic_file.sync_folder(path.parent)
                 print("unchanged", file=sys.stderr)
             else:
-                _store(proposed, pending)
+                _store(proposed, pending, proofs)
             return result
     except worker_lifecycle.OperationDeadlineExpired:
         raise
@@ -2025,6 +2075,10 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
         if isinstance(error, StaffUnreadable):
             raise
         raise StaffUnreadable(f"cannot write staff record: {error}") from error
+
+
+def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
+    return _staff_transaction(lambda rows, pending, _proofs: edit(rows, pending))
 
 
 def _transaction(edit: Callable[[list[StaffRow]], _Result]) -> _Result:
@@ -2659,6 +2713,35 @@ def set_producer_top_item(identity: StaffId, top_item: TopItem) -> StaffRow:
     return _transaction(edit)
 
 
+def settle_priority_request(key: PriorityRequestKey,
+                            command: ApplyPriorityRequest | RefuseUnappliedPriority) -> PriorityRequestOutcome:
+    """Read the final proof or write it with the priority change."""
+    if not is_owner():
+        arguments = ["settle-priority-request"]
+        if isinstance(command, ApplyPriorityRequest):
+            arguments += [f"--producer={command.producer}", f"--number={command.item.number}"]
+        result = _remote(arguments, input_text=key.value)
+        if isinstance(result, str) and result in (PriorityRequestOutcome.SAVED, PriorityRequestOutcome.NOT_SAVED):
+            return PriorityRequestOutcome(result)
+        raise StaffUnreadable("invalid priority request outcome")
+
+    def edit(rows: list[StaffRow], _pending: set[StaffId],
+             proofs: dict[PriorityRequestKey, PriorityRequestOutcome]) -> PriorityRequestOutcome:
+        existing = proofs.get(key)
+        if existing is not None:
+            return existing
+        outcome = PriorityRequestOutcome.NOT_SAVED
+        if isinstance(command, ApplyPriorityRequest) and command.item.number > 0:
+            row = _row_by_id(rows, command.producer)
+            if row is not None and row.kind == "producer" and not isinstance(row.retirement, RetiredProducer):
+                rows[rows.index(row)] = replace(row, top_item=command.item)
+                outcome = PriorityRequestOutcome.SAVED
+        proofs[key] = outcome
+        return outcome
+
+    return _staff_transaction(edit)
+
+
 def retire(staff_id: StaffId) -> StaffRow | None:
     if not is_owner():
         value = _remote(["retire", staff_id])
@@ -2908,6 +2991,7 @@ class _Arguments:
     marker: str = ""
     profile: str = ""
     number: str = ""
+    producer: str = ""
     hold_record: str = ""
     resume_key: str = ""
     restore_pause: bool = False
@@ -3023,6 +3107,10 @@ def _parser() -> argparse.ArgumentParser:
     _ = producer_top_item.add_argument("target")
     _ = producer_top_item.add_argument("--number", required=True, help="a List item number")
     _ = producer_top_item.add_argument("--json", action="store_true")
+    priority_request = verbs.add_parser("settle-priority-request", help=argparse.SUPPRESS)
+    _ = priority_request.add_argument("--producer", default="")
+    _ = priority_request.add_argument("--number", default="")
+    _ = priority_request.add_argument("--json", action="store_true")
     creation = verbs.add_parser("producer-creation", help=argparse.SUPPRESS)
     _ = creation.add_argument("creation_action", choices=("read", "claim", "finish", "read-named"))
     _ = creation.add_argument("--name", required=True)
@@ -3195,6 +3283,15 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb == "settle-priority-request":
+        key = PriorityRequestKey.read(sys.stdin.read())
+        command: ApplyPriorityRequest | RefuseUnappliedPriority = RefuseUnappliedPriority.REQUEST
+        if arguments.producer or arguments.number:
+            if not (_valid_id(arguments.producer) and arguments.number.isascii() and arguments.number.isdecimal()):
+                raise StaffRefused("enter a producer and a List item number")
+            command = ApplyPriorityRequest(StaffId(arguments.producer), TopItem(int(arguments.number)))
+        print(json.dumps(settle_priority_request(key, command)))
+        return 0
     if arguments.verb == "worktree-write-lock-status":
         if not is_owner():
             raise StaffRefused("the staff owner must check the worktree write lock")

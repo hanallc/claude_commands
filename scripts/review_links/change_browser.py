@@ -24,12 +24,14 @@ from scripts.production.production_doc import Production, Refusal as ProductionR
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
 from scripts.rebuild import need
-from scripts.review_links import change_page, console, new_item_dialog, page_frame, question_record, review_events, review_items, staff_names
+from scripts.review_links import change_page, console, new_item_dialog, page_frame, page_version, question_record, review_events
+from scripts.review_links import review_items, staff_names
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
 
 MANIFEST = change_page.BROWSER_MANIFEST
 FOLDER = "/(" + change_page.CONSOLE_FOLDER + "|[a-z0-9]{6})"
+_NO_FOLLOWUP_DELIVERY = change_page.NoDelivery()
 
 
 @dataclass(frozen=True)
@@ -639,6 +641,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     settings = conf.read("review_links")
     feedback_rows = settings.whole("feedback_rows")
     refresh_seconds = settings.number("page_refresh_seconds")
+    request_timeout = settings.whole("page_request_timeout_seconds")
     card_motion = page_frame.CardMotion.read(settings)
     prepared = prepare(browser, status, settings=settings)
     names_read = staff_names.StaffNames(prepared.record)
@@ -654,9 +657,9 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     cards = (''.join(section(item, feedback_rows, prepared.record, names=names_read) for item in prepared.changes)
              if kind == "changes"
              else ''.join(question_section(item, browser, feedback_rows, names_read) for item in prepared.questions))
-    content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], "review")
+    content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], "review", SCRIPT_VERSION)
                + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}"'
-               + f' data-script="{SCRIPT_VERSION}" {card_motion.attributes()}>'
+               + f' data-request-timeout-seconds="{request_timeout}" {card_motion.attributes()}>'
                + '<div data-showrunner-filter><label for="review-showrunner">'
                + names_read.role_label("showrunner", "Showrunner:") + '</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
@@ -795,7 +798,9 @@ def save_outcome(production: update_registration.QuestionScope, question: Waitin
     text = question.record.item["text"]
     if outcome in ("answer", "feedback"):
         return update_registration.answer(production, text, identities=identities, only_open=True)
-    if outcome in ("followup", "question"):
+    if outcome == "question":
+        return update_registration.followup(production, text, words, identities=identities, recipient=question.owner)
+    if outcome == "followup":
         return update_registration.followup(production, text, words, identities=identities)
     urgency.move_to_end(update_registration.question_queue(production), update_registration.item_key(question.owner, text),
                         datetime.now(production.zone).replace(tzinfo=None))
@@ -806,7 +811,8 @@ def save_outcome(production: update_registration.QuestionScope, question: Waitin
 def save_question_record(production: update_registration.QuestionScope, question: WaitingQuestion,
                          outcome: change_page.QuestionOutcome, words: str,
                          save: ExactQuestionSave | SelectedQuestionSave, *,
-                         before_write: Callable[[], None]) -> None:
+                         before_write: Callable[[], None],
+                         recipient: staff.StaffId | change_page.NoDelivery = _NO_FOLLOWUP_DELIVERY) -> None:
     """Validate and write one canonical question under its owner's lock."""
     path = update_registration.outstanding_path(production)
     superseded = ''
@@ -833,8 +839,10 @@ def save_question_record(production: update_registration.QuestionScope, question
         if outcome in ('answer', 'feedback'):
             current = replace(current, status='closed')
         elif outcome in ('followup', 'question'):
+            assert isinstance(recipient, str)
             reason = review_events.require_waiting_why(words)
-            item['followup'] = update_registration.PendingFollowup(text=reason, sent=now.strftime('%Y-%m-%dT%H:%M'))
+            item['followup'] = update_registration.PendingFollowup(
+                text=reason, sent=now.strftime('%Y-%m-%dT%H:%M'), recipient=recipient)
             item['waiting_why'] = reason
         else:
             raise change_page.AnswerRefused('choose an action on this card')
@@ -871,15 +879,9 @@ class QuestionQueueSave:
 QUESTION_QUEUE_SAVE = QuestionQueueSave()
 
 
-def question_relay(record: update_registration.QuestionRecord, production: update_registration.QuestionScope,
-                   identities: update_registration.QuestionStaff) -> update_registration.AnswerRelay:
-    return update_registration.answer_relay(production, production.name, update_registration.question_asker(
-        record.item, update_registration.OpenItemWithoutAsker(), identities), identities)
-
-
 def question_receiver(owner: staff.StaffId, outcome: change_page.QuestionOutcome,
                       relay: update_registration.AnswerRelay) -> staff.StaffId:
-    return relay.recipient if outcome not in ("feedback", "question") and isinstance(relay.recipient, str) else owner
+    return owner if outcome in ("feedback", "question") else relay.recipient_or_owner(owner)
 
 
 def question_toast_labels(record: update_registration.QuestionRecord,
@@ -891,7 +893,7 @@ def question_toast_labels(record: update_registration.QuestionRecord,
         return {**labels, "answer": owner, "followup": owner}
     try:
         scope = update_registration.question_scope(record.owner, members)
-        relay = question_relay(record, scope, update_registration.QuestionStaff.for_record(members))
+        relay = update_registration.question_relay(record, scope, update_registration.QuestionStaff.for_record(members))
     except (OSError, ValueError, ProductionRefusal, update_registration.RegistrationFailure):
         return labels
     return {**labels, "answer": receiver_names(members, (question_receiver(record.owner, "answer", relay),)),
@@ -916,7 +918,7 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
         return send(
             current, question.record, production, "question" if outcome == "followup" else outcome, words, status,
             verify_revision=save.verify_revision if isinstance(save, ExactQuestionSave) else None)
-    relay = question_relay(question.record, production, identities)
+    relay = update_registration.question_relay(question.record, production, identities)
     recipient = question_receiver(question.owner, outcome, relay)
     message = question_message(outcome, production.name, item["text"], relay.unit, words, question.key)
     answer = words if outcome == "answer" else ""
@@ -940,7 +942,8 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
 
         try:
             if not isinstance(save, QuestionQueueSave):
-                save_question_record(production, question, outcome, words, save, before_write=claim_delivery)
+                save_question_record(production, question, outcome, words, save, before_write=claim_delivery,
+                                     recipient=recipient)
             else:
                 claim_delivery()
                 relay = save_outcome(production, question, outcome, words, identities)
@@ -1059,7 +1062,7 @@ async function save(row,form,outcome){
  const early=skip || kind!=='questions' && (outcome==='works' || outcome==='not works');
  if(early) moveOn();
  try{
-  const options={method:'POST',body:data,headers:{Accept:'application/json'}};
+  const options={method:'POST',body:data,headers:{Accept:'application/json'},requestTimeoutSeconds:pageRequestSeconds()};
   const response=await heldFetch(form.action,options,skip ? null : sendActionReceiver(form,data));
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
@@ -1075,7 +1078,8 @@ async function save(row,form,outcome){
  }catch(error){
   const undone=error instanceof SendUndone;
   const reason=error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message;
-  showActionFailure(state,undone ? reason : 'Not saved: '+reason);
+  const unknown=saveTimeoutWords(error);
+  showActionFailure(state,undone ? reason : unknown || 'Not saved: '+reason);
   if(early){
    row.dataset.pending='true';form.hidden=false;
    if(skip && undone){
@@ -1092,12 +1096,12 @@ async function save(row,form,outcome){
    const open=document.createElement('button');open.type='button';open.textContent='Open it';
    open.addEventListener('click',()=>go(row.dataset.key));
    const label=row.dataset.shown || row.querySelector('h1')?.textContent || row.dataset.key;
-   const message=undone ? 'Undone: '+label+'. It is back in the list.' : 'Not saved: '+label+'. '+reason;
+   const message=undone ? 'Undone: '+label+'. It is back in the list.' : unknown ? label+': '+unknown+' It is back in the list.' : 'Not saved: '+label+'. '+reason;
    showActionFailure(saveNotice,message);
    saveNotice.append(' ',open);
   }
  }finally{
-  form.dataset.saving='false';activeSaves--;
+  form.dataset.saving='false';activeSaves--;pageRefresh.changed();
   // Read after the save, so an older response cannot restore the saved item.
   if(saved){await motion.settled();heldPage=null;newestRequest++;pageRefresh.refresh(true);}
   else applyHeldPage();
@@ -1107,12 +1111,14 @@ function detailKey(detail){
  const owner=detail.closest('[data-key]');
  return owner?.dataset.key+'/'+[...owner.querySelectorAll('details')].indexOf(detail);
 }
+// A draft can wait on a card that is not shown, so this counts every form that is not done.
+function holdsText(){
+ return [...content.querySelectorAll('textarea,input[type=text]')].some(field=>field.value!=='' && !field.closest('form')?.hidden);
+}
 function applyHeldPage(){
- if(!heldPage || activeSaves || [...content.querySelectorAll('textarea,input[type=text]')].some(field=>field.value!=='' && !field.closest('form')?.hidden)) return;
+ if(!heldPage || activeSaves || holdsText()) return;
  const fresh=heldPage;heldPage=null;
  if(fresh.outerHTML===shownPage) return;
- // A page from an older server script cannot bind the new rows, so it loads again.
- if(fresh.dataset.script!==content.dataset.script){location.reload();return;}
  const opened=new Set([...content.querySelectorAll('details[open]')].map(detailKey));
  const left=scrollX,top=scrollY,focused=document.activeElement;
  const controlId=focused===runnerMenu ? focused.id : '';
@@ -1155,16 +1161,16 @@ async function refreshPage(supersede=false,current=()=>true){
   const page=new DOMParser().parseFromString(await response.text(),'text/html');
   const fresh=page.querySelector('[data-review-content]');
   if(request!==newestRequest || !current()) return;
+  const newer=reloadForNewScript(page,()=>activeSaves>0);if(newer) return newer;
   if(!fresh) throw new Error('The page has no review list.');
   heldPage=fresh;applyHeldPage();return pageRefreshFacts(page);
  }finally{if(request===newestRequest) activeLoads=false;}
 }
 const pageRefresh=createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds,()=>
- activeSaves ? 'An answer is saving.' : [...content.querySelectorAll('textarea,input[type=text]')]
-  .some(field=>field.value!=='' && !field.closest('form')?.hidden) ? 'You have text in a field.' : '');
+ activeSaves ? 'An answer is saving.' : holdsText() ? 'You have text in a field.' : '');
 document.addEventListener('input',()=>{applyHeldPage();pageRefresh.changed();});
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();
 '''
-SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE
-                                          + page_frame.COPY_SCRIPT + page_frame.COPY_STYLE + page_frame.COPY_BUTTON)
+VERSION_PARTS = (change_page.DOCUMENT_ASSETS, PAGE_STYLE, SCRIPT, page_frame.COPY_BUTTON)
+SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)

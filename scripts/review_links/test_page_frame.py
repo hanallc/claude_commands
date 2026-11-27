@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import conf
 from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
 from scripts.review_links import change_page, list_page, page_frame, record_table, review_items, review_page, review_submissions, serve, staff_names
 from scripts.review_links.browser_test_support import STATUS_PAGES, firefox_probe_results, status_configuration
@@ -51,9 +52,34 @@ class PageStatusTests(unittest.TestCase):
                 source = (scripts / path).read_text(encoding='utf-8')
                 self.assertEqual(page_frame.template(source, page.title(), page).count(page_frame.BUTTON_STATES), 1)
 
+    def test_a_change_in_a_shared_part_changes_the_version_of_each_page(self) -> None:
+        from scripts.review_links import (accounts_page, change_browser, images, investigations_page, list_page,
+                                          new_item_dialog, page_version, review_page)
+        pages: tuple[tuple[str, tuple[str, ...], str], ...] = (
+            ("accounts", accounts_page.VERSION_PARTS, accounts_page.SCRIPT_VERSION),
+            ("change browser", change_browser.VERSION_PARTS, change_browser.SCRIPT_VERSION),
+            ("images", images.VERSION_PARTS, images.SCRIPT_VERSION),
+            ("investigations", investigations_page.VERSION_PARTS, investigations_page.SCRIPT_VERSION),
+            ("list", list_page.VERSION_PARTS, list_page.SCRIPT_VERSION),
+            ("review", review_page.VERSION_PARTS, review_page.SCRIPT_VERSION))
+        for _, parts, version in pages:
+            self.assertEqual(page_version.script_version(*parts), version)
+        shared = {"New item SCRIPT": new_item_dialog.SCRIPT, "New item STYLE": new_item_dialog.STYLE,
+                  "New item PAGE_STATE_STYLE": new_item_dialog.PAGE_STATE_STYLE, "STYLE": page_frame.STYLE,
+                  "REFRESH_SCRIPT": page_frame.REFRESH_SCRIPT, "HEADING_STYLE": page_frame.HEADING_STYLE,
+                  "OWNER_STYLE": page_frame.OWNER_STYLE, "PAGE_SCRIPT_ERRORS": page_frame.PAGE_SCRIPT_ERRORS,
+                  "CONSOLE_DIALOG_ASSETS": page_frame.CONSOLE_DIALOG_ASSETS}
+        for name, part in shared.items():
+            index = page_version.SHARED_PARTS.index(part)
+            changed = (*page_version.SHARED_PARTS[:index], part + "//", *page_version.SHARED_PARTS[index + 1:])
+            with self.subTest(part=name), patch.object(page_version, "SHARED_PARTS", changed):
+                for page, parts, version in pages:
+                    self.assertNotEqual(page_version.script_version(*parts), version, page)
+
     def test_page_owner_uses_current_name_and_parent_chain(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = root / "console.conf"
+        _ = write_config_fixture(root / "review_links.conf")
         _ = config.write_text("page.list.owner=owner\nowner.default=default\n", encoding="utf-8")
         document = root / "remote" / "production.md"
         live = staff.LiveDoc("natedev", document)
@@ -794,6 +820,7 @@ class PageStatusTests(unittest.TestCase):
     def test_accounts_shows_the_configured_owner_and_names_the_route(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = root / "console.conf"
+        _ = write_config_fixture(root / "review_links.conf")
         document = root / "production.md"
         showrunner = staff.StaffRow(staff.StaffId("showrunner"), "showrunner", "natedev", staff.STAFF_ROOT,
                                     current_session=staff.StaffId("session-showrunner"),
@@ -862,6 +889,20 @@ class PageStatusTests(unittest.TestCase):
 '''
                 done = subprocess.run([node, '-e', source], text=True, capture_output=True, timeout=20)
                 self.assertEqual((done.returncode, done.stdout.strip()), (0, 'PASS'), done.stderr)
+
+    def test_save_timeout_words_name_only_a_timeout(self) -> None:
+        source = "function pageRequestSeconds(){return 7;}\n" + page_frame.SAVE_TIMEOUT_SCRIPT + r"""
+const words='No answer in 7 s. The save can still finish.';
+const results=[
+ saveTimeoutWords(new DOMException('The operation timed out.','TimeoutError'))===words,
+ saveTimeoutWords(new DOMException('The operation timed out.','TimeoutError'),3)==='No answer in 3 s. The save can still finish.',
+ saveTimeoutWords(new TypeError('NetworkError when attempting to fetch resource.'))==='',
+ saveTimeoutWords(new DOMException('The operation was aborted.','AbortError'))===''];
+console.log(results.every(Boolean) ? 'PASS' : JSON.stringify(results));
+"""
+        node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
+        done = subprocess.run([node, '-e', source], text=True, capture_output=True, timeout=20)
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, 'PASS'), done.stderr)
 
     def test_invalid_initial_facts_report_failed_without_an_unhandled_rejection(self) -> None:
         markup = page_frame.title("AWS", "aws")
@@ -1145,22 +1186,16 @@ async function newItemOver(under,description){
  check(under.open,description+' stays open under New item.');
  return captures.at(-1);
 }
+async function capturedDocument(capture){
+ const bytes=Uint8Array.from(atob(capture.document_gzip),char=>char.charCodeAt(0));
+ const stream=new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+ return new DOMParser().parseFromString(await new Response(stream).text(),'text/html');
+}
 async function closeNewItem(under,description){
  newItem().querySelector('[data-cancel]').click();
  await painted();
  check(!newItem().open && under.open && under.contains(document.activeElement),
   'Closing New item leaves '+description+' open with the focus in it.');
-}
-// The screenshot service loads the address and takes the picture at the load event.
-async function opensAgain(place,ready,description){
- const frame=document.createElement('iframe');
- frame.style.cssText='border:0;width:'+innerWidth+'px;height:'+innerHeight+'px';
- const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
- frame.src=place;document.body.append(frame);
- await loaded;
- check(ready(frame.contentDocument),'The screenshot address opens '+description+' by the load event.');
- check(!frame.contentWindow.location.hash.includes('console-window'),'The page removes the window name from its address.');
- frame.remove();
 }
 async function report(){await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});}
 '''
@@ -1288,10 +1323,12 @@ class PageWindowTests(unittest.TestCase):
    'The copy in the window has no plate and no ring around its controls.');
   check(pressNewItem('over the picture')!==null,'The press reaches New item.');
   const capture=await newItemOver(picture,'the picture');
-  check(capture.place===location.pathname+'#console-window='+encodeURIComponent('/fixture/picture.svg'),
-   'The screenshot address names the open picture: '+capture.place);
+  const copy=await capturedDocument(capture);
+  const zoom=copy.querySelector('dialog[data-image-zoom-dialog][open][data-capture-modal]');
+  check(zoom?.querySelector('img').getAttribute('src')==='/fixture/picture.svg',
+   'The snapshot keeps the open picture.');
+  check(!copy.querySelector('#review-new-item,[data-new-item-draft]'),'The snapshot omits New item.');
   await closeNewItem(picture,'the picture');
-  await opensAgain(capture.place,doc=>doc.querySelector('[data-image-zoom-dialog]')?.open===true,'the picture');
  }catch(error){failures.push(String(error));}
  await report();
 })();''')
@@ -1306,7 +1343,8 @@ class PageWindowTests(unittest.TestCase):
   await until(()=>captures.length>0,'the first New item screenshot request');
   const dialog=newItem();
   check(dialog.open && onTop(dialog),'New item opens.');
-  check(captures[0].place===location.pathname,'With no other window open the screenshot address is the page.');
+  const snapshot=await capturedDocument(captures[0]);
+  check(!snapshot.querySelector('dialog[open]'),'The snapshot omits New item.');
   const copy=pressNewItem('over New item');
   check(copy!==null && dialog.contains(copy),'The New item button over New item belongs to its window.');
   await painted();

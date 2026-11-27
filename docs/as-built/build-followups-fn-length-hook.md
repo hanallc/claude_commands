@@ -151,7 +151,12 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
 
 ### Account usage rate
 
-- `scripts/whoami/run_out.py`: `Reading(at, used_percent)`, `read_readings`, and `weighted_rate(readings, end) -> float | None`: percent used per second by `end`, each rise between consecutive readings weighted by 0.5^(age / `HALF_LIFE`, 12 h). A drop (a weekly refill or a redeemed reset), time at 100% and a gap over `MAX_GAP` (15 min: the account sat logged out) are skipped, so rises before a refill still count. None until the counted time, weighted, reaches `MIN_SPAN` (1 h).
+- `scripts/whoami/run_out.py` provides `Reading(at, used_percent)`, `read_readings`, and `hourly_usage_rate`.
+  The rate measures the rise and elapsed time from the window start to the latest reading.
+  The setting `rate.lookback_minutes` sets the window length.
+  The latest reading must be at most `MAX_GAP` old.
+  The observed span must reach the window start without a refill, a gap over `MAX_GAP`, or an interval that starts at 100%.
+  The function returns `NoUsageRate` when these conditions fail or the readings show no rise.
 
 ### Showrunner settings and stall watcher
 
