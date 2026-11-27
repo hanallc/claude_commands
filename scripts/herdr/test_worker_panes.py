@@ -1534,6 +1534,38 @@ class WorkerPaneTests(StaffTestCase):
                     self.assertIn(str(first.row.current_session), self.world.requests[-1][1])
                 self.assertEqual(self.world.closed, [])
 
+    def test_standalone_start_and_resume_keep_the_recorded_phase_session(self) -> None:
+        run = self.run_state()
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        key = "CARGO_BERTH_SESSION_ID"
+        expected = f"{self.parent.current_session}.phase-earlier"
+        self.assertEqual(self.world.requests[-1][2].get(key), expected)
+        entries = pane_launch.read(pane_launch.record_directory() / f"{self.world.session}.json")
+        self.assertEqual(entries[opened.pane]["environment"].get(key), expected)
+
+        path = run / "progress_history_state.json"
+        state = cast(dict[str, object], json.loads(path.read_text()))
+        phases = cast(list[dict[str, object]], state["open_phases"])
+        phases.append({"id": "later", "instance_id": "later-phase", "status": "active"})
+        write_text_atomic(path, json.dumps(state))
+        self.assertTrue(self.world.stop(opened.row, self.world))
+        retained = self.start()
+        assert isinstance(retained, worker_panes.OpenWorker)
+        self.assertEqual(self.world.requests[-1][2].get(key), expected)
+
+        state["pass"] = {opened.row.name: {"instance_id": "dispatch-impl", "worker_id": opened.row.id,
+                                         "team_slot": opened.row.name, "kind": "impl", "status": "active",
+                                         "phase": {"id": "earlier", "instance_id": "earlier-phase"}}}
+        write_text_atomic(path, json.dumps(state))
+        self.assertTrue(self.world.stop(retained.row, self.world))
+        account = accounts.CodexWorkersAccount("codex2", self.root / "codex2")
+        resumed = self.start(account=account)
+        assert isinstance(resumed, worker_panes.OpenWorker)
+        self.assertEqual((resumed.terminal, resumed.row.current_session), (opened.terminal, opened.row.current_session))
+        self.assertEqual(self.world.requests[-1][2].get(key), expected)
+        self.assertEqual(self.world.requests[-1][2]["CODEX_HOME"], str(account.home))
+
     def test_unreadable_launch_environment_without_a_current_dispatch_is_uncertain(self) -> None:
         for status in ("missing", "completed", "refused", "error"):
             with self.subTest(status=status):
@@ -3647,6 +3679,7 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(arguments[arguments.index("--model") + 1],
                                  models_registry.launch_settings("direct", "impl", family).model)
                 self.assertEqual(environment["CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"], str(target))
+                self.assertEqual(environment.get("CARGO_BERTH_SESSION_ID"), f"{self.parent.current_session}.phase-earlier")
 
     def test_account_move_to_the_current_account_does_nothing(self) -> None:
         from scripts.accounts import pane_moves
