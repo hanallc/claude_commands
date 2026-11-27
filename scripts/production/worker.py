@@ -830,14 +830,17 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
     live_ids = {record["run_id"] for record in live}
     if isinstance(pane_pass, progress_history.StoppedPassReceipt) and isinstance(
             pane_pass.results, progress_history.LegacyResultsForStoppedPass):
-        # The quota sweep proved the worker stopped. Wait for any unfinished result delivery.
         pending = live_ids | reap_required | {run_id for run_id in deliveries.keys() - covered
                                              if deliveries[run_id].delivered_at is detached_runs.WorkerResultDeferred.PENDING}
         if pending:
             return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply, reap_required=frozenset(reap_required))
-        if isinstance(reply, DispatchAwaitingReply):
-            return DispatchSubmitted(reply.last_reply)
-        return reply
+        if isinstance(row.parent, staff.ReportsTo):
+            state = worker_panes.observe_worker(row.parent.id, row, staff.local_snapshot())
+            if isinstance(state, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
+                # A stopped worker cannot reply after result delivery.
+                if isinstance(reply, DispatchAwaitingReply):
+                    return DispatchSubmitted(reply.last_reply)
+                return reply
     unseen = {run_id for run_id in deliveries.keys() - received - covered - reap_required
               if deliveries[run_id].delivered_at is not detached_runs.WorkerResultDeliverySuppressed.SUCCESS_ONLY}
     pending = unseen | live_ids | reap_required
