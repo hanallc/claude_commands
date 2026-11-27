@@ -693,6 +693,31 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertEqual(self.migrate(apply=True)[0], 0)
         self.assertEqual({item.id for item in the_list.records(KEEPER.id)}, {"L1", "L2"})
 
+    def test_legacy_journal_keeps_the_next_batch_after_counter_advancement(self) -> None:
+        key = self.native("legacy-journal", {"since": FILED, "text": "Choose a plan", "question": "Which plan?"})
+        with (patch.object(record_store.NumberedRecords, "finish_exchange_number",
+                           new=record_store.NumberedRecords.finish_reserved_number),
+              patch.object(the_list, "_save_exchange_reservation", side_effect=OSError("The reservation write stopped."))):
+            self.assertEqual(self.migrate(apply=True)[0], 1)
+        journal = record_store.state_root() / ".list-exchange-allocation"
+        folder = the_list.folder(KEEPER.id)
+        marker = folder / ".list-allocation-only"
+        self.assertTrue(journal.is_file())
+        self.assertFalse(marker.exists())
+        self.assertEqual((folder / ".next-number").read_text(), "2\n")
+
+        def draft(number: int) -> the_list.ListItem:
+            return the_list._new_item(number, "Batch row", OWNER.id, KEEPER.id, "nate", {})  # pyright: ignore[reportPrivateUsage]
+
+        with self.assertRaisesRegex(the_list.ListError, "next available number is L2"):
+            the_list.create_records(KEEPER.id, (draft(1),))
+        self.assertFalse(journal.exists())
+        self.assertEqual(the_list.exchange_reservation(key), the_list.ExchangeDestination(
+            investigation.ListDestination(KEEPER.id, 1), True))
+        the_list.create_records(KEEPER.id, (draft(2),))
+        row, = the_list.records(KEEPER.id, include_closed=True)
+        self.assertEqual(row.number, 2)
+
     def test_fresh_list_creation_recovers_exchange_allocation_without_reading_sources(self) -> None:
         for method in ("add", "create_records"):
             for stage in ("before counter", "after counter"):

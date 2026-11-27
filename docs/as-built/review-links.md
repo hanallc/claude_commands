@@ -2479,7 +2479,8 @@ Aliases share one row and one folder lock.
 The Studio maps alias keys to the displayed row for queries, saved links, and refreshes.
 Retries use the keeper saved with the reservation or receipt.
 A legacy number can use verified source evidence to recover a former keeper.
-A current link cannot replace the saved route. If it conflicts, filing and the first notice stay pending.
+A link to the reserved number in another folder keeps filing and the first notice pending.
+A link to another number leaves the reserved destination in use.
 The fallback preserves the route for recovery if the keeper returns before the claim.
 The pending delivery marker remains if row verification or fallback saving fails.
 A reply to the native question or a Studio follow-up changes the item from **Working** to **Answered**.
@@ -2546,6 +2547,7 @@ Review keeps the source visible if the List row is unavailable or fails verifica
 An Investigation or Bug move saves its mode in the native record before it writes the List row.
 It saves the selected destination before it publishes the row.
 Review keeps the card visible and refuses actions while the move is pending.
+Review hides exact reply copies when the List has matching receipts.
 The move command resumes the saved mode and verifies the source, report kind, and destination.
 One native save records completion and clears the pending move.
 Older pending Bug moves stay visible in Review until verification succeeds.
@@ -2558,6 +2560,7 @@ The List allocator records the destination before it advances the counter.
 Allocation recovery saves the counter and the source reservation before it removes the journal.
 Fresh creation can recover allocation metadata without reading List rows.
 A durable marker identifies a counter that contains only exchange allocations.
+An older journal can restore a missing marker when the folder is empty and the counter equals the reserved number plus one.
 A rejected batch keeps that marker. A corrected batch can reserve new numbers but cannot reuse a reserved number.
 Publishing a row clears the marker so an initialized folder cannot accept a second batch.
 Source recovery checks the complete List before it writes the reserved row.

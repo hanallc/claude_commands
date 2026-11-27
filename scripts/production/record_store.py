@@ -951,9 +951,11 @@ class NumberedRecords:
         counter = self._saved_next_number(self.counter_path())
         marker = self._allocation_only_counter()
         saved = self._saved_next_number(marker)
-        if (counter < number + 1 and not any(self.folder().glob("*.md"))
-                and (saved == number + 1 or saved == counter)):
-            write_text_atomic(marker, f"{number + 1}\n", new_file_mode=0o600)
+        next_number = number + 1
+        advancing = counter < next_number and saved in (next_number, counter)
+        legacy = counter == next_number and saved == 0
+        if (advancing or legacy) and not any(self.folder().glob("*.md")):
+            write_text_atomic(marker, f"{next_number}\n", new_file_mode=0o600)
         self.finish_reserved_number(number)
 
     def finish_reserved_number(self, number: int) -> None:

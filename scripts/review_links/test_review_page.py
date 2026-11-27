@@ -5222,6 +5222,38 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         self.assertIs(closed.state, investigation.InvestigationState.READ)
         self.assertEqual([event.words for event in closed.log if review_items.list_move_event(event)], ["moved to List item 1"])
 
+    def test_pending_bug_move_keeps_the_card_and_hides_receipted_reply_copies(self) -> None:
+        from scripts.review_links import answer_sources
+
+        keeper = fixture_member("producer", name="morty")
+        native = investigation.file(self.fixture.unit.id, "Check the menu", "The last entry clips.",
+                                    waiting_why="The owner checks the menu.", kind=investigation.InvestigationKind.BUG)
+        reply = "Check the last entry."
+        with patch.object(answer_sources, "file_saved_investigation"):
+            native = investigation.answer(native.owner, native.id, reply)
+        key = review_items.investigation_record_key(native)
+        with patch.object(the_list, "verify_investigation_move", side_effect=OSError("The readback stopped.")):
+            with self.assertRaisesRegex(OSError, "The readback stopped"):
+                _ = the_list.move_review_bugs(staff.snapshot())
+        pending = investigation.load(native.owner, native.id)
+        destination = investigation.ListDestination(keeper.id, 1)
+        self.assertEqual(pending.list_move, investigation.PendingListMove(investigation.ListFilingMode.MOVE_BUG, destination))
+        before = review_page.build_snapshot(self.root).body(key)
+        self.assertEqual(before.count(reply.encode()), 2)
+
+        answer_sources.file_saved_investigation(pending)
+        row, = the_list.records(keeper.id)
+        exchange, = row.filed_exchanges
+        self.assertEqual(the_list.confirmed_exchanges(key, destination, row.filed_exchanges), frozenset({exchange}))
+        after = review_page.build_snapshot(self.root)
+        saved = after.records[key]
+        self.assertFalse(review_items.on_list(saved))
+        self.assertIs(saved.moved_report, investigation.NoListDestination.ABSENT)
+        self.assertIn(key, {entry["key"] for entry in after.entries})
+        card = after.body(key)
+        self.assertNotIn(reply.encode(), card)
+        self.assertIn(b"Answer filed on the List", card)
+
     def test_pending_wait_move_resumes_after_the_owner_answers(self) -> None:
         keeper = fixture_member("producer", name="morty")
         native = investigation.file(self.fixture.unit.id, "Check startup", "Read the startup log.",
