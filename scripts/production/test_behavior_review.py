@@ -388,7 +388,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
 
     def save_image_answer(self, item: str, identity: str, action: str, *,
                           save_record: bool = True, different_key: bool = False, save_keeper: bool = True,
-                          feedback: str = "", event_words: str | None = None) -> str:
+                          feedback: str = "", event_words: str | None = None,
+                          attempt_words: str | None = None) -> str:
         words = f"Image {identity}: {images.ANSWERS[action]}"
         message = images.ANSWER_PREFIX + images.ANSWERS[action]
         if feedback:
@@ -404,7 +405,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                 "id": identity, "owner": keeper, "registered_at": "2026-11-20T15:00:00+00:00",
                 "list_item": item, "attempts": {key: {
                     "message": message,
-                    "words": words, "answered": [], "recipients": [keeper], "confirmed": [keeper],
+                    "words": words if attempt_words is None else attempt_words,
+                    "answered": [], "recipients": [keeper], "confirmed": [keeper],
                 }},
             }
             if save_keeper:
@@ -456,8 +458,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def test_image_approval_claim_does_not_verify_with_a_saved_feedback_answer(self) -> None:
         store, item = self.new_list_record()
         claimed = f"Image b12345678901: {images.ANSWERS['approved']}"
-        _ = self.save_image_answer(item, "b12345678901", "feedback", feedback="Change the heading.",
-                                   event_words=claimed)
+        _ = self.save_image_answer(item, "b12345678901", "feedback", event_words=claimed, attempt_words=claimed)
         self.assertEqual(behavior_request.verified_dates(store.path(item), {claimed}), {})
 
     def test_image_approval_with_a_different_feedback_note_does_not_verify(self) -> None:
