@@ -6294,6 +6294,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn("Could not save the List receipt.", errors.getvalue())
         first, = the_list.records(keeper.id)
         self.assertEqual(first.id, item.id)
+        self.assertIs(first.state, the_list.ItemState.ANSWERED)
+        self.assertIs(first.parked_until, the_list.ParkUntilDelivered.DELIVERED)
         exchange, = first.filed_exchanges
         answer_id = the_list.ReturnedAnswerId(exchange.source_key, exchange.exchange_id)
         saved_answer, = (entry for entry in first.log if isinstance(entry.what, the_list.ReturnedAnswer))
@@ -6326,12 +6328,18 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertFalse(change_page.answer_item(reply, words, origin.reply_token, case.status))
         self.assertEqual(the_list.load(keeper.id, item.id), read)
         self.assertEqual(the_list.unread_answer_ids(read), frozenset())
-        self.assertIs(read.parked_until, the_list.ParkUntilDelivered.DELIVERED)
-        page = list_page.render(case.root, include_counts=False)
-        row = page.partition(b'<tbody data-list-item')[2].partition(b'</tbody>')[0]
-        self.assertIn(b'data-unread-answer="false"', row)
-        self.assertNotIn(b'<small data-new-answer>New answer</small>', row)
-        self.assertEqual(row.count(words.encode()), 1)
+        self.assertIs(read.state, the_list.ItemState.CLOSED)
+        self.assertIs(read.parked_until, the_list.NoTimestamp.UNSET)
+        self.assertEqual(read.closing_words, "Read by nate")
+        query = urlencode({"item-state": item.id, "keeper": keeper.id})
+        response = self.request(f"{studio_page.PAGE_PATH}?{query}")
+        self.assertEqual(response.status, 200, response.body)
+        body = cast(list_page.SavedActionState, json.loads(response.body))
+        self.assertIs(body.get("detail_closed"), True)
+        self.assertEqual(body.get("unread_answer"), "false")
+        detail = body.get("detail_html", "")
+        self.assertNotIn('<small data-new-answer>New answer</small>', detail)
+        self.assertEqual(detail.count(words), 1)
 
     def test_proposal_reply_retry_saves_the_missing_list_receipt(self) -> None:
         case = self.review_fixture()
