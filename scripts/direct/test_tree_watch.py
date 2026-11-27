@@ -15,9 +15,9 @@ from scripts.direct import tree_watch
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 
 from scripts.direct.tree_watch_test_support import (
+    WATCH_DEADLINE,
     EventWatcher,
     TreeWatchFixture,
-    WATCH_DEADLINE,
     write_workspace as write_workspace,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -168,7 +168,10 @@ class TreeWatchTests(TreeWatchFixture):
             watcher, fired, _ = self.start_watcher(parent.pid, real_process=True)
             parent.terminate()
             _ = parent.communicate(timeout=TEST_HANG_GUARD_SECS)
-            output, errors = watcher.communicate(timeout=WATCH_DEADLINE)
+            try:
+                output, errors = watcher.communicate(timeout=WATCH_DEADLINE)
+            except subprocess.TimeoutExpired:
+                self.fail("The watcher did not exit after its parent exited.")
             self.assertEqual(watcher.returncode, 3, output + errors)
             self.assertFalse(fired.exists())
         finally:
@@ -203,7 +206,10 @@ class TreeWatchTests(TreeWatchFixture):
         fault.unlink()
         assert isinstance(process, EventWatcher)
         process.advance()
-        output, errors = process.communicate(timeout=WATCH_DEADLINE)
+        try:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            self.fail("The watcher did not finish after Git could read the changed snapshot.")
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertNotEqual(fired.read_text().strip(), before)
         self.assertEqual(fired.read_text().strip(), self.key("--workspace"))

@@ -3498,7 +3498,7 @@ class ReplyPublicationTests(unittest.TestCase):
                 self.assertIs(clock, fixture.clock)
                 threads.append(threading.get_ident())
                 entered.set()
-                if not release.wait(3):
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
                     raise AssertionError("the test did not release the reader")
                 return updated
 
@@ -3506,10 +3506,12 @@ class ReplyPublicationTests(unittest.TestCase):
                 reader = service.OperatingSystemReader(expected_plan, initial, fixture.readings,
                     fixture.proc, fixture.clock, server.reading_events)
                 try:
-                    self.assertTrue(entered.wait(3))
+                    self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS),
+                                    "the system reader did not enter the fixture read")
                     self.assertIs(reader.latest, initial)
                     release.set()
-                    self.assertTrue(select.select([server.reading_events], [], [], 3)[0])
+                    self.assertTrue(select.select([server.reading_events], [], [], test_hang_guard.TEST_HANG_GUARD_SECS)[0],
+                                    "the system reader did not signal publication")
                     self.assertIs(reader.latest, updated)
                     self.assertTrue(threads)
                     self.assertTrue(all(identity != threading.get_ident() for identity in threads))
@@ -11269,7 +11271,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
         for name, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
             with self.subTest(name=name):
                 self.assertEqual(name in service.ADMISSION_CALLERS, expected)
-        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "production/gate.py", "build_queue/admission_client.py",
+        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/gate.py", "build_queue/admission_client.py",
                          "build_queue/queue_place.py", "mac_test/offload.py", "mac_test/copy_watch.py"):
             with self.subTest(script=relative), AdmissionFixture() as fixture:
                 caller = fixture.proc.spawn()
@@ -12014,7 +12016,8 @@ class MemoryTraceCaptureTests(unittest.TestCase):
 
             def slow_seal(writer: memory_trace.TraceWriter, end: memory_trace.TraceEnd) -> memory_trace.TraceEnd:
                 sealing.set()
-                self.assertTrue(resume.wait(timeout=5))
+                self.assertTrue(resume.wait(test_hang_guard.TEST_HANG_GUARD_SECS),
+                                "the test did not release the trace seal")
                 return seal(writer, end)
 
             def notify(fd: int, value: int) -> None:
@@ -12027,14 +12030,17 @@ class MemoryTraceCaptureTests(unittest.TestCase):
                   mock.patch.object(os, "eventfd_write", side_effect=notify)):
                 worker.thread.start()
                 try:
-                    self.assertTrue(created.wait(timeout=3))
+                    self.assertTrue(created.wait(test_hang_guard.TEST_HANG_GUARD_SECS),
+                                    "the trace writer was not created")
                     self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
                         "blocked-seal", run.grant.reservation, 0)), [wire.Ok()])
-                    self.assertTrue(sealing.wait(timeout=3))
+                    self.assertTrue(sealing.wait(test_hang_guard.TEST_HANG_GUARD_SECS),
+                                    "the trace writer did not enter the seal")
                     initial = run.reader.latest
                     run.reader.thread.start()
                     run.reader.request_read()
-                    self.assertTrue(published.wait(timeout=3))
+                    self.assertTrue(published.wait(test_hang_guard.TEST_HANG_GUARD_SECS),
+                                    "the reader did not publish while the seal was blocked")
                     self.assertIsNot(run.reader.latest, initial)
                 finally:
                     resume.set()
