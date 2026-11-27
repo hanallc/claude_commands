@@ -1174,6 +1174,7 @@ def review_console(draft: Draft, context: QuestionReview, system_prompt: str, pa
     line_rules = question_part_digest((system_prompt, part_system_prompt, SCHEMA, LEGACY_PART_REVIEW_SCHEMA,
                                       CODE_RULES, PART_RULES, review_date_and_zone, context.caption_layout,
                                       sorted(LINE_REVIEW_FINGERPRINT_V1_RULES)))
+    # The full draft includes whitespace between parts.
     draft_fingerprint = question_part_digest((line_rules, context.console_kind, key.console_draft_digest, draft.body))
     cache_rules = draft_fingerprint if whole else rules
     fingerprints = ({number: question_part_digest((cache_rules, part, parts[:number - 1].count(part)))
