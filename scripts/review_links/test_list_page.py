@@ -1532,7 +1532,7 @@ if(example.filterOn){
         steps = r'''
  const linked=()=>recordDetails(row).querySelector('[data-linked-items]');
  check(linked()?.textContent.includes('#1 Check the linked item'),'The first snapshot shows the link.');
- row.closest('[data-undo-seconds]').dataset.undoSeconds='0';
+ row.closest('[data-list]').dataset.undoEnabled='false';
  const fetchAction=window.fetch;
  let releasePage,requestPage;
  const requested=new Promise(resolve=>{requestPage=resolve;});
