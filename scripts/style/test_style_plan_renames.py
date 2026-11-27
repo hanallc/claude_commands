@@ -876,8 +876,18 @@ class StylePlanTests(StylePlanFixture):
 
     def test_structural_move_allows_edits_to_its_existing_destination(self) -> None:
         existing = self.sources[1]
+        self.assert_structural_move_allows_edits(existing, existing)
+
+    def test_structural_move_allows_edits_to_a_destination_named_from_the_crate_source_root(self) -> None:
+        name = "scan/collect.rs"
+        existing = f"crates/alpha/src/{name}"
+        self.write(existing, "fn collect() {}\n")
+        _ = self.commit()
+        self.assert_structural_move_allows_edits(name, existing)
+
+    def assert_structural_move_allows_edits(self, name: str, existing: str) -> None:
         ticket = self.approved_reference_ticket(
-            (("fn old() {}", f"Move the fixtures into {existing}."),), ("restructure",),
+            (("fn old() {}", f"Move the fixtures into {name}."),), ("restructure",),
         )
         ledger = self.ledger()
         ledger.set_tip("HEAD")

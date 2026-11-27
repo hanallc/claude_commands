@@ -2427,7 +2427,6 @@ def live_state_refusal(repo: Path, target: str) -> str:
         except (OSError, subprocess.SubprocessError) as error:
             return f"promotion refused: live state check could not export {target}: {error}"
         settings = tree / "config" / "gate.conf"
-        # Chunk 6 removes the old config path.
         if not settings.exists():
             settings = tree / "config" / "merge_gate.conf"
         if not settings.exists():
