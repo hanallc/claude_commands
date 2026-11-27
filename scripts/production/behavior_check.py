@@ -11,7 +11,7 @@ import argparse
 import ast
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
 from enum import StrEnum
@@ -462,6 +462,8 @@ class Approval(StrEnum):
 @dataclass(frozen=True)
 class Clear:
     reply: Path
+    # These requests lacked proof when the review cleared.
+    unverified_requests: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -508,7 +510,12 @@ def read_record(key: str) -> LandingRecord | NoReview:
         fields = cast(dict[str, object], stored)
         match fields:
             case {"state": "clear", "reply": str(reply)} if reply.strip():
-                return Clear(Path(reply))
+                unverified = fields.get("unverified_requests", [])
+                if not isinstance(unverified, list) or not all(
+                    isinstance(test, str) and test for test in cast(list[object], unverified)
+                ):
+                    raise ValueError("expected test names for unverified requests")
+                return Clear(Path(reply), frozenset(cast(list[str], unverified)))
             case {"state": "waiting", "question_id": str(question), "owner": str(owner)} if question and owner:
                 return Waiting(question, owner)
             case {"state": "invalid_answer", "question_id": str(question), "owner": str(owner), "reason": str(reason)} if question and owner and reason:
@@ -526,8 +533,11 @@ def read_record(key: str) -> LandingRecord | NoReview:
 def write_record(key: str, record: LandingRecord) -> None:
     path = record_path(key)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state: dict[str, object]
     if isinstance(record, Clear):
         state = {"state": "clear", "reply": str(record.reply)}
+        if record.unverified_requests:
+            state["unverified_requests"] = sorted(record.unverified_requests)
     elif isinstance(record, Waiting):
         state = {"state": "waiting", **asdict(record)}
     elif isinstance(record, InvalidAnswer):
