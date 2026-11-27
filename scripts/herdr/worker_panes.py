@@ -161,10 +161,10 @@ class HolderRun(Enum):
 def dispatch_run_fields(parent: StaffId, run: Path, *, record: staff.StaffSnapshot) -> dict[str, object] | AdmissionRefused:
     fields = unit_runs.read_run_fields(run)
     try:
-        _ = pass_recorder.resolve_run_owner(run, fields, record)
+        owner = pass_recorder.resolve_run_owner(run, fields, record)
     except (ValueError, staff.StaffUnreadable) as error:
         return AdmissionRefused(str(error))
-    if fields.get(unit_runs.OWNER_FIELD) != parent:
+    if not isinstance(owner, staff.StaffRow) or owner.id != parent:
         return AdmissionRefused(f"{run}: the run is not owned by {parent}")
     return fields
 
@@ -1664,7 +1664,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     expected = worker_admission.find_worker(record, parent, name.value)
     keep_model = isinstance(policy, UseRolePolicy)
     try:
-        with ExitStack() as operations:
+        with ExitStack() as operations, ExitStack() as recorder_lock:
             held = operations.enter_context(worker_lock(parent, name, blocking=expected is None)) if isinstance(lock, WorkerLockAtUse) else lock
             if isinstance(held, Kept):
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, held.blocker)
@@ -1706,9 +1706,9 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     if isinstance(paths, EnrolledPaths):
                         worker = cast(progress_history.RunArtifactFactory, cast(object,
                             import_module("scripts.production.worker")))
-                        recorder = operations.enter_context(worker.CompletionArtifacts(owner, run).append(path))
+                        recorder = recorder_lock.enter_context(worker.CompletionArtifacts(owner, run).append(path))
                     else:
-                        recorder = operations.enter_context(path.open("a+", encoding="utf-8"))
+                        recorder = recorder_lock.enter_context(path.open("a+", encoding="utf-8"))
                     # Keep the worker lock while holding the recorder lock. Finish-run probes the worker lock without waiting.
                     fcntl.flock(recorder.fileno(), fcntl.LOCK_SH)
                     fields = dispatch_run_fields(parent, run, record=staff.snapshot())
@@ -1723,7 +1723,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
             with worker_admission.worker_operation(allowed):
                 result = _start_locked(owner, name, role, policy, account, allowed, held, codex, paths,
-                                       keep_model=keep_model, selection=target, dispatch_run=dispatch_run)
+                                       keep_model=keep_model, selection=target, dispatch_run=dispatch_run,
+                                       recorder_lock=recorder_lock)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1778,7 +1779,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead,
                   paths: EnrolledPaths | OrdinaryWorkerOwner, *, keep_model: bool,
-                  selection: SelectedWorkers | SelectedWorkerRows, dispatch_run: DispatchRun | HolderRun) -> WorkerStart:
+                  selection: SelectedWorkers | SelectedWorkerRows, dispatch_run: DispatchRun | HolderRun,
+                  recorder_lock: ExitStack) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1853,6 +1855,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                         require_review_process(client, identity, paths)
                     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                         return AdmissionRefused(str(error))
+                recorder_lock.close()
                 try:
                     native = (_codex_start_session(client, identity, pane_row=pane) if policy.settings.kind == "codex" else
                               client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane))
@@ -1913,11 +1916,11 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     selected_home = Path(expected.get(key, default_home)).expanduser().resolve()
                     same_account = running_home == selected_home
             if matches and same_run and same_account:
+                recorder_lock.close()
                 _layout(owner.id, evidence)
                 return current
             changing_run = explicit and not same_run
-        if ((explicit and current.status is herdr.AgentStatus.WORKING)
-                or (changing_run and not current.status.idle)):
+        if explicit and not current.status.idle:
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, f"agent state is {current.status.value}")
         proof = LegacyPassCloseProof.RESTART_REPLY if changing_run else LegacyPassCloseProof.DISPATCH_DONE
         closable = can_close(current, lock=lock, legacy_proof=proof)
@@ -2011,16 +2014,17 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 arguments, herdr.NoOpeningPrompt(),
                 int(start_seconds * 1000), agent=name.value, agent_name=agent_name(owner, name.value))
 
-        try:
-            launched = launch_at(launch_destination)
-        except herdr_types.HerdrFailure as error:
-            parents = launch_evidence.scan.found.get(owner.id, [])
-            if (error.code != "pane_not_found" or not isinstance(launch_destination, herdr.SplitPane)
-                    or len(parents) != 1 or launch_destination.of_pane == _text(parents[0], "pane_id")):
-                raise
-            launch_destination = _parent_split(_text(parents[0], "pane_id"), launch_destination.ratio,
-                                               launch_destination.label)
-            launched = launch_at(launch_destination)
+        with recorder_lock.pop_all():
+            try:
+                launched = launch_at(launch_destination)
+            except herdr_types.HerdrFailure as error:
+                parents = launch_evidence.scan.found.get(owner.id, [])
+                if (error.code != "pane_not_found" or not isinstance(launch_destination, herdr.SplitPane)
+                        or len(parents) != 1 or launch_destination.of_pane == _text(parents[0], "pane_id")):
+                    raise
+                launch_destination = _parent_split(_text(parents[0], "pane_id"), launch_destination.ratio,
+                                                   launch_destination.label)
+                launched = launch_at(launch_destination)
         launches.append(launched)
         launch_destinations[launched.pane] = launch_destination
         pane = client.pane_row(launched.pane)

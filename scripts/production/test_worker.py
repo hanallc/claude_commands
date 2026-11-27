@@ -2446,6 +2446,54 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(world.foreground[opened.pane][0], pid)
         self.assertEqual(len(world.launches), 1)
 
+    def test_explicit_restart_refuses_the_legacy_running_status(self) -> None:
+        opened = self.opened()
+        world = self.fixture.world
+        world.locations[opened.pane]["agent_status"] = herdr.AgentStatus.RUNNING.value
+        policy = worker_panes.launch_policy("review", family="codex")
+
+        result = worker_panes.start_or_resume(self.fixture.parent.id, staff.WorkerName.parse(opened.row.name),
+            "review", policy=policy, dispatch_run=worker_panes.DispatchRun(self.run_dir))
+
+        self.assertEqual(result, worker_panes.StartRefused(worker_panes.StartRefusal.BUSY_ROLE_CHANGE,
+            "agent state is running"))
+        self.assertEqual(world.stops, [])
+        self.assertEqual(len(world.launches), 1)
+
+    def test_explicit_start_releases_the_recorder_before_the_first_turn_wait(self) -> None:
+        world = self.fixture.world
+        run = self.run_dir
+        wait = world.wait_turn_end
+
+        def finish_during_wait(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+            with file_lock.exclusive(pass_recorder.recorder_lock_path(run), wait=False) as recorder:
+                self.assertIs(recorder, file_lock.LockResult.ACQUIRED)
+            pending = progress_history.end_run(run, progress_history.RunEndRequested("completed"))
+            self.assertIsInstance(pending, unit_runs.RunExecutionBlocker)
+            assert isinstance(pending, unit_runs.RunExecutionBlocker)
+            self.assertIn("a worker operation is in progress", pending.reason)
+            self.assertTrue(unit_runs.terminal_run(unit_runs.read_run_fields(run)))
+            return wait(pane, timeout_ms)
+
+        policy = worker_panes.launch_policy("impl", family="codex")
+        with patch.object(world, "wait_turn_end", side_effect=finish_during_wait) as first_turn:
+            result = worker_panes.start_or_resume(self.fixture.parent.id, staff.WorkerName.parse("impl"),
+                "impl", policy=policy, dispatch_run=worker_panes.DispatchRun(run))
+
+        first_turn.assert_called_once()
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+
+    def test_explicit_start_accepts_the_unique_staff_run_pointer(self) -> None:
+        fields = unit_runs.read_run_fields(self.run_dir)
+        del fields[unit_runs.OWNER_FIELD]
+        _ = (self.run_dir / unit_runs.STATE_FILE).write_text(json.dumps(fields))
+
+        result = worker_panes.start_or_resume(self.fixture.parent.id, staff.WorkerName.parse("impl"),
+            "impl", dispatch_run=worker_panes.DispatchRun(self.run_dir))
+
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        self.assertEqual(self.fixture.world.requests[-1][2]["UNIT_RUN_DIR"], str(self.run_dir))
+
     def test_launched_agent_reads_the_kept_launch_settings(self) -> None:
         row = fixture_worker("called-agent", self.fixture.parent.id)
         codex = pane_launch.launch("w1:p9", str(row.current_session), str(self.fixture.root), {},
