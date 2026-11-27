@@ -925,24 +925,27 @@ def labeled_sessions(production_name: str, *, record: staff.StaffSnapshot | None
 
 def _selected_unit(production_name: str, name: str, *, record: staff.StaffSnapshot | None = None,
                    sources: MemberSources | None = None,
-                   running: Sequence[SessionRecord] | None = None) -> tuple[LabeledProductions, str]:
+                   running: Sequence[SessionRecord] | None = None,
+                   registry: sessions.RegistryRead | None = None) -> tuple[LabeledProductions, str]:
     record = record if record is not None else staff.snapshot()
     sources = sources if sources is not None else member_sources()
     selected = sources.member(UnitMember(production_name, name), record)
-    marked = observed_session_labels(record=record, running=running)
+    marked = (observed_session_labels(record=record, running=running) if registry is None
+              else observed_session_labels(record=record, running=running, registry=registry))
     if isinstance(selected, MemberFound):
         found = retained_session_labels(marked, selected.row, production_name, record=record, sources=sources)
         return found, selected.row.name
     return group_labeled_sessions(marked, record=record, sources=sources), name
 
 
-def checked_unit(production_name: str, name: str, *, record: staff.StaffSnapshot | None = None) -> UnitOwner:
+def checked_unit(production_name: str, name: str, *, record: staff.StaffSnapshot | None = None,
+                 registry: sessions.RegistryRead | None = None) -> UnitOwner:
     """Read the selected unit with fresh owner evidence."""
     from scripts.herdr import herdr
 
     try:
         with herdr.process_action():
-            found, label = _selected_unit(production_name, name, record=record)
+            found, label = _selected_unit(production_name, name, record=record, registry=registry)
     except OSError as error:
         return UnknownUnit(str(error))
     return found.checked_unit(production_name, label)
