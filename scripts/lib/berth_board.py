@@ -24,6 +24,53 @@ class BoardModel(TypedDict):
 
 
 @dataclass(frozen=True)
+class MergeNotDerived:
+    protection: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MergeEmpty:
+    pass
+
+
+@dataclass(frozen=True)
+class MergeProtected:
+    scopes: tuple[str, ...]
+
+
+type RetainedMergeEvidence = MergeNotDerived | MergeEmpty | MergeProtected
+
+
+@dataclass(frozen=True)
+class MergeUnavailable:
+    retained_evidence: RetainedMergeEvidence
+    failure: str
+
+
+type LiveMergeExtent = RetainedMergeEvidence | MergeUnavailable
+
+
+@dataclass(frozen=True)
+class MergeReleased:
+    at_release: LiveMergeExtent
+
+
+type MergeExtent = LiveMergeExtent | MergeReleased
+
+
+def _blocks(scopes: tuple[str, ...], path: str | Path) -> bool:
+    candidate = PurePosixPath(path).as_posix()
+    for scope in scopes:
+        if scope.startswith("tree:"):
+            root = scope.removeprefix("tree:").rstrip("/")
+            if root == "." or candidate == root or candidate.startswith(root + "/"):
+                return True
+        elif candidate == scope.removeprefix("file:"):
+            return True
+    return False
+
+
+@dataclass(frozen=True)
 class Reservation:
     reservation_id: str
     target: str
@@ -34,18 +81,26 @@ class Reservation:
     edit_blocking_status: Literal["blocking", "clear"]
     # The commit an outstanding reservation protects; empty in every other stage.
     protected_tip: str = ""
+    merge_extent: MergeExtent = MergeEmpty()
+    source_kind: str = "explicit"
 
     def blocks(self, path: str | Path) -> bool:
+        return self.edit_blocking_status == "blocking" and _blocks(self.scopes, path)
+
+    def blocks_foreign(self, path: str | Path) -> bool:
+        """Use cargo-berth's Reservation::protection_in_worktree for a foreign holder."""
         if self.edit_blocking_status != "blocking":
             return False
-        candidate = PurePosixPath(path).as_posix()
-        for scope in self.scopes:
-            if scope.startswith("tree:"):
-                root = scope.removeprefix("tree:").rstrip("/")
-                if root == "." or candidate == root or candidate.startswith(root + "/"):
-                    return True
-            elif candidate == scope.removeprefix("file:"):
-                return True
+        if self.source_kind == "plan_shrink" and self.lifecycle == "active":
+            return _blocks(self.scopes, path)
+        extent = self.merge_extent
+        # MergeExtent::protection uses the last evidence when observation fails.
+        if isinstance(extent, MergeUnavailable):
+            extent = extent.retained_evidence
+        if isinstance(extent, MergeProtected):
+            return _blocks(extent.scopes, path)
+        if isinstance(extent, MergeNotDerived):
+            return _blocks(extent.protection, path)
         return False
 
     def names_file(self, path: str | Path) -> bool:
@@ -108,6 +163,77 @@ def _section(value: object) -> BoardSection:
     return {"journal_position": _object(fields["journal_position"]), "entries": _list(fields["entries"])}
 
 
+def _merge_path(value: object) -> str:
+    path = _string(value)
+    if ("\\" in path or (len(path) > 1 and path[0].isascii() and path[0].isalpha() and path[1] == ":")
+            or any(part.lower() in ("", ".", "..", ".git") for part in path.split("/"))):
+        raise ValueError("invalid merge extent path")
+    return path
+
+
+def _scopes(value: object, *, declared: bool = False) -> tuple[str, ...]:
+    scopes: list[str] = []
+    for scope in _list(value):
+        if declared and isinstance(scope, str):
+            scopes.append(_string(scope))
+            continue
+        fields = _object(scope)
+        kind = fields["kind"]
+        if kind not in ("tree", "file"):
+            raise ValueError("unknown scope kind")
+        if declared:
+            path = _string(fields["path"])
+            scopes.append("tree:" + path if kind == "tree" else path)
+        else:
+            scopes.append(f"{kind}:{_merge_path(fields['path'])}")
+    if not scopes:
+        raise ValueError("reservation has no scopes")
+    return tuple(scopes)
+
+
+def _validate_merge_key(value: object) -> None:
+    key = _object(value)
+    _ = _string(key["trunk"]), _string(key["head"])
+    working_tree = _object(key["working_tree"])
+    for field in ("tracked_paths", "untracked_paths"):
+        for path in _list(working_tree[field]):
+            _ = _merge_path(path)
+    if "reservation_group" in key:
+        group = _object(key["reservation_group"])
+        if group["kind"] == "reservation_shares":
+            for identity in _list(group["reservation_ids"]):
+                _ = _string(identity)
+        elif group["kind"] != "full_holder":
+            raise ValueError("unknown merge extent reservation group")
+
+
+def _merge_evidence(fields: dict[str, object]) -> RetainedMergeEvidence:
+    match fields["status"]:
+        case "not_derived":
+            return MergeNotDerived(_scopes(fields["protection"]))
+        case "empty":
+            _validate_merge_key(fields["key"])
+            return MergeEmpty()
+        case "protected":
+            _validate_merge_key(fields["key"])
+            return MergeProtected(_scopes(fields["scopes"]))
+        case _:
+            raise ValueError("unknown merge extent evidence status")
+
+
+def _live_merge_extent(fields: dict[str, object]) -> LiveMergeExtent:
+    if fields["status"] == "unavailable":
+        return MergeUnavailable(_merge_evidence(_object(fields["retained_evidence"])), _string(fields["failure"]))
+    return _merge_evidence(fields)
+
+
+def _merge_extent(value: object) -> MergeExtent:
+    fields = _object(value)
+    if fields["status"] == "released":
+        return MergeReleased(_live_merge_extent(_object(fields["at_release"])))
+    return _live_merge_extent(fields)
+
+
 def _reservation(value: dict[str, object]) -> Reservation:
     holder = _object(value["holder"])
     branch = holder["branch"]
@@ -130,22 +256,10 @@ def _reservation(value: dict[str, object]) -> Reservation:
     status = value["edit_blocking_status"]
     if status not in ("blocking", "clear"):
         raise ValueError("unknown edit blocking status")
-    scopes: list[str] = []
-    for scope in _list(value["scopes"]):
-        if isinstance(scope, str):
-            scopes.append(_string(scope))
-        else:
-            fields = _object(scope)
-            kind = fields["kind"]
-            if kind not in ("tree", "file"):
-                raise ValueError("unknown scope kind")
-            path = _string(fields["path"])
-            scopes.append("tree:" + path if kind == "tree" else path)
-    if not scopes:
-        raise ValueError("reservation has no scopes")
     return Reservation(
         _string(value["reservation_id"]), _string(target), Path(_string(holder["worktree_root"])),
-        _string(branch), tuple(scopes), _string(lifecycle), status, protected_tip,
+        _string(branch), _scopes(value["scopes"], declared=True), _string(lifecycle), status, protected_tip,
+        merge_extent=_merge_extent(value["merge_extent"]), source_kind=_string(_object(value["source"])["kind"]),
     )
 
 
