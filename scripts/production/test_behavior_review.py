@@ -176,6 +176,17 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertEqual(result.stdout.splitlines(), [str(checker_root / "scripts/lib/transcripts.py"),
                                                       str(checker_root / "scripts/production/update_registration.py")])
 
+    def test_reviewer_prompt_requires_a_quote_from_one_source_message(self) -> None:
+        args, _ = self.changed_range()
+        self.reply(CLEAR_REPLY)
+        with mock.patch.object(astra_review, "run_review", return_value=0) as runner:
+            code, output = self.cli("run", *args)
+
+        self.assertEqual(code, 0, output)
+        prompt = cast(str, runner.call_args.args[1])
+        self.assertIn("Quote one or more complete sentences or lines in order from one source message only.", prompt)
+        self.assertIn("If several messages contain relevant words, quote the newest message that sets the behavior.", prompt)
+
     def test_clear_requires_a_saved_reply_for_this_patch_and_each_test(self) -> None:
         args, key = self.changed_range()
         self.reply(CLEAR_REPLY)
@@ -195,7 +206,10 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("Find Nate's newest words that set each affected behavior.", prompt)
         self.assertIn("saved question answer or feedback.", prompt)
         self.assertIn('Use "specified" when you find words to assess', prompt)
-        for verdict in ("against", "follows", "different", "unclear"):
+        self.assertIn('Use "against" only when the change removes or changes behavior Nate explicitly asked for.', prompt)
+        self.assertIn('A refinement of a term Nate did not define, such as "history", does not warrant "against".', prompt)
+        self.assertNotIn('Use "against" when a replacement', prompt)
+        for verdict in ("follows", "different", "unclear"):
             self.assertIn(f'Use "{verdict}" when', prompt)
         self.assertIn('In "reason", write one plain line that explains the verdict.', prompt)
         self.assertEqual(behavior_check.read_record(key), behavior_check.Clear(self.folder / "completed-reply.txt"))
@@ -795,13 +809,15 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         )
         for case, finding, parts in (
             ("move timing", MOVE_FINDING, MOVE_QUESTION),
-            ("wait source", source_change, source_question),
+            # Nate wrote these words at 09:12 PST on 2026-11-27.
+            # "i never explicitly asked for what usage history means"
+            # "i explicitly asked for the last hour to be what IS USED to calculate"
+            ("wrong assessment example for a replaced named source", source_change, source_question),
         ):
             with self.subTest(case=case):
-                case_root = self.root / case
-                folder = case_root / "review"
-                folder.mkdir(parents=True)
-                with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(case_root / "state")}),
+                folder = self.root / case
+                folder.mkdir()
+                with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(folder / "state")}),
                       mock.patch.object(astra_review, "review_attempt_folder", return_value=folder),
                       mock.patch.object(self, "folder", folder)):
                     _ = self.filed_question(finding, parts)
@@ -811,10 +827,10 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             **MOVE_FINDING, "verdict": "unclear", "reason": "The words do not give a time for a move during a build.",
         })
 
-    def assert_clear_verdict(self, verdict: str, reason: str) -> None:
+    def assert_clear_verdict(self, finding: Mapping[str, str]) -> None:
         args, key = self.changed_range()
-        self.specified_move_reply({**MOVE_FINDING, "verdict": verdict, "reason": reason})
-        expected = f"{key} clear\ntest_fixture.py::test_move {verdict} {reason}\n"
+        self.specified_move_reply(finding)
+        expected = f"{key} clear\n{finding['test']} {finding['verdict']} {finding['reason']}\n"
         with (mock.patch.object(astra_review, "run_review", return_value=0) as runner,
               mock.patch.object(update_registration, "ask") as ask):
             self.assertEqual(self.cli("run", *args, "--question", str(self.question_file(MOVE_QUESTION))), (0, expected))
@@ -827,10 +843,27 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertEqual((self.folder / "completed-reply.txt").read_bytes(), (self.folder / "review.md").read_bytes())
 
     def test_follows_verdict_clears_and_stays_in_the_proof(self) -> None:
-        self.assert_clear_verdict("follows", "The restart still occurs after the move.")
+        self.assert_clear_verdict({
+            **MOVE_FINDING, "verdict": "follows", "reason": "The restart still occurs after the move.",
+        })
 
     def test_different_verdict_clears_and_stays_in_the_proof(self) -> None:
-        self.assert_clear_verdict("different", "The words describe restarts during an account move.")
+        self.assert_clear_verdict({
+            **MOVE_FINDING, "verdict": "different", "reason": "The words describe restarts during an account move.",
+        })
+
+    def test_account_pace_refinement_clears_without_a_question(self) -> None:
+        self.assert_clear_verdict({
+            **MOVE_FINDING,
+            "quote": (
+                "i never explicitly asked for what usage history means - in fact i explicitly asked for the last hour "
+                "to be what IS USED to calculate"
+            ),
+            "date": "2026-11-27",
+            "change": "The last hour of use sets the wait.",
+            "verdict": "follows",
+            "reason": "The wait uses the last hour as Nate asked.",
+        })
 
     def test_specified_findings_require_a_known_verdict_and_a_one_line_reason(self) -> None:
         row: dict[str, object] = {"test": "test_fixture.py::test_move", "finding": "specified", "quote": MOVE_QUOTE,

@@ -24,12 +24,20 @@ The prompt gives the checker's absolute code root and paths to the transcript re
 The reviewer starts isolated Python from the checker's code root before it imports the checker modules.
 It passes the imports to Python with `-c` so the shell needs no temporary file.
 The reviewer runs each command in one tool call without `write_stdin`.
-The gate checks each changed test for no user decision or a verified request from Nate.
+For a `requested` finding, the reviewer quotes one source message.
+If several messages contain relevant words, the reviewer quotes the newest message that sets the behavior.
+The gate checks the finding for each changed test.
+Source verification applies only to `requested` findings.
 The check accepts typed Claude turns, sent List Tell feedback from Nate, and Nate's saved List or Question answers.
 It matches consecutive full sentences or lines and treats each run of whitespace as one space.
-The check reports the date from the source. If the source cannot prove the author or quote, the finding needs a question.
+The check reports the date from the source. A `requested` finding needs a question if the source cannot prove the author or quote.
 Status fails if it cannot read or parse the saved proof for a clear record.
 For a Yes record, the gate reads the answer in the original question.
+
+The reviewer gives a verdict for each `specified` finding.
+Use `against` only when the change removes or changes behavior Nate explicitly asked for.
+A refinement of a term Nate did not define, such as "history", does not warrant `against`.
+The verdicts `against` and `unclear` need a question. The verdicts `follows` and `different` clear the finding.
 
 The showrunner state root stores the records in `behavior_checks/`.
 Each key has one state. The states are clear, waiting, invalid answer, Yes, and No.
@@ -39,7 +47,7 @@ Run `behavior_check.py run` with the same range before a land. Use the repositor
 1. If the range has no changed test, the command exits 0.
 2. If the range has changed tests, the command starts an independent read-only review. Run the same command after the reviewer replies.
 3. The command saves a clear record when no test needs a question. It lists each verified request with its test, quote, date, and source.
-4. A departure from Nate's newest words, uncertainty, or a request with an unverified quote needs a question. The command prints the evidence for those tests.
+4. The command prints the evidence for findings that need a question. It includes requests with unverified quotes.
 5. Send the finding to the unit named in `Ask UNIT (phase PHASE)`.
 6. Ask the author to write the question and run the same command with `--question FILE`.
 7. Run `behavior_check.py status --key KEY` to save the answer and its time. The command also accepts the original range.

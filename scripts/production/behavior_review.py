@@ -226,13 +226,15 @@ For a complete review, return one JSON array. Give one object for each test ID i
 Use {{"test":"ID","finding":"none"}} when you find no such words.
 Use "requested" only when Nate's newest words on the behavior ask for this change.
 For "requested", cite Nate's typed Claude turn, sent List Tell, or saved question answer or feedback.
-Quote one or more complete sentences or lines in order. Use the source date.
+Quote one or more complete sentences or lines in order from one source message only.
+If several messages contain relevant words, quote the newest message that sets the behavior.
+Use the source date.
 Use {{"test":"ID","finding":"requested","quote":"exact words","source":"/absolute/path",
 "date":"YYYY-MM-DD","change":"how the behavior changes"}}
 Use "specified" when you find words to assess and cannot return "requested".
 Use the same fields as "requested" and add "verdict" and "reason".
-1. Use "against" when the change goes against the quoted words.
-   Use "against" when a replacement violates Nate's newest words, even if they only name the source, method, value or rule.
+1. Use "against" only when the change removes or changes behavior Nate explicitly asked for.
+   A refinement of a term Nate did not define, such as "history", does not warrant "against".
 2. Use "follows" when the change follows the quoted words.
 3. Use "different" when the quoted words describe a different behavior.
 4. Use "unclear" when you cannot tell how the change relates to the quoted words.
