@@ -145,12 +145,15 @@ class ContextDeferralTests(unittest.TestCase):
         for name, text in cases.items():
             with self.subTest(name=name):
                 started = time.perf_counter()
-                result = subprocess.run(
-                    [sys.executable, str(HOOK)],
-                    input=json.dumps({"last_assistant_message": text}),
-                    text=True, capture_output=True, check=False,
-                    env=self.environment, timeout=2,
-                )
+                try:
+                    result = subprocess.run(
+                        [sys.executable, str(HOOK)],
+                        input=json.dumps({"last_assistant_message": text}),
+                        text=True, capture_output=True, check=False,
+                        env=self.environment, timeout=TEST_HANG_GUARD_SECS,
+                    )
+                except subprocess.TimeoutExpired:
+                    self.fail(f"The context deferral hook did not return a verdict for {name}.")
                 elapsed = time.perf_counter() - started
                 self.assert_allowed(result)
                 self.assertLess(elapsed, 2)
