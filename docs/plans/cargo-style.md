@@ -238,6 +238,8 @@ A fix phase runs before phase 4 (cargo-liner showrunner, 2026-11-26): `style-spl
 6. `s4-coverage` (checkpoint ce2d467e7 on `style-s4-coverage`, 2026-11-23; on cargo-liner main as 77c877600, 2026-11-24): `coverage` with observed counts and the cell projection for tier A, C and E rules. A rule that needs B or D sites gives a typed `Unavailable` answer.
 7. `s4-coverage-sites` (checkpoint b41da3bf4 on `style-s4-coverage-sites`, 2026-11-27): tier B and D cells and rule counts from the native `sites` membership, with Python parity. `coverage --checkout` has the `sites` meaning. Coverage takes the full-refresh refusal, while a direct `sites` request stays rule-scoped. Cold schema 51 fixture: 0.842 s and 13 Git calls for 16 rules and 189 cells.
 
+A follow-up phase closes S4: `s4-shared-followup` (checkpoint 2ecec98ad on `style-s4-shared-followup`, 2026-11-28). Each S4 copy of shared code is gone: the ledger read, JSON escape, glob, ignore and workspace readers, site text trim and rename pair check. The shared readers give the Python answer for `[z-a-c]` glob classes, strict ignore decoding (coverage and sites) and git replace objects. One stated exception: with a replace ref and a warm ledger, Python reuses stale saved candidate cells; Rust gives the cold Python answer.
+
 ### `syn` and reuse
 
 1. `syn`: the reader copies the Python tokenizer, because the cutover proof needed equal output. That reason ends when the Python selection is gone (S8) and N1 is settled. Then measure `syn` (already a workspace dependency, 3.0.6) against the tokenizer on the 25 MB cargo-liner corpus, with fact equality. An earlier probe parsed 25 MB with `syn` in 0.22 s on eight threads.
