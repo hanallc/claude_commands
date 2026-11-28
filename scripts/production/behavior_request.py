@@ -173,7 +173,7 @@ def question_answers(path: Path, legacy_owner: str) -> Iterator[NateWords]:
     events = review_events.decode(question.item.get("review_log", ""))
     for event in events:
         label, _, words = event.words.partition(": ")
-        if event.who == "nate" and label.casefold() in ("answer", "feedback sent"):
+        if event.who == "nate" and label.casefold() == "answer":
             yield NateWords(words, event.time)
 
 

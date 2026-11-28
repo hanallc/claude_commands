@@ -233,7 +233,7 @@ If you cannot complete the review, return `[{{"blocker":"what stopped the review
 For a complete review, return one JSON array. Give one object for each test ID in tests.json.
 Use {{"test":"ID","finding":"none"}} when you find no such words.
 Use "requested" only when Nate's newest words on the behavior ask for this change.
-For "requested", cite Nate's typed Claude turn, sent List Tell or question, or saved question answer or feedback.
+For "requested", cite Nate's typed Claude turn, sent List Tell or question, or saved question answer.
 You can cite Nate's Images page answer from the store or the List log.
 Quote one or more complete sentences or lines in order from one source message only.
 If several messages contain relevant words, quote the newest message that sets the behavior.

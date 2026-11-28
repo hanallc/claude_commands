@@ -12,7 +12,7 @@ from functools import partial
 import argparse
 from collections.abc import Callable, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from difflib import get_close_matches
@@ -847,15 +847,7 @@ def camera_state(components: dict[str, object]) -> CameraState:
 class MacConsole(StrEnum):
     UNLOCKED = "unlocked"
     LOCKED = "locked"
-    LOGIN_REQUIRED = "login required"
     UNAVAILABLE = "unavailable"
-
-
-class MacConsoleReadFailure(Failure):
-    """The ioreg output has no valid lock state."""
-
-    def __init__(self, cause: str) -> None:
-        super().__init__(f"cannot read the Mac lock state: {cause}")
 
 
 MAC_LOCK_TEXT = "hana_shot.mac_locked"
@@ -863,40 +855,36 @@ SSH_PROBE = ("ssh", "-T", "-o", "BatchMode=yes", "--")
 
 
 def mac_console_state(output: bytes) -> MacConsole:
-    """Read the Mac console login and lock state."""
+    """Read the lock state of the logged-in console session."""
     try:
-        root = cast(object, plistlib.loads(output))
-    except (ValueError, ExpatError, OverflowError, AttributeError, LookupError) as exc:
-        raise MacConsoleReadFailure("invalid ioreg property list") from exc
-    if not isinstance(root, dict):
-        raise MacConsoleReadFailure("the ioreg property list must have a top-level dictionary")
-    properties = cast(dict[str, object], root)
-    locked = properties.get("IOConsoleLocked")
-    if "IOConsoleLocked" in properties and not isinstance(locked, bool):
-        raise MacConsoleReadFailure("IOConsoleLocked must be a boolean")
+        roots = cast(object, plistlib.loads(output))
+    except (ValueError, ExpatError, OverflowError, AttributeError, IndexError):
+        return MacConsole.UNAVAILABLE
+    if not isinstance(roots, list):
+        return MacConsole.UNAVAILABLE
+    rows = cast(list[object], roots)
+    if len(rows) != 1 or not isinstance(rows[0], dict):
+        return MacConsole.UNAVAILABLE
+    properties = cast(dict[str, object], rows[0])
     users = properties.get("IOConsoleUsers")
     if not isinstance(users, list):
-        raise MacConsoleReadFailure("IOConsoleUsers must be an array")
-    console_users = 0
+        return MacConsole.UNAVAILABLE
+    console: list[dict[str, object]] = []
     for user in cast(list[object], users):
         if not isinstance(user, dict):
-            raise MacConsoleReadFailure("IOConsoleUsers must contain dictionaries")
+            return MacConsole.UNAVAILABLE
         session = cast(dict[str, object], user)
-        on_console = session.get("kCGSSessionOnConsoleKey", False)
-        login_done = session.get("kCGSessionLoginDoneKey", False)
-        if not isinstance(on_console, bool):
-            raise MacConsoleReadFailure("kCGSSessionOnConsoleKey must be a boolean")
-        if not isinstance(login_done, bool):
-            raise MacConsoleReadFailure("kCGSessionLoginDoneKey must be a boolean")
-        if on_console and login_done:
-            console_users += 1
-    if console_users == 0:
-        return MacConsole.LOGIN_REQUIRED
-    if console_users > 1:
-        raise MacConsoleReadFailure(f"expected one logged-in console user in IOConsoleUsers, found {console_users}")
-    if "IOConsoleLocked" not in properties:
-        raise MacConsoleReadFailure("IOConsoleLocked is missing")
-    return MacConsole.LOCKED if locked else MacConsole.UNLOCKED
+        if session.get("CGSSessionOnConsoleKey") is True and session.get("CGSSessionLoginDoneKey") is True:
+            console.append(session)
+    if len(console) != 1:
+        return MacConsole.UNAVAILABLE
+    locked = properties.get("IOConsoleLocked")
+    screen_locked = console[0].get("CGSSessionScreenIsLocked", False)
+    if locked is True or screen_locked is True:
+        return MacConsole.LOCKED
+    if locked is False and screen_locked is False:
+        return MacConsole.UNLOCKED
+    return MacConsole.UNAVAILABLE
 
 
 def probe_mac_console(remote: str | None, timeout: float) -> MacConsole:
@@ -914,7 +902,7 @@ def probe_mac_console(remote: str | None, timeout: float) -> MacConsole:
 
 
 def mac_lock_cleared(pid: int, start: str, remote: str | None) -> bool:
-    """Check whether the capture process ended or the Mac console is ready."""
+    """Check whether the capture process ended or the Mac unlocked."""
     identity = process_start.process_start(pid)
     if isinstance(identity, (process_start.Gone, process_start.Zombie)):
         return True
@@ -981,7 +969,7 @@ class Session:
             time.sleep(self.settings.number("resend_seconds"))
 
     def wait_for_mac(self) -> None:
-        """Wait for an unlocked Mac console with a logged-in user."""
+        """Wait for the Mac to unlock before using the camera."""
         if not self.macos:
             return
         timeout = self.settings.number("call_timeout_seconds")
@@ -989,14 +977,14 @@ class Session:
         if state is not MacConsole.UNLOCKED:
             print(f"hana_shot: waiting for {self.remote or 'the Mac'} ({state})", file=sys.stderr)
         while state is not MacConsole.UNLOCKED:
-            if state in (MacConsole.LOCKED, MacConsole.LOGIN_REQUIRED) and not self.mac_lock_alert_sent:
+            if state is MacConsole.LOCKED and not self.mac_lock_alert_sent:
                 self.send_mac_lock_alert()
             time.sleep(self.settings.number("resend_seconds"))
             state = probe_mac_console(self.remote, timeout)
         self.retire_mac_lock_alert()
 
     def send_mac_lock_alert(self) -> None:
-        """Send the alert when the Mac is locked or needs a login."""
+        """Send the first confirmed lock alert for this run."""
         from scripts.notify import review
 
         pid = os.getpid()
@@ -1016,7 +1004,7 @@ class Session:
                                       send_timeout_s=timeout)
 
     def retire_mac_lock_alert(self) -> None:
-        """Retire the alert when the Mac console is ready or the run ends."""
+        """Retire the alert when the Mac unlocks or the run ends."""
         if self.mac_lock_alert_key is None:
             return
         sender = push_texts.render(MAC_LOCK_TEXT).sender
@@ -2953,26 +2941,23 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
 @contextmanager
 def instance(port: int, launch_first: bool, shutdown_after: bool, worktree: str | None, binary: str | None, purpose: str = "", owner: str = "", *,
     hana_shot_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-    capture_session: Session | Literal["no_capture"] = "no_capture",
 ) -> Generator[Brp]:
     if isinstance(hana_shot_settings, UseConfiguredValue):
         hana_shot_settings = conf.read("hana_shot")
     check_port(port, hana_shot_settings=hana_shot_settings)
-    with ExitStack() as shutdown_actions, ExitStack() as capture_cleanup:
-        if isinstance(capture_session, Session):
-            _ = capture_cleanup.callback(capture_session.close)
+    with ExitStack() as cleanup:
         process: subprocess.Popen[bytes] | None = None
         owned_folder: Path | Literal["saved_launch"] = "saved_launch"
         if launch_first:
-            if isinstance(capture_session, Session):
-                capture_session.wait_for_mac()
             state, process = launch(port, worktree, binary, purpose, owner, hana_shot_settings=hana_shot_settings)
             if shutdown_after:
                 owned_folder = Path(state["scratch"])
-                _ = shutdown_actions.callback(shutil.rmtree, owned_folder, ignore_errors=True)
-        if shutdown_after:
-            _ = shutdown_actions.callback(shutdown, port, process, owned_folder=owned_folder, hana_shot_settings=hana_shot_settings)
-        yield capture_session.brp if isinstance(capture_session, Session) else Brp(port, settings=hana_shot_settings)
+                _ = cleanup.callback(shutil.rmtree, owned_folder, ignore_errors=True)
+        try:
+            yield Brp(port, settings=hana_shot_settings)
+        finally:
+            if shutdown_after:
+                shutdown(port, process, owned_folder=owned_folder, hana_shot_settings=hana_shot_settings)
 
 
 # ---------------------------------------------------------------------------
@@ -3073,45 +3058,37 @@ def with_overrides(shot: Shot, args: Arguments, *,
     return shot
 
 
-@contextmanager
-def capture_instance(args: Arguments, *, hana_shot_settings: conf.ConfigRead) -> Generator[Session]:
-    """Use one session for the launch check and capture."""
-    session = Session(Brp(args.port, settings=hana_shot_settings), args.remote)
-    with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner,
-                  hana_shot_settings=hana_shot_settings, capture_session=session):
-        _ = session.start_capture()
-        yield session
-
-
 def run_shots(
-    session: Session, shots: list[Shot], out: str | None, on_result: Callable[[Result], None],
+    brp: Brp, shots: list[Shot], out: str | None, remote: str | None, on_result: Callable[[Result], None],
     invocation: InProgressCaptureInvocation,
 ) -> list[Result]:
-    hana_shot_settings = session.settings
+    hana_shot_settings = brp.settings
     if shots:
         invocation.shot = shots[0]
-    sha = git_sha(Path.cwd(), hana_shot_settings=hana_shot_settings)
-    results: list[Result] = []
-    for shot, path in zip(shots, output_paths(out, [shot.label for shot in shots], hana_shot_settings=hana_shot_settings), strict=True):
-        invocation.shot = shot
-        invocation.orientation = shot.orientation
-        started_ns = time.time_ns()
-        try:
-            result = take(session, shot, path)
-        except (Refused, Failure, CaptureTimeout) as exc:
-            reason = failure_reason(exc)
-            invocation.attempts.append(failed_attempt(shot, path, reason, started_ns, str(exc)))
-            invocation.failures.append(CaptureFailure(reason, str(exc)))
-            raise
-        window = session.last_state.size if session.last_state else (0, 0)
-        timing = timing_record(result, session.brp.port, sha, session.frame_ms, window, session.remote)
-        invocation.successful_timings.append(timing)
-        invocation.attempts.append({
-            **timing, "status": "success", "image_paths": [str(result.path)],
-        })
-        on_result(result)
-        results.append(result)
-    return results
+    with closing(Session(brp, remote)) as session:
+        _ = session.start_capture()
+        sha = git_sha(Path.cwd(), hana_shot_settings=hana_shot_settings)
+        results: list[Result] = []
+        for shot, path in zip(shots, output_paths(out, [shot.label for shot in shots], hana_shot_settings=hana_shot_settings), strict=True):
+            invocation.shot = shot
+            invocation.orientation = shot.orientation
+            started_ns = time.time_ns()
+            try:
+                result = take(session, shot, path)
+            except (Refused, Failure, CaptureTimeout) as exc:
+                reason = failure_reason(exc)
+                invocation.attempts.append(failed_attempt(shot, path, reason, started_ns, str(exc)))
+                invocation.failures.append(CaptureFailure(reason, str(exc)))
+                raise
+            window = session.last_state.size if session.last_state else (0, 0)
+            timing = timing_record(result, brp.port, sha, session.frame_ms, window, remote)
+            invocation.successful_timings.append(timing)
+            invocation.attempts.append({
+                **timing, "status": "success", "image_paths": [str(result.path)],
+            })
+            on_result(result)
+            results.append(result)
+        return results
 
 
 def command_shot(args: Arguments, invocation: InProgressCaptureInvocation, *,
@@ -3138,8 +3115,8 @@ def command_shot(args: Arguments, invocation: InProgressCaptureInvocation, *,
         shots = [replace(shot, hover=HoverTarget(args.hover)) for shot in shots]
     invocation.orientation = shots[0].orientation
     invocation.shot = shots[0]
-    with capture_instance(args, hana_shot_settings=hana_shot_settings) as session:
-        _ = run_shots(session, shots, args.out, report, invocation)
+    with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp:
+        _ = run_shots(brp, shots, args.out, args.remote, report, invocation)
     return 0
 
 
@@ -3432,7 +3409,11 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
         nullcontext(args.out) if args.out is not None
         else build_folders.tool_folder("hana-shot-check")
     ) as out:
-        with capture_instance(args, hana_shot_settings=hana_shot_settings) as session:
+        with (
+            instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp,
+            closing(Session(brp, args.remote)) as session,
+        ):
+            _ = session.start_capture()
             sha = git_sha(path.parent, hana_shot_settings=hana_shot_settings)
             today = datetime.now().strftime("%Y-%m-%d")
             for name, final in zip(names, output_paths(str(out), names, hana_shot_settings=hana_shot_settings), strict=True):
@@ -3446,10 +3427,6 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
                     reason = failure_reason(exc)
                     invocation.attempts.append(failed_attempt(shot, final, reason, started_ns, str(exc)))
                     invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
-                    if isinstance(exc, MacConsoleReadFailure):
-                        if passed:
-                            write_views(path, views)
-                        raise
                     failures.append(f"FAIL {name}: {exc}")
                     print(failures[-1], file=sys.stderr)
                     continue
@@ -3477,7 +3454,7 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
                     failures.append(f"FAIL {name}: {error}")
                     print(failures[-1], file=sys.stderr)
                     continue
-                timing = timing_record(result, session.brp.port, sha, session.frame_ms, window, args.remote)
+                timing = timing_record(result, brp.port, sha, session.frame_ms, window, args.remote)
                 invocation.successful_timings.append(timing)
                 invocation.attempts.append({
                     **timing, "status": "success", "image_paths": [str(result.path)],
@@ -3631,11 +3608,7 @@ def main(argv: list[str]) -> int:
         except ValueError:
             return 2
         remote = argv[3] if len(argv) == 4 else None
-        try:
-            return int(not mac_lock_cleared(pid, argv[2], remote))
-        except MacConsoleReadFailure as exc:
-            print(f"hana_shot: {exc}", file=sys.stderr)
-            return 1
+        return int(not mac_lock_cleared(pid, argv[2], remote))
     hana_shot_settings = conf.read("hana_shot")
     try:
         args = arguments(argv, hana_shot_settings=hana_shot_settings)
