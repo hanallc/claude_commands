@@ -5332,7 +5332,8 @@ done
             return (isinstance(report.path, placement.DispatchPathSettled)
                 and isinstance(report.outcome, placement.AttemptDeclined)
                 and evidence.observed_at >= report.received_at)
-        if assignment.destination.provider == "mac" and self._placement_owner_live(assignment.owner):
+        if (assignment.destination.provider == "mac" and isinstance(saved.permission, placement.PermissionConsumed)
+                and self._placement_owner_live(assignment.owner)):
             # Keep the attempt current until the coordinator reports the verdict or asks for a replacement.
             return False
         return ((self._ended_claim_holder(saved) or self._unconfirmed_holder_owner_ended(saved))
@@ -5886,6 +5887,11 @@ done
         self.assignments[key] = records.SavedPlacementAssignment(assignment, provider=claim,
             assigned_settings_generation=placement.AssignedSettingsGeneration(evidence_key.configuration_generation),
             remote_start_hold=hold, placement_candidates=self._placement_candidate_reading(request))
+        place_key = _place_key(request.owner, request.since)
+        place = self.places.get(place_key)
+        if place is not None and place.episode == request.episode and isinstance(place.lost_launch_at, float):
+            self._depart_queue_id(place.move_id)
+            self.places[place_key] = replace(place, lost_launch_at=NoLostLaunch())
         self.current_assignments[request.episode] = key
         return assignment
 
@@ -6798,15 +6804,19 @@ done
             return
         expired = self._expire_guest_replacement(saved, checked_at=settled_at)
         report = expired.terminal_report
-        if _guest_start_observed(saved) and (isinstance(report, placement.NoTerminalReport)
+        started = _guest_start_observed(saved)
+        if ((isinstance(report, placement.NoTerminalReport) and (saved.guest_proof_required or started)
+                or started and isinstance(report, placement.TerminalAttemptReport)
+                and report.outcome == GUEST_SETTLEMENT_REQUESTED)
+                and self.current_assignments.get(episode) == attempt_key
+                and self._placement_owner_live(assignment.owner)):
+            # The coordinator can still report the result after settlement.
+            return
+        if started and (isinstance(report, placement.NoTerminalReport)
                 or isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
             report = placement.TerminalAttemptReport(
                 placement.AttemptCancelled("The Mac Linux guest ended without a verdict"),
                 placement.DispatchPathSettled(), self.clock.now())
-        if (isinstance(report, placement.NoTerminalReport) and saved.guest_proof_required
-                and self._placement_owner_live(assignment.owner)):
-            # The gate can report its failure after the settlement probe completes.
-            return
         terminal = (replace(report, path=placement.DispatchPathSettled())
                     if isinstance(report, placement.TerminalAttemptReport) else self._lost_report())
         # Keep the settlement time for a reused submission after the worker forgets the attempt.
@@ -6825,6 +6835,13 @@ done
         limit = _guest_wait_limit()
         now = self.clock.now() if checked_at is None else checked_at
         if isinstance(limit, int) and now < report.received_at + limit:
+            return saved
+        assignment = saved.assignment
+        if (checked_at is None and report.outcome == GUEST_SETTLEMENT_REQUESTED
+                and self.current_assignments.get(assignment.episode) == execution_identity.attempt_key(
+                    assignment.episode, assignment.attempt)
+                and self._placement_owner_live(assignment.owner)):
+            # An unproven end leaves the current attempt open for the coordinator's report.
             return saved
         reason = _guest_wait_timeout(saved.assignment.attempt, limit)
         return replace(saved, terminal_report=replace(report, outcome=placement.AttemptCancelled(reason)),

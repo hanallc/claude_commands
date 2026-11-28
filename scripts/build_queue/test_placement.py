@@ -5359,6 +5359,87 @@ class LostMacPlacementTests(unittest.TestCase):
         assert isinstance(authorized, wire.FirstAuthorization), authorized
         return authorized, process
 
+    def test_guest_loss_can_follow_an_expired_unproven_settlement_request(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            authorized, = consume_guest_permission(fixture, assignment, holder, proof_required=True)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            report = mac_outage_report(authorized, fixture.clock.now())
+            fixture.end_owner(holder)
+            self.assertIsInstance(fixture.server.handle_request(wire.SettlementRequest(assignment))[0], wire.Ok)
+
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            _ = fixture.run_pass()
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            pending = fixture.server.assignments[key].terminal_report
+            assert isinstance(pending, placement.TerminalAttemptReport)
+            self.assertEqual(pending.outcome, service.GUEST_SETTLEMENT_REQUESTED)
+
+            closed, = fixture.server.handle_request(report)
+            assert isinstance(closed, wire.DispatchStatus), closed
+            self.assertEqual(closed.state, placement.ClosedAssignment("lost"))
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, request)
+            replacement = assignment_for(fixture, request)
+            self.assertNotEqual(replacement.attempt, assignment.attempt)
+            self.assertIsInstance(consume_guest_permission(fixture, replacement, guest_gate(fixture, replacement))[0],
+                                  wire.FirstAuthorization)
+
+    def test_a_replacement_decline_returns_without_the_lost_run_pin(self) -> None:
+        with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            _ = write_config_fixture(conf.path("build_targets"), UNREACHABLE_WAIT_FIXTURE)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            first = placement_request(fixture, since=now - 2, session=OwningSession("first-launch"))
+            first = replace(first, constraints=replace(first.constraints,
+                candidates=(*first.constraints.candidates, local_candidate(fixture))))
+            second = placement_request(fixture, since=now - 1, session=OwningSession("second-launch"))
+            first_auth = authorize_mac(fixture, first)
+            fixture.clock.advance(1)
+            second_auth = authorize_mac(fixture, second)
+            outage_since = fixture.clock.now()
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+            older = replace(local_cargo_request(fixture), since=now - 3)
+            self.assertIsInstance(fixture.server.handle_request(older)[0], wire.PlacementWait)
+            closed, = fixture.server.handle_request(mac_outage_report(first_auth, outage_since))
+            assert isinstance(closed, wire.DispatchStatus)
+            self.assertEqual(closed.state, placement.ClosedAssignment("lost"))
+
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, first)
+            replacement = assignment_for(fixture, first)
+            self.assertNotEqual(replacement.attempt, first_auth.assignment.attempt)
+            declined, = fixture.server.handle_request(wire.ClaimFailure("no-tests", replacement, "no_tests"))
+            assert isinstance(declined, wire.DispatchStatus)
+            self.assertEqual(declined.state, placement.ClosedAssignment("no_tests"))
+            closed, = fixture.server.handle_request(mac_outage_report(second_auth, outage_since))
+            assert isinstance(closed, wire.DispatchStatus)
+            self.assertEqual(closed.state, placement.ClosedAssignment("lost"))
+            _ = fixture.run_pass()
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual([row.pid for row in view.reading.view.waiting],
+                             [second.owner.pid, older.owner.pid, first.owner.pid])
+
+    def test_an_unused_mac_offer_skips_the_claim_release_liveness_check(self) -> None:
+        with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            offer = assignment_for(fixture, request)
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, request)
+            with mock.patch.object(fixture.server, "_placement_owner_live") as owner_live:
+                status, = fixture.server.handle_request(status_wire.PlacementStatusRequest(offer.episode, offer.attempt))
+            assert isinstance(status, status_wire.PlacementStatusReply)
+            assert isinstance(status.status, status_wire.KnownPlacementStatus)
+            self.assertEqual(status.status.state, placement.CurrentAssignment())
+            owner_live.assert_not_called()
+
     def test_manual_mac_waits_until_a_probe_answers_after_loss(self) -> None:
         with (PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
             _ = write_config_fixture(conf.path("build_targets"), UNREACHABLE_WAIT_FIXTURE)
