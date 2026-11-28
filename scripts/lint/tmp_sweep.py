@@ -84,6 +84,7 @@ except FileNotFoundError:
     pass
 
 
+import ctypes
 import json
 from importlib import import_module
 import os
@@ -99,6 +100,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from errno import EACCES, ENOENT
+from functools import cache
 from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
@@ -628,13 +630,12 @@ def _user_task(path: str, user: int) -> UserTask | UserProcessStatus:
         return UserProcessStatus.UNREADABLE
 
 
-def _surviving_tasks(leader: UserTask, user: int) -> Iterator[UserTask | UserProcessStatus]:
-    pid = os.path.basename(leader.path)
+def _thread_entries(leader: os.DirEntry[str]) -> Iterator[os.DirEntry[str] | UserProcessStatus]:
     try:
         with os.scandir(os.path.join(leader.path, "task")) as entries:
             for entry in entries:
-                if entry.name.isdecimal() and entry.name != pid:
-                    yield _user_task(entry.path, user)
+                if entry.name.isdecimal() and entry.name != leader.name:
+                    yield entry
     except (FileNotFoundError, ProcessLookupError):
         if _task_still_exists(leader.path):
             yield UserProcessStatus.UNREADABLE
@@ -698,6 +699,33 @@ class WorkerRemovalDescriptors:
 
 class NoWorkerDescriptors(Enum):
     NONE = "no worker descriptors"
+
+
+KCMP_FILES = 2
+KCMP_FS = 3
+
+
+@cache
+def _kcmp_syscall() -> tuple[int, Callable[[int, int, int, int, int, int], int]] | None:
+    number = {"x86_64": 312, "aarch64": 272}.get(os.uname().machine)
+    if number is None:
+        return None
+    try:
+        syscall = ctypes.CDLL(None, use_errno=True).syscall
+    except (OSError, AttributeError):
+        return None
+    syscall.argtypes = [ctypes.c_long, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong]
+    syscall.restype = ctypes.c_long
+    return number, cast(Callable[[int, int, int, int, int, int], int], syscall)
+
+
+def _shares_leader_paths(pid: int, tid: int) -> bool:
+    """Check whether the leader and thread share the descriptor table and filesystem state."""
+    kcmp = _kcmp_syscall()
+    if kcmp is None:
+        return False
+    number, syscall = kcmp
+    return syscall(number, pid, tid, KCMP_FILES, 0, 0) == 0 and syscall(number, pid, tid, KCMP_FS, 0, 0) == 0
 
 
 def _read_process_paths(path: str, pid: int, prefix: tuple[bytes, ...], *, strict: bool,
@@ -815,8 +843,9 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
                   worker_fds: WorkerRemovalDescriptors | NoWorkerDescriptors = NoWorkerDescriptors.NONE,
                   stop_after_first_use: bool = False,
                   ) -> ProcessUsesKnown | ProcessUsesUnavailable:
-    """Read matching paths from all live threads and report incomplete reads.
+    """Read matching paths from live processes and report incomplete reads.
 
+    Read the leader before comparing its threads or reading their status.
     Ignore processes that end during the scan.
     Stop at the first confirmed use per process when the caller checks one folder.
     """
@@ -831,6 +860,10 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
             processes = list(entries)
     except OSError:
         return ProcessUsesIncomplete()
+    live_proc = False
+    if sys.platform == "linux" and proc.rstrip("/") == "/proc":
+        with suppress(OSError):
+            live_proc = os.readlink(os.path.join(proc, "self")) == str(os.getpid())
     strict = require_readable_user_processes
     caller_capabilities = 0
     if strict:
@@ -860,9 +893,14 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
         if not isinstance(leader, UserTask) or (strict and not leader.owned_by_user):
             continue
         threaded = leader.has_other_threads()
-        other_tasks = _surviving_tasks(leader, user) if threaded else ()
+        threads = _thread_entries(entry) if threaded else ()
         read_shared_paths = True
-        for task in chain((leader,), other_tasks):
+        compare_threads = False
+        for task in chain((leader,), threads):
+            if isinstance(task, os.DirEntry):
+                if compare_threads and _shares_leader_paths(pid, int(task.name)):
+                    continue
+                task = _user_task(task.path, user)
             if task is UserProcessStatus.UNREADABLE:
                 incomplete.add(pid)
             if not isinstance(task, UserTask) or task.exited or (strict and not task.owned_by_user):
@@ -876,6 +914,8 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
             read_errors = _read_process_paths(task.path, pid, path_prefix, strict=strict, ignored_fds=task_ignored_fds,
                                              found=found, unreadable=unreadable, read_shared_paths=read_shared_paths,
                                              stop_after_first_use=stop_after_first_use)
+            if task is leader:
+                compare_threads = live_proc and not read_errors and not ignored_fds
             read_shared_paths = False
             if (start_ticks >= 0 and not read_errors and len(found) == first_path + 1
                     and found[first_path][2] == WORKS_IN):
