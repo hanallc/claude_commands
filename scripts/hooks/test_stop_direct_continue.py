@@ -77,6 +77,16 @@ class DirectorStopFixture:
         _ = self.staff_file.write_text(json.dumps(document))
         return worker_id
 
+    def start_merge_dispatch(self, *, keep_open_phases: bool = False) -> None:
+        worker_id = self.add_merge_worker()
+        path = self.run / "progress_history_state.json"
+        state = cast(dict[str, object], json.loads(path.read_text()))
+        if not keep_open_phases:
+            state["open_phases"] = []
+        state["pass"] = {"test": {"status": "active", "worker_id": worker_id,
+                                   "instance_id": "fixture-dispatch", "launcher_command": ["assign.sh"]}}
+        _ = path.write_text(json.dumps(state))
+
     @contextmanager
     def live_runner(self, owner: staff.StaffId) -> Generator[None]:
         record = self.run / "detached_runs" / f"{owner}.json"
@@ -268,22 +278,14 @@ class DirectorStopTests(unittest.TestCase):
             self.assertIn("/unit:merge run active", result.stderr)
 
     def test_own_runner_does_not_hide_other_merge_work(self) -> None:
-        for work in ("worker_runner", "worker_dispatch", "background_task", "queued_message"):
+        for work in ("worker_runner", "worker_dispatch", "queued_message"):
             with self.subTest(work=work), director_stop_fixture() as fixture:
                 fixture.set_unit_type("merge")
                 with fixture.live_runner(staff.StaffId(SESSION)):
-                    fields: dict[str, object] = {}
                     if work == "queued_message":
                         _ = fixture.queue_order(f"staff:{SESSION}")
-                    elif work == "background_task":
-                        fields["background_tasks"] = [{"id": "fixture", "status": "running"}]
                     elif work == "worker_dispatch":
-                        worker_id = fixture.add_merge_worker()
-                        path = fixture.run / "progress_history_state.json"
-                        state = cast(dict[str, object], json.loads(path.read_text()))
-                        state["pass"] = {"test": {"status": "active", "worker_id": worker_id,
-                                                 "instance_id": "fixture-dispatch", "launcher_command": ["assign.sh"]}}
-                        _ = path.write_text(json.dumps(state))
+                        fixture.start_merge_dispatch(keep_open_phases=True)
                     else:
                         worker_id = fixture.add_merge_worker()
                         with fixture.live_runner(worker_id):
@@ -291,7 +293,7 @@ class DirectorStopTests(unittest.TestCase):
                         self.assertEqual(result.returncode, 2)
                         self.assertIn("/unit:merge run active", result.stderr)
                         continue
-                    result = fixture.call(**fields)
+                    result = fixture.call()
                     self.assertEqual(result.returncode, 2)
                     self.assertIn("/unit:merge run active", result.stderr)
 
@@ -359,23 +361,19 @@ class DirectorStopTests(unittest.TestCase):
     def test_merge_unit_with_an_active_dispatch_still_gets_a_wake(self) -> None:
         with director_stop_fixture() as fixture:
             fixture.set_unit_type("merge")
-            worker_id = fixture.add_merge_worker()
-            state_path = fixture.run / "progress_history_state.json"
-            state = cast(dict[str, object], json.loads(state_path.read_text()))
-            state["open_phases"] = []
-            state["pass"] = {"test": {"status": "active", "worker_id": worker_id,
-                                       "instance_id": "fixture-dispatch", "launcher_command": ["assign.sh"]}}
-            _ = state_path.write_text(json.dumps(state))
+            fixture.start_merge_dispatch()
             result = fixture.call()
             self.assertEqual(result.returncode, 2)
             self.assertIn("/unit:merge run active", result.stderr)
 
-    def test_merge_unit_with_a_background_runner_still_gets_a_wake(self) -> None:
-        with director_stop_fixture() as fixture:
-            fixture.set_unit_type("merge")
-            result = fixture.call(background_tasks=[{"id": "land", "status": "running"}])
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("/unit:merge run active", result.stderr)
+    def test_merge_unit_with_a_background_task_stops_without_a_wake(self) -> None:
+        for active_dispatch in (False, True):
+            with self.subTest(active_dispatch=active_dispatch), director_stop_fixture() as fixture:
+                fixture.set_unit_type("merge")
+                if active_dispatch:
+                    fixture.start_merge_dispatch()
+                self.assert_allowed(fixture.call(background_tasks=[{"id": "land", "status": "running"}]))
+                self.assertFalse((fixture.run / "compaction_wake_line").exists())
 
     def test_merge_unit_with_a_pending_message_still_gets_a_wake(self) -> None:
         for key in (f"staff:{SESSION}", f"session-{SESSION}", "legacy-recipient"):

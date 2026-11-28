@@ -3,9 +3,10 @@
 
 The separate asyncRewake Stop entry runs this hook in the background.
 Exit 2 sends the reason from stderr to the agent in a system-reminder.
-The guards permit declared waits, background tasks, and stops without context measurements.
+The guards permit declared waits and stops without context measurements.
+A pending CLI background task permits a stop for every director.
 The hook wakes above the threshold only when the final line differs from the last wake.
-A merge unit with no worker work, background task, or queued message stops without a wake.
+A merge unit with no worker work or queued message stops without a wake.
 Own detached runs supply later notices and do not count as merge work.
 Unknown merge state permits the stop and reports one anomaly line.
 A director can stop while only its own detached runs remain live.
@@ -77,14 +78,12 @@ class MergeWorkUnknown:
 type MergeWorkState = MergeWorkFound | MergeIdle | MergeWorkUnknown
 
 
-def merge_work_state(session_dir: Path, row: staff.StaffRow, payload: StopPayload) -> MergeWorkState:
-    """Only worker work, background tasks, and queued messages count as merge work."""
+def merge_work_state(session_dir: Path, row: staff.StaffRow) -> MergeWorkState:
+    """Check worker work and queued messages for the merge unit."""
     from scripts.agents.detached_runs import DETACHED_RUNS_DIR, live_run_evidence_for_staff
     from scripts.direct.progress_history import ActiveDispatch, ActiveDispatchUnavailable, active_dispatch
     from scripts.message import send
 
-    if pending_background_tasks(payload):
-        return MergeWorkFound("CLI background task")
     errors: list[str] = []
     workers: list[staff.StaffRow] = []
     try:
@@ -168,8 +167,10 @@ def main() -> None:
     tokens = measurement["tokens"]
     if tokens < handoff_threshold(window):
         return
+    if pending_background_tasks(payload):
+        return
     if command == "/unit:merge" and row is not None:
-        merge = merge_work_state(session_dir, row, payload)
+        merge = merge_work_state(session_dir, row)
         if isinstance(merge, MergeWorkUnknown):
             reason = " ".join("; ".join(merge.errors).splitlines())
             report_anomaly(f"anomaly: stop-direct-continue: {reason}")
@@ -185,10 +186,6 @@ def main() -> None:
     ):
         return
 
-    # Other directors can stop while a later task result can start another turn.
-    # A worker heartbeat alone does not prove that another result will arrive.
-    if command != "/unit:merge" and pending_background_tasks(payload):
-        return
     from scripts.agents.detached_runs import DETACHED_RUNS_DIR, live_runs_for_staff
 
     if (command != "/unit:merge" and row is not None
