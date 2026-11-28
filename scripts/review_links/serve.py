@@ -2483,6 +2483,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 raise ValueError("Choose one Undo time.")
             server = cast(ReviewLinksServer, self.server)
             saved = settings_page.save(server.store_folder, conf.read("review_links"), fields["seconds"][0])
+        except settings_page.SaveSyncUnconfirmed as error:
+            print(f"review-links settings sync: {error.__cause__}", file=sys.stderr)
+            self.json_response(503, {**error.visible, "reason": str(error)})
         except ValueError as error:
             self.json_response(400, {"reason": str(error)})
         except OSError as error:
@@ -2866,6 +2869,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             outcome = server.send_holds.undo(hold_id)
             if outcome is send_hold.UndoResult.MISSING and server.mode is not ServerMode.LIST_FIXTURE:
                 outcome = settings_page.undo(server.store_folder, hold_id)
+        except settings_page.SettingsSyncUnconfirmed as error:
+            print(f"review-links settings sync: {error}", file=sys.stderr)
+            self.json_response(503, {"outcome": "undone",
+                                     "reason": "The previous time is active. The server could not confirm the save. "
+                                     + "Select this time again to retry."})
+            return
         except OSError as error:
             print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
             self.json_response(503, {"reason": "The undo failed. The send can still leave."})

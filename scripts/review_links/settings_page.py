@@ -58,6 +58,18 @@ class SavedUndoTime(TypedDict):
     remaining_seconds: float
 
 
+class SettingsSyncUnconfirmed(OSError):
+    """The Settings change is visible, and the folder sync failed."""
+
+
+class SaveSyncUnconfirmed(SettingsSyncUnconfirmed):
+    """The response includes the visible choice and its Undo receipt."""
+
+    def __init__(self, visible: SavedUndoTime) -> None:
+        super().__init__("The selected time is active. The server could not confirm the save. Select this time again to retry.")
+        self.visible: SavedUndoTime = visible
+
+
 def undo_choices(config: conf.ConfigRead) -> tuple[int, ...]:
     def parse(value: str) -> tuple[int, ...]:
         choices = tuple(conf.positive_whole(word.strip()) for word in value.split(","))
@@ -136,9 +148,17 @@ def _write(root: Path, preference: UndoReceipt | UndoneReceipt) -> None:
         fields["undone"] = True
     try:
         atomic_file.write_text_atomic(root / SETTINGS_FILE, json.dumps(fields) + "\n", new_file_mode=0o600)
-    except atomic_file.AtomicDurabilityUnconfirmed:
+    except atomic_file.AtomicDurabilityUnconfirmed as error:
         if _read(root) != preference:
             raise
+        raise SettingsSyncUnconfirmed(str(error)) from error
+
+
+def _sync_folder(root: Path) -> None:
+    try:
+        atomic_file.sync_folder(root)
+    except OSError as error:
+        raise SettingsSyncUnconfirmed(str(error)) from error
 
 
 def _saved_time(receipt: UndoReceipt, choices: tuple[int, ...], config: conf.ConfigRead) -> SavedUndoTime:
@@ -158,16 +178,28 @@ def save(root: Path, config: conf.ConfigRead, value: str) -> SavedUndoTime:
     with file_lock.exclusive(root / (SETTINGS_FILE + ".lock")):
         saved = _read(root)
         if isinstance(saved, UndoReceipt) and saved.current.seconds == seconds:
-            return _saved_time(saved, choices, config)
-        previous = _allowed_choice(_current(saved), choices)
-        current = _effective_seconds(previous, config)
-        if seconds == current:
-            return {"seconds": seconds, "hold": "", "previous": current, "remaining_seconds": 0.0}
-        expires_ns = time.time_ns() + int((seconds + send_hold.RELEASE_GRACE_SECONDS) * 1_000_000_000)
-        receipt = UndoReceipt(SavedPick(seconds), previous, send_hold.new_hold_id(), expires_ns)
-        _write(root, receipt)
+            receipt = saved
+        else:
+            previous = _allowed_choice(_current(saved), choices)
+            current = _effective_seconds(previous, config)
+            if seconds == current:
+                visible: SavedUndoTime = {"seconds": seconds, "hold": "", "previous": current, "remaining_seconds": 0.0}
+                if isinstance(saved, UndoneReceipt):
+                    try:
+                        _sync_folder(root)
+                    except SettingsSyncUnconfirmed as error:
+                        raise SaveSyncUnconfirmed(visible) from error
+                return visible
+            expires_ns = time.time_ns() + int((seconds + send_hold.RELEASE_GRACE_SECONDS) * 1_000_000_000)
+            receipt = UndoReceipt(SavedPick(seconds), previous, send_hold.new_hold_id(), expires_ns)
+        try:
+            if receipt is saved:
+                _sync_folder(root)
+            else:
+                _write(root, receipt)
+        except SettingsSyncUnconfirmed as error:
+            raise SaveSyncUnconfirmed(_saved_time(receipt, choices, config)) from error
         return _saved_time(receipt, choices, config)
-
 
 def undo(root: Path, undo_id: str) -> send_hold.UndoResult:
     """Restore the previous choice if this change is still current."""
@@ -179,6 +211,7 @@ def undo(root: Path, undo_id: str) -> send_hold.UndoResult:
         if not isinstance(saved, (UndoReceipt, UndoneReceipt)) or saved.undo_id != undo_id:
             return send_hold.UndoResult.MISSING
         if isinstance(saved, UndoneReceipt):
+            _sync_folder(root)
             return send_hold.UndoResult.UNDONE
         if time.time_ns() >= saved.expires_ns:
             return send_hold.UndoResult.ALREADY_SENT
@@ -247,18 +280,22 @@ SCRIPT = r'''
    const started=performance.now();
    const response=await fetch(form.action,{method:'POST',body});
    const result=await response.json();
-   if(!response.ok) throw new Error(result.reason || 'The Undo time could not be saved.');
-   select(result.seconds);
+   if(Number.isInteger(result.seconds)) select(result.seconds);
+   if(result.hold) toast?.close();
+   if(!response.ok){
+    showActionFailure(error,result.reason || 'The Undo time could not be saved.');
+    return;
+   }
    if(result.hold){
-    toast?.close();
     const transit=Math.max(0,(performance.now()-started)/1000-result.processing_seconds);
     const remaining=result.remaining_seconds-transit;
-    if(!(remaining>0)) return;
-    const current=toast=heldFetch.showSaved({hold:result.hold,seconds:remaining});
+    const current=toast=heldFetch.showSaved({hold:remaining>0 ? result.hold : '',seconds:remaining>0 ? remaining : 3});
     current.done.then(undone=>{
      if(undone && toast===current) select(result.previous);
     }).catch(failure=>{
-     if(toast===current) showActionFailure(error,failure.message);
+     if(toast!==current) return;
+     if(failure.undone) select(result.previous);
+     showActionFailure(error,failure.message);
     });
    }
   }catch(failure){

@@ -655,7 +655,8 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   const tooltip = document.getElementById('nav-tooltip');
   let hoveredEntry;
   function showNavLabel() {
-    const entry = hoveredEntry || document.activeElement;
+    const focused = document.activeElement;
+    const entry = focused?.matches('.nav-entry:focus-visible') ? focused : hoveredEntry || focused;
     if (phone.matches || !shell.classList.contains('collapsed') || !entry?.matches('.nav-entry')) {
       tooltip.hidden = true;
       return;
@@ -675,7 +676,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     entry.addEventListener('pointerenter', () => { hoveredEntry = entry; showNavLabel(); });
     entry.addEventListener('pointerleave', () => { hoveredEntry = undefined; showNavLabel(); });
     entry.addEventListener('focus', showNavLabel);
-    entry.addEventListener('blur', () => { if (!hoveredEntry) tooltip.hidden = true; });
+    entry.addEventListener('blur', showNavLabel);
   }
   sidebar.addEventListener('scroll', showNavLabel);
   addEventListener('resize', showNavLabel);
