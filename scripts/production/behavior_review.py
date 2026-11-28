@@ -11,6 +11,7 @@ import json
 import re
 import sys
 from textwrap import indent
+from threading import Lock
 from typing import cast
 from unicodedata import category
 
@@ -157,7 +158,9 @@ Use these sources:
 2. Question records from scripts/production/update_registration.py and change review verdicts.
    Follow the store paths in the showrunner documents and the showrunner state root.
 3. User turns in Claude session transcripts. Do not count assistant, tool, or peer messages.
-   Use scripts/lib/transcripts.py to find distinct paths and read plain and compressed transcripts.
+   Use scripts/lib/transcripts.py to find distinct paths.
+   Import `transcript_lines` from `scripts.lib.transcripts`.
+   Read plain and compressed transcripts with `with contextlib.closing(transcript_lines(Path(path))) as lines:`.
    Use `rg --search-zip --files-with-matches --hidden --no-ignore` on groups of transcript paths.
    Select files by terms for the affected behaviors. Parse only those files for matching user turns.
 4. Commit messages in {repo}.
@@ -351,7 +354,7 @@ def recover_reply(folder: Path) -> Path | ReviewPending | ReviewNeedsDispatch:
 
 
 def reviewer_reply(change: behavior_check.GitRange, key: str, part: ReviewPart,
-                   pointer: Path, lock: file_lock.ExclusiveLock) -> Path | ReviewPending:
+                   pointer: Path, lock: file_lock.ExclusiveLock, staff_open_lock: Lock) -> Path | ReviewPending:
     """Recover the prior reply or start one review while the lock is held."""
     instructions_digest = sha256(part.instructions.encode("utf-8")).hexdigest()
     try:
@@ -377,7 +380,8 @@ def reviewer_reply(change: behavior_check.GitRange, key: str, part: ReviewPart,
     reply = folder / "review.md"
     log = folder / "codex.log"
     write_text_atomic(pointer, str(folder) + "\n", new_file_mode=0o600)
-    result = astra_review.run_review(reply, prompt, log, cwd=change.repo, dispatch_lock=lock)
+    result = astra_review.run_review(reply, prompt, log, cwd=change.repo, dispatch_lock=lock,
+                                    staff_open_lock=staff_open_lock)
     if result is worker.DispatchSubmission.SUBMITTED:
         return ReviewPending(folder)
     if result != 0:
@@ -398,9 +402,10 @@ class ReviewFailure:
 
 
 def collect_part(change: behavior_check.GitRange, key: str, part: ReviewPart,
-                 pointer: Path, lock: file_lock.ExclusiveLock, number: int) -> ReviewedPart | ReviewPending | ReviewFailure:
+                 pointer: Path, lock: file_lock.ExclusiveLock, number: int,
+                 staff_open_lock: Lock) -> ReviewedPart | ReviewPending | ReviewFailure:
     try:
-        reply = reviewer_reply(change, key, part, pointer, lock)
+        reply = reviewer_reply(change, key, part, pointer, lock, staff_open_lock)
         if isinstance(reply, ReviewPending):
             return reply
         data = reply.read_bytes()
@@ -422,10 +427,11 @@ def part_pointer(record: Path, number: int) -> Path:
 
 def collect_reviews(change: behavior_check.GitRange, key: str, plan: ReviewPart | tuple[ReviewPart, ...],
                     path: Path, lock: file_lock.ExclusiveLock) -> tuple[ReviewedPart | ReviewPending | ReviewFailure, ...]:
+    staff_open_lock = Lock()
     if isinstance(plan, ReviewPart):
-        return (collect_part(change, key, plan, path.with_suffix(".run"), lock, 1),)
+        return (collect_part(change, key, plan, path.with_suffix(".run"), lock, 1, staff_open_lock),)
     with ThreadPoolExecutor() as pool:
-        reviews = [pool.submit(collect_part, change, key, part, part_pointer(path, number), lock, number)
+        reviews = [pool.submit(collect_part, change, key, part, part_pointer(path, number), lock, number, staff_open_lock)
                    for number, part in enumerate(plan, start=1)]
         return tuple(review.result() for review in reviews)
 

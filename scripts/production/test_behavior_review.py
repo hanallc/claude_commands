@@ -9,14 +9,14 @@ import json
 import os
 from pathlib import Path
 from tempfile import mkdtemp
-from threading import Barrier
+from threading import Barrier, Event
 from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.astra import astra_review
 from scripts.direct import pass_record, progress_history
-from scripts.lib import process_start, unit_runs
+from scripts.lib import file_lock, process_start, unit_runs
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.notify import review
@@ -137,6 +137,17 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         runner.assert_not_called()
         self.assertFalse(Path(self.environment["SHOWRUNNER_STATE_DIR"]).exists())
 
+    def test_reviewer_prompt_names_the_read_only_transcript_reader(self) -> None:
+        args, _ = self.changed_range()
+        self.reply(CLEAR_REPLY)
+        with mock.patch.object(astra_review, "run_review", return_value=0) as runner:
+            code, output = self.cli("run", *args)
+
+        self.assertEqual(code, 0, output)
+        prompt = cast(str, runner.call_args.args[1])
+        self.assertIn("`with contextlib.closing(transcript_lines(Path(path))) as lines:`", prompt)
+        self.assertIn("Import `transcript_lines` from `scripts.lib.transcripts`.", prompt)
+
     def test_clear_requires_a_saved_reply_for_this_patch_and_each_test(self) -> None:
         args, key = self.changed_range()
         self.reply(CLEAR_REPLY)
@@ -207,13 +218,93 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         rows = cast(list[dict[str, str]], json.loads((folder / "tests.json").read_text()))
         return [row["test"] for row in rows]
 
+    def test_split_review_serializes_staff_opens_before_replies(self) -> None:
+        args, key = self.split_range("VALUE = 'new'\n")
+        director = replace(self.producer, kind="unit")
+        start = Barrier(2, timeout=5)
+        collision = Event()
+        opened: list[Path] = []
+
+        def write_prompt(path: Path, prompt: str) -> None:
+            _ = self.write(path, prompt)
+            _ = start.wait()
+
+        def open_part(reply: Path, log: Path, target: str, _cwd: Path, _lock: file_lock.ExclusiveLock) -> int:
+            self.assertEqual(target, "staff-worker")
+            with file_lock.exclusive(self.root / "caller-row.lock", wait=False) as held:
+                if held is file_lock.LockResult.BUSY:
+                    _ = self.write(log, "another operation holds this row\n")
+                    collision.set()
+                    return 2
+                opened.append(reply)
+                if len(opened) == 1:
+                    _ = collision.wait(2)
+                return worker.DispatchSubmission.SUBMITTED
+
+        with (mock.patch.object(astra_review, "review_attempt_folder", side_effect=lambda: Path(mkdtemp(dir=self.root))),
+              mock.patch.object(staff, "runtime_id", return_value=director.current_session),
+              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((director,))),
+              mock.patch.object(astra_review, "write_text_atomic", side_effect=write_prompt),
+              mock.patch.object(astra_review, "_managed_review", side_effect=open_part)):
+            code, output = self.cli("run", *args)
+
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("The reviewer exited", output)
+        self.assertFalse(collision.is_set())
+        self.assertEqual(len(opened), 2)
+        for reply in opened:
+            self.assertIn(f"The land waits for the independent review in {reply.parent}.", output)
+            self.assertFalse(reply.exists())
+        self.assertIs(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
+
+    def test_split_review_reopens_only_the_part_whose_open_failed(self) -> None:
+        args, key = self.split_range("VALUE = 'new'\n")
+        attempts: dict[str, list[Path]] = {}
+        running = process_start.process_start(os.getpid())
+        assert isinstance(running, process_start.Started)
+        self.reviewer_process(running.start)
+
+        def review_part(reply: Path, _prompt: str, _log: Path, **_options: object) -> int:
+            folder = reply.parent
+            test_file = self.part_tests(folder)[0].split("::", 1)[0]
+            part_attempts = attempts.setdefault(test_file, [])
+            part_attempts.append(folder)
+            if test_file == "test_second.py" and len(part_attempts) == 1:
+                return 2
+            record = {"status": "active", "delivery": {"actions": {"held_role": REVIEWER}}}
+            _ = self.write(pass_record.state_path(folder), json.dumps({"pass": {"review": record}}))
+            return worker.DispatchSubmission.SUBMITTED
+
+        with (mock.patch.object(astra_review, "review_attempt_folder", side_effect=lambda: Path(mkdtemp(dir=self.root))),
+              mock.patch.object(astra_review, "run_review", side_effect=review_part)):
+            code, output = self.cli("run", *args)
+            self.assertEqual(code, 1, output)
+            first_folder, = attempts["test_first.py"]
+            failed_folder, = attempts["test_second.py"]
+            self.assertIn(f"The reviewer exited with status 2. See {failed_folder / 'codex.log'}.", output)
+            self.assertIn(f"The land waits for the independent review in {first_folder}.", output)
+
+            code, output = self.cli("run", *args)
+            self.assertEqual(code, 1, output)
+            self.assertNotIn("The reviewer exited", output)
+            self.assertEqual(attempts["test_first.py"], [first_folder])
+            previous, reopened = attempts["test_second.py"]
+            self.assertEqual(previous, failed_folder)
+            self.assertNotEqual(reopened, failed_folder)
+            self.assertIn(f"The land waits for the independent review in {first_folder}.", output)
+            self.assertIn(f"The land waits for the independent review in {reopened}.", output)
+            path = behavior_check.record_path(key)
+            self.assertEqual(path.with_suffix(".part-1.run").read_text().strip(), str(first_folder))
+            self.assertEqual(path.with_suffix(".part-2.run").read_text().strip(), str(reopened))
+
     def test_split_review_retries_only_the_part_with_a_blocker(self) -> None:
         args, key = self.split_range("VALUE = 'new'\n")
         attempts: dict[str, list[Path]] = {}
         first_attempt = True
         concurrent = Barrier(2, timeout=5)
 
-        def review_part(reply: Path, _prompt: str, _log: Path, **_options: object) -> int:
+        def review_part(reply: Path, _log: Path, target: str, _cwd: Path, _lock: file_lock.ExclusiveLock) -> int:
+            self.assertEqual(target, "consultation-pane")
             tests = self.part_tests(reply.parent)
             test_file = tests[0].split("::", 1)[0]
             attempts.setdefault(test_file, []).append(reply.parent)
@@ -226,7 +317,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             return 0
 
         with (mock.patch.object(astra_review, "review_attempt_folder", side_effect=lambda: Path(mkdtemp(dir=self.root))),
-              mock.patch.object(astra_review, "run_review", side_effect=review_part)):
+              mock.patch.object(staff, "runtime_id", return_value=""),
+              mock.patch.object(astra_review, "_managed_review", side_effect=review_part)):
             code, output = self.cli("run", *args)
             self.assertEqual(code, 1, output)
             self.assertIn("The reviewer could not complete part 2: I could not read the diff.\n", output)
