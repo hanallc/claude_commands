@@ -830,6 +830,7 @@ An idle claim watcher releases unused claims and tells the holder.
 An unreachable Mac keeps a remote claim until cleanup can confirm that its work ended.
 
 The disk floor preserves useful build output while enough free space remains.
+Before item 372, the floor sweep and `sweep.reclaim` only listed Mac build folders. The only Mac removal was an `rm -rf` of the whole target at run end when free space was below 40 GiB. Item 372 added the guarded removal that the floor sweep does now.
 A Mac copy can finish a local compiling test earlier.
 A new non-copy job can preempt that copy to preserve normal routing priority.
 
