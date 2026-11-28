@@ -1,7 +1,7 @@
 """Run the common trial and production guest on a disposable gate instance."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime
 import inspect
 import json
@@ -9,7 +9,10 @@ import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 from enum import StrEnum
+from hashlib import file_digest
 import math
+import re
+import subprocess
 
 from scripts.lib.python_startup import sitecustomize as python_startup
 from scripts.production.gate_routes import GateJobKind, GateJobResult, GateRun, SuiteMode
@@ -229,9 +232,14 @@ def signed_urls(links: Mapping[str, object]) -> tuple[str, ...]:
                  and link.startswith(('http://', 'https://')) and link.partition('?')[2].partition('#')[0])
 
 
+class GuestTransferFailed(RuntimeError):
+    pass
+
+
 GUEST_TRANSFERS = f'''import json, os, subprocess, tempfile, time
 from collections.abc import Mapping
 {inspect.getsource(signed_urls)}
+{inspect.getsource(GuestTransferFailed)}
 gate_record_filter = {GATE_RECORD_FILTER!r}
 # The controller validates the suite mode before it sends the request.
 transfer_retries = {BOX_CURL_RETRY!r} if gate_request.get('task') != 'paired' and 'mode' in gate_request else ()
@@ -262,11 +270,11 @@ def transfer(stage, name, arguments, *, content=None):
                                      '--write-out', '%{http_code}', *transfer_retries, *arguments],
                                     input=content, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
-        raise RuntimeError(f'{stage} {name} failed (curl could not run)') from None
+        raise GuestTransferFailed(f'{stage} {name} failed (curl could not run)') from None
     if answer.returncode:
         status = answer.stdout
         http = status.decode() if len(status) == 3 and status.isdigit() else '000'
-        raise RuntimeError(f'{stage} {name} failed (curl exit {answer.returncode}, HTTP {http})')
+        raise GuestTransferFailed(f'{stage} {name} failed (curl exit {answer.returncode}, HTTP {http})')
 def get(name, destination):
     transfer('GET', name, ['--max-time', '60', '-o', str(destination)])
 def put(name, content):
@@ -392,6 +400,85 @@ def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -
     exec(CANDIDATE_GUEST, namespace)
 
 
+class GuestSourceRejected(ValueError):
+    pass
+
+
+def restore_current_files(root: Path, links: Mapping[str, str], request: dict[str, object],
+                          get: Callable[[str, Path], None]) -> Path:
+    """Verify the source and check out the requested trees."""
+    repo = root / 'repo'
+    package = root / 'current-files.pack'
+
+    def git(path: Path, *arguments: str) -> str:
+        return subprocess.check_output(['git', '-C', str(path), *arguments], text=True).strip()
+
+    def verify(commit: str, tree: str) -> None:
+        if (git(repo, 'rev-parse', '--verify', commit + '^{commit}') != commit
+                or git(repo, 'rev-parse', '--verify', commit + '^{tree}') != tree):
+            raise GuestSourceRejected('GuestSourceRejected: the requested commit or tree differs')
+
+    try:
+        origin_main = str(request['origin_main'])
+        revisions: dict[str, tuple[str, str]] = {}
+        if request.get('task') == 'paired':
+            for variant in ('base', 'changed'):
+                revision = request[variant]
+                if not isinstance(revision, dict):
+                    raise GuestSourceRejected('GuestSourceRejected: the paired revision is invalid')
+                identity = cast(dict[str, object], revision)
+                revisions[variant] = (str(identity['commit']), str(identity['tree']))
+            if revisions['changed'] != (links['commit'], links['tree']):
+                raise GuestSourceRejected('GuestSourceRejected: the paired candidate differs')
+        else:
+            revisions['repo'] = (links['commit'], links['tree'])
+
+        object_format = 'sha256' if len(origin_main) == 64 else 'sha1'
+        commits = dict.fromkeys((origin_main, *(commit for commit, _ in revisions.values())))
+        if any(len(commit) != len(origin_main) or not re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}', commit)
+               for commit in commits):
+            raise GuestSourceRejected('GuestSourceRejected: an invalid commit id')
+        shallow = ''.join(commit + '\n' for commit in commits)
+
+        get('source', package)
+        with package.open('rb') as stream:
+            if file_digest(stream, 'sha256').hexdigest() != links['source_sha256']:
+                raise GuestSourceRejected('GuestSourceRejected: source checksum differs')
+            _ = stream.seek(0)
+            repo.mkdir()
+            _ = git(repo, 'init', '-q', '--object-format=' + object_format)
+            _ = (repo / '.git/shallow').write_text(shallow)
+            _ = subprocess.run(['git', '-C', str(repo), 'index-pack', '--stdin', '--strict'],
+                               stdin=stream, stdout=subprocess.DEVNULL, check=True)
+
+        verify(origin_main, str(request['origin_main_tree']))
+        for commit, tree in revisions.values():
+            verify(commit, tree)
+        for name, (commit, _) in revisions.items():
+            checkout = root / name
+            if checkout != repo:
+                checkout.mkdir()
+                _ = git(checkout, 'init', '-q', '--object-format=' + object_format)
+                # Share the objects and preserve the shallow history in each checkout.
+                _ = (checkout / '.git/objects/info/alternates').write_text(str(repo.resolve() / '.git/objects') + '\n')
+                _ = (checkout / '.git/shallow').write_text(shallow)
+            _ = git(checkout, 'update-ref', 'refs/remotes/origin/main', origin_main)
+            _ = git(checkout, 'checkout', '--detach', commit)
+        return root / 'changed' if request.get('task') == 'paired' else repo
+    except GuestTransferFailed as error:
+        raise GuestSourceRejected(f'GuestSourceRejected: {error}') from error
+    except (OSError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+        raise GuestSourceRejected('GuestSourceRejected: the requested source could not be restored') from error
+    finally:
+        package.unlink(missing_ok=True)
+
+
+CURRENT_FILES_GUEST_SOURCE = (
+    'import re\nfrom collections.abc import Callable, Mapping\nfrom hashlib import file_digest\nfrom pathlib import Path\n'
+    + 'from typing import cast\n' + inspect.getsource(GuestSourceRejected) + '\n'
+    + inspect.getsource(restore_current_files))
+
+
 # The live bootstrap verifies the tree before it calls the candidate entry point.
 GUEST = (r'''import concurrent.futures, datetime, importlib, json, os, pathlib, sqlite3, subprocess, sys, time, traceback
 root = pathlib.Path(os.environ.pop('GATE_BOX_DIR', '/var/lib/gate-trial'))
@@ -417,9 +504,10 @@ for metadata_path in ('/etc/ec2-metadata/instance-identity-document', '/run/clou
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         continue
     break
-''' + GUEST_TRANSFERS + r'''links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
+''' + GUEST_TRANSFERS + CURRENT_FILES_GUEST_SOURCE + r'''links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
 result = {**timestamps, 'verdict': 'ready', 'tests': 0, 'skips': 0, 'failed_modules': [], 'memory_peak_bytes': None}
 log = root / 'gate.log'
+boot_rejection = False
 try:
     if not (links.get('production') and gate_request.get('task') == 'paired'):
         result['tools'] = {}
@@ -437,7 +525,9 @@ try:
         links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
     else:
         repo = root / 'repo'
-        if links.get('production') and gate_request.get('task') == 'paired':
+        if gate_request.get('source_form') == 'current-files':
+            repo = restore_current_files(root, links, gate_request, get)
+        elif links.get('production') and gate_request.get('task') == 'paired':
             subprocess.run(['git', 'clone', gate_request['clone_url'], str(repo)], check=True)
             for variant in ('base', 'changed'):
                 revision = gate_request[variant]
@@ -487,12 +577,15 @@ try:
         entry(root, links, result)
 except Exception as error:
     result['verdict'] = 'error'
-    result['error'] = (str(error) if str(error) == 'candidate predates guest entry point'
-                       else safe_gate_record(traceback.format_exc().encode()).decode())
-    if result['error'] == 'candidate predates guest entry point' and 'boot_error' in links:
-        put('boot_error', json.dumps(result).encode())
+    rejected = isinstance(error, GuestSourceRejected) or str(error) == 'candidate predates guest entry point'
+    boot_rejection = rejected and 'boot_error' in links
+    result['error'] = str(error) if rejected else safe_gate_record(traceback.format_exc().encode()).decode()
     with log.open('a') as output:
-        output.write(result['error'])
+        output.write(result['error'] + '\n')
+    if boot_rejection:
+        record = safe_gate_record(json.dumps(result).encode())
+        (root / 'boot-error.json').write_bytes(record)
+        put('boot_error', record)
 finally:
     if not (links.get('production') and gate_request.get('task') == 'paired'):
         try:
@@ -511,10 +604,11 @@ finally:
             put('log', content)
         except Exception as error:
             result['log_error'] = str(error)
-    stage('result upload')
-    publish('result' if links['step'] == 'size' else 'ready-' + links['boot'])
-    if links['step'] == 'start' and result['verdict'] == 'ready':
-        (root / 'prepared').touch()
+    if not boot_rejection:
+        stage('result upload')
+        publish('result' if links['step'] == 'size' else 'ready-' + links['boot'])
+        if links['step'] == 'start' and result['verdict'] == 'ready':
+            (root / 'prepared').touch()
 '''.replace('__GATE_STARTUP_SOURCE__', repr(inspect.getsource(python_startup)))
     .replace('__GATE_STARTUP_FILENAME__', repr(python_startup.__file__)))
 
@@ -572,12 +666,13 @@ log_push_pid=$!
 BWRAP_UNAVAILABLE_STAGE = 'bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial'
 
 
-def boot_trap(cold: str, warm: str, *, production: bool) -> str:
+def boot_trap(cold: str, warm: str, *, production: bool, private_tools: bool = False) -> str:
     """Publish a shell failure before the tool shell can publish a result."""
     destination = f'destination="$box_dir/{cold}.curl"'
     if cold != warm:
         destination += f'\n        if [ -e "$box_dir/prepared" ]; then destination="$box_dir/{warm}.curl"; fi'
     poweroff = '    shutdown -h now || :\n' if production else ''
+    tool_failure = 'GateToolsUnavailable' if private_tools else 'Tool preparation failed'
     return fr'''boot_failed() {{
     status=$?
     set +e
@@ -588,7 +683,7 @@ def boot_trap(cold: str, warm: str, *, production: bool) -> str:
         {log_upload(retry=False)}
         stage=$(sed -n 's/^[0-9T:Z-]\{{20\}} stage=//p' "$box_dir/boot.log" | tail -n 1)
         if [ "$stage" = 'tool preparation' ]; then
-            message='Tool preparation failed'
+            message='{tool_failure}'
         elif [ "$stage" = '{BWRAP_UNAVAILABLE_STAGE}' ]; then
             message="stage=$stage"
         else
@@ -596,8 +691,8 @@ def boot_trap(cold: str, warm: str, *, production: bool) -> str:
         fi
         message=$(printf '%s' "$message" | LC_ALL=C tr -d '[:cntrl:]' | sed 's/[\\"]/\\&/g')
         file="${{box_dir:-/var/lib/gate-trial}}/boot-error.json"
-        printf '{{"verdict":"error","error":"%s (exit %s)"}}' "$message" "$status" > "$file"
-        if [ "$?" -eq 0 ]; then
+        if {{ [ -f "$file" ] && [ -s "$file" ]; }} ||
+            printf '{{"verdict":"error","error":"%s (exit %s)"}}' "$message" "$status" > "$file"; then
             safe_gate_record < "$file" |
                 gate_curl 'PUT boot error' --config "$destination" {shlex.join(BOX_CURL_RETRY)} --max-time 30 -X PUT --data-binary @- -o /dev/null || :
         fi
@@ -612,11 +707,21 @@ GATE_IMAGE_OWNER_TAG = 'cloud-claude-gate-image'
 
 
 def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_push_s: float,
-              module_time_limit_s: float) -> str:
+              module_time_limit_s: float, *, tool_paths: tuple[str, ...] = ()) -> str:
     """Run directly in amazon-init on each boot."""
     from scripts.lib import conf
-    packages = conf.read_or_repository('cloud_gate').words('packages')
-    tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
+    if tool_paths:
+        from scripts.aws_target.gate_source import NIX_BINARY_CACHE
+        tools = '"$@"'
+        prepare_tools = f'''set -- {shlex.join(tool_paths)}
+if ! nix --extra-experimental-features nix-command path-info --recursive "$@" >/dev/null 2>&1; then
+    nix --extra-experimental-features nix-command copy --from {NIX_BINARY_CACHE} "$@"
+fi
+'''
+    else:
+        packages = conf.read_or_repository('cloud_gate').words('packages')
+        tools = shlex.join(f'github:NixOS/nixpkgs/{revision}#{name}' for name in packages)
+        prepare_tools = ''
     if links['step'] == 'size':
         cold = warm = 'boot_error' if 'boot_error' in links else 'result'
     else:
@@ -669,6 +774,7 @@ umask 077
 box_dir=${{GATE_BOX_DIR:-/var/lib/gate-trial}}
 export box_dir GATE_BOX_DIR="$box_dir"
 mkdir -p "$box_dir"
+if [ -f "$box_dir/boot-error.json" ]; then rm -f "$box_dir/boot-error.json"; fi
 : > "$box_dir/boot.log"
 exec >> "$box_dir/boot.log" 2>&1
 export PATH=$PATH:/run/current-system/sw/bin
@@ -696,14 +802,14 @@ printf '\\n}}\\n' >> "$box_dir/links.json"
 safe_gate_record() {{
     awk {shlex.quote(GATE_RECORD_FILTER)} "$box_dir/transfer-secrets" -
 }}
-{SHELL_CURL}{boot_trap(cold, warm, production=production)}printf '%s stage=boot\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+{SHELL_CURL}{boot_trap(cold, warm, production=production, private_tools=bool(tool_paths))}printf '%s stage=boot\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 {log_upload()}
 {log_push_loop(links, log_push_s)}touch "$box_dir/timeline.log"
 id -u gate-trial >/dev/null 2>&1 || useradd -m -g users gate-trial
 loginctl enable-linger gate-trial
 export PYTHONUNBUFFERED=1
 printf '%s stage=tool preparation\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-nix --extra-experimental-features 'nix-command flakes' shell {tools} --command bash -ec {shlex.quote(session)}
+{prepare_tools}nix --extra-experimental-features 'nix-command flakes' shell {tools} --command bash -ec {shlex.quote(session)}
 '''
 
 
