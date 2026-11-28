@@ -12,7 +12,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import BinaryIO, NoReturn
 
-__all__ = ["pause_state_root", "print_hook_error", "run_hook_with_budget"]
+__all__ = ["pause_state_root", "print_hook_error", "record_path", "run_hook_with_budget", "scheduled_prompts_path"]
 
 _HOOK_BUDGET_SECONDS = 5
 
@@ -24,6 +24,14 @@ class HookBudgetSpent(Exception):
 def pause_state_root() -> Path:
     return Path(os.environ.get("CONVERSATION_PAUSE_STATE_DIR")
                 or Path.home() / ".local/state/conversation-pause")
+
+
+def record_path(session_id: str) -> Path:
+    return pause_state_root() / f"{session_id}.json"
+
+
+def scheduled_prompts_path(session_id: str) -> Path:
+    return pause_state_root() / "scheduled-prompts" / f"{session_id}.json"
 
 
 def print_hook_error(error: Exception) -> None:
