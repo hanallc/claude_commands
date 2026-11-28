@@ -2858,7 +2858,7 @@ def end(parent: StaffId, name: WorkerName, *,
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
         if (not hold.active or hold.parent != parent or hold.name != name
-                or (isinstance(expected_worker, str) and row is not None and row.id != expected_worker)
+                or (isinstance(expected_worker, str) and row != record.by_id(expected_worker))
                 or (row is None and (hold.bound or expected is not None))
                 or (row is not None and (expected is None or not hold.owns(row)
                     or row.id != expected.id or row.current_session != expected.current_session))):
@@ -4107,13 +4107,12 @@ def main(arguments: list[str] | None = None) -> int:
             row = record.by_id(lifecycle.staff_id) if isinstance(lifecycle, design_roles.HeldWorker) else None
             if args.command == "end" and row is None:
                 return ExitCode.OK
-            if not isinstance(instance.parent, str):
-                raise ValueError("the design role has no recorded parent")
-            owner = record.by_id(instance.parent)
-            if args.command == "end" and row is not None:
-                if not row.reports_to(instance.parent):
-                    raise ValueError("the worker parent differs from the design record")
-                return end(instance.parent, WorkerName.parse(row.name), expected_worker=row.id)
+            if row is not None:
+                owner = record.parent_of(row)
+                if owner is not None and owner.kind in ("unit", "showrunner") and args.command == "end":
+                    return end(owner.id, WorkerName.parse(row.name), expected_worker=row.id)
+            else:
+                owner = record.by_id(instance.parent) if isinstance(instance.parent, str) else None
         else:
             owner = record.by_id(StaffId(args.parent)) if args.parent else record.by_current_session(staff.runtime_id())
         if owner is None or owner.kind not in ("unit", "showrunner"):

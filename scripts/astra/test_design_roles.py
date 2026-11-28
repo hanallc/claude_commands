@@ -805,9 +805,12 @@ class DurableRolesTests(HeldRolePaneCase):
         with stop_once(staff, "ensure_worker"), self.assertRaises(InjectedStop):
             _ = self.open_designer()
         path, = design_roles.state_root().glob("*/design.json")
-        instance = self.instance(design_roles.read_design(path.parent.name), "designer")
+        record = staff.snapshot()
+        with (staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", side_effect=AssertionError("read staff again"))):
+            instance = self.instance(design_roles.read_design(path.parent.name), "designer")
         parent = self.panes.command_case.fixture.parent.id
-        row, = staff.snapshot().find(kind="worker", parent=parent)
+        row, = record.find(kind="worker", parent=parent)
         self.assertEqual(instance.parent, parent)
         self.assertEqual(instance.lifecycle, design_roles.RoleWorkerPublished(row.id))
         self.assertEqual(row.design_claim, staff.DesignWorkerClaim(path.parent.name, "designer"))
@@ -978,6 +981,25 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertIsInstance(self.instance(saved, "designer").lifecycle, design_roles.RoleWorkerPublished)
         self.assertEqual(len(world.launches), 1)
         self.assertEqual(sum("--new-worker" in command for command in self.panes.commands), 1)
+
+    def test_recover_and_end_use_the_recorded_workers_current_parent(self) -> None:
+        design = self.open_designer()
+        instance = self.instance(design, "designer")
+        assert isinstance(instance.lifecycle, design_roles.RoleOpen)
+        showrunner = staff.by_path("demo")
+        assert showrunner is not None
+        self.assertNotEqual(instance.parent, showrunner.id)
+        self.panes.world.add(showrunner, "w1:p-showrunner", family="codex")
+        moved = staff.move(instance.lifecycle.staff_id, staff.ReportsTo(showrunner.id))
+        identifier = design.placement.design_id + "/designer"
+
+        recovered = design_roles.recover(identifier)
+        self.assertEqual(self.instance(recovered, "designer").lifecycle, instance.lifecycle)
+        self.assertEqual(design_roles.worker_parent(recovered, "designer", staff.snapshot()).id, showrunner.id)
+        ended = design_roles.end(identifier)
+        self.assertEqual(self.instance(ended, "designer").lifecycle, design_roles.RoleEnded(moved.id))
+        self.assertIsNone(staff.by_id(moved.id))
+        self.assertEqual(self.panes.world.closed, [("w1:p1", "terminal-w1:p1")])
 
     def test_pane_end_clears_unknown_creation_without_a_worker(self) -> None:
         world = self.pane_start()
@@ -1899,6 +1921,31 @@ class DurableRolesTests(HeldRolePaneCase):
         _ = self.resume(design, "designer")
         self.assertIn(message.id, self.dispatches[0][2])
         self.assertEqual(design_roles.pending_messages(design.placement.design_id, "designer"), ())
+
+    def test_late_success_clears_delivered_messages_and_preserves_the_end(self) -> None:
+        design = self.open_designer()
+        instance = self.instance(design, "designer")
+        assert isinstance(instance.lifecycle, design_roles.RoleOpen)
+        design_id = design.placement.design_id
+        identifier = design_id + "/designer"
+        delivered = design_roles.queue_message(design_id, "designer", "peer", "Use this evidence.")
+        pending: list[design_roles.PendingMessage] = []
+
+        def submit_then_end(current: design_roles.HeldDesign, role: Role, prompt: Path,
+                            reply: Path) -> design_roles.SubmittedRoleTurn:
+            submitted = self.dispatch(current, role, prompt, reply)
+            pending.append(design_roles.queue_message(design_id, role, "peer", "Keep this message."))
+            _ = design_roles.recover(identifier)
+            _ = design_roles.end(identifier)
+            return submitted
+
+        with patch.object(design_roles, "dispatch_turn", side_effect=submit_then_end):
+            _ = self.resume(design, "designer")
+        self.assertIn(delivered.id, self.dispatches[-1][2])
+        self.assertEqual(design_roles.pending_messages(design_id, "designer"), tuple(pending))
+        saved = self.instance(design_roles.read_design(design_id), "designer")
+        self.assertEqual(saved.lifecycle, design_roles.RoleEnded(instance.lifecycle.staff_id))
+        self.assertEqual(saved.assignment_claim, "")
 
     def test_message_queued_during_a_turn_is_kept_for_the_next_assignment(self) -> None:
         design = self.open_designer()

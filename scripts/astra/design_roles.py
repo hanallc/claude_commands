@@ -542,7 +542,7 @@ def _published_workers(design: HeldDesign, *, local_staff: bool = False) -> Held
                and isinstance(instance.lifecycle, RoleNotOpened) and instance.lifecycle.creation == 'outcome_unknown']
     if not pending:
         return design
-    record = staff.local_snapshot() if local_staff else staff.authority_snapshot()
+    record = staff.local_snapshot() if local_staff else staff.snapshot()
     for instance in pending:
         claim = staff.DesignWorkerClaim(design.placement.design_id, instance.role)
         if claim in record.design_workers:
@@ -785,9 +785,8 @@ def worker_parent(design: HeldDesign, role: Role, record: staff.StaffSnapshot) -
     if isinstance(instance.lifecycle, (RoleNotOpened, RoleEnded)):
         raise RoleRefused('role has no active worker')
     row = record.by_id(instance.lifecycle.staff_id)
-    parent = (record.by_id(instance.parent) if isinstance(instance.parent, str) else
-              record.parent_of(row) if row is not None else None)
-    if row is None or row.kind != 'worker' or parent is None or not row.reports_to(parent.id):
+    parent = record.parent_of(row) if row is not None else None
+    if row is None or row.kind != 'worker' or parent is None:
         raise RoleRefused('role worker parent is unavailable')
     return parent
 
@@ -1134,15 +1133,16 @@ def resume(instance_id: str, prompt_file: str | Path) -> SubmittedRoleTurn:
     with _lock(directory):
         current = read_design(design_id)
         selected = _instance(current, role)
-        if selected.assignment_claim != str(prompt) or selected.lifecycle != instance.lifecycle:
-            return submitted
-        updated = _set_instance(current, replace(selected, assignment_claim='',
-                                                 lifecycle=RoleOpen(instance.lifecycle.staff_id)))
-        _save(updated)
+        claim_matches = selected.assignment_claim == str(prompt) and selected.lifecycle == instance.lifecycle
+        if claim_matches:
+            current = _set_instance(current, replace(selected, assignment_claim='',
+                                                     lifecycle=RoleOpen(instance.lifecycle.staff_id)))
+            _save(current)
         identifiers = cast(list[str], worker_lifecycle.read_worker_value(prompt.with_suffix('.messages.json')))
         for identifier in identifiers:
             (directory / 'pending' / role / f'{identifier}.json').unlink(missing_ok=True)
-    _project_hold(updated, role, staff.snapshot())
+    if claim_matches:
+        _project_hold(current, role, staff.snapshot())
     return submitted
 
 
