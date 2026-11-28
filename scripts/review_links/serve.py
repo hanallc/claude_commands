@@ -2464,6 +2464,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
     def settings_post(self, query: str) -> None:
         """Save the selected Undo time from the console form."""
+        started = time.monotonic()
         if not self.same_origin(required=True):
             self.json_response(403, {"reason": "Open Settings on this console."})
             return
@@ -2487,7 +2488,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError as error:
             self.browser_failure(503, "The Undo time could not be saved.", error)
         else:
-            self.json_response(200, dict(saved))
+            self.json_response(200, {**saved, "processing_seconds": time.monotonic() - started})
 
     def accounts_post(self) -> None:
         """Apply one Accounts page action."""

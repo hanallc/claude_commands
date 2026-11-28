@@ -4,7 +4,7 @@ from __future__ import annotations
 import html
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -16,20 +16,46 @@ SETTINGS_FILE = ".review-link-settings.json"
 
 
 @dataclass(frozen=True)
-class UndoPreference:
-    """Keep the selected time and the one change that Undo can reverse."""
+class ConfigDefault:
+    """Use the Undo time from the config."""
 
-    seconds: int | None = None
-    undo_id: str = ""
-    previous: int | None = None
-    expires_ns: int = 0
-    undone: bool = False
+
+@dataclass(frozen=True)
+class SavedPick:
+    """Use the Undo time the user selected."""
+
+    seconds: int
+
+
+type UndoChoice = ConfigDefault | SavedPick
+
+
+@dataclass(frozen=True)
+class UndoReceipt:
+    """Keep the current choice and its previous choice until the Undo deadline."""
+
+    current: SavedPick
+    previous: UndoChoice
+    undo_id: str
+    expires_ns: int
+
+
+@dataclass(frozen=True)
+class UndoneReceipt:
+    """Keep the restored choice and confirm a repeated Undo."""
+
+    restored: UndoChoice
+    undo_id: str
+
+
+type UndoPreference = UndoChoice | UndoReceipt | UndoneReceipt
 
 
 class SavedUndoTime(TypedDict):
     seconds: int
     hold: str
     previous: int
+    remaining_seconds: float
 
 
 def undo_choices(config: conf.ConfigRead) -> tuple[int, ...]:
@@ -39,97 +65,154 @@ def undo_choices(config: conf.ConfigRead) -> tuple[int, ...]:
             raise ValueError("Use distinct Undo times from 1 to 60 seconds.")
         return choices
 
-    return config.value("undo_seconds_choices", parse)
+    choices = config.origin("undo_seconds_choices", parse)
+    if isinstance(choices, conf.UsableLiveValue):
+        return choices.value
+    raise conf.Unusable("The undo_seconds_choices setting is missing or invalid.")
+
+
+def _choice(value: object) -> UndoChoice:
+    return SavedPick(value) if type(value) is int and 0 < value <= 60 else ConfigDefault()
 
 
 def _read(root: Path) -> UndoPreference:
     try:
         value = cast(object, json.loads((root / SETTINGS_FILE).read_text(encoding="utf-8")))
     except (OSError, ValueError, RecursionError):
-        return UndoPreference()
+        return ConfigDefault()
     if not isinstance(value, dict):
-        return UndoPreference()
+        return ConfigDefault()
     fields = cast(dict[str, object], value)
-    seconds, previous = fields.get("seconds"), fields.get("previous")
-    undo_id, expires_ns, undone = fields.get("undo_id"), fields.get("expires_ns"), fields.get("undone")
-    return UndoPreference(
-        seconds=seconds if type(seconds) is int else None,
-        undo_id=undo_id if isinstance(undo_id, str) and send_hold.valid_hold_id(undo_id) else "",
-        previous=previous if type(previous) is int else None,
-        expires_ns=expires_ns if type(expires_ns) is int else 0,
-        undone=undone is True,
-    )
+    current = _choice(fields.get("seconds"))
+    undo_id, expires_ns = fields.get("undo_id"), fields.get("expires_ns")
+    if isinstance(undo_id, str) and send_hold.valid_hold_id(undo_id):
+        if fields.get("undone") is True:
+            return UndoneReceipt(current, undo_id)
+        if isinstance(current, SavedPick) and type(expires_ns) is int and expires_ns > 0:
+            return UndoReceipt(current, _choice(fields.get("previous")), undo_id, expires_ns)
+    return current
 
 
-def _selected(seconds: int | None, config: conf.ConfigRead) -> int | None:
-    return seconds if seconds is not None and seconds in undo_choices(config) else None
+def _current(preference: UndoPreference) -> UndoChoice:
+    if isinstance(preference, UndoReceipt):
+        return preference.current
+    if isinstance(preference, UndoneReceipt):
+        return preference.restored
+    return preference
 
 
-def _effective_seconds(selected: int | None, config: conf.ConfigRead) -> int:
-    return config.whole("undo_seconds") if selected is None else selected
+def _effective_seconds(choice: UndoChoice, config: conf.ConfigRead) -> int:
+    return choice.seconds if isinstance(choice, SavedPick) else config.whole("undo_seconds")
+
+
+def _allowed_choice(choice: UndoChoice, choices: tuple[int, ...]) -> UndoChoice:
+    if isinstance(choice, SavedPick) and choice.seconds in choices:
+        return choice
+    return ConfigDefault()
 
 
 def undo_seconds(root: Path, config: conf.ConfigRead) -> int:
     """Read the saved time, or use the default from the config."""
-    return _effective_seconds(_selected(_read(root).seconds, config), config)
+    choice = _current(_read(root))
+    if isinstance(choice, SavedPick):
+        try:
+            choice = _allowed_choice(choice, undo_choices(config))
+        except conf.Unusable:
+            choice = ConfigDefault()
+    return _effective_seconds(choice, config)
 
 
-def _write(root: Path, preference: UndoPreference) -> None:
-    atomic_file.write_text_atomic(root / SETTINGS_FILE, json.dumps(asdict(preference)) + "\n", new_file_mode=0o600)
+def _write(root: Path, preference: UndoReceipt | UndoneReceipt) -> None:
+    current = _current(preference)
+    fields: dict[str, object] = {
+        "seconds": current.seconds if isinstance(current, SavedPick) else None,
+        "undo_id": preference.undo_id,
+    }
+    if isinstance(preference, UndoReceipt):
+        previous = preference.previous
+        fields.update(previous=previous.seconds if isinstance(previous, SavedPick) else None,
+                      expires_ns=preference.expires_ns)
+    else:
+        fields["undone"] = True
+    try:
+        atomic_file.write_text_atomic(root / SETTINGS_FILE, json.dumps(fields) + "\n", new_file_mode=0o600)
+    except atomic_file.AtomicDurabilityUnconfirmed:
+        if _read(root) != preference:
+            raise
+
+
+def _saved_time(receipt: UndoReceipt, choices: tuple[int, ...], config: conf.ConfigRead) -> SavedUndoTime:
+    remaining = (receipt.expires_ns - time.time_ns()) / 1_000_000_000 - send_hold.RELEASE_GRACE_SECONDS
+    previous = _effective_seconds(_allowed_choice(receipt.previous, choices), config)
+    return {"seconds": receipt.current.seconds, "hold": receipt.undo_id, "previous": previous,
+            "remaining_seconds": max(0.0, remaining)}
 
 
 def save(root: Path, config: conf.ConfigRead, value: str) -> SavedUndoTime:
     """Save one choice and keep the earlier choice for Undo."""
-    choices = {str(seconds): seconds for seconds in undo_choices(config)}
-    if value not in choices:
+    choices = undo_choices(config)
+    numbers = {str(seconds): seconds for seconds in choices}
+    if value not in numbers:
         raise ValueError("Choose an Undo time shown on the Settings page.")
-    seconds = choices[value]
+    seconds = numbers[value]
     with file_lock.exclusive(root / (SETTINGS_FILE + ".lock")):
-        previous = _selected(_read(root).seconds, config)
+        saved = _read(root)
+        if isinstance(saved, UndoReceipt) and saved.current.seconds == seconds:
+            return _saved_time(saved, choices, config)
+        previous = _allowed_choice(_current(saved), choices)
         current = _effective_seconds(previous, config)
         if seconds == current:
-            return {"seconds": seconds, "hold": "", "previous": current}
-        undo_id = send_hold.new_hold_id()
+            return {"seconds": seconds, "hold": "", "previous": current, "remaining_seconds": 0.0}
         expires_ns = time.time_ns() + int((seconds + send_hold.RELEASE_GRACE_SECONDS) * 1_000_000_000)
-        _write(root, UndoPreference(seconds, undo_id, previous, expires_ns))
-    return {"seconds": seconds, "hold": undo_id, "previous": current}
+        receipt = UndoReceipt(SavedPick(seconds), previous, send_hold.new_hold_id(), expires_ns)
+        _write(root, receipt)
+        return _saved_time(receipt, choices, config)
 
 
 def undo(root: Path, undo_id: str) -> send_hold.UndoResult:
     """Restore the previous choice if this change is still current."""
-    if _read(root).undo_id != undo_id:
+    saved = _read(root)
+    if not isinstance(saved, (UndoReceipt, UndoneReceipt)) or saved.undo_id != undo_id:
         return send_hold.UndoResult.MISSING
     with file_lock.exclusive(root / (SETTINGS_FILE + ".lock")):
         saved = _read(root)
-        if saved.undo_id != undo_id:
+        if not isinstance(saved, (UndoReceipt, UndoneReceipt)) or saved.undo_id != undo_id:
             return send_hold.UndoResult.MISSING
-        if saved.undone:
+        if isinstance(saved, UndoneReceipt):
             return send_hold.UndoResult.UNDONE
         if time.time_ns() >= saved.expires_ns:
             return send_hold.UndoResult.ALREADY_SENT
-        _write(root, UndoPreference(saved.previous, undo_id, undone=True))
+        _write(root, UndoneReceipt(saved.previous, undo_id))
     return send_hold.UndoResult.UNDONE
 
 
 def render(root: Path, config: conf.ConfigRead, token: str) -> bytes:
     """Render the Settings page in the shared frame."""
-    selected = undo_seconds(root, config)
+    try:
+        choices = undo_choices(config)
+    except conf.Unusable as error:
+        return _document(f'<p class="action-failure" role="alert">{html.escape(str(error))}</p>')
+    selected = _effective_seconds(_allowed_choice(_current(_read(root)), choices), config)
     buttons = "".join(f'<button type="submit" name="seconds" value="{seconds}" '
                       + f'aria-pressed="{str(seconds == selected).lower()}">{seconds} s</button>'
-                      for seconds in undo_choices(config))
+                      for seconds in choices)
     control = record_table.labelled_chip_row(
         "Undo time", buttons, filter_key="undo-time",
         label_html='<strong>Undo time</strong><span id="undo-time-help">'
         + 'How long the Undo message stays after you save or send.</span>')
     control = control.replace('role="group"', 'role="group" aria-describedby="undo-time-help"', 1)
+    form = (f'<form method="post" action="{PAGE_PATH}" class="card" id="undo-time">'
+            + f'<input type="hidden" name="token" value="{html.escape(token, quote=True)}">'
+            + control + page_frame.action_failure("settings-error") + '</form>')
+    return _document(form, page_frame.HELD_SEND_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + SCRIPT)
+
+
+def _document(content: str, script: str = "") -> bytes:
     return ('''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings</title><style>'''
             + console_theme.CSS + page_frame.STYLE + '</style>' + record_table.STYLE + '<style>' + STYLE
             + '</style></head><body><main><h1 class="page-title">Settings</h1>'
-            + f'<form method="post" action="{PAGE_PATH}" class="card" id="undo-time">'
-            + f'<input type="hidden" name="token" value="{html.escape(token, quote=True)}">'
-            + control + page_frame.action_failure("settings-error") + '</form></main><script>'
-            + page_frame.HELD_SEND_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + SCRIPT
+            + content + '</main><script>' + script
             + page_frame.CONSOLE_READY_SCRIPT + '</script></body></html>').encode("utf-8")
 
 
@@ -161,13 +244,17 @@ SCRIPT = r'''
   form.dataset.saving='true';
   showActionFailure(error);
   try{
+   const started=performance.now();
    const response=await fetch(form.action,{method:'POST',body});
    const result=await response.json();
    if(!response.ok) throw new Error(result.reason || 'The Undo time could not be saved.');
    select(result.seconds);
    if(result.hold){
     toast?.close();
-    const current=toast=heldFetch.showSaved(result);
+    const transit=Math.max(0,(performance.now()-started)/1000-result.processing_seconds);
+    const remaining=result.remaining_seconds-transit;
+    if(!(remaining>0)) return;
+    const current=toast=heldFetch.showSaved({hold:result.hold,seconds:remaining});
     current.done.then(undone=>{
      if(undone && toast===current) select(result.previous);
     }).catch(failure=>{

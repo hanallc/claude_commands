@@ -43,6 +43,7 @@ from functools import partial
 from http.client import HTTPConnection, RemoteDisconnected, parse_headers
 from io import BytesIO, StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, Mock, ThreadingMock, call, patch
 
 
@@ -190,6 +191,7 @@ def new_item_notice_log(folder: Path, keeper: staff.StaffId, *, recorded: thread
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 options = sys.argv[1:]
 rows = sorted(path.stem for path in Path({str(the_list.folder(keeper))!r}).glob("L*.md"))
@@ -1251,6 +1253,151 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(self.held_http("POST", recent)[::2], (200, {"outcome": "undone"}))
             self.assertEqual(self.held_http("POST", recent)[::2], (200, {"outcome": "undone"}))
             self.assertEqual(settings_page.undo_seconds(self.root, conf.read("review_links")), 20)
+
+    def test_settings_confirms_visible_state_after_folder_sync_failure(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        token = self.server.new_item_token
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(atomic_file, "sync_folder", side_effect=OSError("Directory sync failed.")) as sync):
+            status, _, saved = self.post_undo_time("20", token=token)
+            self.assertEqual(status, 200, saved)
+            sync.assert_called_once_with(self.root)
+            self.assertIn(b'value="20" aria-pressed="true"', self.request(settings_page.PAGE_PATH).body)
+            status, _, retry = self.post_undo_time("20", token=token)
+            self.assertEqual((status, retry["hold"], retry["previous"]), (200, saved["hold"], 10))
+            sync.assert_called_once()
+            undo = f'{send_hold.HOLD_PATH}/{saved["hold"]}/undo'
+            self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
+            self.assertEqual(sync.call_count, 2)
+            self.assertIn(b'value="10" aria-pressed="true"', self.request(settings_page.PAGE_PATH).body)
+            self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
+            self.assertEqual(sync.call_count, 2)
+
+    def test_invalid_settings_choices_keep_held_sends_and_undo_available(self) -> None:
+        path = conf.path("review_links")
+        _ = write_config_fixture(path, "undo_seconds=10\n")
+        config = "".join(line for line in path.read_text().splitlines(keepends=True)
+                         if not line.startswith("undo_seconds_choices="))
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            token = self.server.new_item_token
+            for invalid in ("", "undo_seconds_choices=5,5\n", "undo_seconds_choices=5,no\n"):
+                with self.subTest(invalid=invalid):
+                    _ = write_config_fixture(path, "undo_seconds_choices=5,10,20,30\n")
+                    status, _, saved = self.post_undo_time("20", token=token)
+                    self.assertEqual(status, 200, saved)
+                    _ = path.write_text(config + invalid, encoding="utf-8")
+                    page = self.request(settings_page.PAGE_PATH)
+                    self.assertEqual(page.status, 200)
+                    self.assertIn(b'The undo_seconds_choices setting is missing or invalid.', page.body)
+                    self.assertNotIn(b'name="seconds"', page.body)
+                    self.assertEqual(self.post_undo_time("20", token=token)[0], 400)
+                    status, held, send = self.held_http("POST", images.PAGE_PATH, b"action=answer",
+                                                       headers={send_hold.HOLD_HEADER: "1"})
+                    self.assertEqual((status, held, send["seconds"]), (202, "held", 10))
+                    self.assertEqual(self.held_http("POST", f'{send_hold.HOLD_PATH}/{send["hold"]}/undo')[0], 200)
+                    self.assertEqual(self.held_http("POST", f'{send_hold.HOLD_PATH}/{saved["hold"]}/undo')[0], 200)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the sidebar label test.")
+    def test_collapsed_labels_are_visible_beside_the_scrolling_sidebar(self) -> None:
+        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
+
+        pages = tuple(console.ConsolePage(f"page{index}", f"Page {index}", "inbox", f"Page {index}",
+                                          console.UnavailablePage()) for index in range(16))
+        browser = _Chrome(self.root.parent)
+        self.addCleanup(browser.close)
+        _ = browser.command("Emulation.setDeviceMetricsOverride",
+                            {"width": 1440, "height": 700, "deviceScaleFactor": 1, "mobile": False}, browser.session)
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(console, "read_pages", return_value=pages),
+              patch.object(console, "for_you_payload", return_value={"available": True, "count": 0, "entries": []})):
+            browser.navigate(f"http://127.0.0.1:{self.port}/console/")
+            result = browser.command("Runtime.evaluate", {"awaitPromise": True, "expression": r"""
+(async()=>{
+ const check=(ok,message)=>{if(!ok) throw new Error(message);};
+ const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const sidebar=document.querySelector('.sidebar');
+ const toggle=document.getElementById('nav-toggle');
+ const settings=document.querySelector('[data-page=settings]');
+ const label=document.getElementById('nav-tooltip');
+ check(innerWidth===1440 && innerHeight===700,'The desktop viewport is 1440 x 700.');
+ if(toggle.getAttribute('aria-expanded')==='true') toggle.click();
+ check(sidebar.scrollHeight>sidebar.clientHeight,'The sidebar scrolls.');
+ settings.focus();
+ await frame();
+ const bounds=label.getBoundingClientRect(), icon=settings.getBoundingClientRect();
+ check(sidebar.scrollTop>0 && !label.hidden && label.textContent==='Settings',
+  'Focus scrolls to Settings and shows its label.');
+ label.style.pointerEvents='auto';
+ check(bounds.left>sidebar.getBoundingClientRect().right && bounds.top<icon.bottom &&
+  document.elementFromPoint(bounds.left+bounds.width/2,bounds.top+bounds.height/2)===label,
+  'The label is visible outside the sidebar.');
+ label.style.removeProperty('pointer-events');
+ const first=document.querySelector('[data-page=page0]');
+ first.focus();
+ await frame();
+ settings.dispatchEvent(new PointerEvent('pointerenter'));
+ check(label.hidden,'The label is hidden when its icon is outside the scroll area.');
+ settings.dispatchEvent(new PointerEvent('pointerleave'));
+ check(!label.hidden && label.textContent==='Page 0 · Not available','The label returns to the focused icon.');
+ toggle.click();
+ check(label.hidden,'Expanding the sidebar hides the floating label.');
+})();
+"""}, browser.session)
+            self.assertNotIn("exceptionDetails", result, result)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
+    def test_browser_settings_undo_uses_the_time_left_after_save(self) -> None:
+        from scripts.review_links.test_list_page import _Chrome  # pyright: ignore[reportPrivateUsage]
+
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=10\n")
+        elapsed = 0
+        sync_folder = atomic_file.sync_folder
+
+        def sync(folder: Path) -> None:
+            nonlocal elapsed
+            sync_folder(folder)
+            elapsed += 2_000_000_000
+
+        def undo_clock() -> int:
+            return time.time_ns() + elapsed
+
+        browser = _Chrome(self.root.parent)
+        self.addCleanup(browser.close)
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(settings_page, "time", SimpleNamespace(time_ns=undo_clock)),
+              patch.object(atomic_file, "sync_folder", side_effect=sync)):
+            browser.navigate(f"http://127.0.0.1:{self.port}{settings_page.PAGE_PATH}")
+            result = browser.command("Runtime.evaluate", {"awaitPromise": True, "expression": r"""
+(async()=>{
+ const form=document.getElementById('undo-time');
+ const nativeFetch=window.fetch;
+ let save,undo;
+ window.fetch=(...args)=>{
+  const response=nativeFetch(...args);
+  if(args[0]===form.action) save=response.then(answer=>answer.clone().json());
+  if(String(args[0]).endsWith('/undo')) undo=response.then(answer=>answer.clone().json());
+  return response;
+ };
+ const toastAdded=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   const toast=document.querySelector('[data-send-undo]');
+   if(toast){observer.disconnect();resolve(toast);}
+  });
+  observer.observe(document.body,{childList:true,subtree:true});
+ });
+ form.querySelector('[value="5"]').click();
+ const toast=await toastAdded, reply=await save;
+ const duration=toast.getAnimations()[0].effect.getTiming().duration;
+ if(reply.seconds!==5 || !(reply.remaining_seconds>2 && reply.remaining_seconds<=3))
+  throw new Error('The server counts down from the saved deadline.');
+ if(!(duration>1000 && duration<=reply.remaining_seconds*1000))
+  throw new Error('The toast uses the remaining time from the save response.');
+ toast.querySelector('button').click();
+ if((await undo).outcome!=='undone') throw new Error('Undo restores the original choice.');
+})();
+"""}, browser.session)
+            self.assertNotIn("exceptionDetails", result, result)
+            self.assertEqual(settings_page.undo_seconds(self.root, conf.read("review_links")), 10)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the Settings browser test.")
     def test_browser_opens_settings_and_saves_with_undo_in_dark_mode(self) -> None:
@@ -10260,6 +10407,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         child = textwrap.dedent("""
             import json, sys, time
             from pathlib import Path
+from types import SimpleNamespace
             from unittest.mock import patch
             from scripts.review_links import go_ledger
             read = getattr(go_ledger, "_read")
@@ -12408,6 +12556,7 @@ import sys
 import time
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from scripts.review_links import serve
 
 checkout = Path(__file__).parent

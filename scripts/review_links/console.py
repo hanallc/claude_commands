@@ -322,9 +322,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
                        + ('' if available else '<small>Not available</small>') + '</span>'
                        + ('<span class="new-mark" hidden>' + new_mark + '</span>' if available
                           else '<span class="unavailable-dot" aria-hidden="true"></span>')
-                       + ('<span id="nav-quota" role="img" aria-label="" hidden></span>' if quota else '')
-                       + f'<span class="tooltip" aria-hidden="true">{label}'
-                       + ('<span class="new-text" hidden> · New</span>' if available else ' · Not available') + '</span></a>')
+                       + ('<span id="nav-quota" role="img" aria-label="" hidden></span>' if quota else '') + '</a>')
     content = DOCUMENT.replace("<!-- ENTRIES -->", "\n".join(entries)).replace("/* Quota tokens. */", console_theme.QUOTA_TOKENS)
     rebuilds_path = rebuilds.path if isinstance(rebuilds, AvailablePage) else ""
     settings = conf.read("review_links")
@@ -340,8 +338,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     content = content.replace("<!-- FOR YOU BUTTON -->", button)
     content = content.replace("<!-- SETTINGS -->", '<a class="nav-entry" href="?page=settings" data-page="settings" '
                               + f'data-url="{SETTINGS_PATH}" data-title="Settings" aria-label="Settings">'
-                              + SETTINGS_ICON + '<span class="entry-label">Settings</span>'
-                              + '<span class="tooltip" aria-hidden="true">Settings</span></a>')
+                              + SETTINGS_ICON + '<span class="entry-label">Settings</span></a>')
     content = content.replace("<!-- FOR YOU LINK -->", html.escape(place_query("review", review_place()), quote=True))
     content = content.replace("<!-- SHARED STYLES -->", page_frame.BUTTON_STATES + page_frame.COPY_STYLE + FOR_YOU_STYLE)
     notifier = FOR_YOU_SCRIPT
@@ -551,7 +548,7 @@ DOCUMENT = """<!doctype html>
 *{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--text);overflow:hidden}
 .shell{display:grid;grid-template-columns:244px minmax(0,1fr);height:100vh;height:100dvh}
 .shell.collapsed{grid-template-columns:72px minmax(0,1fr)}
-.sidebar{background:var(--nav);border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0;z-index:3}
+.sidebar{background:var(--nav);border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0;min-height:0;z-index:3}
 .brand{height:80px;flex:none;display:flex;align-items:center;gap:12px;padding:0 20px;border-bottom:1px solid var(--border)}
 h1{font-size:16px;letter-spacing:-.3px;margin:0;font-weight:650;white-space:nowrap;flex:1}
 button,a{-webkit-tap-highlight-color:transparent}button{font:inherit}
@@ -580,7 +577,7 @@ background:var(--text);color:var(--page);border-radius:6px;font-size:12px;font-w
 .collapsed .brand{padding:0 18px}.collapsed .entry-label,.collapsed .unavailable-dot{display:none}
 .collapsed .brand h1{position:absolute;width:1px;height:1px;clip-path:inset(50%);overflow:hidden;white-space:nowrap}
 .collapsed .nav-entry{padding:13px 14px}.collapsed .open-icon{display:block}.collapsed .close-icon{display:none}
-.collapsed .nav-entry:hover .tooltip,.collapsed .nav-entry:focus .tooltip{display:block}
+#nav-tooltip{display:block;position:fixed;left:var(--label-left);top:clamp(16px,var(--label-top),calc(100% - 16px));white-space:nowrap}
 .workspace{grid-column:2;display:flex;flex-direction:column;min-width:0;min-height:0}
 .frame-area{flex:1;min-height:0;position:relative}
 .frame-area iframe{position:absolute;inset:0;display:block;border:0;width:100%;height:100%;background:var(--page)}
@@ -623,6 +620,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 <span class="close-icon"><!-- CLOSE --></span><span class="open-icon"><!-- OPEN --></span></button></div>
 <nav id="console-nav" aria-label="Console pages"><!-- ENTRIES -->
 <div class="nav-bottom"><div class="for-you-slot"><!-- FOR YOU BUTTON --></div><!-- SETTINGS --></div></nav></aside>
+<span class="tooltip" id="nav-tooltip" aria-hidden="true" hidden></span>
 <div class="rebuild-slot"><a class="rebuild-link" id="rebuild-link" href="?page=rebuilds" data-page="rebuilds"
 <!-- REBUILDS --> data-title="Rebuilds needed" hidden><!-- REBUILD --><span class="entry-label" id="rebuild-label"></span>
 <span class="rebuild-count" id="rebuild-count" aria-hidden="true"></span><span class="tooltip" id="rebuild-tooltip" aria-hidden="true"></span></a></div>
@@ -653,6 +651,34 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   const mobileToggle = document.getElementById('mobile-nav-toggle');
   const phone = matchMedia('/* Phone query */');
   const entries = [...document.querySelectorAll('.nav-entry')];
+  const sidebar = document.querySelector('.sidebar');
+  const tooltip = document.getElementById('nav-tooltip');
+  let hoveredEntry;
+  function showNavLabel() {
+    const entry = hoveredEntry || document.activeElement;
+    if (phone.matches || !shell.classList.contains('collapsed') || !entry?.matches('.nav-entry')) {
+      tooltip.hidden = true;
+      return;
+    }
+    const bounds = entry.getBoundingClientRect(), viewport = sidebar.getBoundingClientRect();
+    const middle = (bounds.top + bounds.bottom) / 2;
+    tooltip.hidden = middle < viewport.top || middle > viewport.bottom;
+    if (tooltip.hidden) return;
+    const label = entry.querySelector('.entry-label').firstChild.textContent;
+    const suffix = !entry.dataset.url ? ' · Not available'
+      : entry.querySelector('.new-mark:not([hidden])') ? ' · New' : '';
+    tooltip.textContent = label + suffix;
+    tooltip.style.setProperty('--label-left', (viewport.right + 10) + 'px');
+    tooltip.style.setProperty('--label-top', middle + 'px');
+  }
+  for (const entry of entries) {
+    entry.addEventListener('pointerenter', () => { hoveredEntry = entry; showNavLabel(); });
+    entry.addEventListener('pointerleave', () => { hoveredEntry = undefined; showNavLabel(); });
+    entry.addEventListener('focus', showNavLabel);
+    entry.addEventListener('blur', () => { if (!hoveredEntry) tooltip.hidden = true; });
+  }
+  sidebar.addEventListener('scroll', showNavLabel);
+  addEventListener('resize', showNavLabel);
   const rebuildLink = document.getElementById('rebuild-link');
   // The rebuild link opens its page as a navigation entry does, so it is one of the pages.
   const pages = [...entries, rebuildLink];
@@ -680,7 +706,8 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     mobileToggle.setAttribute('aria-expanded', String(!value));
     mobileToggle.setAttribute('aria-label', value ? 'Open navigation' : 'Close navigation');
     document.querySelector('.workspace').inert = phone.matches && !value;
-    if (phone.matches && value && document.querySelector('.sidebar').contains(document.activeElement)) mobileToggle.focus();
+    if (phone.matches && value && sidebar.contains(document.activeElement)) mobileToggle.focus();
+    showNavLabel();
     if (save && !phone.matches) {
       desktopCollapsed = value;
       try { localStorage.setItem(storageKey, String(value)); } catch (_) {}
@@ -821,10 +848,10 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     marked.forEach(entry => {
       const value = fresh.has(entry.dataset.page) && !entry.hasAttribute('aria-current');
       entry.querySelector('.new-mark').hidden = !value;
-      entry.querySelector('.new-text').hidden = !value;
       entry.setAttribute('aria-label', labels.get(entry) + (value ? ' — New items' : ''));
     });
     menuNew.hidden = !marked.some(entry => !entry.querySelector('.new-mark').hidden);
+    showNavLabel();
   }
   async function loadNews() {
     const current = pages.find(entry => entry.hasAttribute('aria-current'));
