@@ -164,7 +164,7 @@ class ProposalIssueTests(unittest.TestCase):
         key = new_item_dialog.ScopedSubmissionKey(new_item_dialog.SubmissionKind.PROPOSAL, recipient,
                                                    issue.value("proposal_id"), details.request_id)
         self.assertFalse(reply_tokens.path().exists())
-        with self.assertRaisesRegex(new_item_dialog.SubmissionError, "no longer accepts"):
+        with self.assertRaisesRegex(record_store.SubmissionError, "no longer accepts"):
             _ = proposal_issue.reply_to_submission(issue.path, key, "Stale reply", details.reply_token, owner=key.recipient_id)
 
     def test_number_replaces_a_legacy_reply_token_with_its_hash(self) -> None:
@@ -374,7 +374,7 @@ class ProposalIssueTests(unittest.TestCase):
 
         scoped, _ = proposal_issue.set_fields(VAULT_ISSUE, {"review_submission": "{}"}, self.issue)
         _ = self.issue.write_text(scoped)
-        with self.assertRaisesRegex(new_item_dialog.SubmissionError, "Use the scoped reply"):
+        with self.assertRaisesRegex(record_store.SubmissionError, "Use the scoped reply"):
             _ = proposal_issue.record_review(self.issue, "Answer: Use the new layout.", NoMark(), today,
                                              submission_reply=native)
         self.assertEqual(self.issue.read_text(), scoped)
