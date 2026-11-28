@@ -7,8 +7,8 @@ assignment.py updates review counts when a source changes or a deadline passes.
 The review cache is `<showrunner state>/counts/<staff id>`.
 Its first line contains the review counts.
 Its second line contains the next deadline, or an empty value.
-The remaining lines contain watched paths and optional unit details.
-The final unit detail uses `source=unit:<staff id>`.
+The watched paths and optional `source=unit:<staff id>` follow.
+The final line identifies the count version.
 The cache time records when the read began.
 """
 from __future__ import annotations
@@ -25,16 +25,19 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.hooks import showrunner_footer  # noqa: E402
-from scripts.production import staff
+from scripts.production import footer_counts, staff
 from scripts.review_links import review_items, review_later
-from scripts.production.update_registration import QuestionStaff
+from scripts.production.update_registration import InputError, QuestionStaff, RegistrationFailure
 from scripts.statusline.rebuild_row import write_status_cache as write_cache
-from scripts.lib.user_zone import user_zone
 
 try:
     from scripts.review_links import for_you
 except Exception:
     for_you = None
+
+
+# Match the count version in assignment.py.
+REVIEW_COUNTS_VERSION = "review-counts=5"
 
 
 def cache_path(name: str) -> Path:
@@ -53,22 +56,22 @@ def retry_due(sources: list[Path]) -> str:
 def question_counts(owner: staff.StaffRow, zone: ZoneInfo, identities: QuestionStaff, sources: list[Path] | None,
                     source: str = "") -> tuple[int, str]:
     """Read question counts through the shared review reader."""
-    from scripts.review_links import review_items
     return review_items.question_counts(owner, zone, identities, sources, source)
+
 
 def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None = None,
         source: str = "", require_complete: bool = False) -> tuple[str, str]:
     """Return counts and sources. Cache writes require complete reads; library callers retain available counts."""
-    from scripts.production import footer_counts, proposals_folder
+    from scripts.production import proposals_folder
     read_sources = sources if require_complete else None
     record = identities.record if identities is not None else staff.snapshot()
     member = record.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
     if member is not None and member.kind == "producer":
         identities = identities if identities is not None else QuestionStaff.for_record(record)
-        questions, deadline = question_counts(member, user_zone(), identities, sources)
+        work = review_items.question_work(member, identities, sources)
         count = review_items.ready_investigations(member.id, sources=sources)
-        counts = footer_counts.FooterCounts(questions=questions, investigations=count)
-        return footer_counts.counts_line(counts) or "", deadline
+        counts = footer_counts.FooterCounts(questions=work.for_session, investigations=count)
+        return footer_counts.counts_line(counts) or "", work.deadline
     doc = showrunner_footer.production_doc(instance)
     if doc is not None:
         sources.append(doc)
@@ -80,7 +83,6 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
             source = member.id
         count = review_items.ready_investigations(staff.StaffId(source), sources=sources)
         return footer_counts.counts_line(footer_counts.FooterCounts(investigations=count)) or "", ""
-    from scripts.production.update_registration import RegistrationFailure
     if identities is None:
         identities = QuestionStaff.read() if read_sources is None else QuestionStaff.read(sources=read_sources)
     own = None
@@ -104,16 +106,17 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
         return line, ""
     outstanding = showrunner_footer.outstanding_path(owner.id, identities=identities)
     sources.append(outstanding)
-    if require_complete:
-        questions, deadline = question_counts(owner, ZoneInfo(production.zone), identities, read_sources, source)
-    else:
-        questions = showrunner_footer.open_questions([production], identities=identities, source=source)
-        after = showrunner_footer.deferred_until([owner.id], production.zone, identities=identities)
-        deadline = "" if after is None else str(int(after.timestamp()))
-    line = footer_counts.counts_line(footer_counts.read_counts(
-        production.doc, questions=questions or 0, record=identities.record, source=source, sources=read_sources,
-        own=own)) or ""
-    return line, deadline
+    try:
+        work = review_items.question_work(owner, identities, read_sources, source)
+    except (InputError, OSError, ValueError, RegistrationFailure, staff.StaffRefused) as error:
+        if require_complete:
+            raise showrunner_footer.FooterError(str(error)) from error
+        print(f"questions: unavailable — {error}", file=sys.stderr)
+        work = review_items.QuestionWork()
+    counts = footer_counts.read_counts(
+        production.doc, questions=work.for_session, record=identities.record, source=source, sources=read_sources,
+        own=own)
+    return footer_counts.counts_line(counts) or "", work.deadline
 
 
 def write(instance: Path) -> Path:
@@ -129,7 +132,7 @@ def write(instance: Path) -> Path:
     except (OSError, ValueError, showrunner_footer.FooterError):
         line = ""
         due = retry_due(sources)
-    write_cache(cache, line, due, sources, began)
+    write_cache(cache, line, due, sources, began, details=REVIEW_COUNTS_VERSION)
     return cache
 
 
@@ -148,7 +151,6 @@ def write_unit(identity: str) -> Path:
         if owner is None:
             if unit is None:
                 raise ValueError(f"{identity}: no staff row")
-            from scripts.production import footer_counts
             count = review_items.ready_investigations(unit.id, sources=sources)
             line, due = footer_counts.counts_line(footer_counts.FooterCounts(investigations=count)) or "", ""
         else:
@@ -161,7 +163,7 @@ def write_unit(identity: str) -> Path:
     except (OSError, ValueError, staff.StaffRefused, showrunner_footer.FooterError):
         line = ""
         due = retry_due(sources)
-    write_cache(cache, line, due, sources, began, details=f"source=unit:{identity}")
+    write_cache(cache, line, due, sources, began, details=f"source=unit:{identity}\n{REVIEW_COUNTS_VERSION}")
     return cache
 
 

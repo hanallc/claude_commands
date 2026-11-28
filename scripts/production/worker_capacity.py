@@ -117,7 +117,9 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
         if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
             return WorkerNotStopped(row.name, state.reason)
         try:
-            run = worker_panes.worker_run(row)
+            record = staff.local_snapshot()
+            scanned = worker_panes.parent_run_index(record)
+            run = worker_panes.worker_run(row, record=record, scanned=scanned)
             with suppress(FileNotFoundError):
                 _ = recorder_state.read_state(run / recorder_state.STATE_FILENAME)
         except recorder_state.OldRecorderState as error:
@@ -136,13 +138,19 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
         if isinstance(state, worker_panes.OpenWorker):
             return WorkerNotStopped(row.name, "the stop did not prove that the worker stopped")
         canceled: int | PassesNotCanceled
+        detached_directories = [run / detached_runs.DETACHED_RUNS_DIR]
         try:
-            canceled = progress_history.cancel_worker_passes(run, row.id)
+            pass_runs = worker_panes.worker_pass_runs(row, run, record, scanned=scanned)
+            canceled = 0
+            for cancellation in progress_history.cancel_worker_passes_in_runs(pass_runs, row.id):
+                canceled += cancellation.count
+                if cancellation.run != run:
+                    detached_directories.append(cancellation.run / detached_runs.DETACHED_RUNS_DIR)
         except (OSError, ValueError, SystemExit, recorder_state.OldRecorderState) as error:
             canceled = PassesNotCanceled(" ".join(str(error).split()))
-        runs = run / detached_runs.DETACHED_RUNS_DIR
-        detached = tuple(f"{record['run_id']}: result {runs / (record['run_id'] + '.json')}; log {record['log']}"
-                         for record in detached_runs.live_runs_for_staff(runs, frozenset({row.id})))
+        detached = tuple(f"{command['run_id']}: result {directory / (command['run_id'] + '.json')}; log {command['log']}"
+                         for directory in detached_directories
+                         for command in detached_runs.live_runs_for_staff(directory, frozenset({row.id})))
         pane: PaneOpen | None = None
         try:
             # Recovery can redirect standard error. Only one recovery can do that at a time.
@@ -217,10 +225,12 @@ def _stop_observed(parent: staff.StaffRow, state: worker_panes.WorkerPane, recor
                    scanned: dict[str, list[str]], client: herdr.Herdr, sweep: StopSweep,
                    ) -> WorkerStopped | WorkerNotStopped | StopSkipped:
     try:
-        if isinstance(state, worker_panes.ClosedWorker) and isinstance(progress_history.active_dispatch(
-                state.row.id, worker_panes.worker_run(state.row, record=record, scanned=scanned)),
-                progress_history.NoActiveDispatch):
-            return StopSkipped.NO_OPEN_WORK
+        if isinstance(state, worker_panes.ClosedWorker):
+            primary = worker_panes.worker_run(state.row, record=record, scanned=scanned)
+            runs = worker_panes.worker_pass_runs(state.row, primary, record, scanned=scanned)
+            if all(isinstance(progress_history.active_dispatch(state.row.id, run), progress_history.NoActiveDispatch)
+                   for run in runs):
+                return StopSkipped.NO_OPEN_WORK
         if not sweep.active():
             return StopSkipped.MODE_ENDED
         return stop_worker(parent, state.row, client, sweep=sweep)

@@ -122,6 +122,9 @@ def _managed_review(review: Path, log: Path, target: str, cwd: Path,
     name = f"astra-reviewer-{run.name}" if dispatch_lock is not None else f"astra-reviewer{os.getpid()}"
     if dispatch_lock is not None and target == "consultation-pane":
         write_text_atomic(run / "consultation-session", herdr.shared_session() + "\n", new_file_mode=0o600)
+    environment = dict(os.environ)
+    if target == "staff-worker":
+        environment["UNIT_RUN_DIR"] = str(run.absolute())
     # Keep the lock until the launcher exits if its caller stops.
     with log.open("w", encoding="utf-8") as output:
         result = subprocess.run([
@@ -130,7 +133,7 @@ def _managed_review(review: Path, log: Path, target: str, cwd: Path,
             "--new-worker", name, "--session-dir", str(run), "--cwd", str(cwd),
             "--prompt", str(run / "prompt.md"), "--reply-file", str(review.resolve()), "--log", str(run / "turn.log"),
             "--model", MODEL, "--effort", REASONING,
-        ], stdout=output, stderr=subprocess.STDOUT, text=True, check=False,
+        ], stdout=output, stderr=subprocess.STDOUT, env=environment, text=True, check=False,
             pass_fds=() if dispatch_lock is None else (dispatch_lock.descriptor,))
     if result.returncode == 0 and log.read_text(encoding="utf-8").splitlines()[-1:] == ["submitted"]:
         return worker.DispatchSubmission.SUBMITTED

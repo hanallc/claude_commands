@@ -31,7 +31,7 @@ from pathlib import Path
 from tempfile import TemporaryFile
 from typing import Literal, NoReturn, cast, final, overload
 
-from scripts.astra import astra_roles
+from scripts.astra import astra_roles, design_roles
 from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
@@ -72,6 +72,7 @@ class Arguments(argparse.Namespace):
     role: str = ""
     target: str = "staff-worker"
     policy: str = ""
+    design_role: str = ""
     parent: str = ""
     to: str = ""
     new_worker: str = ""
@@ -145,6 +146,7 @@ def parse_arguments() -> Arguments:
     _ = parser.add_argument("--target", choices=("staff-worker", "consultation-pane", "durable-design-role"), default="staff-worker")
     _ = parser.add_argument("--policy", choices=("astra-reviewer", "astra-designer"), default="")
     _ = parser.add_argument("--parent", default="")
+    _ = parser.add_argument("--design-role", default="")
     choice = parser.add_mutually_exclusive_group()
     _ = choice.add_argument("--to", default="")
     _ = choice.add_argument("--new-worker", default="")
@@ -169,10 +171,11 @@ def parse_arguments() -> Arguments:
         parser.error("--policy is required for this target")
     if args.target == "consultation-pane" and not args.new_worker:
         parser.error("consultation-pane requires --new-worker")
-    if args.target == "durable-design-role" and not args.parent:
-        parser.error("durable-design-role requires --parent and an Astra policy")
-    if args.target == "durable-design-role" and not (args.to or args.new_worker):
-        parser.error("durable-design-role requires --to or --new-worker")
+    if args.target == "durable-design-role":
+        if args.prompt and not args.parent:
+            parser.error("durable-design-role requires --parent and an Astra policy")
+        if not (args.to or args.new_worker or (args.design_role and not args.prompt)):
+            parser.error("durable-design-role requires --to or --new-worker")
     if not args.prompt and args.target == "staff-worker":
         parser.error("--prompt is required")
     if args.operation == AssignmentOperation.ASTRA_REVIEW and not args.new_worker:
@@ -976,25 +979,56 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
 
 def execute_durable(args: Arguments) -> int:
     """Start or dispatch a durable role through its explicit target."""
+    if not args.prompt:
+        try:
+            return start_durable(args)
+        except (OSError, ValueError) as error:
+            refuse(str(error))
     name = staff.WorkerName.parse(args.to or args.new_worker)
     role = cast(staff.WorkerRole, args.policy)
-    target = worker_panes.DurableDesignRole(staff.StaffId(args.parent), name, role)
     policy = pane_policy(args.policy, model=args.model, effort=args.effort)
-    if not args.prompt:
-        current = launch(target, policy, phase=args.phase or None)
-        if not isinstance(current, worker_panes.OpenWorker):
-            return staff_worker.startup_result(name, current)
-        print(json.dumps(current.row.to_json()))
-        return 0
     prompt = Path(args.prompt).expanduser().resolve()
     if not prompt.is_file() or not args.session_dir or not args.phase:
         refuse("durable dispatch requires --prompt, --session-dir, and --phase")
-    result = staff_worker.dispatch(target.parent, name, role, prompt, session_dir=Path(args.session_dir),
+    result = staff_worker.dispatch(staff.StaffId(args.parent), name, role, prompt, session_dir=Path(args.session_dir),
         slot=name.value, phase=args.phase, kind="astra",
         reply=Path(args.reply_file) if args.reply_file else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
         completion_actions=pass_recorder.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
         launcher_command=launcher_command())
     return result
+
+
+def start_durable(args: Arguments) -> int:
+    """Read the recorded parent before starting a held role."""
+    name_arg = args.to or args.new_worker
+    claim = (staff.DesignWorkerClaim.parse(args.design_role) if args.design_role
+             else design_roles.claim_for_worker_name(name_arg))
+    with ExitStack() as locks:
+        if isinstance(claim, staff.DesignWorkerClaim):
+            if args.policy != f"astra-{claim.role}":
+                refuse("the design role differs from the launch policy")
+            instance = locks.enter_context(design_roles.start_claim(claim))
+            if not isinstance(instance.parent, str):
+                refuse("the design role has no recorded parent")
+            parent, name_arg = instance.parent, instance.name
+        else:
+            run = Path(args.session_dir) if args.session_dir else None
+            record = staff.snapshot()
+            if args.parent:
+                owner = record.by_id(staff.StaffId(args.parent))
+                if owner is None or owner.kind not in ("unit", "showrunner"):
+                    refuse("the specified parent is not a unit or showrunner")
+                parent = owner.id
+            else:
+                parent = worker_admission.parent(record, staff_id=staff.runtime_id(), run=run).id
+        name = staff.WorkerName.parse(name_arg)
+        role = cast(staff.WorkerRole, args.policy)
+        policy = pane_policy(args.policy, model=args.model, effort=args.effort)
+        current = launch(worker_panes.DurableDesignRole(parent, name, role, claim), policy, phase=args.phase or None)
+        if not isinstance(current, worker_panes.OpenWorker):
+            return staff_worker.startup_result(name, current)
+        print(json.dumps(current.row.to_json()))
+        return 0
 
 
 def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Path,
@@ -1025,14 +1059,19 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
             return recorded.returncode
     parent = worker_admission.parent(staff.snapshot(), run=run)
     private_helper = unit_runs.read_run_fields(run).get(unit_runs.PRIVATE_HELPER_SLOT) == args.new_worker
-    target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer")
+    target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer",
+                                      worker_panes.DispatchRun(run))
     policy = pane_policy(args.policy or "astra-reviewer", model=args.model, effort=args.effort)
     before = staff_worker.rows_before_launch()
     with ExitStack() as notices, worker_panes.worker_lock(target.parent, target.name) as hold, ExitStack() as cleanup:
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return staff_worker.ExitCode.BUSY
-        current = launch(target, policy, lock=hold, phase="astra-review")
+        try:
+            with staff.reviewer_startup(parent):
+                current = launch(target, policy, lock=hold, phase="astra-review")
+        except (conf.Unusable, staff.StaffRefused, worker_lifecycle.OperationDeadlineExpired) as error:
+            current = worker_panes.AdmissionRefused(" ".join(str(error).splitlines()))
         staff_worker.arm_launch_cleanup(cleanup, before, current)
         if not isinstance(current, worker_panes.OpenWorker):
             return staff_worker.startup_result(target.name, current)

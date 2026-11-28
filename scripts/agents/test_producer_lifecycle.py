@@ -483,6 +483,7 @@ class ProducerLifecycleTests(unittest.TestCase):
         row, morty = self.producer("dwight"), self.producer("morty")
         owner = fixture_member("showrunner", name="show")
         destination = self.producer("director")
+        _ = write_config_fixture(self.config / "console.conf", f"page.list.owner={morty.id}\n")
         opened = the_list.add(morty.id, "Open work", owner=owner.id, source="fixture", changes={"producer": row.id})
         closed = the_list.add(morty.id, "Closed work", owner=owner.id, source="fixture", changes={"producer": row.id})
         closed = the_list.close(morty.id, closed.id, "Done", source="fixture")

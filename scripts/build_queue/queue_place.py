@@ -524,7 +524,7 @@ def wait_for_placement(request: wire.PlacementRequest, cancel_reason: str) -> Pl
                 if isinstance(answer, wire.DispatchStatus):
                     break
                 if isinstance(answer.wait, wire.Wait):
-                    output(answer.wait)
+                    output(answer.wait, since=answer.since)
                     cause = answer.wait.reason
                     if isinstance(cause, admission_records.HeadAdmissionStatus):
                         cause = cause.cause

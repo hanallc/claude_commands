@@ -15,7 +15,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -32,7 +32,7 @@ from scripts.console_text.test_support import accepting_console_text
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
-from scripts.lib import conf, file_lock
+from scripts.lib import atomic_file, conf, file_lock
 from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
@@ -44,13 +44,13 @@ from scripts.production import (change_review, change_routing, delivery_state, i
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import (browser_test_support, console, go_ledger, list_page, page_frame, serve, staff_names,
                                   studio_page)
-from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
-from scripts.review_links import review_items, review_link, review_page, search_fold, send_hold
+from scripts.review_links import change_browser, change_page, images, new_item_dialog, page_question, question_record
+from scripts.review_links import review_items, review_link, review_page, review_submissions, search_fold, send_hold
 from scripts.review_links.browser_test_support import Chrome, Firefox, UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_record_table import save_notice_failures
-from scripts.review_links.test_serve import new_item_notice_log, read_new_item_notices
+from scripts.review_links.test_serve import HandlerCalls, new_item_notice_log, read_new_item_notices
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
 
@@ -216,9 +216,9 @@ class ListPageTests(unittest.TestCase):
             + "# whole: 1..65535\nserver_port=8765\n"
             + "changes_first_root=natedev\nreview_attachments_root=review-attachments\n")
         _ = (config / "console.conf").write_text(
-            "page.list.label=List\npage.list.icon=list-checks\npage.list.title=The List\n"
-            + "page.list.url=python:scripts.review_links.list_page:page_url\n"
-            + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
+            "page.studio.label=Studio\npage.studio.icon=clapperboard\npage.studio.title=The Studio\n"
+            + "page.studio.url=python:scripts.review_links.studio_page:page_url\n"
+            + "page.studio.items=python:scripts.review_links.list_page:waiting_updates\n"
             + "# range: 0.001..86400\nstatus.round_trip_limit_seconds=1\n"
             + "# range: 0.001..86400\nstatus.render_limit_seconds=1\n"
             + "# range: 0.001..86400\nstatus.reading_delay_seconds=1\n"
@@ -437,10 +437,12 @@ document.body.append(result);
 
     def check_live_window_send(self, *, lose_reply: bool) -> None:
         root = self.root / "reviews"
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={MORTY.id}\n")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={MORTY.id}\npage.studio.owner={DWIGHT.id}\n")
         _ = write_config_fixture(conf.path("producer_map"))
         words = "Keep the wait time next to the queue name."
         saved: list[tuple[int, Mapping[str, object]]] = []
+        new_item_posts = HandlerCalls()
+        delivery_workers: list[threading.Thread] = []
         notice_recorded = threading.Event()
         probe = r"""<script>
 (async()=>{
@@ -462,17 +464,27 @@ document.body.append(result);
   const send=dialog.querySelector('[type="submit"]');
   const words=dialog.querySelector('textarea');
   const error=dialog.querySelector('.new-item-error');
-  document.querySelector('[data-owner-new]').click();
+  const button=document.querySelector('[data-page-owner="studio"] [data-owner-new]');
+  if(!button) throw new Error('The Studio owner button is missing.');
+  button.click();
   const includePage=dialog.querySelector('[name="include_page"]');
   if(includePage.checked) includePage.click();
-  const producer=()=>[...dialog.querySelectorAll('[name="recipient_id"]')]
-   .find(input=>input.value===__PRODUCER__);
-  await until(dialog,producer);
+  const producer=id=>[...dialog.querySelectorAll('[name="recipient_id"]')].find(input=>input.value===id);
+  await until(dialog,()=>producer(__STUDIO_PRODUCER__) && producer(__SAVED_PRODUCER__));
+  if(!sessionStorage.getItem('probe-producer-selected')){
+   if(!producer(__STUDIO_PRODUCER__).checked) throw new Error('New item did not select the Studio producer.');
+   dialog.querySelector('[name="kind"][value="investigation"]').click();
+   producer(__SAVED_PRODUCER__).click();
+   sessionStorage.setItem('probe-producer-selected','yes');
+   result.textContent=JSON.stringify([]);
+   document.body.append(result);
+   return;
+  }
+  if(!producer(__SAVED_PRODUCER__).checked) throw new Error('New item lost the selected producer on reload.');
   dialog.querySelector('[name="kind"][value="investigation"]').click();
   words.value=__WORDS__;
   words.dispatchEvent(new Event('input',{bubbles:true}));
-  if(!send.disabled) throw new Error('Send is available before a producer is selected.');
-  producer().click();
+  if(send.disabled) throw new Error('Send is disabled with the Studio producer selected.');
   let filed=false;
   document.addEventListener('review-item-created',()=>{filed=true;},{once:true});
   const settled=()=>filed || dialog.open && !error.hidden && !send.disabled;
@@ -491,49 +503,75 @@ document.body.append(result);
  }
  document.body.append(result);
 })();
-</script>""".replace("__PRODUCER__", json.dumps(MORTY.id)).replace(
-            "__WORDS__", json.dumps(words)).replace("__RETRY__", json.dumps(lose_reply))
+</script>"""
+        probe = probe.replace("__WORDS__", json.dumps(words)).replace("__RETRY__", json.dumps(lose_reply))
+        probe = probe.replace("__STUDIO_PRODUCER__", json.dumps(DWIGHT.id))
+        probe = probe.replace("__SAVED_PRODUCER__", json.dumps(MORTY.id))
+
+        @final
+        class TrackedDeliveryServer(serve.ReviewLinksServer):
+            @override
+            def start_new_item_delivery(self, deliver: Callable[[], object], *,
+                                        claim: change_page.MessageDelivery | None) -> threading.Thread | None:
+                worker = super().start_new_item_delivery(deliver, claim=claim)
+                if worker is not None:
+                    delivery_workers.append(worker)
+                return worker
 
         @final
         class Probe(serve.ReviewLinksHandler):
             @override
+            def new_item_post(self) -> None:
+                with new_item_posts.running():
+                    super().new_item_post()
+
+            @override
             def html_response(self, status: int, content: bytes, *, delivery_pending: bool | None = None,
                               builds_version: str = "", content_security_policy: str = "",
                               cache_gzip: bool = False) -> None:
-                if self.path == list_page.PAGE_PATH:
+                if self.path == studio_page.PAGE_PATH:
                     content = content.replace(b"</body>", probe.encode() + b"</body>", 1)
                 super().html_response(status, content, delivery_pending=delivery_pending, builds_version=builds_version,
                                       content_security_policy=content_security_policy, cache_gzip=cache_gzip)
 
             @override
             def json_response(self, status: int, fields: Mapping[str, object], *,
-                              hold: send_hold.HoldHeader | None = None) -> None:
+                              hold: send_hold.HoldHeader | None = None,
+                              hold_outcome: Literal["undone", "missing"] | None = None) -> None:
                 if self.command == "POST" and self.path == review_page.NEW_ITEM_PATH and "id" in fields:
                     saved.append((status, fields))
                     if lose_reply and len(saved) <= 2 and status == 200:
                         self.close_connection = True
                         return
-                super().json_response(status, fields, hold=hold)
+                super().json_response(status, fields, hold=hold, hold_outcome=hold_outcome)
 
         with (patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "key-state"),
                                      "REBUILD_NEEDS_DIR": str(self.root / "rebuild-needs")}),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(serve, "loaded_module_stamps", return_value={}),
               new_item_notice_log(self.root, MORTY.id, recorded=notice_recorded) as log,
-              serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+              TrackedDeliveryServer(("127.0.0.1", 0), root) as server):
             server.RequestHandlerClass = Probe
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                url = f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}"
-                result = self.chrome().dom(url, "probe-results", reduced_motion=True, window_size=(1280, 900))
+                url = f"http://127.0.0.1:{server.server_port}{studio_page.PAGE_PATH}"
+                browser = self.chrome()
+                first_page = browser.dom(url, "probe-results", reduced_motion=True, window_size=(1280, 900))
+                result = browser.dom(url, "probe-results", reduced_motion=True, window_size=(1280, 900),
+                                     keep_storage=True)
             finally:
                 server.shutdown()
                 thread.join()
+                self.assertTrue(new_item_posts.wait_until_none_run(), "The New item request did not finish.")
+                for worker in delivery_workers:
+                    worker.join(TEST_HANG_GUARD_SECS)
+                    self.assertFalse(worker.is_alive(), "The New item delivery did not finish.")
             marker = '<p id="probe-results">'
-            self.assertIn(marker, result.stdout, result.stderr)
-            failures = cast(list[str], json.loads(html.unescape(result.stdout.split(marker, 1)[1].split("</p>", 1)[0])))
-            self.assertEqual(failures, [])
+            for page in (first_page, result):
+                self.assertIn(marker, page.stdout, page.stderr)
+                failures = cast(list[str], json.loads(html.unescape(page.stdout.split(marker, 1)[1].split("</p>", 1)[0])))
+                self.assertEqual(failures, [])
             record, = investigation.records(MORTY.id, include_read=True)
             row, = the_list.records(MORTY.id, include_closed=True)
             self.assertTrue(notice_recorded.wait(30), "The notice sender did not write the log.")
@@ -542,7 +580,9 @@ document.body.append(result);
             self.assertEqual(notice["rows"], [row.id])
             first_status, first = saved[0]
             self.assertEqual(first_status, 200)
-            self.assertEqual((first["id"], first["list_number"], row.reviews), (record.id, row.number, (first["key"],)))
+            self.assertEqual((first["id"], first["list_number"]), (record.id, row.number))
+            assert isinstance(row.report, the_list.ListReport)
+            self.assertEqual(row.report.evidence_key, first["key"])
             if lose_reply:
                 _, fallback, retry = saved
                 for status, receipt in (fallback, retry):
@@ -564,8 +604,9 @@ const created=__KEY__,owner=__OWNER__,fresh=__FRESH__,requests=[];
 let finishRowSave,reads=0;
 window.setInterval=()=>0;
 window.fetch=async (path,options={})=>{
+ if(options.method==='POST' && path===document.querySelector('[data-list]').dataset.listPath)
+  return new Promise(resolve=>{finishRowSave=resolve;});
  if(path===location.pathname){
-  if(options.method==='POST') return new Promise(resolve=>{finishRowSave=resolve;});
   reads++;
   return new Response(fresh);
  }
@@ -769,7 +810,8 @@ window.fetch=async (path,options={})=>{
   launcher.click();
   await until(dialog,()=>dialog.querySelector('[name="recipient_id"]:checked'));
   type('The first Send');
-  check(pendingCapture && !send.disabled,'Send is available while the screenshot is pending.');
+  check(!dialog.querySelector('[data-capture-slot]').hidden && !dialog.querySelector('[data-taking]').hidden &&
+        !send.disabled,'Send is available while the screenshot is pending.');
   send.click();
   await until(dialog,()=>!dialog.querySelector('.new-item-error').hidden && !send.disabled);
   dialog.querySelector('[data-later-draft]').click();
@@ -965,26 +1007,22 @@ if(example.filterOn){
             (root / folder).mkdir(parents=True)
             for size in studio_page.SIZES:
                 _ = (root / folder / f"01-{size}.webp").write_bytes(b"RIFF")
-        with (self.root / "config/review_links.conf").open("a") as settings:
-            _ = settings.write(f"studio_avatar_root={root}\n")
         return root
 
-    def test_studio_view_swaps_the_producer_chip_row_for_picture_tabs(self) -> None:
-        _ = self.fixture_items()
+    def test_studio_shows_list_rows_and_one_set_of_producer_tabs(self) -> None:
+        items = self.fixture_items()
         _ = self.studio_avatars(DWIGHT.id)
-        listing = list_page.render(self.root / "reviews").decode()
-        studio = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
+        studio = list_page.render(self.root / "reviews").decode()
         row = '<div class="record-filter-row" role="group" aria-label="Producer" data-filter-row="producer">'
-        self.assertIn('<div class="list-producer-filter">' + row, listing)
-        self.assertIn('<h1 class="page-title">The List</h1>', listing)
-        self.assertIn('<title>The List</title>', listing)
-        self.assertNotIn('studio-tabs', listing)
         self.assertEqual(studio.count(row), 1)
-        self.assertIn('<div class="studio-tabs">' + row, studio)
-        self.assertIn('<div class="list-producer-filter"><div class="record-filter-words">', studio)
+        self.assertIn('<div class="studio-tab-row"><div class="studio-tabs">' + row, studio)
+        controls = ('<div class="studio-tabs">', '<div class="record-filter-words">',
+                    '<div class="list-top-bands">', '<div data-record-filters>')
+        positions = [studio.index(control) for control in controls]
+        self.assertEqual(positions, sorted(positions))
         self.assertIn('<h1 class="page-title">The Studio</h1>', studio)
         self.assertIn('<title>The Studio</title>', studio)
-        self.assertEqual(studio.count('<tbody data-list-item'), listing.count('<tbody data-list-item'))
+        self.assertEqual(studio.count('<tbody data-list-item'), len(items) - 1)
         tab = studio.split(f'data-filter-value="staff:{DWIGHT.id}"', 1)[1].split('</button>', 1)[0]
         self.assertIn(f'src="{studio_page.AVATAR_PATH}/{DWIGHT.id}/01-128.webp"', tab)
         self.assertIn('<span class="studio-name">dwight</span> <b>2</b>', tab)
@@ -1008,7 +1046,7 @@ if(example.filterOn){
  initial.click();
  check(JSON.stringify(activeChipLabels(document,'[data-filter-row="producer"] [aria-pressed="true"]'))
   ==='["Producer: morty"]','The filter label omits the initial.');
-'''.replace('DWIGHT', json.dumps(DWIGHT.id)).replace('MORTY', json.dumps(MORTY.id)), studio_page.STUDIO_VIEW)
+'''.replace('DWIGHT', json.dumps(DWIGHT.id)).replace('MORTY', json.dumps(MORTY.id)))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_studio_refresh_keeps_the_pictures_and_updates_the_tab_counts(self) -> None:
@@ -1019,7 +1057,7 @@ if(example.filterOn){
                 _ = (avatars / folder / f"02-{size}.webp").write_bytes(b"RIFF")
 
         def page() -> str:
-            return list_page.render(self.root / "reviews", include_counts=False, view=studio_page.STUDIO_VIEW).decode()
+            return list_page.render(self.root / "reviews", include_counts=False).decode()
 
         with patch.object(studio_page, "choice", side_effect=min):
             initial = page()
@@ -1050,17 +1088,14 @@ if(example.filterOn){
 '''.replace('DWIGHT', json.dumps(DWIGHT.id)).replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
         self.browser_action_sequence(steps, add_item=False, markup=initial)
 
-    def test_studio_marks_the_open_top_item_of_each_producer_and_the_list_shows_no_marks(self) -> None:
+    def test_studio_marks_the_open_top_item_of_each_producer(self) -> None:
         items = self.fixture_items()
         _ = self.studio_avatars(DWIGHT.id)
         status, latest, removed = items[1], items[2], items[5]
         _ = staff.set_producer_top_item(DWIGHT.id, staff.TopItem(status.number))
         # A Closed item reads as no top item.
         _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(removed.number))
-        listing = list_page.render(self.root / "reviews").decode()
-        studio = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
-        for mark in ("list-top", 'value="top"', "Make top priority"):
-            self.assertNotIn(mark, listing)
+        studio = list_page.render(self.root / "reviews").decode()
         rows: dict[int, str] = {}
         for part in studio.split('<tbody data-list-item')[1:]:
             row = part.split('</tbody>', 1)[0]
@@ -1077,10 +1112,12 @@ if(example.filterOn){
         bands = studio.split('<div class="list-top-bands">', 1)[1].split('<div data-record-filters>', 1)[0]
         dwight = bands.split(f'<section class="list-top-band" data-top-band="staff:{DWIGHT.id}" aria-label="Top priority">',
                              1)[1].split('</section>', 1)[0]
-        self.assertIn(f'<b>#{status.number} {status.title}</b>', dwight)
+        top_link = html.escape(list_page.item_link(MORTY.id, status.number))
+        self.assertIn(f'<a class="list-top-link" data-record-jump href="{top_link}">#{status.number} {status.title}</a>',
+                      dwight)
         self.assertIn("Read the result and check the page.", dwight)
         self.assertIn('<span class="list-state accent">Working</span><small>ETA ', dwight)
-        self.assertNotIn(MORTY.id, bands)
+        self.assertNotIn(f'data-top-band="staff:{MORTY.id}"', bands)
         self.assertIn('<section class="list-top-band" data-top-band="none" aria-label="Top priority">', bands)
         self.assertIn('<b>No top priority item</b><div class="list-top-next">Open an item and click "Make top priority".',
                       bands)
@@ -1088,7 +1125,7 @@ if(example.filterOn){
                       + '[data-top-band="none"]{display:flex}', bands)
         # A retired producer has no top item.
         _ = staff.set_producer_retirement(DWIGHT.id, staff.RetiredProducer("claude:sonnet:high"))
-        retired = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
+        retired = list_page.render(self.root / "reviews").decode()
         self.assertNotIn('class="list-top-mark"', retired)
 
     def test_studio_waiting_item_has_the_make_top_priority_button(self) -> None:
@@ -1101,7 +1138,7 @@ if(example.filterOn){
                 self.fields(item, "question", words="Which check passed?")), status))
 
         def waiting_row() -> str:
-            studio = list_page.render(root, include_counts=False, status=status, view=studio_page.STUDIO_VIEW).decode()
+            studio = list_page.render(root, include_counts=False, status=status).decode()
             return studio.split(f'data-number="{item.number}"', 1)[1].split('</tbody>', 1)[0]
 
         self.assertIn('<form method="post" data-feedback-form data-waiting-actions>', waiting_row())
@@ -1119,7 +1156,7 @@ if(example.filterOn){
         second = self.add("Second item", number=2)
 
         def page() -> str:
-            return list_page.render(self.root / "reviews", include_counts=False, view=studio_page.STUDIO_VIEW).decode()
+            return list_page.render(self.root / "reviews", include_counts=False).decode()
 
         _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(second.number))
         initial = page()
@@ -1147,6 +1184,20 @@ if(example.filterOn){
  tab('staff:'+MORTY).click();
  check(bands()===JSON.stringify(['staff:'+MORTY]) && shown()[0].textContent.includes('#1 First item'),
   'The producer tab shows its top item band.');
+ const topLink=()=>shown()[0]?.querySelector('.list-top-link');
+ const refreshTop=async markup=>{
+  const old=document.querySelector('[data-list]');
+  refreshMarkup=markup;
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  for(let tries=0;tries<200 && old.isConnected;tries++) await flush();
+  check(!old.isConnected,'Studio applied the refreshed band.');
+ };
+ const focused=topLink();
+ focused.focus();
+ await refreshTop(FRESH_PAGE);
+ check(focused!==topLink() && document.activeElement===topLink(),'Refresh restores focus to the same top item.');
+ await refreshTop(INITIAL_PAGE);
+ check(document.activeElement.id==='list-search','A different top item sends focus to Search.');
  tab('staff:'+DWIGHT).click();
  check(bands()==='["none"]' && shown()[0].textContent.includes('No top priority item'),
   'A producer without a top item shows the empty band.');
@@ -1155,10 +1206,470 @@ if(example.filterOn){
 '''.replace('MORTY', json.dumps(MORTY.id)).replace('DWIGHT', json.dumps(DWIGHT.id))
         steps = steps.replace('STUDIO_PATH', json.dumps(studio_page.PAGE_PATH))
         steps = steps.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
+        steps = steps.replace('INITIAL_PAGE', json.dumps(initial).replace('</', '<\\/'))
         self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial)
 
-    def browser_row_expansion(self, steps: str, view: list_page.ListView = list_page.LIST_VIEW) -> None:
-        markup = list_page.render(self.root / "reviews", include_counts=False, view=view).decode()
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_studio_top_priority_link_opens_the_item(self) -> None:
+        item = self.add("Check the top item", number=264)
+        _ = self.add("Check the other item", owner=OTHER.id, number=265)
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(item.number))
+        page = self.root / "studio.html"
+        _ = page.write_bytes(list_page.render(self.root / "reviews", include_counts=False))
+        browser = self.chrome()
+        session = browser.session
+        _ = browser.command("Emulation.setEmulatedMedia",
+                            {"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]}, session)
+        browser.navigate(page.as_uri())
+
+        def evaluate(expression: str) -> object:
+            response = browser.command("Runtime.evaluate",
+                                       {"expression": expression, "awaitPromise": True, "returnByValue": True}, session)
+            self.assertNotIn("exceptionDetails", response, response)
+            return cast(dict[str, object], response["result"]).get("value")
+
+        link = "document.querySelector('.list-top-link')"
+        row = f"document.querySelector('[data-number=\"{item.number}\"]')"
+        opened = f"recordIsOpen({row}) && !{row}.hidden"
+        tab = f'[data-filter-row="producer"] [data-filter-value="staff:{MORTY.id}"]'
+        _ = evaluate(f"document.querySelector({json.dumps(tab)}).click()")
+        _ = evaluate(f"""(() => {{
+ window.addEventListener('click',event=>{{
+  window.followed=event.defaultPrevented;
+  event.preventDefault();
+ }},{{once:true}});
+ {link}.dispatchEvent(new MouseEvent('click',{{bubbles:true,cancelable:true,ctrlKey:true}}));
+}})()""")
+        self.assertIs(evaluate("window.followed"), False)
+        self.assertIs(evaluate(opened), False)
+        _ = evaluate(f"{link}.click()")
+        self.assertIs(evaluate(opened), True)
+        back = "new Promise(resolve=>{addEventListener('popstate',resolve,{once:true});history.back();})"
+        _ = evaluate(back)
+        self.assertIs(evaluate(opened), False)
+        _ = evaluate("document.getElementById('list-search').focus()")
+        for key, code in (("Tab", 9), ("Enter", 13)):
+            if key == "Enter":
+                self.assertIs(evaluate(f"document.activeElement==={link}"), True)
+            fields = {"key": key, "code": key, "windowsVirtualKeyCode": code}
+            _ = browser.command("Input.dispatchKeyEvent", {**fields, "type": "rawKeyDown"}, session)
+            _ = browser.command("Input.dispatchKeyEvent", {**fields, "type": "keyUp"}, session)
+        self.assertIs(evaluate(opened), True)
+        _ = evaluate(back)
+        owner = f'[data-filter-row="owner"] [data-filter-value="staff:{OTHER.id}"]'
+        _ = evaluate(f"document.querySelector({json.dumps(owner)}).click()")
+        self.assertIs(evaluate(f"{row}.hidden"), True)
+        _ = evaluate(f"{link}.click()")
+        self.assertIs(evaluate(opened), True)
+        self.assertEqual(evaluate("document.getElementById('filter-owner-all').getAttribute('aria-pressed')"), "true")
+        self.assertEqual(evaluate("new URLSearchParams(location.hash.slice(1)).get('item')"), f"{MORTY.id}/{item.id}")
+        place = cast(str, evaluate("location.href"))
+        browser.navigate("about:blank")
+        browser.navigate(place)
+        self.assertIs(evaluate(opened), True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_chips_have_counts_and_match_every_selected_tag(self) -> None:
+        for number, tags in enumerate((("review flow", "keyboard"), ("review flow",), ("keyboard",), ()), 1):
+            item = self.add(f"Item {number}", number=number)
+            for name in tags:
+                _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(name), source="morty")
+        self.browser_row_expansion(r'''
+ const tagRow=document.querySelector('#list-tag');
+ const all=tagRow.querySelector('[data-tag-all]');
+ const tag=name=>[...tagRow.querySelectorAll('[data-tag-filter]')].find(chip=>chip.dataset.listTag===name);
+ const visible=()=>rows.filter(row=>!row.hidden).map(row=>row.dataset.number).sort().join(',');
+ const pressed=node=>node.getAttribute('aria-pressed')==='true';
+ const first=rows.find(row=>row.dataset.number==='1');
+ const title=first.querySelector('[data-label="Item"]');
+ const review=title.querySelector('[data-tag-row][data-list-tag="review flow"]');
+ check(title.querySelector('strong').textContent==='Item 1' && review && title.children.length===2,
+       'Tag chips are under the title.');
+ check(pressed(all) && all.querySelector('b').textContent==='4' &&
+       tag('review flow').querySelector('b').textContent==='2' && tag('keyboard').querySelector('b').textContent==='2',
+       'The Tag row shows All followed by the tags and their counts.');
+ review.click();
+ check(visible()==='1,2' && pressed(tag('review flow')) && !pressed(all) && !recordIsOpen(first),
+       'A row chip selects the tag without opening the item.');
+ const input=tagRow.querySelector('[data-tag-input]');
+ input.value='KEY';
+ input.dispatchEvent(new Event('input',{bubbles:true}));
+ const choices=[...tagRow.querySelectorAll('[data-tag-choice]')];
+ check(choices.length===1 && choices[0].dataset.listTag==='keyboard','The search matches the first letters.');
+ choices[0].click();
+ check(visible()==='1' && pressed(tag('review flow')) && pressed(tag('keyboard')),
+       'Two selected tags require both tags on each item.');
+ all.click();
+ check(visible()==='1,2,3,4' && pressed(all),'All clears the Tag selection.');
+''')
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_editor_adds_suggestions_and_displays_validation_errors(self) -> None:
+        item = self.add("Edit tags", number=1)
+        other = self.add("Existing tags", number=2)
+        _ = the_list.add_tag(MORTY.id, other.id, the_list.Tag("review flow"), source="morty")
+        self.check_list_tag_editor(r'''
+ let original=summary();
+ enter('  Phone   Layout  ');
+ await wait(()=>summary()!==original && tags().join()==='phone layout');
+ check(!input().value && document.activeElement===input(),'A new tag clears the field and keeps focus.');
+ type('Re');
+ const choices=[...editor().querySelectorAll('[data-tag-choices] button')];
+ check(choices.map(button=>button.textContent).join('|')==='review flow|Create "re"',
+       'An existing match appears before Create.');
+ original=summary();
+ choices[0].click();
+ await wait(()=>summary()!==original && tags().join()==='phone layout,review flow');
+ check(!input().value && document.activeElement===input(),'Selecting a suggestion keeps the field ready.');
+ for(const [text,error] of [['bad,tag','a tag cannot contain a comma'],
+  ['a\u0000b','a tag cannot contain a control character'],
+  ['none',"'none' is reserved for an empty tag list"],['','tag must have one nonempty line']]){
+  enter(text);
+  await wait(()=>editor().querySelector('[data-tag-error]').textContent===error);
+  check(input().value===text && tags().join()==='phone layout,review flow',
+        'The Tag error preserves the text and saved tags.');
+ }
+''')
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("phone layout"), the_list.Tag("review flow")))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_editor_removes_with_cross_and_backspace_and_can_undo(self) -> None:
+        item = self.add("Edit tags", number=1)
+        for text in ("review flow", "keyboard"):
+            _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(text), source="morty")
+        self.check_list_tag_editor(r'''
+ const notice=()=>document.querySelector('.list-tag-notice');
+ const undo=()=>notice()?.querySelector('button');
+ let original=summary();
+ editor().querySelector('[aria-label="Remove tag keyboard"]').click();
+ await wait(()=>summary()!==original && tags().join()==='review flow' && undo());
+ check(notice().textContent.includes('Removed "keyboard".') && notice().getAnimations().length===1,
+       'The chip goes away and the Undo notice fades.');
+ original=summary();
+ undo().click();
+ await wait(()=>summary()!==original && tags().join()==='review flow,keyboard' && !undo());
+ check(editor().querySelector('[aria-label="Remove tag keyboard"]'),'Undo adds the chip back.');
+ original=summary();
+ input().focus();input().dispatchEvent(new KeyboardEvent('keydown',{key:'Backspace',bubbles:true,cancelable:true}));
+ await wait(()=>summary()!==original && tags().join()==='review flow' && undo());
+ check(undo().getAttribute('aria-label')==='Undo removal of keyboard' && document.activeElement===input(),
+       'Backspace removes the last tag and keeps focus.');
+''')
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("review flow"),))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_removal_elsewhere_clears_the_chip_without_undo(self) -> None:
+        item = self.add("Read the current tags", number=1)
+        tag = the_list.Tag("review flow")
+        _ = the_list.add_tag(MORTY.id, item.id, tag, source="morty")
+        self.check_list_tag_editor(r"""
+ const [keeper,id]=row().dataset.key.split('/');
+ const query=new URLSearchParams({'tag-fields':id,keeper});
+ const signed=await (await fetch(location.pathname+'?'+query)).json();
+ const body=new URLSearchParams({...signed,keeper,id,until:'',action:'remove-tag',words:'review flow'});
+ const other=await fetch(location.pathname,{method:'POST',body});
+ check(other.ok && (await other.json()).tags.length===0,'Another session removes the tag.');
+ const chip=editor().querySelector('[data-tag-remove]');
+ check(chip && tags().join()==='review flow','The first page still shows the stale chip.');
+ chip.click();
+ await wait(()=>!tags().length && editor().querySelector('[data-tag-pending]').hidden);
+ check(!row().querySelector('[data-row-tags]') && !editor().querySelector('[data-tag-remove]'),
+       'The save clears the stale chip from the row and editor.');
+ check(!document.querySelector('[aria-label="Undo removal of review flow"]'),
+       'A removal that saves nothing has no Undo.');
+""")
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.tags, ())
+        self.assertEqual([entry.what for entry in saved.log if isinstance(entry.what, the_list.TagsChanged)],
+                         [the_list.TagsChanged((tag,)), the_list.TagsChanged(())])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_edits_wait_for_each_save_in_order(self) -> None:
+        item = self.add("Queue tag edits", number=1)
+        self.check_list_tag_editor(r"""
+ const sent=[],fetchPage=window.fetch;
+ let release;
+ const held=new Promise(resolve=>{release=resolve;});
+ window.fetch=async (url,options)=>{
+  const action=options?.body?.get?.('action');
+  if(action!=='add-tag') return fetchPage(url,options);
+  sent.push(options.body.get('words'));
+  const response=await fetchPage(url,options);
+  if(sent.length===1) await held;
+  return response;
+ };
+ enter('first tag');
+ enter('second tag');
+ const pending=()=>editor().querySelector('[data-tag-pending]');
+ check(!pending().hidden && pending().textContent==='2 tag edits pending.',
+       'The field reports both pending edits.');
+ await Promise.resolve();
+ check(sent.join()==='first tag','Only the first request starts before its response.');
+ release();
+ await wait(()=>pending().hidden && tags().join()==='first tag,second tag');
+ check(sent.join()==='first tag,second tag' && !input().value && document.activeElement===input(),
+       'Both edits finish in order and the field stays ready.');
+""")
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual([entry.what for entry in saved.log[-2:]], [
+            the_list.TagsChanged((the_list.Tag("first tag"),)),
+            the_list.TagsChanged((the_list.Tag("first tag"), the_list.Tag("second tag")))])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_backspace_uses_pending_removals(self) -> None:
+        item = self.add("Remove two tags", number=1)
+        for text in ("alpha", "beta"):
+            _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(text), source="morty")
+        self.check_list_tag_editor(r"""
+ const removed=[],fetchPage=window.fetch;
+ let release;
+ const held=new Promise(resolve=>{release=resolve;});
+ window.fetch=async (url,options)=>{
+  if(options?.body?.get?.('action')!=='remove-tag') return fetchPage(url,options);
+  removed.push(options.body.get('words'));
+  if(removed.length===1) await held;
+  return fetchPage(url,options);
+ };
+ const backspace=()=>input().dispatchEvent(new KeyboardEvent('keydown',{key:'Backspace',bubbles:true,cancelable:true}));
+ backspace();
+ await Promise.resolve();
+ backspace();
+ release();
+ await wait(()=>editor().querySelector('[data-tag-pending]').hidden);
+ check(removed.join()==='beta,alpha' && tags().length===0,'Each Backspace removes the last remaining tag.');
+ const undo=[...document.querySelectorAll('.list-tag-notice button')];
+ check(undo.map(button=>button.getAttribute('aria-label')).join()==='Undo removal of beta,Undo removal of alpha',
+       'Each removed tag has one Undo notice.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, ())
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_success_clears_an_older_queued_error(self) -> None:
+        item = self.add("Replace a tag error", number=1)
+        self.check_list_tag_editor(r"""
+ const fetchPage=window.fetch;
+ let release;
+ const held=new Promise(resolve=>{release=resolve;});
+ window.fetch=async (url,options)=>{
+  if(options?.body?.get?.('words')==='bad,tag') await held;
+  return fetchPage(url,options);
+ };
+ enter('bad,tag');
+ enter('valid');
+ release();
+ await wait(()=>editor().querySelector('[data-tag-pending]').hidden && tags().join()==='valid');
+ const error=editor().querySelector('[data-tag-error]');
+ check(error.hidden && !error.textContent,'Only the latest edit can show an error.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("valid"),))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_removal_reads_the_record_after_a_lost_response(self) -> None:
+        item = self.add("Read the tag after a lost response", number=1)
+        _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag("review flow"), source="morty")
+        self.check_list_tag_editor(r"""
+ const calls=[],fetchPage=window.fetch;
+ window.fetch=async (url,options)=>{
+  if(options?.body?.get?.('action')==='remove-tag'){
+   calls.push('remove');
+   const response=await fetchPage(url,options);
+   check(response.ok,'The server saved the removal.');
+   throw new Error('The save response was lost.');
+  }
+  const query=new URL(url,location.href).searchParams;
+  if(query.has('item-state')){
+   calls.push('read');
+   return fetchPage(url,options);
+  }
+  if(String(url)===location.pathname) throw new Error('The full page refresh is unavailable.');
+  return fetchPage(url,options);
+ };
+ editor().querySelector('[data-tag-remove]').click();
+ const error=()=>editor().querySelector('[data-tag-error]');
+ await wait(()=>!error().hidden);
+ check(calls.join()==='remove,read','The browser immediately reads the saved item.');
+ check(!row().querySelector('[data-row-tags]') && !editor().querySelector('[data-tag-remove]'),
+       'The row and editor show the tags from the saved item.');
+ check(error().textContent==='The save response was lost.' &&
+       document.querySelector('[aria-label="Undo removal of review flow"]'),
+       'The browser shows the error and offers Undo for the removal.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, ())
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_counts_follow_the_other_filters(self) -> None:
+        for number, owner, state, tags in (
+                (1, OWNER.id, the_list.ItemState.WORKING, ("review flow", "keyboard")),
+                (2, OWNER.id, the_list.ItemState.BLOCKED, ("blocked tag",)),
+                (3, OTHER.id, the_list.ItemState.WORKING, ("other tag",))):
+            item = self.add(f"Item {number}", state, number=number, owner=owner)
+            for tag in tags:
+                _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(tag), source="morty")
+        probe = r"""
+ const count=selector=>document.querySelector('#list-tag '+selector).querySelector('b').textContent;
+ const tagCount=tag=>count('[data-tag-filter][data-list-tag="'+tag+'"]');
+ selectOwner(OWNER);
+ check(count('[data-tag-all]')==='2' && tagCount('other tag')==='0' && tagCount('blocked tag')==='1',
+       'Owner limits the All and tag counts.');
+ chip('show','working').click();
+ check(count('[data-tag-all]')==='1' && tagCount('blocked tag')==='0' && tagCount('review flow')==='1',
+       'Show also limits the tag counts.');
+ document.querySelector('[data-tag-filter][data-list-tag="keyboard"]').click();
+ check(count('[data-tag-all]')==='1' && tagCount('review flow')==='1' &&
+       rows.filter(row=>!row.hidden).map(row=>row.dataset.number).join()==='1',
+       'Tag counts use the other filters and the rows still require the selected tag.');
+"""
+        self.browser_row_expansion(probe.replace("OWNER", json.dumps(OWNER.id)))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_menu_stays_inside_the_card_at_390_pixels(self) -> None:
+        item = self.add("Mobile tag editor", number=1)
+        other = self.add("Long tag", number=2)
+        _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag("existing tag first"), source="morty")
+        _ = the_list.add_tag(MORTY.id, other.id,
+            the_list.Tag("suggest a tag name long enough to need the full width"), source="morty")
+        self.browser_row_expansion(r"""
+ const row=rows.find(row=>row.dataset.number==='1');
+ toggle(row).click();
+ const detail=recordDetails(row),editor=detail.querySelector('[data-tag-editor]');
+ const field=editor.querySelector('input'),menu=editor.querySelector('[data-tag-choices]');
+ const card=detail.querySelector('.list-panel');
+ check(innerWidth===390,'The viewport is 390 pixels wide.');
+ for(const theme of ['dark','light']){
+  document.documentElement.dataset.theme=theme;
+  field.value='suggest';field.dispatchEvent(new Event('input',{bubbles:true}));
+  const bounds=card.getBoundingClientRect(),box=menu.getBoundingClientRect();
+  check(!menu.hidden && menu.querySelector('[data-tag-choice]') && box.width>0 &&
+        box.left>=bounds.left && box.right<=bounds.right && box.top>=bounds.top && box.bottom<=bounds.bottom,
+        'The '+theme+' menu fits within the card.');
+ }
+""", window_size=(390, 980))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_editor_uses_one_template_and_treats_tags_as_text(self) -> None:
+        first = self.add("One template", number=1)
+        _ = self.add("Keep this item closed", number=2)
+        tag = the_list.Tag('<em data-example="tag">tag text</em>')
+        _ = the_list.add_tag(MORTY.id, first.id, tag, source="morty")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        self.assertEqual(markup.count("data-tag-editor>"), 1)
+        self.assertNotIn("data-tag-token=", markup)
+        probe = r"""
+ const label=TAG;
+ const row=rows.find(row=>row.dataset.number==='1');
+ const editor=()=>recordDetails(row).querySelector('[data-tag-editor]');
+ const exact=chip=>chip.dataset.listTag===label &&
+  chip.querySelector('[data-tag-label]').textContent===label && !chip.querySelector('em');
+ check(exact(row.querySelector('[data-tag-row]')) && exact(document.querySelector('[data-tag-filter]')),
+       'The title and filter show the tag as text.');
+ check(!editor(),'A closed row has no editor.');
+ toggle(row).click();
+ check(exact(editor().querySelector('[data-tag-remove]')) &&
+       document.querySelectorAll('[data-tag-editor]').length===1,'The open row has one editor with text chips.');
+ toggle(row).click();
+ check(!editor(),'Closing the row removes the editor.');
+ toggle(rows.find(row=>row.dataset.number==='2')).click();
+ const field=document.querySelector('[data-tag-editor] input');
+ field.value='<em';field.dispatchEvent(new Event('input',{bubbles:true}));
+ check(exact(document.querySelector('[data-tag-editor] [data-tag-choice]')),
+       'The editor suggestion shows the tag as text.');
+"""
+        self.browser_row_expansion(probe.replace("TAG", json.dumps(tag.text)))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_editor_saves_on_a_waiting_row_without_feedback_actions(self) -> None:
+        item = self.add("Wait for an answer", number=1)
+        root = self.root / "reviews"
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            delivery = list_page.submit(root, urlencode(self.fields(item, "question", words="What changed?")))
+            list_page.deliver(delivery)
+        waiting = the_list.load(MORTY.id, item.id)
+        # An item with no active producer has no Make top priority action.
+        entries = [list_page.ListRecord(MORTY.id, replace(waiting, number=number, producer=staff.StaffId("missing")))
+                   for number in range(1, 321)]
+        with (patch.object(list_page, "records", return_value=entries),
+              patch.object(the_list, "question_visibility", return_value=the_list.WaitingForAnswer())):
+            markup = list_page.render(root, include_counts=False).decode()
+        self.assertEqual(markup.count('data-waiting-for-answer="true"'), 320)
+        self.assertEqual(markup.count('name="token"'), 0)
+        _ = staff.set_producer_top_item(waiting.producer, staff.TopItem(waiting.number))
+        self.check_list_tag_editor(r"""
+ const detail=recordDetails(row());
+ check(!detail.querySelector('[data-feedback-form]'),'The waiting item has no feedback controls.');
+ enter('waiting tag');
+ await wait(()=>tags().join()==='waiting tag');
+ const requests=performance.getEntriesByType('resource').filter(entry=>
+  new URL(entry.name).searchParams.has('tag-fields'));
+ check(requests.length===1,'The opened item requests its signed fields once.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("waiting tag"),))
+
+    def check_list_tag_editor(self, steps: str) -> None:
+        root = self.root / "reviews"
+        config = self.root / "config" / "review_links.conf"
+        _ = config.write_text(config.read_text().replace("undo_seconds=0", "undo_seconds=10"))
+        results: list[list[str]] = []
+        complete = threading.Event()
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const row=()=>document.querySelector('[data-list-item][data-number="1"]');
+ const summary=()=>row().querySelector('.list-row');
+ const editor=()=>recordDetails(row()).querySelector('[data-tag-editor]');
+ const input=()=>editor().querySelector('[data-tag-input]');
+ const tags=()=>JSON.parse(row().dataset.tags ?? '[]');
+ const type=text=>{input().value=text;input().dispatchEvent(new Event('input',{bubbles:true}));};
+ const enter=text=>{type(text);input().dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));};
+ const wait=ready=>new Promise((resolve,reject)=>{
+  const observer=new MutationObserver(read);
+  const timer=setTimeout(()=>{observer.disconnect();reject(new Error('The tag edit did not finish. Tags: '+tags().join(', ')));},8000);
+  function read(){if(ready()){observer.disconnect();clearTimeout(timer);resolve();}}
+  observer.observe(document.body,{attributes:true,childList:true,subtree:true,characterData:true});read();
+ });
+ try{
+  row().querySelector('.list-toggle').click();
+  input().focus();
+''' + steps + '''
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+
+        class TagProbe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == list_page.PAGE_PATH:
+                    markup = list_page.render(root, include_counts=False).decode()
+                    self.html_response(200, markup.replace("</body>", probe + "</body>").encode())
+                    return None
+                return super().send_head()
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == "/results":
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                    self.json_response(200, {})
+                    complete.set()
+                else:
+                    super().do_POST()
+
+        with (patch.object(serve, "ReviewLinksHandler", TagProbe),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                page = f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}"
+                browser = self.firefox_view(page, None, 1440, 1000, complete)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+
+    def browser_row_expansion(self, steps: str, *,
+                              window_size: tuple[int, int] | None = None) -> None:
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         probe = r'''<script>
 (async()=>{
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
@@ -1174,7 +1685,7 @@ const result=document.createElement('p');
 result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>'''
-        self.browser_actions(markup, "", probe)
+        self.browser_actions(markup, "", probe, window_size=window_size)
 
     def test_new_item_opens_above_the_review_box_and_its_screenshot_shows_the_box(self) -> None:
         from scripts.review_links.test_page_frame import WINDOW_BROWSERS, WINDOW_PROBE, window_probe_results
@@ -1191,7 +1702,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         with (patch.object(list_page, "read_linked_reviews", return_value=[change]),
               patch.object(list_page, "counts_strip", return_value="")):
             markup = list_page.render(self.root / "reviews")
-        page = page_frame.with_owner(markup, "list", MORTY, staff.StaffSnapshot((MORTY,)), new_item_dialog.render)
+        page = page_frame.with_owner(markup, "studio", MORTY, staff.StaffSnapshot((MORTY,)), new_item_dialog.render)
         probe = r'''
 (async()=>{
  if(nested) return;
@@ -1201,17 +1712,19 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
   const link=document.querySelector('a[data-list-review-card]');
   link.click();
   await until(()=>dialog.open && dialog.querySelector('iframe'),'the review box');
+  await until(()=>dialog.querySelector('iframe').contentDocument?.body?.textContent.includes('Review card fixture'),
+   'the loaded review card');
   await painted();
   check(onTop(dialog.querySelector('.list-review-close')),'The action area does not cover the review box Close button.');
   check(dialog.getBoundingClientRect().top>=actionsBottom(),'The review box starts below the action area.');
   check(pressNewItem('over the review box')!==null,'The press reaches New item.');
   const capture=await newItemOver(dialog,'the review box');
-  const address=location.pathname+location.search+location.hash;
-  check(capture.place===address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent(link.getAttribute('href')),
-   'The screenshot address names the open review box: '+capture.place);
+  const snapshot=await capturedDocument(capture);
+  const review=snapshot.querySelector('[data-list-review-dialog][open][data-capture-modal] iframe[srcdoc]');
+  check(capture.place===location.pathname && review?.getAttribute('srcdoc').includes('Review card fixture'),
+   'The snapshot includes the open review box and the loaded card.');
+  check(!snapshot.querySelector('#review-new-item'),'The snapshot omits New item.');
   await closeNewItem(dialog,'the review box');
-  await opensAgain(capture.place,doc=>doc.querySelector('[data-list-review-dialog]')?.open===true
-   && doc.querySelector('[data-list-review-dialog] iframe')!==null,'the review box');
   dialog.querySelector('.list-review-close').click();
   await until(()=>!dialog.open,'the review box to close');
   frameElement.style.width='390px';
@@ -1228,6 +1741,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
   await painted();
   const copy=dialog.querySelector('[data-page-window-actions] [data-owner-new]');
   const box=copy.getBoundingClientRect();
+  check(copy.closest('[data-page-owner]').dataset.pageOwner==='studio','The copy uses the Studio owner.');
   check(box.top>=0 && box.bottom<=innerHeight && onTop(copy),'The New item copy is clickable on the phone.');
   check(dialog.getBoundingClientRect().top>=box.bottom-1,'The phone review box starts below the New item copy.');
   copy.click();
@@ -1244,8 +1758,8 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
                 cached.close()
         for browser in WINDOW_BROWSERS:
             with self.subTest(browser=browser):
-                self.assertEqual(window_probe_results({list_page.PAGE_PATH: page, review_page.PAGE_PATH: card},
-                                                      list_page.PAGE_PATH, browser), [[]])
+                self.assertEqual(window_probe_results({studio_page.PAGE_PATH: page, review_page.PAGE_PATH: card},
+                                                      studio_page.PAGE_PATH, browser), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_linked_review_send_blocks_a_second_form(self) -> None:
@@ -1317,6 +1831,231 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         if self._chrome is not None:
             self._chrome.close()
         self.assertEqual(window_probe_results(
+            {studio_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, studio_page.PAGE_PATH, "firefox"), [[]])
+
+    def linked_response_documents(self) -> tuple[bytes, bytes]:
+        """Render the List and its linked Response from private records."""
+        root = self.root / "reviews"
+        doc = self.root / "sdlc.md"
+        _ = doc.write_text('# Production\n> **Status: PRODUCTION — running.**\n'
+                           + f'- **Showrunner checkout:** `{self.root}`\n- **Proposals:** `{self.root / "proposals"}`\n'
+                           + '- **Merge branch:** main\n- **Log:** progress.log\n')
+        owner = replace(OWNER, doc=staff.LiveDoc(local_machine(), doc))
+        members = staff.StaffSnapshot((MORTY, owner))
+        with (patch.object(staff, "snapshot", return_value=members),
+              patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})):
+            sent = review_submissions.submit(new_item_dialog.NewItemRequest(
+                f'r1-{uuid4().hex}-question-{owner.id}', new_item_dialog.SubmissionKind.QUESTION, owner.id,
+                'Which layout should I use?', new_item_dialog.NoEvidence()))
+            self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+            item = self.add("Check the linked Response")
+            key = review_items.submission_review_key(sent)
+            _ = the_list.link(MORTY.id, item.id, (key,), source="morty")
+            snapshot = review_page.build_snapshot(root)
+            page = list_page.render(root, include_counts=False, review_records=snapshot.records)
+            card = snapshot.body(key, view=review_page.ReviewBodyView.CARD)
+        return page, card
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_linked_response_stays_open_until_the_undo_toast_shows(self) -> None:
+        from scripts.review_links.test_page_frame import window_probe_results
+
+        page, card = self.linked_response_documents()
+        probe = br'''<script>
+(async()=>{
+ const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+ const dialog=document.querySelector('[data-list-review-dialog]');
+ const toast=()=>top.document.querySelector('[data-send-undo]');
+ const until=async(ready,label)=>{
+  const end=performance.now()+8000;
+  while(!ready()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ try{
+  document.querySelector('[data-list-review-card]').click();
+  const frame=dialog.querySelector('iframe');
+  await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const view=frame.contentWindow,form=frame.contentDocument.querySelector('[data-review-form]');
+  const words='Can I use it on a phone?';
+  let releaseHold;
+  view.fetch=url=>String(url).endsWith('/undo') ? Promise.resolve(view.Response.json({outcome:'undone'})) :
+   new Promise(resolve=>{releaseHold=()=>resolve(view.Response.json({hold:'a'.repeat(24),seconds:30},
+    {status:202,headers:{'X-Send-Hold':'held'}}));});
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="question"]'));
+  await until(()=>releaseHold,'The follow-up did not request a hold.');
+  check(dialog.open && !frame.hidden && !toast(),'The List dialog stays open until the hold response.');
+  releaseHold();
+  await until(()=>toast()?.querySelector('button'),'The Undo toast did not show.');
+  check(!dialog.open && frame.hidden && toast().querySelector('span').textContent==='Sent to sdlc.',
+   'The List dialog closes when the toast names the owner.');
+  toast().querySelector('button').click();
+  await until(()=>dialog.open && !frame.hasAttribute('data-saving'),'Undo did not reopen the Response.');
+  check(!frame.hidden && form.elements.feedback.value===words,'Undo returns the same Response and words.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        page = page.replace(b"</body>", probe + b"</body>", 1)
+        self.assertEqual(window_probe_results(
+            {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_linked_response_closes_after_got_it_with_whitespace(self) -> None:
+        from scripts.review_links.test_page_frame import window_probe_results
+
+        page, card = self.linked_response_documents()
+        probe = br'''<script>
+(async()=>{
+ const failures=[],dialog=document.querySelector('[data-list-review-dialog]');
+ try{
+  document.querySelector('[data-list-review-card]').click();
+  const frame=dialog.querySelector('iframe');
+  await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const view=frame.contentWindow,form=frame.contentDocument.querySelector('[data-review-form]');
+  const result=new Promise(resolve=>{
+   frame.addEventListener('review-card-saved',()=>resolve('saved'),{once:true});
+   frame.addEventListener('review-card-saved-with-draft',()=>resolve('draft'),{once:true});
+  });
+  view.fetch=()=>Promise.resolve(view.Response.json({answer:'marked read',words_saved:false,detail_closed:true}));
+  form.elements.feedback.value=' \n\t\u0085';
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  if(await result!=='saved' || dialog.open || document.querySelector('[data-unsaved-review-key]'))
+   failures.push('Got it closes the List dialog with no unsent words.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        page = page.replace(b"</body>", probe + b"</body>", 1)
+        self.assertEqual(window_probe_results(
+            {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_linked_response_keeps_words_edited_during_a_successful_send(self) -> None:
+        self.check_linked_response_with_later_words(readable=True)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_unreadable_linked_response_result_keeps_the_draft(self) -> None:
+        self.check_linked_response_with_later_words(readable=False)
+
+    def check_linked_response_with_later_words(self, *, readable: bool) -> None:
+        from scripts.review_links.test_page_frame import window_probe_results
+
+        page, card = self.linked_response_documents()
+        probe = br'''<script>
+(async()=>{
+ const readable=READABLE,failures=[],dialog=document.querySelector('[data-list-review-dialog]');
+ const toast=()=>top.document.querySelector('[data-send-undo]');
+ const until=async(ready,label)=>{
+  const end=performance.now()+8000;
+  while(!ready()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ try{
+  document.querySelector('[data-list-review-card]').click();
+  const frame=dialog.querySelector('iframe');
+  await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const view=frame.contentWindow,doc=frame.contentDocument,form=doc.querySelector('[data-review-form]');
+  const sent='Can I use it on a phone?',draft='Can I use it on a narrow tablet?';
+  const hold='a'.repeat(24),posts=[];
+  let releaseHold,completed=false;
+  view.fetch=(url,options)=>{
+   if(String(url).endsWith('/'+hold)){
+    completed=true;
+    return Promise.resolve(readable ? view.Response.json({answer:'follow-up sent',words_saved:true,state:'Waiting',type:'question'})
+     : new view.Response('{"answer":'));
+   }
+   posts.push(new URLSearchParams(options.body).get('feedback'));
+   return new Promise(resolve=>{releaseHold=()=>resolve(view.Response.json({hold,seconds:30},
+    {status:202,headers:{'X-Send-Hold':'held'}}));});
+  };
+  const field=form.elements.feedback;
+  field.value=sent;
+  form.requestSubmit(form.querySelector('[value="question"]'));
+  await until(()=>releaseHold,'The follow-up did not request a hold.');
+  field.value=draft;field.dispatchEvent(new view.Event('input',{bubbles:true}));
+  releaseHold();
+  await until(()=>toast()?.getAnimations().length,'The Undo toast did not show.');
+  toast().getAnimations()[0].finish();
+  await until(()=>completed && !frame.hasAttribute('data-saving'),'The follow-up did not finish.');
+  const message=doc.querySelector('[data-review-card-notice]').textContent;
+  if(!dialog.open || frame.hidden || !field.isConnected || field.value!==draft ||
+   (readable ? message!=='Saved. Your newer words are unsent.' : !message.includes('The save outcome is not known yet.')))
+   failures.push('The send result returns the dialog with the newer, unsent words.');
+  if(posts.length!==1 || posts[0]!==sent) failures.push('Only the original words were sent.');
+  if(!readable){
+   dialog.querySelector('[data-close]').click();
+   const copy=document.querySelector('[data-unsaved-review-key] textarea');
+   if(dialog.open || !copy?.getClientRects().length || copy.value!==draft)
+    failures.push('Close shows a visible copy of the unconfirmed draft.');
+   document.querySelector('[data-list-review-card]').click();
+   const reopened=dialog.querySelector('iframe');
+   await new Promise(resolve=>reopened.addEventListener('load',resolve,{once:true}));
+   if(reopened.contentDocument.querySelector('[name="feedback"]').value!==draft)
+    failures.push('Reopening the card restores the unconfirmed draft.');
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        page = page.replace(b"</body>", probe.replace(b"READABLE", json.dumps(readable).encode()) + b"</body>", 1)
+        self.assertEqual(window_probe_results(
+            {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_checks_a_lost_review_reply_after_the_card_closes(self) -> None:
+        from scripts.review_links.test_page_frame import window_probe_results
+
+        page, card = self.linked_response_documents()
+        probe = b'<script>' + UNDO_ACTION_SCRIPT.encode() + br'''
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),failures=[],reports=[];
+ const dialog=document.querySelector('[data-list-review-dialog]');
+ let reachable=false,attempt;
+ window.fetch=(url,options)=>{
+  if(url!=='/console/review-save-failure') return realFetch(url,options);
+  reports.push(new URLSearchParams(options.body));
+  return reachable ? Promise.resolve(Response.json({outcome:'saved',words_saved:true})) :
+   Promise.reject(new TypeError('Connection lost.'));
+ };
+ try{
+  document.querySelector('[data-list-review-card]').click();
+  const frame=dialog.querySelector('iframe');
+  await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const view=frame.contentWindow,form=frame.contentDocument.querySelector('[data-review-form]');
+  const words='Keep the words until the outcome is known.';
+  view.fetch=(_url,options)=>{
+   const sent=new view.Headers(options?.headers).get('X-Review-Save-Attempt');
+   if(sent) attempt=sent;
+   return Promise.reject(new TypeError('Connection lost.'));
+  };
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>!frame.hasAttribute('data-saving') && dialog.open,'The unresolved card did not return.');
+  dialog.querySelector('[data-close]').click();
+  const copy=()=>document.querySelector('[data-unsaved-review-key]');
+  if(dialog.querySelector('iframe') || copy()?.querySelector('textarea').value!==words)
+   throw new Error('Close did not keep the words in the List.');
+  reachable=true;
+  document.dispatchEvent(new Event('visibilitychange'));
+  await until(()=>!copy(),'The List did not clear the saved draft after reconnecting.');
+  const report=reports.at(-1);
+  if(!report) failures.push('The List did not send an outcome check.');
+  else{
+   if(report.get('failure_attempt')!==attempt) failures.push('The List changed the attempt ID.');
+   if(report.get('feedback')!==words) failures.push('The List changed the words.');
+  }
+  if(dialog.querySelector('iframe')) failures.push('The List opened a card to check the outcome.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        page = page.replace(b"</body>", probe + b"</body>", 1)
+        self.assertEqual(window_probe_results(
             {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
@@ -1354,12 +2093,12 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         for key, value in (("page_request_timeout_seconds", 7), ("card_fade_out_ms", 180), ("card_fade_in_ms", 260)):
             overlay_settings = re.sub(rf"(?m)^{key}=.*$", f"{key}={value}", overlay_settings)
         _ = settings.write_text(overlay_settings)
-        pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
+        pages = (console.ConsolePage("studio", "Studio", "clapperboard", "The Studio", console.AvailablePage(studio_page.PAGE_PATH)),
                  console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(review_page.PAGE_PATH)))
         shell = console.render(pages, console.UnavailablePage()).decode()
-        list_place = list_page.PAGE_PATH + '#' + urlencode({"show": "working", "item": f"{MORTY.id}/{item.id}"})
+        list_place = studio_page.PAGE_PATH + '#' + urlencode({"show": "working", "item": f"{MORTY.id}/{item.id}"})
         review_place = review_page.PAGE_PATH + '#' + urlencode({"show": "Done", "type": "question", "q": "keep"})
-        destination = "/proof" + console.place_query("list", list_place) + "&" + urlencode({"at.review": review_place})
+        destination = "/proof" + console.place_query("studio", list_place) + "&" + urlencode({"at.review": review_place})
         probe = r'''<script>
 const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
 const params=new URLSearchParams(location.search);
@@ -1562,7 +2301,7 @@ async function inspect(){
   check(entries.some(entry=>entry[0]===waitingKey) && entries.every(entry=>entry[0]!=='sdlc/C2'),
    'The Review index includes the Waiting card and excludes the Done card.');
   check(listFrame.hidden && !dialog.open,'Changing the console page closes an idle card.');
-  document.querySelector('.nav-entry[data-page="list"]').click();
+  document.querySelector('.nav-entry[data-page="studio"]').click();
   await animationFrames(win);
   check(win.recordIsOpen(row()),'The List keeps the item open on return.');
   check(!listFrame.hidden && !dialog.open && !dialog.querySelector('iframe'),'Returning to List shows no old card.');
@@ -1592,7 +2331,7 @@ async function inspect(){
    if(String(url).includes('?counts=')){countsStarted();await heldCounts;}
    return fetchBeforeReturn(url,options);
   };
-  document.querySelector('.nav-entry[data-page="list"]').click();
+  document.querySelector('.nav-entry[data-page="studio"]').click();
   await readingCounts;
   check(doc.querySelector('[data-list]')!==listBeforeReturn && row()===beforeReturn && win.recordIsOpen(row()),
    'The List refreshes and keeps the open row node while it reads links.');
@@ -1623,14 +2362,15 @@ async function inspect(){
    }
    return fetchList(url,options);
   };
-  savedWindow.fetch=()=>Promise.resolve(new savedWindow.Response('Invalid JSON'));
+  savedWindow.fetch=(_url,options)=>Promise.resolve(savedWindow.Response.json({
+   answer:'works',words_saved:Boolean(options.body.get('feedback').trim()),detail_unavailable:true}));
   savedForm.requestSubmit(savedForm.querySelector('[value=works]'));
   await reading;
   check(!dialog.open && doc.activeElement===link('sdlc/C1'),
    'The card stays closed and returns focus during the List refresh.');
   const notice=doc.querySelector('[data-review-refresh-error]');
   check(!notice.hidden && notice.textContent==='Saved; the item could not refresh.',
-   'The List reports the unreadable response from a confirmed save.');
+   'The List reports the unavailable detail from a confirmed save.');
   const currentSearch=doc.querySelector('#list-search');
   currentSearch.focus();
   check(doc.activeElement===currentSearch,'Search stays available during the List refresh.');
@@ -1652,7 +2392,7 @@ async function inspect(){
  const listRefresh=new Promise(resolve=>{releaseRefresh=resolve;});
  if(!phone){
   win.fetch=async(url,options)=>{
-   if(url===win.location.pathname){
+   if(url===win.location.pathname || url===doc.querySelector('[data-list]').dataset.listPath){
     if(options?.method==='POST') return listSave;
     if(delayRefresh){listReads++;await listRefresh;}
    }
@@ -1814,7 +2554,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                     def html_response(self, status: int, content: bytes, *,
                                       delivery_pending: bool | None = None, builds_version: str = "",
                                       content_security_policy: str = "", cache_gzip: bool = False) -> None:
-                        if self.path in (list_page.PAGE_PATH + "?direct=1", list_page.PAGE_PATH + "?direct=1&short=1"):
+                        if self.path in (studio_page.PAGE_PATH + "?direct=1", studio_page.PAGE_PATH + "?direct=1&short=1"):
                             content = content.replace(b'</body>', probe.encode() + b'</body>')
                         super().html_response(status, content, delivery_pending=delivery_pending,
                                               builds_version=builds_version,
@@ -1873,7 +2613,8 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                         width, height = map(int, viewport.split(","))
                         route = destination
                         if size == "500,800":
-                            route = list_place.replace("#", "?direct=1&short=1#", 1)
+                            old_place = list_page.PAGE_PATH + list_place.removeprefix(studio_page.PAGE_PATH)
+                            route = old_place.replace("#", "?direct=1&short=1#", 1)
                         elif size == "1474,600":
                             route += "&short=1"
                         elif size == "390,900":
@@ -1936,7 +2677,7 @@ addEventListener('message',event=>{
  [...links].find(link=>link.textContent==='#'+event.data.clickListLink).click();
 });
 </script></body>''')
-        page = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH))
+        page = console.ConsolePage("studio", "Studio", "clapperboard", "The Studio", console.AvailablePage(studio_page.PAGE_PATH))
         shell = console.render((page,), console.UnavailablePage()).decode()
         probe = r'''<script>
 const params=new URLSearchParams(location.search),number=params.get('number'),scenario=params.get('case');
@@ -1951,6 +2692,16 @@ frame.addEventListener('load',async()=>{
   const doc=frame.contentDocument,win=frame.contentWindow;
   const row=id=>doc.querySelector('[data-number="'+id+'"]');
   const source=row(1),target=row(number),search=doc.querySelector('#list-search');
+  if(scenario==='open'){
+   const address=new URL(location.href);
+   const place=new URL(address.searchParams.get('at.studio'),location.href);
+   check(address.searchParams.get('page')==='studio' && !address.searchParams.has('at.list'),
+    'The console replaces the old List place with the Studio place.');
+   const filters=new URLSearchParams(place.hash.slice(1));
+   check(place.pathname===win.location.pathname && (place.searchParams.get('show') || filters.get('show'))==='working'
+    && filters.get('item')===source.dataset.key && win.recordIsOpen(source),
+    'The old List bookmark opens the same item and keeps its filters.');
+  }
   const chip=(name,value)=>doc.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
   const selected=name=>doc.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
   const unread=doc.getElementById('list-unread');
@@ -1991,7 +2742,7 @@ frame.addEventListener('load',async()=>{
   if(pendingWords){params.set('q',pendingWords);original.hash=String(params);}
   const originalPlace=original.href;
   const debounced=pendingWords ? new Promise(done=>search.addEventListener('filterchange',done,{once:true})) : null;
-  const consolePlace=()=>new URL(new URLSearchParams(location.search).get('at.list'),location.href).href;
+  const consolePlace=()=>new URL(new URLSearchParams(location.search).get('at.studio'),location.href).href;
   const updated=new Promise(resolve=>{
    const done=()=>{
     clearTimeout(timeout);removeEventListener('message',record);resolve();
@@ -2135,7 +2886,7 @@ frame.addEventListener('load',async()=>{
                 path = urlsplit(self.path).path
                 if path == '/list-jump-ready':
                     _ = complete.wait(35)
-                body = listing if path == list_page.PAGE_PATH else shell.encode() if path == "/console/" else b'{}'
+                body = listing if path == studio_page.PAGE_PATH else shell.encode() if path == "/console/" else b'{}'
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8' if body != b'{}' else 'application/json')
                 self.end_headers()
@@ -2174,8 +2925,12 @@ frame.addEventListener('load',async()=>{
                             filters.update(owner=OWNER.id, producer=MORTY.id, q="linked item")
                         if case == "unread-words":
                             filters.update(unread="1", q="item")
-                        place = list_page.PAGE_PATH + "?show=working#" + urlencode(filters)
-                        url = "/console/" + console.place_query("list", place)
+                        place = studio_page.PAGE_PATH + "?show=working#" + urlencode(filters)
+                        if case == "open":
+                            old_place = list_page.PAGE_PATH + place.removeprefix(studio_page.PAGE_PATH)
+                            url = "/console/" + console.place_query("list", old_place)
+                        else:
+                            url = "/console/" + console.place_query("studio", place)
                         destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
                         if case == "proof" and proof:
                             result = self.firefox_view(destination, Path(proof), 1440, 1100, complete, dark=True)
@@ -2214,11 +2969,321 @@ frame.addEventListener('load',async()=>{
         for text in (OWNER.id, MORTY.id, "EtaRange(", "next_step", "latest_status"):
             self.assertNotIn(text, shown)
 
-    def test_producer_filter_and_both_tables_show_the_producer_label_color(self) -> None:
+    def link_detail_panel(self, entry: list_page.ListRecord, sections: str, today: datetime,
+                          names: staff_names.StaffNames, unread: frozenset[str]) -> str:
+        progress = list_page.item_progress(entry.item, names, the_list.NoSchedule.UNSET)
+        return list_page.detail_panel(entry, sections, today, names, unread, progress)
+
+    def test_item_text_links_http_urls_and_escapes_other_text(self) -> None:
+        source = 'See <proof> (https://console.test/path?x=1&y=2), http://console.test/end.:<next>"'
+        first = ('<a class="item-url" href="https://console.test/path?x=1&amp;y=2" target="_blank" '
+                 'rel="noopener">https://console.test/path?x=1&amp;y=2</a>')
+        second = ('<a class="item-url" href="http://console.test/end" target="_blank" '
+                  'rel="noopener">http://console.test/end</a>')
+        self.assertEqual(list_page.item_text_html(source), f'See &lt;proof&gt; ({first}), {second}.:&lt;next&gt;&quot;')
+        self.assertEqual(list_page.item_text_html('http://console.test/end>"'), second + '&gt;&quot;')
+        self.assertEqual(list_page.item_text_html('http://console.test/end"caption'), second + '&quot;caption')
+        self.assertEqual(list_page.item_text_html('javascript:alert(1) ftp://console.test/path'),
+                         'javascript:alert(1) ftp://console.test/path')
+        self.assertEqual(list_page.item_text_html('javascript:http://console.test/end', paragraphs=True),
+                         f'<p>javascript:{second}</p>')
+        self.assertEqual(list_page.item_text_html('See **proof** http://console.test/end.', paragraphs=True),
+                         f'<p>See <strong>proof</strong> {second}.</p>')
+
+    def test_item_text_splits_adjacent_urls_and_keeps_bold(self) -> None:
+        first, second = "https://one.test/a,b", "https://two.test/b"
+        markup = list_page.item_text_html(f"{first},{second}")
+        anchors = ElementTree.fromstring(f"<p>{markup}</p>").findall("a")
+        self.assertEqual([anchor.get("href") for anchor in anchors], [first, second])
+        self.assertEqual(anchors[0].tail, ",")
+        markup = list_page.item_text_html(f"{first},ftp://two.test/b")
+        anchors = ElementTree.fromstring(f"<p>{markup}</p>").findall("a")
+        self.assertEqual([anchor.get("href") for anchor in anchors], [first])
+        self.assertEqual(anchors[0].tail, ",ftp://two.test/b")
+        markup = list_page.item_text_html(f"**{second}**", paragraphs=True)
+        bold = ElementTree.fromstring(markup).findall("strong/a")
+        self.assertEqual([(anchor.get("href"), anchor.text) for anchor in bold], [(second, second)])
+
+    def test_item_text_uses_the_url_end_rule(self) -> None:
+        example = "https://example.test/a"
+        wildcard = "https://example.test/build/*/linux"
+        apostrophe = "https://example.test/it's/x"
+        first, second = "https://one.test/a", "https://two.test/b"
+        short_first, short_second = "https://a.test/x", "https://b.test/y"
+        cases = (
+            (f"See '{first}','{second}'.", (first, second)),
+            (f"**{example}**", (example,)),
+            (wildcard, (wildcard,)),
+            (apostrophe, (apostrophe,)),
+            (f"({example}).", (example,)),
+            (f"{short_first},{short_second}", (short_first, short_second)),
+            (f"https://a.test/{short_second}", ("https://a.test/", short_second)),
+            (f"{short_first}{short_second}", ("https://a.test/",)),
+            (f"{short_first},ftp://b.test/y", (short_first,)),
+            (f"{short_first},ftp://b.test/https://c.test/z", (short_first, "https://c.test/z")),
+            (f"{short_first},Git+ssh-2.0://b.test/y,{short_second}", (short_first, short_second)),
+            (f"https://a.test/12ftp://b.test/y", ("https://a.test/12",)),
+            (f'"{example}"', (example,)),
+            (f"Did you read {example}?", (example,)),
+        )
+        for source, urls in cases:
+            with self.subTest(source=source):
+                markup = ElementTree.fromstring(f"<p>{list_page.item_text_html(source)}</p>")
+                self.assertEqual("".join(markup.itertext()), source)
+                self.assertEqual([(anchor.get("href"), anchor.text) for anchor in markup.findall("a")],
+                                 [(url, url) for url in urls])
+
+    def test_item_links_exclude_trailing_punctuation_and_list_one_destination(self) -> None:
+        url = "https://example.test/check"
+        marks = ("!", "?", ";", "]", "'", ".", ",", ")", ":", "?!;].")
+        for mark in marks:
+            with self.subTest(mark=mark):
+                markup = list_page.item_text_html(f"Read {url}{mark}", paragraphs=True)
+                anchor = ElementTree.fromstring(markup).find("a")
+                assert anchor is not None
+                self.assertEqual((anchor.get("href"), anchor.text, anchor.tail), (url, url, mark))
+        ipv6 = "https://[2001:db8::1]"
+        anchors = ElementTree.fromstring(list_page.item_text_html(f"Read {ipv6}]!", paragraphs=True)).findall("a")
+        self.assertEqual([(anchor.get("href"), anchor.tail) for anchor in anchors], [(ipv6, "]!")])
+
+        status = " ".join([*(f"{url}{mark}" for mark in marks), url])
+        item = the_list.add(MORTY.id, "Read the check", owner=OWNER.id, source="nate",
+                            changes={"latest_status": status})
+        panel = self.link_detail_panel(list_page.ListRecord(MORTY.id, item), "", NOW, staff_names.read(), frozenset())
+        section = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        anchors = ElementTree.fromstring(f"<section>{section}</section>").findall("ul/li/a")
+        self.assertEqual([anchor.get("href") for anchor in anchors], [url])
+
+    def test_blocking_condition_links_keep_asterisks_and_apostrophes_inside_paths(self) -> None:
+        _ = self.add("Blocking item", number=210)
+        wildcard = "https://example.test/build/*/linux"
+        apostrophe = "https://example.test/build/o'brien"
+        item = the_list.add(MORTY.id, "Inspect the links", owner=OWNER.id, source="nate", changes={
+            "blocked_by": (the_list.ItemDependency(210, f"See {wildcard},{apostrophe}'*?!."),),
+        })
+        panel = self.link_detail_panel(list_page.ListRecord(MORTY.id, item), "", NOW, staff_names.read(), frozenset())
+        section = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        parsed = ElementTree.fromstring('<section>' + section.replace(' data-record-jump ', ' data-record-jump="" ')
+                                        + '</section>')
+        inline = parsed.findall("ul/li/a[@class='item-url']")
+        self.assertEqual([(anchor.get("href"), anchor.text, anchor.tail) for anchor in inline], [
+            (wildcard, wildcard, ","),
+            (apostrophe, apostrophe, "'*?!."),
+        ])
+        labels = parsed.findall("ul/li/a[@class='item-link-label']")
+        self.assertEqual([anchor.get("href") for anchor in labels], [wildcard, apostrophe])
+
+    def test_item_url_labels_follow_generated_console_destinations(self) -> None:
+        output = io.StringIO()
+        with (patch.object(images, "register", return_value={"id": "sample", "file": "image.png"}),
+              patch.object(review_link, "link_host", return_value="console.test"), redirect_stdout(output)):
+            self.assertEqual(images.main(["register", "--image", "image.png", "--title", "A fixture image",
+                                         "--owner", OWNER.id, "--phase", "itemlinks"]), 0)
+        image_link = output.getvalue().splitlines()[1].removeprefix("Image link: ")
+        origin = "http://console.test:8765"
+        self.assertEqual(urlsplit(image_link).netloc, "console.test:8765")
+        relative_image = image_link.removeprefix(origin)
+        list_place = studio_page.PAGE_PATH + list_page.item_link(MORTY.id, 210)
+        review_place = review_page.PAGE_PATH + "#key=sdlc%2FC1"
+        for path, expected in (
+            (relative_image, "Images page"),
+            (images.PAGE_PATH + "#image=sample", "Images page"),
+            ("/console/" + console.place_query("studio", list_place), "List item 210"),
+            (list_place, "List item 210"),
+            (list_page.PAGE_PATH + list_page.item_link(MORTY.id, 210), "List item 210"),
+            ("/console/" + console.place_query("list", list_page.PAGE_PATH + list_page.item_link(MORTY.id, 210)),
+             "List item 210"),
+            ("/console/" + console.place_query("review", review_place), "Review item"),
+            (review_page.card_url("sdlc/C1"), "Review item"),
+        ):
+            for prefix in ("", "/tenant/desk"):
+                with self.subTest(path=path, prefix=prefix):
+                    self.assertEqual(list_page.item_url_label(urlsplit(origin + prefix + path)), expected)
+
+    def test_item_links_lists_oldest_sources_once(self) -> None:
+        images = "http://console.test:8765/console/images#image=sample"
+        related = "http://console.test:8765/console/list.html#item=keeper%2FL210"
+        review = "http://console.test:8765/console/review.html#key=owner%2FC1"
+        external = "https://example.test/check?x=1&y=2"
+        item = the_list.add(MORTY.id, "Review the links", owner=OWNER.id,
+                            source="nate", changes={"latest_status": f"See {images}."})
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=2)):
+            item = the_list.update(MORTY.id, item.id,
+                                   {"evidence": f"{related}\n{images}"}, source="morty")
+        note = the_list.ItemChange(NOW + timedelta(hours=3), f"Also read {external}.", "morty")
+        answer = question_record.Answer(f"Check {review}.", (NOW + timedelta(hours=1)).isoformat())
+        question = question_record.Question("Q1", NOW.isoformat(), "Where is the review?", answer=answer)
+        item = replace(item, log=(*item.log, note), questions=(question,))
+        names = staff_names.read()
+        entry = list_page.ListRecord(MORTY.id, item)
+        panel = self.link_detail_panel(entry, '<form></form>', NOW.astimezone(user_zone()), names, frozenset({"Q1"}))
+        links = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        rows = ElementTree.fromstring(f"<section>{links}</section>").findall("ul/li")
+        self.assertEqual([(row[0].text, row[1].text, row[2].text) for row in rows], [
+            ("Images page", "Latest status", images),
+            ("Review item", "Answer", review),
+            ("List item 210", "Evidence", related),
+            ("example.test/check", "Note", external),
+        ])
+        self.assertEqual([row[0].get("href") for row in rows], [images, review, related, external])
+        self.assertLess(panel.index('class="list-item-fields"'), panel.index('class="item-links"'))
+        self.assertLess(panel.index('class="item-links"'), panel.index('<form>'))
+        self.assertIn(f'<a class="item-url" href="{html.escape(external)}"', panel)
+        questions = list_page.panel_questions(item, NOW, frozenset({"Q1"}))
+        self.assertIn(f'<a class="item-url" href="{review}" target="_blank" rel="noopener">', questions)
+        empty = the_list.add(MORTY.id, "No addresses", owner=OWNER.id, source="nate", changes={})
+        empty_panel = self.link_detail_panel(
+            list_page.ListRecord(MORTY.id, empty), "", NOW, names, frozenset())
+        self.assertNotIn('<h3>Links</h3>', empty_panel)
+
+    def test_later_blocking_condition_keeps_the_oldest_url_source_and_order(self) -> None:
+        _ = self.add("Blocking item", number=210)
+        shared = "https://console.test/console/images#image=sample"
+        next_step = "https://example.test/next"
+        condition = "https://example.test/condition"
+        item = the_list.add(MORTY.id, "Inspect the links", owner=OWNER.id, source="nate",
+                            changes={"latest_status": f"See {shared}."})
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=1)):
+            item = the_list.update(MORTY.id, item.id, {"next_step": f"Read {next_step}."}, source="morty")
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=2)):
+            item = the_list.update(MORTY.id, item.id, {
+                "blocked_by": (the_list.ItemDependency(210, f"Check {shared} and {condition}."),),
+            }, source="morty")
+        panel = self.link_detail_panel(list_page.ListRecord(MORTY.id, item), "", NOW, staff_names.read(), frozenset())
+        section = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        parsed = ElementTree.fromstring(f"<section>{section.replace(' data-record-jump ', ' data-record-jump="" ')}</section>")
+        anchors = parsed.findall("ul/li/a[@class='item-link-label']")
+        self.assertEqual([(anchor.get("href"), anchor.text) for anchor in anchors], [
+            (shared, "Images page"),
+            (next_step, "example.test/next"),
+            (condition, "example.test/condition"),
+        ])
+        self.assertEqual([field.text for field in parsed.findall("ul/li/span[@class='item-link-field']")],
+                         ["Latest status", "Next step", "Blocked by"])
+
+    def test_closed_question_keeps_its_original_link_source_and_order(self) -> None:
+        shared = "https://example.test/check"
+        question_url = "https://example.test/question"
+        status_url = "https://example.test/status"
+        item = the_list.add(MORTY.id, "Inspect the links", owner=OWNER.id, source="nate", changes={})
+        asked_at = NOW + timedelta(hours=1)
+        question_clock = Mock(wraps=datetime)
+        question_clock.configure_mock(**{"now.return_value": asked_at})
+        with patch.object(page_question, "datetime", question_clock):
+            fields = self.fields(item, "question", words=f"Did you read {shared} and {question_url}?")
+            _ = list_page.submit(self.root / "reviews", urlencode(fields))
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=2)):
+            _ = the_list.update(MORTY.id, item.id, {"latest_status": f"Read {shared} and {status_url}."},
+                                source="morty")
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=3)):
+            _ = the_list.close(MORTY.id, item.id, "The check is complete.", source="nate")
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=4)):
+            item = the_list.reopen(MORTY.id, item.id, source="nate")
+        self.assertEqual(item.questions, ())
+        panel = self.link_detail_panel(list_page.ListRecord(MORTY.id, item), "", NOW, staff_names.read(), frozenset())
+        section = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        rows = ElementTree.fromstring(f"<section>{section}</section>").findall("ul/li")
+        self.assertEqual([(row[0].get("href"), row[1].text) for row in rows], [
+            (shared, "Question"),
+            (question_url, "Question"),
+            (status_url, "Latest status"),
+        ])
+
+    def test_collapsed_list_row_keeps_item_urls_plain(self) -> None:
+        url = "https://console.test/check"
+        _ = the_list.add(MORTY.id, f"See {url}", owner=OWNER.id, source="nate", changes={
+            "next_step": f"Read **this** {url}.",
+            "next_check": the_list.CheckCondition(url),
+            "eta": the_list.EtaDescription(url),
+        })
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        row = body.split('<tr class="list-row">', 1)[1].split("</tr>", 1)[0]
+        self.assertIn(f"<strong>See {url}</strong>", row)
+        self.assertIn(f"<p>Read <strong>this</strong> {url}.</p>", row)
+        self.assertNotIn("<a ", row)
+        detail = body.split('<div class="list-panel">', 1)[1].split('<script', 1)[0]
+        self.assertIn(f'href="{url}" target="_blank" rel="noopener"', detail)
+
+    def test_one_links_section_keeps_related_jumps_and_url_links(self) -> None:
+        _ = self.add("Related item", number=210)
+        _ = self.add("Blocking item", number=211)
+        url = "https://console.test/check"
+        item = the_list.add(MORTY.id, "Inspect the links", owner=OWNER.id, source="nate", changes={
+            "latest_status": f"See {url}.", "related_to": (210,),
+            "blocked_by": (the_list.ItemDependency(211, "The check passes."),),
+        })
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        row = body.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split("</tbody>", 1)[0]
+        self.assertEqual(row.count("<h3>Links</h3>"), 1)
+        self.assertNotIn("<h3>Related items</h3>", row)
+        section = row.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        parsed = ElementTree.fromstring(f"<section>{section.replace(' data-record-jump ', ' data-record-jump="" ')}</section>")
+        anchors = parsed.findall("ul/li/a")
+        self.assertEqual([(anchor.text, anchor.get("href"), anchor.get("target")) for anchor in anchors], [
+            ("#211", list_page.item_link(MORTY.id, 211), None),
+            ("#210", list_page.item_link(MORTY.id, 210), None),
+            ("console.test/check", url, "_blank"),
+        ])
+        self.assertTrue(all("data-record-jump" in anchor.attrib for anchor in anchors[:2]))
+        self.assertEqual(anchors[-1].get("rel"), "noopener")
+
+    def test_blocking_condition_links_the_url_once_in_the_links_section(self) -> None:
+        _ = self.add("First blocking item", number=210)
+        _ = self.add("Second blocking item", number=211)
+        url = "https://example.test/check"
+        item = the_list.add(MORTY.id, "Inspect the check", owner=OWNER.id, source="nate", changes={
+            "latest_status": f"Read {url}.",
+            "blocked_by": (the_list.ItemDependency(210, f"Check <proof> at {url}!"),
+                           the_list.ItemDependency(211, f"Confirm {url}.")),
+        })
+        panel = self.link_detail_panel(list_page.ListRecord(MORTY.id, item), "", NOW, staff_names.read(), frozenset())
+        section = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        parsed = ElementTree.fromstring(f"<section>{section.replace(' data-record-jump ', ' data-record-jump=\"\" ')}</section>")
+        rows = parsed.findall("ul/li")
+        self.assertEqual([row[0].text for row in rows], ["#210", "#211", "example.test/check"])
+        self.assertEqual(rows[0][0].tail, " — Check <proof> at ")
+        self.assertEqual(rows[1][0].tail, " — Confirm ")
+        links = parsed.findall("ul/li/a[@class='item-url']")
+        self.assertEqual([anchor.get("href") for anchor in links], [url, url])
+        self.assertEqual([(anchor.text, anchor.get("target"), anchor.get("rel"), anchor.tail) for anchor in links],
+                         [(url, "_blank", "noopener", "!"), (url, "_blank", "noopener", ".")])
+        self.assertIs(links[0], rows[0][1])
+        self.assertIs(links[1], rows[1][1])
+        self.assertEqual([anchor.get("href") for anchor in parsed.findall("ul/li/a[@class='item-link-label']")], [url])
+
+    def test_links_scan_skips_url_free_history_and_keeps_current_evidence(self) -> None:
+        item = the_list.add(MORTY.id, "History without URLs", owner=OWNER.id, source="nate", changes={})
+        history = tuple(the_list.ItemChange(NOW, f"Note {index}.", "morty") for index in range(32))
+        item = replace(item, log=(*item.log, *history))
+        names = staff_names.read()
+        with patch.object(list_page, "item_url_matches", wraps=list_page.item_url_matches) as matches:
+            panel = self.link_detail_panel(list_page.ListRecord(MORTY.id, item), "", NOW, names, frozenset())
+        matches.assert_not_called()
+        self.assertNotIn('<h3>Links</h3>', panel)
+        url = "https://console.test/current"
+        legacy = replace(item, evidence=f"See {url}.")
+        panel = self.link_detail_panel(list_page.ListRecord(MORTY.id, legacy), "", NOW, names, frozenset())
+        self.assertIn(f'href="{url}" target="_blank" rel="noopener">console.test/current</a>', panel)
+
+    def test_browser_latest_status_links_open_a_new_tab_and_wrap(self) -> None:
+        url = "https://console.test:8765/check/" + "proof" * 90
+        _ = the_list.add(MORTY.id, "Check the result", owner=OWNER.id, source="nate",
+                         changes={"latest_status": f"See {url}."})
+        self.browser_action_sequence(r"""
+ const panel=recordDetails(row).querySelector('.list-panel');
+ const link=panel.querySelector('.list-field-latest_status a');
+ const section=panel.querySelector('.item-links');
+ check(link?.target==='_blank' && link.relList.contains('noopener'),'Latest status opens a new tab.');
+ check(link?.href==='https://console.test:8765/check/'+'proof'.repeat(90),'The link keeps the whole URL.');
+ check(link?.getClientRects().length>1,'The inline link wraps at phone width.');
+ check(section.clientWidth===section.scrollWidth,'The Links section fits at phone width.');
+""", add_item=False, reduced_motion=True, window_size=(390, 1000))
+
+    def test_studio_producer_tabs_and_both_tables_label_the_producer(self) -> None:
         _ = self.add("Producer labels")
         body = list_page.render(self.root / "reviews", include_counts=False).decode()
         label = '<span class="staff-name" data-color-text="role.producer" style="color:#90fe42">Producer</span>'
-        self.assertIn(f'aria-label="Producer" data-filter-row="producer"><span aria-hidden="true">{label}</span>', body)
+        self.assertIn('aria-label="Producer" data-filter-row="producer"><span aria-hidden="true">Producer</span>', body)
         self.assertIn('<th scope="col" aria-sort="none" data-list-producer>'
                       + '<button type="button" id="list-sort-2" data-sort="2">Producer', body)
         self.assertIn('th[data-list-producer] button{color:var(--producer-label-color,inherit)}', body)
@@ -2280,7 +3345,8 @@ frame.addEventListener('load',async()=>{
         _ = the_list.update(MORTY.id, item.id, {"evidence": replacement, "next_step": "Read the result."}, source="morty")
         body = list_page.render(self.root / "reviews", include_counts=False).decode()
         log = body.split('<ol class="list-log">', 1)[1]
-        added_html = "Read https://example.invalid/proof?x=1&amp;y=2."
+        added_html = ('Read <a class="item-url" href="https://example.invalid/proof?x=1&amp;y=2" '
+                      'target="_blank" rel="noopener">https://example.invalid/proof?x=1&amp;y=2</a>.')
         for index, expected in enumerate((added_html, "The &lt;check&gt; passed.", replacement)):
             with self.subTest(index=index):
                 row = log.split(f'<li data-log-index="{index}">', 1)[1].split('</li>', 1)[0]
@@ -2308,8 +3374,8 @@ frame.addEventListener('load',async()=>{
         item = replace(item, log=(*item.log,
             the_list.ItemChange(NOW, the_list.QuestionAnswered("Q1"), "morty"),
             the_list.ItemChange(NOW, the_list.QuestionClosed(question), "nate")))
-        log = list_page.item_log_html(list_page.ListRecord(MORTY.id, item), NOW.astimezone(user_zone()),
-                                      staff_names.read(), frozenset())
+        log = list_page.item_log(list_page.ListRecord(MORTY.id, item), NOW.astimezone(user_zone()),
+                                 staff_names.read(), frozenset()).markup
         self.assertIn('<li class="question" data-log-index="1">', log)
         self.assertIn('<div><strong>Answer</strong> to question Q1', log)
         self.assertIn('<li class="question" data-log-index="2">', log)
@@ -2339,6 +3405,60 @@ frame.addEventListener('load',async()=>{
             self.assertEqual(read.updated, read_at)
             body = list_page.render(self.root / "reviews", include_counts=False).decode()
             self.assertIn(f'<h3>Latest status · <time datetime="{updated.isoformat()}">2026-11-16 13:20 EST</time></h3>', body)
+
+    def test_report_hides_latest_status_only_when_it_repeats_the_report_words(self) -> None:
+        item = self.file_repaired_report("Fix the menu")
+        assert isinstance(item.report, the_list.ListReport)
+        report_words = item.report.words
+        for status, shows_status in ((report_words, False), ("The cause is known.", True), (report_words, False)):
+            with self.subTest(status=status):
+                _ = the_list.update(MORTY.id, item.id, {"latest_status": status}, source="dwight")
+                saved = list_page.saved_action_state(MORTY.id, item.id, include_detail=True)
+                left = saved.get("detail_html", "").split('<section class="list-log-panel">', 1)[0]
+                self.assertEqual(left.count(f"<p>{report_words}</p>"), 1)
+                self.assertEqual('<section class="list-field-latest_status">' in left, shows_status)
+                if shows_status:
+                    self.assertIn(f"<p>{status}</p>", left)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_report_page_details_open_separately_from_the_screenshot(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        words = "The menu hides choices."
+        viewport = new_item_dialog.PageViewport(1440, 900, True)
+        state = new_item_dialog.BugPageState(
+            "http://127.0.0.1/console/list.html", viewport,
+            0.25, ("One menu option is missing.",), (), "Show All", True, "The List")
+        request = new_item_dialog.NewItemRequest(
+            f"r1-{uuid4().hex}-bug-{MORTY.id}", new_item_dialog.SubmissionKind.BUG, MORTY.id,
+            words, new_item_dialog.NoEvidence(), page_state=state)
+        saved = review_submissions.submit(
+            request, screenshot=new_item_dialog.PageScreenshot(base64.b64decode(PNG), viewport))
+        native = saved.record
+        assert isinstance(native, investigation.Investigation)
+        report = the_list.ListReport(the_list.ReportKind.BUG, review_items.investigation_record_key(native), words,
+                                     saved.key)
+        _ = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                 unit="", source="nate")
+        self.browser_action_sequence(r"""
+ const box=recordDetails(row).querySelector('[data-submission-page-state]');
+ const details=box.querySelector('details'),summary=details.querySelector('summary');
+ const table=details.querySelector('dl'),thumbnail=box.querySelector('figure img');
+ check(!details.open && summary.textContent==='Page details' && box.innerText.includes('Screenshot of The List') &&
+  !box.innerText.includes('Show All') && thumbnail.getClientRects().length,
+  'Page details start closed and the picture stays visible.');
+ const style=getComputedStyle(box);
+ check(style.paddingBlockStart==='12px' && style.paddingInlineStart==='14px' && style.marginBlockStart==='12px',
+  'The report card has padding and space above it.');
+ summary.click();
+ check(details.open && table.innerText.includes('Show All') && table.innerText.includes('0.25 s'),
+  'The disclosure shows the saved page details.');
+ summary.click();
+ thumbnail.click();
+ const zoom=document.querySelector('[data-image-zoom-dialog]');
+ check(zoom.open && zoom.querySelector('img').src===thumbnail.src && !details.open,
+  'The picture opens the shared zoom with the original attachment.');
+""", add_item=False, window_size=(1440, 1000))
 
     def test_log_shows_the_recorded_clock_time_once(self) -> None:
         log = self.legacy_log('- 2026-11-16 18:20:00+00:00 Updated state: "Working" — morty, 09:00 CST')
@@ -2483,14 +3603,19 @@ frame.addEventListener('load',async()=>{
 document.querySelector('.list-toggle').click();
 const panel=document.querySelector('.list-panel'),[left,right]=panel.children;
 const log=right.querySelector('.list-log-scroll');
+const logStyle=getComputedStyle(log);
 const desktop=innerWidth>600,box=log.getBoundingClientRect();
 const rem=parseFloat(getComputedStyle(document.documentElement).fontSize);
 const failures=[];
-if(getComputedStyle(log).overflowY!=='auto' || log.scrollHeight<=log.clientHeight)
+if(logStyle.overflowY!=='auto' || log.scrollHeight<=log.clientHeight)
  failures.push('The log scrolls in its own area.');
+const ink=getComputedStyle(right.querySelector('h3')).color;
+if(logStyle.scrollbarColor!==ink+' rgba(0, 0, 0, 0)')
+ failures.push('The log uses the theme for the thumb and shows the panel color through the track.');
 if(desktop && !(box.left>left.getBoundingClientRect().right && box.bottom<=panel.getBoundingClientRect().bottom &&
  panel.getBoundingClientRect().height<innerHeight))
- failures.push('On a desktop the log sits beside the details and ends with the panel.');
+ failures.push('On a desktop the log sits beside the details and ends with the panel. Panel height: '+
+  panel.getBoundingClientRect().height+' px. Viewport height: '+innerHeight+' px.');
 if(!desktop && Math.abs(log.clientHeight-9*rem)>1)
  failures.push('On a narrow page the log is 9rem tall from the config. Found '+log.clientHeight+' px.');
 const result=document.createElement('p');result.id='probe-results';
@@ -2595,6 +3720,9 @@ document.body.append(result);
         config = self.root / "config"
         changes = self.root / "change-reviews"
         _ = shutil.copytree(self.browser_root / "config", config)
+        with (config / "review_links.conf").open("a") as settings:
+            _ = settings.write(f"studio_avatar_root={self.root / 'avatars'}\n")
+        _ = write_config_fixture(config / "console.conf", f"page.list.owner={MORTY.id}\n")
         _ = (config / "change_review.conf").write_text(
             f"lists_directory={changes}\nreview_links_directory={self.root / 'reviews'}\n")
         environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
@@ -2608,6 +3736,11 @@ document.body.append(result);
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
         _ = self.enterContext(patch.object(rebuild_row, "read", return_value=rebuild_row.RebuildAnswer((), False)))
         _ = change_page.console_folder(self.root / "reviews")
+
+    def assign_legacy_producer(self, item: the_list.ListItem, identity: staff.StaffId) -> the_list.ListItem:
+        producer = replace(MORTY, id=identity)
+        with patch.object(staff, "authority_snapshot", return_value=staff.StaffSnapshot((producer,))):
+            return the_list.update(MORTY.id, item.id, {"producer": identity}, source="morty")
 
     def add(self, title: str, state: the_list.ItemState = the_list.ItemState.WORKING, *,
             owner: the_list.ItemOwner = OWNER.id, number: int | the_list.NextNumber = the_list.NextNumber.AVAILABLE,
@@ -2659,9 +3792,13 @@ document.body.append(result);
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_keeps_the_first_paint_rows_and_chip_counts_for_query_filters(self) -> None:
         upper, lower = "\u1c89", "\u1c8a"
-        for number, character, owner in (
-                (1, upper, OWNER.id), (2, lower, OWNER.id), (3, upper, OTHER.id), (4, upper, OWNER.id)):
+        smile = "\U0001f642"
+        for number, character, owner, tags in (
+                (1, upper, OWNER.id, ("alpha", "shared", "a\ufffdb", smile)), (2, lower, OWNER.id, ("alpha",)),
+                (3, upper, OTHER.id, ("beta", "shared")), (4, upper, OWNER.id, ())):
             item = self.add(f"Check \0 {character}", owner=owner, number=number)
+            for tag in tags:
+                _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(tag), source="morty")
             if number != 4:
                 _ = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
             if number == 3:
@@ -2670,17 +3807,22 @@ document.body.append(result);
         fragment = urlencode({"show": "working", "owner": OTHER.id, "q": "unmatched"})
         key_query = urlencode({"show": "working", "key": f"{MORTY.id}/L4"})
         key_fragment = urlencode({"key": f"{MORTY.id}/L1"})
+        owner_query = urlencode({"owner": OWNER.id})
+        tag_query = urlencode({"tag": json.dumps(["alpha", "shared", smile, "a\u0000b", "a\ud800b"])})
+        tag_fragment = urlencode({"tag": json.dumps(["beta"])})
         numbers = ["1", "2"] if search_fold.fold(upper) == search_fold.fold(lower) else ["1"]
         unread_alias = "show=unread&unread=0"
         all_rows = ["1", "2", "3", "4"]
         unread_rows = ["1", "2", "4"]
         before = r'''<script>
-const [address,firstRows,loadedRows,allCount,firstUnread,loadedUnread]=CASE;
+const [address,firstRows,loadedRows,allCount,firstUnread,loadedUnread,firstTags]=CASE;
 history.replaceState(null,'',address);
 const snapshot=()=>({
  rows:[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).sort(),
  chips:[...document.querySelectorAll('[data-filter-count]')].map(chip=>
   [chip.id,chip.dataset.filterCount,chip.getAttribute('aria-pressed')]),
+ tags:[...document.querySelectorAll('#list-tag [data-list-tag]')].map(chip=>
+  [chip.dataset.listTag,Number(chip.querySelector('b').textContent),chip.getAttribute('aria-pressed')==='true']),
  unread:document.querySelector('#list-unread').checked,
 });
 const firstPaint=snapshot();
@@ -2692,6 +3834,8 @@ const loaded=snapshot();
 check(JSON.stringify(firstPaint.rows)===JSON.stringify(firstRows),'The server shows the matching rows.');
 check(JSON.stringify(loaded.rows)===JSON.stringify(loadedRows),'Script start shows the matching rows.');
 check(firstPaint.unread===firstUnread && loaded.unread===loadedUnread,'Unread has the expected state.');
+if(firstTags)
+ check(JSON.stringify(firstPaint.tags)===JSON.stringify(firstTags),'The server shows the expected tag counts and selection.');
 if(firstUnread===loadedUnread)
  check(JSON.stringify(firstPaint)===JSON.stringify(loaded),'Script start keeps the rows and chip counts.');
 check(document.querySelector('#filter-show-all').dataset.filterCount===String(allCount),'The All chip has the expected count.');
@@ -2710,10 +3854,18 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 ("show=unread", "", unread_rows, unread_rows, 3, True, True),
                 (unread_alias, "unread=0", unread_rows, unread_rows, 3, True, True),
                 (key_query, key_fragment, ["4"], ["4"], 1, False, False),
+                (owner_query, "", ["1", "2", "4"], ["1", "2", "4"], 3, False, False),
+                (tag_query, tag_fragment, ["1"], ["1"], 1, False, False),
         ):
             with self.subTest(query=server_query, fragment=browser_fragment):
                 address = ("?" + server_query if server_query else "") + ("#" + browser_fragment if browser_fragment else "")
-                case = json.dumps((address, first_rows, loaded_rows, all_count, first_unread, loaded_unread))
+                first_tags = {
+                    owner_query: [("All", 3, True), ("alpha", 2, False), ("a\ufffdb", 1, False),
+                                  ("beta", 0, False), ("shared", 1, False), (smile, 1, False)],
+                    tag_query: [("All", 4, False), ("alpha", 2, True), ("a\ufffdb", 1, False),
+                                ("beta", 1, False), ("shared", 2, True), (smile, 1, True)],
+                }.get(server_query)
+                case = json.dumps((address, first_rows, loaded_rows, all_count, first_unread, loaded_unread, first_tags))
                 markup = list_page.render(self.root / "reviews", include_counts=False, query=server_query).decode()
                 page = markup.replace(script, before.replace("CASE", case) + script, 1)
                 page = page.replace("</body>", after + "</body>", 1)
@@ -2726,7 +3878,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
             (1, owner, producer), (2, owner, staff.StaffId("p%0Db")), (3, staff.StaffId("o%0Da"), producer),
         ):
             item = self.add(f"Check item {number}", owner=owner_id, number=number)
-            _ = the_list.update(MORTY.id, item.id, {"producer": producer_id}, source="morty")
+            _ = self.assign_legacy_producer(item, producer_id)
         before = r'''<script>
 history.replaceState(null,'',ADDRESS);
 const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')]
@@ -2801,9 +3953,9 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
             self.assertIn(label + '<span data-sort-mark', body)
         controls = body.split('data-record-filters>', 1)[1].split('<p data-missing-item', 1)[0]
         self.assertNotIn('<select', controls)
-        self.assertEqual(controls.count('type="search"'), 1)
+        self.assertEqual(body.count('type="search"'), 1)
         self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
-                         ['owner', 'producer', 'show'])
+                         ['owner', 'show'])
         shows = controls.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
         self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+) <b>', shows),
                          [("all", "All"), ("needs-me", "Needs me"), ("producer-answering", "Producer answering"),
@@ -2811,11 +3963,12 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                           ("scheduled", "Scheduled")])
         self.assertIn('role="switch" id="list-unread" value="1">Unread only</label>', controls)
         owners = controls.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
-        producers = controls.split('data-filter-row="producer"', 1)[1].split('</div>', 1)[0]
+        producers = body.split('data-filter-row="producer"', 1)[1].split('</div>', 1)[0]
         chip = r'data-filter-value="([^"]+)"[^>]*>([^<]+) <b>(\d+)</b>'
         self.assertEqual(re.findall(chip, owners),
                          [('all', 'All', '5'), (f'staff:{OTHER.id}', 'builds', '1'), (f'staff:{OWNER.id}', 'sdlc', '4')])
-        self.assertEqual(re.findall(chip, producers),
+        tab = r'data-filter-value="([^"]+)"[^>]*>.*?<span class="studio-name">([^<]+)</span> <b>(\d+)</b>'
+        self.assertEqual(re.findall(tab, producers),
                          [('all', 'All', '5'), (f'staff:{DWIGHT.id}', 'dwight', '2'), (f'staff:{MORTY.id}', 'morty', '3')])
         self.assertEqual(body.count('<td data-label="Producer">dwight</td>'), 2)
         self.assertEqual(body.count('<td data-label="Producer">morty</td>'), 3)
@@ -3092,7 +4245,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
                       + '<button name="action" value="question" disabled>Ask question</button>'
                       + '<button name="action" value="tell" disabled>Tell morty</button></div>', words)
         self.assertIn("!words.value.trim()", list_page.SCRIPT)
-        self.assertIn("const edit=()=>{draftStamp++;retain();};", list_page.SCRIPT)
+        self.assertIn("const edit=()=>{draftStamp++;retain();persistDraft();};", list_page.SCRIPT)
         self.assertIn("words.addEventListener('input',edit)", list_page.SCRIPT)
         self.assertIn("setCardSubmitting(form,false,stale ? form : recordDetails(item));syncTell()", list_page.SCRIPT)
         self.assertIn('rows="4"', words)
@@ -3136,19 +4289,33 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
         self.assertEqual(len(errors.getvalue().splitlines()), 2)
 
     def test_nav_marks_new_update_times_and_keeps_read_operations_out_of_the_page(self) -> None:
-        pages = tuple(page for page in console.read_pages() if page.identity == "list")
+        pages = tuple(page for page in console.read_pages() if page.identity == "studio")
         root = self.root / "reviews"
-        self.assertEqual(list_page.page_url(), '/console/list.html')
+        self.assertEqual(studio_page.page_url(), '/console/studio.html')
         self.assertEqual(console.news(root, pages, "changes"), ())
         item = self.add("Unread item")
-        self.assertEqual(console.news(root, pages, "changes"), ("list",))
-        self.assertEqual(console.news(root, pages, "list"), ())
+        self.assertEqual(console.news(root, pages, "changes"), ("studio",))
+        self.assertEqual(console.news(root, pages, "studio"), ())
         self.assertEqual(console.news(root, pages, "changes"), ())
         with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=1)):
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "A new result arrived."}, source="morty")
-        self.assertEqual(console.news(root, pages, "changes"), ("list",))
+        self.assertEqual(console.news(root, pages, "changes"), ("studio",))
         _ = the_list.mark_read(MORTY.id, item.id, source="nate")
         self.assertEqual(console.news(root, pages, "changes"), ())
+
+    def test_studio_news_keeps_the_seen_list_updates(self) -> None:
+        root = self.root / "reviews"
+        studio, = (page for page in console.read_pages() if page.identity == "studio")
+        old = replace(studio, identity="list", destination=console.AvailablePage(list_page.PAGE_PATH))
+        seen = self.add("Update seen on the List")
+        self.assertEqual(console.news(root, (old,), "list"), ())
+        unread = self.add("Update added after the last List visit")
+        self.assertEqual(console.news(root, (studio,), "review"), ("studio",))
+        saved = change_page.console_folder(root) / console.SEEN_NAME
+        self.assertEqual(json.loads(saved.read_text()), {"studio": [f"{MORTY.id}/{seen.id}/{NOW.isoformat()}"]})
+        self.assertEqual(console.news(root, (studio,), "studio"), ())
+        self.assertIn(unread.id, saved.read_text())
+        self.assertEqual(console.news(root, (studio,), "review"), ())
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_unread_excludes_legacy_closed_records(self) -> None:
@@ -3184,7 +4351,9 @@ document.body.append(result);
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_status_counts_partition_all_items_with_and_without_unread(self) -> None:
-        states = [state for state in the_list.ItemState if state is not the_list.ItemState.SCHEDULED]
+        states = (the_list.ItemState.NEW, the_list.ItemState.WORKING, the_list.ItemState.BLOCKED,
+                  the_list.ItemState.WAITING_FOR_NATE, the_list.ItemState.DELIVERED, the_list.ItemState.DONE,
+                  the_list.ItemState.PAUSED, the_list.ItemState.CLOSED)
         for offset in (0, 8):
             for number, state in enumerate(states, start=1 + offset):
                 closed = state is the_list.ItemState.CLOSED
@@ -3524,7 +4693,7 @@ window.fetch=async (url,options)=>{
  const result=document.createElement('p');
  result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
-</script>""".replace("REQUEST", json.dumps(f"{list_page.PAGE_PATH}?{query},no-store")).replace(
+</script>""".replace("REQUEST", json.dumps(f"{studio_page.PAGE_PATH}?{query},no-store")).replace(
                     "EXPECTED", json.dumps(expected))
                 self.browser_actions(markup, setup, probe)
 
@@ -3781,6 +4950,145 @@ window.fetch=(url,options)=>{
         fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', form))
         return {**fields, "action": action, "words": "", "until": "", **changes}
 
+    def test_report_verdicts_use_a_signed_repair_and_send_to_both_recipients(self) -> None:
+        root = self.root / "reviews"
+        for kind in the_list.ReportKind:
+            with self.subTest(kind=kind):
+                native = investigation.file(OWNER.id, "Check the menu", "The menu hides half the choices.",
+                                            waiting_why="sdlc checks the menu.")
+                report = the_list.ListReport(kind, review_items.investigation_record_key(native), native.question)
+                number = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                              unit="", source="nate")
+                item = the_list.load(MORTY.id, f"L{number}")
+                self.assertEqual((item.state, item.state_entered), (the_list.ItemState.NEW, item.opened))
+                with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=1)):
+                    working = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.WORKING}, source="dwight")
+                self.assertEqual((working.state, working.state_entered),
+                                 (the_list.ItemState.WORKING, NOW + timedelta(minutes=1)))
+                with self.assertRaisesRegex(the_list.ListError, "Use Works or Not fixed"):
+                    _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="dwight")
+                instructions = "Open the menu and count the choices."
+                with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=2)):
+                    repaired = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.REPAIRED,
+                                                "next_step": instructions}, source="dwight")
+                page = list_page.render(root, include_counts=False, query="show=needs-me").decode()
+                self.assertIn(f'<strong>{native.title}</strong>', page)
+                self.assertIn('<h3>How to try</h3>', page[:page.index('</main>')])
+                self.assertIn(instructions, page[:page.index('</main>')])
+                self.assertIn('value="works">Works</button>', page)
+                self.assertIn('value="not works" disabled>Not fixed</button>', page)
+                self.assertEqual(repaired.state_entered, NOW + timedelta(minutes=2))
+                stale = self.fields(repaired, "works")
+                with self.assertRaisesRegex(question_record.AnswerRefused, "List token"):
+                    _ = list_page.submit(root, urlencode({**stale, "token": "wrong"}))
+                revision = repaired.repair_revision
+                _ = the_list.save_image_answer(MORTY.id, item.id, f"review:picture-{number}",
+                                               "The image shows the chooser.", image_id="000000000001", approved=True)
+                after_image = the_list.load(MORTY.id, item.id)
+                self.assertEqual((after_image.state, after_image.next_step, after_image.repair_revision),
+                                 (the_list.ItemState.REPAIRED, instructions, revision))
+                words = "The last two choices still disappear."
+                rejected = self.fields(repaired, "not works", words=f"\x85 {words}\x1c\u3000")
+                with patch.object(change_page, "send_to_staff") as send:
+                    delivery = list_page.submit(root, urlencode(rejected))
+                    self.assertEqual(the_list.load(MORTY.id, item.id).state, the_list.ItemState.WORKING)
+                    self.assertEqual(the_list.load(MORTY.id, item.id).next_step, "")
+                    send.assert_not_called()
+                    list_page.deliver(delivery)
+                    list_page.deliver(list_page.submit(root, urlencode(rejected)))
+                    self.assertEqual({call.args[0] for call in send.call_args_list}, {OWNER.id, DWIGHT.id})
+                    self.assertEqual([call.args[2] for call in send.call_args_list],
+                                     [f"Studio: Not fixed for item {item.number}\n{words}"] * 2)
+
+                panel = list_page.saved_action_state(MORTY.id, item.id, include_detail=True)
+                self.assertIn(f"<p>Not fixed: {words}</p>", panel.get("detail_html", ""))
+                self.assertEqual(panel.get("next_step_sort"), "dwight repairs it again")
+                _ = the_list.update(MORTY.id, item.id, {"latest_status": "The producer found the cause.",
+                                                     "next_step": "Check the menu code."}, source="dwight")
+                panel = list_page.saved_action_state(MORTY.id, item.id, include_detail=True)
+                self.assertIn("<p>The producer found the cause.</p>", panel.get("detail_html", ""))
+                self.assertEqual(panel.get("next_step_html"), "<p>Check the menu code.</p>")
+
+                with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=3)):
+                    repaired_again = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.REPAIRED,
+                                                      "next_step": instructions}, source="dwight")
+                with self.assertRaisesRegex(the_list.ListError, "The repair changed"):
+                    _ = list_page.submit(root, urlencode(stale))
+                with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=4)):
+                    _ = list_page.submit(root, urlencode(self.fields(repaired_again, "works")))
+                delivered = the_list.load(MORTY.id, item.id)
+                self.assertEqual((delivered.state, delivered.state_entered),
+                                 (the_list.ItemState.DELIVERED, NOW + timedelta(minutes=4)))
+                self.assertEqual(delivered.next_step, "")
+                panel = list_page.saved_action_state(MORTY.id, item.id, include_detail=True)
+                self.assertEqual(panel.get("next_step_html"), "")
+                self.assertNotIn('<h3>Next step</h3>', panel.get("detail_html", ""))
+                done_page = list_page.render(root, include_counts=False, query="show=needs-me").decode()
+                row = re.search(r'<tbody data-list-item [^>]+data-number="'+str(number)+r'"[^>]*>', done_page)
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertIn(" hidden", row[0])
+                _ = the_list.close(MORTY.id, item.id, "Test finished.", source="nate")
+
+    def test_repair_feedback_recovers_after_pending_or_partial_delivery(self) -> None:
+        root = self.root / "reviews"
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\n")
+        words = "The menu still hides the last choice."
+        for scenario in ("both pending", "owner pending", "owner failed", "owner failed and alerted"):
+            with self.subTest(scenario=scenario):
+                native = investigation.file(OWNER.id, "Check the menu", words, waiting_why="sdlc checks the menu.")
+                report = the_list.ListReport(the_list.ReportKind.BUG, review_items.investigation_record_key(native), words)
+                number = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                              unit="", source="nate")
+                identity = f"L{number}"
+                _ = the_list.update(MORTY.id, identity, {"state": the_list.ItemState.WORKING}, source="dwight")
+                repaired = the_list.update(MORTY.id, identity, {"state": the_list.ItemState.REPAIRED,
+                            "next_step": "Open the menu."}, source="dwight")
+                fields = self.fields(repaired, "not works", words=words)
+                delivery = list_page.submit(root, urlencode(fields))
+                accepted: list[tuple[staff.StaffId, str]] = []
+                recover = False
+
+                def send(recipient: staff.StaffId, _sender: str, message: str, *,
+                         key: str) -> Literal["pending", "skipped"] | None:
+                    self.assertTrue(message.endswith(words))
+                    if not recover:
+                        if recipient == OWNER.id and scenario.startswith("owner failed"):
+                            raise OSError("The owner is unavailable.")
+                        if recipient == OWNER.id or scenario == "both pending":
+                            return "pending"
+                    if (recipient, key) in accepted:
+                        return "skipped"
+                    accepted.append((recipient, key))
+                    return None
+
+                alerted = scenario == "owner failed and alerted"
+                with (patch.object(change_page, "send_to_staff", side_effect=send),
+                      patch.object(list_page, "alert_showrunners", return_value=(OTHER,) if alerted else ()),
+                      patch.object(change_page, "alert_delivery_failures", return_value=alerted) as alert):
+                    first = list_page.deliver_with_outcome(delivery)
+                    expected = (change_page.FailedDelivery if scenario.startswith("owner failed")
+                                else change_page.DeliveryUnconfirmed)
+                    self.assertIsInstance(first, expected)
+                    saved = the_list.load(MORTY.id, identity)
+                    feedback = the_list.feedback_requests(saved)[fields["request"]]
+                    self.assertEqual(feedback.state, "alerted" if alerted else "pending")
+                    self.assertEqual(saved.next_step, "")
+                    recover = True
+                    if alerted:
+                        alert.assert_called_once()
+                    else:
+                        list_page.recover_pending(root)
+                        list_page.recover_pending(root)
+                    self.assertIsInstance(list_page.deliver_with_outcome(list_page.submit(root, urlencode(fields))),
+                                          change_page.DeliveryConfirmed)
+                done = the_list.load(MORTY.id, identity)
+                notices = [entry.what for entry in done.log if isinstance(entry.what, the_list.PageFeedback)]
+                self.assertEqual(notices, [replace(feedback, state="sent", alerted_to="")])
+                self.assertCountEqual([target for target, _ in accepted], [DWIGHT.id, OWNER.id])
+                self.assertEqual(len({key for _, key in accepted}), 1)
+                _ = the_list.close(MORTY.id, identity, "Test finished.", source="nate")
+
     def test_unpark_saves_before_delivery_and_sends_one_notice(self) -> None:
         root = self.root / "reviews"
         item = self.add("Unpark this item", number=106)
@@ -3797,7 +5105,7 @@ window.fetch=(url,options)=>{
             list_page.deliver(delivery)
             self.assertEqual(send.call_count, 1)
             self.assertEqual((send.call_args.args[0], send.call_args.args[2]),
-                             (MORTY.id, "List page: nate unparked item 106."))
+                             (MORTY.id, "Studio: nate unparked item 106."))
             delivered = the_list.load(MORTY.id, item.id)
             list_page.deliver(list_page.submit(root, urlencode(fields)))
             self.assertEqual(the_list.load(MORTY.id, item.id), delivered)
@@ -3805,11 +5113,24 @@ window.fetch=(url,options)=>{
             list_page.deliver(list_page.submit(root, urlencode(fields)))
             saved = the_list.load(MORTY.id, item.id)
             receipt = the_list.UnparkNoChangeReceipt(
-                the_list.PageRequest(fields["request"], "unpark", "List page: nate unparked item 106."),
+                the_list.PageRequest(fields["request"], "unpark", "Studio: nate unparked item 106."),
                 the_list.UnparkNoChangeReason.NO_ACTIVE_PARKING)
             self.assertEqual(saved.log[-1].what, receipt)
             self.assertEqual(replace(saved, log=saved.log[:-1]), delivered)
             self.assertEqual(send.call_count, 1)
+
+    def test_unpark_retry_uses_the_saved_list_page_notice(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Unpark this item", number=106)
+        parked = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        fields = self.fields(parked, "unpark")
+        message = "List page: nate unparked item 106."
+        notice = the_list.PageItemNotice(fields["request"], message, "unpark")
+        _ = the_list.unpark(MORTY.id, item.id, source=the_list.PAGE_SOURCE, notice=notice)
+        with patch.object(change_page, "send_to_staff") as send:
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            send.assert_called_once()
+            self.assertEqual(send.call_args.args[2], message)
 
     def test_mark_read_on_a_waiting_item_sends_its_producer_one_next_step_request(self) -> None:
         root = self.root / "reviews"
@@ -3823,7 +5144,7 @@ window.fetch=(url,options)=>{
             self.assertEqual(send.call_count, 1)
             recipient, _, message = cast(tuple[str, object, str], send.call_args.args[:3])
             self.assertEqual(recipient, DWIGHT.id)
-            self.assertTrue(message.startswith("List page: nate read item 107, so it is now Working. Write its next step:"))
+            self.assertTrue(message.startswith("Studio: nate read item 107, so it is now Working. Write its next step:"))
             self.assertNotIn("\n", message)
             list_page.deliver(list_page.submit(root, urlencode(fields)))
             self.assertEqual(send.call_count, 1)
@@ -3913,22 +5234,83 @@ window.fetch=(url,options)=>{
         self.browser_action_sequence(steps, add_item=False, markup=initial, reduced_motion=True)
 
     def test_remove_closes_before_delivery_and_repeated_requests_do_nothing(self) -> None:
-        item = self.add("Remove this item now")
-        fields = self.fields(item, "remove")
         root = self.root / "reviews"
+        for words in ("", " \t\n", " Keep <this> & that.\n\nRemove the duplicate.  \n"):
+            with self.subTest(words=words), patch.object(change_page, "send_to_staff") as send:
+                item = self.add("Remove this item now")
+                fields = self.fields(item, "remove", words=words)
+                delivery = list_page.submit(root, urlencode(fields))
+                closed = the_list.load(MORTY.id, item.id)
+                self.assertEqual(closed.state, the_list.ItemState.CLOSED)
+                reason = words if words.strip() else ""
+                self.assertEqual(closed.closing_words, reason or "Removed by nate on the Studio.")
+                self.assertEqual(sum(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Closed"
+                                     for entry in closed.log), 1)
+                send.assert_not_called()
+                list_page.deliver(delivery)
+                expected = f"Studio: nate removed item {item.number}." + (f"\n\n{reason}" if reason else "")
+                self.assertEqual((send.call_args.args[0], send.call_args.args[2]), (MORTY.id, expected))
+                saved = the_list.load(MORTY.id, item.id)
+                if reason:
+                    log = list_page.item_log(list_page.ListRecord(MORTY.id, saved), NOW, staff_names.read(), frozenset())
+                    escaped = "Keep &lt;this&gt; &amp; that."
+                    self.assertIn(f"<dt>Closing words</dt><dd><p>{escaped}</p>", log.markup)
+                    self.assertIn(f"<p>Studio: nate removed item {item.number}.</p><p> {escaped}</p>", log.markup)
+                    self.assertNotIn("<this>", log.markup)
+                list_page.deliver(list_page.submit(root, urlencode(fields)))
+                send.assert_called_once()
+                self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+                with self.assertRaisesRegex(the_list.ListError, "different action or words"):
+                    _ = list_page.submit(root, urlencode({**fields, "words": "Changed on retry."}))
+
+    def test_remove_retry_uses_the_saved_list_page_notice(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Remove the duplicate")
+        fields = self.fields(item, "remove", words="Keep the original.")
+        message = f"List page: nate removed item {item.number}."
+        notice = the_list.PageItemNotice(fields["request"], message, "remove", fields["words"])
+        closed = the_list.close(MORTY.id, item.id, "Removed by nate on the List page.",
+                                 source=the_list.PAGE_SOURCE, notice=notice)
         with patch.object(change_page, "send_to_staff") as send:
             delivery = list_page.submit(root, urlencode(fields))
-            closed = the_list.load(MORTY.id, item.id)
-            self.assertEqual(closed.state, the_list.ItemState.CLOSED)
-            self.assertEqual(sum(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Closed"
-                                 for entry in closed.log), 1)
-            send.assert_not_called()
+            self.assertEqual(the_list.load(MORTY.id, item.id), closed)
             list_page.deliver(delivery)
-            self.assertEqual(send.call_args.args[2], f"List page: nate removed item {item.number}.")
-            saved = the_list.load(MORTY.id, item.id)
-            list_page.deliver(list_page.submit(root, urlencode(fields)))
             send.assert_called_once()
-            self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+            self.assertEqual(send.call_args.args[2], message)
+
+    def test_remove_alerts_the_showrunner_after_an_unconfirmed_send(self) -> None:
+        item = self.add("Remove this duplicate")
+        fields = self.fields(item, "remove")
+        delivery = list_page.submit(self.root / "reviews", urlencode(fields))
+        with (patch.object(change_page, "send_to_staff", side_effect=change_page.UnconfirmedSend("offline")),
+              patch.object(change_page, "alert_delivery_failures", return_value=True) as alert):
+            list_page.deliver(delivery)
+        alert.assert_called_once()
+        self.assertEqual(alert.call_args.kwargs["recipients"], (OWNER.id,))
+        feedback = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]]
+        self.assertEqual((feedback.state, feedback.alerted_to), ("alerted", OWNER.name))
+
+    def test_remove_retries_a_receipt_with_a_trimmed_reason(self) -> None:
+        root = self.root / "reviews"
+        reason = "  Keep the original.  \n"
+        for scoped in (False, True):
+            with self.subTest(scoped=scoped), patch.object(change_page, "send_to_staff") as send:
+                if scoped:
+                    start = the_list.ScheduledRun(NOW + timedelta(days=1), "Check the figures.")
+                    series = the_list.ScheduledSeries(start, repeat_rule.parse("FREQ=DAILY"),
+                                                      the_list.series_run_limit())
+                    item = the_list.add(MORTY.id, "Check the figures", owner=OWNER.id, source="nate",
+                                        changes={"state": the_list.ItemState.SCHEDULED, "schedule": series})
+                    fields = self.fields(item, "remove", scope="this", run="1",
+                                         schedule_revision=the_list.schedule_revision(item.schedule))
+                else:
+                    item = self.add("Remove the duplicate")
+                    fields = self.fields(item, "remove")
+                list_page.deliver(list_page.submit(root, urlencode({**fields, "words": reason.strip()})))
+                saved = the_list.load(MORTY.id, item.id)
+                list_page.deliver(list_page.submit(root, urlencode({**fields, "words": reason})))
+                send.assert_called_once()
+                self.assertEqual(the_list.load(MORTY.id, item.id), saved)
 
     def test_list_adds_the_next_number_after_a_page_remove(self) -> None:
         first = self.add("Keep the first item", number=206)
@@ -3955,7 +5337,7 @@ window.fetch=(url,options)=>{
             self.assertEqual(parked.state, item.state)
             send.assert_not_called()
             list_page.deliver(delivery)
-            self.assertEqual(send.call_args.args[2], f"List page: nate parked item {item.number} until 2026-12-03.")
+            self.assertEqual(send.call_args.args[2], f"Studio: nate parked item {item.number} until 2026-12-03.")
             saved = the_list.load(MORTY.id, item.id)
             list_page.deliver(list_page.submit(root, urlencode(fields)))
             send.assert_called_once()
@@ -3971,7 +5353,7 @@ window.fetch=(url,options)=>{
         self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "delivered")
         notice = the_list.feedback_requests(parked)[fields["request"]]
         self.assertEqual(notice.parked_until, parked.parked_until)
-        self.assertEqual(notice.words, f"List page: nate parked item {item.number} until delivered.")
+        self.assertEqual(notice.words, f"Studio: nate parked item {item.number} until delivered.")
         with self.assertRaisesRegex(the_list.ListError, "different parking"):
             _ = list_page.submit(root, urlencode({**fields, "until": "2026-12-03"}))
         delivered = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
@@ -4277,7 +5659,7 @@ window.fetch=async(_path,options={})=>{
             skipped = the_list.load(MORTY.id, item.id).schedule
             assert isinstance(skipped, the_list.ScheduledSeries)
             self.assertEqual(skipped.exceptions, (the_list.RunException(
-                2, the_list.SkippedRun("Removed by nate on the List page.")),))
+                2, the_list.SkippedRun("Removed by nate on the Studio.")),))
             other = self.fields(saved, "remove", scope="this", run="3")["request"]
             for request, expected in ((remove["request"], True), (create["request"], False), (other, False)):
                 with self.subTest(request=request):
@@ -4302,6 +5684,73 @@ window.fetch=async(_path,options={})=>{
                 state = list_page.saved_action_state(MORTY.id, exhausted.id, include_detail=True)
                 self.assertEqual(state.get("eta_short"), short_eta)
                 self.assertTrue(state.get("scheduled_note", "").endswith(note))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_schedule_picker_stays_in_view_on_scroll(self) -> None:
+        self.browser_action_sequence(r"""
+ document.body.style.paddingTop='600px';
+ document.body.style.paddingBottom='1200px';
+ const toggle=form.querySelector('[data-later-toggle]');
+ toggle.focus({preventScroll:true});
+ toggle.click();
+ const picker=form.querySelector('[data-later-menu]');
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ await paint();
+ const initial=picker.getBoundingClientRect();
+ check(!picker.hidden && initial.top>=0 && initial.bottom<=innerHeight,'The open picker fits before scrolling.');
+ const focus=document.activeElement,scrollBefore=scrollY;
+ scrollBy({top:initial.top+80,behavior:'instant'});
+ await paint();
+ const box=picker.getBoundingClientRect();
+ check(scrollY>scrollBefore && document.activeElement===focus,'The page scrolls with the same focus.');
+ check(!picker.hidden && box.top>=0 && box.bottom<=innerHeight,'The open picker fits after scrolling.');
+""", reduced_motion=True, window_size=(1024, 1024))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_schedule_picker_stays_in_view_on_resize(self) -> None:
+        _ = self.add("Check the schedule picker")
+        page = self.root / "studio.html"
+        _ = page.write_bytes(list_page.render(self.root / "reviews", include_counts=False))
+        browser = self.chrome()
+        session = browser.session
+
+        def set_height(height: int) -> None:
+            _ = browser.command("Emulation.setDeviceMetricsOverride",
+                {"width": 1024, "height": height, "deviceScaleFactor": 1, "mobile": False}, session)
+
+        def evaluate(expression: str) -> dict[str, float]:
+            response = browser.command("Runtime.evaluate",
+                {"expression": expression, "awaitPromise": True, "returnByValue": True}, session)
+            self.assertNotIn("exceptionDetails", response, response)
+            return cast(dict[str, dict[str, float]], response["result"])["value"]
+
+        set_height(1024)
+        _ = browser.command("Emulation.setEmulatedMedia",
+            {"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]}, session)
+        browser.navigate(page.as_uri())
+        before = evaluate(r"""
+(() => {
+ document.querySelector('.list-toggle').click();
+ const detail=document.querySelector('[data-record-inline-detail]');
+ const picker=detail.querySelector('[data-later-menu]');
+ document.body.style.paddingBottom='1200px';
+ document.body.style.paddingTop=(950-picker.parentElement.getBoundingClientRect().top)+'px';
+ detail.querySelector('[data-later-toggle]').click();
+ window.pickerLayout=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>{
+  const {top,bottom,height}=picker.getBoundingClientRect();
+  resolve({top,bottom,height,scrollY,innerHeight});
+ })));
+ return pickerLayout();
+})()
+""")
+        self.assertGreater(before["bottom"], 800)
+        self.assertLessEqual(before["bottom"], before["innerHeight"])
+        set_height(800)
+        after = evaluate("pickerLayout()")
+        self.assertEqual(after["innerHeight"], 800)
+        self.assertEqual((after["scrollY"], after["height"]), (before["scrollY"], before["height"]))
+        self.assertGreaterEqual(after["top"], 0)
+        self.assertLessEqual(after["bottom"], 800)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_schedule_filters_repeat_menu_and_scopes(self) -> None:
@@ -4333,7 +5782,7 @@ window.fetch=async(_path,options={})=>{
         class FixtureList(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 url = urlsplit(self.path)
-                if url.path != list_page.PAGE_PATH:
+                if url.path != studio_page.PAGE_PATH:
                     self.send_error(404)
                     return
                 query = parse_qs(url.query)
@@ -4380,7 +5829,7 @@ window.fetch=async(_path,options={})=>{
                 _ = browser.command("Emulation.setEmulatedMedia", {"features": [
                     {"name": "prefers-color-scheme", "value": "dark"},
                     {"name": "prefers-reduced-motion", "value": "reduce"}]}, session)
-                browser.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}")
+                browser.navigate(f"http://127.0.0.1:{server.server_port}{studio_page.PAGE_PATH}")
                 proof = os.environ.get("LIST_SCHEDULE_PROOF")
 
                 def evaluate(expression: str) -> None:
@@ -4625,7 +6074,8 @@ window.fetch=async(_path,options={})=>{
   form.querySelector('[data-later-month-step="1"]').click();
   form.querySelector('[data-date="'+date+'"]').click();
  };
- const waitForSave=async(form,save,scope,{lost=false,date,instruction,rule,repeatZone,refusal,advanceRun=false}={})=>{
+ const waitForSave=async(form,save,scope,{lost=false,date,instruction,rule,repeatZone,refusal,
+                                        advanceRun=false,reason,laterWords}={})=>{
   let posted;
   let sentPost=false;
   let readback;
@@ -4635,6 +6085,7 @@ window.fetch=async(_path,options={})=>{
     if(args[1]?.method==='POST'){
      sentPost=true;
      if(advanceRun) args[1].headers={'X-Test-Advance-Run':'1'};
+     if(laterWords){form.elements.words.value=laterWords;edit(form.elements.words);}
     }
     const reply=await send(...args);
     if(args[1]?.method==='POST'){
@@ -4667,6 +6118,7 @@ window.fetch=async(_path,options={})=>{
   const result=await response;
   if(!advanceRun) check(!result.reason,result.reason);
   if(scope) check(posted.get('scope')===scope,'The selected scope is sent.');
+  if(reason) check(posted.get('words')===reason,'Remove sends the submitted reason.');
   if(date) check(posted.get('until')===date,'The edit sends the selected instant.');
   if(date && !rule) check(!posted.has('repeat'),'The move keeps the saved repeat rule.');
   if(instruction) check(posted.get('schedule_words')===instruction && !posted.get('until') && !posted.has('repeat'),
@@ -4771,10 +6223,11 @@ window.fetch=async(_path,options={})=>{
    refusal:'Choose an end date on or after the start.',
    note:'Daily until 2026-11-30 14:00:00 UTC · next Nov 30 09:00 EST'}],
   [2,'unpark',null,{}],
-  [1,'remove','this',{lost:true}],
+  [1,'remove','this',{lost:true,reason:'Skip this run.'}],
+  [1,'remove','this',{reason:'Skip another run.',laterWords:'Keep this new draft.'}],
   [1,'park','all',{repeat:'daily',rule:'FREQ=DAILY',advanceRun:true}],
   [1,'park','following',{advanceRun:true}],
-  [1,'remove','this',{advanceRun:true}],
+  [1,'remove','this',{advanceRun:true,reason:'Keep the refused reason.'}],
   [3,'remove','all',{}],
   [1,'remove','following',{refresh:true}],
  ]){
@@ -4806,8 +6259,14 @@ window.fetch=async(_path,options={})=>{
     form.elements.until.value='2026-12-23T09:00';edit(form.elements.until);
    }
   }
+  if(options.reason){form.elements.words.value=options.reason;edit(form.elements.words);}
   try{await waitForSave(form,form.querySelector('[value='+action+']'),scope,options);}
   catch(error){throw new Error('Item '+number+', '+action+', '+scope+': '+error.message);}
+  if(options.reason){
+   const current=recordIsOpen(row(number)) ? recordDetails(row(number)).querySelector('form') : openItem(number);
+   const expected=options.advanceRun ? options.reason : options.laterWords ?? '';
+   check(current.elements.words.value===expected,'Remove clears only its confirmed reason.');
+  }
   if(number===1 && options.instruction && scope==='following')
    check(row(number).querySelector('[data-scheduled-note]').textContent.endsWith('Dec 1 09:00 EST'),
     'The instruction edit keeps the moved start.');
@@ -4896,6 +6355,8 @@ window.fetch=async(_path,options={})=>{
     def test_browser_park_opens_the_shared_picker_and_submits_the_chosen_time(self) -> None:
         self.browser_action_sequence(r"""
  Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
+ form.elements.words.value='Check both rows.';
+ form.elements.words.dispatchEvent(new Event('input',{bubbles:true}));
  const toggle=form.querySelector('[data-later-toggle]');
  check(!form.querySelector('input[type=date]'),'Park has no native date input');
  toggle.click();
@@ -4914,6 +6375,7 @@ window.fetch=async(_path,options={})=>{
  check(sheet.hidden && requests.length===1,'Enter in Time closes the picker and submits once');
  check(requests[0]?.get('action')==='park' && requests[0].get('until')==='2026-12-04T00:30:00.000Z',
   'Save sends the selected instant');
+ check(requests[0]?.get('words')==='Check both rows.','Save sends the words in the box.');
  finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 19:30 EST'});
  await flush();
  check(row.querySelector('[data-parked-note]').textContent===summary.replace('Parks until','Parked until'),
@@ -4921,6 +6383,54 @@ window.fetch=async(_path,options={})=>{
  check(form.querySelector('[data-parked-detail]').textContent==='Parked until Dec 3 19:30 EST',
   'The expanded form uses the same saved time.');
 """)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_preset_keeps_the_words_when_delivery_fails(self) -> None:
+        self.browser_action_sequence(r"""
+ const words=form.elements.words;
+ words.value='Check both rows.\nKeep the headings.';
+ words.dispatchEvent(new Event('input',{bubbles:true}));
+ form.querySelector('[data-later-toggle]').click();
+ form.querySelector('[data-later-preset="soon"]').click();
+ check(requests[0]?.get('words')===words.value,'The preset sends the words in the box.');
+ finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 19:30 EST',
+  send_failure:'Delivery failed: The producer is unavailable.'});
+ await flush();
+ check(words.value==='Check both rows.\nKeep the headings.','A failed send keeps the draft.');
+ check(form.querySelector('[data-send-status]').textContent.includes('The producer is unavailable.'),
+  'A failed send shows its reason.');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_reuses_the_pending_words_request_after_reopening(self) -> None:
+        self.browser_action_sequence(r"""
+ show('all');
+ const current=()=>recordDetails(row).querySelector('form');
+ form.elements.words.value='Keep this result.';
+ form.elements.words.dispatchEvent(new Event('input',{bubbles:true}));
+ submit('park-until-delivered');
+ const first=requests[0];
+ finishPost({item_state:'Working',parked:'true',parked_until:'delivered',words_receipt:true,delivery:'check-1'});
+ await flush();await finishRowMotion();
+ check(wordsStatusRequests[0]?.get('words-status')==='1','Park checks the saved words separately.');
+ check(wordsStatusRequests[0]?.get('request')===first.get('request') && wordsStatusRequests[0].get('delivery')==='check-1',
+  'The status checks the original delivery.');
+ finishWordsStatus?.({words_receipt:true,send_failure:'The showrunner was alerted.'});
+ await flush();
+ if(!recordIsOpen(row)) row.querySelector('.list-toggle').click();
+ await finishRowMotion();
+ check(current().elements.words.value==='Keep this result.','Reopening keeps the words.');
+ current().elements.words.value='Keep these newer words.';
+ current().elements.words.dispatchEvent(new Event('input',{bubbles:true}));
+ const retry=current().querySelector('[data-action-words-retries] button');
+ check(retry?.textContent==='Retry words','The item offers a words retry.');
+ retry?.click();
+ check(requests[1]?.get('action')==='retry-words' && requests[1].get('request')===first.get('request'),
+  'Retry addresses the original delivery without pressing Park.');
+ if(requests[1]) finishPost({words_receipt:true});
+ await flush();
+ check(current().elements.words.value==='Keep these newer words.','Retry keeps the newer draft.');
+""", reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_parks_until_delivered_with_one_post(self) -> None:
@@ -5087,7 +6597,7 @@ window.fetch=async(_path,options={})=>{
  const replay=requests[1];
  check(notice.hidden && !form.querySelector('[value="retry-park"]'),
   'The pending retry shows no failure line or Retry Park button');
- check(replay?.toString()===first.toString() && replay.get('words')==='' && words.value==='Edited words',
+ check(replay?.toString()===first.toString() && replay.get('words')==='Original words' && words.value==='Edited words',
   'The automatic retry sends the original request and keeps the edited draft');
  losePost();await flush();await finishRowMotion();
  const above=document.querySelector('[data-hidden-action-status]');
@@ -5099,7 +6609,7 @@ window.fetch=async(_path,options={})=>{
  week.click();
  const second=requests[2];
  check(requests.length===3 && second.get('request')!==first.get('request') &&
-  second.get('until')==='2026-12-07T14:00:00.000Z' && second.get('words')==='',
+  second.get('until')==='2026-12-07T14:00:00.000Z' && second.get('words')==='Edited words',
   'A new preset click sends a fresh request with a new deadline');
  if(second){finishPost({parked:'true',parked_until:'Dec 7 09:00 EST'});await flush();}
  check(notice.hidden && requests.length===3,'A confirmed save leaves no failure or retry');
@@ -5288,8 +6798,9 @@ window.fetch=async(_path,options={})=>{
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_unpark_controls_layout_and_focus(self) -> None:
         parked = self.add("Parked item", number=1, next_check=NOW + timedelta(hours=1))
-        _ = self.add("Unparked item", number=2)
+        unparked = self.add("Unparked item", number=2)
         _ = the_list.park(MORTY.id, parked.id, NOW + timedelta(days=2), source="nate")
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(unparked.number))
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         with patch.object(the_list, "now", return_value=NOW + timedelta(hours=2)):
             _ = the_list.unpark(MORTY.id, parked.id, source="nate")
@@ -5309,7 +6820,13 @@ window.fetch=async(_path,options={})=>{
   check(near(remove.left,box.left) && near(park.right,box.right) && near(remove.top,park.top),'one aligned control row');
   check(pick('[value=unpark]').hidden===(item===other),'Unpark only shows on the parked item');
   check(pick('[data-parked-detail]').hidden===(item===other),'parking line only shows on the parked item');
+  const padding=item===row ? '8px' : '12px';
+  check(['[value=remove]','[data-later-toggle]'].every(selector=>
+   getComputedStyle(pick(selector)).paddingInlineStart===padding),'The row uses its expected control padding.');
   if(item===row){
+   const top=pick('[value=top]');
+   check(top?.textContent==='Make top priority' && near(rectangle(top).top,remove.top),
+    'The parked row shows Make top priority on the control row.');
    check(near(park.left-rectangle(pick('[value=unpark]')).right,8),'parking controls are adjacent');
    check(recordDetails(item).querySelectorAll('[data-parked-detail]:not([hidden])').length===1,
     'The expanded row shows one parking line.');
@@ -5413,7 +6930,7 @@ window.fetch=async(_path,options={})=>{
  refreshMarkup=fixture.saved;
  submit('park-until-delivered');
  check(document.querySelector('[data-record-inline-view]') && recordIsOpen(item()),'The item stays active while Park waits for its result.');
- check(!requests[0].get('words'),'Park does not send the draft.');
+ check(requests[0].get('words')==='Keep these unsent words.','Park sends the words in the box.');
  if(fixture.lost){readback=()=>({...fixture.response,park_request_saved:true});await loseParkPost();losePost();}
  else finishPost(fixture.response);
  await flush();
@@ -5454,7 +6971,11 @@ window.fetch=async(_path,options={})=>{
   draft.dispatchEvent(new Event('input'));
   draft.focus();draft.setSelectionRange(5,14,'backward');
  };
- if(!parks){editOther();prior.querySelector('.list-toggle').click();}
+ if(!parks){
+  editOther();prior.querySelector('.list-toggle').click();
+  const unpark=recordDetails(prior).querySelector('[data-waiting-actions] [value="unpark"]');
+  check(getComputedStyle(unpark).paddingInlineStart==='12px','The waiting row keeps its control padding.');
+ }
  const methods=[];
  window.fetch=new Proxy(window.fetch,{apply(fetch,receiver,args){
   methods.push(args[1]?.method || 'GET');return Reflect.apply(fetch,receiver,args);
@@ -5793,7 +7314,7 @@ window.fetch=async(_path,options={})=>{
                 for key, value in (("EDGE", edge), ("AFTER_PAGE", after), ("REMOVED_ROWS", removed)):
                     steps = steps.replace(key, json.dumps(value).replace("</", "<\\/"))
                 self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=before,
-                                             open_number=opened, window_size=(1280, 1050))
+                                             open_number=opened, window_size=(1280, 1150))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_list_refresh_preserves_the_open_row_when_the_page_fits(self) -> None:
@@ -5829,7 +7350,7 @@ window.fetch=async(_path,options={})=>{
  check(scroller.scrollHeight===scroller.clientHeight,'The scroll removes all space below the list.');
 """
         self.browser_action_sequence(steps.replace("AFTER_PAGE", json.dumps(after).replace("</", r"<\/")),
-                                     reduced_motion=True, add_item=False, markup=before, window_size=(1280, 1100))
+                                     reduced_motion=True, add_item=False, markup=before, window_size=(1280, 1320))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_list_scroll_input_removes_the_top_space_on_a_short_page(self) -> None:
@@ -5885,7 +7406,7 @@ window.fetch=async(_path,options={})=>{
         for key, markup in (("BEFORE_PAGE", before), ("AFTER_PAGE", after)):
             steps = steps.replace(key, json.dumps(markup).replace("</", r"<\/"))
         self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=before,
-                                     open_number=2, window_size=(1280, 1300))
+                                     open_number=2, window_size=(1280, 1400))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_list_save_keeps_the_open_row_in_place_during_the_animation(self) -> None:
@@ -6000,7 +7521,8 @@ window.fetch=async(_path,options={})=>{
             "AFTER_PAGE", json.dumps(after).replace("</", r"<\/"))
         for case, checks in enumerate(cases):
             with self.subTest(case=case):
-                self.browser_action_sequence(steps + checks, add_item=False, markup=before, window_size=(1280, 800))
+                height = 900 if scroll_start == "bottom" else 800
+                self.browser_action_sequence(steps + checks, add_item=False, markup=before, window_size=(1280, height))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_lost_park_reply_keeps_the_other_open_row_at_the_same_pixel(self) -> None:
@@ -6468,8 +7990,8 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         saved = the_list.load(MORTY.id, item.id)
         legacy = replace(saved, log=tuple(entry for entry in saved.log
                                          if entry.what != the_list.QuestionAnswered("Q1")))
-        legacy_log = list_page.item_log_html(list_page.ListRecord(MORTY.id, legacy), NOW.astimezone(user_zone()),
-                                            staff_names.read(), frozenset())
+        legacy_log = list_page.item_log(list_page.ListRecord(MORTY.id, legacy), NOW.astimezone(user_zone()),
+                                        staff_names.read(), frozenset()).markup
         self.assertIn('<li class="question" data-log-index="Q1-answered">' + answer_time, legacy_log)
         self.assertEqual(legacy_log.count('12:35 EST'), 1)
 
@@ -7334,6 +8856,44 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_clears_the_remove_draft_after_a_lost_reply_without_a_notice(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Remove the duplicate", number=1)
+        words = "Close the duplicate."
+        first = self.fields(item, "remove", words=words)
+        second = self.fields(item, "remove", words=words)
+        with patch.object(list_page, "signed_item_request", return_value=(second["request"], second["token"])):
+            initial = list_page.render(root, include_counts=False).decode()
+        _ = list_page.submit(root, urlencode(first))
+        delivery = list_page.submit(root, urlencode(second))
+        self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+        closed = the_list.load(MORTY.id, item.id)
+        self.assertNotIn(second["request"], the_list.feedback_requests(closed))
+        state = list_page.saved_action_state(MORTY.id, item.id, park_request=second["request"], include_detail=True)
+        _ = the_list.reopen(MORTY.id, item.id, source="morty")
+        reopened = list_page.render(root, include_counts=False).decode()
+        self.browser_action_sequence('''
+ show('all');
+ form.elements.words.value='Close the duplicate.';
+ form.elements.words.dispatchEvent(new Event('input',{bubbles:true}));
+ readback=(key,request)=>{
+  check(key===row.dataset.key && request===EXPECTED_REQUEST,'Readback asks for the second Remove receipt.');
+  return SAVED_STATE;
+ };
+ submit('remove');losePost();await flush();
+ refreshMarkup=REOPENED_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();
+ const reopened=document.querySelector('[data-number="1"]');
+ check(!reopened.hidden && reopened.dataset.state==='New','Refresh shows the reopened item.');
+ reopened.querySelector('.list-toggle').click();
+ check(recordDetails(reopened).querySelector('form').elements.words.value==='','Readback clears the saved draft.');
+'''.replace('EXPECTED_REQUEST', json.dumps(second["request"]))
+   .replace('SAVED_STATE', json.dumps(state).replace('</', '<\\/'))
+   .replace('REOPENED_PAGE', json.dumps(reopened).replace('</', '<\\/')),
+                                     reduced_motion=True, add_item=False, markup=initial)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_reads_the_saved_item_after_a_lost_park_or_remove_response(self) -> None:
         self.browser_action_sequence('''
  show('working');
@@ -7680,7 +9240,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
 (async()=>{
- const {realFetch,posts,until,undo}=fixtureUndo();
+  const {realFetch,posts,until,undo}=fixtureUndo();
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  try{
   frameElement.style.width='1280px';frameElement.style.height='820px';
@@ -7698,6 +9258,13 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
    }
    form.querySelector('[value="'+action+'"]').click();
    check(row.hidden,action+' hides the row at once.');
+   if(action==='remove'){
+    const toast=()=>window.top.document.querySelector('[data-send-undo]');
+    await until(()=>toast()?.querySelector('button'),'Remove did not show the Undo toast.');
+    check(!document.querySelector('dialog[open]'),'Remove opens no confirmation window.');
+    check(toast().getAnimations().some(animation=>animation.effect.getKeyframes().at(-1).opacity==='0'),
+     'The Remove toast fades.');
+   }
    await undo();
    await until(()=>!row.hidden && recordIsOpen(row) &&
     form.querySelector('[value="read"]:enabled'),action+' did not restore the open row.');
@@ -7967,7 +9534,7 @@ window.fetch=async(_url,options)=>{
   const expanded=item=>recordIsOpen(item);
   const linked=item=>!section().hidden && section().contains(item) && !item.hidden && expanded(item);
   const framePlace=()=>location.pathname+location.search+location.hash;
-  const consolePlace=()=>new URL(parent.location.href).searchParams.get('at.list');
+  const consolePlace=()=>new URL(parent.location.href).searchParams.get('at.studio');
   const reload=async next=>{
    if(consoleReload){
     if(consolePlace()!==framePlace()) await new Promise(resolve=>{
@@ -8103,6 +9670,425 @@ window.fetch=async(_url,options)=>{
   'After Undo the row keeps its state and its unread mark, so it is not marked sent.');
  check(undos===1 && requests.length===1,'Undo posts once and nothing else is sent.');
 '''.replace('HANG_GUARD_MS', str(TEST_HANG_GUARD_SECS * 1000)))
+
+    def file_repaired_report(self, title: str, instructions: str = "Open the menu.") -> the_list.ListItem:
+        native = investigation.file(OWNER.id, title, "The menu hides choices.", waiting_why="sdlc checks the menu.")
+        report = the_list.ListReport(the_list.ReportKind.BUG, review_items.investigation_record_key(native), native.question)
+        number = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                      unit="", source="nate")
+        identity = f"L{number}"
+        _ = the_list.update(MORTY.id, identity, {"state": the_list.ItemState.WORKING}, source="dwight")
+        return the_list.update(MORTY.id, identity, {"state": the_list.ItemState.REPAIRED, "next_step": instructions},
+                               source="dwight")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_repair_undo_restores_the_draft_and_works_leaves_needs_me(self) -> None:
+        _ = self.file_repaired_report("Fix the menu", "Open the menu and count all six choices.")
+        steps = r"""
+ document.querySelector('[data-undo-enabled]').dataset.undoEnabled='true';
+ const originalFetch=window.fetch;let undos=0;
+ const undoOutcome=UNDO_OUTCOME;
+ let undoPath='';
+ const delivered={item_state:'Delivered',unread:'false',state_time_html:'<time>13:00</time>'};
+ window.fetch=async(path,options={})=>{
+  if(String(path).endsWith('/undo')){
+   undos++;undoPath=String(path);
+   if(undoOutcome===null) return new Response('Invalid JSON');
+   return Response.json({outcome:undoOutcome});
+  }
+  if(String(path).startsWith('/send-hold/')){
+   if(undoOutcome==='undone') return Response.json(delivered);
+   return Response.json({reason:'The hold result is unavailable.'},
+    {status:404,headers:{'X-Send-Hold-Outcome':'missing'}});
+  }
+  if(options.method==='POST'){
+   const fields=new URLSearchParams(options.body);
+   check(new Headers(options.headers).get('X-Undo-Hold')==='1',
+    fields.get('action')+' uses the shared Undo flow.');
+   requests.push(fields);
+   return Response.json({hold:new Headers(options.headers).get('X-Undo-Request'),seconds:30},
+    {status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  return originalFetch(path,options);
+ };
+ const until=async(test,label)=>{
+  const end=performance.now()+5000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ const words=form.elements.words;
+ const text='The last choice is missing.';
+ const reject=form.querySelector('[value="not works"]');
+ const toast=()=>document.querySelector('[data-send-undo]:has(button)');
+ show('needs-me');
+ check(row.getClientRects().length && recordIsOpen(row),'Needs me contains the open Repaired item.');
+ check(recordDetails(row).textContent.includes('Open the menu and count all six choices.'),'The panel shows how to try it.');
+ check(reject.disabled,'Not fixed needs words.');
+ for(const blank of ['\u0085','\u001c\t\u2028','\u00a0\n\u3000']){
+  words.value=blank;words.dispatchEvent(new Event('input'));
+  check(reject.disabled,'Not fixed rejects words with only server whitespace.');
+  form.requestSubmit(reject);
+  check(!requests.length,'A blank draft sends no request.');
+ }
+ words.value=text;words.dispatchEvent(new Event('input'));
+ const store=Storage.prototype.setItem;
+ Storage.prototype.setItem=function(){throw new Error('Storage unavailable');};
+ reject.click();
+ Storage.prototype.setItem=store;
+ check(!requests.length && form.querySelector('[data-send-status]').textContent.includes('cannot store Not fixed'),
+  'A storage failure shows before any request leaves.');
+ submit('not works');
+ await until(toast,'The Undo toast did not show.');
+ check(toast().textContent.includes('Sent to sdlc and dwight.'),'The toast names the owner and producer.');
+ check(!row.getClientRects().length,'The held repair report is hidden.');
+ toast().querySelector('button').click();
+ if(undoOutcome!=='undone'){
+  await until(()=>!form.dataset.sending && row.getClientRects().length,'An uncertain Undo did not restore the row.');
+  const key=Object.keys(sessionStorage).find(name=>name.includes('/list-not-fixed-v1/'));
+  const saved=JSON.parse(sessionStorage.getItem(key));
+  check(undoPath==='/send-hold/'+saved?.hold+'/undo','Undo uses the original hold.');
+  check(saved?.payload.request===requests[0].get('request'),'An uncertain Undo keeps the saved request.');
+  check(words.value===text && !reject.disabled,'An uncertain Undo keeps the words and permits retry.');
+  check(!form.querySelector('[data-send-status]').textContent.startsWith('Undone.'),'The card reports uncertainty.');
+ }else{
+  await until(()=>row.getClientRects().length && words===document.activeElement,'Undo did not restore the draft.');
+  check(row.dataset.state==='Repaired' && words.value===text && undos===1,'Undo keeps the Repaired state and words.');
+  check(!Object.keys(sessionStorage).some(key=>key.includes('/list-not-fixed-v1/')),
+   'Undo before acceptance removes the request from storage.');
+  submit('works');
+  await until(toast,'Works did not show the Undo toast.');
+  check(toast().textContent.includes('Saved.') && row.dataset.state==='Repaired',
+   'Works offers Undo before it changes the state.');
+  toast().querySelector('button').click();
+  await until(()=>row.getClientRects().length && words===document.activeElement,'Undo did not restore the repair.');
+  check(row.dataset.state==='Repaired' && undos===2,'Undo keeps the repair in Needs me.');
+  submit('works');
+  await until(toast,'Works did not offer Undo again.');
+  toast().getAnimations()[0].finish();
+  await until(()=>row.dataset.state==='Delivered' && row.hidden,'Works did not leave Needs me.');
+  show('all');
+  check(row.getClientRects().length && row.dataset.state==='Delivered','All shows the Delivered item.');
+  check(row.querySelector('[data-list-state-time]').textContent==='13:00','The row shows the Delivered time.');
+ }
+"""
+        for outcome in ("undone", "missing", None):
+            with self.subTest(outcome=outcome):
+                self.browser_action_sequence(steps.replace("UNDO_OUTCOME", json.dumps(outcome)),
+                                             add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_not_fixed_undo_times_out_while_reading_the_body(self) -> None:
+        _ = self.file_repaired_report("Fix the menu")
+        self.browser_action_sequence(r"""
+ const deadlines=new Map(),originalFetch=window.fetch;
+ AbortSignal.timeout=milliseconds=>{
+  const controller=new AbortController();
+  deadlines.set(controller.signal,{controller,milliseconds});
+  return controller.signal;
+ };
+ const words=form.elements.words,button=form.querySelector('[value="not works"]');
+ const text='The last menu choice still disappears.';
+ let undoSignal,resultSignal,bodyReads=0;
+ const until=async(condition,message)=>{
+  const deadline=performance.now()+4000;
+  while(!condition()){
+   if(performance.now()>deadline) throw new Error(message);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ window.fetch=async(path,options={})=>{
+  if(String(path).endsWith('/undo')){
+   undoSignal=options.signal;
+   const response=new Response(new ReadableStream({start(controller){
+    controller.enqueue(new TextEncoder().encode('{"outcome":'));
+    undoSignal?.addEventListener('abort',()=>controller.error(undoSignal.reason),{once:true});
+   }}));
+   const read=response.json.bind(response);
+   response.json=()=>{bodyReads++;return read();};
+   return response;
+  }
+  if(String(path).startsWith('/send-hold/')){
+   resultSignal=options.signal;
+   return Response.json({reason:'The hold result is unavailable.'},
+    {status:404,headers:{'X-Send-Hold-Outcome':'missing'}});
+  }
+  if(new URL(path,location.href).searchParams.has('not-fixed-request')){
+   const request=requests[0].get('request');
+   return Response.json({not_fixed_receipt:{request,state:'absent'}});
+  }
+  if(options.method!=='POST' || requests.length) return originalFetch(path,options);
+  requests.push(new URLSearchParams(options.body));
+  const hold=new Headers(options.headers).get('X-Undo-Request');
+  return Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ };
+ words.value=text;words.dispatchEvent(new Event('input'));
+ const initial=submit('not works');
+ const undo=()=>document.querySelector('[data-send-undo] button');
+ await until(undo,'The Undo toast did not show.');
+ undo().click();
+ await until(()=>bodyReads===1,'The browser did not read the Undo body.');
+ const deadline=deadlines.get(undoSignal);
+ if(!deadline) throw new Error('The Undo POST has no request deadline.');
+ check(Boolean(form.dataset.sending),'The card waits for the incomplete Undo body.');
+ deadline.controller.abort(new DOMException('The fixture timed out.','TimeoutError'));
+ await until(()=>!form.dataset.sending && !button.disabled,'The Undo timeout did not release the card.');
+ check(!undo() && !resultSignal,'The timeout clears the Undo toast and defers the result read until retry.');
+ const key=Object.keys(sessionStorage).find(name=>name.includes('/list-not-fixed-v1/'));
+ const saved=JSON.parse(sessionStorage.getItem(key));
+ check(saved?.payload.request===initial.id && words.value===text,'The timeout keeps the request and the words.');
+ check(form.querySelector('[data-send-status]').textContent.includes('The Undo response timed out.'),
+  'The card reports the timeout.');
+ button.click();
+ await until(()=>requests.length===2,'Retry did not send the original request.');
+ check(deadline.milliseconds===deadlines.get(resultSignal)?.milliseconds,
+  'Undo and hold result reads use the same time limit.');
+ check(requests[1].toString()===requests[0].toString(),'Retry uses the original signed payload.');
+ finishPost({status:503,reason:'The fixture did not confirm delivery.'});
+ await until(()=>!form.dataset.sending,'Retry did not finish.');
+""", add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_not_fixed_keeps_the_draft_until_delivery_is_confirmed(self) -> None:
+        repaired = self.file_repaired_report("Fix the menu")
+        root = self.root / "reviews"
+        before = list_page.render(root, include_counts=False).decode()
+        words = "The last choice is missing."
+        _ = list_page.submit(root, urlencode(self.fields(repaired, "not works", words=words)))
+        saved = list_page.saved_action_state(MORTY.id, "L1", include_detail=True)
+        probe = r"""
+ const result=SAVED,expected=EXPECTED;
+ const until=async(condition,message)=>{
+  const limit=performance.now()+4000;
+  while(!condition()){
+   if(performance.now()>limit) throw new Error(message);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ show('needs-me');
+ const text='The last choice is missing.', words=form.elements.words;
+ words.value=text;words.dispatchEvent(new Event('input'));
+ const first=submit('not works');
+ const receipt=state=>({not_fixed_receipt:{request:first.id,state}});
+ finishPost({...result,...receipt(expected ? 'delivered' : 'accepted')});
+ await until(()=>row.dataset.state==='Working' && row.hidden,'The saved item did not leave Needs me.');
+ show('working');
+ row.querySelector('.list-toggle').click();
+ await until(()=>recordDetails(row)?.querySelector('[data-feedback-form]'),'Working did not open the saved card.');
+ const detail=recordDetails(row),nextStep=detail.querySelector('.list-field-next_step');
+ const nextStepCell=row.querySelector('[data-label="Next step"]');
+ check(nextStep?.textContent==='Next stepdwight repairs it again','The card says who repairs it again.');
+ check(nextStepCell.textContent==='dwight repairs it again','The row says who repairs it again.');
+ check([nextStep,nextStepCell].every(field=>field.querySelector('.staff-name')?.textContent==='dwight'),
+  'The next step uses the producer role color.');
+ check(detail.querySelector('.list-field-latest_status p')?.textContent==='Not fixed: '+text,
+  'The latest status shows the repair feedback.');
+ const draft=detail.querySelector('textarea[name=words]').value;
+ check(draft===(expected ? '' : text),'The card clears the draft only after confirmed delivery.');
+ const retryForm=detail.querySelector('[data-feedback-form]'),retry=retryForm.querySelector('[value="not works"]');
+ check(Boolean(retry.getClientRects().length)===!expected,'Only unconfirmed delivery shows Not fixed on the Working card.');
+ if(!expected){
+  retryForm.requestSubmit(retry);
+  await until(()=>requests.length===2,'The test retry did not start.');
+  const second=requests.at(-1);
+  check(second.get('request')===first.id && second.get('token')===first.token,'The retry uses the signed request that saved the words.');
+  check(second.get('words')===text,'The retry sends the original words.');
+  finishPost({...CONFIRMED,...receipt('delivered')});
+  await until(()=>!recordDetails(row).querySelector('textarea[name=words]')?.value,
+   'The confirmed retry did not clear the words.');
+  const settled=recordDetails(row).querySelector('[value="not works"]');
+  check(!settled?.getClientRects().length,'The confirmed retry hides Not fixed.');
+ }
+"""
+        for case in ({}, {"delivery_pending": True}, {"send_failure": "The owner is unavailable."}):
+            with self.subTest(result=case):
+                steps = probe.replace("SAVED", json.dumps({**saved, **case}).replace("</", "<\\/"))
+                steps = steps.replace("EXPECTED", json.dumps(not case))
+                steps = steps.replace("CONFIRMED", json.dumps(saved).replace("</", "<\\/"))
+                self.browser_action_sequence(steps, add_item=False, markup=before, reduced_motion=True)
+
+        self.browser_action_sequence(r"""
+ const words=form.elements.words,button=form.querySelector('[value="not works"]');
+ const edit=value=>{words.value=value;words.dispatchEvent(new Event('input'));};
+ const storedKey=()=>Object.keys(sessionStorage).find(key=>key.includes('/list-not-fixed-v1/'));
+ for(const [invalid,corrected] of [['The original words.','\u0085The corrected words.\u001c'],
+                                  ['\ufeff','\u00a0The final words.\u2029']]){
+  edit(invalid);
+  const first=submit('not works');
+  finishPost({reason:'The server refused these words.',not_fixed_receipt:{request:first.id,state:'refused'}});
+  await flush();
+  check(!storedKey() && words.value===invalid,'An exact refusal removes the request and keeps the draft.');
+  edit(corrected);
+  const retry=submit('not works');
+  check(retry.id!==first.id,'Corrected words start a new request.');
+  check(requests.at(-1).get('words')===corrected.slice(1,-1),'The browser sends words without edge whitespace.');
+  finishPost({reason:'The server refused these words.',not_fixed_receipt:{request:retry.id,state:'refused'}});
+  await flush();
+  check(!storedKey() && !button.disabled,'A refused correction can be edited again.');
+ }
+""", add_item=False, markup=before, reduced_motion=True)
+
+        for scenario in ("temporary failure", "lost hold result", "tell"):
+            with self.subTest(scenario=scenario):
+                item = self.file_repaired_report(f"Fix the menu in case {scenario}")
+                self.check_not_fixed_retry_after_reload(root, item, words, scenario=scenario)
+
+    def check_not_fixed_retry_after_reload(self, root: Path, item: the_list.ListItem, words: str,
+                                          *, scenario: Literal["temporary failure", "lost hold result", "tell"]) -> None:
+        lose_hold_result = scenario == "lost hold result"
+        tell_after_failure = scenario == "tell"
+        tell_words = "A separate Tell before the retry."
+        _ = write_config_fixture(conf.path("review_links"), f"undo_seconds={int(lose_hold_result)}\ndelivery_tries=1\n")
+        posted: list[dict[str, list[str]]] = []
+        tells: list[str] = []
+        accepted: set[tuple[staff.StaffId, str]] = set()
+        save_action = list_page.save_action
+
+        def save(request_root: Path, body: str, status: change_page.DeliveryStatus | None = None, *,
+                 review_records: list_page.ImmediateReviewRecords, include_detail: bool,
+                 top_priority: list_page.TopPriority) -> tuple[list_page.ListActionSubmission, list_page.SavedActionState | None]:
+            fields = parse_qs(body, keep_blank_values=True)
+            if fields["action"] == ["not works"]:
+                posted.append(fields)
+                if scenario == "temporary failure" and len(posted) == 2:
+                    raise OSError("The List is temporarily unavailable.")
+            return save_action(request_root, body, status, review_records=review_records,
+                               include_detail=include_detail, top_priority=top_priority)
+
+        def send(recipient: staff.StaffId, _sender: str, message: str, *,
+                 key: str) -> Literal["pending", "skipped"] | None:
+            if tell_after_failure and message.endswith(tell_words):
+                self.assertEqual(recipient, DWIGHT.id)
+                tells.append(message)
+                return None
+            self.assertTrue(message.endswith(words))
+            if recipient == OWNER.id and len(posted) == 1:
+                return "pending"
+            if (recipient, key) in accepted:
+                return "skipped"
+            accepted.add((recipient, key))
+            return None
+
+        script = r"""
+(async()=>{
+ const frame=document.createElement('iframe'),failures=[];
+ const loseHoldResult=LOSE_HOLD_RESULT,tellAfterFailure=TELL_AFTER_FAILURE,holdReads=[];
+ const expectedDraft=tellAfterFailure ? '' : 'A separate edit for later.';
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const until=async(test,message)=>{
+  const end=performance.now()+4500;
+  while(!test()){
+   if(performance.now()>end) throw new Error(message);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ const load=action=>new Promise(resolve=>{frame.addEventListener('load',resolve,{once:true});action();});
+ const win=()=>frame.contentWindow;
+ const row=()=>win().document.querySelector('[data-number="ITEM_NUMBER"]');
+ const form=()=>win().recordDetails(row()).querySelector('[data-feedback-form]');
+ const open=()=>{
+  if(!win().recordIsOpen(row())) row().querySelector('.list-toggle').click();
+ };
+ const words=()=>form().elements.words;
+ const edit=value=>{words().value=value;words().dispatchEvent(new (win().Event)('input'));};
+ const click=async({loseResult=false}={})=>{
+  const view=win(),target=form(),button=target.querySelector('[value="not works"]'),actual=view.fetch;
+  let result;
+  view.fetch=async(url,options)=>{
+   const response=await actual.call(view,url,options);
+   if(String(url).startsWith('/send-hold/') && !options?.method){
+    holdReads.push(url);
+    if(loseResult && response.status===200){
+     result={status:503,fields:{reason:'The hold result was lost.'}};
+     return Response.json(result.fields,{status:result.status});
+    }
+   }else if(options?.method==='POST') result={status:response.status,fields:await response.clone().json()};
+   return response;
+  };
+  try{
+   check(!button.disabled && button.getClientRects().length,'Not fixed is available on the card.');
+   button.click();
+   await until(()=>result && !target.dataset.sending,'Not fixed did not finish.');
+   return result;
+  }finally{view.fetch=actual;}
+ };
+ try{
+  await load(()=>{frame.src=location.pathname;document.body.append(frame);});
+  open();edit(SUBMITTED_WORDS);
+  const first=await click({loseResult:loseHoldResult}),receipt=first.fields.not_fixed_receipt;
+  if(loseHoldResult){
+   check(first.status===503 && holdReads.length===1,'The first held result is lost.');
+  }else{
+   check(first.status===200 && first.fields.send_failure && receipt?.state==='accepted','The first send saves without delivery.');
+   check(row().dataset.state==='Working' && words().value===SUBMITTED_WORDS,'Working keeps the submitted words.');
+  }
+  edit('');
+  check(!form().querySelector('[value="not works"]').disabled,'An empty draft still permits retry.');
+  if(tellAfterFailure){
+   edit(TELL_WORDS);
+   form().querySelector('[value="tell"]').click();
+   await until(()=>!words().value && !form().dataset.sending,'Tell did not clear the draft.');
+  }else edit(expectedDraft);
+  if(!loseHoldResult && !tellAfterFailure){
+   const second=await click();
+   check(second.status===503,'The second send has a temporary failure.');
+  }
+  await load(()=>win().location.reload());
+  open();
+  check(words().value===expectedDraft,'Reload restores only unsent draft words.');
+  const beforeRefresh=win().document.querySelector('[data-list]');
+  const resumed=await click();
+  check(resumed.status===200 && resumed.fields.not_fixed_receipt?.state==='delivered',
+   'The original request confirms delivery after reload.');
+  if(loseHoldResult) check(holdReads.length===2 && holdReads[0]===holdReads[1],'The retry reads the original hold.');
+  else check(resumed.fields.not_fixed_receipt.request===receipt?.request,'The delivery receipt names the original request.');
+  check(words().value===expectedDraft,'Confirmation keeps the current draft.');
+  check(!form().querySelector('[value="not works"]').getClientRects().length,'The confirmed request leaves the card.');
+  await until(()=>!beforeRefresh.isConnected,'The List did not refresh after the confirmed retry.');
+ }catch(error){failures.push(String(error));}
+ return failures;
+})()
+""".replace("ITEM_NUMBER", str(item.number)).replace("SUBMITTED_WORDS", json.dumps(words))
+        script = script.replace("LOSE_HOLD_RESULT", json.dumps(lose_hold_result))
+        script = script.replace("TELL_AFTER_FAILURE", json.dumps(tell_after_failure))
+        script = script.replace("TELL_WORDS", json.dumps(tell_words))
+        with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root)}),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(list_page, "save_action", side_effect=save),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(list_page, "recover_pending"),
+              patch.object(change_page, "send_to_staff", side_effect=send),
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            chrome = self.chrome()
+            try:
+                chrome.navigate(f"http://127.0.0.1:{server.server_port}{studio_page.PAGE_PATH}")
+                reply = chrome.command("Runtime.evaluate", {"expression": script, "awaitPromise": True,
+                                       "returnByValue": True}, chrome.session)
+                self.assertNotIn("exceptionDetails", reply)
+                self.assertEqual(cast(dict[str, object], reply["result"])["value"], [])
+            finally:
+                chrome.navigate("about:blank")
+                server.shutdown()
+                thread.join()
+        self.assertEqual(len(posted), 3 if scenario == "temporary failure" else 2)
+        self.assertEqual(posted, [posted[0]] * len(posted))
+        self.assertEqual(posted[0]["words"], [words])
+        request, = posted[0]["request"]
+        feedback = the_list.feedback_requests(the_list.load(MORTY.id, item.id))
+        if tell_after_failure:
+            self.assertEqual(len(tells), 1)
+            self.assertEqual([entry.words for entry in feedback.values() if entry.action == "tell"], [tell_words])
+            self.assertEqual(len(feedback), 2)
+            self.assertEqual(feedback[request].action, the_list.ReportVerdict.NOT_FIXED)
+        else:
+            self.assertEqual(list(feedback), [request])
+        self.assertEqual((feedback[request].state, feedback[request].words), ("sent", words))
+        self.assertCountEqual([recipient for recipient, _ in accepted], (OWNER.id, DWIGHT.id))
+        self.assertEqual(len({key for _, key in accepted}), 1)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_held_question_hides_the_item_and_failure_restores_it(self) -> None:
@@ -8626,11 +10612,11 @@ window.fetch=async(_url,options)=>{
         frame_url = frame_path
         console_shell = b""
         if reload_console or console_fragment:
-            frame_path = list_page.PAGE_PATH
-            listing = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(frame_path))
+            frame_path = studio_page.PAGE_PATH
+            listing = console.ConsolePage("studio", "Studio", "clapperboard", "The Studio", console.AvailablePage(frame_path))
             console_shell = console.render((listing,), console.UnavailablePage())
             place = frame_path + (console_fragment or "#show=working")
-            frame_url = "/console/?" + urlencode({"page": "list", "at.list": place})
+            frame_url = "/console/?" + urlencode({"page": "studio", "at.studio": place})
             if console_fragment:
                 console_shell = console_shell.replace(b"</body>", b'<img hidden src="/complete"></body>')
         host_page = (f'<!doctype html><style>iframe{{border:0;width:100%;height:{height}}}'
@@ -8845,7 +10831,7 @@ const change=async path=>{
  }catch(error){errors.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
 })();
-</script>""".replace('LIST_PATH', list_page.PAGE_PATH).encode()
+</script>""".replace('LIST_PATH', studio_page.PAGE_PATH).encode()
 
         class Probe(serve.ReviewLinksHandler):
             @override
@@ -9020,15 +11006,30 @@ const settle=async (done,message)=>{
   await settle(()=>box.isConnected && !button.disabled &&
    win.recordDetails(row).querySelector('[data-send-status]')?.textContent.includes("Could not check natedev's addresses."),
    'The row shows the address error and the ask stays open.');
+  const words=win.recordDetails(row).querySelector('[data-feedback-form] textarea[name=words]');
+  words.value='Check the merge result.';
+  words.dispatchEvent(new win.Event('input',{bubbles:true}));
   button.click();
   await settle(()=>!box.isConnected && row.hidden,'A Go closes the box and the item leaves Needs me.');
+  doc.getElementById('filter-show-all').click();
+  await settle(()=>!row.hidden,'All shows the saved item.');
+  row.querySelector('.list-toggle').click();
+  const retry=()=>win.recordDetails(row).querySelector('[data-action-words-retries] button');
+  await settle(()=>retry()?.textContent==='Retry Go delivery','The item offers a delivery retry.');
+  const draft=win.recordDetails(row).querySelector('[data-feedback-form] textarea[name=words]');
+  check(draft.value==='Check the merge result.','The box keeps the words after a failed send.');
+  draft.value='Keep the newer words.';
+  draft.dispatchEvent(new win.Event('input',{bubbles:true}));
+  retry().click();
+  await settle(()=>!retry(),'Retry finishes the saved Go delivery.');
+  check(draft.value==='Keep the newer words.','Retry keeps the newer words.');
   check(doc.getElementById('filter-show-needs-me').dataset.filterCount==='0','The Needs me count is 0 after the Go.');
   check(row.dataset.state==='Working' && row.querySelector('.list-state').textContent==='Working',
    'The Go on the last ask sets the waiting row to Working in place.');
  }catch(error){errors.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
 })();
-</script>""".replace('LIST_PATH', list_page.PAGE_PATH).replace('KEY', key).encode()
+</script>""".replace('LIST_PATH', studio_page.PAGE_PATH).replace('KEY', key).encode()
 
         class Probe(serve.ReviewLinksHandler):
             @override
@@ -9047,13 +11048,24 @@ const settle=async (done,message)=>{
                 else:
                     super().do_POST()
 
+        target_sends = 0
+
+        def send_to_target(recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
+            nonlocal target_sends
+            if recipient == OWNER.id:
+                target_sends += 1
+                if target_sends <= 3:
+                    raise OSError("The target is offline.")
+
         with (patch.object(serve, "ReviewLinksHandler", Probe),
               patch.object(review_page.ReviewSnapshotCache, "start"),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(review_link, "tailscale_ip",
-                           side_effect=["192.0.2.1", ValueError("No IPv6 address."), "192.0.2.1", "2001:db8::1"]),
+                           side_effect=["192.0.2.1", ValueError("No IPv6 address."),
+                                        "192.0.2.1", "2001:db8::1", "192.0.2.1", "2001:db8::1",
+                                        "192.0.2.1", "2001:db8::1"]),
               patch.object(list_page, "counts_strip", return_value=""),
-              patch.object(change_page, "send_to_staff") as delivery,
+              patch.object(change_page, "send_to_staff", side_effect=send_to_target) as delivery,
               patch.object(go_ledger, "natedev_address", return_value=False),
               serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
@@ -9069,7 +11081,173 @@ const settle=async (done,message)=>{
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual((the_list.open_asks(saved), saved.state), ((), the_list.ItemState.WORKING))
         self.assertIn(the_list.GoGiven(saved.asks[0]), [change.what for change in saved.log])
-        self.assertEqual(sorted(cast(str, sent.args[0]) for sent in delivery.call_args_list), sorted([OWNER.id, MORTY.id]))
+        self.assertEqual(sorted(cast(str, sent.args[0]) for sent in delivery.call_args_list),
+                         sorted([OWNER.id] * 4 + [MORTY.id]))
+        target_calls = [sent for sent in delivery.call_args_list if sent.args[0] == OWNER.id]
+        self.assertEqual(len({(sent.args[2], sent.kwargs["key"]) for sent in target_calls}), 1)
+        self.assertIn("Nate's words:\nCheck the merge result.", cast(str, target_calls[-1].args[2]))
+
+    def test_browser_reload_restores_pending_park_and_go_words(self) -> None:
+        parked = self.add("Park the item", number=1)
+        asked = self.add("Approve the check", number=2)
+        for what in ("Run the first check.", "Run the second check."):
+            _ = the_list.add_ask(MORTY.id, asked.id, kind=the_list.AskKind.GO, target=OWNER.id, what=what,
+                                 why="The check needs approval.", config=False, requester=MORTY.id, source="morty")
+        root = self.root / "reviews"
+        results: list[list[str]] = []
+        complete = threading.Event()
+        probe = r"""<!doctype html><meta charset="utf-8">
+<style>iframe{width:100%;height:95vh;border:0}</style><iframe></iframe><script>
+const frame=document.querySelector('iframe'),errors=[];
+const navigate=action=>new Promise(resolve=>{frame.onload=resolve;action();});
+const current=number=>frame.contentDocument.querySelector('[data-number="'+number+'"]');
+const detail=number=>frame.contentWindow.recordDetails(current(number));
+const retries=number=>[...detail(number).querySelectorAll('[data-words-retry]')];
+const retryText=row=>row.querySelector('[data-words-retry-text]').textContent;
+const retryWhat=row=>row.querySelector('[data-words-retry-what]');
+async function until(condition,message){
+ for(let tries=0;tries<160;tries++){
+  if(condition()) return;
+  await new Promise(resolve=>setTimeout(resolve,25));
+ }
+ throw new Error(message);
+}
+function draft(number,words){
+ const field=detail(number).querySelector('textarea[name=words]');
+ field.value=words;
+ field.dispatchEvent(new frame.contentWindow.Event('input',{bubbles:true}));
+}
+function openIfClosed(number){
+ const row=current(number);
+ if(!frame.contentWindow.recordIsOpen(row)) row.querySelector('.list-toggle').click();
+}
+async function openItem(number){
+ const key='KEEPER/L'+number;
+ await navigate(()=>{frame.src='STUDIO_PATH?item-test='+number+'#'+new URLSearchParams({show:'all',item:key});});
+ await until(()=>frame.contentWindow.recordIsOpen?.(current(number)),'Open item '+number);
+}
+async function pressWithWords(number,words,count,press){
+ openIfClosed(number);
+ draft(number,words);
+ press(detail(number));
+ await until(()=>[...frame.contentDocument.querySelectorAll('[role=status]')]
+  .some(status=>status.textContent.includes('The sender has not confirmed delivery.')),'Wait for the delivery status.');
+ await until(()=>{openIfClosed(number);return retries(number).length===count;},'Show the pending retries.');
+}
+async function reloadAndRetry(number,expected){
+ const previous=frame.contentDocument;
+ await navigate(()=>frame.contentWindow.location.reload());
+ if(frame.contentDocument===previous) throw new Error('The browser did not reload.');
+ openIfClosed(number);
+ await until(()=>retries(number).length===expected.length,'Restore the pending retries.');
+ draft(number,'New draft.');
+ for(const [words,recipient,label,what=''] of expected){
+  const matches=row=>retryText(row)===words && (retryWhat(row)?.textContent ?? '')===what;
+  const row=retries(number).find(matches);
+  if(!row || row.querySelector('[data-words-retry-recipients]')?.textContent!=='To '+recipient)
+   throw new Error('Show the saved words, recipient, and What text for '+(what || words));
+  const button=row.querySelector('button');
+  const description=frame.contentDocument.getElementById(button.getAttribute('aria-describedby'));
+  if(button.textContent!==label || !description?.contains(row.querySelector('[data-words-retry-text]')) ||
+     (what && !description.contains(retryWhat(row)))) throw new Error('Describe the retry for '+(what || words));
+  button.click();
+  await until(()=>!retries(number).some(matches) &&
+   detail(number).querySelector('[data-send-status]')?.textContent==='Sent the saved words.',
+   'Confirm the retry for '+(what || words));
+ }
+ if(detail(number).querySelector('textarea[name=words]').value!=='New draft.') throw new Error('Keep the new draft.');
+}
+const park=preset=>card=>{
+ card.querySelector('[data-later-toggle]').click();
+ card.querySelectorAll('[data-later-preset]')[preset].click();
+};
+(async()=>{
+ try{
+  await openItem(1);
+  await pressWithWords(1,'Words for first Park.',1,park(0));
+  const change=await fetch('/change-producer',{method:'POST'});
+  if(!change.ok) throw new Error('Change the producer in the fixture.');
+  await pressWithWords(1,'Words for second Park.\nCheck line two.',2,park(1));
+  await reloadAndRetry(1,[['Words for second Park.\nCheck line two.','dwight','Retry words'],
+                          ['Words for first Park.','morty','Retry words']]);
+  await openItem(2);
+  await pressWithWords(2,'Proceed.',1,card=>card.querySelector('[data-ask="A1"] [data-go-form] button').click());
+  await pressWithWords(2,'Proceed.',2,card=>card.querySelector('[data-ask="A2"] [data-go-form] button').click());
+  await reloadAndRetry(2,[['Proceed.','sdlc','Retry Go delivery','What: Run the second check.'],
+                          ['Proceed.','sdlc','Retry Go delivery','What: Run the first check.']]);
+ }catch(error){errors.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
+})();</script>""".replace('KEEPER', MORTY.id).replace('STUDIO_PATH', studio_page.PAGE_PATH).encode()
+
+        class Probe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == '/proof':
+                    self.html_response(200, probe)
+                    return None
+                return super().send_head()
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == '/results':
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                    self.json_response(200, {})
+                    complete.set()
+                elif self.path == '/change-producer':
+                    _ = the_list.update(MORTY.id, parked.id, {"producer": DWIGHT.id}, source="morty")
+                    self.json_response(200, {})
+                else:
+                    super().do_POST()
+
+        tries = conf.read("review_links").whole("delivery_tries")
+        attempts: dict[tuple[staff.StaffId, str], int] = {}
+
+        def send(recipient: staff.StaffId, _sender: str, message: str, *, key: str) -> Literal["pending"] | None:
+            delivery = recipient, key
+            attempts[delivery] = attempts.get(delivery, 0) + 1
+            pending_tries = tries if "Words for second Park." in message else int(
+                "Words for first Park." in message or recipient == OWNER.id)
+            return "pending" if attempts[delivery] <= pending_tries else None
+
+        with (patch.object(serve, "ReviewLinksHandler", Probe),
+              patch.object(review_page.ReviewSnapshotCache, "start"),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(review_link, "tailscale_ip", side_effect={4: "192.0.2.1", 6: "2001:db8::1"}.__getitem__),
+              patch.object(go_ledger, "natedev_address", return_value=False),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(change_page, "send_to_staff", side_effect=send) as sender,
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                browser = self.firefox_view(f'http://127.0.0.1:{server.server_port}/proof', None, 1440, 900, complete)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                complete.set()
+                server.shutdown()
+                thread.join()
+        first_park = [call for call in sender.call_args_list if "Words for first Park." in cast(str, call.args[2])]
+        second_park = [call for call in sender.call_args_list if "Words for second Park." in cast(str, call.args[2])]
+        first_go = [call for call in sender.call_args_list if "What: Run the first check.\n" in cast(str, call.args[2])]
+        second_go = [call for call in sender.call_args_list if "What: Run the second check.\n" in cast(str, call.args[2])]
+        self.assertEqual([call.args[0] for call in first_park], [MORTY.id, MORTY.id])
+        self.assertEqual([call.args[0] for call in second_park], [DWIGHT.id] * (tries + 1))
+        self.assertEqual(first_park[0], first_park[1])
+        self.assertEqual(second_park, [second_park[0]] * (tries + 1))
+        self.assertNotEqual(first_park[0].kwargs["key"], second_park[0].kwargs["key"])
+        for sends in (first_go, second_go):
+            self.assertEqual([call.args[0] for call in sends], [OWNER.id, MORTY.id, OWNER.id])
+            self.assertEqual(sends[0], sends[-1])
+            self.assertIn("Nate's words:\nProceed.", cast(str, sends[-1].args[2]))
+        self.assertNotEqual(first_go[0].kwargs["key"], second_go[0].kwargs["key"])
+        self.assertEqual(sender.call_args_list[-2:], [second_go[-1], first_go[-1]])
+        self.assertEqual(len(sender.call_args_list), tries + 10)
+        park_log = the_list.load(MORTY.id, parked.id).log
+        go_log = the_list.load(MORTY.id, asked.id).log
+        self.assertEqual(sum(isinstance(change.what, the_list.FieldChange) and change.what.action == "Parked"
+                             for change in park_log), 2)
+        self.assertEqual(sum(isinstance(change.what, the_list.GoGiven) for change in go_log), 2)
 
     def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True,
                                 window_size: tuple[int, int] | None = None, in_frame: bool = False,
@@ -9082,11 +11260,15 @@ const settle=async (done,message)=>{
         markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
         markup = re.sub(r'data-park-retry-seconds="[^"]+"', 'data-park-retry-seconds="0"', markup, count=1)
         setup = '''<script>
-const requests=[],itemSnapshots=new Map();
-let finishPost,losePost,lostHold,failPostBody,refreshMarkup,readback,deliveryPending,pageReads=0;
+const requests=[],wordsStatusRequests=[],itemSnapshots=new Map();
+let finishPost,finishWordsStatus,losePost,lostHold,failPostBody,refreshMarkup,readback,deliveryPending,pageReads=0;
 window.fetch=async(path,options={})=>{
  if(options.method!=='POST'){
   const query=new URL(path,location.href).searchParams;
+  if(query.has('words-status')){
+   wordsStatusRequests.push(query);
+   return new Promise(resolve=>{finishWordsStatus=result=>resolve({ok:true,json:async()=>result});});
+  }
   if(query.has('item-state')){
    const key=query.get('keeper')+'/'+query.get('item-state');
    return {ok:true,json:async()=>readback ? readback(key,query.get('park-request')) : {
@@ -9359,6 +11541,826 @@ window.fetch=async(path,options={})=>{
                 self.assertEqual(notice.recipient_id(MORTY.id), MORTY.id)
                 self.assertEqual(notice.state, "sent")
 
+    def page_action_messages(self, item: the_list.ListItem, action: str, **fields: str
+                             ) -> list[tuple[staff.StaffId, str]]:
+        with patch.object(change_page, "send_to_staff") as send:
+            submission, _ = list_page.save_action(
+                self.root / "reviews", urlencode(self.fields(item, action, **fields)),
+                top_priority=list_page.TopPriority.SHOWN)
+            list_page.deliver(submission)
+        return [(cast(staff.StaffId, call.args[0]), cast(str, call.args[2])) for call in send.call_args_list]
+
+    def test_mark_read_adds_words_to_the_producers_message(self) -> None:
+        for state in (the_list.ItemState.WAITING_FOR_NATE, the_list.ItemState.WORKING):
+            with self.subTest(state=state):
+                item = self.add("Read the figures", state)
+                item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                recipient, message = self.page_action_messages(item, "read", words=" Use this.\nKeep both lines.  ")[0]
+                self.assertEqual(recipient, DWIGHT.id)
+                self.assertTrue(message.endswith("\n\nNate's words:\nUse this.\nKeep both lines."))
+                if state is the_list.ItemState.WAITING_FOR_NATE:
+                    self.assertIn("Write its next step:", message)
+                else:
+                    self.assertEqual(message.splitlines()[0], f"Studio: feedback for item {item.number}.")
+                    self.assertEqual(self.page_action_messages(item, "read", words=" \n "), [])
+
+    def test_park_presets_and_date_save_send_words_to_the_producer(self) -> None:
+        for until in ("delivered", "2026-12-03", (NOW + timedelta(hours=1)).isoformat()):
+            with self.subTest(until=until):
+                item = self.add("Park after the check")
+                item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                blank, = self.page_action_messages(item, "park", until=until, words=" \n ")
+                _ = the_list.unpark(MORTY.id, item.id, source="nate")
+                legacy, copy = self.page_action_messages(item, "park", until=until, words="See the check.")
+                self.assertEqual(legacy, blank)
+                self.assertEqual(copy, (DWIGHT.id, f"Studio: feedback for item {item.number}.\n\n"
+                                                 + "Nate's words:\nSee the check."))
+
+    def test_unpark_sends_words_to_the_producer(self) -> None:
+        item = self.add("Unpark after the check")
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        legacy = (MORTY.id, f"Studio: nate unparked item {item.number}.")
+        copy = (DWIGHT.id, f"Studio: feedback for item {item.number}.\n\nNate's words:\nCheck this.")
+        for words, notices in (("  ", [legacy]), ("Check this.", [legacy, copy])):
+            parked = the_list.park(MORTY.id, item.id, NOW + timedelta(days=1), source="nate")
+            self.assertEqual(self.page_action_messages(parked, "unpark", words=words), notices)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(self.page_action_messages(saved, "unpark", words="Check this anyway."),
+                         [(DWIGHT.id, f"Studio: feedback for item {item.number}.\n\n"
+                                      + "Nate's words:\nCheck this anyway.")])
+
+    def test_unschedule_sends_words_to_the_producer(self) -> None:
+        for words in (" \n ", "Check this today."):
+            with self.subTest(words=words):
+                item = the_list.add(MORTY.id, "Clear the schedule", owner=OWNER.id, source="nate", changes={
+                    "producer": DWIGHT.id, "state": the_list.ItemState.SCHEDULED,
+                    "schedule": the_list.ScheduledRun(NOW + timedelta(days=1), "Check the result."),
+                })
+                sent = self.page_action_messages(item, "unschedule", words=words)
+                expected = [(DWIGHT.id, f"Studio: feedback for item {item.number}.\n\nNate's words:\n{words}")]
+                self.assertEqual(sent, expected if words.strip() else [])
+                self.assertIs(the_list.load(MORTY.id, item.id).schedule, the_list.NoSchedule.UNSET)
+
+    def test_make_top_priority_sends_words_to_the_producer(self) -> None:
+        item = self.add("Check the priority")
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        self.assertEqual(self.page_action_messages(item, "top", words=" \n "), [])
+        self.assertEqual(self.page_action_messages(item, "top", words="Check it first."),
+                         [(DWIGHT.id, f"Studio: feedback for item {item.number}.\n\n"
+                                      + "Nate's words:\nCheck it first.")])
+
+    def test_parking_notices_use_the_producer_at_write(self) -> None:
+        for action, writer in (("park", "park"), ("unpark", "unpark"), ("unschedule", "save_page_schedule")):
+            with self.subTest(action=action):
+                item = self.add("Check the producer at write")
+                if action == "unpark":
+                    item = the_list.park(MORTY.id, item.id, NOW + timedelta(days=1), source="nate")
+                if action == "unschedule":
+                    item = the_list.add(MORTY.id, "Clear the schedule", owner=OWNER.id, source="nate", changes={
+                        "state": the_list.ItemState.SCHEDULED,
+                        "schedule": the_list.ScheduledRun(NOW + timedelta(days=1), "Check the result."),
+                    })
+                original = cast(Callable[..., object], getattr(the_list, writer))
+
+                def change_producer(*args: object, **kwargs: object) -> object:
+                    _ = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                    return original(*args, **kwargs)
+
+                with patch.object(the_list, writer, side_effect=change_producer):
+                    sent = self.page_action_messages(item, action, words="Check the result.",
+                                                     until="delivered" if action == "park" else "")
+                self.assertEqual([recipient for recipient, _ in sent],
+                                 [DWIGHT.id] if action == "unschedule" else [MORTY.id, DWIGHT.id])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_keeps_priority_words_when_both_responses_are_lost(self) -> None:
+        self.check_priority_words_in_browser("lost")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_priority_button_starts_a_new_write_after_failed_words(self) -> None:
+        self.check_priority_words_in_browser("new")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_keeps_the_priority_request_when_retry_precedes_its_save(self) -> None:
+        self.check_priority_words_in_browser("early")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_recovers_priority_words_after_the_list_sync_fails(self) -> None:
+        self.check_priority_words_in_browser("sync")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_keeps_priority_words_before_the_server_receives_the_post(self) -> None:
+        self.check_priority_words_in_browser("in-transit")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_restores_an_unresolved_priority_request_after_reload(self) -> None:
+        self.check_priority_words_in_browser("reload")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_drops_priority_words_after_a_completed_save_failure(self) -> None:
+        self.check_priority_words_in_browser("refused")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_requires_priority_save_proof(self) -> None:
+        self.check_priority_words_in_browser("invalid-response")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_retry_settles_priority_after_preparation_fails(self) -> None:
+        self.check_priority_words_in_browser("prepare-failure")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_priority_post_respects_an_earlier_retry_refusal(self) -> None:
+        self.check_priority_words_in_browser("retry-first")
+
+    def check_priority_words_in_browser(self, mode: Literal[
+            "lost", "new", "early", "refused", "sync", "in-transit", "reload",
+            "invalid-response", "prepare-failure", "retry-first"]) -> None:
+        item = self.add("Keep the original priority request", number=1)
+        second = self.add("Set a different priority", number=2)
+        root = self.root / "reviews"
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        complete = threading.Event()
+        write_started = threading.Event()
+        release_write = threading.Event()
+        original_finished = threading.Event()
+        original_post = threading.local()
+        results: list[list[str]] = []
+        probe = r"""<!doctype html><meta charset="utf-8"><iframe style="width:100%;height:95vh"></iframe><script>
+const frame=document.querySelector('iframe'),errors=[],mode='PROBE_MODE';
+async function until(condition,message){
+ for(let tries=0;tries<160;tries++){
+  if(condition()) return;
+  await new Promise(resolve=>setTimeout(resolve,25));
+ }
+ throw new Error(message);
+}
+(async()=>{
+ try{
+  await new Promise(resolve=>{
+   frame.onload=resolve;
+   frame.src='STUDIO_PATH#'+new URLSearchParams({show:'all',item:'KEEPER/L1'});
+  });
+  const win=frame.contentWindow;
+  const row=()=>frame.contentDocument.querySelector('[data-number="1"]');
+  const card=()=>win.recordDetails(row());
+  const form=()=>card().querySelector('[data-feedback-form]');
+  const retry=()=>card().querySelector('[data-words-retry] button');
+  const notice=()=>form()?.querySelector('[data-send-status]')?.textContent ?? '';
+  await until(()=>win.recordIsOpen?.(row()) && form(),'Open the item.');
+  const fetch=window.fetch.bind(window);
+  const topRequests=[],retries=[],delivered=new Set();
+  let lostStatus=false,firstTop,topStatus,checkedRefusal=false,latePost,releaseStatus,releaseRetry;
+  const beforePost=['in-transit','reload','retry-first'].includes(mode);
+  const postWins=mode==='in-transit' || mode==='reload';
+  if(mode==='early' || beforePost) frame.contentDocument.querySelector('[data-list]').dataset.requestTimeoutSeconds='1';
+  const intercept=async(path,options={})=>{
+   const url=new URL(path,win.location.href),data=options.body;
+   if(data?.get?.('action')==='top'){
+    topRequests.push(data.get('request'));
+    firstTop ??= new URLSearchParams(data);
+    if(beforePost && topRequests.length===1){
+     latePost=()=>fetch(path,{method:'POST',body:data});
+     return new Promise((_,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true}));
+    }
+    if(mode==='invalid-response'){
+     const request=topRequests.at(-1);
+     if(topRequests.length===1) return new Response('{',{status:200});
+     if(topRequests.length===2) return Response.json({priority_request:request,words_receipt:true});
+     if(topRequests.length===3)
+      return Response.json({priority_request:topRequests[0],priority_outcome:'saved',words_receipt:true});
+     await fetch(path,options);
+     return Response.json({priority_request:request,priority_outcome:'unknown',words_receipt:true});
+    }
+    const response=await fetch(path,options);
+    topStatus=response.status;
+    if(mode==='lost' || (mode==='refused' && response.status===409) ||
+       (mode==='prepare-failure' && response.status===503)) throw new Error('The action response was lost.');
+    return response;
+   }
+   if(url.searchParams.has('words-status')){
+    if(mode==='invalid-response'){
+     await new Promise(resolve=>{releaseStatus=resolve;});
+     return Response.json({priority_outcome:'unknown',priority_request:topRequests.at(-1),
+      words_receipt:true,words_delivery:'delivered'});
+    }
+    if((mode==='lost' || mode==='early' || beforePost || mode==='prepare-failure') && !lostStatus){
+     if(url.searchParams.get('request')!==topRequests[0]) throw new Error('Status changed the request.');
+     if(beforePost){
+      const response=await fetch(path,options);
+      if((await response.json()).priority_outcome!=='unknown') throw new Error('Early status settled the request.');
+     }
+     lostStatus=true;
+     throw new Error('The first status response was lost.');
+    }
+    if(['refused','new','prepare-failure','retry-first'].includes(mode)){
+     const response=await fetch(path,options);
+     const result=await response.clone().json();
+     if(result.priority_outcome==='not_saved') checkedRefusal=true;
+     if(result.words_delivery==='delivered') delivered.add(url.searchParams.get('request'));
+     return response;
+    }
+   }
+   if(data?.get?.('action')==='retry-words'){
+    if(postWins) await new Promise(resolve=>{releaseRetry=resolve;});
+    const response=await fetch(path,options);
+    const result=await response.clone().json();
+    retries.push({request:data.get('request'),result:result.words_receipt ? result.words_delivery : result.priority_outcome});
+    return response;
+   }
+   return fetch(path,options);
+  };
+  win.fetch=intercept;
+  function pressTop(){
+   const field=form().querySelector('textarea[name=words]');
+   field.value='Check this item first.';
+   field.dispatchEvent(new win.Event('input',{bubbles:true}));
+   const top=form().querySelector('[value="top"]');
+   if(!top || top.disabled) throw new Error('Make top priority is unavailable.');
+   top.click();
+  }
+  if(mode!=='invalid-response') pressTop();
+  if(mode==='invalid-response'){
+   for(const response of ['invalid JSON','a missing outcome','a different request ID','an unknown outcome']){
+    releaseStatus=undefined;
+    pressTop();
+    await until(()=>releaseStatus && notice().startsWith('Save not confirmed:'),
+     'The browser reported a save after '+response+'.');
+    releaseStatus();
+    await until(()=>retry() && notice()==='The server has not confirmed the priority save.',
+     'An unknown outcome must keep Retry words.');
+    retry().click();
+    const final=response==='an unknown outcome' ? 'delivered' : 'not_saved';
+    await until(()=>retries.at(-1)?.request===topRequests.at(-1) && retries.at(-1)?.result===final && !retry(),
+     'Retry did not reach the final result.');
+   }
+  }else if(mode==='prepare-failure' || mode==='retry-first'){
+   await until(()=>lostStatus && retry(),'The item offers Retry words.');
+   if(mode==='prepare-failure' && topStatus!==503) throw new Error('The preparation error did not return 503.');
+   retry().click();
+   await until(()=>retries.at(-1)?.result==='not_saved' && !retry() && notice().startsWith('Not saved'),
+    'Retry did not settle the unsaved priority request.');
+   if(mode==='retry-first'){
+    const delayed=await latePost();
+    if(delayed.status!==409 || (await delayed.json()).priority_outcome!=='not_saved')
+     throw new Error('The delayed POST did not respect the refusal.');
+   }
+   pressTop();
+   await until(()=>topRequests.length===2 && topStatus===200 && delivered.has(topRequests[1]) &&
+    !form()?.querySelector('[value="top"]') && !retry(),
+    'The new priority save finished.');
+   if(topRequests[0]===topRequests[1]) throw new Error('The new press reused the failed request.');
+  }else if(mode==='refused'){
+   await until(()=>topStatus===409 && checkedRefusal && !retry() && !form()?.querySelector('[value="top"]')?.disabled,
+    'The server did not acknowledge the durable refusal.');
+   const delayed=await fetch('STUDIO_PATH',{method:'POST',body:firstTop});
+   if(delayed.status!==409 || (await delayed.json()).priority_outcome!=='not_saved')
+    throw new Error('The request that failed stayed final.');
+   pressTop();
+   await until(()=>topRequests.length===2 && topStatus===200 && delivered.has(topRequests[1]) &&
+    !form()?.querySelector('[value="top"]') && !retry(),
+    'The new priority save finished.');
+   if(topRequests[0]===topRequests[1] || retry()) throw new Error('The new press reused the failed request.');
+  }else if(mode==='new'){
+   await until(()=>retry(),'The item offers Retry words.');
+   const changed=await fetch('/set-second-priority',{method:'POST'});
+   if(!changed.ok) throw new Error('The other item did not become top priority.');
+   frame.contentDocument.dispatchEvent(new win.Event('review-item-created'));
+   await until(()=>form()?.querySelector('[value="top"]') && !form().querySelector('[value="top"]').disabled,
+    'The item can become top priority again.');
+   pressTop();
+   await until(()=>topRequests.length===2 || retries.length,'The next press reached the server.');
+   if(topRequests.length!==2 || topRequests[0]===topRequests[1] || retries.length)
+    throw new Error('Make top priority must submit a new action.');
+   await until(()=>delivered.has(topRequests[1]) && !form()?.querySelector('[value="top"]'),'The second action finished.');
+  }else{
+   await until(()=>retry() && (mode==='sync' || lostStatus),'The item offers Retry words after a save error.');
+   if(mode==='sync' && topStatus!==503) throw new Error('The sync error did not return 503.');
+   if(mode==='reload'){
+    await new Promise(resolve=>{frame.onload=resolve;win.location.reload();});
+    await until(()=>win.recordIsOpen?.(row()) && retry(),'The browser did not restore the priority request.');
+    win.fetch=intercept;
+   }
+   if(mode==='early' || beforePost){
+    if(mode==='early'){
+     retry().click();
+     await until(()=>retries.length===1 && !retry()?.disabled,'The early Retry finished.');
+     if(!retry() || retries[0].result!=='unknown') throw new Error('The early Retry lost the request.');
+    }else if(postWins){
+     retry().click();
+     await until(()=>releaseRetry,'Retry did not start before the original POST.');
+    }
+    const released=await (mode==='early' ? fetch('/release-priority',{method:'POST'}) : latePost());
+    if(!released.ok) throw new Error('The original write did not finish.');
+    if(beforePost){
+     const reply=await released.json();
+     const status=new URLSearchParams(firstTop);
+     status.set('item-state',status.get('id'));
+     status.set('words-status','1');
+     status.set('delivery',reply.delivery);
+     await fetch('STUDIO_PATH?'+status);
+    }
+   }
+   if(mode==='reload'){
+    const draft=form().querySelector('textarea[name=words]');
+    draft.value='A newer draft.';
+    draft.dispatchEvent(new win.Event('input',{bubbles:true}));
+    const changed=await fetch('/set-second-priority',{method:'POST'});
+    if(!changed.ok) throw new Error('The other item did not become top priority.');
+   }
+   if(postWins) releaseRetry();else retry().click();
+   await until(()=>retries.at(-1)?.result==='delivered' && !retry(),'The saved words were sent.');
+   if(topRequests.length!==1 || retries.some(attempt=>attempt.request!==topRequests[0]))
+    throw new Error('Retry words changed the request.');
+   if(mode==='reload' && form().querySelector('textarea[name=words]').value!=='A newer draft.')
+    throw new Error('Retry words changed the newer draft.');
+  }
+ }catch(error){errors.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
+})();
+</script>""".replace("STUDIO_PATH", studio_page.PAGE_PATH).replace("KEEPER", MORTY.id).replace("PROBE_MODE", mode).encode()
+
+        settle = staff.settle_priority_request
+        writes: list[int] = []
+        first_failed = False
+        prepare_failed = False
+        write_list = cast(Callable[..., None], getattr(the_list, "_save"))
+        sync_errors = 0
+        sync = atomic_file.sync_folder
+        list_folder = the_list.folder(MORTY.id)
+
+        def save_list(store: object, current: the_list.ListItem, **options: object) -> None:
+            nonlocal prepare_failed
+            if mode == "prepare-failure" and not prepare_failed and the_list.feedback_requests(current):
+                prepare_failed = True
+                raise OSError("The List write did not start.")
+            write_list(store, current, **options)
+
+        def sync_words(folder: Path) -> None:
+            nonlocal sync_errors
+            if mode == "sync" and folder == list_folder and sync_errors < 2:
+                current = the_list.load(MORTY.id, item.id)
+                if any(notice.action == "action-words" and notice.can_deliver()
+                       for notice in the_list.feedback_requests(current).values()):
+                    sync_errors += 1
+                    raise OSError("The List folder did not sync.")
+            sync(folder)
+
+        def save_priority(key: staff.PriorityRequestKey, command: staff.ApplyPriorityRequest | staff.RefuseUnappliedPriority
+                          ) -> staff.PriorityRequestOutcome:
+            nonlocal first_failed
+            if not isinstance(command, staff.ApplyPriorityRequest):
+                return settle(key, command)
+            writes.append(command.item.number)
+            if mode == "refused" and not first_failed:
+                first_failed = True
+                raise OSError("The priority write did not start.")
+            if mode == "early":
+                original_post.writes_priority = True
+                write_started.set()
+                if not release_write.wait(TEST_HANG_GUARD_SECS):
+                    raise OSError("The probe did not release the write.")
+            return settle(key, command)
+
+        class Probe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == "/proof":
+                    self.html_response(200, probe)
+                    return None
+                return super().send_head()
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == "/results":
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                    self.json_response(200, {})
+                    complete.set()
+                elif self.path == "/set-second-priority" and mode in ("new", "reload"):
+                    _ = the_list.make_top_priority(MORTY.id, second.id)
+                    writes.append(second.number)
+                    self.json_response(200, {})
+                elif self.path == "/release-priority" and mode == "early":
+                    release_write.set()
+                    saved = write_started.is_set() and original_finished.wait(TEST_HANG_GUARD_SECS)
+                    self.json_response(200 if saved else 500, {})
+                else:
+                    try:
+                        super().do_POST()
+                    finally:
+                        if getattr(original_post, "writes_priority", False):
+                            original_finished.set()
+
+        with (patch.object(serve, "ReviewLinksHandler", Probe),
+              patch.object(review_page.ReviewSnapshotCache, "start"),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(the_list, "_save", side_effect=save_list),
+              patch.object(atomic_file, "sync_folder", side_effect=sync_words),
+              patch.object(the_list, "sync_folder", side_effect=sync_words),
+              patch.object(change_page, "send_to_staff",
+                           side_effect=[None] if mode in ("early", "refused", "sync", "prepare-failure", "retry-first")
+                           else [OSError("offline"), None]) as send,
+              patch.object(change_page, "alert_delivery_failures", return_value=False),
+              patch.object(staff, "settle_priority_request", side_effect=save_priority),
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                browser = self.firefox_view(f"http://127.0.0.1:{server.server_port}/proof", None, 1440, 900, complete)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                release_write.set()
+                complete.set()
+                server.shutdown()
+                thread.join()
+        expected = [item.number]
+        if mode == "new":
+            expected += [second.number, item.number]
+        elif mode == "reload":
+            expected.append(second.number)
+        elif mode == "refused":
+            expected.append(item.number)
+        self.assertEqual(writes, expected)
+        self.assertEqual(send.call_count, 1 if mode in ("early", "refused", "sync", "prepare-failure", "retry-first") else 2)
+        if mode == "prepare-failure":
+            self.assertTrue(prepare_failed)
+        if mode == "sync":
+            self.assertEqual(sync_errors, 2)
+            saved, = the_list.feedback_requests(the_list.load(MORTY.id, item.id)).values()
+            assert isinstance(saved.priority, the_list.PriorityWordsRequest)
+            self.assertTrue(send.call_args.kwargs["key"] == saved.priority.delivery_key.value)
+            self.assertTrue(saved.form_words in send.call_args.args[2])
+        if mode == "lost":
+            self.assertTrue(send.call_args_list[0] == send.call_args_list[1])
+        producer = staff.snapshot().by_id(MORTY.id)
+        assert producer is not None
+        self.assertEqual(producer.top_item, staff.TopItem(second.number if mode == "reload" else item.number))
+
+    def test_replaying_top_priority_preserves_the_newer_item(self) -> None:
+        root = self.root / "reviews"
+        first = self.add("First priority")
+        second = self.add("Second priority")
+        fields = self.fields(first, "top", words="Check this item.")
+        with patch.object(change_page, "send_to_staff", side_effect=OSError("offline")):
+            first_send, _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+            self.assertIsInstance(list_page.deliver_with_outcome(first_send), change_page.FailedDelivery)
+        _ = the_list.make_top_priority(MORTY.id, second.id)
+        replay, _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+        assert isinstance(replay, list_page.PriorityWordsDelivery)
+        self.assertFalse(replay.send_pending)
+        self.assertEqual(replay.outcome, "saved")
+        with (patch.object(change_page, "send_to_staff") as send,
+              patch.object(the_list, "make_top_priority", side_effect=AssertionError("Priority repeated"))):
+            list_page.deliver(replay)
+            send.assert_not_called()
+            retry = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
+            assert isinstance(retry, list_page.ListFeedbackDelivery)
+            self.assertIsInstance(list_page.deliver_with_outcome(retry, retry_words=True), change_page.DeliveryConfirmed)
+            list_page.deliver(retry)
+        send.assert_called_once()
+        producer = staff.snapshot().by_id(MORTY.id)
+        assert producer is not None
+        self.assertEqual(producer.top_item, staff.TopItem(second.number))
+
+    def test_priority_words_recover_after_the_priority_write_and_preserve_the_newer_item(self) -> None:
+        root = self.root / "reviews"
+        first = self.add("First priority")
+        second = self.add("Second priority")
+        fields = self.fields(first, "top", words="Check this item.")
+        original = cast(Callable[..., None], getattr(the_list, "_save"))
+
+        def stop_notice(store: object, item: the_list.ListItem, **options: object) -> None:
+            if any(feedback.action == "action-words" and feedback.can_deliver()
+                   for feedback in the_list.feedback_requests(item).values()):
+                raise OSError("The words write stopped.")
+            original(store, item, **options)
+
+        with patch.object(the_list, "_save", side_effect=stop_notice):
+            with self.assertRaisesRegex(OSError, "The words write stopped"):
+                _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+        producer = staff.snapshot().by_id(MORTY.id)
+        assert producer is not None
+        self.assertEqual(producer.top_item, staff.TopItem(first.number))
+        prepared = the_list.action_words_notice(the_list.load(MORTY.id, first.id), fields["request"])
+        assert isinstance(prepared, the_list.PageFeedback)
+        assert isinstance(prepared.priority, the_list.PriorityWordsRequest)
+        self.assertIs(prepared.priority.save, the_list.PriorityWordsSave.PREPARED)
+        _ = the_list.make_top_priority(MORTY.id, second.id)
+        settle = staff.settle_priority_request
+        with (patch.object(staff, "settle_priority_request", wraps=settle) as native,
+              patch.object(change_page, "send_to_staff", return_value=None) as send):
+            list_page.recover_pending(root)
+            list_page.recover_pending(root)
+        native.assert_called_once()
+        self.assertIs(cast(object, native.call_args.args[1]), staff.RefuseUnappliedPriority.REQUEST)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], MORTY.id)
+        self.assertTrue(send.call_args.kwargs["key"] == prepared.priority.delivery_key.value)
+        self.assertTrue(fields["words"] in send.call_args.args[2])
+        producer = staff.snapshot().by_id(MORTY.id)
+        assert producer is not None
+        self.assertEqual(producer.top_item, staff.TopItem(second.number))
+
+    def test_priority_words_retry_cannot_apply_a_refused_priority_write(self) -> None:
+        root = self.root / "reviews"
+        first = self.add("First priority")
+        second = self.add("Second priority")
+        _ = the_list.make_top_priority(MORTY.id, second.id)
+        fields = self.fields(first, "top", words="Check this item.")
+
+        class StopBeforePriority(BaseException):
+            pass
+
+        with patch.object(staff, "settle_priority_request", side_effect=StopBeforePriority):
+            with self.assertRaises(StopBeforePriority):
+                _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+        notice = the_list.action_words_notice(the_list.load(MORTY.id, first.id), fields["request"])
+        assert isinstance(notice, the_list.PageFeedback)
+        assert isinstance(notice.priority, the_list.PriorityWordsRequest)
+        self.assertIs(notice.priority.save, the_list.PriorityWordsSave.PREPARED)
+        with patch.object(change_page, "send_to_staff") as send:
+            list_page.deliver(list_page.ListFeedbackDelivery(MORTY.id, first.id, notice.request))
+            list_page.recover_pending(root)
+            list_page.recover_pending(root)
+            replay, _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+            self.assertIs(replay, list_page.RefusedPriorityWords.NOT_SAVED)
+            with self.assertRaisesRegex(the_list.ListError, "different words"):
+                _ = list_page.save_action(root, urlencode({**fields, "words": ""}), top_priority=list_page.TopPriority.SHOWN)
+            list_page.deliver(replay)
+            send.assert_not_called()
+        attempted_again = staff.settle_priority_request(notice.priority.delivery_key,
+            staff.ApplyPriorityRequest(MORTY.id, staff.TopItem(first.number)))
+        self.assertIs(attempted_again, staff.PriorityRequestOutcome.NOT_SAVED)
+        retry = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
+        self.assertIsInstance(retry, change_page.NoMessageDelivery)
+        producer = staff.snapshot().by_id(MORTY.id)
+        assert producer is not None
+        self.assertEqual(producer.top_item, staff.TopItem(second.number))
+
+    def test_priority_words_resolve_a_lost_remote_writer_response(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Check the remote priority result")
+        fields = self.fields(item, "top", words="Keep these words.")
+        remote_calls: list[str] = []
+
+        def remote_settle(arguments: list[str], *, input_text: str) -> str:
+            key = staff.PriorityRequestKey.read(input_text)
+            with patch.object(staff, "is_owner", return_value=True):
+                if len(arguments) > 1:
+                    remote_calls.append("apply")
+                    outcome = staff.settle_priority_request(key, staff.ApplyPriorityRequest(MORTY.id, staff.TopItem(item.number)))
+                    self.assertIs(outcome, staff.PriorityRequestOutcome.SAVED)
+                    raise staff.StaffUnreadable("The remote reply was lost.")
+                remote_calls.append("resolve")
+                return staff.settle_priority_request(key, staff.RefuseUnappliedPriority.REQUEST).value
+
+        with (patch.object(staff, "is_owner", return_value=False),
+              patch.object(staff, "_remote", side_effect=remote_settle)):
+            saved, _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+        self.assertEqual(remote_calls, ["apply", "resolve"])
+        assert isinstance(saved, list_page.PriorityWordsDelivery)
+        with patch.object(change_page, "send_to_staff", return_value=None) as send:
+            list_page.deliver(saved)
+            list_page.recover_pending(root)
+        send.assert_called_once()
+        feedback = the_list.action_words_notice(the_list.load(MORTY.id, item.id), fields["request"])
+        assert isinstance(feedback, the_list.PageFeedback)
+        assert isinstance(feedback.priority, the_list.PriorityWordsRequest)
+        self.assertTrue(send.call_args.kwargs["key"] == feedback.priority.delivery_key.value)
+        self.assertTrue(fields["words"] in send.call_args.args[2])
+
+    def test_pending_park_notice_waits_for_confirmation_and_recovers(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Check pending Park delivery")
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        request = self.fields(item, "park", until="delivered", words="Keep the full result.")
+        submission = list_page.submit(root, urlencode(request))
+        with patch.object(change_page, "send_to_staff", return_value="pending") as pending:
+            outcome = list_page.deliver_with_outcome(submission)
+        self.assertIsInstance(outcome, change_page.DeliveryUnconfirmed)
+        saved = the_list.load(MORTY.id, item.id)
+        notices = the_list.feedback_requests(saved)
+        self.assertEqual(notices[request["request"]].state, "sent")
+        self.assertEqual(notices[request["request"] + "-words"].state, "pending")
+        keeper_send, *words_sends = pending.call_args_list
+        self.assertEqual(keeper_send.args[0], MORTY.id)
+        self.assertTrue(all(attempt.args[0] == DWIGHT.id for attempt in words_sends))
+        with (patch.object(change_page, "send_to_staff") as send,
+              patch.object(the_list, "park", side_effect=AssertionError("Park repeated"))):
+            list_page.recover_pending(root)
+            list_page.recover_pending(root)
+        send.assert_called_once()
+        self.assertEqual(send.call_args, words_sends[-1])
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(saved)[request["request"] + "-words"].state, "sent")
+
+    def test_park_words_retry_sends_after_alert_without_parking_again(self) -> None:
+        root = self.root / "reviews"
+        for separate in (False, True):
+            with self.subTest(separate=separate):
+                item = self.add("Park with notes")
+                if separate:
+                    item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                fields = self.fields(item, "park", until="delivered", words="Check the notes.")
+                first = list_page.submit(root, urlencode(fields))
+                alert_target = DWIGHT.id
+                with (patch.object(change_page, "send_to_staff", side_effect=OSError("offline")) as send,
+                      patch.object(change_page, "alert_delivery_failures", return_value=True) as alert):
+                    self.assertIsInstance(list_page.deliver_with_outcome(first), change_page.FailedDelivery)
+                self.assertEqual(alert.call_count, 2 if separate else 1)
+                previous_key = cast(str, send.call_args.kwargs["key"])
+                delivery = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
+                assert isinstance(delivery, list_page.ListFeedbackDelivery)
+                _ = the_list.unpark(MORTY.id, item.id, source="morty")
+                with (patch.object(change_page, "send_to_staff") as retry,
+                      patch.object(the_list, "park", side_effect=AssertionError("Park repeated"))):
+                    self.assertIsInstance(list_page.deliver_with_outcome(delivery, retry_words=True),
+                                          change_page.DeliveryConfirmed)
+                retry.assert_called_once()
+                self.assertEqual(retry.call_args.args[0], alert_target if separate else MORTY.id)
+                self.assertEqual(retry.call_args.kwargs["key"], previous_key)
+                self.assertIn("Nate's words:\nCheck the notes.", cast(str, retry.call_args.args[2]))
+                self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
+
+    def test_park_words_stay_retryable_when_the_keepers_send_is_pending(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Park with notes")
+        fields = self.fields(item, "park", until="delivered", words="Check the notes.")
+        submission = list_page.submit(root, urlencode(fields))
+        delivery = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
+        assert isinstance(delivery, list_page.ListFeedbackDelivery)
+        self.assertEqual(delivery.request, fields["request"])
+        with (patch.object(change_page, "send_to_staff", return_value="pending") as pending,
+              patch.object(change_page, "alert_delivery_failures") as alert):
+            self.assertIsInstance(list_page.deliver_with_outcome(submission), change_page.DeliveryUnconfirmed)
+            self.assertIsInstance(list_page.words_delivery_status(delivery), change_page.DeliveryUnconfirmed)
+            list_page.recover_pending(root)
+        self.assertEqual(pending.call_args_list, [pending.call_args, pending.call_args])
+        alert.assert_not_called()
+        self.assertEqual(pending.call_args.args[0], MORTY.id)
+        self.assertIn("Nate's words:\nCheck the notes.", cast(str, pending.call_args.args[2]))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(saved)[delivery.request].state, "sent")
+        log = list_page.item_log(list_page.ListRecord(MORTY.id, saved), NOW,
+                                 staff_names.StaffNames(staff.snapshot()), frozenset()).markup
+        self.assertIn("Feedback delivery unconfirmed to", log)
+        self.assertIn("Check the notes.", log)
+        self.assertNotIn("Feedback sent to", log)
+        _ = the_list.unpark(MORTY.id, item.id, source="morty")
+        with (patch.object(change_page, "send_to_staff") as send,
+              patch.object(the_list, "park", side_effect=AssertionError("Park repeated"))):
+            for _ in range(2):
+                self.assertIsInstance(list_page.deliver_with_outcome(delivery, retry_words=True),
+                                      change_page.DeliveryConfirmed)
+        self.assertEqual(send.call_args_list, [pending.call_args])
+        self.assertIsInstance(list_page.words_delivery_status(delivery), change_page.DeliveryConfirmed)
+        self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
+
+    def test_blank_actions_keep_the_original_delivery_rules(self) -> None:
+        root = self.root / "reviews"
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=3\ndelivery_pause_seconds=0\n")
+        for action in ("park", "unpark", "read", "tell", "remove"):
+            for box in ("", " \n "):
+                for transport, alert_ok in ((None, True), ("pending", True), ("uncertain", True),
+                                            ("offline", True), ("offline", False), ("uncertain", False)):
+                    with self.subTest(action=action, box=box, transport=transport, alert_ok=alert_ok):
+                        state = the_list.ItemState.WAITING_FOR_NATE if action == "read" else the_list.ItemState.WORKING
+                        item = self.add("Check the existing notice", state)
+                        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                        if action == "unpark":
+                            item = the_list.park(MORTY.id, item.id, NOW + timedelta(days=1), source="morty")
+                        words = box + "Keep these words." + box if action == "tell" else box
+                        fields = self.fields(item, action, until="delivered" if action == "park" else "", words=words)
+                        submission = list_page.submit(root, urlencode(fields))
+                        error = (change_page.UnconfirmedSend("uncertain") if transport == "uncertain"
+                                 else OSError("offline") if transport == "offline" else None)
+                        with (patch.object(change_page, "send_to_staff",
+                                           return_value=transport, side_effect=error) as send,
+                              patch.object(change_page, "alert_delivery_failures", return_value=alert_ok) as alert):
+                            list_page.deliver(submission)
+                        count = 3 if error is not None else 1
+                        self.assertEqual(send.call_count, count)
+                        self.assertEqual(alert.call_count, int(error is not None))
+                        saved = the_list.load(MORTY.id, item.id)
+                        notice, = the_list.feedback_requests(saved).values()
+                        recipient = DWIGHT.id if action in ("read", "tell") else MORTY.id
+                        self.assertEqual(notice.recipient_id(MORTY.id), recipient)
+                        self.assertTrue(all(attempt.args[0] == recipient for attempt in send.call_args_list))
+                        source = the_list.folder(MORTY.id) / f"{item.id}.md"
+                        key = change_page.review_delivery_key(source, item.id, fields["request"])
+                        self.assertTrue(all(attempt.kwargs["key"] == key for attempt in send.call_args_list))
+                        expected = "sent" if error is None else "alerted" if alert_ok else "pending"
+                        self.assertEqual(notice.state, expected)
+                        self.assertNotIn("Nate's words:", notice.words)
+                        if action == "park":
+                            self.assertIs(saved.parked_until, the_list.ParkUntilDelivered.DELIVERED)
+                        elif action == "unpark":
+                            self.assertIs(saved.parked_until, the_list.NoTimestamp.UNSET)
+                        elif action == "remove":
+                            self.assertIs(saved.state, the_list.ItemState.CLOSED)
+                        else:
+                            self.assertIs(saved.state, the_list.ItemState.WORKING)
+        for words in ("", " \n "):
+            item = self.add("Skip blank Tell")
+            with self.assertRaises(ValueError):
+                _ = list_page.submit(root, urlencode(self.fields(item, "tell", words=words)))
+
+    def test_start_now_uses_only_the_current_press_words(self) -> None:
+        item = the_list.add(MORTY.id, "Start the check", owner=OWNER.id, source="nate", changes={
+            "producer": DWIGHT.id, "state": the_list.ItemState.SCHEDULED,
+            "schedule": the_list.ScheduledRun(NOW + timedelta(days=1), "Keep the saved instruction."),
+        })
+        self.assertEqual(self.page_action_messages(item, "start-now", words="Old box words."), [])
+        item = the_list.load(MORTY.id, item.id)
+        self.assertEqual(self.page_action_messages(item, "start-now", words=" \n "), [])
+        saved = the_list.load(MORTY.id, item.id).schedule
+        self.assertEqual(saved, the_list.ScheduledRun(NOW, "Keep the saved instruction."))
+        assert isinstance(saved, the_list.ScheduledRun)
+        self.assertEqual(saved.start_feedback, "")
+
+    def test_start_now_adds_words_to_the_saved_instruction_message(self) -> None:
+        for words in (" \n ", "Keep both rows.\nCheck the total."):
+            with self.subTest(words=words):
+                item = the_list.add(MORTY.id, "Start the check", owner=OWNER.id, source="nate", changes={
+                    "producer": DWIGHT.id, "state": the_list.ItemState.SCHEDULED,
+                    "schedule": the_list.ScheduledRun(NOW + timedelta(days=1), "Check the result."),
+                })
+                self.assertEqual(self.page_action_messages(item, "start-now", words=words, schedule_words="Draft."), [])
+                scheduled = the_list.load(MORTY.id, item.id).schedule
+                assert isinstance(scheduled, the_list.ScheduledRun)
+                self.assertEqual(scheduled.words, "Check the result.")
+                self.assertEqual(scheduled.start.astimezone(UTC), NOW)
+                command = cast(Callable[[str, the_list.RunDelivery, the_list.RunNotice], list[str]],
+                               getattr(the_list, "_scheduled_notice_command"))
+                run = the_list.RunDelivery("0" * 32, scheduled, item.title, OWNER.id, DWIGHT.id, 0,
+                                           the_list.AwaitingInstruction.OWNER, ())
+                for notice, recipient in ((the_list.RunNotice.OWNER_START, OWNER.id),
+                                          (the_list.RunNotice.PRODUCER_START, DWIGHT.id)):
+                    argv = command(item.id, run, notice)
+                    self.assertEqual(argv[argv.index("--to") + 1], f"staff:{recipient}")
+                    message = argv[argv.index("--text") + 1]
+                    self.assertIn("\nDo this: Check the result.\n", message)
+                    self.assertNotIn("Draft.", message)
+                    self.assertEqual(message.partition("\n\nNate's words:\n")[2], words.strip())
+
+    def test_go_and_approved_add_words_to_the_targets_message(self) -> None:
+        root = self.root / "reviews"
+        for kind in (the_list.AskKind.GO, the_list.AskKind.APPROVAL):
+            for words in (" \n ", "Check the figures."):
+                with self.subTest(kind=kind, words=words):
+                    item = self.add("Check the ask")
+                    ask = the_list.add_ask(MORTY.id, item.id, kind=kind, target=OWNER.id, what="Run the check.",
+                                           why="The check needs approval.", config=False, requester=MORTY.id, source="morty")
+                    token = list_page.signed_token(list_page.form_secret(root), MORTY.id, item.id,
+                                                   go_ledger.token_prefix(ask.ask_id))
+                    fields = dict(keeper=MORTY.id, id=item.id, ask=ask.ask_id, token=token, page="/console/list.html",
+                                  words=words)
+                    go_id, _ = list_page.save_go(root, root, urlencode(fields), "192.0.2.2")
+                    with patch.object(change_page, "send_to_staff") as send:
+                        _ = list_page.deliver_go(root, go_id)
+                    message, = [cast(str, call.args[2]) for call in send.call_args_list if call.args[0] == OWNER.id]
+                    self.assertIn("What: Run the check.\n", message)
+                    self.assertEqual(message.partition("\n\nNate's words:\n")[2], words.strip())
+
+    def test_go_words_keep_the_original_delivery_rules(self) -> None:
+        root = self.root / "reviews"
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=3\ndelivery_pause_seconds=0\n")
+        for words in ("", " \n ", "Check the result."):
+            for transport, alert_ok in ((None, True), ("pending", True), ("uncertain", True),
+                                        ("offline", True), ("offline", False), ("uncertain", False)):
+                with self.subTest(words=words, transport=transport, alert_ok=alert_ok):
+                    item = self.add("Check the ask")
+                    ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id,
+                                           what="Run the check.", why="The check needs approval.",
+                                           config=False, requester=MORTY.id, source="morty")
+                    token = list_page.signed_token(list_page.form_secret(root), MORTY.id, item.id,
+                                                   go_ledger.token_prefix(ask.ask_id))
+                    fields = dict(keeper=MORTY.id, id=item.id, ask=ask.ask_id, token=token, page="/console/list.html")
+                    if words:
+                        fields["words"] = words
+                    go_id, _ = list_page.save_go(root, root, urlencode(fields), "192.0.2.2")
+                    error = (change_page.UnconfirmedSend("uncertain") if transport == "uncertain"
+                             else OSError("offline") if transport == "offline" else None)
+                    with (patch.object(change_page, "send_to_staff",
+                                       return_value=transport, side_effect=error) as send,
+                          patch.object(change_page, "alert_delivery_failures", return_value=alert_ok) as alert):
+                        _ = list_page.deliver_go(root, go_id)
+                    recipients = (OWNER.id, MORTY.id)
+                    self.assertEqual([attempt.args[0] for attempt in send.call_args_list],
+                                     list(recipients) * (1 if error is None else 3))
+                    self.assertEqual(alert.call_count, int(error is not None))
+                    entry = go_ledger.read(root, go_id)
+                    self.assertEqual(entry["sent"], dict.fromkeys(recipients, error is None))
+                    self.assertEqual(entry["reported"], dict.fromkeys(recipients, error is not None))
+                    self.assertTrue(all(cast(str, attempt.args[2]).partition("\n\nNate's words:\n")[2] == words.strip()
+                                        for attempt in send.call_args_list))
+                    source = the_list.folder(MORTY.id) / f"{item.id}.md"
+                    key = change_page.review_delivery_key(source, item.id, go_id)
+                    self.assertTrue(all(attempt.kwargs["key"] == key for attempt in send.call_args_list))
+                    closed, = the_list.load(MORTY.id, item.id).asks
+                    self.assertEqual((closed.is_open, closed.go_id), (False, go_id))
+
     def test_signed_actions_use_the_keeper_of_each_visible_item(self) -> None:
         root = self.root / "reviews"
         for keeper in (DWIGHT.id, OTHER.id, staff.StaffId("missing-keeper")):
@@ -9434,9 +12436,9 @@ window.fetch=async(path,options={})=>{
             self.assertIs(item.unread_since, the_list.NoTimestamp.UNSET)
             self.assertEqual(item.log[-1].what, the_list.MarkedRead())
             for action, extra, words in (
-                    ("park", {"until": "2026-12-03"}, "List page: nate parked item 106 until 2026-12-03."),
+                    ("park", {"until": "2026-12-03"}, "Studio: nate parked item 106 until 2026-12-03."),
                     ("tell", {"words": "Explain this simply.\nKeep these words."}, "Explain this simply.\nKeep these words."),
-                    ("remove", {}, "List page: nate removed item 106.")):
+                    ("remove", {}, "Studio: nate removed item 106.")):
                 with self.subTest(action=action):
                     fields = self.fields(item, action, **extra)
                     delivery = list_page.submit(root, urlencode(fields))
@@ -9462,7 +12464,7 @@ window.fetch=async(path,options={})=>{
                         self.assertNotIn(fields["request"], log)
                     list_page.deliver(delivery)
                     self.assertEqual(send.call_args.args[0], MORTY.id)
-                    expected = "List page: nate's words for item 106\n" + words if action == "tell" else words
+                    expected = "Studio: nate's words for item 106\n" + words if action == "tell" else words
                     self.assertEqual(send.call_args.args[2], expected)
                     item = the_list.load(MORTY.id, item.id)
                     if action != "remove":
@@ -9491,7 +12493,7 @@ window.fetch=async(path,options={})=>{
         root = self.root / "reviews"
         producer = staff.StaffId("producer." + "a" * 32)
         item = self.add("The assigned item")
-        _ = the_list.update(MORTY.id, item.id, {"producer": producer}, source="morty")
+        _ = self.assign_legacy_producer(item, producer)
         stored = the_list.load(MORTY.id, item.id)
         self.assertEqual(stored.producer, producer)
         fields = self.fields(stored, "tell", words="Keep these words.")
@@ -9507,7 +12509,7 @@ window.fetch=async(path,options={})=>{
         root = self.root / "reviews"
         producer = staff.StaffId("old producer")
         item = self.add("The assigned item")
-        item = the_list.update(MORTY.id, item.id, {"producer": producer}, source="morty")
+        item = self.assign_legacy_producer(item, producer)
         fields = self.fields(item, "tell", words="Keep these words.")
         delivery = list_page.submit(root, urlencode(fields))
         request = fields["request"]
@@ -9517,7 +12519,7 @@ window.fetch=async(path,options={})=>{
             list_page.deliver(delivery)
             send.assert_called_once()
             self.assertEqual(send.call_args.args,
-                             (producer, change_page.SENDER, f"List page: nate's words for item {item.number}\nKeep these words."))
+                             (producer, change_page.SENDER, f"Studio: nate's words for item {item.number}\nKeep these words."))
         saved = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[request]
         self.assertEqual((saved.state, saved.recipient, saved.words), ("sent", producer, "Keep these words."))
 
@@ -9525,7 +12527,7 @@ window.fetch=async(path,options={})=>{
         root = self.root / "reviews"
         producer = staff.StaffId("old.producer")
         item = self.add("The assigned item")
-        item = the_list.update(MORTY.id, item.id, {"producer": producer}, source="morty")
+        item = self.assign_legacy_producer(item, producer)
         fields = self.fields(item, "tell", words="Keep these words.")
         request = fields["request"] + "." + "b" * 32
         alternate = request.replace("%2E", "%2e")
@@ -9559,7 +12561,7 @@ window.fetch=async(path,options={})=>{
             send.assert_called_once()
             self.assertEqual(send.call_args.args,
                              (f"session:{moved.current_session}", change_page.SENDER,
-                              f"List page: nate's words for item {item.number}\nKeep these words."))
+                              f"Studio: nate's words for item {item.number}\nKeep these words."))
             self.assertEqual(send.call_args.kwargs["recipient_key"], DWIGHT.id)
         saved = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]]
         self.assertEqual((saved.state, saved.words, saved.recipient), ("sent", "Keep these words.", DWIGHT.id))
@@ -9592,7 +12594,7 @@ window.fetch=async(path,options={})=>{
             list_page.recover_pending(root)
             send.assert_called_once()
             self.assertEqual(send.call_args.args[0], MORTY.id)
-            self.assertIn("Recover these words.", cast(str, send.call_args.args[2]))
+            self.assertEqual(send.call_args.args[2], f"List page: nate's words for item {item.number}\nRecover these words.")
         feedback = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[request]
         self.assertEqual((feedback.state, feedback.recipient_id(MORTY.id)), ("sent", MORTY.id))
         body = without_role_colors(list_page.render(root, include_counts=False).decode())
@@ -9811,7 +12813,7 @@ window.fetch=async(_path,options={})=>{
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
                 thread.start()
                 try:
-                    browser.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}#show=needs-me")
+                    browser.navigate(f"http://127.0.0.1:{server.server_port}{studio_page.PAGE_PATH}#show=needs-me")
                     result = browser.command("Runtime.evaluate", {
                         "expression": r"""(async () => {
  const row=document.querySelector('[data-number="ITEM_NUMBER"]');
@@ -10042,7 +13044,7 @@ window.fetch=async(_path,options={})=>{
             _ = self.add(f"Item {number}", owner=staff.StaffId(f"delivery-team-{number:02d}"), number=number)
         all_staff = staff.StaffId("all")
         item = self.add("Item for all", owner=all_staff, number=13)
-        _ = the_list.update(MORTY.id, item.id, {"producer": all_staff}, source="morty")
+        _ = self.assign_legacy_producer(item, all_staff)
         _ = self.add("Item for builds", owner=OTHER.id, number=14)
         _ = self.add("Item for builds support", owner=staff.StaffId("builds-support"), number=15)
         spacetime = staff.StaffId("10e35465-1777-435a-8bbf-5709e6ab0491")
@@ -10055,7 +13057,7 @@ window.fetch=async(_path,options={})=>{
 (async()=>{
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 try{
-const rows=[...document.querySelectorAll('[data-record-filters] [data-filter-row]')];
+const rows=['owner','producer','show'].map(name=>document.querySelector('[data-filter-row="'+name+'"]'));
 const left=row=>row.querySelector('button').getBoundingClientRect().left;
 for(const row of rows){
  const bounds=row.getBoundingClientRect();
@@ -10067,7 +13069,9 @@ for(const row of rows){
 const ownerChips=[...rows[0].querySelectorAll('button')];
 check(new Set(ownerChips.map(button=>button.getBoundingClientRect().top)).size>1,
  'The owner chips wrap onto more than one line.');
-check(rows.every(row=>Math.abs(left(row)-left(rows[0]))<1),'The three rows align.');
+const rowLeft=row=>row.getBoundingClientRect().left;
+check(rows.every(row=>Math.abs(rowLeft(row)-rowLeft(rows[0]))<1) && Math.abs(left(rows[2])-left(rows[0]))<1
+ && Math.abs(left(rows[1])-rowLeft(rows[1]))<1,'The filter rows align and the picture tabs start at the row edge.');
 check(document.documentElement.scrollWidth<=innerWidth,'The filter rows fit without horizontal scrolling.');
 const ownerName=number=>document.querySelector('[data-number="'+number+'"] .list-owner-name');
 const fits=name=>name.scrollWidth<=name.clientWidth;
@@ -10097,17 +13101,33 @@ if(innerWidth>960){
  check(Math.abs(width('Next step')-width('Item')*23/17)<1,
   'Item and Next step share the available width in their original proportion.');
 }
-const producerBox=rows[1].getBoundingClientRect(),words=document.getElementById('list-search').getBoundingClientRect();
-check(innerWidth>620 ? words.top<producerBox.bottom && words.left>=producerBox.right :
- words.top>=producerBox.bottom,'The words box sits beside Producer on desktop and wraps below it on a phone.');
+const producerBounds=()=>rows[1].getBoundingClientRect();
+const wordsBounds=()=>document.getElementById('list-search').getBoundingClientRect();
+const producerBox=producerBounds(),words=wordsBounds();
+check(innerWidth===VIEWPORT_WIDTH,'The page uses the requested viewport width.');
+check(words.left>=producerBox.right || words.top>=producerBox.bottom,'The words box does not overlap the Producer tabs.');
+if(innerWidth===1440){
+ check(words.top>=producerBox.top && words.top<producerBox.bottom,'The words box shares the picture row.');
+ check(Math.abs(words.top+words.bottom-producerBox.top-producerBox.bottom)<=2,
+  'The words box is vertically centered with the pictures.');
+}
 const allChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="all"]'));
 const staffChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="staff:all"]'));
-check(allChips.every(chip=>chip.textContent==='All 16') && staffChips.every(chip=>chip?.textContent==='all 1'),
+const chipText=chip=>chip?.querySelector('.studio-name') ? chip.querySelector('.studio-name').textContent+' '+chip.querySelector('b').textContent : chip?.textContent;
+check(allChips.every(chip=>chipText(chip)==='All 16') && staffChips.every(chip=>chipText(chip)==='all 1'),
  'Each staff row has distinct All and all chips with separate counts.');
 check(ownerChips[2].textContent==='builds 1' && ownerChips[3].textContent==='builds-support 1',
  'The owner chips omit the suffix and sort by the displayed name.');
 const matchesAllStaff=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).join()==='13';
 staffChips.forEach(chip=>chip.click());
+const band=document.querySelector('[data-top-band="none"]').getBoundingClientRect();
+const search=wordsBounds();
+check(band.height>0 && search.bottom<=band.top,'The words box stays above the visible Top priority band.');
+check(Math.abs(search.right-band.right)<=1,'The words box and the Top priority band align at the right edge.');
+if(innerWidth===390){
+ check(search.top>=producerBounds().bottom && Math.abs(search.left-band.left)<=1,
+  'The words box takes the full width below the tabs on a phone.');
+}
 const selectedPlace=new URLSearchParams(location.hash.slice(1));
 check(matchesAllStaff() && selectedPlace.get('owner')==='all' && selectedPlace.get('producer')==='all',
  'Selecting the staff ID all filters the items and stores the raw IDs.');
@@ -10117,20 +13137,31 @@ location.hash='show=all&owner=all&producer=all';
 await restored;
 check(matchesAllStaff() && staffChips.every(chip=>chip.getAttribute('aria-pressed')==='true'),
  'An existing address with the staff ID all selects both staff chips.');
+if(innerWidth===1440){
+ const tabs=rows[1].querySelector('div');
+ tabs.append(...Array.from({length:16},()=>document.createElement('button')));
+ const bounds=producerBounds();
+ check([...tabs.children].every(tab=>{
+  const box=tab.getBoundingClientRect();
+  return box.width===88 && box.left>=bounds.left && box.right<=bounds.right+1;
+ }), 'Each tab keeps its full width when many tabs wrap.');
+ check(wordsBounds().top>=bounds.bottom && document.documentElement.scrollWidth<=innerWidth,
+  'Many tabs move the words box to the next line without horizontal scrolling.');
+}
 }catch(error){failures.push(String(error));}
 const result=document.createElement('p');result.id='probe-results';
 result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>"""
-        for width in (1700, 1280, 1024, 390):
+        for width in (1700, 1440, 1280, 1024, 390):
             with self.subTest(width=width):
-                self.browser_actions(markup, "", probe, window_size=(width, 900))
+                self.browser_actions(markup, "", probe.replace("VIEWPORT_WIDTH", str(width)), window_size=(width, 900))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_staff_chips_strip_repeated_suffixes_and_keep_empty_name_ids(self) -> None:
         for number, identity in enumerate((OTHER.id, staff.StaffId("-unit")), start=1):
             item = self.add(f"Item {number}", owner=identity, number=number)
-            _ = the_list.update(MORTY.id, item.id, {"producer": identity}, source="morty")
+            _ = self.assign_legacy_producer(item, identity)
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
             member.to_json() for member in (MORTY, OWNER, replace(OTHER, name="builds-unit-unit"))]}))
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
@@ -10140,7 +13171,9 @@ for(const [number,label] of [['1','builds'],['2','-unit']]){
  const row=document.querySelector('[data-number="'+number+'"]'),id=row.dataset.owner;
  for(const name of ['owner','producer']){
   const chip=document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="staff:'+id+'"]');
-  if(chip.textContent!==label+' 1') failures.push('The '+name+' chip shows '+label+' and its count.');
+  const tab=chip.querySelector('.studio-name');
+  const text=tab ? tab.textContent+' '+chip.querySelector('b').textContent : chip.textContent;
+  if(text!==label+' 1') failures.push('The '+name+' chip shows '+label+' and its count.');
   chip.click();
  }
  const place=new URLSearchParams(location.hash.slice(1));
@@ -10337,13 +13370,19 @@ try{
   return .2126*r+.7152*g+.0722*b;
  };
  show('working');select('owner',OWNER);select('producer',MORTY);
- check(pressed('owner').textContent==='sdlc 1' && pressed('producer').textContent==='morty 1',
-  'The selected staff chips show the names and counts.');
+ const tab=pressed('producer');
+ check(pressed('owner').textContent==='sdlc 1' && tab.querySelector('.studio-name').textContent==='morty'
+  && tab.querySelector('b').textContent==='1','The selected staff controls show the names and counts.');
  for(const themeName of ['light','dark']){
   document.documentElement.dataset.theme=themeName;
   for(const view of ['working','blocked']){
    show(view);
-   for(const control of [chip(view),pressed('owner'),pressed('producer')]){
+   const producer=pressed('producer'),initial=producer.querySelector('.studio-initial');
+   const scrim=getComputedStyle(producer,'::after').backgroundImage;
+   check(getComputedStyle(producer).opacity==='1' && scrim.startsWith('linear-gradient(')
+    && [...producer.querySelectorAll('.studio-name,b')].every(label=>getComputedStyle(label).color==='rgb(255, 255, 255)'),
+    'The selected picture tab keeps its label and count over the scrim.');
+   for(const control of [chip(view),pressed('owner'),initial]){
     const background=luminance(getComputedStyle(control).backgroundColor);
     for(const element of [control,...control.querySelectorAll('b')]){
      const ink=luminance(getComputedStyle(element).color);
@@ -10496,7 +13535,8 @@ try{
   await until(()=>!form.dataset.sending,'the '+action+' response');
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
-  check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
+  if(action==='remove') check(form.elements.words.value==='','a confirmed Remove clears its words');
+  else check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
   const motions=[...document.querySelectorAll('[data-record-motion]')].flatMap(node=>node.getAnimations({subtree:true}));
   await Promise.allSettled(motions.map(animation=>animation.finished));
   if(action==='tell'){

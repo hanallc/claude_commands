@@ -27,6 +27,7 @@ Use the `agents` program.
 - Run `agents reboot [--dry-run]` from a terminal outside Herdr. See Reboot below.
 - `agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]`: restore saved rows or restart local live rows with `--all`.
 - `agents stop SESSION [--dry-run]`: stop the session and its workers. Keep their rows, conversations, and panes at the shell.
+  A stop of a closed worker ends its open passes as canceled.
   SESSION can be a staff path, such as `assembly/fix2` or `hana/assembly/fix2`. A unit path stops the unit and its workers.
   A path that matches no staff row goes to the native session stop, which can match a saved session name such as `review/x`.
   A path that matches more than one staff row stops nothing.

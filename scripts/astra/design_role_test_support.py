@@ -109,12 +109,12 @@ class HeldRolePaneFixture:
             status = worker.main(arguments)
         return subprocess.CompletedProcess(arguments, status, output.getvalue(), errors.getvalue())
 
-    def assign(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    def assign(self, arguments: list[str], *, env: Mapping[str, str] = os.environ) -> subprocess.CompletedProcess[str]:
         from scripts.direct import assign
         from scripts.production.cli_fixture import invoke_cli
 
         self.commands.append(arguments.copy())
-        return invoke_cli(assign, assign.main, arguments, os.environ.copy(), self.command_directory)
+        return invoke_cli(assign, assign.main, arguments, env, self.command_directory)
 
     def record(self, arguments: list[str], *, env: Mapping[str, str] = os.environ) -> None:
         self.recorder_commands.append(arguments.copy())

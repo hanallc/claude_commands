@@ -209,7 +209,7 @@ class Chrome(_Browser):
         self.blank = destination == "about:blank"
 
     def dom(self, page: Path | str, marker: str, *, reduced_motion: bool,
-            window_size: tuple[int, int] | None) -> subprocess.CompletedProcess[str]:
+            window_size: tuple[int, int] | None, keep_storage: bool = False) -> subprocess.CompletedProcess[str]:
         with self.stop_on_error():
             session = self.session
             if window_size is not None:
@@ -223,9 +223,11 @@ class Chrome(_Browser):
             destination = page.as_uri() if isinstance(page, Path) else page
             # Evaluate the promise in the new document, after the navigation.
             marker_literal = json.dumps(marker)
-            script = (
+            clear_storage = "" if keep_storage else (
                 "try { sessionStorage.clear(); localStorage.clear(); }"
                 "catch (error) { if (error.name !== 'SecurityError') throw error; }"
+            )
+            script = clear_storage + (
                 "globalThis.fixtureDOM = new Promise(resolve => {"
                 "const observer = new MutationObserver(() => {"
                 f"const result = document.getElementById({marker_literal});"

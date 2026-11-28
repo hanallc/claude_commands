@@ -35,7 +35,7 @@ from scripts.copies.workspace_test_support import registered_workspace
 from scripts.lib import build_folders
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
-from scripts.review_links import change_browser, change_page, new_item_dialog, reply_tokens, review_actions, review_items, review_later, review_submissions
+from scripts.review_links import change_browser, change_page, new_item_dialog, reply_proofs, reply_tokens, review_actions, review_items, review_later, review_submissions
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 SCRIPT = Path(__file__).with_name("tidy_wrapped.py")
@@ -118,6 +118,15 @@ class TidyWrappedTests(unittest.TestCase):
         return new_item_dialog.NewItemRequest(f"r1-{number:032x}-{kind}-{owner}", kind, owner,
                                               "Check this result.\n\nThe evidence has two lines.", evidence)
 
+    def store_hash_only_proof(self, saved: review_submissions.SavedSubmission
+                              ) -> tuple[reply_proofs.SubmissionIdentity, reply_proofs.NoteProof]:
+        identity = reply_proofs.SubmissionIdentity(saved.id, saved.request_id)
+        proof = review_submissions.current_reply_proof(saved.key)
+        retained = reply_proofs.NoteProof(reply=reply_tokens.LegacyReplyProof(proof.sha256))
+        with reply_proofs.publishing(identity, retained):
+            pass
+        return identity, retained
+
     def test_wrap_moves_open_user_reports_and_their_receipts(self) -> None:
         doc, child, parent = self.review_wrap_fixture()
         requests = [self.user_request(kind, child.id) for kind in
@@ -196,8 +205,8 @@ class TidyWrappedTests(unittest.TestCase):
     def test_restart_keeps_the_destination_reply_when_the_receipt_is_missing(self) -> None:
         self.check_wrap_recovery("destination reply", remove_receipt=True)
 
-    def test_restart_replaces_a_legacy_token_in_the_changed_destination(self) -> None:
-        self.check_wrap_recovery("destination reply", legacy_target=True)
+    def test_restart_preserves_the_changed_destination_with_hash_only_proof(self) -> None:
+        self.check_wrap_recovery("destination reply", hash_only_proof=True)
 
     def test_restart_refuses_to_remove_either_copy_when_both_change(self) -> None:
         self.check_wrap_recovery("both replies")
@@ -207,7 +216,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     def check_wrap_recovery(
         self, change: Literal["source reply", "destination read", "destination reply", "both replies", "missing digest"],
-        *, remove_receipt: bool = False, legacy_target: bool = False,
+        *, remove_receipt: bool = False, hash_only_proof: bool = False,
     ) -> None:
         class StoppedWrap(BaseException):
             """The process stops without rolling back the move."""
@@ -267,14 +276,11 @@ class TidyWrappedTests(unittest.TestCase):
                 del move_fields["destination_digest"]
                 _ = journal.write_text(json.dumps(move_fields))
             expected_target = target.read_bytes()
-            if legacy_target:
-                token = original.reply_token.encode()
-                nonce_field = f', "reply_token_nonce": "{original.details.reply_token_nonce}"'.encode()
-                expected_target = expected_target.replace(nonce_field, b"")
-                legacy = expected_target.replace(b"reply_token_sha256", b"reply_token", 1).replace(
-                    original.details.reply_token_sha256.encode(), token, 1)
-                self.assertIn(token, legacy)
-                _ = target.write_bytes(legacy)
+            if hash_only_proof:
+                identity, expected_proof = self.store_hash_only_proof(original)
+            else:
+                identity = reply_proofs.SubmissionIdentity(original.id, original.request_id)
+                expected_proof = reply_proofs.read(identity)
             if remove_receipt:
                 receipt.unlink()
             preserved_paths = (original.path, target, journal)
@@ -293,6 +299,7 @@ class TidyWrappedTests(unittest.TestCase):
             replay = review_submissions.submit(request)
             change_page.deliver(review_actions.prepare_submission_delivery(replay, request.words, restarted), restarted)
             send.assert_called_once()
+        self.assertTrue(reply_proofs.read(identity) == expected_proof)
         self.assertFalse(original.path.exists())
         self.assertFalse(journal.exists())
         self.assertEqual([item.id for item in investigation.records(parent.id, include_read=True)], [original.id])
@@ -311,11 +318,9 @@ class TidyWrappedTests(unittest.TestCase):
         request = self.user_request(new_item_dialog.SubmissionKind.QUESTION, child.id)
         sent = review_submissions.submit(request)
         token = sent.reply_token
-        nonce_field = f', "reply_token_nonce": "{sent.details.reply_token_nonce}"'.encode()
-        original = sent.path.read_bytes().replace(nonce_field, b"")
-        self.assertNotIn(b"reply_token_nonce", original)
-        _ = sent.path.write_bytes(original.replace(b"reply_token_sha256", b"reply_token", 1).replace(
-            sent.details.reply_token_sha256.encode(), token.encode(), 1))
+        identity, expected_proof = self.store_hash_only_proof(sent)
+        original = sent.path.read_bytes()
+        self.assertFalse(any(name.encode() in original for name in reply_proofs.SUBMISSION_FIELDS))
         expected = original.replace(f"production_id: {child.id}\n".encode(), f"production_id: {parent.id}\n".encode(), 1)
         reply_tokens.path().unlink()
 
@@ -326,6 +331,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertEqual((moved.key, moved.owner, moved.original_path), (sent.key, parent.id, sent.path))
         self.assertFalse(sent.path.exists())
         self.assertEqual(moved.path.read_bytes(), expected)
+        self.assertTrue(reply_proofs.read(identity) == expected_proof)
         self.assertFalse(reply_tokens.path().exists())
         self.assertTrue(new_item_dialog.matches_reply_token(moved.details, token))
         self.assertTrue(review_submissions.answer(sent.key, "Reply after wrap", token))
@@ -334,6 +340,37 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertEqual(replied.item.get("followups"), [{"followup": request.words, "reply": "Reply after wrap"}])
         self.assertNotIn("followup", replied.item)
         self.assertFalse(reply_tokens.path().exists())
+
+    def test_wrap_moves_a_legacy_question_proof(self) -> None:
+        doc, child, parent = self.review_wrap_fixture()
+        request = self.user_request(new_item_dialog.SubmissionKind.QUESTION, child.id)
+        sent = review_submissions.submit(request)
+        token = sent.reply_token
+        identity = sent.details.proof_identity(sent.id)
+        reply_proofs.path_for(identity).unlink()
+        clean = sent.path.read_bytes()
+        marker = b'"images": []'
+        legacy = (', ' + json.dumps({"reply_token": token})[1:-1]).encode()
+        self.assertTrue(marker in clean)
+        original = clean.replace(marker, marker + legacy, 1)
+        _ = sent.path.write_bytes(original)
+
+        _ = self.write(doc, doc.read_text().replace("— running.**", "— wrapped.**"))
+        result = self.run_tidy(doc)
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(sent.path.exists())
+        backups = self.state / "review-reply-proof-backups"
+        backup, = (path for path in backups.iterdir() if path.is_dir())
+        copy = backup / sent.path.relative_to(sent.path.anchor)
+        self.assertTrue(copy.read_bytes() == original)
+        report = reply_proofs.move_journal_path()
+        self.assertEqual(json.loads(report.read_text()), {"path": str(sent.path), "fields": ["reply_token"]})
+        expected_proof = reply_tokens.LegacyReplyProof(reply_tokens.digest(reply_tokens.RawReplyToken(token)))
+        self.assertTrue(reply_proofs.read(identity).reply == expected_proof)
+        moved = review_submissions.submit(request)
+        expected = clean.replace(f"production_id: {child.id}\n".encode(), f"production_id: {parent.id}\n".encode(), 1)
+        self.assertTrue(moved.path.read_bytes() == expected)
+        self.assertTrue(review_submissions.answer(sent.key, "Reply after wrap", token))
 
     def test_wrap_refuses_an_id_collision_without_moving_either_record(self) -> None:
         doc, child, parent = self.review_wrap_fixture()
@@ -399,10 +436,10 @@ class TidyWrappedTests(unittest.TestCase):
 
         self.assertNotIn("followup", update_registration.read_review_question(first.path).item)
         current = update_registration.read_review_question(second.path)
-        details = new_item_dialog.read_submission(current.item.get("review_submission"))
+        details = update_registration.review_submission(current)
         self.assertIn(change_page.reply_command(second.key), delivery.message)
-        self.assertIn(change_page.reply_command(second.key, details.reply_token),
-                      change_page.outbound_review_message(delivery).text)
+        self.assertTrue(change_page.reply_command(second.key, details.reply_token)
+                        in change_page.outbound_review_message(delivery).text)
         self.assertTrue(review_submissions.answer(second.key, "More detail", details.reply_token))
 
 

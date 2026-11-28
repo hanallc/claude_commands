@@ -199,7 +199,7 @@ class LinkedTableTests(unittest.TestCase):
     def render(self, fragment: str, *, query: str = '', closed_item: str = '',
                park_open_card: bool = False) -> dict[str, object]:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
-        _, start, rest = review_page.SCRIPT.partition('function allEntries(){')
+        _, start, rest = review_page.SCRIPT.partition('let failedDelivery=null;')
         table_script = start + rest.partition('\nasync function afterRowAnimations(')[0]
         source = ('const fragment=' + json.dumps(fragment) + ';\n'
                   + 'const queryString=' + json.dumps(query) + ';\n'

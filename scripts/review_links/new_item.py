@@ -10,6 +10,7 @@ import os
 import platform
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 from collections.abc import Callable, Generator
@@ -20,6 +21,7 @@ from enum import IntEnum, StrEnum
 from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 from typing import Literal, cast
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib import atomic_file, conf, main_publish
@@ -27,12 +29,29 @@ from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
 from scripts.production import investigation, producer_map, record_store, repeat_rule, staff, the_list, unrouted_alert
-from scripts.review_links import change_page, for_you, list_draft, new_item_dialog, review_page, review_submissions
+from scripts.review_links import change_page, for_you, list_draft, new_item_dialog, review_items, review_page, review_submissions
 
 SOURCE = "nate via /new_item"
 OPTIONS_TARGET = f"{review_page.NEW_ITEM_PATH}?page=list"
 FORM = "/new_item <type> <assignee> <description> [extra, such as a time]"
+RESEND_FORM = "new_item.py resend-reply <item-id>"
 MAY_BE_FILED = "The item may be filed. Check the List before a retry."
+
+
+def file_review_save_bug(failure: review_submissions.ReviewSaveFailure) -> int:
+    """File a failed Review save for morty and return its List number."""
+    members = staff.snapshot()
+    owner = producer_map.find_member("morty", members, ("producer",))
+    if isinstance(owner, producer_map.UnknownMember) or owner.name != "morty":
+        raise record_store.SubmissionError("The Bug needs one active producer named morty.")
+    bug = review_submissions.file_review_save_bug(failure, owner.id, members)
+    origin = bug.submission
+    assert isinstance(origin, new_item_dialog.ReviewSubmission)
+    key = review_items.investigation_record_key(bug)
+    evidence = review_page.PAGE_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
+    return the_list.add_review_item(owner.id, bug.title, owner=owner.id, producer=owner.id,
+                                    unit="", words=bug.question, evidence=evidence, review_key=key,
+                                    source="nate via Review", reservation=review_submissions.list_filing_reservation(origin))
 
 
 class ItemType(StrEnum):
@@ -291,6 +310,7 @@ def usage() -> str:
         f"Types: {', '.join((*ItemType, new_item_dialog.SCHEDULED_KIND))}",
         "Assignee: a producer, a showrunner or a unit",
         "/new_item scheduled natedev Set the time zone back to Eastern time. Start Fri Nov 27 13:00.",
+        f"Resend a reply command: {RESEND_FORM}",
     ))
 
 
@@ -338,8 +358,12 @@ def assignment_receipt(item_type: ItemType | Literal["scheduled"], member: staff
     return f"{item_type.capitalize()} → {to}.{producer_line(member, mapped)}"
 
 
+def filing_number_label(number: int, *, label: Literal["List item", "Bug"] = "List item") -> str:
+    return f"{label} {number}"
+
+
 def filing_receipt(assignment: str, identity: str) -> str:
-    return f"{assignment} List item {identity.removeprefix('L')}."
+    return f"{assignment} {filing_number_label(int(identity.removeprefix('L')))}."
 
 
 def producer_line(member: staff.StaffRow, mapped: producer_map.MappedProducer) -> str:
@@ -442,11 +466,13 @@ def request_body(options: Options, item_type: ItemType, recipient: staff.StaffId
 
 @dataclass(frozen=True)
 class PendingListDraft:
-    """Keep the request ID and recipient while the result is uncertain."""
+    """Keep the original routing IDs while the result is uncertain."""
 
     request_id: str
     recipient: staff.StaffId
     routing: new_item_dialog.PageRecipient
+    assignee: staff.StaffId
+    assignee_reference: str
 
 
 @dataclass(frozen=True)
@@ -463,31 +489,86 @@ def draft_path(address: for_you.ConsoleAddress, session: str, assignee: staff.St
     return state / hashlib.sha256(json.dumps(scope).encode()).hexdigest()
 
 
-def read_pending_draft(path: Path) -> PendingListDraft | NoPendingListDraft:
-    try:
-        fields = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return NoPendingListDraft()
-    if len(fields) == 2:
-        fields.append(new_item_dialog.PageRecipient.SELECTED.value)
-    if (len(fields) != 3 or not re.fullmatch(r"r6-[0-9a-f]{32}", fields[0]) or not fields[1]
+def draft_scope(address: for_you.ConsoleAddress, session: str, item_type: ItemType, words: str) -> Path:
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "new-item"
+    scope = json.dumps([address.host, address.port, session, item_type, words])
+    return state / hashlib.sha256(scope.encode()).hexdigest()
+
+
+def _parse_draft(fields: list[str]) -> PendingListDraft:
+    if (len(fields) != 5 or not re.fullmatch(r"r6-[0-9a-f]{32}", fields[0])
+            or not all(fields[1:])
             or fields[2] not in (new_item_dialog.PageRecipient.SELECTED, new_item_dialog.PageRecipient.PRODUCER)):
         raise OSError("Cannot read the pending New item draft.")
-    return PendingListDraft(fields[0], staff.StaffId(fields[1]), new_item_dialog.PageRecipient(fields[2]))
+    return PendingListDraft(fields[0], staff.StaffId(fields[1]), new_item_dialog.PageRecipient(fields[2]),
+                            staff.StaffId(fields[3]), fields[4])
 
 
-def save_pending_draft(path: Path, recipient: staff.StaffId) -> PendingListDraft:
-    draft = PendingListDraft("r6-" + secrets.token_hex(16), recipient, new_item_dialog.PageRecipient.PRODUCER)
-    atomic_file.write_text_atomic(path, f"{draft.request_id}\n{draft.recipient}\n{draft.routing}\n", new_file_mode=0o600)
-    return draft
+def _draft_for_reference(scope: Path, reference: str, member: staff.StaffRow | producer_map.UnknownMember
+                         ) -> tuple[Path, PendingListDraft | NoPendingListDraft]:
+    """Prefer a typed fixed ID, then the saved spelling, then the resolved assignee."""
+    by_member: tuple[Path, PendingListDraft | NoPendingListDraft] = (scope, NoPendingListDraft())
+    by_reference = by_member
+    for path in scope.glob("*.draft"):
+        draft = _parse_draft(path.read_text(encoding="utf-8").splitlines())
+        if draft.assignee == reference:
+            return path, draft
+        if draft.assignee_reference == reference:
+            by_reference = path, draft
+        elif isinstance(member, staff.StaffRow) and draft.assignee == member.id:
+            by_member = path, draft
+    return by_reference if isinstance(by_reference[1], PendingListDraft) else by_member
+
+
+class LegacyDraftAssigneeUnproven(Exception):
+    """The draft cannot prove that this name still identifies the same assignee."""
+
+    def __init__(self, reference: str) -> None:
+        super().__init__(f'Cannot prove the assignee of the pending New item draft for "{reference}". '
+                         + 'Retry with the original fixed staff ID or the new name.')
+
+
+def _legacy_draft(address: for_you.ConsoleAddress, session: str, item_type: ItemType, words: str,
+                  typed_reference: str, reference: str, member: staff.StaffRow | producer_map.UnknownMember
+                  ) -> tuple[Path, PendingListDraft | NoPendingListDraft]:
+    def path_for(value: str, *, legacy: bool = False) -> Path:
+        return draft_path(address, session, staff.StaffId(value), item_type, words, legacy=legacy)
+
+    def existing_path(value: str) -> Path:
+        path = path_for(value)
+        return path if path.is_file() else path_for(value, legacy=True)
+
+    exact = existing_path(reference)
+    if exact.is_file():
+        path = exact
+        if isinstance(member, staff.StaffRow) and member.id == reference:
+            assignee = member.id
+        else:
+            try:
+                assignee = staff.native_id(reference)
+            except staff.StaffRefused:
+                raise LegacyDraftAssigneeUnproven(reference) from None
+    else:
+        if typed_reference != reference and existing_path(typed_reference).is_file():
+            raise LegacyDraftAssigneeUnproven(reference)
+        if isinstance(member, producer_map.UnknownMember):
+            return exact, NoPendingListDraft()
+        path = existing_path(member.id)
+        if not path.is_file():
+            return path, NoPendingListDraft()
+        assignee = member.id
+    fields = path.read_text(encoding="utf-8").splitlines()
+    if len(fields) == 2:
+        fields.append(new_item_dialog.PageRecipient.SELECTED.value)
+    return path, _parse_draft([*fields, assignee, reference])
 
 
 def post_item(address: for_you.ConsoleAddress, options: Options, item_type: ItemType,
-              draft: PendingListDraft, words: str, assignee: staff.StaffId) -> ServerReply:
+              draft: PendingListDraft, words: str) -> ServerReply:
     """Retry an unconfirmed POST with the same draft ID and recipient."""
     def send(current: Options) -> ServerReply:
         return exchange(address, "POST", review_page.NEW_ITEM_PATH,
-                        request_body(current, item_type, draft.recipient, words, assignee, draft.request_id, draft.routing))
+                        request_body(current, item_type, draft.recipient, words, draft.assignee, draft.request_id, draft.routing))
 
     try:
         reply = send(options)
@@ -559,13 +640,14 @@ class ScheduledFiling:
         return " ".join(run.words.split())
 
     def save(self, *, new_item_draft_id: review_submissions.ListDraftOrigin = review_submissions.NoNewItemDraft.ABSENT,
+             assignee_copy: the_list.ScheduledAssigneeCopy | the_list.NoScheduledAssigneeCopy = the_list.NoScheduledAssigneeCopy.ABSENT,
              before_save: Callable[[int], None] | None = None) -> the_list.ListItem:
         changes: the_list.ItemChanges = {
             "state": the_list.ItemState.SCHEDULED, "schedule": self.schedule, "producer": self.producer,
             "unit": self.member.name if self.member.kind == "unit" else "",
         }
         return the_list.add(self.keeper, self.title, owner=self.member.id, source=SOURCE, changes=changes,
-                            new_item_draft_id=new_item_draft_id, before_save=before_save)
+                            new_item_draft_id=new_item_draft_id, assignee_copy=assignee_copy, before_save=before_save)
 
 
 def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff.StaffSnapshot, *,
@@ -596,14 +678,17 @@ def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff
 
 
 def _assignment_notices(title: str, producer_id: staff.StaffId, keeper: staff.StaffId, member: staff.StaffRow,
-                        members: staff.StaffSnapshot) -> tuple[tuple[review_submissions.ListAssignmentNotice, ...], str]:
+                        members: staff.StaffSnapshot, *, producer_assigns: bool = False
+                        ) -> tuple[tuple[review_submissions.ListAssignmentNotice, ...], str]:
     if producer_id == keeper:
         return (), ""
     producer = members.by_id(producer_id)
     if producer is None:
         return (), "At least one assignment notice failed. The List item is saved."
-    showrunner = producer_map.showrunner_of(member, members)
     title = title if title.endswith((".", "?", "!")) else title + "."
+    if producer_assigns:
+        return (review_submissions.ListAssignmentNotice(producer.id, "producer", f"{title} You assign it."),), ""
+    showrunner = producer_map.showrunner_of(member, members)
     if showrunner.kind == "showrunner":
         notices = (
             review_submissions.ListAssignmentNotice(producer.id, "producer", f"{title} Its showrunner is {showrunner.name}."),
@@ -669,12 +754,17 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_sub
             producer = recipient if request.producer_route else None
             owner = review_submissions.assigned_member(request.assignment, recipient, members)
             filing = prepare_scheduled(owner, request.words, members, producer=producer)
-            notices, warning = _assignment_notices(filing.title, filing.producer, filing.keeper, owner, members)
+            notices, warning = _assignment_notices(
+                filing.title, filing.producer, filing.keeper, owner, members,
+                producer_assigns=request.producer_route and isinstance(request.assignment, new_item_dialog.ProducerAssigns))
             claim = review_submissions.ListDraftClaim(digest, filing.keeper, filing.assignment, filing.readback, notices, warning)
             draft = review_submissions.NewItemDraft(request.request_id, claim)
+            copy = (the_list.ScheduledAssigneeCopy(request.request_id, owner.id, request.words)
+                    if isinstance(request.assignment, new_item_dialog.ChosenAssignee) and owner.id != recipient.id
+                    else the_list.NoScheduledAssigneeCopy.ABSENT)
 
             def save(claim_number: Callable[[int], None]) -> str:
-                return filing.save(new_item_draft_id=draft, before_save=claim_number).id
+                return filing.save(new_item_draft_id=draft, assignee_copy=copy, before_save=claim_number).id
 
             yield claim, save
 
@@ -724,21 +814,61 @@ class Arguments(argparse.Namespace):
     preview: bool = False
 
 
+class ResendArguments(argparse.Namespace):
+    item: str = ""
+
+
+def resend_reply(arguments: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="new_item.py resend-reply",
+                                     description="Send the reply command of a waiting item to its current owner.",
+                                     epilog="The command refuses closed items and unknown IDs.")
+    _ = parser.add_argument("item", help="the native item ID or full submission key")
+    args = parser.parse_args(arguments, namespace=ResendArguments())
+    try:
+        identity = change_page.resend_submission_reply(args.item)
+    except (OSError, ValueError, RuntimeError) as error:
+        print("new_item: " + " ".join(str(error).splitlines()), file=sys.stderr)
+        return Outcome.REFUSED
+    print(f"Accepted the reply command for delivery to the owner of {identity}.")
+    return Outcome.FILED
+
+
+def forward_filing(arguments: list[str], session: str, ssh_program: str) -> int:
+    """Carry the Mac hook identity to the natedev filing process."""
+    environment = shlex.join(["env", "CODEX_THREAD_ID=", f"CLAUDE_CODE_SESSION_ID={session}"])
+    command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/new_item.py" '
+               + shlex.join(arguments))
+    limit = main_publish.CommandTimeLimit(conf.read_or_repository("live_settings").whole("natedev_forward_seconds"))
+    result = main_publish.ssh(f"{environment} {command}", ssh_program=ssh_program, host="natedev", time_limit=limit)
+    if isinstance(result, str):
+        print(f"new_item: natedev: {result}", file=sys.stderr)
+        return Outcome.FAILED
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
+
+
 def main(arguments: list[str] | None = None) -> int:
     argv = sys.argv[1:] if arguments is None else arguments
     if not argv:
         print(usage())
         return Outcome.USAGE
+    session = staff.caller_identity()
     if platform.system() == "Darwin":
-        # The Mac uses the natedev staff snapshot and console address.
-        return main_publish.forward("review_links/new_item.py", [*argv, "--session", staff.caller_identity()],
-                                    label="new_item", ssh_program=os.environ.get("ZONE_SSH") or "ssh")
-    parser = argparse.ArgumentParser(prog="new_item.py", description=__doc__)
+        ssh_program = os.environ.get("ZONE_SSH") or "ssh"
+        if argv[0] == "resend-reply":
+            return main_publish.forward("review_links/new_item.py", argv, label="new_item", ssh_program=ssh_program)
+        return forward_filing(argv, session, ssh_program)
+    if argv[0] == "resend-reply":
+        return resend_reply(argv[1:])
+    parser = argparse.ArgumentParser(prog="new_item.py", description=__doc__, epilog=(
+        "The item owner receives the reply command through Review delivery. "
+        f"To send it again, run {RESEND_FORM}."))
     _ = parser.add_argument("item_type", type=str.lower, choices=(*ItemType, new_item_dialog.SCHEDULED_KIND))
     _ = parser.add_argument("assignee")
     _ = parser.add_argument("description")
     _ = parser.add_argument("extra", nargs="?", default="")
-    _ = parser.add_argument("--session", default=staff.caller_identity(), help=argparse.SUPPRESS)
+    _ = parser.add_argument("--session", default=session, help=argparse.SUPPRESS)
     _ = parser.add_argument("--preview", action="store_true", help="read a Scheduled start and repeat without saving")
     args = parser.parse_args(argv, namespace=Arguments())
     if not args.description.strip():
@@ -763,31 +893,30 @@ def main(arguments: list[str] | None = None) -> int:
         item_type = ItemType(args.item_type)
         members = staff.snapshot()
         member = producer_map.find_member(args.assignee, members, producer_map.ASSIGNEE_KINDS)
-        if isinstance(member, producer_map.UnknownMember):
-            print(unknown_name(member, members))
-            return Outcome.UNKNOWN_NAME
-        caller = members.by_current_session(args.session) if args.session else None
-        to = unit_of(member, members) + (", this session" if caller is not None and caller.id == member.id else "")
-        result = f"{item_type.value.capitalize()} → {to}."
         words = words_text(item_type, args.description, args.extra)
         try:
             address = console_address()
         except ServerUnavailable:
+            if isinstance(member, producer_map.UnknownMember):
+                print(unknown_name(member, members))
+                return Outcome.UNKNOWN_NAME
             mapped = producer_map.producer_for(member.id, members)
             if isinstance(mapped, producer_map.NoProducer):
                 print(producer_question(member, mapped, members))
                 return Outcome.NO_PRODUCER
             raise
-        path = draft_path(address, args.session, member.id, item_type, words)
-        legacy_path = draft_path(address, args.session, member.id, item_type, words, legacy=True)
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with exclusive(legacy_path.with_suffix(".lock")):
-            draft = read_pending_draft(path)
+        scope = draft_scope(address, args.session, item_type, words)
+        reference = args.assignee if "/" in args.assignee else args.assignee.casefold()
+        scope.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        producer_note = ""
+        with exclusive(scope.with_suffix(".lock")):
+            path, draft = _draft_for_reference(scope, reference, member)
             if isinstance(draft, NoPendingListDraft):
-                legacy_draft = read_pending_draft(legacy_path)
-                if isinstance(legacy_draft, PendingListDraft):
-                    path, draft = legacy_path, legacy_draft
+                path, draft = _legacy_draft(address, args.session, item_type, words, args.assignee, reference, member)
             if isinstance(draft, NoPendingListDraft):
+                if isinstance(member, producer_map.UnknownMember):
+                    print(unknown_name(member, members))
+                    return Outcome.UNKNOWN_NAME
                 mapped = producer_map.producer_for(member.id, members)
                 if isinstance(mapped, producer_map.NoProducer):
                     print(producer_question(member, mapped, members))
@@ -797,14 +926,22 @@ def main(arguments: list[str] | None = None) -> int:
                 if isinstance(recipient, Refusal):
                     print(f"new_item: {recipient.reason}", file=sys.stderr)
                     return Outcome.REFUSED
-                draft = save_pending_draft(path, recipient.id)
-                result += producer_line(member, mapped)
+                draft = PendingListDraft("r6-" + secrets.token_hex(16), recipient.id, new_item_dialog.PageRecipient.PRODUCER, member.id, reference)
+                path = scope / draft_path(address, args.session, member.id, item_type, words).with_suffix(".draft").name
+                scope.mkdir(mode=0o700, exist_ok=True)
+                atomic_file.write_text_atomic(
+                    path, f"{draft.request_id}\n{draft.recipient}\n{draft.routing}\n{draft.assignee}\n{draft.assignee_reference}\n",
+                    new_file_mode=0o600)
+                atomic_file.sync_folder(scope.parent)
+                producer_note = producer_line(member, mapped)
             else:
                 options = read_options(address)
-            reply = post_item(address, options, item_type, draft, words, member.id)
+            reply = post_item(address, options, item_type, draft, words)
             refused = reply.status == 400 or reply.status == 409 and reply.fields.get("code") != "already_filed"
             if reply.status == 200 or refused:
                 path.unlink()
+                if path.parent == scope and not any(scope.iterdir()):
+                    scope.rmdir()
         if reply.status != 200:
             print(f"new_item: {_server_error(reply)}", file=sys.stderr)
             return Outcome.FAILED
@@ -814,17 +951,32 @@ def main(arguments: list[str] | None = None) -> int:
             return Outcome.REFUSED
         print(error)
         return Outcome.NO_PRODUCER if error.reason is FilingRefusal.UNMAPPED_PRODUCER else Outcome.UNKNOWN_NAME
+    except LegacyDraftAssigneeUnproven as error:
+        print(f"new_item: {error}", file=sys.stderr)
+        return Outcome.REFUSED
     except (ServerUnavailable, OSError, ValueError, staff.StaffRefused) as error:
         print(f"new_item: {error}", file=sys.stderr)
         return Outcome.FAILED
+    caller = members.by_current_session(session) if session else None
+    session_label = ", this session" if caller is not None and caller.id == draft.recipient else ""
+    member = members.by_id(draft.assignee)
+    assignee = unit_of(member, members) if member is not None else draft.assignee
+    delivery = ""
+    if draft.recipient == draft.assignee:
+        assignee += session_label
+    elif session_label or draft.routing == new_item_dialog.PageRecipient.SELECTED:
+        recipient_row = members.by_id(draft.recipient)
+        recipient_name = recipient_row.name if recipient_row is not None else next(
+            (row.name for row in options.recipients if row.id == draft.recipient), draft.recipient)
+        delivery = f" Reply command goes to {recipient_name}{session_label}."
     number = reply.fields.get("list_number")
     if type(number) is int and number > 0:
-        filed = f"List item {number}."
+        filed = f"{filing_number_label(number)}."
     else:
         review_id = reply.fields.get("id")
-        shown = review_id if isinstance(review_id, str) and review_id else "a Review item"
-        filed = f"Filed as {shown}. The console server returned no List number."
-    print(f"{result} {filed}")
+        saved = f"Filed as {review_id} in Review." if isinstance(review_id, str) and review_id else "Filed a Review item."
+        filed = f"{saved} No List row was filed."
+    print(f"{item_type.value.capitalize()} → {assignee}.{producer_note}{delivery} {filed}")
     return Outcome.FILED
 
 

@@ -39,8 +39,9 @@ from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
 from scripts.hooks import review_hold_delivery
 from scripts.message import review_hold
-from scripts.review_links import for_you
+from scripts.review_links import for_you, new_item_dialog
 from scripts.agents import remote
+from scripts.review_links.test_for_you import comparison_cache_details
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
@@ -159,10 +160,13 @@ def seed_rebuild_cache(home: Path, configuration: Path, row: str = "", *, cache:
     seed_interpreter_cache(home / ".cache")
     cache = cache if cache is not None else home / ".local/state/showrunner/rebuilds"
     cache.parent.mkdir(parents=True, exist_ok=True)
-    metadata = {"commit": "a" * 40, "source": ["/etc/nixos", "main", "natedev", "MacBook-Pro"],
-                "natedev": "/nix/store/fixture-linux", "mac": "/nix/store/fixture-mac",
-                "running_system_probes": {"natedev": True, "mac": True}}
-    _ = cache.write_text(row + "\n9999999999\n" + str(configuration) + "\n" + json.dumps(metadata) + "\n", encoding="utf-8")
+    expected = rebuild_row.ExpectedSystems("a" * 40, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),
+                                           "/nix/store/fixture-linux", "/nix/store/fixture-mac")
+    observed = {machine: f"/nix/store/older-{machine}" if f"rebuild {machine}" in row else expected.path_for(machine)
+                for machine in rebuild_row.MACHINES}
+    metadata = comparison_cache_details(expected, observed, rebuild_row.RunningSystemProbes(True, True))
+    _ = cache.write_text(f"{row}\n9999999999\n{configuration}\n{metadata}\n", encoding="utf-8")
+
 
 
 OWNER = staff.StaffRow(staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"), "showrunner", "show", staff.StaffRoot(), current_session=staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"))
@@ -571,10 +575,11 @@ class ForYouStatusTests(unittest.TestCase):
             config = root / "statusline.conf"
             cache = root / "rebuild-cache"
             _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
-            _ = cache.write_text("\n9999999999\n", encoding="utf-8")
+            seed_rebuild_cache(root, config, cache=cache)
+            saved = cache.read_text(encoding="utf-8")
 
             def read_console_actions() -> for_you.StatusLineActions:
-                _ = cache.write_text("\n0\n", encoding="utf-8")
+                _ = cache.write_text(saved.replace("\n9999999999\n", "\n0\n"), encoding="utf-8")
                 return for_you.StatusLineActions(other_count=3)
 
             with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": os.devnull,
@@ -1202,7 +1207,8 @@ class RoleTests(ConfiguredShellTests):
         folder.mkdir(parents=True, exist_ok=True)
         for row in rows:
             source = f"source=unit:{row.id}\n" if row.kind == "unit" else ""
-            _ = (folder / row.id).write_text(f"\n9999999999\n{source}", encoding="utf-8")
+            _ = (folder / row.id).write_text(
+                f"\n9999999999\n{source}{assignment.REVIEW_COUNTS_VERSION}\n", encoding="utf-8")
 
     def first_line(self, session_id: str = "aaaa-1111", **marks: str) -> str:
         return ANSI.sub("", self.command_lines({"session_id": session_id}, **marks)[0])
@@ -1239,9 +1245,11 @@ class RoleTests(ConfiguredShellTests):
         state = self.home / ".local/state/showrunner"
         self.seed_empty_counts(record, state)
         _ = (state / "counts" / UNIT.id).write_text(
-            f"Review: 2 questions\n9999999999\nsource=unit:{UNIT.id}\n", encoding="utf-8")
+            f"Review: 2 questions\n9999999999\nsource=unit:{UNIT.id}\n{assignment.REVIEW_COUNTS_VERSION}\n",
+            encoding="utf-8")
         self.timer(f"showrunner-{OWNER.id}", f"session:{OWNER.current_session}")
-        _ = (state / "counts" / OWNER.id).write_text("Review: 3 proposals\n9999999999\n", encoding="utf-8")
+        _ = (state / "counts" / OWNER.id).write_text(
+            f"Review: 3 proposals\n9999999999\n{assignment.REVIEW_COUNTS_VERSION}\n", encoding="utf-8")
         seed_rebuild_cache(self.home, self.runtime / "config/statusline.conf", "rebuild mac")
         (self.home / ".git").mkdir()
         _ = (self.home / ".git/HEAD").write_text("ref: refs/heads/cached-branch\n", encoding="utf-8")
@@ -1285,6 +1293,30 @@ class RoleTests(ConfiguredShellTests):
                     self.assertEqual(render(session, shell), expected)
                     self.assertEqual(len(launches.read_text(encoding="utf-8").splitlines()), index)
 
+    def test_shell_reuses_a_render_with_seven_thousand_sources_in_under_two_seconds(self) -> None:
+        render = self.cache_shell()
+        expected = render(UNIT.id, "/bin/sh")
+        cache = self.saved_render()
+        key, _, _, fields, *_ = cache.read_text(encoding="utf-8").splitlines()
+        sources = assignment.RenderSources()
+        sources.deadline = int(time.time()) + 60
+        sources.watch(self.runtime / "scripts/statusline/assignment.py")
+        for index in range(6999):
+            source = self.home / f"source '{index}\\file"
+            if index % 2 == 0:
+                source.touch()
+            sources.watch(source)
+        assignment.publish_render(cache, key, cast(dict[str, str], json.loads(fields)), sources)
+        lines = cache.read_text(encoding="utf-8").splitlines()
+        self.assertEqual((lines[2], len(lines) - 4), ("7000", 7000))
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                start = time.monotonic()
+                output = render(UNIT.id, shell)
+                self.assertLess(time.monotonic() - start, 2)
+                self.assertEqual(output, expected)
+                self.assertEqual((self.home / "python-invocations").read_text(encoding="utf-8"), "Python\n")
+
     def saved_render(self) -> Path:
         cache, = (self.home / ".local/state/showrunner/counts").glob(f"statusline-render-v*/s-{UNIT.id}")
         return cache
@@ -1295,10 +1327,25 @@ class RoleTests(ConfiguredShellTests):
         cache = self.saved_render()
         valid = cache.read_text(encoding="utf-8").splitlines(keepends=True)
         for index, bad in enumerate((
-                valid + [str(self.home / "partial-source")], valid[:-1], [*valid[:2], "0\n", valid[3]]), 2):
+                valid + [str(self.home / "partial-source")], [*valid[:-1], valid[-1].rstrip("\n")],
+                valid + ["\n"], valid[:-1], [*valid[:2], "0\n", valid[3]]), 2):
             _ = cache.write_text("".join(bad), encoding="utf-8")
             self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
             self.assertEqual(len((self.home / "python-invocations").read_text().splitlines()), index)
+
+    def test_shell_rejects_a_missing_source_that_now_exists(self) -> None:
+        render = self.cache_shell()
+        expected = render(UNIT.id, "/bin/sh")
+        cache = self.saved_render()
+        lines = cache.read_text(encoding="utf-8").splitlines()
+        appeared = self.home / "new source"
+        lines.append(f"{appeared}\tmissing")
+        lines[2] = str(len(lines) - 4)
+        _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
+        appeared.touch()
+        self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
+        self.assertEqual((self.home / "python-invocations").read_text(encoding="utf-8"), "Python\nPython\n")
 
     def test_shell_rejects_invalid_render_fields_and_deadlines(self) -> None:
         render = self.cache_shell()
@@ -1385,7 +1432,8 @@ class RoleTests(ConfiguredShellTests):
                         requested_by="sdlc", reason="Login", waits="Release", concerns="console", dedupe_key="access")
                 elif reason == "review":
                     _ = (state / "counts" / UNIT.id).write_text(
-                        f"Review: 5 proposals\n9999999999\nsource=unit:{UNIT.id}\n", encoding="utf-8")
+                        f"Review: 5 proposals\n9999999999\nsource=unit:{UNIT.id}\n{assignment.REVIEW_COUNTS_VERSION}\n",
+                        encoding="utf-8")
                 elif reason == "branch":
                     _ = (self.home / ".git/HEAD").write_text("ref: refs/heads/updated-branch\n", encoding="utf-8")
                 else:
@@ -1837,14 +1885,15 @@ class CountsRowTests(ConfiguredShellTests):
             if path not in paths:
                 path.unlink()
 
-    def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
+    def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh", *, color: bool = False) -> list[str]:
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": MISSING_HERDR_BIN,
                "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
                "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
                "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}
         result = subprocess.run([shell, "-c", self.shell_command], input=json.dumps({"session_id": session_id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
-        return [ANSI.sub("", line) for line in result.stdout.splitlines()]
+        lines = result.stdout.splitlines()
+        return lines if color else [ANSI.sub("", line) for line in lines]
 
     def test_the_session_a_production_targets_shows_its_counts_under_the_other_rows(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
@@ -1875,16 +1924,47 @@ class CountsRowTests(ConfiguredShellTests):
                             self.assertFalse(any(line.startswith("Review:") for line in self.lines(shell=shell)))
                 _ = record.write_text(saved_record, encoding="utf-8")
 
+    def test_an_unanswered_question_from_nate_uses_the_regular_question_count(self) -> None:
+        self.questions({"since": "2026-10-16T19:00", "text": "Check the layout"})
+        path = self.home / ".local/state/showrunner" / OWNER.id / "questions/question-fixture-0.md"
+        origin = new_item_dialog.ReviewSubmission(
+            f'r1-{"a" * 32}-question-{OWNER.id}', "b" * 64, new_item_dialog.NoEvidence(), ())
+        header, _, saved = path.read_text().partition("registration: ")
+        registration, _, body = saved.partition("\n")
+        fields = cast(dict[str, object], json.loads(registration))
+        fields["review_id"] = "Q1"
+        fields["review_submission"] = new_item_dialog.stored_submission(origin)
+        prompt = "Can you check the layout?"
+        fields["followup"] = {"text": prompt, "sent": fields["since"]}
+        _ = path.write_text(f"{header}registration: {json.dumps(fields)}\n{body}")
+
+        self.assertEqual(self.lines(color=True)[-1], "Review: \x1b[91m\x1b[1m1\x1b[22m question\x1b[0m")
+        self.assertEqual(self.cache.read_text().splitlines()[:2], ["Review: 1 question", ""])
+        self.assertNotIn("Review: 1 question", self.lines("another-session"))
+
+    def test_the_footer_replaces_a_legacy_count_for_an_answered_question(self) -> None:
+        self.questions({"since": "2026-10-16T19:00", "text": "Check the layout"})
+        path = self.cache.parent.parent / OWNER.id / "questions" / "question-fixture-0.md"
+        origin = new_item_dialog.ReviewSubmission(
+            f'r1-{"a" * 32}-question-{OWNER.id}', "b" * 64, new_item_dialog.NoEvidence(), ())
+        header, _, saved = path.read_text().partition("registration: ")
+        registration, _, body = saved.partition("\n")
+        fields = cast(dict[str, object], json.loads(registration))
+        fields.update(review_id="Q691", review_submission=new_item_dialog.stored_submission(origin),
+                      followups=[{"followup": "Check the layout", "reply": "The layout fits."}])
+        _ = path.write_text(f"{header}registration: {json.dumps(fields)}\n{body}")
+        self.cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = self.cache.write_text(f"Review: 1 question\n9999999999\n{path}\n")
+
+        self.assertFalse(any(line.startswith("Review:") for line in self.lines()))
+        line, due, *sources = self.cache.read_text().splitlines()
+        self.assertEqual((line, due), ("", ""))
+        self.assertEqual(sources[-1], assignment.REVIEW_COUNTS_VERSION)
+
     def test_each_count_in_the_row_is_bold_inside_its_fixture_color(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
-        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": MISSING_HERDR_BIN,
-               "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
-               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
-               "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}
-        result = subprocess.run(["/bin/sh", "-c", self.shell_command], input=json.dumps({"session_id": OWNER.id}),
-                                capture_output=True, text=True, check=True, env=env, cwd=self.home)
-        self.assertEqual(result.stdout.splitlines()[-1],
+        self.assertEqual(self.lines(color=True)[-1],
                          "Review: \x1b[91m\x1b[1m12\x1b[22m questions\x1b[0m, "
                          + "\x1b[38;5;141m\x1b[1m1\x1b[22m proposal\x1b[0m")
 
@@ -2116,11 +2196,12 @@ class CountsRowTests(ConfiguredShellTests):
                     child.assert_not_called()
                     if reading == "cached":
                         self.assertEqual(sum(call.args[0] == self.cache for call in opened.call_args_list), 1)
-                    for path in self.cache.read_text(encoding="utf-8").splitlines()[2:]:
+                    for path in self.cache.read_text(encoding="utf-8").splitlines()[2:-1]:
                         self.assertTrue(Path(path).is_relative_to(self.home), path)
 
             for damage, due in (("text", "damaged"), ("too many digits", "9" * 5000)):
-                _ = self.cache.write_text(f"Review: 99 questions\n{due}\n", encoding="utf-8")
+                _ = self.cache.write_text(
+                    f"Review: 99 questions\n{due}\n{assignment.REVIEW_COUNTS_VERSION}\n", encoding="utf-8")
                 before = refresh.call_count
                 with self.subTest(deadline=damage), \
                         patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": OWNER.current_session}))), \
@@ -2139,7 +2220,8 @@ class CountsRowTests(ConfiguredShellTests):
                     (UNIT, "write_unit", ""),
                     (OWNER, "write", f"{OWNER.current_session} Review: 99 questions\n")):
                 cache = self.cache.with_name(owner.id)
-                _ = cache.write_text("Review: 99 questions\n0\n", encoding="utf-8")
+                _ = cache.write_text(
+                    f"Review: 99 questions\n0\n{assignment.REVIEW_COUNTS_VERSION}\n", encoding="utf-8")
                 with self.subTest(failed_refresh=owner.kind), \
                         patch.object(counts_row, writer, side_effect=staff.StaffRefused("fixture refusal")), \
                         patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": owner.current_session}))), \
@@ -2181,7 +2263,7 @@ class CountsRowTests(ConfiguredShellTests):
                 line, due, *sources = cache.read_text(encoding="utf-8").splitlines()
                 self.assertEqual(line, "")
                 self.assertEqual(due, str(now + 7))
-                self.assertEqual(sources, [str(instance / "conf"), str(record)])
+                self.assertEqual(sources[:-1], [str(instance / "conf"), str(record)])
                 self.assertEqual(self.lines()[-1], "Review: 1 question, 1 proposal")
                 self.assertEqual(cache.read_text(encoding="utf-8").splitlines()[:2],
                                  ["Review: 1 question, 1 proposal", ""])
@@ -2609,7 +2691,7 @@ class CountsRowTests(ConfiguredShellTests):
                     cache = counts_row.write(instance)
                 line, due, *sources = cache.read_text(encoding="utf-8").splitlines()
                 self.assertEqual((line, due), ("", ""))
-                self.assertEqual(set(sources), {str(path) for path in expected})
+                self.assertEqual(set(sources[:-1]), {str(path) for path in expected})
                 built = cache.stat().st_mtime_ns
                 self.assertFalse(any(line.startswith("Review:") for line in self.lines()))
                 self.assertEqual(cache.stat().st_mtime_ns, built)
@@ -2685,6 +2767,18 @@ class RebuildRowTests(unittest.TestCase):
         paths = rebuild_row.ExpectedSystems("a" * 40, (), expected, expected)
         return rebuild_row.row(self.settings(), paths, run)
 
+    def nix_machine(self, command: list[str], commit: str) -> str:
+        expression = command[-1]
+        self.assertEqual(command[:-1], ["nix", "eval", "--json", "--no-write-lock-file", "--expr"])
+        self.assertIn(f"?rev={commit}", expression)
+        targets = {
+            "natedev": 'nixosConfigurations."natedev"',
+            "mac": 'darwinConfigurations."MacBook-Pro"',
+        }
+        matches = [machine for machine, attribute in targets.items() if attribute in expression]
+        self.assertEqual(len(matches), 1)
+        return matches[0]
+
     def test_8ab801c_differs_from_613d31d_then_the_1628_rebuild_clears_the_item(self) -> None:
         self.assertEqual(self.answer("/nix/store/8ab801c-system", "/nix/store/main-system"), "rebuild natedev")
         self.assertEqual(self.answer("/nix/store/main-system", "/nix/store/main-system"), "")
@@ -2732,7 +2826,9 @@ class RebuildRowTests(unittest.TestCase):
             _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
                                   + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
             commands: list[list[str]] = []
-            running = "/nix/store/old"
+            evaluated: list[str] = []
+            expected = {"natedev": "/nix/store/main-linux", "mac": "/nix/store/main-mac"}
+            running = {"natedev": "/nix/store/old-linux", "mac": "/nix/store/old-mac"}
 
             def run(command: list[str], *, timeout: int = 30) -> str:
                 commands.append(command)
@@ -2740,23 +2836,28 @@ class RebuildRowTests(unittest.TestCase):
                 if command[0] == "git":
                     return "a" * 40
                 if command[0] == "nix":
-                    return json.dumps({"natedev": "/nix/store/main", "mac": "/nix/store/main"})
-                return running
+                    machine = self.nix_machine(command, "a" * 40)
+                    evaluated.append(machine)
+                    return json.dumps(expected[machine])
+                self.assertIn(command[0], ("realpath", "ssh"))
+                return running["natedev" if command[0] == "realpath" else "mac"]
 
             rebuild_row.write(config, run)
+            self.assertEqual(evaluated, ["natedev", "mac"])
             line, due, source, details = cache.read_text(encoding="utf-8").splitlines()
             self.assertEqual(line, "rebuild natedev, rebuild mac")
             self.assertGreater(int(due), time.time())
             self.assertEqual(source, str(config))
             self.assertEqual(rebuild_row.read(config).expected, rebuild_row.ExpectedSystems(
-                "a" * 40, ("/test/nixos", "main", "natedev", "MacBook-Pro"), "/nix/store/main", "/nix/store/main"))
+                "a" * 40, ("/test/nixos", "main", "natedev", "MacBook-Pro"), expected["natedev"], expected["mac"]))
             commands.clear()
             rebuild_row.write(config, run)
             self.assertEqual(commands, [])
-            running = "/nix/store/main"
+            running.update(expected)
             _ = cache.write_text("\n0\n" + str(config) + "\n" + details + "\n", encoding="utf-8")
             rebuild_row.write(config, run)
             self.assertEqual(cache.read_text(encoding="utf-8").splitlines()[0], "")
+            self.assertEqual(evaluated, ["natedev", "mac"])
 
     def test_running_system_probe_availability_survives_cache_round_trip(self) -> None:
         for failed in ("natedev", "mac", ""):
@@ -2766,27 +2867,39 @@ class RebuildRowTests(unittest.TestCase):
                 _ = config.write_text("rebuild.repo=/fixture/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
                     + "rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=120\n"
                     + f"rebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
+                commit = "a" * 40
+                expected = {"natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac"}
+                evaluated: list[str] = []
 
                 def run(command: list[str], *, timeout: int = 30) -> str:
-                    _ = timeout
                     if command[0] == "git":
-                        return "a" * 40
+                        return commit
                     if command[0] == "nix":
-                        return json.dumps({"natedev": "/nix/store/expected", "mac": "/nix/store/expected"})
+                        self.assertEqual(timeout, 120)
+                        machine = self.nix_machine(command, commit)
+                        evaluated.append(machine)
+                        return json.dumps(expected[machine])
+                    self.assertIn(command[0], ("realpath", "ssh"))
                     machine = "mac" if command[0] == "ssh" else "natedev"
                     if machine == failed:
                         failure = subprocess.CompletedProcess(command, 255, "", "Fixture probe failure.")
                         with patch.object(subprocess, "run", return_value=failure):
                             return rebuild_row.command_output(command)
-                    return "/nix/store/expected"
+                    return expected[machine]
 
                 rebuild_row.write(config, run)
+                self.assertEqual(evaluated, ["natedev", "mac"])
                 details = cast(dict[str, object], json.loads(cache.read_text().splitlines()[3]))
                 self.assertEqual(details.get("running_system_probes"),
                                  {"natedev": failed != "natedev", "mac": failed != "mac"})
                 answer = rebuild_row.read(config)
-                self.assertEqual(answer.probes.natedev, failed != "natedev")
-                self.assertEqual(answer.probes.mac, failed != "mac")
+                self.assertEqual(answer.expected, rebuild_row.ExpectedSystems(
+                    commit, ("/fixture/nixos", "main", "natedev", "MacBook-Pro"), expected["natedev"], expected["mac"]))
+                self.assertEqual(answer.failure, rebuild_row.NoEvaluationFailure())
+                for machine in rebuild_row.MACHINES:
+                    outcome = (rebuild_row.RunningProbeOutcome.FAILED if machine == failed
+                               else rebuild_row.RunningProbeOutcome.SUCCEEDED)
+                    self.assertIs(answer.probes.outcome(machine), outcome)
                 self.assertEqual(answer.row(), "")
 
     def test_changes_list_commits_after_each_switch_with_the_session_that_wrote_them(self) -> None:
@@ -2859,7 +2972,7 @@ class RebuildRowTests(unittest.TestCase):
             for line, machines in (("rebuild natedev, rebuild mac", "natedev\nmac\n"),
                                    ("rebuild mac", "mac\n"), ("", "")):
                 with self.subTest(line=line):
-                    _ = cache.write_text(line + "\n9999999999\n" + str(config) + "\n", encoding="utf-8")
+                    seed_rebuild_cache(Path(directory), config, line, cache=cache)
                     result = subprocess.run(
                         ["python3", str(PROGRAM.with_name("rebuild_row.py")), "read", "--config", str(config)],
                         capture_output=True, text=True, check=False,
@@ -2885,7 +2998,8 @@ class RebuildRowTests(unittest.TestCase):
             config = Path(directory) / "statusline.conf"
             cache = Path(directory) / "cache"
             _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
-            _ = cache.write_text("rebuild natedev, rebuild mac\n0\n" + str(config) + "\n", encoding="utf-8")
+            seed_rebuild_cache(Path(directory), config, "rebuild natedev, rebuild mac", cache=cache)
+            _ = cache.write_text(cache.read_text().replace("\n9999999999\n", "\n0\n"), encoding="utf-8")
             answer = rebuild_row.read(config)
             self.assertTrue(answer.refresh_due)
             self.assertEqual(answer.row(), "rebuild natedev, rebuild mac")
@@ -2902,6 +3016,7 @@ class RebuildRowTests(unittest.TestCase):
             _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
                                   + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=47\nrebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
             commands: list[list[str]] = []
+            evaluated: list[str] = []
             commit = "a" * 40
             running = "/nix/store/old"
 
@@ -2913,26 +3028,27 @@ class RebuildRowTests(unittest.TestCase):
                                                "--end-of-options", "main^{commit}"])
                     return commit + "\0Update the settings"
                 if command[0] == "nix":
-                    self.assertIn(f"?rev={commit}", command[-1])
-                    self.assertIn('nixosConfigurations."natedev"', command[-1])
-                    self.assertIn('darwinConfigurations."MacBook-Pro"', command[-1])
-                    return json.dumps({"natedev": "/nix/store/main", "mac": "/nix/store/main"})
+                    evaluated.append(self.nix_machine(command, commit))
+                    return json.dumps("/nix/store/main")
                 return running
 
             rebuild_row.write(config, run)
-            self.assertEqual([command[0] for command in commands], ["git", "nix", "realpath", "ssh"])
+            self.assertEqual([command[0] for command in commands], ["git", "nix", "nix", "realpath", "ssh"])
+            self.assertEqual(evaluated, ["natedev", "mac"])
             for changed in (False, True):
                 with self.subTest(changed=changed):
                     lines = cache.read_text(encoding="utf-8").splitlines()
                     lines[1] = "0"
                     _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
                     commands.clear()
+                    evaluated.clear()
                     running = "/nix/store/main"
                     if changed:
                         commit = "b" * 40
                     rebuild_row.write(config, run)
                     self.assertEqual([command[0] for command in commands],
-                                     ["git", "nix", "realpath", "ssh"] if changed else ["git", "realpath", "ssh"])
+                                     ["git", "nix", "nix", "realpath", "ssh"] if changed else ["git", "realpath", "ssh"])
+                    self.assertEqual(evaluated, ["natedev", "mac"] if changed else [])
                     self.assertEqual(rebuild_row.read(config).row(), "")
 
     def test_failed_eval_waits_for_a_retry_and_a_new_commit_bypasses_the_wait(self) -> None:
@@ -2944,7 +3060,11 @@ class RebuildRowTests(unittest.TestCase):
                     _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
                         + "rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=59\n"
                         + f"rebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
-                    evaluated = 0
+                    machines = ("natedev", "mac")
+                    failed = (failure.removeprefix("empty "),) if failure.startswith("empty ") else machines
+                    confirmed = tuple(machine for machine in machines if machine not in failed)
+                    evaluated: list[str] = []
+                    evaluation_fails = True
                     commit = "a" * 40
                     now = 1000.0
 
@@ -2952,57 +3072,60 @@ class RebuildRowTests(unittest.TestCase):
                         return now
 
                     def run(command: list[str], *, timeout: int = 30) -> str:
-                        nonlocal evaluated, now
+                        nonlocal now
                         if command[0] == "git":
                             return commit
                         if command[0] != "nix":
                             return "/nix/store/old"
-                        evaluated += 1
+                        machine = self.nix_machine(command, commit)
+                        evaluated.append(machine)
                         self.assertEqual(timeout, 59)
-                        self.assertIn(f"?rev={commit}", command[-1])
-                        paths = {"natedev": "/nix/store/main", "mac": "/nix/store/main"}
-                        if evaluated == 1:
-                            now += 59
-                            if failure.startswith("empty"):
-                                paths[failure.removeprefix("empty ")] = ""
-                            else:
-                                effect = (subprocess.TimeoutExpired(command, timeout) if failure == "timeout"
-                                          else subprocess.CompletedProcess(command, 1, "", "eval failed"))
-                                with patch.object(subprocess, "run", side_effect=[effect]) as process:
-                                    output = rebuild_row.command_output(command, timeout=timeout)
-                                self.assertEqual(process.call_args.kwargs["timeout"], 59)
-                                return output
-                        return json.dumps(paths)
+                        if not evaluation_fails or machine not in failed:
+                            return json.dumps("/nix/store/main")
+                        now += timeout
+                        if failure.startswith("empty "):
+                            return json.dumps("")
+                        effect = (subprocess.TimeoutExpired(command, timeout) if failure == "timeout"
+                                  else subprocess.CompletedProcess(command, 1, "", "eval failed"))
+                        with patch.object(subprocess, "run", side_effect=[effect]) as process:
+                            output = rebuild_row.command_output(command, timeout=timeout)
+                        self.assertEqual(process.call_args.kwargs["timeout"], 59)
+                        return output
 
                     stale = rebuild_row.ExpectedSystems(
                         commit, ("/test/nixos", "main", "natedev", "MacBook-Pro"), "", "")
                     _ = cache.write_text("\n0\n" + str(config) + "\n" + stale.details() + "\n", encoding="utf-8")
                     rebuild_row.write(config, run, clock=clock)
-                    self.assertEqual(evaluated, 1)
+                    self.assertEqual(evaluated, list(machines))
                     answer = rebuild_row.read(config, clock=clock)
                     self.assertIsInstance(answer.expected, rebuild_row.NoExpectedSystems)
-                    self.assertEqual(answer.failure, rebuild_row.EvaluationFailure(commit, stale.source, 1059))
+                    failed_at = 1000 + 59 * len(failed)
+                    self.assertEqual(answer.failure,
+                                     rebuild_row.EvaluationFailure(commit, stale.source, failed_at, confirmed))
                     self.assertEqual(answer.row(), {
                         "empty natedev": "rebuild mac", "empty mac": "rebuild natedev"}.get(failure, ""))
-                    # The cache retains the row, but never stores partial paths for reuse.
+                    # The cache records only the successful paths for this commit.
                     details = cast(dict[str, object], json.loads(cache.read_text().splitlines()[3]))
                     self.assertNotIn("natedev", details)
                     self.assertNotIn("mac", details)
+                    self.assertEqual(tuple(answer.evaluated_system_paths), confirmed)
                     for elapsed in (60, 120, 539):
-                        now = 1059 + elapsed
+                        now = failed_at + elapsed
                         commit = "" if elapsed == 120 else "a" * 40
                         rebuild_row.write(config, run, clock=clock)
                         delayed = rebuild_row.read(config, clock=clock)
-                        self.assertEqual(evaluated, 1)
+                        self.assertEqual(evaluated, list(machines))
                         self.assertEqual(delayed.row(), answer.row())
                         self.assertEqual(delayed.failure, answer.failure)
                     if changed:
                         commit = "b" * 40
-                        now = 1059 + 599
+                        now = failed_at + 599
                     else:
-                        now = 1059 + 600
+                        now = failed_at + 600
+                    evaluation_fails = False
                     rebuild_row.write(config, run, clock=clock)
-                    self.assertEqual(evaluated, 2)
+                    expected_evaluations = [*machines, *(machines if changed else failed)]
+                    self.assertEqual(evaluated, expected_evaluations)
                     success = rebuild_row.read(config, clock=clock)
                     self.assertEqual(success.expected, rebuild_row.ExpectedSystems(
                         commit, stale.source, "/nix/store/main", "/nix/store/main"))
@@ -3011,7 +3134,7 @@ class RebuildRowTests(unittest.TestCase):
                     self.assertEqual(success.row(), "rebuild natedev, rebuild mac")
                     now += 60
                     rebuild_row.write(config, run, clock=clock)
-                    self.assertEqual(evaluated, 2)
+                    self.assertEqual(evaluated, expected_evaluations)
 
     def test_open_needs_show_without_an_evaluation_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3023,7 +3146,7 @@ class RebuildRowTests(unittest.TestCase):
                     need.add_need(machine, "a" * 40, "Apply the settings.", "fixture")
                     self.assertEqual(rebuild_row.read(config).row(), "rebuild natedev" if machine == "natedev"
                                      else "rebuild natedev, rebuild mac")
-            _ = cache.write_text("rebuild mac\n9999999999\n" + str(config) + "\n", encoding="utf-8")
+            seed_rebuild_cache(Path(directory), config, "rebuild mac", cache=cache)
             self.assertEqual(rebuild_row.read(config).row(), "rebuild natedev, rebuild mac")
             for path in need.needs_folder().glob("*.json"):
                 path.unlink()

@@ -827,16 +827,26 @@ class WorkerResultNotSubmitted(Result):
     """The prompt failed before it could send input."""
 
 
+class WorkerResultNotReady(Result):
+    """The pane can still receive the result when it is ready."""
+
+
 class WorkerResultUnconfirmed(Result):
     """The prompt may have sent input, and the transcript receipt is missing."""
 
 
 @dataclass(frozen=True)
-class BlockedWorkerResult:
-    """The worker needs input, and the result must wait for the pane."""
+class WorkerResultHolderRelay:
+    """The holder can receive the result after the worker lock releases."""
 
     detail: str
     send_to_holder: Callable[[str, str], Result]
+
+
+@dataclass(frozen=True)
+class BlockedWorkerResult(WorkerResultHolderRelay):
+    """The worker needs input, and the result must wait for the pane."""
+
     outcome: Literal["retry"] = field(init=False, default="retry")
 
 
@@ -1189,21 +1199,23 @@ def write_key_states(states: KeyStates) -> None:
 
 
 def read_key_states(*, require_readable: bool = False) -> KeyStates:
+    if not require_readable:
+        return cast(KeyStates, review_hold.read_message_keys(STATE))
     try:
         return cast(KeyStates, json.loads((STATE / "keys.json").read_text(encoding="utf-8")))
     except FileNotFoundError:
-        return {}
-    except (OSError, ValueError):
-        if require_readable:
-            raise
         return {}
 
 
 @contextmanager
 def key_states(*, require_readable: bool = False) -> Generator[KeyStates]:
     """The key states, under the lock, written back on exit when changed."""
+    if not require_readable:
+        with review_hold.message_keys(STATE, locked()) as keys:
+            yield cast(KeyStates, keys)
+        return
     with locked():
-        states = read_key_states(require_readable=require_readable)
+        states = read_key_states(require_readable=True)
         before = json.dumps(states, sort_keys=True)
         yield states
         if json.dumps(states, sort_keys=True) != before:
@@ -5645,14 +5657,20 @@ class WorkerResultProbe:
         if isinstance(backend, staff.BackendUnavailable):
             raise ValueError("worker transcript backend is unavailable")
         source = worker_admission.transcript_source(worker, backend)
+        incomplete = False
         for entry in worker_admission.transcript_entries(source, set()):
-            if not isinstance(entry, str) or not entry.startswith("user:\n"):
+            if isinstance(entry, worker_admission.TornTranscriptRecord):
+                incomplete = True
+                continue
+            if not entry.startswith("user:\n"):
                 continue
             body = entry.removeprefix("user:\n")
             if body.lstrip().startswith(SCRIPT_ENVELOPE_START) and not body.rstrip().endswith(SCRIPT_ENVELOPE_END):
                 continue
             if self.marker in body.splitlines():
                 return True
+        if incomplete:
+            raise ValueError("worker transcript has incomplete records")
         return False
 
 
@@ -5667,7 +5685,6 @@ class WorkerResultSubmission:
     wait_for_idle: bool = False
     before_input: Callable[[], object] = lambda: None
     worker_only: bool = False
-    before_holder: Callable[[], object] = lambda: None
 
 
 class NoResultTranscript(Enum):
@@ -5703,12 +5720,12 @@ def _result_transcript_cursors(source: Path, stream: str
 
 
 def _result_submission_boundary(worker: staff.StaffRow, membership: staff.StaffSnapshot
-                                ) -> worker_panes.TranscriptCursor | NoResultTranscript:
+                                ) -> worker_panes.TranscriptCursor:
     from scripts.herdr import worker_panes
 
     source = _result_transcript_source(worker, membership)
     if isinstance(source, NoResultTranscript):
-        return source
+        raise ValueError(source.value)
     stream = worker_panes.transcript_stream(worker, source)
     boundary = worker_panes.TranscriptCursor(stream, 0, hashlib.sha256().hexdigest())
     for _, boundary in _result_transcript_cursors(source, stream):
@@ -5803,11 +5820,16 @@ class OrdinaryWorkerMessage(Enum):
     SEND = "send a message without a detached run receipt"
 
 
+class _WorkerResultReadinessFailure(herdr_types.HerdrFailure):
+    """The checks could not prove that the worker can receive the result."""
+
+
 def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
                         sender: str, timeout: float, reason: str = "",
                         receipt: WorkerResultProbe | WorkerResultSubmission | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
                         selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
-                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False) -> Result | BlockedWorkerResult | WorkerResultSubmitted:
+                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False,
+                        ) -> Result | WorkerResultHolderRelay | WorkerResultSubmitted:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
     from scripts.herdr import herdr
@@ -5824,24 +5846,40 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         return _send(options._replace(selection=WorkerHolderRecipient(address, holder.id)), membership=membership)
 
     if not reason:
-        state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
+        try:
+            state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
+        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            if isinstance(receipt, WorkerResultSubmission):
+                return WorkerResultNotReady("retry", str(error))
+            raise
         if isinstance(state, worker_panes.OpenWorker):
+            checking_target = False
             attempting_input = False
             boundary: worker_panes.TranscriptCursor | NoResultTranscript = NoResultTranscript.UNRECORDED
             ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
 
-            def require_idle() -> None:
-                nonlocal attempting_input, boundary
-                readiness = prompt_client.readiness(state.pane)
+            def check_readiness() -> None:
+                try:
+                    readiness = prompt_client.readiness(state.pane)
+                except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                    if isinstance(receipt, WorkerResultSubmission):
+                        raise _WorkerResultReadinessFailure(str(error)) from error
+                    raise
                 if not (readiness["agent_status"].idle and readiness["interactive_ready"]):
-                    raise herdr_types.HerdrFailure("worker is not ready for input")
+                    raise _WorkerResultReadinessFailure("worker is not ready for input")
+
+            def require_idle() -> None:
+                nonlocal checking_target, attempting_input, boundary
+                checking_target = False
+                check_readiness()
                 assert isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission))
                 _ = receipt.before_input()
                 if isinstance(receipt, WorkerResultSubmission):
                     try:
                         boundary = _result_submission_boundary(worker, membership)
-                    except (OSError, ValueError) as error:
-                        raise herdr_types.HerdrFailure(f"worker transcript is unavailable: {error}") from error
+                    except (OSError, ValueError, subprocess.SubprocessError) as error:
+                        raise _WorkerResultReadinessFailure(f"worker transcript is unavailable: {error}") from error
+                    check_readiness()
                 attempting_input = True
 
             def check_message_status() -> None:
@@ -5852,7 +5890,9 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
             submission = herdr.TrackedPromptSubmission(check_message_status)
 
             if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
-                wait_for_idle = receipt.wait_for_idle and state.status == herdr.AgentStatus.WORKING
+                # The detached run waits outside the worker lock.
+                wait_for_idle = (isinstance(receipt, WorkerResultProbe) and receipt.wait_for_idle
+                                 and state.status == herdr.AgentStatus.WORKING)
                 can_prompt = state.status.idle or wait_for_idle
                 on_submission = require_idle
             else:
@@ -5871,18 +5911,23 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         current = _current_staff_session(selection, ExpectedStaffSession(worker.current_session))
                         if isinstance(current, RecipientLookupFailed):
                             return Result("failed", current.reason)
+                    checking_target = True
                     prompt_client.prompt(state.pane, review_text or text, target=str(worker.current_session),
                                          proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=on_submission)
                     if isinstance(receipt, OrdinaryWorkerMessage):
                         return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
                 except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                    reason = str(error)
+                    reason = str(error) or type(error).__name__
+                    if isinstance(receipt, WorkerResultSubmission) and (
+                            checking_target or isinstance(error, _WorkerResultReadinessFailure)):
+                        return WorkerResultNotReady("retry", reason)
                     if isinstance(receipt, OrdinaryWorkerMessage):
                         if submission.may_have_submitted:
                             return WorkerMessageUnconfirmed("failed",
                                 f"worker message delivery unconfirmed: {reason}. "
                                 + "The message may already have arrived. Do not resend it.")
-                    elif isinstance(error, (herdr_types.HerdrFailure, OSError)):
+                    elif (isinstance(receipt, WorkerResultSubmission)
+                            or isinstance(error, (herdr_types.HerdrFailure, OSError))):
                         if not attempting_input or isinstance(error, (herdr.HerdrCommandNotStarted, herdr.AgentBlocked)):
                             return WorkerResultNotSubmitted("retry", reason)
                     else:
@@ -5890,14 +5935,19 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                 if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                     try:
                         if isinstance(receipt, WorkerResultSubmission):
-                            return _confirm_worker_result(worker, state.pane, state.terminal, review_text or text, boundary)
-                        if receipt.received(worker, membership):
+                            confirmed = _confirm_worker_result(worker, state.pane, state.terminal, review_text or text, boundary)
+                            if isinstance(confirmed, WorkerResultSubmitted) or not reason:
+                                return confirmed
+                        elif receipt.received(worker, membership):
                             return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
-                    except (OSError, ValueError, staff.StaffUnreadable) as error:
-                        reason = f"worker transcript is unavailable: {error}"
+                    except (OSError, ValueError, subprocess.SubprocessError) as error:
+                        if not isinstance(receipt, WorkerResultSubmission) or not reason:
+                            reason = f"worker transcript is unavailable: {error}"
                     return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
             else:
                 reason = f"worker is {state.status.value}"
+                if isinstance(receipt, WorkerResultSubmission) and state.status is herdr.AgentStatus.UNKNOWN:
+                    return WorkerResultNotReady("retry", reason)
                 if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                     if state.status != herdr.AgentStatus.BLOCKED or worker_only:
                         return Result("retry", reason)
@@ -5911,11 +5961,16 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
             if skip_closed:
                 return RecipientClosed(f"codex:{worker.current_session}").as_result()
             reason = "worker is stopped" if isinstance(state, worker_panes.StoppedWorker) else "worker pane is closed"
+        if isinstance(receipt, WorkerResultSubmission) and (
+                state is None or isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))):
+            return WorkerResultNotReady("retry", reason)
     if worker_only:
         return Result("retry", reason)
     if not allow_holder_fallback or isinstance(selection, FixedStaffLookup):
         return Result("failed", reason)
-    if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
+    if isinstance(receipt, WorkerResultSubmission):
+        return WorkerResultHolderRelay(reason, send_to_holder)
+    if isinstance(receipt, WorkerResultProbe):
         _ = receipt.before_holder()
     return send_to_holder(reason, text)
 

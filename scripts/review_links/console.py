@@ -170,6 +170,9 @@ def news(root: Path, pages: tuple[ConsolePage, ...], opened: str) -> tuple[str, 
                 for page, keys in cast(dict[str, object], stored).items() if isinstance(keys, list)}
         fresh: list[str] = []
         updated = dict(seen)
+        identities = {page.identity for page in pages}
+        if "list" in seen and "list" not in identities and "studio" in identities:
+            _ = updated.setdefault("studio", updated.pop("list"))
         request = NewsRequest(root)
         for page in pages:
             if page.items is None or not isinstance(page.destination, AvailablePage):
@@ -180,9 +183,9 @@ def news(root: Path, pages: tuple[ConsolePage, ...], opened: str) -> tuple[str, 
                 print(f"review-links news: {page.identity}: {error}", file=sys.stderr)
                 continue
             # A page with no record starts from its present items, so a first visit marks nothing as new.
-            if page.identity == opened or page.identity not in seen:
+            if page.identity == opened or page.identity not in updated:
                 updated[page.identity] = items
-            elif items - seen[page.identity]:
+            elif items - updated[page.identity]:
                 fresh.append(page.identity)
         if updated != seen:
             atomic_file.write_text_atomic(folder / SEEN_NAME, json.dumps(
@@ -209,41 +212,47 @@ class ForYouEntry(TypedDict):
     href: str
 
 
-class CompleteForYouCount(TypedDict):
-    """The complete count of open actions."""
+class CompleteForYouPayload(TypedDict):
+    """The confirmed count and at most two open entries."""
 
     available: Literal[True]
     count: int
-
-
-class CompleteForYouPayload(CompleteForYouCount):
-    """The complete count and at most two short entries."""
-
     entries: list[ForYouEntry]
 
 
+class StaleForYouPayload(TypedDict):
+    """The stale count and at most two open entries."""
+
+    available: Literal[True]
+    count: int
+    stale: Literal[True]
+    kept_parts: tuple[for_you.ForYouCountPart, ...]
+    entries: list[ForYouEntry]
+
+
+class PartialForYouPayload(StaleForYouPayload):
+    """The count that includes an incomplete source read."""
+
+    partial: Literal[True]
+
+
 class UnavailableForYouPayload(TypedDict):
-    """The console cannot give a complete action count."""
+    """The console has no count to show."""
 
     available: Literal[False]
 
 
-type ForYouCountPayload = CompleteForYouCount | UnavailableForYouPayload
-type ForYouPayload = CompleteForYouPayload | UnavailableForYouPayload
-
-
-def for_you_count(snapshot: for_you.ForYouSnapshot) -> ForYouCountPayload:
-    """Encode the count without command text."""
-    count = snapshot.open_count
-    if isinstance(count, for_you.UnavailableOpenCount):
-        return {"available": False}
-    return {"available": True, "count": count.value}
+type ForYouPayload = CompleteForYouPayload | StaleForYouPayload | PartialForYouPayload | UnavailableForYouPayload
 
 
 def for_you_count_view(snapshot: for_you.ForYouSnapshot) -> dict[str, object]:
-    """Send the counts, rebuild machines, and short reasons."""
+    """Send the count from current stores and the native status line fields."""
     status = snapshot.status_line_actions()
-    payload: dict[str, object] = {**for_you_count(snapshot), "rebuild_machines": status.rebuild_machines}
+    count = snapshot.count_with_current_stores()
+    payload: dict[str, object] = {"available": isinstance(count, for_you.KnownOpenCount) and not snapshot.unavailable,
+                                  "rebuild_machines": status.rebuild_machines}
+    if isinstance(count, for_you.KnownOpenCount) and not snapshot.unavailable:
+        payload["count"] = count.value
     if status.rebuild_reasons:
         payload["rebuild_reasons"] = dict(status.rebuild_reasons)
     if isinstance(status.other_count, int):
@@ -255,10 +264,10 @@ def for_you_count_view(snapshot: for_you.ForYouSnapshot) -> dict[str, object]:
 
 def for_you_payload() -> ForYouPayload:
     """Read the shared action sources without changing their stores."""
-    snapshot = for_you.read()
-    count = for_you_count(snapshot)
-    if count["available"] is False:
-        return count
+    snapshot = for_you.read(include_running_revision=False)
+    count = snapshot.open_count
+    if isinstance(count, for_you.UnavailableOpenCount):
+        return {"available": False}
     entries: list[ForYouEntry] = []
     for row in (row for row in snapshot.rows if row.status == "open"):
         if len(entries) == 2:
@@ -266,7 +275,13 @@ def for_you_payload() -> ForYouPayload:
         place = review_place(row.key)
         entries.append({"key": row.key, "kind": row.kind, "title": row.title, "command": row.command,
                         "machine": row.machine, "requested_by": row.requested_by, "href": place_query("review", place)})
-    return {**count, "entries": entries}
+    if isinstance(count, for_you.PartialOpenCount):
+        return {"available": True, "count": count.value, "stale": True, "partial": True,
+                "kept_parts": count.affected_parts, "entries": entries}
+    if isinstance(count, for_you.StaleOpenCount):
+        return {"available": True, "count": count.value, "stale": True, "kept_parts": count.kept_parts,
+                "entries": entries}
+    return {"available": True, "count": count.value, "entries": entries}
 
 
 def _unavailable_owner_controls(pages: tuple[str, ...]) -> str:
@@ -328,10 +343,10 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
                               + f'data-frame-retry-seconds="{settings.number("frame_retry_seconds")}" '
                               + f'data-news="/{change_page.CONSOLE_FOLDER}/{NEWS_NAME}"')
     content = content.replace("<!-- REBUILD -->", icon_svg("refresh-cw"))
-    button = ('<button type="button" class="for-you-button" data-for-you-toggle data-state="unavailable" '
-              + 'aria-controls="action-popover" aria-expanded="false" aria-label="For you: Unavailable">'
-              + icon_svg("inbox") + '<span class="for-you-label">For you</span><b data-for-you-count>?</b>'
-              + '<span class="for-you-state" data-for-you-state>Unavailable</span></button>')
+    button = ('<button type="button" class="for-you-button" data-for-you-toggle data-state="pending" '
+              + 'aria-controls="action-popover" aria-expanded="false" aria-label="For you">'
+              + icon_svg("inbox") + '<span class="for-you-label">For you</span><b data-for-you-count hidden></b>'
+              + '<span class="for-you-state" data-for-you-state hidden></span></button>')
     content = content.replace("<!-- FOR YOU BUTTON -->", button)
     content = content.replace("<!-- SETTINGS -->", '<a class="nav-entry" href="?page=settings" data-page="settings" '
                               + f'data-url="{SETTINGS_PATH}" data-title="Settings" aria-label="Settings">'
@@ -369,7 +384,7 @@ border:1px solid var(--notice-hover);border-radius:9px;background:var(--notice);
 .for-you-button b{margin-left:auto;background:var(--notice-text);color:var(--notice);border-radius:999px;min-width:24px;line-height:24px;text-align:center;font-size:13px}
 .for-you-button[data-state=quiet]{background:var(--hover);border-color:var(--border);color:var(--muted)}
 .for-you-button[data-state=quiet] b{background:var(--border);color:var(--muted)}
-.for-you-button[data-state=unavailable]{background:var(--hover);border-color:var(--border);color:var(--muted)}
+.for-you-button[data-state=pending]{background:var(--hover);border-color:var(--border);color:var(--muted)}
 .for-you-state{position:absolute;bottom:0;left:46px;font-size:10px;line-height:12px}
 .collapsed .for-you-label,.collapsed .for-you-state{display:none}
 .collapsed .for-you-button b{position:absolute;top:3px;right:2px;min-width:17px;line-height:17px;font-size:11px;padding:0 3px}
@@ -406,7 +421,13 @@ function createForYouNotifier(openCard){
  const entries=panel.querySelector('[data-for-you-entries]');
  const failure=panel.querySelector('[data-for-you-failure]'),empty=panel.querySelector('[data-for-you-empty]');
  const summary=panel.querySelector('[data-for-you-summary]');
- let last=null,stale=false,reading=false,completionPending=false,opener=null,displayed='';
+ const countKey='console.for-you.count';
+ let count=null,lastEntries=[],state='pending',reading=false,completionPending=false,opener=null,displayed='';
+ let fallbackCount=null,fallbackEntries=[];
+ try{
+  const saved=JSON.parse(localStorage.getItem(countKey));
+  if(Number.isSafeInteger(saved) && saved>=0){count=fallbackCount=saved;state='stale';}
+ }catch(_){}
  function selectionIntersects(node){
   const selection=getSelection();
   if(!selection || selection.isCollapsed) return false;
@@ -443,28 +464,28 @@ function createForYouNotifier(openCard){
   });
   entries.replaceChildren(...nodes);displayed=value;
  }
- function drawPanel(count){
+ function drawPanel(){
   if(selectionIntersects(panel)) return;
   const heading=panel.querySelector('[data-panel-count]');
-  if(heading.textContent!==count) heading.textContent=count;
-  showActionFailure(failure,!last ? 'The action count is unavailable.' : stale ? 'Stale. The action read failed.' : '');
-  empty.hidden=!last || stale || last.count!==0;
-  summary.hidden=!last || stale || last.count===0;
-  showEntries(last?.entries ?? []);
+  const text=count===null ? '' : String(count);
+  if(heading.textContent!==text) heading.textContent=text;
+  showActionFailure(failure,state==='stale' ? 'The action count is stale.' : '');
+  empty.hidden=state!=='quiet';
+  summary.hidden=state!=='ready';
+  showEntries(lastEntries);
  }
  function draw(){
-  const state=last ? stale ? 'stale' : last.count===0 ? 'quiet' : 'ready' : 'unavailable';
-  const count=last ? String(last.count) : '?';
   for(const button of triggers){
    button.dataset.state=state;
    const badge=button.querySelector('[data-for-you-count]');
-   if(badge.textContent!==count) badge.textContent=count;
+   const text=count===null ? '' : String(count);
+   badge.hidden=count===null;
+   if(badge.textContent!==text) badge.textContent=text;
    const label=button.querySelector('[data-for-you-state]');
-   const message=state==='stale' ? 'Stale' : state==='unavailable' ? 'Unavailable' : '';
-   showActionFailure(label,message);
-   button.setAttribute('aria-label','For you: '+(last ? count+(stale ? ', stale' : '') : 'Unavailable'));
+   showActionFailure(label,state==='stale' ? 'Stale' : '');
+   button.setAttribute('aria-label',count===null ? 'For you' : 'For you: '+count+(state==='stale' ? ', stale' : ''));
   }
-  drawPanel(count);
+  drawPanel();
  }
  const quota=document.getElementById('nav-quota'),quotaIcons=/* Quota icons. */ {};
  function drawQuota(alert){
@@ -482,10 +503,22 @@ function createForYouNotifier(openCard){
    const response=await fetch('/console/for-you.json'+(quota ? '?view=console' : ''),{cache:'no-store'});
    const value=await response.json();
    drawQuota(value?.accounts_quota);
-   if(value?.available===false){last=null;stale=false;return;}
-   if(!response.ok || value?.available!==true || !Number.isInteger(value.count) || value.count<0 || !Array.isArray(value.entries)) throw Error('Invalid action count.');
-   last=value;stale=false;
-  }catch(error){stale=true;}
+   if(value?.available===false) fallbackEntries=[];
+   if(!response.ok || value?.available!==true || !Number.isSafeInteger(value.count) || value.count<0 || !Array.isArray(value.entries)) throw Error('Invalid action count.');
+   count=value.count;lastEntries=value.entries;
+   const partial=value.partial===true;
+   const stale=value.stale===true || partial;
+   const comparisonOnly=Array.isArray(value.kept_parts) &&
+    value.kept_parts.length===1 && value.kept_parts[0]==='rebuild comparison';
+   state=stale && !comparisonOnly ? 'stale' : count===0 ? 'quiet' : 'ready';
+   if(!partial){fallbackCount=count;fallbackEntries=lastEntries;}
+   if(!stale){
+    try{localStorage.setItem(countKey,String(count));}catch(_){}
+   }
+  }catch(error){
+   count=fallbackCount;lastEntries=fallbackEntries;
+   state=count===null ? 'pending' : 'stale';
+  }
   finally{
    reading=false;draw();
    if(completionPending) refresh();
@@ -513,9 +546,8 @@ function createForYouNotifier(openCard){
   if(!link || event.button!==0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
   event.preventDefault();close();openCard(actionURL(link.href));
  });
- const release=()=>drawPanel(last ? String(last.count) : '?');
- entries.addEventListener('focusout',()=>queueMicrotask(release));
- document.addEventListener('selectionchange',release);
+ entries.addEventListener('focusout',()=>queueMicrotask(drawPanel));
+ document.addEventListener('selectionchange',drawPanel);
  addEventListener('message',event=>{
   if(event.origin!==location.origin) return;
   const frame=[...document.querySelectorAll('iframe')].find(item=>item.contentWindow===event.source);
@@ -629,8 +661,8 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 <!-- UNAVAILABLE OWNERS --></section></div></main>
 </div>
 <section id="action-popover" aria-label="For you actions" hidden>
-<header><strong>For you <span data-panel-count>?</span></strong><button type="button" id="close-actions" aria-label="Close actions">×</button></header>
-<p class="panel-note" role="status" data-for-you-failure>The action count is unavailable.</p>
+<header><strong>For you <span data-panel-count></span></strong><button type="button" id="close-actions" aria-label="Close actions">×</button></header>
+<p class="panel-note" role="status" data-for-you-failure hidden></p>
 <p class="panel-note" role="status" data-for-you-empty hidden>No actions required.</p>
 <p class="panel-note" data-for-you-summary hidden>These actions require you now.</p>
 <div data-for-you-entries></div>
@@ -693,6 +725,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   const placeKey = identity => 'at.' + identity;
   const legacyTypes = new Map([['changes','change'],['questions','question'],['investigations','investigation']]);
   const reviewEntry = entries.find(entry => entry.dataset.page === 'review');
+  const studioEntry = entries.find(entry => entry.dataset.page === 'studio');
   const storageKey = 'admin-console.navigation-collapsed';
   let desktopCollapsed = false;
   try { desktopCollapsed = localStorage.getItem(storageKey) === 'true'; } catch (_) {}
@@ -712,17 +745,38 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       try { localStorage.setItem(storageKey, String(value)); } catch (_) {}
     }
   }
-  function placeOf(entry, stored) {
+  function validPlace(entry, stored, oldPath = '') {
     const base = entry.dataset.url;
-    if (!base || !stored) return base;
+    if (!base || !stored?.trim()) return;
     try {
       const target = new URL(stored, location.href);
       // A recorded place stays on the page's own path, so a link cannot frame another page.
-      if (target.origin === location.origin && target.pathname === new URL(base, location.href).pathname) {
-        return target.pathname + target.search + target.hash;
+      const path = new URL(base, location.href).pathname;
+      if (target.origin === location.origin && (target.pathname === path || target.pathname === oldPath)) {
+        return path + target.search + target.hash;
       }
     } catch (_) {}
-    return base;
+  }
+  const placeOf = (entry, stored) => validPlace(entry, stored) ?? entry.dataset.url;
+  function studioPlace(url) {
+    if (!studioEntry || entries.some(entry => entry.dataset.page === 'list')) return false;
+    const params = url.searchParams;
+    const openStudio = params.get('page') === 'list';
+    const oldKey = placeKey('list');
+    const key = placeKey('studio');
+    if (!openStudio && !params.has(oldKey)) return false;
+    const listPlace = validPlace(studioEntry, params.get(oldKey), '/console/list.html');
+    if (openStudio) {
+      params.set('page', 'studio');
+      const requested = listPlace ?? validPlace(studioEntry, params.get(key));
+      const place = requested ?? (frames.has('studio') ? '' : studioEntry.dataset.url);
+      if (place) params.set(key, place);
+      else params.delete(key);
+    } else if (listPlace && !params.has(key)) {
+      params.set(key, listPlace);
+    }
+    params.delete(oldKey);
+    return true;
   }
   function record(entry) {
     let place, state = history.state;
@@ -904,6 +958,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     if (!link || link.hasAttribute('download')) return;
     const url = new URL(link.href);
     if (url.origin !== location.origin || url.pathname !== '/console/') return;
+    studioPlace(url);
     const identity = url.searchParams.get('page');
     if (reviewEntry && legacyTypes.has(identity)) {
       event.preventDefault();
@@ -960,7 +1015,9 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     const review = pages.find(entry => entry.dataset.page === 'review');
     if (review) openConsolePlace(review, url);
   });
-  select(new URL(location.href).searchParams.get('page'));
+  const start = new URL(location.href);
+  if (studioPlace(start)) history.replaceState(history.state, '', start);
+  select(start.searchParams.get('page'));
   function refresh() { loadRebuilds(); loadNews(); actions.refresh(); }
   function scheduleRebuilds() {
     clearInterval(rebuildTimer);

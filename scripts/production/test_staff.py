@@ -31,7 +31,7 @@ from scripts.agents.remote import local_machine
 from scripts.agents.inventory import Inventory
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
-from scripts.lib import models_registry, transcripts, unit_runs
+from scripts.lib import atomic_file, models_registry, transcripts, unit_runs
 from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.git_test_support import fixture_git_environment
@@ -907,6 +907,31 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual([command[0] for command in self.ssh_commands()], ["set-producer-top-item"])
         self.assertEqual(changed.top_item, staff.TopItem(7))
         self.assertEqual(staff.by_id(producer.id), changed)
+
+    def test_priority_request_proof_survives_later_priority_changes(self) -> None:
+        producer = fixture_member("producer", name="planner")
+        command = staff.ApplyPriorityRequest(producer.id, staff.TopItem(7))
+        applied = staff.PriorityRequestKey.read("review:" + "a" * 64)
+        refused = staff.PriorityRequestKey.read("review:" + "b" * 64)
+        with mock.patch.object(atomic_file, "sync_folder", side_effect=OSError("The staff folder did not sync.")):
+            with self.assertRaisesRegex(staff.StaffUnreadable, "The staff folder did not sync"):
+                _ = staff.settle_priority_request(applied, command)
+        outcome = staff.settle_priority_request(applied, staff.RefuseUnappliedPriority.REQUEST)
+        self.assertIs(outcome, staff.PriorityRequestOutcome.SAVED)
+        current = staff.by_id(producer.id)
+        assert current is not None
+        self.assertEqual(current.top_item, command.item)
+        outcome = staff.settle_priority_request(refused, staff.RefuseUnappliedPriority.REQUEST)
+        self.assertIs(outcome, staff.PriorityRequestOutcome.NOT_SAVED)
+        _ = staff.set_producer_top_item(producer.id, staff.TopItem(8))
+        saved = staff.local_snapshot()
+        self.assertIs(saved.priority_request_proofs[applied], staff.PriorityRequestOutcome.SAVED)
+        self.assertIs(saved.priority_request_proofs[refused], staff.PriorityRequestOutcome.NOT_SAVED)
+        self.assertIs(staff.settle_priority_request(refused, command), staff.PriorityRequestOutcome.NOT_SAVED)
+        self.assertIs(staff.settle_priority_request(applied, command), staff.PriorityRequestOutcome.SAVED)
+        current = staff.by_id(producer.id)
+        assert current is not None
+        self.assertEqual(current.top_item, staff.TopItem(8))
 
     def test_owner_lookup_returns_the_unit_for_a_worker_reference(self) -> None:
         showrunner, unit, worker = self.tree()
@@ -2116,6 +2141,79 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(set(worker.to_json()), {"id", "kind", "name", "parent", "current_session"})
         _ = staff.retire(worker.id)
         self.assertIsNone(staff.by_id(worker.id))
+
+    def test_ensure_worker_commits_the_design_claim_with_the_row(self) -> None:
+        runner = fixture_member("showrunner", name="designs")
+        claim = staff.DesignWorkerClaim("9a01e67d-6c33-4637-8fa8-2e760dfd9445", "designer")
+        worker_id = staff.native_id(fixture_runtime_id("published-design-worker"))
+        original = self.staff_file.read_bytes()
+        with mock.patch.object(os, "replace", side_effect=OSError("staff publish interrupted")):
+            with self.assertRaisesRegex(staff.StaffUnreadable, "staff publish interrupted"):
+                _ = staff.ensure_worker(worker_id, "design-worker", runner.id, design_claim=claim)
+        self.assertEqual(self.staff_file.read_bytes(), original)
+        self.assertIsNone(staff.by_id(worker_id))
+        result = self.cli("ensure-worker", worker_id, "--name", "design-worker", "--parent", runner.id,
+                          "--design-role", str(claim), "--json", "--row-write")
+        worker = staff.StaffRow.from_json(cast(object, json.loads(result.stdout)))
+        self.assertEqual((worker.id, worker.design_claim), (worker_id, claim))
+        self.assertEqual(staff.by_id(worker_id), worker)
+        self.assertEqual(staff.authority_snapshot().design_workers, {claim: worker_id})
+        fields = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        self.assertEqual(fields["design_workers"], {str(claim): worker_id})
+        self.assertEqual(staff.ensure_worker(worker_id, worker.name, runner.id, design_claim=claim), worker)
+        with (mock.patch.object(staff, "is_owner", return_value=False),
+              mock.patch.object(staff, "_remote_row", return_value=worker) as remote_row):
+            self.assertEqual(staff.ensure_worker(worker_id, worker.name, runner.id, design_claim=claim), worker)
+        remote_row.assert_called_once_with(["ensure-worker", worker_id, "--name", worker.name,
+                                            "--parent", runner.id, "--design-role", str(claim)])
+        with self.assertRaisesRegex(staff.StaffRefused, "the design role already has a worker"):
+            another = staff.native_id(fixture_runtime_id("another-worker"))
+            _ = staff.ensure_worker(another, "other-worker", runner.id, design_claim=claim)
+
+    def test_seal_design_start_preserves_an_admission_and_blocks_late_publication(self) -> None:
+        owner = fixture_member("showrunner", name="designs")
+        design_id = "9a01e67d-6c33-4637-8fa8-2e760dfd9445"
+        opened = staff.DesignWorkerClaim(design_id, "designer")
+        stopped = staff.DesignWorkerClaim(design_id, "reviewer")
+        identity = staff.native_id(fixture_runtime_id("design-worker"))
+        worker = staff.ensure_worker(identity, "designer", owner.id, design_claim=opened)
+        staff.seal_design_worker_start(opened)
+        _ = self.cli("seal-design-start", str(stopped))
+        saved = staff.StaffSnapshot.decode(staff.authority_snapshot().encode())
+        self.assertEqual(saved.design_workers, {opened: worker.id})
+        self.assertEqual(saved.sealed_design_starts, frozenset({stopped}))
+        with (mock.patch.object(staff, "is_owner", return_value=False),
+              mock.patch.object(staff, "_remote", return_value=None) as transport):
+            staff.seal_design_worker_start(stopped)
+        transport.assert_called_once_with(["seal-design-start", str(stopped)])
+        late_id = staff.native_id(fixture_runtime_id("late-design-worker"))
+        with self.assertRaisesRegex(staff.StaffRefused, "the design startup has ended"):
+            _ = staff.ensure_worker(late_id, "reviewer", owner.id, design_claim=stopped)
+        self.assertIsNone(staff.by_id(late_id))
+
+    def test_mac_seals_a_design_start_with_the_remote_argument_list(self) -> None:
+        claim = staff.DesignWorkerClaim("9a01e67d-6c33-4637-8fa8-2e760dfd9445", "reviewer")
+        with self.machine("mac"):
+            staff.seal_design_worker_start(claim)
+        self.assertEqual(self.ssh_commands(), [["seal-design-start", str(claim), "--json"]])
+        self.assertEqual(staff.authority_snapshot().sealed_design_starts, frozenset({claim}))
+
+    def test_staff_row_writes_preserve_live_and_retired_design_records(self) -> None:
+        owner = fixture_member("showrunner", name="designs")
+        design_id = "9a01e67d-6c33-4637-8fa8-2e760dfd9445"
+        designer = staff.DesignWorkerClaim(design_id, "designer")
+        reviewer = staff.DesignWorkerClaim(design_id, "reviewer")
+        worker = staff.ensure_worker(staff.native_id(fixture_runtime_id("design-worker")), "designer", owner.id,
+                                     design_claim=designer)
+        staff.seal_design_worker_start(reviewer)
+        _ = staff.rename(owner.id, "renamed-designs")
+        self.assertEqual(staff.authority_snapshot().design_workers, {designer: worker.id})
+        _ = staff.retire(worker.id)
+        _ = staff.rename(owner.id, "retired-designs")
+        saved = staff.authority_snapshot()
+        self.assertIsNone(saved.by_id(worker.id))
+        self.assertEqual(saved.design_workers, {designer: worker.id})
+        self.assertEqual(saved.sealed_design_starts, frozenset({reviewer}))
 
     def test_workers_accept_unit_and_showrunner_parents_and_refuse_invalid_parents(self) -> None:
         runner, unit, ordinary = self.tree()

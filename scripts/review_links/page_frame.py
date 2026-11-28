@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from urllib.parse import urlencode
+
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff
@@ -18,6 +20,18 @@ from scripts.review_links import console_theme, send_hold, setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
+LIST_PAGE_PATH = "/console/list.html"
+STUDIO_PAGE_PATH = "/console/studio.html"
+
+
+def list_item_fragment(keeper: str, number: int, *, only_item: bool = False) -> str:
+    key = f"{keeper}/L{number}"
+    fields = {"item": key}
+    if only_item:
+        fields["key"] = key
+    return "#" + urlencode(fields)
+
+
 OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "placement_disk",
                          "rebuilds", "review", "studio"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
@@ -223,20 +237,6 @@ document.addEventListener('DOMContentLoaded',()=>{
 ACTIONS_SCRIPT = """<script>
 (()=>{
  const root=document.documentElement, windows=[];
- let clicked=null, reopen='', reopenClick=null;
- // Remove the window name from the address before the page reads it.
- const named=location.hash.match(/(?:^#|&)console-window=([^&]*)/);
- if(named){
-  try{reopen=decodeURIComponent(named[1]);}catch(_){}
-  const hash=location.hash.replace(named[0],named[0].startsWith('#') ? '#' : '').replace(/^#&/,'#');
-  history.replaceState(history.state,'',location.pathname+location.search+(hash==='#' ? '' : hash));
- }
- document.addEventListener('click',event=>{
-  clicked=event.target instanceof Element ? event.target : null;
-  setTimeout(()=>{clicked=null;});
- },true);
- // A link that opens no window must not move the page.
- addEventListener('click',event=>{if(event===reopenClick) event.preventDefault();});
  // A page action button opens its dialog. When the dialog closes, focus goes back to the button.
  // A press on the copy inside the open dialog moves the focus to the first control of the dialog.
  document.addEventListener('click',event=>{
@@ -288,9 +288,7 @@ ACTIONS_SCRIPT = """<script>
    const copy=home.cloneNode(true);
    copy.toggleAttribute('data-page-window-actions',true);
    copy.querySelectorAll('[id]').forEach(node=>node.removeAttribute('id'));
-   // The control that opened the window names it in a screenshot address.
-   const launcher=clicked?.closest('[data-window-place],a[href]');
-   windows.push({dialog,copy,place:launcher ? launcher.dataset.windowPlace ?? launcher.getAttribute('href') : ''});
+   windows.push({dialog,copy});
    // The copy comes last, so the window keeps its own first focus.
    dialog.append(copy);
    // The window has its box only after it opens. The measure runs before the browser shows it.
@@ -307,33 +305,7 @@ ACTIONS_SCRIPT = """<script>
  addEventListener('scroll',()=>place(false),{passive:true});
  // A picture in a window gets its width when it loads.
  document.addEventListener('load',()=>place(),true);
- window.pageCapturePlace=(except)=>{
-  const address=location.pathname+location.search+location.hash;
-  const shown=windows.filter(entry=>entry.dialog!==except && entry.dialog.open).at(-1)?.place;
-  return shown ? address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent(shown) : address;
- };
- function openNamed(){
-  if(!reopen) return true;
-  let launcher=null;
-  try{
-   launcher=document.querySelector('[data-window-place="'+CSS.escape(reopen)+'"]')
-    || document.querySelector('a[href="'+CSS.escape(reopen)+'"]');
-  }catch(_){reopen='';return true;}
-  if(!launcher) return false;
-  reopen='';
-  reopenClick=new MouseEvent('click',{bubbles:true,cancelable:true,button:0,view:window});
-  launcher.dispatchEvent(reopenClick);
-  reopenClick=null;
-  return true;
- }
- if(reopen){
-  // The page can add its controls after it loads its data. The screenshot waits only for the load event.
-  const watch=new MutationObserver(()=>{if(openNamed()) watch.disconnect();});
-  document.addEventListener('DOMContentLoaded',()=>{
-   if(!openNamed()) watch.observe(root,{childList:true,subtree:true});
-  },{once:true});
-  addEventListener('load',()=>{openNamed();watch.disconnect();reopen='';},{once:true});
- }
+ window.pageCaptureWindows=()=>windows.map(entry=>entry.dialog);
  addEventListener('page-top-resize',()=>place());
 })();
 </script>"""
@@ -370,10 +342,11 @@ def icon_svg(name: str) -> str:
 def title(text: str, page: str, *, status_companion: str = "") -> str:
     """Build the title and refresh status with an optional control."""
     settings = conf.read_or_repository("console")
+    status_page = "list" if page == "studio" else page
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
                "readingDelay": settings.number("status.reading_delay_seconds"),
-               "ageLimit": settings.number(f"status.{page}.age_limit_seconds"), "zone": str(user_zone())}
+               "ageLimit": settings.number(f"status.{status_page}.age_limit_seconds"), "zone": str(user_zone())}
     icons = ''.join(f'<span data-status-icon="{state}"' + ('' if state == 'Reading' else ' hidden')
                     + '>' + icon_svg(icon) + '</span>' for state, icon in (
                         ('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),
@@ -443,7 +416,7 @@ _VERSION_SCRIPT = r'''(() => {
  let current,visible='',reading=false,clearing=false,card,selected='',opener='',requested='',edit=0;
  let refreshPending=false;
  const itemLink=key=>rows.querySelector('a[data-version-item="'+CSS.escape(key)+'"]');
- const itemURL=key=>new URL('/console/list.html?'+new URLSearchParams({item:key,reveal:'1'}),location.href);
+ const itemURL=key=>new URL('/console/studio.html?'+new URLSearchParams({item:key,reveal:'1'}),location.href);
  const cardBusy=()=>card?.contentDocument?.versionListBusy?.();
  function selectItem(key){
   if(key===selected) return;
@@ -793,6 +766,32 @@ border-radius:8px;background:var(--card);color:var(--ink)}
 @media(max-width:960px){.review-action-group+.review-action-group{padding-left:0;border:0}}
 @media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
 ''' + HEADING_STYLE + PAGE_TOP_STYLE)
+
+class VerdictAction(StrEnum):
+    WORKS = "works"
+    NOT_FIXED = "not works"
+
+
+class VerdictItemType(StrEnum):
+    CHANGE = "outcome"
+    LIST_REPAIR = "action"
+
+
+NEGATIVE_VERDICT_LABELS = {
+    VerdictItemType.CHANGE: "Does not work",
+    VerdictItemType.LIST_REPAIR: "Not fixed",
+}
+
+
+def verdict_button(item_type: VerdictItemType, action: VerdictAction, *,
+                   primary: bool = False, selected: bool = False) -> str:
+    """Render the verdict for a change or a List repair."""
+    label = "Works" if action is VerdictAction.WORKS else NEGATIVE_VERDICT_LABELS[item_type]
+    pressed = 'aria-pressed="true" ' if selected else ""
+    style = ' class="primary"' if primary else ""
+    disabled = ' disabled' if item_type is VerdictItemType.LIST_REPAIR and action is VerdictAction.NOT_FIXED else ""
+    return f'<button {pressed}name="{item_type}" value="{action}"{style}{disabled}>{label}</button>'
+
 
 def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
                    before_body: str = '', footer: str = '', form: bool = False, body_class: str = '') -> str:
@@ -1208,11 +1207,13 @@ function sendUndoHost(){
  try{ return window.top.document; }catch{ return document; }
 }
 const pause=(ms,view=window)=>new Promise(resolve=>view.setTimeout(resolve,ms));
+const holdRequestSignal=()=>AbortSignal.timeout(30000);
 const RETRY_LIMIT_MS=120_000,KEEPALIVE_LIMIT=64*1024;
 const heldRequests=new Map();
-function trackHeldRequest(key){
+const newHoldId=()=>Array.from(crypto.getRandomValues(new Uint8Array(12)),
+ byte=>byte.toString(16).padStart(2,'0')).join('');
+function trackHeldRequest(key,id){
  const view=sendUndoHost().defaultView || window;
- const id=Array.from(crypto.getRandomValues(new Uint8Array(12)),byte=>byte.toString(16).padStart(2,'0')).join('');
  const started=Date.now(),elapsed=performance.now();
  const expired=()=>Date.now()-started>=RETRY_LIMIT_MS || performance.now()-elapsed>=RETRY_LIMIT_MS;
  const request={id,hold:id,expired,closed:false,closeToast:null,finish};
@@ -1233,28 +1234,47 @@ function trackHeldRequest(key){
  heldRequests.set(key,request);
  return request;
 }
-function showSendUndo(request,seconds,receiver,{saved=false,reason=''}={}){
- const {hold}=request,host=sendUndoHost();
- const view=host.defaultView;
+function createSendToast(){
+ const host=sendUndoHost(),view=host.defaultView;
  if(!view.getSendUndoStack){
   // Install the observer in the top window so it stays active after a frame closes.
   const script=host.createElement('script');script.textContent=SEND_UNDO_STACK_SCRIPT;
   host.head.append(script);script.remove();
  }
- const stack=view.getSendUndoStack();
- const toast=host.createElement('div'),text=host.createElement('span'),button=host.createElement('button');
- const bar=host.createElement('div');
+ const toast=host.createElement('div'),text=host.createElement('span');
+ toast.dataset.sendUndo='';toast.append(text);view.getSendUndoStack().append(toast);
+ return {host,view,toast,text};
+}
+function fadeSendToast(toast,duration){
+ return toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],{duration,easing:'linear',fill:'forwards'});
+}
+function filedReceiptText(response,result,filedReceipt){
+ return response?.ok && result && !result.send_failure && filedReceipt?.(result);
+}
+function showFiledReceipt(toast,text,message,remove){
+ text.textContent=message;toast.hidden=false;
+ fadeSendToast(toast,3000).finished.then(remove,remove);
+}
+async function showImmediateReceipt(request,response,filedReceipt){
+ if(!filedReceipt || !response.ok || request.closed) return;
+ const result=await response.clone().json().catch(()=>null);
+ const message=filedReceiptText(response,result,filedReceipt);
+ if(!message || request.closed) return;
+ const {toast,text}=createSendToast();
+ showFiledReceipt(toast,text,message,()=>toast.remove());
+}
+function showSendUndo(request,seconds,receiver,{saved=false,reason='',resumable=false,filedReceipt}={}){
+ const {hold}=request,{host,view,toast,text}=createSendToast();
+ const button=host.createElement('button'),bar=host.createElement('div');
  const sent=receiver===null ? 'Saved.' : receiver ? 'Sent to '+receiver+'.' : 'Sent.';
- toast.dataset.sendUndo='';text.textContent=reason || (receiver || receiver===null ? sent : 'Sending.');
+ text.textContent=reason || (receiver || receiver===null ? sent : 'Sending.');
  if(reason) text.setAttribute('role','alert');
  button.type='button';button.textContent='Undo';
  const canUndo=!saved || Boolean(hold);
- toast.append(text);
  if(canUndo){bar.dataset.sendUndoBar='';toast.append(button,bar);}
- stack.append(toast);
- // The Undo stays clear for the first half of the time, then fades out until the send leaves.
  const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
- const fade=toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
+ const countdown=fadeSendToast(toast,timing.duration);
+ const removeUndo=()=>{button.remove();bar.remove();};
  return new Promise((resolve,reject)=>{
   let done=false,removalTimer=0;
   const remove=()=>{
@@ -1269,6 +1289,13 @@ function showSendUndo(request,seconds,receiver,{saved=false,reason=''}={}){
   const reportResult=async(response,late=false,warning)=>{
    const result=await response?.clone().json().catch(()=>null);
    if(request.closed || !toast.parentNode) return;
+   const message=filedReceiptText(response,result,filedReceipt);
+   if(message){
+    removeUndo();
+    countdown.cancel();
+    showFiledReceipt(toast,text,(late ? 'Too late to undo. ' : '')+message,remove);
+    return;
+   }
    if(!late && !result?.send_failure && (!warning || response?.ok)){
     if(warning) warning.then(remove);
     else remove();
@@ -1278,7 +1305,7 @@ function showSendUndo(request,seconds,receiver,{saved=false,reason=''}={}){
     ? (result.no_message ? 'Saved.' : sent)
     : result?.send_failure || result?.reason || result?.error || 'The send result is unavailable.';
    text.textContent=(late ? 'Too late to undo. ' : '')+summary;
-   fade.cancel();toast.hidden=false;
+   countdown.cancel();toast.hidden=false;
    removalTimer=view.setTimeout(remove,3000);
   };
   const close=()=>{
@@ -1287,25 +1314,25 @@ function showSendUndo(request,seconds,receiver,{saved=false,reason=''}={}){
   };
   request.closeToast=close;
   window.addEventListener('pagehide',close);
-  fade.finished.then(()=>{
+  countdown.finished.then(()=>{
    if(done) return;
    if(saved){finish(false);return;}
    done=true;
-   button.remove();bar.remove();toast.hidden=true;
+   removeUndo();toast.hidden=true;
    resolve(reportResult);
   },()=>{});
   if(!canUndo) return;
   const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
   button.addEventListener('click',async()=>{
-   button.disabled=true;fade.pause();shrink.pause();
+   button.disabled=true;countdown.pause();shrink.pause();
+   const signal=saved || resumable ? holdRequestSignal() : undefined;
    let answer=null;
-   const signal=saved ? AbortSignal.timeout(30000) : undefined;
    for(let tries=0;tries<2 && !answer && !signal?.aborted;tries++){
     try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST',signal}); }
     catch{ if(!signal?.aborted) await pause(500); }
    }
-   const result=saved ? await answer?.json().catch(()=>null) : null;
-   if(answer?.ok && (!saved || result?.outcome==='undone')){finish(true);return;}
+   const result=saved || (resumable && answer?.ok) ? await answer?.json().catch(()=>null) : null;
+   if(answer?.ok && (!(saved || resumable) || result?.outcome==='undone')){finish(true);return;}
    if(request.closed) return;
    if(saved){
     done=true;remove();
@@ -1313,8 +1340,13 @@ function showSendUndo(request,seconds,receiver,{saved=false,reason=''}={}){
      {undone:result?.outcome==='undone'}));
     return;
    }
+   if(signal?.aborted){
+    done=true;remove();
+    reject(new Error('The Undo response timed out. The send can still leave.'));
+    return;
+   }
    done=true;
-   button.remove();bar.remove();fade.cancel();
+   removeUndo();countdown.cancel();
    if(answer?.status===409){
     text.textContent='Too late to undo. Checking the result…';
     resolve(response=>reportResult(response,true));
@@ -1327,11 +1359,11 @@ function showSendUndo(request,seconds,receiver,{saved=false,reason=''}={}){
   });
  });
 }
-async function heldFetch(url,init={},receiver,onHold){
+async function heldFetch(url,{holdRequestId,filedReceipt,...init}={},receiver,onHold,holdId){
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
- const key=JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
- const request=heldRequests.get(key) || trackHeldRequest(key);
+ const key=holdId ?? holdRequestId ?? JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
+ const request=heldRequests.get(key) || trackHeldRequest(key,holdId ?? holdRequestId ?? newHoldId());
  headers.set(SEND_REQUEST_HEADER,request.id);
  const keepalive=body.length<=KEEPALIVE_LIMIT && new TextEncoder().encode(body).length<=KEEPALIVE_LIMIT;
  const post=async keepalive=>{
@@ -1342,30 +1374,41 @@ async function heldFetch(url,init={},receiver,onHold){
   if(!keepalive) throw error;
   return post(false);
  });
- if(first.headers.get('X-Send-Hold')!=='held'){
-  if(!(first.status>=500)) request.finish();
+ const holdStatus=first.headers.get('X-Send-Hold');
+ if(holdStatus!=='held'){
+  if(first.status<500 || holdStatus==='refused') request.finish();
+  if(filedReceipt) await showImmediateReceipt(request,first,filedReceipt);
   return first;
  }
  const {hold,seconds}=await first.json();
+ if(holdId && hold!==holdId) throw new Error('The send hold does not match this request.');
  request.hold=hold;
  let undo=false;
  if(!request.closed && seconds>0){
-  const shown=showSendUndo(request,seconds,receiver);
+  const shown=showSendUndo(request,seconds,receiver,{resumable:Boolean(holdId),filedReceipt});
   onHold?.();
   undo=await shown;
  }
  if(undo===true){request.finish();throw new SendUndone();}
+ const result=await readHeldResult(hold,request,undo,Boolean(holdId));
+ if(filedReceipt && !undo) await showImmediateReceipt(request,result,filedReceipt);
+ return result;
+}
+async function readHeldResult(hold,request,undo,resumable){
  // A server restart drops the connection; the held send waits in its file, so read its result again.
+ const signal=resumable ? holdRequestSignal() : undefined;
  for(let failures=0;;){
   try{
-   const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
-   if(response.headers.get('X-Send-Hold')!=='pending'){
-    if(response.status!==404 || !request.expired()) request.finish();
-    if(typeof undo==='function') await undo(response);
-    return response;
-   }
+   const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store',signal});
+   if(response.headers.get('X-Send-Hold')==='pending') continue;
+   if(resumable || response.status!==404 || !request?.expired()) request?.finish();
+   if(typeof undo==='function') await undo(response);
+   if(resumable && response.status===404 && response.headers.get('X-Send-Hold-Outcome')==='undone')
+    throw new SendUndone();
+   return response;
   }catch(error){
-   if(++failures>=30){
+   if(error instanceof SendUndone) throw error;
+   if(signal?.aborted || ++failures>=30){
     if(typeof undo==='function') await undo();
     throw error;
    }
@@ -1373,19 +1416,28 @@ async function heldFetch(url,init={},receiver,onHold){
   }
  }
 }
+heldFetch.newId=newHoldId;
+heldFetch.resume=id=>{
+ const request=heldRequests.get(id);
+ return readHeldResult(request?.hold ?? id,request,false,true);
+};
 heldFetch.showSaved=({hold,seconds,reason})=>{
  const request={hold,closed:false};
  const done=showSendUndo(request,seconds,null,{saved:true,reason});
  return {done,close(){request.closed=true;request.closeToast();}};
 };
 function sendActionReceiver(form,data){
- const action=data.get('outcome');
- const verdict=action==='works' && data.get('feedback')?.trim() ? 'works-with-words' : action;
+ const changeAction=data.get('action');
+ if(changeAction==='works') return null;
+ if(changeAction==='not works') return form.dataset.repairReceiver;
+ const action=data.get('outcome') ?? changeAction;
  if(action==='approve' && data.get('assignee')){
   const option=form.elements.assignee?.selectedOptions[0];
   return option?.value===data.get('assignee') ? option.dataset.sendReceiver : undefined;
  }
- return JSON.parse(form.dataset.sendLabels || '{}')[verdict];
+ const labels=JSON.parse(form.dataset.sendLabels || '{}');
+ const withWords=action+'-with-words';
+ return labels[data.get('feedback')?.trim() && Object.hasOwn(labels,withWords) ? withWords : action];
 }
 window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendActionReceiver=sendActionReceiver;
 })();
@@ -1414,7 +1466,7 @@ function holdCard(card,changed){
   return true;
  }
  return {
-  post:(url,init,receiver)=>heldFetch(url,init,receiver,()=>setHeld(true)),
+  post:(url,init,receiver,id)=>heldFetch(url,init,receiver,()=>setHeld(true),id),
   restore:()=>setHeld(false),
  };
 }

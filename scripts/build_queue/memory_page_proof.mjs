@@ -30,6 +30,7 @@
 // Use --kill-both-shot with an output PNG path for the full Builds page.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
+import {gunzipSync} from 'node:zlib';
 import {accessSync, constants, statSync} from 'node:fs';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -2164,16 +2165,30 @@ try {
         await start(27, 'end', edgeRow);
         const edge = {x:(await grip(edgeRow)).x, y:2};
         assert.ok(await evaluate(`document.elementFromPoint(${edge.x}, ${edge.y}).closest('.page-top') !== null`));
-        const before = await evaluate('scrollY');
+        const {before, started} = await evaluate(`(() => {
+          const before = scrollY;
+          const now = performance.now.bind(performance);
+          const started = now();
+          // Simulate a slow first scroll frame without delaying the browser.
+          performance.now = () => now() + (scrollY < before ? 3000 : 0);
+          return {before, started};
+        })()`);
         await mouse('mouseMoved', edge);
         const edgePreview = await evaluate(`new Promise(resolve => {
-          const start = performance.now();
+          let scrollTop = ${before};
+          let lastProgress = ${started};
           function check() {
+            const now = performance.now();
+            if (scrollY < scrollTop) {
+              scrollTop = scrollY;
+              lastProgress = now;
+            }
             const destination = queueDrag.destination;
-            if (destination?.kind !== 'QueueHeadDrop' && performance.now() - start < 3000) {
+            if (destination?.kind !== 'QueueHeadDrop' && queueDrag.scrollFrame !== null && now - lastProgress < 3000) {
               requestAnimationFrame(check);
               return;
             }
+            delete performance.now;
             resolve({scrolled:scrollY < ${before}, destination,
               overHeader:document.elementFromPoint(${edge.x}, ${edge.y}).closest('.page-top') !== null,
               place:document.querySelector(${JSON.stringify(placeCell(edgeRow))}).textContent});
@@ -2955,11 +2970,11 @@ try {
               const opened=await evaluate(`(() => {
                 const dialog=document.querySelector('#${action}-dialog'), body=dialog.querySelector('.console-dialog-body');
                 return {modal:dialog.matches(':modal'),right:dialog.getBoundingClientRect().right,
-                  capturePlace:pageCapturePlace(),
+                  captureWindows:pageCaptureWindows().map(window=>window.id),
                   sideways:body.scrollWidth-body.clientWidth};
               })()`);
               assert.ok(opened.modal, action+' does not open its dialog.');
-              assert.equal(opened.capturePlace, '/memory_live.html#console-window=' + action + '-dialog');
+              assert.deepEqual(opened.captureWindows, [action + '-dialog']);
               assert.ok(opened.right<=width, action+' leaves the window at '+width+' px.');
               assert.ok(opened.sideways<=0, action+' scrolls sideways at '+width+' px.');
               if (action==='builds-swap') {
@@ -5313,21 +5328,13 @@ try {
             return document.querySelector('#review-new-item').matches(':modal');
           })()`).then(open => assert.ok(open, 'New item does not open above Swap.')),
         ]);
-        assert.equal(captureRequest.place, '/memory_live.html#console-window=builds-swap-dialog');
-        const captureDialogs = await evaluate(`(async () => {
-          const frame = document.createElement('iframe');
-          frame.src = ${JSON.stringify(captureRequest.place)};
-          frame.style.cssText = 'position:fixed;left:-2000px;width:1400px;height:1100px';
-          const loaded = new Promise(resolve => frame.addEventListener('load', resolve, {once:true}));
-          document.body.append(frame);
-          try {
-            await loaded;
-            return [...frame.contentDocument.querySelectorAll('dialog:modal')].map(dialog => dialog.id);
-          } finally {
-            frame.remove();
-          }
+        assert.equal(captureRequest.place, '/memory_live.html');
+        const snapshot = gunzipSync(Buffer.from(captureRequest.document_gzip, 'base64')).toString('utf8');
+        const captureDialogs = await evaluate(`(() => {
+          const copy = new DOMParser().parseFromString(${JSON.stringify(snapshot)}, 'text/html');
+          return [...copy.querySelectorAll('dialog[open][data-capture-modal]')].map(dialog => dialog.id);
         })()`);
-        assert.deepEqual(captureDialogs, ['builds-swap-dialog'], 'The screenshot address does not restore Swap.');
+        assert.deepEqual(captureDialogs, ['builds-swap-dialog'], 'The snapshot keeps Swap open and omits New item.');
 
         if (comparisonImages) {
           await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,

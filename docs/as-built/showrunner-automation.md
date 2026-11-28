@@ -746,7 +746,8 @@ They can use `--blocked-by` only for their own List items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-Producers can update their own items with `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence`.
+Producers can use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, and `--next-check` on their own items.
+They can also use `--owner`, `--related-to`, `--blocked-by`, `--evidence`, and `--add-evidence`.
 Their updates use the caller's staff name as the log source.
 Their `add` can set `--producer` to their own name or staff ID. The item goes to the caller by default.
 The CLI refuses another producer and `--number` on their `add`.
@@ -755,7 +756,7 @@ The CLI saves new items in morty's store on the machine where it runs. Every pro
 These commands require `--source` and use its words as the log source.
 Close clears the parking time.
 The writer checks the assigned producer under the same lock as the save.
-Only morty can change the owner or producer of an existing item.
+Only morty can change the producer of an existing item.
 Only morty can run `mark-read`, `clean-evidence`, `link`, and `unlink`.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
@@ -789,13 +790,31 @@ The CLI reads character limits in `config/the_list.conf` when add or update sets
 
 The CLI refuses a write if the applicable text setting is missing, invalid, or too small for the supplied text.
 The limit applies when the CLI next sets that text. Existing text stays readable at any length.
-`--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
+`--blocked-by L<n>:<condition> ...` records dependencies.
+`--related-to L<n> ...` records related items.
 Either option with no values clears its field.
 References use numbers in the folder of the item that the command edits.
+On update, a producer can link its own item to another producer's item.
+The update writes only the item that the producer edits.
 Add and update check references when they set dependency or related fields.
 The store refuses missing references, self-dependencies, and dependency cycles.
 Other changes, including mark-read, do not read referenced records.
 Closing a prerequisite preserves its dependents' conditions.
+
+Use `the_list.py tag --id L<n> --add <tag>` to add a tag.
+Use `--remove <tag>` to remove it.
+Morty supplies `--source`. For other producers, the command uses the caller's staff name.
+The writer checks the assigned producer under the write lock.
+Tags use lowercase text and one space between words.
+A tag cannot contain a comma or a line break.
+A tag cannot contain a Unicode control character (`Cc`) or a lone surrogate (`Cs`).
+The record keeps tags in the order added.
+Each tag change writes a separate note with the full tag list.
+An empty tag list writes `Tags: none`.
+The tag type reserves `none` for an empty tag list.
+A tag change preserves the unread state.
+`the_list.py tags` lists tags and counts open items in the caller's List scope.
+Repeat `--tag <tag>` on `the_list.py list` to require all selected tags.
 
 Closed and removed records remain on disk with their time, closing words, and log.
 The `.next-number` record in morty's List folder stores the next number.

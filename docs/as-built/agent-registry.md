@@ -286,8 +286,15 @@ An ad hoc Astra review starts through `assign.sh --target consultation-pane --op
 `side_pane.py` supplies pane functions for Astra consultations without a staff row.
 Its command interface retains `send` and `close`.
 A managed Astra review starts through `assign.sh --role review --operation astra-review`.
-`worker.py` adds, assigns, and ends the reviewer.
-The pane transport keeps the hold while `assign.sh` runs; after a failed end, the staff row is the record of the reviewer.
+Managed reviewers for the same caller take turns opening their panes under the caller's staff row lock.
+The startup lock waits until its holder releases it or exits.
+Pane opening and the first Codex turn use their own time limits.
+The wait for the caller's staff row uses `operation_lock_seconds`.
+If the row wait times out, the launcher names the row and its holder when available.
+Both locks release before dispatch.
+Each reviewer uses its own worker lock through submission.
+Reviews can run in parallel after submission.
+The reviewer's role hold stays active until completion. After a failed close, the staff row remains the record of the reviewer.
 
 ### Catalog sync (`scripts/agents/sync_codex_catalog.sh`)
 
