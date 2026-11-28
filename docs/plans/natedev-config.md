@@ -877,26 +877,15 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Binds later work:** A fixture that appends a key the base fixture already holds has no effect; replace the row.
 
-### Phase 28 — Join with main 090d037287  · status: todo
+### Phase 28 — Join with main 090d037287  · status: done
 
-**Depends on:** Phase 27
+#### As-built
 
-#### Work Order
+- Merge commit 8a08501281. The conflicts in `new_item_dialog.py`, `review_page.py` and `serve.py` keep main's behavior and the config reads. `SubmissionError` and `SubmissionConflict` come from `scripts/production/record_store.py`.
+- The rerere resolutions of `mac_linux.py` and `checkout_test_support.py` were checked against both parents. `test_config_form.py` is back in the shared fixture list in `helper_tree_test_support.py`, where main moved `runtime_files`.
+- Tip 2ed9876326 (with Phase 29): `gate.py --affected` green, 834 modules; `behavior_check.py run` with main's checker exit 0, 252 altered tests.
 
-**Goal:** The branch holds main 090d037287, and the queued affected run of the joined tip is green.
-
-**Spec:**
-1. Resolve the conflicts in `scripts/review_links/new_item_dialog.py`, `review_page.py` and `serve.py`. Keep main's behavior and reapply the config moves. Import `SubmissionError` and `SubmissionConflict` from `scripts/production/record_store.py`.
-2. Check the rerere resolutions of `scripts/build_targets/mac_linux.py` and `scripts/lib/checkout_test_support.py` against both parents.
-3. Reference: the accounts-carrier merge c6ae41716e resolved the same files.
-
-**Files:** the five files above.
-
-**Workers:** 1 writer; one merge holds all files. `test` opens as impl and is idle.
-
-**Constraints from prior phases:** Phase 21: each main join conflict keeps main's behavior and reapplies the config moves, with no code default.
-
-**Acceptance gate:** no conflict marker; basedpyright clean on the five files; the tests of the resolved code pass by class; `fixture_conf_keys.py` reports 0 missing; the queued `gate.py --affected` run is green; `behavior_check.py run` with main's checker on the tip.
+**Binds later work:** Git rerere replays an earlier resolution; check each replayed file against both parents.
 
 ### Phase 29 — A host value too large for the reader is unusable  · status: done
 
