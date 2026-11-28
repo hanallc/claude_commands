@@ -361,14 +361,20 @@ from scripts.lib import build_folders
 from scripts.production import gate
 from scripts.production.gate_test_support import MergeGateFixture
 
-MergeGateFixture.setUpClass()
+class NestedGateFixture(MergeGateFixture):
+    @classmethod
+    def fixture_configuration(cls, directory):
+        from scripts.lib.build_copies_test_support import private_copy_config
+        return dict(private_copy_config(directory).environment)
+
+NestedGateFixture.setUpClass()
 allocate = build_folders.temporary_build_folder
 
 @contextmanager
-def hold_nested_gate(request):
-    with allocate(request) as folder:
+def hold_nested_gate(request, **options):
+    with allocate(request, **options) as folder:
         Path({str(record)!r}).write_text(json.dumps([
-            str(MergeGateFixture.fixture_root.parent), str(folder)]))
+            str(NestedGateFixture.fixture_root.parent), str(folder)]))
         signal.pause()
         yield folder
 

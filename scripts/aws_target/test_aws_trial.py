@@ -403,7 +403,8 @@ class PairedTrialTests(CostFixture):
         (self.repo / 'scripts/production').mkdir(exist_ok=True)
         _ = (self.repo / 'scripts/production/gate.py').write_text(
             "def test_module_environment(root, environment):\n"
-            + "    return {**environment, 'TMPDIR': str(root), 'TEST_TIMES_OUT': str(root / 'test-times.json')}\n"
+            + "    return {**environment, 'TMPDIR': str(root), 'MERGE_GATE_MODULE_DIR': str(root), "
+            + "'TEST_TIMES_OUT': str(root / 'test-times.json')}\n"
             + "def process_memory_mib(roots):\n"
             + "    return {pid: 0.0 for pid in roots}\n")
         (self.repo / 'config').mkdir(exist_ok=True)

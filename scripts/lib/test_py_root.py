@@ -9,6 +9,8 @@ import sys
 import tempfile
 import unittest
 
+from scripts.lib import conf
+from scripts.lib.build_copies_test_support import write_private_build_roots
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -355,6 +357,7 @@ class PythonRootTests(unittest.TestCase):
                                     ignore=shutil.ignore_patterns("__pycache__"))
                 _ = (checkout / "scripts/build_targets/test_copy_imports.py").write_text(COPY_IMPORT_TEST)
             _ = shutil.copytree(repository / "config", selected / "config")
+            write_private_build_roots(selected / "config/build_folders.conf", base, conf.local_host_key_name())
             wrapper = selected / "targeted_probe.py"
             _ = wrapper.write_text(COPY_TARGETED_RUN)
             detached = other / "detached_probe.py"

@@ -39,6 +39,7 @@ from scripts.buildlog import machine_facts, store, treekey
 from scripts.copies import copies
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start, scratch
 from scripts.lib.build_copies import CopyQueuePosition
+from scripts.lib.build_copies_test_support import write_private_build_roots
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
@@ -450,7 +451,7 @@ import sys
 
 repo = Path.cwd()
 state = Path(os.environ['GATE_STATE_DIR'])
-assert state.parent == Path(os.environ['TMPDIR']).parent
+assert state.parent == Path(os.environ['FIXTURE_ATTEMPT_TMP']).parent
 assert state.is_relative_to(repo / 'target')
 state.mkdir()
 paths = [str(Path(path).relative_to(repo)) for path in sys.argv[1:]]
@@ -1182,6 +1183,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         for folder in ('config', 'scripts/lib', 'scripts/production', 'scripts/fixture', 'scripts/build_targets'):
             (self.repo / folder).mkdir(parents=True)
         _ = shutil.copyfile(config / 'build_folders.conf', self.repo / 'config/build_folders.conf')
+        write_private_build_roots(config / 'build_folders.conf', self.root, conf.local_host_key_name())
         _ = (self.repo / 'scripts/production/gate.py').write_text(GATE_FIXTURE, encoding='utf-8')
         for module in ('test_first.py', 'test_second.py'):
             (self.repo / 'scripts/fixture' / module).touch()

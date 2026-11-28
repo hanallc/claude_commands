@@ -395,6 +395,7 @@ class FirstStepTests(unittest.TestCase):
 
             with (mock.patch.object(gate_targets, "outer_reservation", return_value=parent),
                   mock.patch.object(gate, "outer_reservation", return_value=parent),
+                  build_folders.use_build_root(fixture.root / "build"),
                   mock.patch.object(gate, "checked_gate_target", return_value=gate.NO_GATE_ASSIGNMENT),
                   mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
                   mock.patch.object(gate, "run_tests_only", return_value=17),

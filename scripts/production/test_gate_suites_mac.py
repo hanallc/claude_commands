@@ -28,7 +28,7 @@ from scripts.build_targets import mac_linux, target_config
 from scripts.buildlog import treekey
 from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
-from scripts.lib import conf, process_group, scratch
+from scripts.lib import build_folders, conf, process_group, scratch
 from scripts.lib.build_copies import CopyQueuePosition
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, gate_job_for_command
@@ -371,7 +371,8 @@ class MacGateSuitesTests(GateSuitesFixture):
         """Hand off a natedev gate, then run gate.main with this mode flag and arguments as the gate process does."""
         argv = [mode_flag, "--repo", str(self.checkout), *arguments]
         run_real = mock.Mock(wraps=gate.run_suites)
-        with placement_fixture.PlacementFixture() as queue, mock.patch.dict(os.environ):
+        with (placement_fixture.PlacementFixture() as queue, mock.patch.dict(os.environ),
+              build_folders.use_build_root(self.root / "build")):
             def run_local(repo: Path, *arguments: object, **options: object) -> gate.GateRun:
                 self.assertEqual(self.queue_state(reply), placement.CurrentAssignment())
                 grant = cast(gate.LocalGateAssignment, options["local_grant"])
