@@ -2311,13 +2311,6 @@ assert not loaded, loaded
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
 
-    def test_tmpfs_parent_uses_only_inherited_tmpfs_paths(self) -> None:
-        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "build_folders.conf", "roots.gate=/dev/shm\n")
-        for value, expected in (("/dev/shm/outer/module", Path("/dev/shm/outer/module")),
-                                ("/dev/shm-other", Path("/dev/shm"))):
-            with self.subTest(value=value), mock.patch.dict(os.environ, {"TMPDIR": value}):
-                self.assertEqual(folders.tmpfs_temporary_parent(), expected)
-
     def test_inherited_parent_changes_between_allocations(self) -> None:
         first = folders.create_build_folder(folders.UniqueBuildFolder("merge-gate-"))
         other = self.root / "inherited parent with spaces"
@@ -2337,6 +2330,7 @@ assert not loaded, loaded
         path = folders.create_build_folder(folders.UniqueBuildFolder(
             "bump-gate-", folders.ExplicitBuildParent(parent)))
         self.assertEqual(path.parent, parent)
+        self.assertEqual(path.stat().st_dev, parent.stat().st_dev)
         self.assertTrue(path.name.startswith("bump-gate-"))
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
         self.assertFalse((path / copy_record.RECORD).exists())
@@ -2394,19 +2388,6 @@ assert not loaded, loaded
         finally:
             self.root.chmod(0o700)
         self.assertEqual(list(self.root.iterdir()), [])
-
-    @unittest.skipUnless(Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK),
-                         "the memory filesystem is unavailable")
-    def test_explicit_parent_allocates_under_a_private_dev_shm_parent(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
-            parent = Path(temporary)
-            with folders.temporary_build_folder(folders.UniqueBuildFolder(
-                    "merge-gate-", folders.ExplicitBuildParent(parent))) as name:
-                path = Path(name)
-                self.assertEqual(path.parent, parent)
-                self.assertTrue(path.is_dir())
-                self.assertEqual(path.stat().st_dev, parent.stat().st_dev)
-            self.assertFalse(path.exists())
 
     def test_context_removes_build_output_after_completion_and_interruption(self) -> None:
         for interrupted in (False, True):

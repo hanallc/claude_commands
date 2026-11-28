@@ -37,7 +37,7 @@ from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import machine_facts, store, treekey
 from scripts.copies import copies
-from scripts.lib import atomic_file, build_folders, conf, process_group, process_start, scratch
+from scripts.lib import atomic_file, conf, process_group, process_start, scratch
 from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -254,9 +254,14 @@ if sys.argv[1] == '--json-status-fd':
     os.write(int(words[1]), f'{{"exit-code": {status}}}\\n'.encode())
     sys.exit(status)
 flags = ['--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/',
-         '--proc', '/proc', '--bind', os.environ['TMPDIR'], '/tmp', '--tmpfs', '/dev/shm', '--']
+         '--proc', '/proc', '--bind', os.environ['TMPDIR'], '/tmp', '--tmpfs', '/dev/shm',
+         '--setenv', 'TMPDIR', '/tmp', '--']
 assert sys.argv[1:1 + len(flags)] == flags, sys.argv[1:]
 assert Path(os.environ['TMPDIR']).is_dir()
+guest = Path(os.environ['FIXTURE_GUEST_HOME'])
+temporary_root = guest.parent / 'guest-tmp'
+temporary_root.mkdir(exist_ok=True)
+os.environ['TMPDIR'] = str(temporary_root)
 os.environ['FIXTURE_SANDBOX'] = 'bwrap'
 command = sys.argv[1 + len(flags):]
 os.execvp(command[0], command)
@@ -289,7 +294,7 @@ signal.pause()
 '''
 
 
-GATE_FIXTURE = '''from dataclasses import replace
+GATE_FIXTURE = '''from dataclasses import dataclass, replace
 import fcntl
 import os
 from pathlib import Path
@@ -299,6 +304,7 @@ import subprocess
 from time import sleep
 
 from scripts.copies import copies
+from scripts.lib import build_folders
 from scripts.production.gate_modules import discover_test_modules
 from scripts.production.gate_routes import AllModules, GateJobKind, GateJobResult, GateRun, SelectedModules, SuiteMode
 from scripts.test_times.gate_record import TYPE_CHECK_JOB, WallClockSpan
@@ -317,11 +323,31 @@ class WholeMachine:
         self.rerun_failed_modules = rerun_failed_modules
 
 
-def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_limit_s, time_limit):
+@dataclass(frozen=True)
+class MacLinuxGuestGateParent:
+    temporary_root: Path
+    account_home: Path
+
+
+def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_limit_s, time_limit, suite_location):
     assert os.environ['FIXTURE_SANDBOX'] == 'bwrap'
     guest = Path(os.environ['FIXTURE_GUEST_HOME'])
-    assert repo == guest / 'build/claude' / os.environ['FIXTURE_EXPECTED_UNIT'] / '1', repo
+    build_root = Path(os.environ.get('FIXTURE_GUEST_BUILD_ROOT', guest / 'build'))
+    assert repo == build_root / 'claude' / os.environ['FIXTURE_EXPECTED_UNIT'] / '1', repo
     assert Path.home().is_relative_to(repo / 'target')
+    assert suite_location.account_home == guest
+    assert suite_location.temporary_root == Path(os.environ['TMPDIR'])
+    assert not suite_location.temporary_root.is_relative_to(guest)
+    if 'FIXTURE_SUITE_PARENT' in os.environ:
+        parent = suite_location.temporary_root / 'gate-test-runs'
+        parent.mkdir(parents=True, exist_ok=True)
+        probe = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=parent, capture_output=True)
+        assert probe.returncode == 128, probe
+        assert parent == Path(os.environ['FIXTURE_SUITE_PARENT']), parent
+    if 'FIXTURE_DIRECT_TEST_PARENT' in os.environ:
+        parent = build_folders.test_runs_parent(repo)
+        assert parent == Path(os.environ['FIXTURE_DIRECT_TEST_PARENT']), parent
+        parent.mkdir(parents=True, exist_ok=True)
     assert Path(os.environ['XDG_RUNTIME_DIR']).is_relative_to(repo / 'target')
     assert isinstance(machine, WholeMachine)
     assert (Path.home() / '.claude/config').resolve() == repo / 'config'
@@ -3975,6 +4001,47 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual(result.module_skips, {'scripts/fixture/test_first.py': 0, 'scripts/fixture/test_second.py': 1})
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
+    def test_guest_direct_runs_keep_the_numbered_copy_test_runs_parent(self) -> None:
+        parent = self.guest_home / 'build/claude/caller/1/target/test-runs'
+        with patch.dict(os.environ, {'FIXTURE_DIRECT_TEST_PARENT': str(parent)}):
+            result = self.route()
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        self.assertTrue(result.passed)
+        self.assertTrue(parent.is_dir())
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_guest_gate_uses_a_temporary_parent_outside_home(self) -> None:
+        temporary_root = self.guest_home.parent / 'guest-tmp'
+        parent = temporary_root / 'gate-test-runs'
+        with patch.dict(os.environ, {'FIXTURE_SUITE_PARENT': str(parent)}):
+            result = self.route()
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        self.assertTrue(result.passed)
+        self.assertEqual(gate.gate_suite_parent(self.repo, gate.MacLinuxGuestGateParent(
+            temporary_root, self.guest_home)), parent)
+        self.assertFalse(parent.is_relative_to(self.guest_home))
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_guest_copy_uses_the_account_build_root_with_a_different_checkout_setting(self) -> None:
+        root = self.guest_home / 'configured-output'
+        settings = self.repo / 'config/build_folders.conf'
+        checkout_settings = settings.read_text(encoding='utf-8')
+        host = conf.local_host_key_name()
+        _ = write_config_fixture(settings, f'roots.build={root}\nroots.build.{host}={root}\n')
+        _ = self.git('commit', '-qam', 'Set the guest account build root')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        _ = settings.write_text(checkout_settings, encoding='utf-8')
+        _ = self.git('commit', '-qam', 'Keep the candidate build folder settings')
+
+        parent = root / 'claude/caller/1/target/test-runs'
+        with patch.dict(os.environ, {'FIXTURE_GUEST_BUILD_ROOT': str(root), 'FIXTURE_DIRECT_TEST_PARENT': str(parent)}):
+            result = self.route()
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        self.assertTrue(result.passed)
+        self.assertTrue(parent.is_dir())
+        self.assertFalse((self.guest_home / 'build').exists())
+        self.assertEqual(self.trace.read_text(encoding='utf-8').splitlines(), ['probe', 'arm', 'run', 'cleanup'])
+
     def recorded_guest_gate(self) -> dict[str, object]:
         paths = sorted((store.root() / mac_linux.TARGET).glob('*.jsonl'))
         self.assertEqual(len(paths), 1, 'The guest gate did not save a buildlog file.')
@@ -4522,7 +4589,6 @@ with (patch.object(conf, 'read', read_config),
                                      'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main'),
                                      'BUILDLOG_PLACEMENT_FILE': str(path)}),
               patch.object(gate, 'module_runner', return_value=CHECKOUT / 'scripts/test_times/module_run.py'),
-              patch.object(build_folders, 'configured_gate_root', return_value=self.root),
               patch.object(gate, 'run_suites', side_effect=run_types),
               patch.object(gate, 'release_local_gate') as release,
               redirect_stdout(io.StringIO()) as output):

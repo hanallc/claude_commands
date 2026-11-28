@@ -70,7 +70,7 @@ class GuestTests(unittest.TestCase):
             + '# range: 0..\nindex_touch_minutes=60\n'
             + '# whole: 1..\nindex_spill_pages=65536\n')
         _ = (root / 'build_folders.conf').write_text(
-            f'roots.system={root}\nroots.gate={root}\nroots.build={root / "build"}\n'
+            f'roots.system={root}\nroots.build={root / "build"}\n'
             + '# whole: 1..\nnames.suffix_length=8\n'
             + 'names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_\n'
             + 'patterns.legacy-unique={purpose}{suffix}\n'

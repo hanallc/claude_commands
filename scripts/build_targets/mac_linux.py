@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import errno
 import fcntl
+from functools import partial
 import hashlib
 from io import BytesIO
 import json
@@ -2693,7 +2694,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
 def sandboxed_suite_command(tmp: Path, command: Sequence[str]) -> list[str]:
     # Mount the guest root before mounting proc for the new PID namespace.
     return ['bwrap', '--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/',
-            '--proc', '/proc', '--bind', str(tmp), '/tmp', '--tmpfs', '/dev/shm', '--', *command]
+            '--proc', '/proc', '--bind', str(tmp), str(TEMP), '--tmpfs', '/dev/shm',
+            '--setenv', 'TMPDIR', str(TEMP), '--', *command]
 
 
 def guest_tool(real: Path, copy: Path) -> bool:
@@ -2793,7 +2795,7 @@ def command_refusal(copy: Path, argv: Sequence[str], checked: Sequence[str], sea
     can start a later match. A later word also counts each readable match, because bash finds a script name on
     PATH with no execute bit.
 
-    The check reads PATH outside the read limit. The limit /tmp and /dev/shm start empty, so the limit PATH
+    The check reads PATH outside the read limit. The limit temporary and shared memory mounts start empty, so the limit PATH
     finds no file there that the check does not see.
     """
     copy = copy.resolve()
@@ -2991,7 +2993,8 @@ def run_guest(request_path: Path) -> int:
     request = guest_request(request_path)
     main = Path.cwd()
     work = request['work'] if 'argv' in request else request['mode']
-    with (build_folders.inherit_build_lock(RUN_LOCK_FD),
+    build_root = build_folders.build_root().absolute()
+    with (build_folders.use_build_root(build_root), build_folders.inherit_build_lock(RUN_LOCK_FD),
           build_copies.take_copy(main, request['commit'], showrunner='', unit=request['unit'],
                                 work=work, purpose=TARGET) as copy):
         with build_folders.tool_folder(TARGET, copy.cargo_dir) as runtime:
@@ -3021,6 +3024,7 @@ def run_guest(request_path: Path) -> int:
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
             environment['MAC_LINUX_GUEST_HOME'] = str(Path.home())
+            environment['MAC_LINUX_GUEST_BUILD_ROOT'] = str(build_root)
             reply = os.dup(1)
             try:
                 return run_sandboxed_gate(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
@@ -3090,12 +3094,12 @@ def run_copy(request_path: Path, reply: int) -> None:
     if tree != request['tree']:
         raise GuestUnavailable('The guest checkout differs from the request.')
     selection = request['selection']
-    # The configured gate root (/dev/shm, private to the sandbox) keeps test folders outside the copy and the home.
     token = copies.COMMAND_LOCKS.set(descriptors)
     home = Path(os.environ.pop('MAC_LINUX_GUEST_HOME'))
     print(guest_start_line(request['attempt'], repo, home), file=sys.stderr, flush=True)
     try:
-        with (build_folders.inherit_build_lock(RUN_LOCK_FD),
+        with (build_folders.use_build_root(Path(os.environ.pop('MAC_LINUX_GUEST_BUILD_ROOT'))),
+              build_folders.inherit_build_lock(RUN_LOCK_FD),
               os.fdopen(reply, 'w', encoding='utf-8') as output):
             def send_progress(line: str) -> None:
                 print(GUEST_PROGRESS + json.dumps(line), file=output, flush=True)
@@ -3107,7 +3111,11 @@ def run_copy(request_path: Path, reply: int) -> None:
                 machine = gate.WholeMachine(module_progress=send_progress)
             else:
                 machine = gate.WholeMachine()
-            run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
+            suites = gate.run_suites
+            if hasattr(gate, 'MacLinuxGuestGateParent'):
+                suites = partial(suites, suite_location=gate.MacLinuxGuestGateParent(
+                    build_folders.inherited_temporary_parent(), home))
+            run = suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
                                   mode=SuiteMode(request['mode']), machine=machine,
                                   selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),
                                   module_time_limit_s=request['module_time_limit_s'],

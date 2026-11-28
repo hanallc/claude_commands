@@ -55,6 +55,7 @@ scripts/lib/cancellation.py
 scripts/lib/cargo_output.py
 scripts/lib/conf.py
 scripts/lib/conf_reads.py
+scripts/lib/copy_owner.py
 scripts/lib/copy_record.py
 scripts/lib/dev_shell.py
 scripts/lib/file_lock.py

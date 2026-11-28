@@ -1234,7 +1234,15 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 #### As-built
 
 - `scripts.lib.build_folders.create_build_folder(request: BuildFolderRequest) -> Path` accepts `UniqueBuildFolder(prefix, parent)` or `StableOwnerFolder(name, parent, mode)`. Unique allocation is atomic with mode `0700`. Stable allocation preserves existing contents and permissions.
-- `InheritedTemporaryParent` reads `TMPDIR` at allocation. `ExplicitBuildParent` preserves the supplied parent. `SystemTemporaryParent` selects `/tmp`. `UnitRunParent` uses `unit_runs.run_roots()`. The merge gate requires `/dev/shm` without a disk fallback.
+- `InheritedTemporaryParent` reads `TMPDIR` at allocation. `ExplicitBuildParent` preserves the supplied parent. `SystemTemporaryParent` selects `/tmp`. `UnitRunParent` uses `unit_runs.run_roots()`.
+- The merge gate uses `<build root>/test-runs/<repo>/<unit>/<copy>` for a numbered copy.
+  Worktrees use their output name in place of the copy number.
+  The main checkout uses `<build root>/test-runs/<repo>/main`.
+  The Mac Linux guest gate uses `<guest temporary root>/gate-test-runs` outside the account home and any Git checkout.
+  Direct tests on a guest numbered copy use `<copy>/target/test-runs`.
+  A gate without a modeled checkout uses `$TMPDIR/gate-test-runs`. Direct tests use `$TMPDIR/test-runs`.
+  Both routes reuse the temporary root when `DEVTOOLS_TEST_RUN_FOLDER` matches a `TMPDIR` run directly under either parent.
+  The native Mac uses `/private/tmp` (List 542). The gate keeps the folders of earlier runs.
 - `FOLDER_PREFIXES` defines build names. `MKDTEMP_SUFFIX_PATTERN` defines eight-character allocator suffixes. `temporary_build_folder(request: UniqueBuildFolder) -> Generator[Path]` uses standard-library cleanup and permission repair. Callers retain ownership records and cleanup order.
 - The CLI prints one path. Forms are `unique --kind KIND [--owner TEXT] [--parent PATH | --system-temp]` and `unique --prefix TEXT [--parent PATH | --system-temp]`. Stable forms are `stable --name NAME (--parent PATH | --unit-root)`, `stable --path PATH`, and `stable --run-temp RUN`. `run-temp-path RUN` only names the path.
 - `scratch.new()` and `scratch.target()` retain registration and task naming. `copy_record.root()` and `copy_record.copies_root()` retain root authority. `unit_runs.RUN_TEMP_NAME` names run temporary folders. `unit_runs.activate()` maintains current and former markers.

@@ -196,6 +196,7 @@ class Identity:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     what: str = field(default="", kw_only=True)
+    gate_targets: placement.GateTargets | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -314,6 +315,14 @@ class WidthRequest(CallerCode):
     request_id: str
     reservation: str
     width: int
+
+
+@dataclass(frozen=True)
+class ParentGateTargets:
+    """Show a nested gate's targets on the live parent reservation."""
+
+    reservation: str
+    gate_targets: placement.GateTargets
 
 
 @dataclass(frozen=True)
@@ -761,7 +770,7 @@ class DispatchStatus:
 
 
 Request = (VerifyRunSlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest
-           | ReleaseRequest | WidthRequest | ViewRequest
+           | ReleaseRequest | WidthRequest | ParentGateTargets | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest
            | QueueMoveRequest | QueueUndoRequest | TokenWaitRequest
            | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport
@@ -777,7 +786,7 @@ _UNIT_PRIORITY_ONLY = "priority applies to a unit"
 _REQUESTS: dict[str, type] = {
     "verify_run_slot": VerifyRunSlotRequest,
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
-    "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
+    "width": WidthRequest, "parent_gate_targets": ParentGateTargets, "view": ViewRequest, "explain": ExplainRequest,
     "build_history": BuildHistoryRequest, "mine": MineRequest,
     "queue_move": QueueMoveRequest, "queue_undo": QueueUndoRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
@@ -838,6 +847,8 @@ def _write_wire_record(value: object) -> object:
     if not isinstance(value, dict):
         return value
     record = {key: _write_wire_record(item) for key, item in cast(dict[str, object], value).items()}
+    if "gate_targets" in record and record["gate_targets"] is None:
+        del record["gate_targets"]
     if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
             and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
         del record["route"]

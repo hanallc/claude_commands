@@ -199,8 +199,9 @@ The runner starts the sandbox, and `dbus-run-session` if the guest has it, for t
 Only the JSON reply line goes to the reply descriptor, so other output cannot come before it.
 It makes a per-run tool folder under the copy's `target` directory.
 Bubblewrap binds the tool folder's `tmp` directory to `/tmp` and mounts a private tmpfs at `/dev/shm`.
-The gate in the guest uses the configured gate root (`roots.gate`, `/dev/shm`), as natedev does.
-So test folders are outside the copy and outside the guest user's home.
+The guest gate puts suite folders in `<build root>/test-runs/<repo>/<unit>/<copy>`.
+The guest reads its account build root before it changes `HOME` for the tests.
+It resolves the build root from the guest account's home.
 The guest removes the tool folder when the suite returns.
 A forced stop can leave the tool folder in the numbered copy.
 On a later allocation, the shared build folder allocator removes the folder if its lease owner has ended and the locks permit removal.

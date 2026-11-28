@@ -21,9 +21,10 @@ class SelectParentFromCheckout:
     """Select the parent when the test starts."""
 
 
-# Create this value after the folder preparation and sweep.
+SELECT_PARENT_FROM_CHECKOUT = SelectParentFromCheckout()
+# Create this value after the caller prepares its parent.
 PreparedTestRunsParent = NewType("PreparedTestRunsParent", Path)
-_prepared_parent: PreparedTestRunsParent | SelectParentFromCheckout = SelectParentFromCheckout()
+_prepared_parent: PreparedTestRunsParent | SelectParentFromCheckout = SELECT_PARENT_FROM_CHECKOUT
 
 
 def prepare_test_runs_parent(checkout: Path) -> PreparedTestRunsParent:
@@ -41,9 +42,13 @@ def use_test_runs_parent(parent: PreparedTestRunsParent) -> None:
 
 
 @contextmanager
-def test_run_folder() -> Generator[Path]:
-    """Give a test command a private folder in its checkout's output."""
-    with _test_run_folder(prepare_test_runs_parent(Path(__file__).resolve().parents[2])) as folder:
+def test_run_folder(
+    parent: PreparedTestRunsParent | SelectParentFromCheckout = SELECT_PARENT_FROM_CHECKOUT,
+) -> Generator[Path]:
+    """Give a test command a private folder under its selected parent."""
+    if isinstance(parent, SelectParentFromCheckout):
+        parent = prepare_test_runs_parent(Path(__file__).resolve().parents[2])
+    with _test_run_folder(parent) as folder:
         yield folder
 
 

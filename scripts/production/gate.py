@@ -109,7 +109,8 @@ from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
 from scripts.lib.python_startup.sitecustomize import GATE_PARENT_SOURCE_FD
-from scripts.lib.testing_folders import test_run_folder
+from scripts.lib import git_files
+from scripts.lib.testing_folders import PreparedTestRunsParent, test_run_folder
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
@@ -223,6 +224,27 @@ class WholeMachine:
     rerun_failed_modules: bool = False
 
 
+@dataclass(frozen=True)
+class NativeMacGateParent:
+    """Use the native Mac gate's temporary root until it has a fixed build folder."""
+
+    path: Path
+
+
+@dataclass(frozen=True)
+class MacLinuxGuestGateParent:
+    """Use the Mac Linux sandbox's temporary root for the gate suites."""
+
+    temporary_root: Path
+    account_home: Path
+
+
+class CheckoutTestRuns:
+    """Use the test-runs parent of the checkout under test."""
+
+
+CHECKOUT_TEST_RUNS = CheckoutTestRuns()
+GateSuiteLocation = CheckoutTestRuns | NativeMacGateParent | MacLinuxGuestGateParent
 SHARED_MACHINE = SharedMachine()
 
 
@@ -987,23 +1009,19 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
     identity = process_start(os.getpid())
     if not isinstance(identity, Started):
         raise GateRefused("the gate has no readable process start")
-    directory = Path(tempfile.mkdtemp(prefix="gate-recovery-", dir=parent))
-    recovery = GateRecovery(directory / "run.json", str(repo.resolve()), os.getpid(), identity.start)
-    try:
-        with (directory / "operation.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_SH)
-            recovery.save()
-            token = ACTIVE_GATE_RECOVERY.set(recovery)
-            try:
-                yield recovery
-            finally:
-                ACTIVE_GATE_RECOVERY.reset(token)
-    finally:
-        if recovery.folders:
-            if not (recovery.groups or recovery.tokens or recovery.rollback):
+    request = build_folders.UniqueBuildFolder("gate-recovery-", build_folders.ExplicitBuildParent(parent))
+    keep = False
+    with build_folders.temporary_build_folder(request, keep_on_exit=lambda: keep) as directory:
+        recovery = GateRecovery(directory / "run.json", str(repo.resolve()), os.getpid(), identity.start)
+        recovery.save()
+        token = ACTIVE_GATE_RECOVERY.set(recovery)
+        try:
+            yield recovery
+        finally:
+            ACTIVE_GATE_RECOVERY.reset(token)
+            keep = bool(recovery.folders)
+            if keep and not (recovery.groups or recovery.tokens or recovery.rollback):
                 recovery.finish()
-        else:
-            shutil.rmtree(directory)
 
 
 @contextmanager
@@ -1778,29 +1796,49 @@ def module_runner(repo: Path) -> Path:
     return runner
 
 
-def _gate_job_parent() -> Path:
-    """Keep jobs below the module folder that the outer gate removes."""
-    root = build_folders.configured_gate_root()
-    if inherited_module := os.environ.get(GATE_MODULE_TEMP_DIR):
-        module = Path(inherited_module)
-        if module.is_dir() and (resolved := module.resolve()).is_relative_to(root.resolve()):
-            return resolved
-    return root
-
-
-def gate_test_parent(tmpfs: Path) -> Path:
-    """Return the parent of the gate test fixtures."""
-    return tmpfs / "merge-gate-tests"
-
-
-def report_retained_gate_test_folders(tmpfs: Path) -> None:
+def gate_suite_parent(repo: Path, location: GateSuiteLocation) -> PreparedTestRunsParent:
+    """Prepare the suite parent for this checkout."""
     try:
-        folders = sorted(gate_test_parent(tmpfs).iterdir())
-    except FileNotFoundError:
-        return
-    for folder in folders:
-        if not folder.is_symlink() and folder.is_dir():
-            report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
+        if isinstance(location, MacLinuxGuestGateParent):
+            parent = location.temporary_root.resolve() / "gate-test-runs"
+            if parent.is_symlink() or parent.is_relative_to(location.account_home.resolve()):
+                raise GateRefused(f"{parent}: the guest gate folder must be a directory outside the account home")
+        elif isinstance(location, NativeMacGateParent):
+            parent = location.path
+        else:
+            parent = build_folders.test_runs_parent(repo, placement=build_folders.TestRunPlacement.GATE)
+        resolved = parent.resolve()
+        try:
+            _ = git_files.locate(next(path for path in (resolved, *resolved.parents) if path.is_dir()))
+        except git_files.NotACheckout:
+            pass
+        else:
+            raise GateRefused(f"{parent}: the gate folder is inside a Git checkout")
+        if isinstance(location, (CheckoutTestRuns, MacLinuxGuestGateParent)):
+            parent.mkdir(parents=True, exist_ok=True)
+    except (OSError, RuntimeError, build_folders.InvalidFolderForm, git_files.GitFilesError) as error:
+        raise GateRefused(f"cannot prepare the test-runs parent for {repo}: {error}") from error
+    if not parent.is_dir() or not os.access(parent, os.W_OK):
+        raise GateRefused(f"the test runner requires a writable gate folder at {parent}")
+    return PreparedTestRunsParent(parent)
+
+
+def gate_test_parent(fixture_run: Path) -> Path:
+    """Return the parent of the gate test fixtures."""
+    return fixture_run / "merge-gate-tests"
+
+
+def report_retained_gate_test_folders(parent: Path) -> None:
+    for fixture_run in sorted(parent.glob("mg-*/merge-gate-tests")):
+        if fixture_run.is_symlink() or fixture_run.parent.is_symlink():
+            continue
+        try:
+            folders = sorted(fixture_run.iterdir())
+        except FileNotFoundError:
+            continue
+        for folder in folders:
+            if not folder.is_symlink() and folder.is_dir():
+                report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
 
 
 _GATE_RECEIVED_SIGTERM: ContextVar[bool] = ContextVar("gate_received_sigterm", default=False)
@@ -1876,17 +1914,20 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.GATE,
                machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine = SHARED_MACHINE,
+               suite_location: GateSuiteLocation = CHECKOUT_TEST_RUNS,
                local_grant: LocalGateAssignment | NoLocalGateGrant = NO_LOCAL_GATE_GRANT,
                selected: AllModules | SelectedModules | NamedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
     with unwind_gate_on_sigterm() if source != "checkpoint" else nullcontext():
         return _run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, source=source, full=full,
-                           mode=mode, machine=machine, local_grant=local_grant, selected=selected, time_limit=time_limit)
+                           mode=mode, machine=machine, suite_location=suite_location, local_grant=local_grant,
+                           selected=selected, time_limit=time_limit)
 
 
 def _run_suites(repo: Path, type_dirs: Sequence[str], module_time_limit_s: float, max_running_jobs: int, *,
                 source: Literal["tests-only", "checkpoint"], full: bool, mode: SuiteMode,
                 machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine,
+                suite_location: GateSuiteLocation,
                 local_grant: LocalGateAssignment | NoLocalGateGrant, selected: AllModules | SelectedModules | NamedModules,
                 time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit) -> GateRun:
     shared = not isinstance(machine, WholeMachine)
@@ -1916,9 +1957,7 @@ def _run_suites(repo: Path, type_dirs: Sequence[str], module_time_limit_s: float
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     runner = module_runner(repo)
-    gate_parent = _gate_job_parent()
-    if not gate_parent.is_dir() or not os.access(gate_parent, os.W_OK):
-        raise GateRefused(f"the test runner requires a writable gate folder at {gate_parent}")
+    gate_parent = gate_suite_parent(repo, suite_location)
     report_retained_gate_test_folders(gate_parent)
     hold = BuildHoldWait() if needs_shared_slots and isinstance(machine, SharedMachine) else None
     tested_tree: CleanTestTree | UnrecordableTestTree = UnrecordableTestTree("whole machine")
@@ -3615,20 +3654,26 @@ class GateAssignmentRefused(GateRefused):
     """The gate could not verify the placement supplied by the caller."""
 
 
-def gate_placement_targets(args: GateArguments, source: Path) -> tuple[str, ...]:
+DIRECT_GATE_TARGETS_ONLY = "direct gates require natedev or mac-linux"
+
+
+def gate_placement_targets(args: GateArguments, source: Path) -> placement.GateTargets:
     """Limit direct gates to natedev and Mac Linux."""
+    from scripts.build_targets.gate_targets import natedev_only_reason
+
     requested = first_step.gate_targets(args.command, source)
-    if not requested:
-        return ()
+    if not requested.names:
+        return requested
     flag = gate_natedev_only_flag(args.command)
     if flag is not None:
-        if "natedev" not in requested:
-            raise GateAssignmentRefused(f"gate.py {flag} runs only on natedev")
-        return ("natedev",)
-    targets = tuple(name for name in requested if name in ("natedev", "mac-linux"))
+        reason = natedev_only_reason(flag)
+        if "natedev" not in requested.names:
+            raise GateAssignmentRefused(reason)
+        return requested.restrict(("natedev",), reason)
+    targets = tuple(name for name in requested.names if name in ("natedev", "mac-linux"))
     if not targets:
-        raise GateAssignmentRefused("Direct gates require natedev or mac-linux")
-    return targets
+        raise GateAssignmentRefused(DIRECT_GATE_TARGETS_ONLY.capitalize())
+    return requested.restrict(targets, DIRECT_GATE_TARGETS_ONLY)
 
 
 @contextmanager
@@ -3641,7 +3686,7 @@ def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> 
         yield "natedev"
         return
     targets = gate_placement_targets(args, source)
-    if not targets:
+    if not targets.names:
         yield "natedev"
         return
     with gate_cleanup_scope() as cleanup:
@@ -3650,7 +3695,7 @@ def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> 
         if not isinstance(grant, first_step.GatePlacement):
             raise GateAssignmentRefused("The queue returned no gate placement")
         assignment = grant.grant.assignment
-        if assignment.destination.target not in targets:
+        if assignment.destination.target not in targets.names:
             raise GateAssignmentRefused("The queue returned a target outside the gate request")
         admitted.handoff(source)
         mode = SuiteMode.TARGETED if args.affected else SuiteMode.GATE
@@ -4263,12 +4308,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py {words}", file=sys.stderr, flush=True)
             return 1
         target = checked_gate_target(args)
-        if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
-                and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
-            target = "natedev"
-        checkpoint = not (args.affected or args.tests_only or args.nightly or args.promote_only)
-        with unwind_gate_on_sigterm() if not checkpoint else nullcontext():
-            return run_gate_command(args, target)
+        with ExitStack() as scope:
+            if isinstance(target, NoGateAssignment):
+                if args.promote_only:
+                    target = "natedev"
+                elif args.modules and isinstance(parent := outer_reservation(match_cpu_pool=True), OuterReservation):
+                    scope.enter_context(first_step.report_parent_gate_targets(parent))
+                    target = "natedev"
+            checkpoint = not (args.affected or args.tests_only or args.nightly or args.promote_only)
+            with unwind_gate_on_sigterm() if not checkpoint else nullcontext():
+                return run_gate_command(args, target)
     except GatePlacementIncomplete as error:
         print(error, file=sys.stderr, flush=True)
         return error.status
@@ -4282,7 +4331,8 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
         source = Path(args.repo).expanduser().resolve()
         check_named_modules(source, args.modules)
         mode = SuiteMode.TARGETED if args.affected else SuiteMode.GATE
-        with gate_cleanup_scope(test_run_folder() if args.affected else nullcontext()) as cleanup:
+        outer_run = test_run_folder(gate_suite_parent(source, CHECKOUT_TEST_RUNS)) if args.affected else nullcontext()
+        with gate_cleanup_scope(outer_run) as cleanup:
             assigned = cleanup.enter_context(gate_suite_target(args, source, target))
             return run_tests_only(args, mode, assigned)
     try:
