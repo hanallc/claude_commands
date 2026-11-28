@@ -48,25 +48,43 @@ def complete_quotes(text: str, normalized_quotes: dict[str, str]) -> Iterator[st
             yield original
 
 
+def _has_excluded_turn_markers(fields: dict[str, object]) -> bool:
+    return (any(fields.get(key) for key in ("isSidechain", "isMeta", "isCompactSummary",
+                                           "isSynthetic", "isVisibleInTranscriptOnly"))
+            or not fields.keys().isdisjoint({"source", "sourceToolAssistantUUID", "sourceToolUseID", "toolUseResult",
+                                            "turnCompanion", "pastedContents"}))
+
+
 def typed_turn(row: object) -> Iterator[NateWords]:
     if not isinstance(row, dict):
         return
     fields = cast(dict[str, object], row)
-    if (fields.get("type") != "user" or fields.get("origin") != {"kind": "human"}
-            or fields.get("turnOrigin") != "human" or fields.get("promptSource") not in ("typed", "queued")
-            or any(fields.get(key) for key in ("isSidechain", "isMeta", "isCompactSummary",
-                                               "isSynthetic", "isVisibleInTranscriptOnly"))
-            or fields.keys() & {"source", "sourceToolAssistantUUID", "sourceToolUseID", "toolUseResult",
-                                "turnCompanion", "pastedContents"}):
+    row_type = fields.get("type")
+    if row_type == "user":
+        if (fields.get("origin") != {"kind": "human"} or fields.get("turnOrigin") != "human"
+                or fields.get("promptSource") not in ("typed", "queued")):
+            return
+        message = fields.get("message")
+        if not isinstance(message, dict):
+            return
+        message = cast(dict[str, object], message)
+        if message.get("role") != "user" or "source" in message:
+            return
+        content, stamp = message.get("content"), fields.get("timestamp")
+    elif row_type == "attachment":
+        attachment = fields.get("attachment")
+        if not isinstance(attachment, dict):
+            return
+        attachment = cast(dict[str, object], attachment)
+        if (attachment.get("type") != "queued_command" or attachment.get("origin") != {"kind": "human"}
+                or attachment.get("humanTurn") is not True or attachment.get("commandMode") != "prompt"
+                or _has_excluded_turn_markers(attachment)):
+            return
+        content, stamp = attachment.get("prompt"), attachment.get("timestamp")
+    else:
         return
-    message = fields.get("message")
-    stamp = fields.get("timestamp")
-    if not isinstance(message, dict) or not isinstance(stamp, str):
+    if not isinstance(stamp, str) or _has_excluded_turn_markers(fields):
         return
-    message = cast(dict[str, object], message)
-    if message.get("role") != "user" or "source" in message:
-        return
-    content = message.get("content")
     if isinstance(content, str):
         words = content
     else:
@@ -76,10 +94,12 @@ def typed_turn(row: object) -> Iterator[NateWords]:
         for part in cast(list[object], content):
             if not isinstance(part, dict):
                 return
-            fields = cast(dict[str, object], part)
-            match fields:
-                case {"type": "text", "text": str(text)} if len(fields) == 2:
+            part_fields = cast(dict[str, object], part)
+            match part_fields:
+                case {"type": "text", "text": str(text)} if len(part_fields) == 2:
                     parts.append(text)
+                case {"type": "image", "source": dict()} if row_type == "user" and len(part_fields) == 2:
+                    continue
                 case _:
                     return
         words = "\n".join(parts)

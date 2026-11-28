@@ -117,6 +117,12 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         return {"type": "user", "origin": {"kind": "human"}, "turnOrigin": "human", "promptSource": "typed",
                 "timestamp": "2026-11-25T23:30:00-08:00", "message": {"role": "user", "content": text}}
 
+    def queued_turn(self, prompt: str | list[dict[str, object]], **attachment_fields: object) -> dict[str, object]:
+        return {"type": "attachment", "timestamp": "2026-11-28T00:00:00Z", "isSidechain": False,
+                "attachment": {"type": "queued_command", "prompt": prompt, "origin": {"kind": "human"},
+                               "humanTurn": True, "commandMode": "prompt", "timestamp": "2026-11-27T17:47:57.687Z",
+                               "source_uuid": "fixture-source", "delivery_id": "fixture-delivery", **attachment_fields}}
+
     def transcript(self, *turns: dict[str, object]) -> Path:
         path = self.home / ".claude/projects/fixture/conversation.jsonl"
         return self.write(path, "".join(json.dumps(turn) + "\n" for turn in turns))
@@ -461,6 +467,64 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             with self.subTest(case=case):
                 finding = self.verify_requested(self.transcript(turn), quote)
                 self.assertIsInstance(finding, expected)
+
+    def test_queued_human_command_verifies_a_quote_and_uses_attachment_time(self) -> None:
+        prompts: tuple[str | list[dict[str, object]], ...] = (MOVE_REQUEST, [{"type": "text", "text": MOVE_REQUEST}])
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                finding = self.verify_requested(self.transcript(self.queued_turn(prompt)), MOVE_REQUEST)
+                self.assertIsInstance(finding, behavior_review.NateRequest)
+                assert isinstance(finding, behavior_review.NateRequest)
+                self.assertEqual(finding.day, date(2026, 11, 27))
+
+    def test_typed_turn_with_an_image_verifies_the_text_quote(self) -> None:
+        content = [{"type": "text", "text": MOVE_REQUEST},
+                   {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}]
+        turn = {**self.typed_turn(MOVE_REQUEST), "message": {"role": "user", "content": content}}
+        self.assertIsInstance(self.verify_requested(self.transcript(turn), MOVE_REQUEST), behavior_review.NateRequest)
+
+    def test_queued_peer_command_does_not_verify(self) -> None:
+        turn = self.queued_turn(MOVE_REQUEST, origin={"kind": "peer", "from": "fixture-peer"})
+        self.assertIsInstance(self.verify_requested(self.transcript(turn), MOVE_REQUEST), behavior_review.NateSpecified)
+
+    def test_queued_meta_or_sidechain_command_does_not_verify(self) -> None:
+        queued = self.queued_turn(MOVE_REQUEST)
+        for turn in ({**queued, "isMeta": True}, {**queued, "isSidechain": True},
+                     self.queued_turn(MOVE_REQUEST, isMeta=True)):
+            with self.subTest(turn=turn):
+                finding = self.verify_requested(self.transcript(turn), MOVE_REQUEST)
+                self.assertIsInstance(finding, behavior_review.NateSpecified)
+
+    def test_queued_command_requires_exact_provenance_text_and_time(self) -> None:
+        for case, turn in (
+            ("unknown attachment", self.queued_turn(MOVE_REQUEST, type="note")),
+            ("extra origin field", self.queued_turn(MOVE_REQUEST, origin={"kind": "human", "extra": True})),
+            ("numeric human turn", self.queued_turn(MOVE_REQUEST, humanTurn=1)),
+            ("non-prompt mode", self.queued_turn(MOVE_REQUEST, commandMode="task-notification")),
+            ("extra text field", self.queued_turn([{"type": "text", "text": MOVE_REQUEST, "extra": True}])),
+            ("image", self.queued_turn([{"type": "text", "text": MOVE_REQUEST}, {"type": "image", "source": {}}])),
+            ("naive time", self.queued_turn(MOVE_REQUEST, timestamp="2026-11-27T17:47:57")),
+            ("invalid time", self.queued_turn(MOVE_REQUEST, timestamp="invalid")),
+            ("paste", self.queued_turn(f"<pasted_content>\n{MOVE_REQUEST}\n</pasted_content>")),
+            ("generated tag", self.queued_turn(f'<system-reminder source="script">\n{MOVE_REQUEST}\n</system-reminder>')),
+            ("generated prefix", self.queued_turn(f"Another Claude session sent a message.\n{MOVE_REQUEST}")),
+        ):
+            with self.subTest(case=case):
+                finding = self.verify_requested(self.transcript(turn), MOVE_REQUEST)
+                self.assertIsInstance(finding, behavior_review.NateSpecified)
+
+    def test_typed_turn_with_a_tool_result_or_malformed_image_does_not_verify(self) -> None:
+        invalid_parts: tuple[dict[str, object], ...] = (
+            {"type": "tool_result", "tool_use_id": "fixture-tool", "content": "Fixture tool result."},
+            {"type": "image", "source": "invalid"},
+            {"type": "image", "source": {}, "text": "extra"},
+        )
+        for part in invalid_parts:
+            with self.subTest(part=part):
+                content = [{"type": "text", "text": MOVE_REQUEST}, part]
+                turn = {**self.typed_turn(MOVE_REQUEST), "message": {"role": "user", "content": content}}
+                finding = self.verify_requested(self.transcript(turn), MOVE_REQUEST)
+                self.assertIsInstance(finding, behavior_review.NateSpecified)
 
     def test_only_sent_list_tell_feedback_from_nate_verifies(self) -> None:
         store, item = self.new_list_record()
