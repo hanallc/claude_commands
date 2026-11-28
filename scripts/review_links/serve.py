@@ -2053,12 +2053,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                             claims=claims)
                     except review_actions.SubmissionDeliveryPending:
                         deliveries = review_actions.SubmissionDeliveries()
-                    if (on_list or isinstance(request, new_item_dialog.NewItemRequest) and
-                            request.page_recipient == new_item_dialog.PageRecipient.PRODUCER
-                            or isinstance(saved.record, investigation.Investigation) and saved.record.belongs_on_list):
-                        number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
-                        if isinstance(number, int):
-                            response["list_number"] = number
+                    record = saved.record
+                    if ((isinstance(record, investigation.Investigation) and record.belongs_on_list) or on_list
+                            or isinstance(request, new_item_dialog.NewItemRequest)
+                            and request.page_recipient == new_item_dialog.PageRecipient.PRODUCER):
+                        response.update(review_actions.submission_list_receipt(saved, created.members))
                 if pending or (main_request is not None and list_page_request
                                and isinstance(screenshot, new_item_dialog.PageScreenshot)):
                     if review_submissions.PAGE_SCREENSHOT not in details.images:

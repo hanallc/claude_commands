@@ -571,6 +571,37 @@ def submission_report_row(saved: review_submissions.SavedSubmission) -> the_list
     raise OSError(f"Cannot read the List filing for {saved.id}.")
 
 
+def submission_list_receipt(saved: review_submissions.SavedSubmission,
+                            members: staff.StaffSnapshot) -> dict[str, object]:
+    """Read the saved List number, owner and producer for a New item receipt."""
+    record = saved.record
+    report = (record if isinstance(record, investigation.Investigation) and record.belongs_on_list
+              else the_list.NoListReport.ABSENT)
+    number: int | the_list.NextNumber = the_list.NextNumber.AVAILABLE
+    try:
+        if isinstance(report, investigation.Investigation) and isinstance(
+                report.list_destination, investigation.ListDestination):
+            number = report.list_destination.number
+        else:
+            number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
+        if isinstance(report, investigation.Investigation):
+            row = submission_report_row(saved)
+            assert isinstance(row, the_list.ListItem)
+        else:
+            if not isinstance(number, int):
+                return {}
+            route = review_submissions.list_filing_route(saved)
+            if isinstance(route, (review_submissions.NoListFiling, review_submissions.ListFilingUnavailable)):
+                raise OSError(f"Cannot read the List route for {saved.id}.")
+            row = the_list.load(route["keeper"], f"L{number}")
+        number = row.number
+        owner = row.owner.value if isinstance(row.owner, the_list.UnassignedOwner) else review_items.name(row.owner, members)
+        return {"list_number": number, "list_owner": owner, "list_producer": review_items.name(row.producer, members)}
+    except (OSError, ValueError) as error:
+        print(f"review-links New item receipt: {error}", file=sys.stderr)
+        return {"list_number": number} if isinstance(number, int) else {}
+
+
 def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
     """Finish a staged List row before claiming its notice."""
     record = saved.record

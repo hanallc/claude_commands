@@ -1755,20 +1755,31 @@ UNDO_PROBE = r"""
 const failures = [];
 const check = (value, description) => { if (!value) failures.push(description); };
 const wire = [], fetchHTTP = window.fetch, host = window.top.document;
-const outcome = __OUTCOME__;
-const held = '/send-hold/' + 'a'.repeat(24), saved = {id:'I1',key:'bug/owner/I1'};
+const outcome = __OUTCOME__, kind = __KIND__;
+const linked = kind === 'question';
+const held = '/send-hold/' + 'a'.repeat(24);
+const saved = linked ? {id:'Q1',key:'question/owner/Q1'} : {id:'I1',key:'bug/owner/I1'};
+const report = outcome.startsWith('report-');
+const builds = report || outcome === 'skipped-list';
+if (report) saved.list_number = 17;
+if (outcome === 'report-receipt') Object.assign(saved, {list_owner:'builds', list_producer:'sdlc'});
+const filing = Promise.withResolvers(), confirmFiling = Promise.withResolvers();
 let realSends = 0;
 window.fetch = async (path, options = {}) => {
  path = String(path);
  if (path === held + '/undo') return Response.json({outcome:'undone'});
  if (path === held) {
   realSends++;
+  if (builds) {
+   filing.resolve();
+   await confirmFiling.promise;
+  }
   return outcome === 'failure' ? Response.json({error:'The test send failed.'},{status:503}) : Response.json(saved);
  }
  if (!path.startsWith('/console/review/new-item')) return fetchHTTP(path, options);
  if (!options.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[
   {id:'owner',name:'sdlc',proposal:true}, {id:'chosen',name:'chosen producer',proposal:true},
- ]});
+ ], ...(linked ? {page_assignee:'builds-owner',assignees:[{id:'builds-owner',name:'builds'}]} : {})});
  const payload = JSON.parse(options.body);
  // The screenshot stays pending, so the first Send keeps its item for a retry.
  if (payload.page_capture) return new Promise(() => {});
@@ -1796,6 +1807,7 @@ const type = text => {
  try {
   launch.click();
   await until(() => dialog.querySelector('[data-recipients] input:checked'), 'The dialog did not load its recipients.');
+  dialog.querySelector('[name="kind"][value="'+kind+'"]').click();
   dialog.querySelector('[name="recipient_id"][value="chosen"]').click();
   type('The first words.');
   const input = new DataTransfer();
@@ -1814,6 +1826,9 @@ const type = text => {
   check(!dialog.open && document.activeElement === launch, 'Send closes the dialog and returns focus at once.');
   const toast = () => host.querySelector('[data-send-undo]');
   await until(() => toast()?.querySelector('button'), 'The Undo toast did not show.');
+  const undoToast = toast();
+  const toastVisible = () => toast() === undoToast && !undoToast.hidden &&
+    undoToast.getClientRects().length > 0 && getComputedStyle(undoToast).opacity === '1';
   check(toast().querySelector('span').textContent === 'Sent to chosen producer.',
         'The toast names the selected recipient.');
   check(toast().querySelector('button').textContent === 'Undo', 'The toast offers Undo.');
@@ -1830,15 +1845,30 @@ const type = text => {
   const undo = outcome.startsWith('undo') || outcome === 'second-draft';
   if (undo) toast().querySelector('button').click();
   else {
-   const [fade] = toast().getAnimations();
-   check(fade.effect.getTiming().duration === 30000, 'The toast uses the duration from the server.');
-   fade.finish();
+   const [hold] = undoToast.getAnimations();
+   check(hold.effect.getTiming().duration === 30000, 'The toast uses the duration from the server.');
+   if (builds) {
+    hold.pause();
+    hold.currentTime = 29000;
+    const opacity = Number(getComputedStyle(undoToast).opacity);
+    check(toast() === undoToast && !undoToast.hidden && opacity > 0 && opacity < .2 &&
+          undoToast.querySelector('button')?.textContent === 'Undo',
+          'The message fades during the hold and still offers Undo.');
+   }
+   hold.finish();
+   if (builds) {
+    await filing.promise;
+    check(undoToast.hidden && !undoToast.querySelector('button') &&
+          undoToast.querySelector('span').textContent === 'Sent to chosen producer.',
+          'The message hides when the hold ends and the server still has no result.');
+    confirmFiling.resolve();
+   }
   }
   if (undo || outcome === 'failure') {
    await until(() => dialog.open && !error.hidden && !send.disabled, 'The dialog did not reopen for editing.');
    check(error.textContent === (undo ? 'Undone. Edit and send again.' : 'The test send failed.'),
          'The dialog shows the result above the draft.');
-   check(words.value === 'The first words.' && dialog.querySelector('[name="kind"]:checked')?.value === 'bug' &&
+   check(words.value === 'The first words.' && dialog.querySelector('[name="kind"]:checked')?.value === kind &&
          dialog.querySelector('[name="recipient_id"]:checked')?.value === 'chosen',
          'The dialog restores the type, recipient and words.');
    check(image && dialog.querySelector('[data-previews] img')?.src === image, 'The dialog restores the pasted image.');
@@ -1858,9 +1888,22 @@ const type = text => {
   }
   await until(() => events.length === 2, 'The successful Send did not report the saved item.');
   check(JSON.stringify(events) === JSON.stringify([
-   ['review-item-saved', 'I1', false], ['review-item-created', 'I1', false]
+   ['review-item-saved', saved.id, false], ['review-item-created', saved.id, false]
   ]), 'Send closes the dialog before it reports the saved item.');
-  check(!toast(), 'The Undo toast disappears.');
+  if (builds) {
+   check(wire[0][0].page === 'builds', 'Send uses the Builds page.');
+   if (linked) check(wire[0][0].page_recipient === 'producer' && wire[0][0].assignee_id === 'builds-owner',
+                     'The Question uses the producer route and the Builds assignee.');
+  }
+  if (report) {
+   const receipt = outcome === 'report-receipt' ? 'List item 17. Owner builds. Producer sdlc.' : 'List item 17.';
+   check(toastVisible() && !undoToast.querySelector('button') && undoToast.querySelector('span').textContent === receipt,
+         'The same toast shows the List receipt at full opacity.');
+   const [fade] = undoToast.getAnimations();
+   check(fade.effect.getTiming().duration === 3000, 'The List receipt starts a new three-second fade.');
+   fade.finish();
+   await until(() => !toast(), 'The List receipt did not fade.');
+  } else check(!toast(), 'The Undo toast disappears.');
   if (undo) {
    check(wire.length === 2 && wire[0][0].words === 'The first words.' &&
          wire[1][0].words === 'The edited words.' && wire[1][1] === '1',
@@ -1869,7 +1912,7 @@ const type = text => {
          JSON.stringify(wire[1][0].defer_capture) === JSON.stringify(wire[0][0].defer_capture),
          'The Send after Undo uses the same page capture.');
   } else {
-   check(wire.length === 1 && wire[0][0].kind === 'bug' && wire[0][1] === '1', 'Send holds the Bug once.');
+   check(wire.length === 1 && wire[0][0].kind === kind && wire[0][1] === '1', 'Send holds the selected type once.');
   }
  } catch (failure) {
   failures.push(String(failure));
@@ -3392,6 +3435,19 @@ window.fetch = (path, options = {}) => {
         self.assert_held_send("success")
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_builds_send_shows_the_list_receipt_in_the_undo_message(self) -> None:
+        for kind, outcome in (("bug", "report-receipt"), ("bug", "report-number"),
+                              ("enhancement", "report-receipt"), ("question", "report-receipt")):
+            with self.subTest(kind=kind, outcome=outcome):
+                probe = UNDO_PROBE.replace("__OUTCOME__", json.dumps(outcome)).replace("__KIND__", json.dumps(kind))
+                self.assertEqual(firefox_probe_results(fixture_page(1440, photo=False, script=probe)), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_builds_question_fades_when_list_filing_is_skipped(self) -> None:
+        probe = UNDO_PROBE.replace("__OUTCOME__", '"skipped-list"').replace("__KIND__", '"question"')
+        self.assertEqual(firefox_probe_results(fixture_page(1440, photo=False, script=probe)), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_undo_reopens_the_new_item_with_the_words(self) -> None:
         self.assert_held_send("undo")
 
@@ -3410,7 +3466,7 @@ window.fetch = (path, options = {}) => {
         self.assert_held_send("failure")
 
     def assert_held_send(self, outcome: str) -> None:
-        probe = UNDO_PROBE.replace("__OUTCOME__", json.dumps(outcome)).replace("__PNG__", PNG)
+        probe = UNDO_PROBE.replace("__OUTCOME__", json.dumps(outcome)).replace("__KIND__", '"bug"').replace("__PNG__", PNG)
         self.assertEqual(firefox_probe_results(bug_fixture_page(script=probe)), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")

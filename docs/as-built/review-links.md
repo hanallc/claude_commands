@@ -939,7 +939,11 @@ The producer notice says **You assign it.**
 Changing the producer keeps **None** selected.
 The browser keeps the assignee choice in the submitted draft for recovery and Retry.
 **Send** closes the New item dialog at once.
-The user can work on the page while the fading **Undo** toast shows.
+The user can work on the page while the **Undo** toast shows.
+The toast fades during the Undo time for every send.
+If the reply includes a List number, the same toast shows the number and any owner and producer names.
+The receipt starts a new fade at full opacity.
+The server sends the notice even if it cannot read the receipt.
 **Undo** reopens the dialog with the same type, recipient, words, images and page capture.
 A failed send reopens the draft and shows the error.
 A retry after a lost response sends the original request again.

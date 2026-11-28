@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, tzinfo
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Self, TextIO, cast
+from typing import Callable, Literal, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, conf_reads, urgency
 from scripts.lib import user_zone as user_zone_config
@@ -7461,44 +7461,57 @@ window.fetch=async(url,options={})=>{
                 markup = page.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
                 self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
-    def new_item_filter_page(self, kind: new_item_dialog.SubmissionKind, *, matches_filters: bool = False) -> bytes:
+    def new_item_filter_page(self, kind: new_item_dialog.SubmissionKind | Literal['enhancement'], *,
+                             matches_filters: bool = False, hold_review_only: bool = False) -> bytes:
         owner = self.ready_submission_recipient()
         _ = self.question('Keep this question')
         cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
         before = cache.get()
-        request = self.submission_request(kind, owner.id)
+        filed_kind = new_item_dialog.SubmissionKind.INVESTIGATION if kind == 'enhancement' else kind
+        request = replace(self.submission_request(filed_kind, owner.id), kind=kind)
         if matches_filters:
             request = replace(request, words='Keep this question too.')
         created = cache.create_submission(request)
         fresh = cache.get()
+        expect_report = filed_kind in (new_item_dialog.SubmissionKind.BUG, new_item_dialog.SubmissionKind.INVESTIGATION)
         values: dict[str, object] = {
             'owner': owner.id, 'key': created.key, 'id': created.saved.id, 'kind': kind,
+            'held': expect_report or hold_review_only,
             'words': request.words, 'matches': matches_filters,
             'body': fresh.body(created.key).decode(), 'snapshot': cast(object, json.loads(fresh.index_response())),
         }
         receipt: dict[str, object] = {'id': created.saved.id, 'key': created.key, 'version': fresh.version}
-        if kind in (new_item_dialog.SubmissionKind.INVESTIGATION, new_item_dialog.SubmissionKind.BUG):
+        if expect_report:
+            self.assertIsInstance(created.saved.record, investigation.Investigation)
             row = review_actions.submission_report_row(created.saved)
             assert isinstance(row, the_list.ListItem)
             assert isinstance(row.report, the_list.ListReport)
-            self.assertEqual((row.report.kind, row.report.evidence_key, row.report.words), (
-                the_list.ReportKind.BUG if kind == new_item_dialog.SubmissionKind.BUG
-                else the_list.ReportKind.INVESTIGATION, created.key, request.words))
+            self.assertEqual((row.report.kind.value.lower(), row.report.evidence_key, row.report.words),
+                             (kind, created.key, request.words))
             assert not isinstance(row.owner, the_list.UnassignedOwner)
             receipt.update(list_number=row.number, list_owner=review_items.name(row.owner, created.members),
                            list_producer=review_items.name(row.producer, created.members))
         values['receipt'] = receipt
         setup = r'''<script>
 const fixture=FIXTURE, nativeFetch=fetch;
+const hold='a'.repeat(24), filing=Promise.withResolvers(), confirmFiling=Promise.withResolvers();
 let sent=false;
 const selection={owner:fixture.owner,type:fixture.matches?fixture.kind:'question',
  show:fixture.matches?'all':'open',q:'keep this question'};
 history.replaceState(null,'','#'+new URLSearchParams(selection));
 window.fetch=async(url,options={})=>{
  const route=new URL(url,location.href);
+ if(route.pathname==='/send-hold/'+hold){
+  filing.resolve();
+  await confirmFiling.promise;
+  sent=true;
+  return Response.json(fixture.receipt);
+ }
  if(route.pathname==='/console/review/new-item'){
   if(options.method==='POST'){
    if(JSON.parse(options.body).page_capture) return Response.json({});
+   if(fixture.held && new Headers(options.headers).get('X-Undo-Hold')==='1')
+    return Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
    sent=true;
    return Response.json(fixture.receipt);
   }
@@ -7517,6 +7530,9 @@ window.fetch=async(url,options={})=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const review=document.querySelector('[data-review]'), dialog=document.querySelector('#review-new-item');
  const params=()=>new URLSearchParams(location.hash.slice(1));
+ const host=window.top.document, toast=()=>host.querySelector('[data-send-undo]');
+ const visible=message=>toast()===message && !message.hidden && message.getClientRects().length>0 &&
+  host.defaultView.getComputedStyle(message).opacity==='1';
  try {
   const previous=history.length, previousHash=location.hash;
   check(params().get('owner')===fixture.owner, 'The original owner filter is active.');
@@ -7538,15 +7554,44 @@ window.fetch=async(url,options={})=>{
   words.dispatchEvent(new Event('input',{bubbles:true}));
   const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
   const created=new Promise(resolve=>document.addEventListener('review-item-created',resolve,{once:true}));
+  const receipt=fixture.receipt;
+  let message;
+  const shown=fixture.held && new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(toast()?.querySelector('button')){observer.disconnect();resolve(toast());}
+   });
+   observer.observe(host.body,{childList:true,subtree:true});
+  });
   dialog.querySelector('[type="submit"]').click();
+  if(shown){
+   message=await shown;
+   check(visible(message) && message.querySelector('button').textContent==='Undo' &&
+         message.querySelector('span').textContent==='Sent to page-owner.', 'The hold shows the recipient and Undo.');
+   const [countdown]=message.getAnimations();
+   countdown.pause();
+   countdown.currentTime=29000;
+   const opacity=Number(host.defaultView.getComputedStyle(message).opacity);
+   check(!message.hidden && opacity>0 && opacity<.2 && message.querySelector('button')?.textContent==='Undo',
+         'The message fades during the hold and still offers Undo.');
+   countdown.finish();
+   await filing.promise;
+   check(message.hidden && !message.querySelector('button') &&
+         message.querySelector('span').textContent==='Sent to page-owner.',
+         'The message hides when the hold ends and the server still has no result.');
+   confirmFiling.resolve();
+  }
   const event=await created;
   check(!dialog.open && event.detail.id===fixture.id,'Send closes the dialog and reports the saved ID.');
-  const receipt=fixture.receipt;
   if(receipt.list_number){
    const text='List item '+receipt.list_number+'. Owner '+receipt.list_owner+'. Producer '+receipt.list_producer+'.';
-   check(window.top.document.querySelector('[data-report-receipt]')?.textContent===text,
-         'Send shows the saved List number, owner, and producer.');
-  }
+   check(visible(message) && !message.querySelector('button') && message.querySelector('span').textContent===text,
+         'The same message shows the saved List number, owner, and producer at full opacity.');
+   const [fade]=message.getAnimations();
+   check(fade.effect.getTiming().duration===3000,'The List receipt starts a new three-second fade.');
+   fade.finish();
+   await fade.finished;
+   check(!toast(), 'The List receipt fades.');
+  }else check(!toast(), 'A Review-only send leaves no List receipt.');
   await refreshed;
   const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
   check(Object.entries(selection).every(([key,value])=>params().get(key)===value),
@@ -7584,9 +7629,16 @@ window.fetch=async(url,options={})=>{
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_new_items_keep_every_review_filter(self) -> None:
-        for kind in new_item_dialog.SubmissionKind:
+        kinds: tuple[new_item_dialog.SubmissionKind | Literal['enhancement'], ...] = (
+            *new_item_dialog.SubmissionKind, 'enhancement')
+        for kind in kinds:
             with self.subTest(kind=kind):
                 self.assertEqual(firefox_probe_results(self.new_item_filter_page(kind)), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_review_only_question_fades_during_undo(self) -> None:
+        page = self.new_item_filter_page(new_item_dialog.SubmissionKind.QUESTION, hold_review_only=True)
+        self.assertEqual(firefox_probe_results(page), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_new_item_opens_when_it_matches_every_review_filter(self) -> None:

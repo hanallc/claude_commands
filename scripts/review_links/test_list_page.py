@@ -1908,12 +1908,15 @@ if(example.filterOn){
             delivery = list_page.submit(root, urlencode(self.fields(item, "question", words="What changed?")))
             list_page.deliver(delivery)
         waiting = the_list.load(MORTY.id, item.id)
-        entries = [list_page.ListRecord(MORTY.id, replace(waiting, number=number)) for number in range(1, 321)]
+        # An item with no active producer has no Make top priority action.
+        entries = [list_page.ListRecord(MORTY.id, replace(waiting, number=number, producer=staff.StaffId("missing")))
+                   for number in range(1, 321)]
         with (patch.object(list_page, "records", return_value=entries),
               patch.object(the_list, "question_visibility", return_value=the_list.WaitingForAnswer())):
             markup = list_page.render(root, include_counts=False).decode()
         self.assertEqual(markup.count('data-waiting-for-answer="true"'), 320)
         self.assertEqual(markup.count('name="token"'), 0)
+        _ = staff.set_producer_top_item(waiting.producer, staff.TopItem(waiting.number))
         self.check_list_tag_editor(r"""
  const detail=recordDetails(row());
  check(!detail.querySelector('[data-feedback-form]'),'The waiting item has no feedback controls.');
