@@ -38,7 +38,9 @@ At capacity, the store logs and removes the oldest record before it accepts a ne
 Slash-command classification is a heuristic, as described in `session-roster.md`.
 Raw agent calls to `herdr send-text` remain outside this source-marking rule.
 
-`scripts/hooks/user-prompt-submit-conversation-pause.py` classifies the prompt, stamps typed activity through `escalate.typed()`, and calls `message_arrived`. `scripts/hooks/stop-conversation-pause.py` calls:
+`scripts/hooks/user-prompt-submit-conversation-pause.py` classifies the prompt, records typed activity through `escalate.typed()`, and calls `message_arrived`.
+`scripts/hooks/pause_record.py` defines the pause record and scheduled prompt record.
+The Stop hook imports this module in its worker and calls:
 
 ```python
 mark_reply_ended(session_id: str, now: int) -> None
