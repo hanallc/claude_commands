@@ -327,14 +327,18 @@ class InvestigationTests(unittest.TestCase):
         destination = other.list_destination
         assert isinstance(destination, investigation.ListDestination)
         self.assertEqual(destination.keeper, LIST_KEEPER.id)
-        row = the_list.load(destination.keeper, f"L{destination.number}")
+        rows = the_list.records(destination.keeper, include_closed=True)
+        self.assertEqual(len(rows), 3)
+        row = next(item for item in rows if item.id == f"L{destination.number}")
         self.assertEqual((row.owner, row.producer), (OTHER.id, OTHER.id))
         assert isinstance(row.report, the_list.ListReport)
         self.assertEqual(row.report.evidence_key, f"investigation/{OTHER.id}/I14")
-        answers = {exchange.source_key: exchange.answer.text
-                   for item in the_list.records(LIST_KEEPER.id) for exchange in item.filed_exchanges
-                   if isinstance(exchange.answer, list_exchange.ExchangeAnswer)}
-        self.assertEqual(answers, {f"investigation/{OWNER.id}/{identity}": "Found it." for identity in ("I1", "I12")})
+        exchanges = [exchange for item in rows for exchange in item.filed_exchanges]
+        self.assertEqual(len(exchanges), 2)
+        answers = [(exchange.source_key, exchange.answer.text) for exchange in exchanges
+                   if isinstance(exchange.answer, list_exchange.ExchangeAnswer)]
+        self.assertCountEqual(answers, [(f"investigation/{OWNER.id}/{identity}", "Found it.")
+                                        for identity in ("I1", "I12")])
 
     def test_missing_callers_and_invalid_inputs_get_one_refusal_line(self) -> None:
         for args in (("file", "--title", "Two\nlines", "--question", "Why?"),

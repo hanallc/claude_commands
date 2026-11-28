@@ -1663,7 +1663,9 @@ window.fetch=(url,options)=>{
             self.assertTrue(retry.wait(TEST_HANG_GUARD_SECS))
             cache.synchronize()
         self.assertEqual(during_retry, [False])
-        self.assertNotIn(key, {entry['key'] for entry in cache.get().entries})
+        current = cache.get()
+        self.assertNotIn(key, {entry['key'] for entry in current.entries})
+        self.assertNotIn(key, current.records)
         item = the_list.load(destination.keeper, f'L{destination.number}')
         self.assertIs(item.state, the_list.ItemState.WORKING)
 
@@ -8490,11 +8492,18 @@ window.fetch=(url,options={})=>{
  if(options.method==='POST') return Promise.resolve(Response.json({answer:'works'}));
  return sendProbe(url,options);
 };
-if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#'+new URLSearchParams({item:INITIAL_ITEM}));
+const reloaded=Boolean(sessionStorage.getItem('review-reload'));
+const copied=CASE==='copied' || CASE==='copied-legacy';
+if(!reloaded){
+ const place=CASE==='copied-legacy' ? {show:'all'} : {item:INITIAL_ITEM};
+ history.replaceState(null,'','#'+new URLSearchParams(place));
+}
+if((copied || CASE==='appearance') && reloaded) history.replaceState(null,'');
+const initialHistory=history.state;
 </script>"""
         count_requests = r"""<script>
 let arrivingReviewRow;
-const removeSavedRow=CASE==='restored' && sessionStorage.getItem('review-reload');
+const removeSavedRow=(CASE==='restored' || copied) && reloaded;
 if(CASE==='appearance' || removeSavedRow){
  const node=document.querySelector('[data-review-index]'),index=JSON.parse(node.textContent);
  const key=removeSavedRow ? 'page-owner/C1' : 'page-owner/C2';
@@ -8522,9 +8531,9 @@ window.fetch=(url,options)=>{
  window.fetch=(url,options)=>new URL(url,location.href).search==='?version=1'
   ? Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}))
   : fetchCard(url,options);
- const follow=async item=>{
+ const follow=async params=>{
   const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-  location.hash=new URLSearchParams({item});
+  location.hash=new URLSearchParams(params);
   await changed;
  };
  const refreshIndex=async update=>{
@@ -8545,11 +8554,15 @@ window.fetch=(url,options)=>{
   if(CASE==='appearance'){
    check(!notice.hidden && addressItem()==='builds/C2' && !row(otherKey),
     'Review shows the notice while the shown ID is missing.');
+   if(!reloaded && !failures.length){
+    sessionStorage.setItem('review-reload','1');location.reload();return;
+   }
+   check(initialHistory===null,'The missing shown ID loads without browser history state.');
    await refreshIndex(index=>index.r.push(arrivingReviewRow));
    await readyReviewCard(row(otherKey));
    check(expanded(otherKey) && notice.hidden && addressItem()===otherKey,
     'A refresh resolves the missing shown ID and opens its card.');
-  }else if(!sessionStorage.getItem('review-reload')){
+  }else if(!reloaded){
    if(CASE==='verdict'){
     const form=await readyReviewCard(row());
     check(expanded(key) && notice.hidden,
@@ -8566,9 +8579,14 @@ window.fetch=(url,options)=>{
     form.requestSubmit(form.querySelector('[value="works"]'));
     await saved;
     history.replaceState(null,'','#item=page-owner%2FC1');
-   }else if(CASE==='restored'){
-    check(expanded(key) && notice.hidden && history.state?.recordTable?.linkedItem===key,
+   }else if(CASE==='restored' || copied){
+    if(CASE==='copied-legacy') row().querySelector('.list-toggle').click();
+    check(expanded(key) && notice.hidden && history.state?.recordTable?.opened[0]===key,
      'Review saves the key of the open card.');
+    if(CASE==='copied-legacy'){
+     const params=new URLSearchParams(location.hash.slice(1));params.delete('item-kind');
+     history.replaceState(history.state,'','#'+params);
+    }
    }else content.querySelector('[data-filter-row="show"] [data-filter-value="open"]').click();
    if(!failures.length){
     sessionStorage.setItem('review-reload','1');
@@ -8581,13 +8599,18 @@ window.fetch=(url,options)=>{
    await refreshIndex(index=>{index.r=index.r.filter(entry=>entry[0]!==key);});
    check(!row() && !sessionStorage.getItem(savedKey),
     'The new snapshot confirms the removal and clears the saved verdict marker.');
-   await follow('BUILDS/c2');
+   await follow({item:'BUILDS/c2'});
    check(expanded(otherKey) && notice.hidden && addressItem()===otherKey,
     'A new link resolves the shown ID and clears the missing item notice.');
-   await follow('unknown/C1');
+   await follow({item:'unknown/C1'});
    check(!notice.hidden && notice.textContent==='This review is no longer on the Review page.',
     'An unknown ID shows the missing item notice.');
-  }else if(CASE==='restored'){
+   await follow({show:'all',key:'builds/C2'});
+   const shown=[...content.querySelectorAll('[data-list-item]:not([hidden])')];
+   check(shown.length===1 && shown[0].dataset.key===otherKey && !expanded(otherKey),
+    'A filter link shows the row with the matching ID and keeps its card closed.');
+  }else if(CASE==='restored' || copied){
+   if(copied) check(initialHistory===null,'The copied address loads without browser history state.');
    check(!row() && row(otherKey) && !expanded(otherKey) && !notice.hidden && addressItem()===key,
     'A missing saved key does not open a card with the same shown ID.');
    check(initialBodyRequests.length===0,'Review does not request a card for the missing saved key.');
@@ -8598,13 +8621,13 @@ window.fetch=(url,options)=>{
  await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
-        for case in ('verdict', 'restored', 'appearance', 'show'):
+        for case in ('verdict', 'restored', 'copied', 'copied-legacy', 'appearance', 'show'):
             with self.subTest(case=case):
                 if case == 'show':
                     _ = change_review.record_verdict(self.fixture.review_list, 'C1', 'works',
                                                      datetime.now(user_zone()).date(), self.fixture.production)
                 shown_ids = {'page-owner/C1': 'builds/C1', 'page-owner/C2': 'builds/C2'} if case == 'verdict' else {}
-                if case == 'restored':
+                if case in ('restored', 'copied', 'copied-legacy'):
                     shown_ids = {'page-owner/C2': 'page-owner/C1'}
                 if shown_ids:
                     records = [replace(item, id=shown_ids[item.key]) if item.key in shown_ids else item
@@ -8614,7 +8637,8 @@ window.fetch=(url,options)=>{
                 else:
                     page = browser_markup(self.root)
                 item = {'verdict': 'BUILDS/c1', 'appearance': 'builds/C2'}.get(case, 'page-owner/C1')
-                page = page.replace('<head>', '<head>'+setup.replace('INITIAL_ITEM', json.dumps(item)), 1)
+                page = page.replace('<head>', '<head>'+setup.replace('INITIAL_ITEM', json.dumps(item))
+                                    .replace('CASE', json.dumps(case)), 1)
                 request_script = '<script>'+review_page.CARD_REQUEST_SCRIPT
                 page = page.replace(request_script, count_requests.replace('CASE', json.dumps(case))+request_script, 1)
                 page = page.replace('</body>', probe.replace('CASE', json.dumps(case))+'</body>', 1)

@@ -2326,6 +2326,7 @@ function readIndex(payload){
  return new Map(payload.r.map((row,at)=>[row[0],indexEntry(payload,row,at)]));
 }
 let index=readIndex(JSON.parse(document.querySelector('[data-review-index]').textContent));
+const reviewRecordLinks={stableItemLinks:true,resolveItem:value=>resolveShownRecordId(index,value)};
 function reviewRequestSignal(){
  const seconds=Number(document.querySelector('[data-review]').dataset.requestTimeoutSeconds);
  return AbortSignal.timeout(seconds*1000);
@@ -2346,7 +2347,7 @@ const firstReviewCard=(()=>{
  }
  const params=recordPlaceParams(reviewPlaceOptions);
  legacyReviewPlace(params);
- const key=recordItemLink(params,value=>resolveShownRecordId(index,value));
+ const key=recordItemLink(params,reviewRecordLinks.resolveItem,reviewRecordLinks);
  if(!index.has(key)) return null;
  const version=document.querySelector('[data-review]').dataset.version;
  const result=requestReviewCard(key,version);
@@ -2495,7 +2496,7 @@ const mountReviewRow=entry=>reviewCardSummary(entry,Number(content.dataset.title
   filterRow('type').querySelector('[data-filter-value="'+entry.type+'"] .review-icon').outerHTML);
 const missingReview='This review is no longer on the Review page.';
 let missingCard=false;
-const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
+const view=createRecordTable({...reviewPlaceOptions,...reviewRecordLinks,content:()=>content,
  entries:allEntries,mount:mountReviewRow,mounted:()=>loadBodies(),
  retainDetailState:(previous,row)=>{
   const version=previous.dataset.bodyVersion;
@@ -2526,7 +2527,6 @@ const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
  },
  selectOwner:(rows,filters)=>!filters.owner || rows.some(({dataset:entry})=>
   availableForFilters(entry,filters) && ownerHasType(entry,filters)) ? filters.owner : '',
- resolveItem:value=>resolveShownRecordId(index,value),
  hasKey:key=>index.has(key),
  shows:showValues,
  staffChipFilters:['owner'],
@@ -3033,7 +3033,7 @@ function followItemLink(options){
  const linked = recordPlaceParams(reviewPlaceOptions);
  legacyReviewPlace(linked);
  const linkedItem = linked.get('jump') || linked.get('item');
- if(linkedItem && !index.has(resolveShownRecordId(index,linkedItem))){
+ if(linkedItem && !index.has(recordItemLink(linked,reviewRecordLinks.resolveItem,reviewRecordLinks))){
   const current=location.href;
   const query=new URLSearchParams({filed:linkedItem});
   void fetch(location.pathname+'?'+query,{cache:'no-store',signal:reviewRequestSignal()})

@@ -634,9 +634,17 @@ const filterControl={
   }
  }
 };
-function recordItemLink(params,resolve){
+function isStoredItemLink(params){
+ if(params.get('jump')) return false;
+ const kind=params.get('item-kind');
+ if(kind) return kind==='key';
+ // Older saved addresses include all five table fields.
+ return ['owner','show','q','sort','dir'].every(name=>params.has(name));
+}
+function recordItemLink(params,resolve,{stableItemLinks=false}={}){
  const item=params.get('jump') || params.get('item'),saved=history.state?.recordTable;
- return item && (!saved || saved.pendingItem) ? resolve(item) : item;
+ const lookup=saved?.pendingItem || !saved && !(stableItemLinks && isStoredItemLink(params));
+ return item && lookup ? resolve(item) : item;
 }
 function resolveShownRecordId(index,value){
  if(!value || index.has(value)) return value;
@@ -1059,16 +1067,17 @@ function placeParams(){
 const resolveStoredItem=value=>options.resolveStoredItem?.(value) ?? value;
 const resolveItem=value=>options.resolveItem?.(value) ?? resolveStoredItem(value);
 const canResolveItem=Boolean(options.resolveItem || options.resolveStoredItem);
-const itemLinkKey=()=>recordItemLink(placeParams(),resolveItem);
+const itemLinkKey=()=>recordItemLink(placeParams(),resolveItem,options);
 function place(){return readPlace(placeParams());}
 function itemWithKey(key){
  if(options.hasKey && !options.hasKey(key)) return;
  return options.entries ? options.entries().map(dataset=>({dataset})).find(item=>item.dataset.key===key) :
   [...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===key);
 }
-function readPlace(params,followingItemLink=false){
+function readPlace(params,{followingItemLink=false,keepKeys=false}={}){
  placeHash=location.hash;
- keys=new Set(params.getAll('key').map(resolveStoredItem));
+ const saved=followingItemLink ? null : history.state?.recordTable;
+ if(!keepKeys) keys=new Set(params.getAll('key').map(saved ? resolveStoredItem : resolveItem));
  owner=ownerQueryKeys.map(key=>params.get(key)).find(Boolean) || '';show=params.get('show') || defaultShow;query=params.get('q') || '';
  sort=params.get('sort') || '';direction=params.get('dir')==='desc' ? 'desc' : 'asc';
  type=params.get('type') || '';
@@ -1078,7 +1087,6 @@ function readPlace(params,followingItemLink=false){
  show=options.selectShow?.(show,type) ?? show;
  if(!columns.includes(sort)) sort='';
  const item=params.has('item') ? resolveStoredItem(params.get('item')) : null;
- const saved=followingItemLink ? null : history.state?.recordTable;
  if(saved){
   const savedKeys=saved.opened.map(resolveStoredItem);
   const key=savedKeys.includes(item) ? item : savedKeys[0];
@@ -1109,7 +1117,7 @@ function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}
   const resolved=resolveItem(value);
   unresolved=Boolean(canResolveItem && !options.hasKey?.(resolved));
   return resolved;
- });
+ },options);
  if(!key) return false;
  const motion=rowMotion.size ? motionsByKey().get(key) : undefined;
  if(motion){
@@ -1123,9 +1131,8 @@ function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}
  if(inheritFilters){
   for(const [name,value] of Object.entries({owner,show,q:query,sort,dir:direction,type,'source-owner':sourceOwner,...filters}))
    if(!params.has(name)) params.set(name,value);
-  if(!params.has('key')) keys.forEach(key=>params.append('key',key));
  }
- readPlace(params,true);
+ readPlace(params,{followingItemLink:true,keepKeys:inheritFilters && !params.has('key')});
  jump(key,{pushPlace:false,focusTarget:Boolean(params.get('jump')),keepMatchingFilters:true,unresolved});
  return true;
 }
@@ -1420,7 +1427,10 @@ function writePlace(push=false,top){
  const place=new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
   ...Object.fromEntries(filterNames.filter(name=>filters[name]).map(name=>[name,filters[name]]))});
  const item=linkedItem || [...opened][0];
- if(item) place.set('item',item);
+ if(item){
+  place.set('item',item);
+  if(options.stableItemLinks) place.set('item-kind',linkedItem && pendingItem ? 'id' : 'key');
+ }
  if(options.persistLinkedTarget && linkedItem) place.set('linked','1');
  if(linkedItem && revealedLinkedItem===linkedItem) place.set('reveal','1');
  keys.forEach(key=>place.append('key',key));
