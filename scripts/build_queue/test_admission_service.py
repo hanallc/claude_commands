@@ -626,6 +626,45 @@ class PlacementStatusTests(unittest.TestCase):
             assert isinstance(granted, wire.Assignment), granted
             self.assertEqual(granted.assignment.destination, guest.destination)
 
+    def test_a_guest_reading_window_preserves_natedev_queue_order(self) -> None:
+        from scripts.build_queue.test_placement import (
+            ManualEvidenceWorker, PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture,
+            placement_request,
+        )
+        from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, PinnedTarget
+
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            backoff = mac_linux_fixture(fixture)
+            fixture.free(60 * GIB)
+            now = fixture.clock.now()
+            _ = backoff.write_text(str(now + 1))
+            os.utime(backoff, (now - 1, now - 1))
+            guest, local = mac_linux_candidate(), local_candidate(fixture)
+            older = placement_request(fixture, since=now - 1)
+            older = replace(older, route=ANY_ELIGIBLE_TARGET,
+                            constraints=replace(older.constraints, candidates=(guest, local)))
+            key = fixture.server.host_evidence_key(older, guest.destination)
+            fixture.server.host_requests[key] = older
+            reading = fixture.server.read_provider_evidence(key)
+            assert isinstance(reading, placement.FreshHostEvidence), reading
+            self.assertEqual(reading.eligibility, placement.TemporaryExclusion("mac_linux_backoff"))
+            fixture.server.publish_host_evidence(reading)
+
+            fixture.clock.advance(2)
+            waiting, = fixture.connect(older).replies()
+            assert isinstance(waiting, wire.PlacementWait), waiting
+            self.assertEqual(waiting.eligibility[0], placement.CandidateEligibility(
+                guest.destination, placement.EvidenceNeeded("mac_linux_reading_required")))
+            younger = placement_request(fixture)
+            younger = replace(younger, route=PinnedTarget("natedev"),
+                              constraints=replace(younger.constraints, candidates=(local,)))
+            reply, = fixture.connect(younger).replies()
+            self.assertIsInstance(reply, wire.PlacementWait)
+            self.assertFalse(fixture.server.reservations)
+            self.assertEqual(fixture.queue_pids(), [older.owner.pid, younger.owner.pid])
+            assert isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait), reply
+            self.assertIsInstance(reply.wait.reason, records.BehindHead)
+
     def test_placement_uses_natedev_before_reading_a_blocked_guest(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture, placement_request,
