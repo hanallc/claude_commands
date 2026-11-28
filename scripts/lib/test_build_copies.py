@@ -25,6 +25,7 @@ from scripts.lib import build_copies, build_folder_lock, build_folders, copy_rec
 from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.git_test_support import commit_repository
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
@@ -113,6 +114,27 @@ class BuildCopiesTests(unittest.TestCase):
         self.assertNotIn("slot", lease)
         self.assertNotIn("number", lease)
         self.assertIs(lease["released"], True)
+
+    def test_mac_numbered_copy_holds_the_floor_lease_from_allocation_to_release(self) -> None:
+        configuration = self.root / "config/mac_test.conf"
+        _ = write_config_fixture(configuration, "mirror_root=~/mirrors\nfloor_sweep_timeout_s=0.02\n")
+        lease = self.root / "mirrors/.widget.copy-lease.floor-group"
+        lease.parent.mkdir()
+        candidate = build_folders.copy_path("widget", "queue", 1)
+        with (mock.patch.dict(os.environ, {"HOME": str(self.root)}),
+              mock.patch.object(build_folders, "mac_build_host", return_value=True, create=True),
+              lease.open("a+") as floor):
+            fcntl.flock(floor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(TimeoutError, "Mac floor sweep"), self.take_queue_copy():
+                self.fail("the copy allocated while the sweep held the repository")
+            self.assertFalse(candidate.exists())
+            fcntl.flock(floor, fcntl.LOCK_SH)
+            with self.take_queue_copy() as copy:
+                fcntl.flock(floor, fcntl.LOCK_UN)
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(floor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(copy.path, candidate)
+            fcntl.flock(floor, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_sweep_respects_the_numbered_copy_lease(self) -> None:
         from scripts.lint import sweep
