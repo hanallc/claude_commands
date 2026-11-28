@@ -3185,7 +3185,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             stored = serve.PageCaptures(self.root / serve.PAGE_CAPTURE_FOLDER)
             saved_key = next(iter(stored.bound_work()))[2]
             self.assertEqual(saved_key.item_id, saved["id"])
-            with self.assertRaises(new_item_dialog.SubmissionConflict):
+            with self.assertRaises(record_store.SubmissionConflict):
                 _ = stored.bind(pending, attempt.request_id, replace(saved_key, item_id="I999"))
 
             server.capture_page(pending, "/test/firefox", url, FIXTURE_CAPTURE)

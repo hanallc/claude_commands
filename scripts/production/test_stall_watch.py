@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from zoneinfo import ZoneInfo
 
-from scripts.agents import detached_runs
+from scripts.agents import detached_run_record, detached_runs
 from scripts.build_hold.build_hold_test_support import write_holder
 from scripts.buildlog.test_holds import write_mac_block
 from scripts.lib import unit_runs
@@ -2857,9 +2857,9 @@ runpy.run_path(str(script), run_name='__main__')
         director = next(row for row in staff.find(kind="unit")
                         if row.current_session == unit_session("unit-one"))
         pane_worker = fixture_member("worker", name="test", parent=director.id)
-        live_records: dict[tuple[Path, str], list[detached_runs.RunRecord]] = {}
+        live_records: dict[tuple[Path, str], list[detached_run_record.RunRecord]] = {}
 
-        def read_live_runs(runs: Path, worker: str) -> list[detached_runs.RunRecord]:
+        def read_live_runs(runs: Path, worker: str) -> list[detached_run_record.RunRecord]:
             return live_records.get((runs, worker), [])
 
         cases = (
@@ -2894,7 +2894,7 @@ runpy.run_path(str(script), run_name='__main__')
                 detached_folder = held_folder / "detached_runs"
                 if detached_status:
                     detached_folder.mkdir(parents=True, exist_ok=True)
-                    record: detached_runs.RunRecord = {
+                    record: detached_run_record.RunRecord = {
                         "run_id": "worker-test", "status": "running" if detached_status == "running" else "finished",
                         "session_dir": str(detached_folder.parent), "worker": pane_worker.name,
                         "staff_id": pane_worker.id, "label": "worker tests", "command": ["test"],

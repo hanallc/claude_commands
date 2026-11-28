@@ -2141,7 +2141,7 @@ class WorkerCommandTests(unittest.TestCase):
                 worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh", name], prompt=self.prompt, kind="impl", lens="")
             _ = self.fixture.world.stop(opened.row, self.fixture.world)
         states = worker_panes.observe(self.fixture.parent.id, staff.snapshot())
-        first, second = states
+        _, second = states
         request = self.fixture.world.socket_request
         failed = False
         def fail_one_layout(method: str, **params: object) -> dict[str, object]:
@@ -2153,8 +2153,9 @@ class WorkerCommandTests(unittest.TestCase):
         with patch.object(self.fixture.world, "socket_request", side_effect=fail_one_layout), patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK):
             with redirect_stderr(io.StringIO()) as errors:
                 code = worker.restore(self.fixture.parent.id)
-        self.assertEqual(code, worker.ExitCode.UNCERTAIN)
-        self.assertEqual(errors.getvalue().splitlines(), [f"anomaly: {first.row.name}: restore layout unavailable"])
+        self.assertEqual(code, worker.ExitCode.OK)
+        self.assertEqual(errors.getvalue().splitlines(),
+                         [f"herdr {self.fixture.parent.id}: skipped worker layout. restore layout unavailable"])
         resumed = {state.row.id for state in worker_panes.observe(self.fixture.parent.id, staff.snapshot())
                    if isinstance(state, worker_panes.OpenWorker)}
         self.assertIn(second.row.id, resumed)

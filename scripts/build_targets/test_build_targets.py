@@ -927,11 +927,12 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
     def test_floor_sweep_failure_keeps_the_disk_route_and_names_the_cause(self) -> None:
         for result, cause in ((offload.CommandOutput(7, "", "disk busy"), "status 7: disk busy"),
                               (offload.COMMAND_TIMED_OUT, "timed out")):
-            with self.subTest(cause=cause):
-                output, errors = self.floor_answer(200, result)
-                self.assertEqual(output.splitlines()[0], "any_target")
-                self.assertIn("mac\texcluded\tdisk", output)
-                self.assertIn(cause, errors)
+            for free_gib, route in ((59, "mac\texcluded\tdisk"), (200, "mac\teligible\t-")):
+                with self.subTest(cause=cause, free_gib=free_gib):
+                    output, errors = self.floor_answer(free_gib, result)
+                    self.assertEqual(output.splitlines()[0], "any_target")
+                    self.assertIn(route, output)
+                    self.assertIn(cause, errors)
 
     def test_kind_table_keeps_target_order_settings_and_each_mac_decision(self) -> None:
         other_settings = self.settings.with_name("other.conf")

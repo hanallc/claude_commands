@@ -3409,11 +3409,11 @@ def migrate_on_mac(repo: str, *, dry_run: bool) -> int:
 
 def _run_on_mac(command: str) -> int:
     """Run the command on the Mac with the configured SSH keepalive."""
-    from scripts.build_targets import mac_linux, target_config
+    from scripts.build_targets import gate_targets, target_config
     from scripts.mac_test import eligibility
 
     connection = eligibility.read_connection_settings(target_config.configured_ssh_target("mac").settings)
-    return _run_ssh(("ssh", *mac_linux.SSH_OPTIONS, "-o", f"ConnectTimeout={mac_linux.SSH_CONNECT_TIMEOUT_SECONDS}",
+    return _run_ssh(("ssh", *gate_targets.SSH_OPTIONS, "-o", f"ConnectTimeout={gate_targets.SSH_CONNECT_TIMEOUT_SECONDS}",
                      *eligibility.server_alive_options(connection.unreachable_wait_s), connection.host, command))
 
 

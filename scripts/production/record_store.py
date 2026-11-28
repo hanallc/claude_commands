@@ -17,7 +17,7 @@ from enum import StrEnum
 from itertools import chain
 from pathlib import Path
 from threading import Lock
-from typing import NamedTuple, cast
+from typing import Literal, NamedTuple, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
@@ -32,6 +32,16 @@ from scripts.production.production_doc import (
 )
 
 from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY
+
+
+class SubmissionError(ValueError):
+    """The request cannot be saved or applied to this item."""
+
+
+class SubmissionConflict(SubmissionError):
+    """The request ID already names different item data."""
+
+    status: Literal[409] = 409
 
 
 class RecordText(NamedTuple):
@@ -734,8 +744,6 @@ def create_record_text(path: Path, text: str) -> None:
                     and (existing := _review_publication(path)) is not None
                     and request.request_id == existing.request_id):
                 if request.digest != existing.digest:
-                    from scripts.review_links.new_item_dialog import SubmissionConflict
-
                     raise SubmissionConflict("This request ID already has different item data.") from error
                 raise ReusedReviewRecord(str(path)) from error
             raise OccupiedRecordPath(str(path)) from error
