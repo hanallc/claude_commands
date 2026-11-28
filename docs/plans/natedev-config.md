@@ -876,3 +876,45 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Files:** `scripts/aws_target/test_aws_trial.py`, `scripts/build_targets/test_mac_linux.py`, `scripts/notify/test_pushover.py`, `scripts/production/test_waiting_why.py`, `scripts/review_links/test_list_page.py`, `test_review_submissions.py`, `scripts/statusline/test_statusline.py`
 
 **Binds later work:** A fixture that appends a key the base fixture already holds has no effect; replace the row.
+
+### Phase 28 — Join with main 090d037287  · status: todo
+
+**Depends on:** Phase 27
+
+#### Work Order
+
+**Goal:** The branch holds main 090d037287, and the queued affected run of the joined tip is green.
+
+**Spec:**
+1. Resolve the conflicts in `scripts/review_links/new_item_dialog.py`, `review_page.py` and `serve.py`. Keep main's behavior and reapply the config moves. Import `SubmissionError` and `SubmissionConflict` from `scripts/production/record_store.py`.
+2. Check the rerere resolutions of `scripts/build_targets/mac_linux.py` and `scripts/lib/checkout_test_support.py` against both parents.
+3. Reference: the accounts-carrier merge c6ae41716e resolved the same files.
+
+**Files:** the five files above.
+
+**Workers:** 1 writer; one merge holds all files. `test` opens as impl and is idle.
+
+**Constraints from prior phases:** Phase 21: each main join conflict keeps main's behavior and reapplies the config moves, with no code default.
+
+**Acceptance gate:** no conflict marker; basedpyright clean on the five files; the tests of the resolved code pass by class; `fixture_conf_keys.py` reports 0 missing; the queued `gate.py --affected` run is green; `behavior_check.py run` with main's checker on the tip.
+
+### Phase 29 — A host value too large for the reader is unusable  · status: todo
+
+**Depends on:** Phase 28
+
+#### Work Order
+
+**Goal:** A config value the reader cannot hold gives the normal unusable-value error that names the key, not an `OverflowError`.
+
+**Spec:**
+1. Showrunner ruling 11-28 03:42 EST, from nate 11-24 ("didn't we create machine onl values to not honor the normal limits"): a `<key>.<host>` row keeps a limit wider than the shared row. Do not make a wider host row unusable.
+2. Fix only the crash. The phase 13 adversary probe wrote `worker.history_bytes.<host>` with `# whole: 1..` and the value 2^63; the read raised `OverflowError`. That read now raises the normal unusable-value error, and the message names the key.
+3. One test for the read.
+
+**Files:** `scripts/lib/conf.py` (or the reader that raised), its test module.
+
+**Workers:** 1 writer + 1 tester. `impl`: the reader. `test`: the read test.
+
+**Constraints from prior phases:** No code default and no new refusal (Phase 21).
+
+**Acceptance gate:** the new test fails before the fix and passes after; basedpyright clean; the queued `gate.py --affected` run is green.
