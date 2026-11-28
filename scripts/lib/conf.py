@@ -240,8 +240,11 @@ class ConfigRead:
             repository = _repository_path(self.file)
             if repository != self.source:
                 try:
-                    value, _ = read_key(_read_settings(repository.read_text(encoding="utf-8"), repository))
+                    value, _ = read_key(_read_repository_settings(self.file, repository))
                     return RecoveredValue(value, reason)
+                except _MissingKey as error:
+                    if conf_reads.shift_reads_enabled():
+                        reason = f"{repository}: {key}='<missing>': {error}"
                 except (OSError, UnicodeError, ValueError, ArithmeticError):
                     pass
         if warn:
@@ -341,7 +344,7 @@ class ConfigRead:
         if fault.missing and self.repository_allowed and isinstance(self.file, str):
             try:
                 repository = _repository_path(self.file)
-                return _read_settings(repository.read_text(encoding="utf-8"), repository)
+                return _read_repository_settings(self.file, repository)
             except (OSError, UnicodeError):
                 pass
         for contents in _committed_files(self.source):
@@ -445,6 +448,15 @@ def _read_settings(contents: str, source: Path) -> dict[str, Setting]:
                 origin = conf_reads.ShiftedConfigKey(source.name, shift)
                 settings[shift.key] = _ShiftedSetting(setting.value, setting.limit, setting.line, origin)
     return settings
+
+
+def _read_repository_settings(stem: str, source: Path) -> dict[str, Setting]:
+    contents = source.read_text(encoding="utf-8")
+    if conf_reads.shift_reads_enabled():
+        from scripts.lib import conf_fixture
+
+        contents = "\n".join(conf_fixture.config_lines(f"{stem}.conf", contents, settings=settings, decimal=decimal))
+    return _read_settings(contents, source)
 
 
 def settings(source: str) -> dict[str, Setting]:

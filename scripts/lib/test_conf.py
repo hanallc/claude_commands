@@ -377,6 +377,47 @@ conf_reads.record('disabled')
             self.assertEqual(origin.value, "~/rust/hanadocs/agents")
         self.assertEqual(source.read_text(), contents)
 
+    def test_repository_fallback_reads_raw_values_without_the_test_marker(self) -> None:
+        self.addCleanup(conf_reads.set_shift_read_log, conf_reads.set_shift_read_log(""))
+        del os.environ["CONF_DIR"]
+        live = self.root / "home/.claude/config/accounts.conf"
+        live.parent.mkdir(parents=True)
+        _ = live.write_text("local=kept\n")
+        repository = self.root / "repository-config/accounts.conf"
+        _ = repository.write_text("# whole: 0..\ncount=42\nnotes_directory=/raw\nword=raw\n")
+
+        settings = conf.read("accounts")
+        self.assertEqual(settings.whole("count"), 42)
+        self.assertEqual(settings.text("notes_directory"), "/raw")
+        self.assertEqual(settings.text("word"), "raw")
+
+    def test_repository_fallback_applies_the_fixture_rules_with_the_test_marker(self) -> None:
+        log = self.root / "shift-reads"
+        previous = conf_reads.set_shift_read_log(str(log))
+        self.addCleanup(conf_reads.set_shift_read_log, previous)
+        del os.environ["CONF_DIR"]
+        repository = self.root / "repository-config/accounts.conf"
+        _ = repository.write_text("# whole: 0..\ncount=42\nnotes_directory=/raw\nword=raw\n")
+
+        settings = conf.read("accounts")
+        values = settings.values()
+        self.assertEqual(values["count"], "43")
+        self.assertEqual(values["notes_directory"], "~/rust/hanadocs/agents")
+        self.assertNotIn("word", values)
+        self.assertEqual(settings.value("word", str, default="default"), "default")
+        with redirect_stderr(io.StringIO()), self.assertRaisesRegex(conf.Unusable, "key is missing"):
+            _ = settings.text("word")
+
+        live = self.root / "home/.claude/config/accounts.conf"
+        live.parent.mkdir(parents=True)
+        _ = live.write_text("local=kept\n")
+        settings = conf.read("accounts")
+        self.assertEqual(settings.whole("count"), 43)
+        self.assertEqual(settings.text("notes_directory"), "~/rust/hanadocs/agents")
+        with redirect_stderr(io.StringIO()), self.assertRaisesRegex(conf.Unusable, "key is missing"):
+            _ = settings.text("word")
+        self.assertIn("accounts.conf:count: 42 -> 43", log.read_text().splitlines())
+
     def test_missing_override_key_refuses_repository_values(self) -> None:
         source = self.directory / "accounts.conf"
         contents = "# whole: 1..\nusage_stale_minutes=23\n"

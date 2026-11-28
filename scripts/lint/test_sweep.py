@@ -8259,12 +8259,16 @@ class BudgetTests(unittest.TestCase):
         _ = budget_path.write_text("# range: 0..\nsweep_budget_gib=17\n")
         target = root / "target"
         target.mkdir()
-        repository = Path(__file__).resolve().parents[2] / "config" / "lint.conf"
+        repository = root / "repository" / "lint.conf"
+        repository.parent.mkdir()
+        _ = repository.write_text("# range: 32..32\nsweep_doc_index_mib=32\n"
+                                  + "# whole: 1..\nsweep_max_tree_depth=3\n")
         doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * MIB)
         environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
         environment.update({sweep.BUDGET_ENV: "", sweep.DOC_INDEX_ENV: ""})
         with (mock.patch.dict(os.environ, environment, clear=True),
               mock.patch.object(conf, "directory", return_value=root),
+              mock.patch.object(conf, "_repository_path", return_value=repository),
               mock.patch.object(sweep, "process_uses", return_value={}),
               mock.patch.object(sweep, "_build_trees", return_value=[]),
               mock.patch.object(sweep, "prune_doc_index", return_value=0) as prune,

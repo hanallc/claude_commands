@@ -8,10 +8,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from scripts.lib import conf
+from scripts.lib import conf, conf_fixture
 from scripts.lint.memory_test_support import (
     ConfigFixtureRefused, commit_config_fixture, config_environment, copy_config_file_fixture, copy_config_fixture,
-    shifted_number, write_config_fixture,
+    write_config_fixture,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -110,13 +110,14 @@ class ConfigFixtureTests(unittest.TestCase):
 
     def test_decimal_shift_uses_high_midpoint_when_only_high_side_has_room(self) -> None:
         setting = conf.Setting("4", "# range: 4..4.5", 0)
-        self.assertEqual(shifted_number(setting), "4.25")
+        self.assertEqual(conf_fixture.shifted_number(setting, conf.decimal), "4.25")
 
     def test_narrow_decimal_range_uses_an_endpoint_or_an_adjacent_float(self) -> None:
         narrow = conf.Setting("1", "# range: 1..1.0000000000000002", 0)
         smallest = conf.Setting("5e-324", "# range: 5e-324..", 0)
-        self.assertEqual(shifted_number(narrow), "1.0000000000000002")
-        self.assertEqual(float(shifted_number(smallest)), math.nextafter(float(smallest.value), math.inf))
+        self.assertEqual(conf_fixture.shifted_number(narrow, conf.decimal), "1.0000000000000002")
+        self.assertEqual(float(conf_fixture.shifted_number(smallest, conf.decimal)),
+                         math.nextafter(float(smallest.value), math.inf))
 
     def test_successive_overrides_keep_prior_values_and_allow_an_explicit_empty_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
