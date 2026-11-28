@@ -115,8 +115,7 @@ class SshEligibilityTests(unittest.TestCase):
         script = arguments[-1]
         self.assertNotIn("nix print-dev-env", script)
         self.assertNotIn("dev-shell.py", script)
-        self.assertIn('test -f "$HOME"/', script)
-        self.assertIn("copies.probe_remote_folder(sys.argv[1])", script)
+        self.assertNotIn("probe_remote_folder", script)
         self.assertIn('df -g "$HOME"', script)
         self.assertIn('$(hostname -s)', script)
         self.assertIn(r"free_gib=%s\nhost=%s\nrc=0\n", script)
