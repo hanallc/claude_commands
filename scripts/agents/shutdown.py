@@ -2090,9 +2090,10 @@ def retire_remote_unit(row: staff.StaffRow, record: staff.StaffSnapshot, fields:
     if isinstance(location, staff.WorktreeUnfilled):
         raise RetirementBeforeRemoval("the unit has no current worktree")
     if isinstance(location, staff.RemovedWorktree):
-        saved = retired_record_retry(row, record)
-        if isinstance(saved, OldRetiredRecord):
+        retry = retired_record_retry(row, record)
+        if not isinstance(retry, ActiveRetirementJournal):
             raise RetirementBeforeRemoval("the active retirement journal is absent")
+        saved = retry.facts
     else:
         saved = active_retirement(row, record)
     parent = record.parent_of(row)
@@ -2157,7 +2158,7 @@ def unit_local_command() -> int:
                 if not isinstance(location, staff.RemovedWorktree):
                     raise ValueError("retirement journal requires a retired staff row")
                 retry = retired_record_retry(row, record)
-                result["active_retry"] = not isinstance(retry, OldRetiredRecord)
+                result["active_retry"] = isinstance(retry, ActiveRetirementJournal)
                 result["code"] = 0
             elif fields["action"] in ("retired-check", "retired-forget-journal"):
                 if not isinstance(location, staff.RemovedWorktree):
@@ -2166,9 +2167,9 @@ def unit_local_command() -> int:
                 if fields["action"] == "retired-check":
                     check_retired_checkout(location)
                     check_peer_retired_branch(location, saved, cast(list[str], fields["merge_tips"]))
-                    if saved is not None and not complete_legacy_retirement(row, record, saved):
+                    if isinstance(saved, LegacyRetirementJournal) and not complete_legacy_retirement(row, record, saved):
                         raise RetirementRefused("pane cleanup is incomplete")
-                elif saved is not None:
+                elif isinstance(saved, LegacyRetirementJournal):
                     _ = forget_retirement_journal(row.id, row.name)
                 result["code"] = 0
             elif fields["action"] == "retire-complete":
@@ -2369,41 +2370,92 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
                 return False
     return True
 
-def read_retirement_journal(row: staff.StaffRow) -> dict[str, object] | None:
-    journal = retirement_journal(row)
+
+@dataclass(frozen=True)
+class NoRetirementJournal:
+    """The journal file does not exist."""
+
+
+@dataclass(frozen=True)
+class LegacyRetirementJournal:
+    facts: dict[str, str]
+
+
+@dataclass(frozen=True)
+class ActiveRetirementJournal:
+    facts: dict[str, object]
+
+
+type RetiredRecordJournal = NoRetirementJournal | LegacyRetirementJournal | ActiveRetirementJournal
+
+
+def read_retirement_journal(journal: Path) -> dict[str, object] | NoRetirementJournal:
     try:
         saved = cast(object, json.loads(journal.read_text(encoding="utf-8")))
     except FileNotFoundError:
-        return None
+        return NoRetirementJournal()
     if not isinstance(saved, dict):
         raise ValueError(f"{journal}: invalid retirement journal")
     return cast(dict[str, object], saved)
 
 
-ACTIVE_RETIREMENT_MARKERS = frozenset({
-    "cleanup_token", "completed_row", "qualified_name", "parent", "workers", "pane_only",
-    "checkout_cleanup_complete", "cleanup_complete", "kept_work",
+RETIREMENT_JOURNAL_SHARED_FIELDS = frozenset({
+    "session", "worktree", "pane_session", "pane_id", "pane_terminal", "checkout", "branch", "merge_branch",
 })
+LEGACY_RETIREMENT_JOURNAL_FIELDS = RETIREMENT_JOURNAL_SHARED_FIELDS | {"config", "date"}
+ACTIVE_RETIREMENT_REQUIRED_FIELDS = (RETIREMENT_JOURNAL_SHARED_FIELDS - {"pane_terminal"}) | {
+    "cleanup_token", "completed_row", "qualified_name", "parent", "workers",
+}
+ACTIVE_RETIREMENT_FLAGS = frozenset({"pane_only", "checkout_cleanup_complete", "cleanup_complete"})
+ACTIVE_RETIREMENT_TEXT_FIELDS = LEGACY_RETIREMENT_JOURNAL_FIELDS | {"qualified_name", "shell_start", "kept_work"}
+ACTIVE_RETIREMENT_JOURNAL_FIELDS = ACTIVE_RETIREMENT_REQUIRED_FIELDS | ACTIVE_RETIREMENT_FLAGS | ACTIVE_RETIREMENT_TEXT_FIELDS | {
+    "shell_pid",
+}
 
 
-def read_legacy_retirement_journal(row: staff.StaffRow, location: staff.RemovedWorktree) -> dict[str, object] | None:
-    fields = read_retirement_journal(row)
-    if fields is None:
-        return None
-    if ACTIVE_RETIREMENT_MARKERS.intersection(fields):
+def classify_retired_record_journal(journal: Path) -> RetiredRecordJournal:
+    facts = read_retirement_journal(journal)
+    if isinstance(facts, NoRetirementJournal):
+        return facts
+    fields = facts.keys()
+    if fields == LEGACY_RETIREMENT_JOURNAL_FIELDS and all(isinstance(value, str) for value in facts.values()):
+        legacy = cast(dict[str, str], facts)
+        if (all(legacy[key] for key in ("session", "branch", "date", "merge_branch"))
+                and all(Path(legacy[key]).is_absolute() for key in ("checkout", "worktree"))):
+            return LegacyRetirementJournal(legacy)
+    token = facts.get("cleanup_token")
+    if (ACTIVE_RETIREMENT_REQUIRED_FIELDS <= fields <= ACTIVE_RETIREMENT_JOURNAL_FIELDS
+            and all(isinstance(facts[key], str) for key in ACTIVE_RETIREMENT_TEXT_FIELDS & fields)
+            and isinstance(token, str) and re.fullmatch(r"[0-9a-f]{32}", token)
+            and isinstance(facts["completed_row"], dict) and isinstance(facts["parent"], dict)
+            and isinstance(facts["workers"], list)
+            and all(type(facts[key]) is bool for key in ACTIVE_RETIREMENT_FLAGS & fields)
+            and ("shell_pid" not in fields or type(facts["shell_pid"]) is int)):
+        return ActiveRetirementJournal(facts)
+    raise ValueError(f"{journal}: invalid retirement journal")
+
+
+def read_legacy_retirement_journal(
+    row: staff.StaffRow, location: staff.RemovedWorktree,
+) -> NoRetirementJournal | LegacyRetirementJournal:
+    saved = classify_retired_record_journal(retirement_journal(row))
+    if isinstance(saved, NoRetirementJournal):
+        return saved
+    if isinstance(saved, ActiveRetirementJournal):
         raise ValueError("the retirement journal already has a staff cleanup receipt")
-    if fields.get("session") != row.current_session or fields.get("worktree") != str(location.path):
+    if saved.facts["session"] != row.current_session or saved.facts["worktree"] != str(location.path):
         raise ValueError("the retirement journal names another conversation or worktree")
-    return fields
+    return saved
 
 
 def complete_legacy_retirement(row: staff.StaffRow, record: staff.StaffSnapshot,
-                               saved: dict[str, object]) -> bool:
-    if saved.get("pane_id"):
-        if not saved.get("pane_terminal"):
+                               journal: LegacyRetirementJournal) -> bool:
+    saved = journal.facts
+    if saved["pane_id"]:
+        if not saved["pane_terminal"]:
             print(f"anomaly: {saved['pane_session']}:{saved['pane_id']}: saved terminal identity is unavailable")
             return False
-        pane = RetiringPane(str(saved["pane_session"]), str(saved["pane_id"]), str(saved["pane_terminal"]), UnprovedShell())
+        pane = RetiringPane(saved["pane_session"], saved["pane_id"], saved["pane_terminal"])
     else:
         pane = retirement_pane(row, record)
     return retirement_close_idle_shell(pane, row, record, mode=RetirementPaneCleanup.OLD_RECORD)
@@ -2412,9 +2464,10 @@ def complete_legacy_retirement(row: staff.StaffRow, record: staff.StaffSnapshot,
 def forget_retirement_journal(identity: staff.StaffId, name: str) -> bool:
     journal = retirement_journal_folder() / f"{identity}.json"
     try:
-        saved = cast(object, json.loads(journal.read_text(encoding="utf-8")))
-        if (not isinstance(saved, dict) or ACTIVE_RETIREMENT_MARKERS.intersection(cast(dict[str, object], saved))
-                or not isinstance(cast(dict[str, object], saved).get("worktree"), str)):
+        saved = classify_retired_record_journal(journal)
+        if isinstance(saved, NoRetirementJournal):
+            return False
+        if not isinstance(saved, LegacyRetirementJournal):
             raise ValueError("the journal does not contain old retirement facts")
         journal.unlink()
     except FileNotFoundError:
@@ -2447,13 +2500,12 @@ def check_retired_checkout(location: staff.RemovedWorktree) -> None:
     raise RetirementRefused(f"checkout {location.path} still exists on {location.machine}")
 
 
-def check_peer_retired_branch(location: staff.RemovedWorktree, saved: dict[str, object] | None,
+def check_peer_retired_branch(location: staff.RemovedWorktree, saved: NoRetirementJournal | LegacyRetirementJournal,
                               merge_tips: list[str]) -> None:
     assert isinstance(location.branch, staff.ParkedBranch)
     branch = location.branch.value
-    checkout = saved.get("checkout") if saved is not None else None
-    if isinstance(checkout, str) and Path(checkout).is_absolute():
-        repository = Path(checkout)
+    if isinstance(saved, LegacyRetirementJournal) and (checkout := Path(saved.facts["checkout"])).is_absolute():
+        repository = checkout
     elif (record := worktree_records.checkout_record(location.path)) is not None and Path(record.repo).is_absolute():
         repository = Path(record.repo)
     else:
@@ -2554,8 +2606,8 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
 
 def saved_retirement(row: staff.StaffRow) -> dict[str, object]:
     """Read the facts needed to retry one removal."""
-    saved = read_retirement_journal(row)
-    if saved is None:
+    saved = read_retirement_journal(retirement_journal(row))
+    if isinstance(saved, NoRetirementJournal):
         return {}
     require_retirement_journal_location(row, saved)
     return saved
@@ -2588,21 +2640,13 @@ def active_retirement(row: staff.StaffRow, record: staff.StaffSnapshot) -> dict[
     return {}
 
 
-@dataclass(frozen=True)
-class OldRetiredRecord:
-    """The journal has no active retirement facts."""
-
-
-def retired_record_retry(row: staff.StaffRow, record: staff.StaffSnapshot) -> dict[str, object] | OldRetiredRecord:
-    saved = read_retirement_journal(row)
-    if saved is None or not ACTIVE_RETIREMENT_MARKERS.intersection(saved):
-        return OldRetiredRecord()
-    require_retirement_journal_location(row, saved)
-    token = saved.get("cleanup_token")
-    if (not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token)
-            or not retirement_journal_matches_staff(row, record, saved)):
-        raise RetirementBeforeRemoval("the active retirement journal does not match the staff rows or has an invalid token")
-    return saved
+def retired_record_retry(row: staff.StaffRow, record: staff.StaffSnapshot) -> RetiredRecordJournal:
+    journal = classify_retired_record_journal(retirement_journal(row))
+    if isinstance(journal, ActiveRetirementJournal):
+        require_retirement_journal_location(row, journal.facts)
+        if not retirement_journal_matches_staff(row, record, journal.facts):
+            raise RetirementBeforeRemoval("the active retirement journal does not match the staff rows")
+    return journal
 
 
 def retire_local_unit(unit: RetiringUnit, *, settings: conf.ConfigRead,
@@ -2776,7 +2820,7 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
     local = unit_machine_is_local(location.machine)
     if isinstance(location, staff.RemovedWorktree):
         if local:
-            if isinstance(retired_record_retry(row, record), OldRetiredRecord):
+            if not isinstance(retired_record_retry(row, record), ActiveRetirementJournal):
                 return remove_retired_record(unit, location, record, settings=settings)
         else:
             retry = unit_remote_command("retired-retry", row, record)
@@ -2790,10 +2834,13 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
             production = retirement_production_of(unit.production.name, record=current)
             if production != unit.production or current.parent_of(row) != production.owner:
                 raise retirement_race(row, "The production changed before retirement")
-            saved = (retired_record_retry(row, current) if isinstance(location, staff.RemovedWorktree)
-                     else active_retirement(row, current))
-            if isinstance(saved, OldRetiredRecord):
-                raise RetirementBeforeRemoval("the active retirement journal is absent")
+            if isinstance(location, staff.RemovedWorktree):
+                retry_journal = retired_record_retry(row, current)
+                if not isinstance(retry_journal, ActiveRetirementJournal):
+                    raise RetirementBeforeRemoval("the active retirement journal is absent")
+                saved = retry_journal.facts
+            else:
+                saved = active_retirement(row, current)
             retirement = retire_local_unit(unit, settings=settings, record=current, saved=saved)
             if retirement is not RetirementResult.COMPLETE:
                 return retirement.code
@@ -2940,11 +2987,11 @@ def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, r
     if not isinstance(location.branch, staff.ParkedBranch):
         raise RetirementRefused(f"{unit.name}: the retired record has no branch")
     local = unit_machine_is_local(location.machine)
-    saved = None
+    saved = NoRetirementJournal()
     if local:
         check_retired_checkout(location)
         saved = read_legacy_retirement_journal(row, location)
-        if saved is not None and not complete_legacy_retirement(row, record, saved):
+        if isinstance(saved, LegacyRetirementJournal) and not complete_legacy_retirement(row, record, saved):
             return 1
 
     run = partial(retirement_git, unit, settings=settings)
@@ -2969,7 +3016,7 @@ def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, r
         return 1
     if not local:
         _ = unit_remote_command("retired-forget-journal", row, record)
-    elif saved is not None:
+    elif isinstance(saved, LegacyRetirementJournal):
         _ = forget_retirement_journal(row.id, row.name)
     message = "retired record removed" if removal is staff.RetiredUnitRemoval.REMOVED else "staff record is absent"
     print(f"{unit.name}: {message}")

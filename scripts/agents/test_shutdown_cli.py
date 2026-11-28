@@ -955,6 +955,66 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         })
         return token
 
+    def legacy_retirement_facts(self, row: staff.StaffRow, *, pane: bool = False) -> dict[str, str]:
+        return {
+            "session": row.current_session, "worktree": str(self.worktree),
+            "pane_session": "alpha" if pane else "", "pane_id": "w1:p1" if pane else "",
+            "pane_terminal": "terminal-w1:p1" if pane else "",
+            "checkout": str(self.checkout / ".git"), "branch": "alpha-branch",
+            "config": "", "date": "2026-11-28", "merge_branch": "main",
+        }
+
+    RETIRED_JOURNAL_CASES: ClassVar[dict[str, dict[str, object]]] = {
+        "only the shell PID is saved": {"shell_pid": 4101},
+        "only the shell start is saved": {"shell_start": "100"},
+        "only the cleanup token is saved": {"cleanup_token": "0123456789abcdef" * 2},
+        "only the completed row is saved": {"completed_row": {}},
+        "only the qualified name is saved": {"qualified_name": "alpha/alpha"},
+        "only the parent is saved": {"parent": {}},
+        "only the workers are saved": {"workers": []},
+        "only the pane-only flag is saved": {"pane_only": True},
+        "only the checkout completion flag is saved": {"checkout_cleanup_complete": True},
+        "only the cleanup completion flag is saved": {"cleanup_complete": True},
+        "only the reason to keep work is saved": {"kept_work": "work remains"},
+        "only the shared fields are saved": {},
+        "a complete old journal has an unknown field": {"unexpected": "saved"},
+        "a complete journal from the old writer": {},
+    }
+
+    def check_retired_record_journal(self, row: staff.StaffRow, journal: Path, scenario: str) -> None:
+        assert isinstance(row.worktree, staff.PresentWorktree)
+        _ = git(self.checkout, "worktree", "remove", "--force", str(self.worktree))
+        row = staff.set_worktree(row.id, staff.RemovedWorktree(row.worktree.machine, self.worktree,
+            staff.ParkedBranch("alpha-branch")), expected=row.worktree)
+        self.pane_world.add(row, "w1:p1", live=False, terminal="replacement")
+        _ = self.stop_session(DIRECTOR)
+        _ = self.stop_session(SEAT)
+        saved_pane = self.pane_world.locations["w1:p1"].copy()
+        saved_launch = pane_record.read("alpha").get("w1:p1")
+        complete = scenario == "a complete journal from the old writer"
+        facts: dict[str, object] = {**self.legacy_retirement_facts(row, pane=True)}
+        if not complete and scenario != "a complete old journal has an unknown field":
+            del facts["config"], facts["date"]
+        facts.update(self.RETIRED_JOURNAL_CASES[scenario])
+        journal.parent.mkdir(parents=True)
+        original = json.dumps(facts) + "\n"
+        write_text_atomic(journal, original)
+
+        code, output = self.retire()
+
+        if complete:
+            self.assertEqual(code, 0, output)
+            self.assertIn("retired record removed", output)
+            self.assertIsNone(staff.by_id(row.id))
+            self.assertFalse(journal.exists())
+        else:
+            self.assertEqual(staff.by_id(row.id), row, output)
+            self.assertEqual(journal.read_bytes(), original.encode())
+            self.assertEqual(code, 1, output)
+            self.assertIn("invalid retirement journal", output)
+        self.assertEqual(self.pane_world.locations["w1:p1"], saved_pane)
+        self.assertEqual(pane_record.read("alpha").get("w1:p1"), saved_launch)
+
     def test_resume_of_a_retired_unit_names_retire_before_dispatch(self) -> None:
         self.park_without_worktree()
         row = staff.by_id(self.unit_staff_id)
@@ -1117,10 +1177,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         member = staff.by_id(case.unit_staff_id)
                         assert member is not None
                         journal.parent.mkdir(parents=True)
-                        write_text_atomic(journal, json.dumps({
-                            "session": member.current_session, "worktree": str(case.worktree),
-                            "checkout": str(case.checkout), "pane_id": "",
-                        }))
+                        write_text_atomic(journal, json.dumps(case.legacy_retirement_facts(member)))
                     if peer_checkout:
                         location = case.unit_worktree()
                         assert isinstance(location, staff.RemovedWorktree)
@@ -1831,18 +1888,22 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(admitted.worktree, claimed)
 
     def test_local_retirement_reuses_the_journal_after_an_authority_write_fails(self) -> None:
-        for scenario in ("present worktree", "removed worktree with a saved token"):
+        for scenario in ("present worktree", "removed worktree with a saved token", *self.RETIRED_JOURNAL_CASES):
             with self.subTest(scenario=scenario):
-                removed = scenario == "removed worktree with a saved token"
-                case = RetireUnitTests() if removed else self
-                if removed:
+                separate_case = scenario != "present worktree"
+                case = RetireUnitTests() if separate_case else self
+                if separate_case:
                     case.setUp()
                 try:
+                    removed = scenario == "removed worktree with a saved token"
                     if removed:
                         case.park_without_worktree()
                     row = staff.by_id(case.unit_staff_id)
                     assert row is not None
                     journal = shutdown.retirement_journal(row)
+                    if scenario in self.RETIRED_JOURNAL_CASES:
+                        case.check_retired_record_journal(row, journal, scenario)
+                        continue
                     token = ""
                     if removed:
                         assert isinstance(row.worktree, staff.RemovedWorktree)
@@ -1880,7 +1941,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     case.assertFalse(case.worktree.exists())
                     case.assertEqual(git(case.checkout, "branch", "--list", "alpha-branch"), "")
                 finally:
-                    if removed:
+                    if separate_case:
                         case.doCleanups()
 
     def test_retirement_keeps_a_worker_added_after_the_cleanup_snapshot(self) -> None:
@@ -2289,10 +2350,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         _ = self.stop_session(SEAT)
         journal = self.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
         journal.parent.mkdir(parents=True)
-        write_text_atomic(journal, json.dumps({
-            "session": row.current_session, "worktree": str(self.worktree), "checkout": str(self.checkout),
-            "pane_id": "w1:p1", "pane_session": "alpha", "pane_terminal": "terminal-w1:p1",
-        }))
+        write_text_atomic(journal, json.dumps(self.legacy_retirement_facts(row, pane=True)))
         with (mock.patch.object(build_folders, "repo_word", side_effect=OSError("repository word unreadable")) as word,
               mock.patch.object(shutdown, "retirement_check") as check,
               mock.patch.object(shutdown, "retirement_remove") as remove):
@@ -2824,10 +2882,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         _ = case.stop_session(DIRECTOR)
                         _ = case.stop_session(SEAT)
                         journal.parent.mkdir(parents=True)
-                        write_text_atomic(journal, json.dumps({
-                            "session": row.current_session, "worktree": str(case.worktree), "checkout": str(case.checkout),
-                            "pane_session": "alpha", "pane_id": "w1:p1", "pane_terminal": "terminal-w1:p1",
-                        }))
+                        write_text_atomic(journal, json.dumps(case.legacy_retirement_facts(row, pane=True)))
                         replace_pane()
                     saved_pane = case.pane_world.locations["w1:p1"].copy()
                     with (mock.patch.object(shutdown, "retirement_remove", side_effect=replace_after_cleanup),
@@ -3203,13 +3258,17 @@ fi
     def test_remote_retirement_retries_failed_steps_before_or_after_row_removal(self) -> None:
         for failure in ("stop", "remove", "branch", "origin", "ssh", "answer", "hold", "copy", "journal", "journal removal",
                         "authority write", "legacy authority write", "authority response",
-                        "removed worktree with a saved token", "pane-only cleanup with a saved token"):
+                        "removed worktree with a saved token", "pane-only cleanup with a saved token",
+                        *self.RETIRED_JOURNAL_CASES):
             with self.subTest(failure=failure):
                 case = RetireUnitTests()
                 case.setUp()
                 try:
                     row = case.move_to_other_machine()
                     journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
+                    if failure in self.RETIRED_JOURNAL_CASES:
+                        case.check_retired_record_journal(row, journal, failure)
+                        continue
                     branch = "alpha-branch"
                     pane_only = failure == "pane-only cleanup with a saved token"
                     saved_token = ""
