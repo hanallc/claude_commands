@@ -535,6 +535,8 @@ def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = No
 def hand_over(path: Path, owner: str, task: str, *, run_dir: str = "", land_target: str = "",
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
+    from scripts.production import staff
+
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     if not WORD.fullmatch(owner):
@@ -546,16 +548,21 @@ def hand_over(path: Path, owner: str, task: str, *, run_dir: str = "", land_targ
             raise ScratchError(f"{path}: no readable copy record")
         return fields_for_task({**record.fields, "owner_unit": owner}, task, run_dir=run_dir, land_target=land_target)
 
-    with (locked_holds(scratch_settings=scratch_settings) as found,
-          copy_lock(path, scratch_settings=scratch_settings),
-          copy_record_lock(path, scratch_settings=scratch_settings)):
-        current = task_of(path, scratch_settings=scratch_settings)
-        updated = update_record(path, transferred, scratch_settings=scratch_settings)
-        held = found.get(str(path.resolve()))
-        if held is not None and isinstance(current, copy_record.Registered) and (
-                held["task"] == current.task or updated.fields.get("test_hana_clone") is True):
-            held.update(task=task, ended=0.0)
-            write_holds(found, scratch_settings=scratch_settings)
+    try:
+        staff.precheck_copy_owner(owner)
+        with (locked_holds(scratch_settings=scratch_settings) as found,
+              copy_lock(path, scratch_settings=scratch_settings),
+              copy_record_lock(path, scratch_settings=scratch_settings)):
+            current = task_of(path, scratch_settings=scratch_settings)
+            with staff.copy_owner_admission(owner):
+                updated = update_record(path, transferred, scratch_settings=scratch_settings)
+                held = found.get(str(path.resolve()))
+                if held is not None and isinstance(current, copy_record.Registered) and (
+                        held["task"] == current.task or updated.fields.get("test_hana_clone") is True):
+                    held.update(task=task, ended=0.0)
+                    write_holds(found, scratch_settings=scratch_settings)
+    except (staff.StaffRefused, staff.StaffUnreadable) as error:
+        raise ScratchError(str(error)) from error
 
 
 def fields_for_task(fields: dict[str, object], task: str, *, run_dir: str = "", phase_id: str = "",

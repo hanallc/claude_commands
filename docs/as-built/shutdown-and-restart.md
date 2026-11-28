@@ -405,11 +405,20 @@ If shell identity is uncertain, the journal stays for retry.
 A confirmed close removes the saved pane launch record.
 
 Removal of an old staff record preserves the checkout files and Git refs.
-The authority checks checkout absence before the final origin read.
-Both final checks share half the staff operation lock wait limit.
-If a check times out, retirement keeps the rows and reports the check and retry command.
-A caller timeout can leave removal unconfirmed while the authority finishes the write.
-A retry by staff ID reports current absence and can remove a remaining old journal.
+The staff authority checks checkout absence and compares the origin tip immediately before it publishes the staff change.
+These checks share half the staff operation lock wait limit.
+If a check fails or a member lock is busy, retirement keeps the rows and gives the retry command.
+The staff write removes the unit and worker rows and records a copy cleanup receipt.
+The receipt reserves the removed staff IDs and native session IDs.
+The worktree host locks the removed members' slots and confirms the receipt with the authority before it removes copies.
+Copy publication uses the same slots to check the staff record before it writes a copy record.
+The copy registry routes removal for registered remote mirrors with the receipt token.
+The command clears the receipt after all removals succeed.
+If a copy is busy or removal is unconfirmed, the command reports cleanup pending and gives the retry command.
+A retry by staff ID resumes the receipt without a journal or a production checkout.
+A request with an older token reports that it was superseded and keeps the current receipt.
+A retry with no receipt reports current absence and can remove a remaining old journal.
+Showrunner retirement completes pending copy cleanup for its retired units before it removes the showrunner.
 
 `agents retire NAME` retires a showrunner when no active unit or child showrunner reports to it.
 The command names each unit to retire or transfer and each child showrunner to detach or retire.

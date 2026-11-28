@@ -49,6 +49,8 @@ else:
     from scripts.buildlog import store as buildlog_store
 from scripts.lib import conf, conf_reads, session_folder
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test.offload_test_commands import install_nextest_log_writer
@@ -1689,6 +1691,89 @@ class OffloadCommandTests(OffloadCommandFixture):
             self.assertTrue(all(isinstance(admission.server.assignments[execution_identity.attempt_key(
                 saved.assignment.episode, saved.assignment.attempt)].state, placement.ClosedAssignment)
                 for saved in assigned), assigned)
+
+        with self.subTest(owner="retired owner"):
+            staff_file = self.root / "private-staff.json"
+            _ = staff_file.write_text('{"schema": 2, "rows": []}\n')
+            before = self.events_for("rsync")
+            with mock.patch.dict(self.environment, {"STAFF_FILE": str(staff_file)}), \
+                    mock.patch.object(copies, "source_owner", return_value="00000000-0000-4000-8000-000000000001"):
+                refused = self.command(direct_placement=True, separate_stderr=True)
+            self.assertEqual(self.events_for("rsync"), before, refused.stderr)
+            self.assertEqual(refused.returncode, 75, refused.stdout)
+            self.assertIn("copy owner is absent from staff", refused.stdout)
+            self.assertFalse(self.claim_file.exists())
+
+        for change in ("session changes", "worktree moves", "owner retires after reuse", "owner retires after creation"):
+            with self.subTest(change=change), mock.patch.dict(self.environment), ExitStack() as fixture_scope:
+                from scripts.agents import remote
+
+                self.fixture.update(run_status_reported=True, run_lines=[])
+                self.sync_fixture()
+                path.unlink(missing_ok=True)
+                fixture = self.root / change
+                fixture.mkdir()
+                staff_file = fixture / "staff.json"
+                mirror_path = fixture / "mirror"
+                contents = mirror_path / "contents.txt"
+                reused = change == "owner retires after reuse"
+                fresh = change == "owner retires after creation"
+                if reused:
+                    mirror_path.mkdir()
+                    _ = contents.write_text("existing mirror contents")
+                _ = fixture_scope.enter_context(isolated_staff_file(staff_file, self.environment))
+                parent = fixture_member("showrunner", name="offload-owner-parent")
+                staff_before_owner = staff_file.read_bytes()
+                owner = fixture_member("unit", name="offload-owner", parent=parent.id,
+                                       runtime_id=fixture_runtime_id(f"offload-owner:{change}"),
+                                       worktree=staff.PresentWorktree("natedev", self.repository))
+                copy_tree = offload.copy_tree_with_key
+                replacement = staff.native_id(fixture_runtime_id("offload-new-session"))
+
+                def transfer(controller: offload.ProcessController, config: eligibility.OffloadConfig,
+                             request: offload.OffloadRequest, repository: eligibility.KnownRepository
+                             ) -> offload.CopiedTree | offload.TreeCopyFailed:
+                    if fresh:
+                        self.assertFalse(mirror_path.exists())
+                    if change == "session changes":
+                        with staff.slot_operation(owner.id, owner.name, join=False):
+                            _ = staff.update_current_session(owner.current_session, replacement)
+                    result = copy_tree(controller, config, request, repository)
+                    self.assertIsInstance(result, offload.CopiedTree)
+                    mirror_path.mkdir(exist_ok=True)
+                    if fresh:
+                        _ = contents.write_text("new mirror contents")
+                    copies.mark_mirror(mirror_path, owner.id, repository.name, request.holder_session)
+                    if change == "worktree moves":
+                        _ = staff.set_worktree(owner.id, staff.PresentWorktree("mac", self.repository),
+                                               expected=owner.worktree)
+                    if reused or fresh:
+                        _ = staff_file.write_bytes(staff_before_owner)
+                    return result
+
+                with (mock.patch.object(remote, "local_machine", return_value="natedev"),
+                      mock.patch.object(copies, "source_owner", return_value=owner.id),
+                      mock.patch.object(offload, "remote_mirror", return_value=str(mirror_path)),
+                      mock.patch.object(offload, "copy_tree_with_key", side_effect=transfer),
+                      mock.patch.object(copies, "remove_remote_mirror") as remove_peer):
+                    result = self.command(direct_placement=True)
+                with mock.patch.dict(os.environ, self.environment):
+                    if reused or fresh:
+                        self.assertEqual(result.returncode, 75, result.stdout)
+                        self.assertIn("copy owner is absent from staff", result.stdout)
+                        self.assertIn(f":{mirror_path}", result.stdout)
+                        self.assertEqual(contents.read_text(), "new mirror contents" if fresh else "existing mirror contents")
+                        self.assertEqual(copies.owned_remote_mirrors(owner.id), [])
+                        remove_peer.assert_not_called()
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout)
+                        if change == "session changes":
+                            self.assertEqual(staff.authority_snapshot().by_id(owner.id),
+                                             replace(owner, current_session=replacement))
+                        else:
+                            self.assertEqual([mirror.path for mirror in copies.owned_remote_mirrors(owner.id)],
+                                             [str(mirror_path)])
+                self.assertFalse(self.claim_file.exists())
 
     def test_copy_refusal_records_cleanup_without_receiver_proof_as_unconfirmed(self) -> None:
         self.fixture["rsync_status"] = 23

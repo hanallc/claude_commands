@@ -91,7 +91,7 @@ from scripts.production.production_doc import (
 )
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD, NOTES_DIRECTORY
 from scripts.production.unit_move import RenameRefused, read_json, write_json
-from scripts.lib import origin_deletion
+from scripts.lib import origin_deletion, scratch, time_limit
 from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_text_atomic
 from scripts.worktree import worktree_records, worktrees
 from scripts.agents import (
@@ -778,6 +778,16 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError, RetirementRefused) as error:
             print(str(error))
             return 1
+    if len(arguments) == 4 and arguments[0] == "_retired-copy-cleanup":
+        owner, token, machine = arguments[1:]
+        try:
+            request = staff.RetiredCopyCleanupRequest(staff.StaffId(owner), token, machine)
+            state = cleanup_retired_copies_here(request)
+            print(f"{COPY_CLEANUP_RESULT}{state.value}")
+            return 0
+        except (RetirementDeferred, *RETIREMENT_IO_ERRORS) as error:
+            print(error)
+            return 1
     if len(arguments) == 2 and arguments[0] == "_retired-retry-journal":
         return retry_retirement_journal_here(arguments[1])
     if len(arguments) == 3 and arguments[0] == "_keep-workers-check":
@@ -1399,6 +1409,7 @@ class RetirementResult(Enum):
     KEPT = "work kept"
     PENDING = "cleanup pending"
     REFUSED = "refused"
+    SUPERSEDED = "superseded"
 
     @property
     def code(self) -> int:
@@ -1567,6 +1578,8 @@ def retired_remote_read(machine: str, arguments: list[str]) -> str:
     status, output = run_remote(arguments, limit={"kind": "time limit", "seconds": seconds},
                                 propagate_timeout=True)
     _ = retirement_seconds_remaining()
+    if status == time_limit.TIMED_OUT:
+        raise subprocess.TimeoutExpired(arguments, seconds)
     if status:
         raise ValueError(output or f"cannot read from {machine}")
     return output
@@ -1574,6 +1587,61 @@ def retired_remote_read(machine: str, arguments: list[str]) -> str:
 
 def retired_check_timeout(identity: staff.StaffId, check: str) -> staff.StaffRefused:
     return staff.StaffRefused(f"{check} did not finish in time. Run agents retire {identity} again.")
+
+
+COPY_CLEANUP_RESULT = "copy_cleanup_result="
+
+
+def cleanup_retired_copies_here(request: staff.RetiredCopyCleanupRequest) -> staff.CopyCleanupState:
+    if not unit_machine_is_local(request.machine):
+        raise RetirementDeferred(f"copy cleanup belongs to {request.machine}")
+    record = staff.authority_snapshot()
+    receipt = request.current_receipt(record)
+    if receipt is None:
+        return request.state(record)
+    with ExitStack() as members:
+        for identity in receipt.members:
+            _ = members.enter_context(staff.slot_operation(identity, identity, join=False))
+        state = staff.confirm_retired_copy_cleanup(request)
+        if state is not staff.CopyCleanupState.CURRENT:
+            return state
+        try:
+            copies.remove_trees(request.owner, retirement=request)
+        except scratch.ScratchError as error:
+            raise copies.CopyError(str(error)) from error
+        return staff.finish_retired_copy_cleanup(request)
+
+
+def resume_retired_copy_cleanup(identity: staff.StaffId, receipt: staff.RetiredUnitCopyCleanup) -> RetirementResult:
+    request = staff.RetiredCopyCleanupRequest(identity, receipt.token, receipt.machine)
+    try:
+        if unit_machine_is_local(request.machine):
+            state = cleanup_retired_copies_here(request)
+        else:
+            if request.machine != other_machine():
+                raise RetirementDeferred(f"no route to {request.machine}")
+            status, output = run_remote(["_retired-copy-cleanup", identity, request.token, request.machine])
+            if status:
+                raise RetirementDeferred(output or f"{request.machine}: copy cleanup result is not confirmed")
+            progress, _, result = output.rstrip("\n").rpartition("\n")
+            if not result.startswith(COPY_CLEANUP_RESULT):
+                raise RetirementDeferred(f"{request.machine}: copy cleanup result is not confirmed")
+            try:
+                state = staff.CopyCleanupState(result.removeprefix(COPY_CLEANUP_RESULT))
+            except ValueError as error:
+                raise RetirementDeferred(f"{request.machine}: copy cleanup result is not confirmed") from error
+            if progress:
+                print(progress)
+        if state is staff.CopyCleanupState.COMPLETE:
+            return RetirementResult.COMPLETE
+        if state is staff.CopyCleanupState.SUPERSEDED:
+            print(f"{identity}: copy cleanup request superseded. Run agents retire {identity} again.")
+            return RetirementResult.SUPERSEDED
+        raise RetirementDeferred(f"{request.machine}: copy cleanup result is not confirmed")
+    except (RetirementDeferred, *RETIREMENT_IO_ERRORS) as error:
+        detail = " ".join(str(error).splitlines()).rstrip(".")
+        print(f"{identity}: cleanup pending. {detail}. Run agents retire {identity} again.")
+        return RetirementResult.PENDING
 
 
 def require_retired_record_unchanged(identity: staff.StaffId, branch: staff.ParkedBranch, checked: staff.RetiredUnitOrigin,
@@ -3016,13 +3084,13 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
     if isinstance(location, staff.RemovedWorktree):
         if local:
             if not isinstance(retired_record_retry(row, record), ActiveRetirementJournal):
-                return remove_retired_record(unit, location, record, settings=settings)
+                return remove_retired_record(unit, location, record, settings=settings).code
         else:
             retry = unit_remote_command("retired-retry", row, record)
             if retry["code"]:
                 return retry["code"]
             if not retry.get("active_retry"):
-                return remove_retired_record(unit, location, record, settings=settings)
+                return remove_retired_record(unit, location, record, settings=settings).code
     if local:
         with retirement_member_locks(row, record):
             current = retirement_staff(row, record)
@@ -3317,15 +3385,20 @@ def save_showrunner_retirement(saved: ShowrunnerRetirementJournal) -> None:
 def remove_showrunner_retired_units(row: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
     retired = [(member, member.worktree) for member in record.find(kind="unit", parent=row.id)
                if isinstance(member.worktree, staff.RemovedWorktree)]
+    for identity, receipt in record.retirement_cleanup.items():
+        if isinstance(receipt, staff.RetiredUnitCopyCleanup) and receipt.parent == row.id:
+            if resume_retired_copy_cleanup(identity, receipt) is not RetirementResult.COMPLETE:
+                print(f"{row.name}: cannot complete cleanup for retired unit {identity}.")
+                return False
     if not retired:
         return True
     settings = conf.read("production")
     for member, location in retired:
         try:
             unit = retirement_find_unit(row.name, str(member.id), record=record)
-            if remove_retired_record(unit, location, record, settings=settings) == 0:
+            if remove_retired_record(unit, location, record, settings=settings) is RetirementResult.COMPLETE:
                 continue
-        except (RetirementRefused, RetirementBeforeRemoval, RetirementDeferred, staff.StaffNotFound,
+        except (RetirementRace, RetirementRefused, RetirementBeforeRemoval, RetirementDeferred, staff.StaffNotFound,
                 *RETIREMENT_IO_ERRORS) as error:
             print(f"{row.name}: cannot remove retired unit {member.name} ({member.id}). {error}")
             return False
@@ -3551,7 +3624,7 @@ def retirement_showrunner_command(arguments: list[str]) -> int:
 
 
 def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, record: staff.StaffSnapshot,
-                          *, settings: conf.ConfigRead) -> int:
+                          *, settings: conf.ConfigRead) -> RetirementResult:
     row = unit.staff_member
     if not isinstance(location.branch, staff.ParkedBranch):
         raise RetirementRefused(f"{unit.name}: the retired record has no branch")
@@ -3561,7 +3634,7 @@ def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, r
         check_retired_checkout(location)
         saved = read_legacy_retirement_journal(row, location)
         if isinstance(saved, LegacyRetirementJournal) and not complete_legacy_retirement(row, record, saved):
-            return 1
+            return RetirementResult.REFUSED
 
     run = partial(retirement_git, unit, settings=settings)
     tips = retired_branch_tips(run, unit.branch)
@@ -3575,21 +3648,31 @@ def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, r
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
     if peer_status or refused:
-        return 1
+        return RetirementResult.REFUSED
     origin = staff.RetiredUnitOrigin(local_machine(), unit.production.checkout,
                                     tips.commits.get("origin", staff.OriginBranchAbsent()))
-    try:
-        removal = staff.remove_retired_unit(row, origin)
-    except staff.RetiredUnitRemovalUnconfirmed as error:
-        print(f"{unit.name}: {error}. Run agents retire {row.id} again.")
-        return 1
+    removal = staff.remove_retired_unit(row, origin)
+    if isinstance(removal, staff.RetiredUnitRemovalRefused):
+        match removal.reason:
+            case staff.RetiredUnitRemovalFailure.MEMBERS_CHANGED:
+                raise retirement_race(row, "The unit changed before retirement")
+            case staff.RetiredUnitRemovalFailure.MEMBER_BUSY:
+                report_retirement_deferred(row, removal.detail)
+                return RetirementResult.PENDING
+            case staff.RetiredUnitRemovalFailure.CHECK_FAILED:
+                raise staff.StaffRefused(removal.detail)
+            case staff.RetiredUnitRemovalFailure.WRITE_UNCONFIRMED:
+                print(f"{unit.name}: {removal.detail}. Run agents retire {row.id} again.")
+                return RetirementResult.REFUSED
     if not local:
         _ = unit_remote_command("retired-forget-journal", row, record)
     elif isinstance(saved, LegacyRetirementJournal):
         _ = forget_retirement_journal(row.id, row.name)
-    message = "retired record removed" if removal is staff.RetiredUnitRemoval.REMOVED else "staff record is absent"
-    print(f"{unit.name}: {message}")
-    return 0
+    if isinstance(removal, staff.RetiredUnitRemoved):
+        print(f"{unit.name}: retired record removed")
+        return resume_retired_copy_cleanup(row.id, removal.cleanup)
+    print(f"{unit.name}: staff record is absent")
+    return RetirementResult.COMPLETE
 
 
 @dataclass(frozen=True)
@@ -3621,6 +3704,11 @@ def unit_production_name(row: staff.StaffRow, record: staff.StaffSnapshot) -> st
 def retirement_completion_for_reference(name: str, record: staff.StaffSnapshot) -> int | None:
     identity = staff.StaffId(name)
     receipt = record.retirement_cleanup.get(identity)
+    if isinstance(receipt, staff.RetiredUnitCopyCleanup):
+        result = resume_retired_copy_cleanup(identity, receipt)
+        if result is RetirementResult.COMPLETE:
+            print(f"{identity}: copy cleanup complete. The staff record is absent.")
+        return result.code
     if isinstance(receipt, staff.ShowrunnerRetirementReceipt):
         try:
             if unit_machine_is_local(receipt.machine):

@@ -2768,6 +2768,36 @@ print(scratch.target('gate:proof', 'tree'))
         with self.assertRaises(scratch.ScratchError):
             scratch.hand_over(path, "next-unit", "row:invalid")
         self.assertEqual((path / copy_record.RECORD).read_bytes(), before)
+        with self.subTest(task="valid task for a retired owner"):
+            owner = fixture_runtime_id("retired-scratch-owner")
+            with self.assertRaisesRegex(scratch.ScratchError, "copy owner is absent from staff"):
+                scratch.hand_over(path, owner, "gate:retired-owner")
+            self.assertEqual((path / copy_record.RECORD).read_bytes(), before)
+        with self.subTest(task="owner moves before hand-over publication"):
+            from scripts.agents import remote
+
+            parent = fixture_member("showrunner", name="scratch-owner-parent")
+            owner = fixture_member("unit", name="scratch-owner", parent=parent.id,
+                                   worktree=staff.PresentWorktree("natedev", self.base / "owner"))
+            task_of = scratch.task_of
+            moved = False
+
+            def read_copy(copy: Path, *, scratch_settings: conf.ConfigRead) -> (
+                    copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord):
+                nonlocal moved
+                if not moved:
+                    moved = True
+                    _ = staff.set_worktree(owner.id, staff.PresentWorktree("mac", self.base / "peer"),
+                                           expected=owner.worktree)
+                return task_of(copy, scratch_settings=scratch_settings)
+
+            with (mock.patch.object(remote, "local_machine", return_value="natedev"),
+                  mock.patch.object(scratch, "task_of", side_effect=read_copy)):
+                scratch.hand_over(path, owner.id, "gate:move-during-transfer")
+            record = scratch.task_of(path)
+            assert isinstance(record, copy_record.Registered)
+            self.assertEqual(record.task, "gate:move-during-transfer")
+            self.assertEqual(record.fields["owner_unit"], owner.id)
 
     def test_lifetime_judgment_does_not_create_a_busy_mark(self) -> None:
         path = self.copy()

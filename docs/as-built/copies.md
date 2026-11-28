@@ -172,16 +172,39 @@ Cancellation closes its acquired descriptors.
 The lock files retain their inodes.
 
 `copies.py remove` takes the owner from the caller's staff row and includes that owner's remote mirrors within the repository scope.
-Retirement and production cleanup use the same removal path before deleting source trees or production state.
+Retirement and production cleanup use the same removal path.
+Removal of a retired staff record starts copy cleanup after the authority publishes its receipt.
+A pre-check reads the staff owner before copy creation or transfer.
+Publication holds the mirror lease, enters admission, then takes `records.lock`. Retirement holds the staff slots and tries the mirror leases without waiting.
+Publication waits for the staff slot up to `staff.operation_lock_seconds` or the caller's remaining deadline, whichever is shorter.
+After the wait, publication reads the staff owner again even if the slot remains busy.
+Publication refuses a pending cleanup receipt or an absent owner.
+A live owner can publish from either workstation.
+Publication prints one warning if it cannot read the staff authority and proceeds.
+Publication without the slot can race retirement.
+The copyintent follow-up adds a durable creation record so retirement can find the copy.
+Transfers and clone setup use their copy leases.
+When admission refuses publication, the creator leaves the copy and reports its host and path.
+Scratch hand-over keeps the source record when admission refuses the destination owner.
+Admission, discovery, and cleanup treat equivalent UUID spellings as one owner.
+An implicit clone has a local task record.
+The Mac gate uses the installed clone command to create and register a task-owned clone on the Mac.
+The Mac gate also publishes a mirror record on the sender.
+The sender saves the mirror lease path before publication.
+If a marker remains after interruption, cleanup checks the host, path, and task in the registry while it holds the mirror lease.
 Busy removal names the holder session and mirror path.
-A host connection failure marks the local mirror record for deferred removal, so retirement can finish.
+A host connection failure marks the local mirror record for deferred removal.
+When a staff receipt authorizes cleanup, the mirror record keeps its token and the staff receipt stays pending.
+Run `agents retire ID` again to retry a mirror that has a receipt token.
 Removal tries an unreachable host only once per call.
-`register_remote` retries deferred removals after the next successful copy or remote clone on that host.
+`register_remote` retries ordinary deferred removals after the next successful copy or remote clone on that host.
 Registration replaces the current path's record first, so reuse clears its removal mark.
 A failed retry keeps the mark and prints one anomaly without failing the copy.
 A successful retry removes the record.
 Removal requires a zero status marker from the remote command before it deletes the local record.
-Authentication failures and remote removal refusals still raise `RemoteMirrorKept` and prevent retirement.
+Authentication failures and remote removal refusals raise `RemoteMirrorKept`.
+Receipt-based mirror removal checks the current authority receipt while it holds the mirror lease.
+Mirror hosts that do not own the staff record read it from natedev over SSH.
 A kept local tree prints one line, and retirement continues.
 The tmp sweep lists eligible local trees for vetted manual removal.
 Another owner's records remain.
