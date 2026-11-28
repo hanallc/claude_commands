@@ -300,6 +300,9 @@ class ReviewPageTests(unittest.TestCase):
         self.fixture.set_up_review(changes=3)
         self.fixture.page = change_page.ReviewPage(
             self.fixture.review_list, self.fixture.production, ('C1', 'C2', 'C3'), 'selected-fixture')
+        self.configure_review()
+
+    def configure_review(self) -> None:
         config = self.fixture.temporary / 'config'
         _ = write_config_fixture(config / "production.conf", "question_title_max_chars=100\n")
         _ = write_config_fixture(config / "console.conf",
