@@ -205,10 +205,10 @@ class ConsoleTests(unittest.TestCase):
         markup = ConsoleMarkup()
         markup.feed(source)
         self.assertEqual(markup.pages, ["accounts", "aws", "aws_machines", "builds", "disks", "images", "studio",
-                                        "review", "placement_disk"])
+                                        "review", "placement_disk", "settings"])
         self.assertEqual(markup.sources, [])
         # Each page has its own icon and a hidden new mark; the menu button has one more mark.
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 27)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 28)
         self.assertEqual(source.count('class="lucide lucide-sparkle"'), 10)
         self.assertEqual(source.count('<span class="new-mark" hidden>'), 9)
         self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
@@ -401,7 +401,7 @@ addEventListener('load', async () => {
         self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         markup.feed(source)
         self.assertEqual(markup.pages, ["placement_disk", "review", "studio", "images", "disks", "builds", "aws_machines",
-                                        "aws", "accounts"])
+                                        "aws", "accounts", "settings"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
         self.assertIn('aria-label="Builds — Not available"', source)
         self.assertNotIn("fixture page absent", source)

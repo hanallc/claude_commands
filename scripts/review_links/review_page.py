@@ -33,6 +33,7 @@ from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_link
 from scripts.review_links import new_item_dialog, reply_tokens, review_submissions
 from scripts.review_links import question_path, question_record, review_actions, review_events, send_hold, staff_names
+from scripts.review_links import settings_page
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
 from scripts.review_links.review_items import source_stamp as source_stamp
 from scripts.statusline import rebuild_row
@@ -593,7 +594,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     sources = ReviewSourceStamps()
     sources.extend((folder/change_browser.MANIFEST, staff.record_path(), state_root(),
                     change_review.lists_directory(), urgency.state_dir(), conf.path('review_links'), conf.path('production'), conf.path('statusline'),
-                    Path(USER_ZONE_CONF)))
+                    Path(USER_ZONE_CONF), root / settings_page.SETTINGS_FILE))
     zone = user_zone()
     token,initial = change_browser.browser_manifest(folder)
     members = staff.snapshot()
@@ -640,7 +641,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     request_timeout = settings.whole('page_request_timeout_seconds')
     delivery_window = record_table.delivery_window_seconds(settings)
     card_motion = page_frame.CardMotion.read(settings)
-    undo_enabled = settings.whole('undo_seconds') > 0
+    undo_enabled = settings_page.undo_seconds(root, settings) > 0
     later = record_table.park_settings(settings)
     title_limit = conf.read_or_repository('production').whole('question_title_max_chars')
     log_max_height = record_table.log_max_height_rem(settings)

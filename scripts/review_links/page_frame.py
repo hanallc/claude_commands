@@ -1395,7 +1395,7 @@ function trackHeldRequest(key,id){
  heldRequests.set(key,request);
  return request;
 }
-function showSendUndo(request,seconds,receiver,resumable){
+function showSendUndo(request,seconds,receiver,resumable,saved=false,reason=''){
  const {hold}=request,host=sendUndoHost();
  const view=host.defaultView;
  if(!view.getSendUndoStack){
@@ -1407,13 +1407,16 @@ function showSendUndo(request,seconds,receiver,resumable){
  const toast=host.createElement('div'),text=host.createElement('span'),button=host.createElement('button');
  const bar=host.createElement('div');
  const sent=receiver===null ? 'Saved.' : receiver ? 'Sent to '+receiver+'.' : 'Sent.';
- toast.dataset.sendUndo='';text.textContent=receiver || receiver===null ? sent : 'Sending.';
+ toast.dataset.sendUndo='';text.textContent=reason || (receiver || receiver===null ? sent : 'Sending.');
+ if(reason) text.setAttribute('role','alert');
  button.type='button';button.textContent='Undo';
- bar.dataset.sendUndoBar='';toast.append(text,button,bar);stack.append(toast);
+ const canUndo=!saved || Boolean(hold);
+ toast.append(text);
+ if(canUndo){bar.dataset.sendUndoBar='';toast.append(button,bar);}
+ stack.append(toast);
  // The Undo stays clear for the first half of the time, then fades out until the send leaves.
  const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
  const fade=toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
- const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
  return new Promise((resolve,reject)=>{
   let done=false,removalTimer=0;
   const remove=()=>{
@@ -1448,10 +1451,13 @@ function showSendUndo(request,seconds,receiver,resumable){
   window.addEventListener('pagehide',close);
   fade.finished.then(()=>{
    if(done) return;
+   if(saved){finish(false);return;}
    done=true;
    button.remove();bar.remove();toast.hidden=true;
    resolve(reportResult);
   },()=>{});
+  if(!canUndo) return;
+  const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
   button.addEventListener('click',async()=>{
    button.disabled=true;fade.pause();shrink.pause();
    const signal=resumable ? holdRequestSignal() : undefined;
@@ -1460,10 +1466,17 @@ function showSendUndo(request,seconds,receiver,resumable){
     try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST',signal}); }
     catch{ if(!signal?.aborted) await pause(500); }
    }
-   if(answer?.ok && (!resumable || (await answer.json().catch(()=>null))?.outcome==='undone')){
+   const result=resumable && (saved || answer?.ok) ? await answer?.json().catch(()=>null) : null;
+   if(answer?.ok && (!resumable || result?.outcome==='undone')){
     finish(true);return;
    }
    if(request.closed) return;
+   if(saved){
+    done=true;remove();
+    reject(Object.assign(new Error(result?.reason || 'The Undo time could not be restored.'),
+     {undone:result?.outcome==='undone'}));
+    return;
+   }
    if(signal?.aborted){
     done=true;remove();
     reject(new Error('The Undo response timed out. The send can still leave.'));
@@ -1537,6 +1550,11 @@ async function readHeldResult(hold,request,undo,resumable){
  }
 }
 heldFetch.newId=newHoldId;
+heldFetch.showSaved=({hold,seconds,reason})=>{
+ const request={hold,closed:false};
+ const done=showSendUndo(request,seconds,null,true,true,reason);
+ return {done,close(){request.closed=true;request.closeToast();}};
+};
 heldFetch.resume=id=>{
  const request=heldRequests.get(id);
  return readHeldResult(request?.hold ?? id,request,false,true);
