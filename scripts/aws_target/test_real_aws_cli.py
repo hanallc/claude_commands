@@ -89,7 +89,10 @@ SCENARIOS = {
         'test_expired_uncertain_launch_keeps_reservation_until_reconciliation',
         'test_stopped_instance_reports_a_confirmed_spot_interruption',
         'test_reconcile_closes_the_missing_box_in_a_batch',
+        'test_current_files_upload_once_and_use_a_signed_home_get_in_the_fallback_region',
     ),
+    'test_teardown.GateBucketRemovalTests': (
+        'test_down_empties_the_home_gate_bucket_and_retries_after_a_late_write',),
     'test_gpu_size_trial.GpuOnlineTests': (
         'test_upload_uses_s3_cp_at_the_multipart_limit',
         'test_hana_nextest_uses_the_cheapest_offer_within_quota_and_settles',
