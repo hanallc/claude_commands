@@ -501,7 +501,6 @@ class PaneRead:
     panes: list[dict[str, object]]
     scan: herdr.RowPaneScan
     statuses: dict[str, herdr.AgentStatus]
-    agent_names: dict[str, str]
     launches: LaunchRecords | LaunchRecordsUnavailable
     launch_owners: dict[str, StaffId]
 
@@ -581,16 +580,14 @@ def _read_panes(record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneRead | 
     except (OSError, ValueError) as error:
         launches = LaunchRecordsUnavailable(f"launch records are unavailable: {error}")
     try:
-        agents = agent_inventory(client)
+        statuses = {agent["pane_id"]: agent["agent_status"] for agent in agent_inventory(client)}
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
-        agents = []
-    statuses = {agent["pane_id"]: agent["agent_status"] for agent in agents}
-    agent_names = {agent["pane_id"]: agent["name"] for agent in agents if "name" in agent}
+        statuses = {}
     # The staff owner of each launched pane, read once for all parents.
     launch_owners = ({pane: reference.id for pane, entry in launches.entries.items()
                       if isinstance(reference := pane_launch.launch_reference(entry, record), pane_launch.StaffLaunchReference)}
                      if isinstance(launches, LaunchRecords) else {})
-    return PaneRead(panes, scan, statuses, agent_names, launches, launch_owners)
+    return PaneRead(panes, scan, statuses, launches, launch_owners)
 
 
 def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
@@ -608,26 +605,6 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
         if launch_owners.get(_text(pane, "pane_id")) == parent
         and not any(pane in found for owner, found in scan.found.items() if owner != parent)]
     parent_tabs = {_text(pane, "tab_id") for pane in parent_panes} - {""}
-    pane_locations = {_text(pane, "pane_id"): pane for pane in panes}
-    unknown_here = [(item, pane_locations[item.pane]) for item in scan.unknown
-                    if item.tab in parent_tabs and item.pane not in scan.confirmed_closed]
-    parent_unreadable = not scan.found.get(parent) and any(
-        launch_owners.get(item.pane) == parent for item, _ in unknown_here)
-    owner = record.by_id(parent)
-    names = {row.id: (row.name,) if owner is None else (row.name, agent_name(owner, row.name)) for row in workers}
-    unknown_workers: dict[StaffId, ProcessUnknownWorker] = {}
-    unclaimed_unreadable = False
-    for item, pane in unknown_here:
-        launch_owner = launch_owners.get(item.pane)
-        session = _text(pane, "session_id")
-        reported_name = read.agent_names.get(item.pane, "")
-        candidates = [row for row in workers if launch_owner == row.id or session == row.current_session
-                      or (launch_owner is None and not session and reported_name in names[row.id])]
-        for row in candidates:
-            _ = unknown_workers.setdefault(row.id, ProcessUnknownWorker(
-                row, item.pane, _text(pane, "terminal_id"), item.reason))
-        if not candidates and launch_owner is None and not session:
-            unclaimed_unreadable = True
     # Only a worker that launched a pane in a parent tab can recover one.
     launched_here = {launch_owners[pane_id] for pane in panes
                      if (pane_id := _text(pane, "pane_id")) in launch_owners and _text(pane, "tab_id") in parent_tabs}
@@ -655,8 +632,12 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
                     if launch_owners.get(_text(pane, "pane_id")) == row.id
                     and _text(pane, "tab_id") in parent_tabs
                     and not any(pane in scan.found.get(sibling.id, []) for sibling in workers)]
-        if row.id in unknown_workers:
-            states.append(unknown_workers[row.id])
+        related_unknown = [item for item in scan.unknown
+                           if launch_owners.get(item.pane) == row.id and item.tab in parent_tabs]
+        if related_unknown:
+            unknown = related_unknown[0]
+            location = next(pane for pane in panes if _text(pane, "pane_id") == unknown.pane)
+            states.append(ProcessUnknownWorker(row, unknown.pane, _text(location, "terminal_id"), unknown.reason))
         elif len(recovery) > 1:
             states.append(_uncertain(row, "multiple recovery panes"))
         elif recovery:
@@ -670,10 +651,8 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
                 states.append(_uncertain(row, "recovery pane belongs to another native session"))
                 continue
             states.append(StoppedWorker(row, identity, terminal))
-        elif not isinstance(selection, SelectedWorkers) and parent_unreadable:
-            states.append(_uncertain(row, "the parent pane is unreadable; worker absence is unproved"))
-        elif unclaimed_unreadable:
-            states.append(_uncertain(row, "an unreadable pane in the parent tab has no known worker"))
+        elif not isinstance(selection, SelectedWorkers) and any(item.tab in parent_tabs for item in scan.unknown):
+            states.append(_uncertain(row, "pane evidence is incomplete; absence is unproved"))
         else:
             states.append(ClosedWorker(row))
     terminals: frozenset[str] = frozenset()

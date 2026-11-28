@@ -1080,7 +1080,6 @@ class UnknownPane:
 class RowPaneScan:
     found: dict[staff.StaffId, list[dict[str, object]]]
     unknown: list[UnknownPane]
-    confirmed_closed: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1210,7 +1209,6 @@ class NoReportedAgentSession:
 class AgentOccupant(TypedDict):
     pane_id: str
     agent: NotRequired[str | None]
-    name: NotRequired[str]
     agent_status: AgentStatus
     agent_session: ReportedAgentSession | NoReportedAgentSession
 
@@ -1330,7 +1328,6 @@ PROGRAM_TIMEOUT_SECONDS = 10.0
 def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     prompt_transport = argv[3:5] == ["agent", "prompt"]
-    input_transport = prompt_transport or argv[3:5] == ["pane", "send-text"]
     deadline = worker_lifecycle.effective_deadline(time.monotonic() + timeout)
     try:
         remaining = operation_deadline.remaining(timeout)
@@ -1338,14 +1335,14 @@ def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
         raise HerdrLaunchRefused(f"{argv[0]}: {error}") from error
     try:
         env = unmarked_environment() if environment is None else child_environment(environment)
-        if not input_transport:
+        if not prompt_transport:
             try:
                 return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=remaining, env=env)
             except UnicodeDecodeError as error:
                 raise HerdrFailure("the Herdr reply cannot be decoded") from error
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     except Exception as error:
-        if input_transport or isinstance(error, OSError):
+        if prompt_transport or isinstance(error, OSError):
             raise HerdrCommandNotStarted(f"{argv[0]}: {error}") from error
         raise
     with process:
@@ -1354,8 +1351,7 @@ def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
         except BaseException as error:
             process.kill()
             if isinstance(error, UnicodeDecodeError):
-                command = "prompt" if prompt_transport else "send-text"
-                raise HerdrFailure(f"the Herdr {command} reply cannot be decoded") from error
+                raise HerdrFailure("the Herdr prompt reply cannot be decoded") from error
             raise
         return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
@@ -2576,7 +2572,7 @@ class Herdr:
                 for identity in sessions:
                     if (row := record.by_current_session(identity)) is not None:
                         found.setdefault(row.id, []).append(pane)
-        return RowPaneScan(found, unknown, frozenset(closed))
+        return RowPaneScan(found, unknown)
 
     @pane_evidence_run()
     def retitle_row(self, row_id: str) -> bool:
@@ -3605,45 +3601,37 @@ class Herdr:
         submission = TrackedPromptSubmission(lambda: None)
         try:
             self.prompt(pane, text, target=target, on_submission=submission)
-        except AgentBlocked as error:
-            return AnswerDidNotSubmit(str(error))
         except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-            if submission.may_have_submitted:
-                return AnswerDeliveryUnknown(str(error))
-            return AnswerDidNotSubmit(str(error))
+            refused = isinstance(error, AgentBlocked) or (
+                isinstance(error, HerdrFailure) and error.code in ("agent_not_found", "agent_not_ready"))
+            if refused or not submission.may_have_submitted:
+                return AnswerDidNotSubmit(str(error))
+            return AnswerDeliveryUnknown(str(error))
         return AnswerTransportCompleted.SENT
 
-    def answer_question(self, pane: str, text: str, *, target: str,
-                        require_open: Callable[[], None]) -> AnswerTransport:
-        """Answer one free-text question in the selected Codex session."""
+    def answer_question(self, pane: str, text: str, *, target: str) -> None:
+        """Answer a Codex question through the selected session's input box."""
         if not target:
-            return AnswerDidNotSubmit(f"{pane}: would send keys without a named target session")
-
-        def require_target(expected: str) -> None:
+            raise HerdrFailure(f"{pane}: would send keys without a named target session")
+        for index, key in enumerate(("shift+left", "enter", "enter")):
+            expected = "" if index == 0 else text
             if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=expected,
                                 pane_info=self.pane_row(pane), client=self):
                 raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
-
-        may_have_typed = False
-        try:
-            require_target("")
-            script_prompts.record(pane, text)
-            require_open()
-            may_have_typed = True
             try:
-                _ = self.run("pane", "send-text", pane, text)
+                self._send_keys(pane, key)
             except HerdrCommandNotStarted as error:
-                return AnswerDidNotSubmit(str(error))
-            require_target(text)
-            self._send_keys(pane, "enter", before_send=require_open)
-        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-            if may_have_typed:
-                return AnswerDeliveryUnknown(str(error))
-            return AnswerDidNotSubmit(str(error))
-        return AnswerTransportCompleted.SENT
+                if index == 0:
+                    raise
+                raise HerdrFailure(f"{pane}: the answer may be partly typed: {error}") from error
+            if index == 0:
+                script_prompts.record(pane, text)
+                try:
+                    _ = self.run("pane", "send-text", pane, text)
+                except HerdrCommandNotStarted as error:
+                    raise HerdrFailure(f"{pane}: the answer selection key was sent: {error}") from error
 
-    def _send_keys(self, pane: str, *keys: str, before_send: Callable[[], None] = lambda: None) -> None:
-        before_send()
+    def _send_keys(self, pane: str, *keys: str) -> None:
         _ = self.run("pane", "send-keys", pane, *keys)
 
     def close_pane(self, pane: str, *, target: str) -> bool:
@@ -3673,15 +3661,12 @@ class Herdr:
                 report = json_object(agent["agent_session"], "herdr agent session")
                 if json_text(report.get("kind"), "herdr agent session kind") == "id":
                     session = ReportedAgentSession(json_text(report.get("value"), "herdr agent session id"))
-            occupant: AgentOccupant = {
+            agents.append({
                 "pane_id": json_text(agent.get("pane_id"), "herdr agent pane id"),
                 "agent": kind,
                 "agent_status": AgentStatus.decode(agent.get("agent_status")),
                 "agent_session": session,
-            }
-            if isinstance(name := agent.get("name"), str) and name:
-                occupant["name"] = name
-            agents.append(occupant)
+            })
         return agents
 
 
