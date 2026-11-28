@@ -1,6 +1,7 @@
 """Apply Review actions through the existing stores and message sender."""
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import shlex
@@ -9,17 +10,19 @@ from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, tzinfo
+from importlib import import_module
 from pathlib import Path
+from typing import Literal, cast
 from urllib.parse import urlencode
 
 from scripts.for_you.action import REVIEW_PATH
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, conf
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
-from scripts.production import change_review, change_routing, investigation, proposal_issue, staff, the_list, update_registration
+from scripts.production import change_review, change_routing, investigation, proposal_issue, record_store, staff, the_list, update_registration
 from scripts.production.production_doc import Production
-from scripts.review_links import change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
-from scripts.review_links import question_path, question_record, reply_tokens
+from scripts.review_links import change_browser, change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
+from scripts.review_links import question_path, question_record, reply_tokens, review_events
 from scripts.review_links.review_events import KeepMark, MarkChange, NoMark, ReviewMark
 
 PY = '~/.claude/scripts/lib/py ~/.claude/scripts/'
@@ -65,6 +68,135 @@ def record_action(item: review_items.ReviewItem, words: str, *, root: Path | Non
         _ = efficiency_reviews.record(source.path, decision_store.efficiency_identity(item), words, KeepMark(), check=check)
     elif check is not None:
         _ = check()
+
+
+class ReviewWaitEnded(Exception):
+    """The source can no longer move as Waiting work."""
+
+
+@dataclass(frozen=True)
+class MovedReportNumberChanged(Exception):
+    destination: investigation.ListDestination
+
+
+def migrate_report_words(item: review_items.ReviewItem) -> str:
+    source = item.source
+    if isinstance(source, review_items.ChangeSource):
+        request = source.slots.question
+        if isinstance(request, change_page.OpenQuestion) and request.text.strip():
+            return request.text
+        validation = source.slots.validation
+        if isinstance(validation, (change_page.ValidationRequested, change_page.DeliveryIntent)) and validation.feedback.strip():
+            return validation.feedback
+        if item.state == review_items.ReviewState.VALIDATING:
+            events = review_events.decode(source.row.get('Review log', ''))
+            for event in reversed(events):
+                action, _, words = event.words.partition(': ')
+                if action == 'validate':
+                    if words.strip():
+                        return words
+                    break
+        proof = source.row.get(change_review.CHECK, '').strip()
+        return proof or item.title
+    if isinstance(source, review_items.ProposalSource):
+        original = proposal_issue.read_issue(source.record.path)
+        body = original.partition('\n---\n')[2].strip() if original.startswith('---\n') else original.strip()
+        return body or item.title
+    if isinstance(source, review_items.EfficiencySource):
+        for event in reversed(item.log):
+            if event.who == 'nate' and event.words.startswith('question: '):
+                return event.words.removeprefix('question: ')
+    return item.title
+
+
+def move_wait_to_list(root: Path, item: review_items.ReviewItem, members: staff.StaffSnapshot, resume_move: bool = False
+                      ) -> investigation.ListDestination | investigation.NoListDestination:
+    """File the current native wait while its source is locked."""
+    original = item.source
+    if isinstance(original, review_items.InvestigationSource):
+        try:
+            moved = investigation.file_on_list(original.path, lambda record: the_list.file_investigation_report(
+                record, the_list.ReportKind.BUG if record.kind is investigation.InvestigationKind.BUG
+                else the_list.ReportKind.INVESTIGATION, members, route=review_submissions.NoListFiling(),
+                reservation=the_list.NextNumber.AVAILABLE, source='moved from Review'),
+                mode=investigation.ListFilingMode.MOVE_WAIT, resume_move=resume_move)
+        except FileNotFoundError:
+            return investigation.NoListDestination.ABSENT
+        return moved.list_destination
+    if isinstance(original, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
+        move = cast(Callable[[Path, review_items.ReviewItem, staff.StaffSnapshot, staff.StaffId],
+                             investigation.ListDestination | investigation.NoListDestination],
+                    import_module("scripts.review_links.answer_sources").move_question_wait)
+        return move(root, item, members, original.record.owner)
+
+    route = the_list.report_route(item.owner, members)
+    expected = the_list.moved_report_candidate(route.keeper, item.key)
+
+    def file_current_wait() -> None:
+        try:
+            current = review_items.read_current(root, item, members)
+        except review_items.ReviewRecordMissing:
+            raise ReviewWaitEnded() from None
+        if not review_items.can_move_wait(current):
+            raise ReviewWaitEnded()
+        kind = the_list.ReportKind.VALIDATION if current.state == review_items.ReviewState.VALIDATING else {
+            review_items.ReviewType.CHANGE: the_list.ReportKind.CHANGE,
+            review_items.ReviewType.PROPOSAL: the_list.ReportKind.PROPOSAL,
+            review_items.ReviewType.EFFICIENCY: the_list.ReportKind.EFFICIENCY,
+        }[current.type]
+        current_route = the_list.report_route(current.owner, members)
+        validation_log = (review_items.validation_log_start(current.source.row)
+                          if kind is the_list.ReportKind.VALIDATION
+                          and isinstance(current.source, review_items.ChangeSource)
+                          else review_items.LegacyValidationLog.MOVE_MARKER)
+        report = the_list.ListReport(kind, current.key, migrate_report_words(current), validation_log=validation_log)
+        destination = the_list.file_report(
+            current_route.keeper, report,
+            ' '.join(current.title.split()), owner=current.owner or the_list.UnassignedOwner.NOT_RECORDED,
+            producer=current_route.producer, unit=current_route.unit, source='moved from Review',
+            state=the_list.ItemState.WORKING)
+        the_list.verify_report_destination(destination, report)
+        if not the_list.same_destination(destination, expected):
+            raise MovedReportNumberChanged(destination)
+
+    while True:
+        try:
+            record_action(item, f'moved to List item {expected.number}', root=root, check=file_current_wait)
+        except ReviewWaitEnded:
+            return investigation.NoListDestination.ABSENT
+        except MovedReportNumberChanged as changed:
+            expected = changed.destination
+        else:
+            return expected
+
+
+def file_change_work(page: change_page.ReviewPage, row: dict[str, str],
+                     assignment: change_routing.ChangeAssignment, outcome: str, words: str
+                     ) -> investigation.ListDestination:
+    """File the List report before the change saves its action."""
+    members = staff.snapshot()
+    kind = the_list.ReportKind.VALIDATION if outcome == 'validate' else the_list.ReportKind.CHANGE
+    routed = assignment.owner
+    if kind is the_list.ReportKind.VALIDATION:
+        owner, = routed.showrunner_recipients
+    elif isinstance(routed, change_routing.StaffRoutedChange):
+        owner = routed.unit_id
+    else:
+        member = next((member for member in members.rows if member.name == routed.tab), None)
+        owner = member.id if member is not None else the_list.UnassignedOwner.NOT_RECORDED
+    key = page.review_list.stem.removeprefix(change_review.PREFIX)+'/'+row['#']
+    title = ' '.join(row['Change'].split())
+    validation_log = (review_items.validation_log_start(row, review_items.validation_request_words(words))
+                      if kind is the_list.ReportKind.VALIDATION else review_items.LegacyValidationLog.MOVE_MARKER)
+    report = the_list.ListReport(kind, key, words if words.strip() else title, validation_log=validation_log)
+    try:
+        route = the_list.report_route(staff.StaffId(owner), members)
+        retry = (the_list.ReportRetry.UPDATE if outcome in ('not works', 'validate')
+                 else the_list.ReportRetry.KEEP)
+        return the_list.file_report(route.keeper, report, title, owner=owner, producer=route.producer, unit=route.unit,
+                                    source='nate via Review', retry=retry)
+    except (the_list.ListError, staff.StaffRefused) as error:
+        raise OSError(f'Cannot file {key} on the List: {error}') from error
 
 
 def record_superseded(item: review_items.ReviewItem, action: str, *,
@@ -134,7 +266,6 @@ def track_question(delivery: change_page.MessageDelivery, key: str, words: str,
 def question_action(item: review_items.ReviewItem, action: change_page.QuestionOutcome, words: str,
                     status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery, str]:
     """Save the action against the selected Question."""
-    from scripts.review_links import change_browser
     source = item.source
     assert isinstance(source, review_items.QuestionSource)
     if not words.strip():
@@ -147,6 +278,71 @@ def question_action(item: review_items.ReviewItem, action: change_page.QuestionO
     question = change_browser.WaitingQuestion(item.key, review_items.name(item.owner, identities.record), source.record,
         update_registration.question_source(scope), item.owner, review_items.name(source.record.asker, identities.record))
     return change_browser.submit_question(question, action, words, status, save=change_browser.SelectedQuestionSave())
+
+
+@dataclass(frozen=True)
+class StudioQuestionTarget:
+    keeper: staff.StaffId
+    number: int
+    owner: staff.StaffId
+
+
+def studio_question_target(item: review_items.ReviewItem) -> StudioQuestionTarget:
+    handoff = item.exchange_handoff
+    if not isinstance(handoff, review_items.FiledReviewExchange) or not handoff.open_staff_question:
+        raise question_record.AnswerRefused('This question is no longer open on the Studio.')
+    destination = handoff.destination
+    row = the_list.load(destination.keeper, f'L{destination.number}')
+    if isinstance(row.owner, the_list.UnassignedOwner):
+        raise question_record.AnswerRefused('This item has no owner.')
+    return StudioQuestionTarget(destination.keeper, row.number, row.owner)
+
+
+def studio_question_action(item: review_items.ReviewItem, record: update_registration.QuestionRecord,
+                           action: Literal['answer', 'question'], words: str,
+                           status: change_page.DeliveryStatus, route: change_browser.QuestionRoute,
+                           target: StudioQuestionTarget
+                           ) -> tuple[change_page.MessageDelivery, str]:
+    question = change_browser.WaitingQuestion(item.key, '', record, update_registration.question_source(route.production),
+                                              record.owner, '')
+    message = change_browser.question_message(action, route.production.name, item.title, route.relay.unit, words, item.key)
+    document = route.production.doc if isinstance(route.production, Production) else record.path.parent
+    saved: change_page.StoredUserAnswer = {
+        'saved': False, 'source': str(record.path), 'production': str(document), 'owner': record.owner,
+        'question': item.title, 'answer': words if action == 'answer' else '', 'message': message, 'kind': action,
+    }
+    opened: change_page.NoQuestion | change_page.OpenQuestion = change_page.NoQuestion()
+    saved['studio_delivery'] = True
+    if action == 'question':
+        identity = secrets.token_hex(4)
+        saved['question_id'] = identity
+        saved['question_text'] = words.strip()
+        saved['message'] = message.replace(change_page.reply_command(item.key), change_page.reply_command(item.key, identity))
+        opened = change_page.OpenQuestion(identity, words.strip(), change_page.NoDelivery())
+    page = change_page.UserQuestionPage(record.path, document, (record.path.stem,), '', saved)
+
+    def save() -> None:
+        with the_list.locked_item(target.keeper, f'L{target.number}') as current:
+            if current.owner != target.owner:
+                raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
+            change_browser.save_question_record(route.production, question, action, words,
+                                                change_browser.SelectedQuestionSave(), before_write=lambda: None)
+
+    return save_delivery(page, target.owner, save, status, opened), words
+
+
+@dataclass(frozen=True)
+class ListFeedbackDelivery:
+    keeper: staff.StaffId
+    identity: str
+    request: str
+
+
+@dataclass(frozen=True)
+class StudioNoticeDelivery(ListFeedbackDelivery):
+    """Deliver words from a Studio Later or Mark read save."""
+
+    alert_status: change_page.DeliveryStatus = field(compare=False, repr=False)
 
 
 def sent_question_action(item: review_items.ReviewItem, record: update_registration.QuestionRecord,
@@ -231,7 +427,6 @@ def _save_review_park(item: review_items.ReviewItem, until: datetime, words: str
                       check_deadline: Callable[[datetime], None],
                       verify_revision: Callable[[], object] | None, root: Path | None) -> str:
     event = 'Later until '+question_path.write_later(until)+(': '+words if words else '')
-
     def record_later(publish_deadline: Callable[[], None]) -> None:
         def check_and_publish() -> None:
             if verify_revision is not None:
@@ -246,6 +441,36 @@ def _save_review_park(item: review_items.ReviewItem, until: datetime, words: str
           else nullcontext()):
         review_later.save(item.key, until, record_log=record_later)
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
+
+
+def studio_later(target: StudioQuestionTarget, value: str, words: str, request: str,
+                 status: change_page.DeliveryStatus, *,
+                 verify_revision: Callable[[], object]
+                 ) -> tuple[ListFeedbackDelivery | change_page.NoMessageDelivery, str]:
+    identity = f'L{target.number}'
+    zone = user_zone()
+    request = request or secrets.token_hex(16)
+
+    def save(until: datetime, check: Callable[[datetime], None]
+             ) -> tuple[ListFeedbackDelivery | change_page.NoMessageDelivery, str]:
+        until = until.astimezone(zone)
+        label = 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
+        message = f'Studio: nate parked item {target.number} {label}.\n\n{words}'
+        notice = (the_list.PageItemNotice(request, message, 'park', words, recipient=target.owner,
+                                          origin=the_list.PageNoticeOrigin.STUDIO)
+                  if words.strip() else the_list.NoPageRequest.ABSENT)
+
+        def check_current(moment: datetime) -> None:
+            _ = verify_revision()
+            check(moment)
+
+        _ = the_list.park(target.keeper, identity, until, source=the_list.PAGE_SOURCE, notice=notice,
+                          note='Later: '+words if words.strip() else '', check_deadline=check_current)
+        delivery = (StudioNoticeDelivery(target.keeper, identity, request, status)
+                    if isinstance(notice, the_list.PageItemNotice) else change_page.NoMessageDelivery())
+        return delivery, label
+
+    return save_timed_park(value, zone, save)
 
 
 def later(item: review_items.ReviewItem, value: str, words: str, *,
@@ -303,47 +528,203 @@ def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words
         return delivery
 
 
-def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
-    """Finish a staged List row before claiming its notice."""
-    route = review_submissions.list_filing_route(saved)
-    if isinstance(route, review_submissions.NoListFiling):
-        return
-    if isinstance(route, review_submissions.ListFilingUnavailable):
-        review_submissions.skip_list_filing(saved, route.reason)
-        return
+def ensure_submission_list_item(address: review_submissions.SubmissionAddress) -> None:
+    """Finish the List row under the current recipient locks."""
+    with review_submissions.submission_for_delivery(address) as filing:
+        if isinstance(filing, review_submissions.LocatedSubmission):
+            _ensure_list_filing(filing.saved())
+
+
+def submission_report_row(saved: review_submissions.SavedSubmission) -> the_list.ListItem | the_list.NoListReport:
+    """Read the published List row for a filed report."""
+    if not isinstance(saved.record, investigation.Investigation) or not saved.record.belongs_on_list:
+        return the_list.NoListReport.ABSENT
+    with review_submissions.submission_for_delivery(saved.address) as located:
+        if isinstance(located, review_submissions.LocatedSubmission):
+            record = located.record
+            if isinstance(record, investigation.Investigation) and isinstance(
+                    record.list_destination, investigation.ListDestination):
+                destination = record.list_destination
+                return the_list.load(destination.keeper, f"L{destination.number}")
+    raise OSError(f"Cannot read the List filing for {saved.id}.")
+
+
+def _read_question_filing_fields(path: Path) -> dict[str, object]:
+    fields = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    if not isinstance(fields, dict):
+        raise OSError(f"Invalid List route at {path}.")
+    return cast(dict[str, object], fields)
+
+
+def _question_filing_retry(saved: review_submissions.SavedSubmission, fields: dict[str, object],
+                           members: staff.StaffSnapshot) -> review_submissions.ListFilingUnavailable:
+    reason = "The saved question needs a current List keeper."
+    match fields:
+        case {"owner": str(owner), "producer": str(producer), "unit": str(unit), "source": str(source)}:
+            return review_submissions.ListFilingUnavailable(reason, review_submissions.PendingProducerFiling(
+                staff.StaffId(owner), staff.StaffId(producer), unit, source))
+        case {"assignee": str(assignee)}:
+            return review_submissions.ListFilingUnavailable(reason, review_submissions.list_command_assignee(assignee))
+        case _:
+            pass
+    # Older fallback records saved only the reason. Read the assignment from the native question.
+    details = saved.details
+    if isinstance(details.assignment, new_item_dialog.ChosenAssignee):
+        recipient = members.by_id(saved.owner)
+        if recipient is None:
+            raise OSError(f"The recipient for {saved.id} is unavailable.")
+        assignee_row = review_submissions.assigned_member(details.assignment, recipient, members)
+        notice = details.notice
+        source = ("nate via /new_item" if isinstance(notice, new_item_dialog.SubmissionNotice) and notice.from_command
+                  else "nate via New item")
+        unit = assignee_row.name if assignee_row.kind == "unit" else ""
+        return review_submissions.ListFilingUnavailable(reason, review_submissions.PendingProducerFiling(
+            assignee_row.id, recipient.id, unit, source))
+    return review_submissions.ListFilingUnavailable(reason)
+
+
+def _refresh_studio_question_route(saved: review_submissions.SavedSubmission, reservation: Path,
+                                   route: review_submissions.ListFilingRoute | review_submissions.ListFilingUnavailable
+                                   | review_submissions.NoListFiling, members: staff.StaffSnapshot
+                                   ) -> review_submissions.ListFilingRoute:
+    """Resolve the keeper before publishing a new or reserved row."""
+    path = reservation.with_name("list-filing.json")
+    if record_store.saved_path_exists(reservation):
+        if isinstance(route, dict):
+            return route
+        raise OSError(f"Cannot read the reserved List route for {saved.id}.")
+    keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+    if isinstance(route, dict) and keeper is not None and route["keeper"] == keeper.id:
+        return route
+    if not isinstance(route, review_submissions.ListFilingUnavailable):
+        route = _question_filing_retry(saved, _read_question_filing_fields(path), members)
+    return review_submissions.retry_list_filing_route(saved, route, members)
+
+
+def _add_submission_list_row(saved: review_submissions.SavedSubmission, route: review_submissions.ListFilingRoute,
+                             reservation: Path) -> investigation.ListDestination:
     key = review_items.submission_review_key(saved)
     evidence = REVIEW_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
     words = saved.words
+    keeper = route["keeper"]
+    return the_list.file_review_item(keeper, review_submissions.submission_title(words),
+                                     owner=route["owner"], producer=route["producer"], unit=route["unit"],
+                                     words=words, evidence=evidence, review_key=key, source=route["source"],
+                                     reservation=reservation)
+
+
+def _ensure_studio_question_filing(saved: review_submissions.SavedSubmission,
+                                   record: update_registration.QuestionRecord) -> None:
+    with update_registration.wrap_question_locks(record.owner):
+        reservation = review_submissions.list_filing_reservation(saved)
+        if not record_store.saved_path_exists(reservation.with_name("list-filing.json")):
+            if record_store.saved_path_exists(reservation):
+                raise OSError(f"Cannot find the reserved List route for {saved.id}.")
+            return
+        saved_route = review_submissions.list_filing_route(saved)
+        if isinstance(saved_route, review_submissions.NoListFiling) and not record_store.saved_path_exists(
+                reservation.with_name("first-message.json")):
+            return
+        members = staff.snapshot()
+        if (not record_store.saved_path_exists(reservation)
+                and record_store.list_keeper(conf.read_or_repository("console"), members) is None):
+            def save_fallback() -> None:
+                if isinstance(saved_route, review_submissions.NoListFiling):
+                    return
+                path = reservation.with_name("list-filing.json")
+                reason = "The List has no active producer."
+                fields = _read_question_filing_fields(path)
+                atomic_file.write_text_atomic(path, json.dumps({**fields, "skipped": reason}) + "\n", new_file_mode=0o600)
+                print(f"Review List filing {saved.id}: {reason}", file=sys.stderr)
+
+            finish = cast(Callable[[update_registration.QuestionRecord, Callable[[], None]], None],
+                          import_module("scripts.review_links.answer_sources").finish_studio_question_without_keeper)
+            finish(record, save_fallback)
+            return
+
+        def file_row() -> investigation.ListDestination:
+            route = _refresh_studio_question_route(saved, reservation, saved_route, members)
+            return _add_submission_list_row(saved, route, reservation)
+
+        file_question = cast(Callable[[update_registration.QuestionRecord, Path,
+                                       Callable[[], investigation.ListDestination], staff.StaffSnapshot], None],
+                             import_module("scripts.review_links.answer_sources").file_list_submission_question)
+        file_question(record, reservation, file_row, members)
+
+
+def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
+    """Finish a staged List row before claiming its notice."""
+    record = saved.record
+    if isinstance(record, update_registration.QuestionRecord):
+        _ensure_studio_question_filing(saved, record)
+        return
+    reservation = review_submissions.list_filing_reservation(saved)
+    route_saved = record_store.saved_path_exists(reservation.with_name("list-filing.json"))
+    route = review_submissions.list_filing_route(saved)
+    if isinstance(record, investigation.Investigation) and isinstance(record.list_move, investigation.PendingListMove):
+        raise investigation.InvestigationError(investigation.LIST_MOVE_PENDING)
+    if isinstance(record, investigation.Investigation) and record.belongs_on_list:
+        kind = the_list.investigation_report_kind(record)
+        if isinstance(kind, the_list.ReportKind):
+            if isinstance(record.list_destination, investigation.ListDestination):
+                report = the_list.report_from_investigation(record, kind, review_items.investigation_record_key(record))
+                the_list.verify_report_destination(record.list_destination, report)
+            else:
+                members = staff.snapshot()
+                if isinstance(route, review_submissions.ListFilingUnavailable):
+                    route = review_submissions.retry_list_filing_route(saved, route, members)
+                try:
+                    _ = investigation.file_on_list(saved.path, lambda current: the_list.file_investigation_report(
+                        current, kind, members, route=route, reservation=reservation,
+                        source="nate via New item"),
+                        mode=(investigation.ListFilingMode.MOVE_BUG
+                              if record.purpose is investigation.InvestigationPurpose.MOVING_LEGACY_BUG
+                              else investigation.ListFilingMode.NEW_REPORT))
+                except the_list.ListError as error:
+                    raise OSError(f"Cannot file {saved.id} on the List: {error}") from error
+        return
+    if isinstance(route, review_submissions.NoListFiling):
+        if record_store.saved_path_exists(reservation):
+            raise OSError(f"Cannot find the reserved List route for {saved.id}.")
+        if route_saved:
+            with record_store.list_destination_lock():
+                _ = the_list.review_fallback_destination(review_items.submission_review_key(saved))
+        return
+    if isinstance(route, review_submissions.ListFilingUnavailable):
+        _skip_submission_list_filing(saved, reservation, route.reason, route)
+        return
     try:
-        _ = the_list.add_review_item(route["keeper"], review_submissions.submission_title(words), owner=route["owner"],
-                                     producer=route["producer"], unit=route["unit"], words=words, evidence=evidence,
-                                     review_key=key, source=route["source"],
-                                     reservation=review_submissions.list_filing_reservation(saved))
+        _ = _add_submission_list_row(saved, route, reservation)
     except the_list.RetiredListProducer as error:
-        review_submissions.skip_list_filing(saved, str(error))
+        _skip_submission_list_filing(saved, reservation, str(error), route)
+
+
+def _skip_submission_list_filing(
+    saved: review_submissions.SavedSubmission, reservation: Path, reason: str,
+    route: review_submissions.ListFilingRoute | review_submissions.ListFilingUnavailable,
+) -> None:
+    with record_store.list_destination_lock():
+        destination = the_list.review_fallback_destination(review_items.submission_review_key(saved))
+        if isinstance(destination, investigation.ListDestination):
+            raise the_list.ListError("The Review source still has a List destination.")
+        reserved = the_list.review_reservation(reservation)
+        if isinstance(reserved, investigation.ListDestination):
+            if isinstance(route, review_submissions.ListFilingUnavailable) or record_store.saved_path_exists(
+                    the_list.folder(reserved.keeper) / f"L{reserved.number}.md"):
+                raise the_list.ListError("The Review source still has a List reservation.")
+        review_submissions.skip_list_filing(saved, reason)
 
 
 def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus,
                                claims: ExitStack, *, words: str = "", evidence_page: str = ""
                                ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
-    # Finish the List row under the recipient locks before taking the delivery lock.
-    with review_submissions.submission_for_delivery(address) as filing:
-        if isinstance(filing, review_submissions.NoNativeSubmission):
-            return change_page.NoMessageDelivery()
-        _ensure_list_filing(filing.saved())
-        assignment = filing.details.assignment
-    assignee = ""
-    if isinstance(assignment, new_item_dialog.ChosenAssignee):
-        name = review_items.name(assignment.id, staff.snapshot())
-        assignee = f"\n{name} is the assignee."
+    if address.kind is not new_item_dialog.SubmissionKind.QUESTION:
+        ensure_submission_list_item(address)
 
     with status.locked(), review_submissions.submission_for_delivery(address) as located:
         if isinstance(located, review_submissions.NoNativeSubmission):
             return change_page.NoMessageDelivery()
         saved = located.saved()
-        if not saved.awaiting_reply:
-            review_submissions.clear_initial_delivery(address)
-            return change_page.NoMessageDelivery()
         row, path = saved.request_id, saved.original_path
         if path == saved.path and saved.owner != saved.recipient_id:
             path = status.previous_submission_source(row, path)
@@ -351,10 +732,16 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
         stored = status.metadata_page(placeholder)
         slots = status.slots(placeholder, row)
         intent = slots.verdict
-        if isinstance(stored, change_page.ReviewMessagePage) and stored.saved.get('submission_request') == row:
-            if stored.saved.get('submission_delivered'):
-                review_submissions.clear_initial_delivery(address)
-                return change_page.NoMessageDelivery()
+        stored_request = isinstance(stored, change_page.ReviewMessagePage) and stored.saved.get('submission_request') == row
+        if isinstance(stored, change_page.ReviewMessagePage) and stored_request and stored.saved.get('submission_delivered'):
+            review_submissions.clear_initial_delivery(address)
+            return change_page.NoMessageDelivery()
+        if (address.kind is new_item_dialog.SubmissionKind.QUESTION
+                and not (stored_request and isinstance(intent, change_page.DeliveryIntent))):
+            _ensure_list_filing(saved)
+        if not saved.awaiting_reply:
+            review_submissions.clear_initial_delivery(address)
+            return change_page.NoMessageDelivery()
         if isinstance(intent, change_page.DeliveryIntent) and status.owns_live_claim(placeholder, row, intent.attempt):
             raise SubmissionDeliveryPending("This item is still sending.")
         saved = review_submissions.renew_legacy_reply(located)
@@ -379,6 +766,11 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
                     label = notice.kind.capitalize()
                 if notice.from_command:
                     source = ""
+            assignee = ""
+            assignment = saved.details.assignment
+            if isinstance(assignment, new_item_dialog.ChosenAssignee):
+                name = review_items.name(assignment.id, staff.snapshot())
+                assignee = f"\n{name} is the assignee."
             message = (f'New {label} {saved.id}{source}.{assignee}\n\n{words or saved.words}{evidence}\n\n'
                        + change_page.reply_command(saved.key))
             record: change_page.StoredReviewMessage = {
@@ -403,6 +795,37 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
     return delivery
 
 
+def recover_interrupted_list_reports() -> None:
+    """Complete native reports even when a delivery claim has no first-message marker."""
+    pending = ([investigation.InvestigationPurpose.BUG_REPORT], [investigation.InvestigationPurpose.ENHANCEMENT],
+               [investigation.InvestigationPurpose.LIST_INVESTIGATION])
+    try:
+        owners = record_store.store_owners(record_store.RecordKind.INVESTIGATION, strict=True)
+    except OSError as error:
+        print(f"List report recovery: {error}", file=sys.stderr)
+        return
+    for owner in owners:
+        try:
+            paths = tuple(investigation.review_record_paths(owner, strict=True))
+        except (OSError, ValueError) as error:
+            print(f"List report recovery for {owner}: {error}", file=sys.stderr)
+            continue
+        for path in paths:
+            try:
+                header = record_store.read_header(path, keys=frozenset(("purpose", "list_destination")), strict=True)
+                if header.get("purpose") not in pending or header.get("list_destination"):
+                    continue
+                record = investigation.read_review_record(path)
+                if record.submission_scope:
+                    scoped = new_item_dialog.read_submission_key(record.submission_scope)
+                    ensure_submission_list_item(review_submissions.SubmissionAddress(
+                        scoped.kind, scoped.recipient_id, scoped.request_id))
+                elif record.purpose is investigation.InvestigationPurpose.LIST_INVESTIGATION:
+                    the_list.finish_cli_investigation(path, staff.snapshot())
+            except (OSError, ValueError, RuntimeError, staff.StaffRefused) as error:
+                print(f"List report recovery {path}: {error}", file=sys.stderr)
+
+
 def recover_submission_deliveries(status: change_page.DeliveryStatus, review_path: str) -> None:
     """Claim the first messages that were interrupted before the claim saved."""
     for pending in review_submissions.pending_initial_deliveries(status.root):
@@ -420,17 +843,29 @@ def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestion
                   question: change_page.NoQuestion | change_page.OpenQuestion) -> change_page.MessageDelivery:
     row = page.rows[0]
     with status.locked():
-        previous_page = status.metadata_page(change_page.ReviewPage(page.review_list, page.production, page.rows, page.token))
+        source = change_page.ReviewPage(page.review_list, page.production, page.rows, page.token)
+        previous_page = status.metadata_page(source)
         previous_slots = status.slots(page, row)
         attempt = secrets.token_hex()
         intent = change_page.DeliveryIntent(attempt,'verdict',recipients=(owner,))
         slots = change_page.DeliverySlots(change_page.NoDelivery(),intent,question)
+        studio = isinstance(page, change_page.UserQuestionPage) and change_page.studio_review_delivery(page)
+        if studio:
+            row = f"{row}/Studio/{attempt}"
+            page = replace(page, rows=(row,), saved={**page.saved, "studio_delivery_row": row})
         status.write_slots(page,row,slots)
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page,row),'claimed')
         try:
+            if studio:
+                # The reply uses the source row. Each saved message uses its own row.
+                reply_page = previous_page if previous_slots.intents() else source
+                status.write_slots(reply_page, source.rows[0], replace(previous_slots, question=question))
             _ = save()
         except BaseException:
-            status.write_slots(previous_page, row, previous_slots)
+            _ = status.request_attempts.pop(attempt, None)
+            if studio:
+                status.path(page, row).unlink(missing_ok=True)
+            status.write_slots(previous_page, source.rows[0], previous_slots)
             raise
         page = replace(page,saved={**page.saved,'saved':True})
         status.mark_review_saved(page, row, slots, intent)

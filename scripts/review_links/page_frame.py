@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from urllib.parse import urlencode
+
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff
@@ -18,6 +20,14 @@ from scripts.review_links import send_hold, setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
+LIST_PAGE_PATH = "/console/list.html"
+STUDIO_PAGE_PATH = "/console/studio.html"
+
+
+def list_item_fragment(keeper: str, number: int) -> str:
+    return "#" + urlencode({"item": f"{keeper}/L{number}"})
+
+
 OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "placement_disk",
                          "rebuilds", "review", "studio"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
@@ -124,7 +134,8 @@ HEADING_STYLE = ('.page-heading{box-sizing:border-box;display:flex;align-items:c
 # Modal dialogs and the image zoom use the browser top layer.
 PAGE_TOP_STYLE = """
 :root{scroll-padding-top:var(--page-top-height,0px)}
-main:has(>.page-top>.page-status,>.page-top>.page-heading>h1):not(.page-wide){max-width:1124px}
+main:has(>.page-top>.page-status,>.page-top>.page-heading>h1,>div>.page-top>[data-page-top-controls]):not(.page-wide){
+max-width:1124px}
 .page-top{position:sticky;top:0;z-index:4;display:flow-root;flex:0 0 100%;min-width:0;
 margin-block:-8px 12px;padding-block:8px;background:var(--bg,Canvas)}
 .page-top>.page-status{position:relative;top:auto;z-index:auto;padding-block:0;margin:0}
@@ -253,13 +264,19 @@ ACTIONS_SCRIPT = """<script>
   dialog.addEventListener('close',()=>button.focus({preventScroll:true}),{once:true});
   dialog.showModal();
  });
- // A scroll does not change the left and right edges, so it only moves the copy and the value (measure=false).
+ let frozenBottom=0;
+ // On scroll, keep the last measured bottom of the frozen top and move the action copy.
  function place(measure=true){
   if(!windows.length) return;
   const home=pageActionsArea();
   if(!home) return;
   const box=home.getBoundingClientRect(), area=pageActionsBox(home);
   const top=Math.max(box.top,8);
+  if(measure){
+   const frozen=home.closest('.page-top:has(>[data-page-top-controls])');
+   frozenBottom=frozen?.getBoundingClientRect().bottom ?? 0;
+  }
+  const bottom=Math.max(top+area.height,frozenBottom);
   for(const entry of windows){
    const {dialog,copy}=entry;
    Object.assign(copy.style,{top:top+'px',left:box.left+'px',width:box.width+'px'});
@@ -275,7 +292,7 @@ ACTIONS_SCRIPT = """<script>
     entry.meets=meets() || (dialog.style.getPropertyValue('--page-window-top')!==''
      && (dialog.style.removeProperty('--page-window-top'),meets()));
    }
-   const value=entry.meets ? (top+area.height)+'px' : '';
+   const value=entry.meets ? bottom+'px' : '';
    if(dialog.style.getPropertyValue('--page-window-top')!==value) dialog.style.setProperty('--page-window-top',value);
   }
  }
@@ -367,18 +384,20 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str, *, status_companion: str = "") -> str:
-    """Build the title and refresh status with an optional control."""
+def title(text: str, page: str, *, status_companion: str = "", frozen_controls: str = "") -> str:
+    """Build the title, refresh status and optional frozen controls."""
     settings = conf.read_or_repository("console")
+    status_page = "list" if page == "studio" else page
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
                "readingDelay": settings.number("status.reading_delay_seconds"),
-               "ageLimit": settings.number(f"status.{page}.age_limit_seconds"), "zone": str(user_zone())}
+               "ageLimit": settings.number(f"status.{status_page}.age_limit_seconds"), "zone": str(user_zone())}
     icons = ''.join(f'<span data-status-icon="{state}"' + ('' if state == 'Reading' else ' hidden')
                     + '>' + icon_svg(icon) + '</span>' for state, icon in (
                         ('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
+    controls = f'<div data-page-top-controls>{frozen_controls}</div>' if frozen_controls else ''
     return (PAGE_TOP + heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
@@ -386,7 +405,7 @@ def title(text: str, page: str, *, status_companion: str = "") -> str:
             + '<span data-status-age hidden></span><span data-status-trip hidden></span>'
             + '<span data-status-render hidden></span><span data-status-reason hidden></span>'
             + '<span class="page-status-announcement" aria-live="polite" data-status-announcement></span></p>'
-            + status_companion + '</div>'
+            + status_companion + controls + '</div>'
             + PAGE_TOP_SCRIPT + HEADING_MEASURE)
 
 
@@ -479,8 +498,10 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
   if(initial){last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;failure=value.failure || '';draw();}
   await frame();if(own!==request) return;
   if(held()){pending={value,began,own};draw();return;}
-  last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;
-  trip=(performance.now()-began)/1000;failure=value.failure || '';reading=false;pending=null;draw();
+  const {aroundStatusDraw,...facts}=value;
+  last=facts;if(line) line.dataset.renderSeconds=facts.renderSeconds;
+  trip=(performance.now()-began)/1000;failure=facts.failure || '';reading=false;pending=null;
+  if(aroundStatusDraw) aroundStatusDraw(draw); else draw();
   }catch(error){failed(error,own);}
  }
  async function refresh(supersede=false){
@@ -531,13 +552,31 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
 }
 '''
 
-CODE_BLOCK = re.compile(r"(?m)^[ \t]*```[^`\n]*\n([\s\S]*?)\n[ \t]*```[ \t]*(?=\n|$)"
-                        + r"|^[ \t]*`([^`\n]+)`[ \t]*(?=\n|$)")
+CODE_FENCE_CLOSE = r"[ \t]*```[ \t]*\r?$"
+CODE_BLOCK = re.compile(
+    rf"(?m)^[ \t]*```[^`\n]*\n((?:(?!{CODE_FENCE_CLOSE})[^\n]*\n)*){CODE_FENCE_CLOSE}"
+    + r"|^[ \t]*`([^`\n]+)`[ \t]*\r?$"
+)
+
+
+def code_block_run(text: str) -> tuple[re.Match[str], ...]:
+    """Find consecutive code blocks when the text has no prose."""
+    blocks: list[re.Match[str]] = []
+    start = 0
+    for block in CODE_BLOCK.finditer(text):
+        if text[start:block.start()].strip():
+            return ()
+        blocks.append(block)
+        start = block.end()
+    return () if text[start:].strip() else tuple(blocks)
 
 
 def code_block_html(block: re.Match[str]) -> str:
     """Build a code block with the shared copy button."""
-    text = block[1] if block[1] is not None else block[2]
+    text = block[1]
+    if text is None:
+        return copy_code_block(block[2])
+    text = text[:-2] if text.endswith("\r\n") else text.removesuffix("\n")
     return copy_code_block(text)
 
 
@@ -620,6 +659,85 @@ border-radius:8px;background:var(--card);color:var(--ink)}
 @media(max-width:960px){.review-action-group+.review-action-group{padding-left:0;border:0}}
 @media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
 ''' + HEADING_STYLE + PAGE_TOP_STYLE)
+
+class VerdictAction(StrEnum):
+    WORKS = "works"
+    NOT_FIXED = "not works"
+
+
+class VerdictItemType(StrEnum):
+    CHANGE = "outcome"
+    LIST_REPAIR = "action"
+
+
+NEGATIVE_VERDICT_LABELS = {
+    VerdictItemType.CHANGE: "Does not work",
+    VerdictItemType.LIST_REPAIR: "Not fixed",
+}
+
+
+class SendWithoutName(StrEnum):
+    SAVE_ONLY = "save without a send"
+    UNAVAILABLE = "receiver name unavailable"
+
+
+@dataclass(frozen=True)
+class SendTo:
+    """The displayed name of the send destination."""
+
+    name: str
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("A send destination needs a name.")
+
+
+type SendReceiver = SendTo | SendWithoutName
+
+
+@dataclass(frozen=True)
+class SendControl:
+    label_html: str
+    attributes: str
+
+
+def send_control(label: str, receiver: SendReceiver, *, show_receiver: bool = False) -> SendControl:
+    """Use one receiver name for the control and its send message."""
+    if receiver is SendWithoutName.SAVE_ONLY:
+        return SendControl(html.escape(label), ' data-send-receiver=""')
+    if receiver is SendWithoutName.UNAVAILABLE:
+        return SendControl(html.escape(label), "")
+    receiver_html = html.escape(receiver.name, quote=True)
+    attributes = f' data-send-receiver="{receiver_html}"'
+    if show_receiver:
+        label = f"{label} {receiver.name}" if label else receiver.name
+    else:
+        attributes += f' aria-label="{html.escape(label, quote=True)}, {receiver_html}"'
+    return SendControl(html.escape(label), attributes)
+
+
+def send_button(label: str, receiver: SendReceiver, attributes: str, *, show_receiver: bool = False,
+                with_words: SendReceiver = SendWithoutName.UNAVAILABLE) -> str:
+    control = send_control(label, receiver, show_receiver=show_receiver)
+    alternative = ""
+    if with_words is not SendWithoutName.UNAVAILABLE:
+        named = send_control("", with_words, show_receiver=True)
+        alternative = f'<template data-send-with-words{named.attributes}></template>'
+    return f'<button{control.attributes} {attributes}>{control.label_html}{alternative}</button>'
+
+
+def verdict_button(item_type: VerdictItemType, action: VerdictAction, *,
+                   primary: bool = False, selected: bool = False,
+                   receiver: SendReceiver = SendWithoutName.UNAVAILABLE,
+                   with_words: SendReceiver = SendWithoutName.UNAVAILABLE) -> str:
+    """Render the verdict for a change or a List repair."""
+    label = "Works" if action is VerdictAction.WORKS else NEGATIVE_VERDICT_LABELS[item_type]
+    pressed = 'aria-pressed="true" ' if selected else ""
+    style = ' class="primary"' if primary else ""
+    disabled = ' disabled' if item_type is VerdictItemType.LIST_REPAIR and action is VerdictAction.NOT_FIXED else ""
+    return send_button(label, receiver, f'{pressed}name="{item_type}" value="{action}"{style}{disabled}',
+                       with_words=with_words)
+
 
 def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
                    before_body: str = '', footer: str = '', form: bool = False, body_class: str = '') -> str:
@@ -1035,11 +1153,13 @@ function sendUndoHost(){
  try{ return window.top.document; }catch{ return document; }
 }
 const pause=(ms,view=window)=>new Promise(resolve=>view.setTimeout(resolve,ms));
+const holdRequestSignal=()=>AbortSignal.timeout(30000);
 const RETRY_LIMIT_MS=120_000,KEEPALIVE_LIMIT=64*1024;
 const heldRequests=new Map();
-function trackHeldRequest(key){
+const newHoldId=()=>Array.from(crypto.getRandomValues(new Uint8Array(12)),
+ byte=>byte.toString(16).padStart(2,'0')).join('');
+function trackHeldRequest(key,id){
  const view=sendUndoHost().defaultView || window;
- const id=Array.from(crypto.getRandomValues(new Uint8Array(12)),byte=>byte.toString(16).padStart(2,'0')).join('');
  const started=Date.now(),elapsed=performance.now();
  const expired=()=>Date.now()-started>=RETRY_LIMIT_MS || performance.now()-elapsed>=RETRY_LIMIT_MS;
  const request={id,hold:id,expired,closed:false,closeToast:null,finish};
@@ -1060,7 +1180,7 @@ function trackHeldRequest(key){
  heldRequests.set(key,request);
  return request;
 }
-function showSendUndo(request,seconds,receiver){
+function showSendUndo(request,seconds,receiver,resumable){
  const {hold}=request,host=sendUndoHost();
  const view=host.defaultView;
  if(!view.getSendUndoStack){
@@ -1079,7 +1199,7 @@ function showSendUndo(request,seconds,receiver){
  const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
  const fade=toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
  const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
- return new Promise(resolve=>{
+ return new Promise((resolve,reject)=>{
   let done=false,removalTimer=0;
   const remove=()=>{
    view.clearTimeout(removalTimer);
@@ -1119,12 +1239,21 @@ function showSendUndo(request,seconds,receiver){
   },()=>{});
   button.addEventListener('click',async()=>{
    button.disabled=true;fade.pause();shrink.pause();
+   const signal=resumable ? holdRequestSignal() : undefined;
    let answer=null;
-   for(let tries=0;tries<2 && !answer;tries++){
-    try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'}); }catch{ await pause(500); }
+   for(let tries=0;tries<2 && !answer && !signal?.aborted;tries++){
+    try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST',signal}); }
+    catch{ if(!signal?.aborted) await pause(500); }
    }
-   if(answer?.ok){finish(true);return;}
+   if(answer?.ok && (!resumable || (await answer.json().catch(()=>null))?.outcome==='undone')){
+    finish(true);return;
+   }
    if(request.closed) return;
+   if(signal?.aborted){
+    done=true;remove();
+    reject(new Error('The Undo response timed out. The send can still leave.'));
+    return;
+   }
    done=true;
    button.remove();bar.remove();fade.cancel();
    if(answer?.status===409){
@@ -1139,11 +1268,11 @@ function showSendUndo(request,seconds,receiver){
   });
  });
 }
-async function heldFetch(url,init={},receiver,onHold){
+async function heldFetch(url,init={},receiver,onHold,holdId){
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
- const key=JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
- const request=heldRequests.get(key) || trackHeldRequest(key);
+ const key=holdId ?? JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
+ const request=heldRequests.get(key) || trackHeldRequest(key,holdId ?? newHoldId());
  headers.set(SEND_REQUEST_HEADER,request.id);
  const keepalive=body.length<=KEEPALIVE_LIMIT && new TextEncoder().encode(body).length<=KEEPALIVE_LIMIT;
  const post=async keepalive=>{
@@ -1159,25 +1288,32 @@ async function heldFetch(url,init={},receiver,onHold){
   return first;
  }
  const {hold,seconds}=await first.json();
+ if(holdId && hold!==holdId) throw new Error('The send hold does not match this request.');
  request.hold=hold;
  let undo=false;
  if(!request.closed && seconds>0){
-  const shown=showSendUndo(request,seconds,receiver);
+  const shown=showSendUndo(request,seconds,receiver,Boolean(holdId));
   onHold?.();
   undo=await shown;
  }
  if(undo===true){request.finish();throw new SendUndone();}
+ return readHeldResult(hold,request,undo,Boolean(holdId));
+}
+async function readHeldResult(hold,request,undo,resumable){
  // A server restart drops the connection; the held send waits in its file, so read its result again.
+ const signal=resumable ? holdRequestSignal() : undefined;
  for(let failures=0;;){
   try{
-   const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
-   if(response.headers.get('X-Send-Hold')!=='pending'){
-    if(response.status!==404 || !request.expired()) request.finish();
-    if(typeof undo==='function') await undo(response);
-    return response;
-   }
+   const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store',signal});
+   if(response.headers.get('X-Send-Hold')==='pending') continue;
+   if(resumable || response.status!==404 || !request?.expired()) request?.finish();
+   if(typeof undo==='function') await undo(response);
+   if(resumable && response.status===404 && response.headers.get('X-Send-Hold-Outcome')==='undone')
+    throw new SendUndone();
+   return response;
   }catch(error){
-   if(++failures>=30){
+   if(error instanceof SendUndone) throw error;
+   if(signal?.aborted || ++failures>=30){
     if(typeof undo==='function') await undo();
     throw error;
    }
@@ -1185,16 +1321,26 @@ async function heldFetch(url,init={},receiver,onHold){
   }
  }
 }
-function sendActionReceiver(form,data){
- const action=data.get('outcome');
- const verdict=action==='works' && data.get('feedback')?.trim() ? 'works-with-words' : action;
- if(action==='approve' && data.get('assignee')){
-  const option=form.elements.assignee?.selectedOptions[0];
-  return option?.value===data.get('assignee') ? option.dataset.sendReceiver : undefined;
- }
- return JSON.parse(form.dataset.sendLabels || '{}')[verdict];
+heldFetch.newId=newHoldId;
+heldFetch.resume=id=>{
+ const request=heldRequests.get(id);
+ return readHeldResult(request?.hold ?? id,request,false,true);
+};
+function sendReceiver(control){
+ const form=control?.form;
+ const assignee=control?.hasAttribute('data-send-assignee') && form?.elements.assignee;
+ const withWords=control?.querySelector('[data-send-with-words]');
+ if(assignee?.value) control=assignee.selectedOptions[0];
+ else if(withWords && form?.elements.feedback?.value.trim()) control=withWords;
+ const receiver=control?.getAttribute('data-send-receiver');
+ return receiver==='' ? null : receiver ?? undefined;
 }
-window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendActionReceiver=sendActionReceiver;
+function updateSendLabel(button){
+ const receiver=sendReceiver(button);
+ if(receiver) button.setAttribute('aria-label',button.textContent+', '+receiver);
+ else button.removeAttribute('aria-label');
+}
+window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendReceiver=sendReceiver;window.updateSendLabel=updateSendLabel;
 })();
 '''
 
@@ -1221,7 +1367,7 @@ function holdCard(card,changed){
   return true;
  }
  return {
-  post:(url,init,receiver)=>heldFetch(url,init,receiver,()=>setHeld(true)),
+  post:(url,init,receiver,id)=>heldFetch(url,init,receiver,()=>setHeld(true),id),
   restore:()=>setHeld(false),
  };
 }

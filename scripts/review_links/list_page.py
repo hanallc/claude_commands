@@ -1,4 +1,4 @@
-"""Show The List from the producer's numbered records."""
+"""Show List records in the Studio and handle item actions."""
 from __future__ import annotations
 
 import hashlib
@@ -17,23 +17,25 @@ from enum import Enum, StrEnum
 from functools import cache
 from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
-from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
+from urllib.parse import SplitResult, parse_qs, quote, unquote, urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts
 from scripts.lib import conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, delivery_state, footer_counts, record_store, repeat_rule, session_staff, staff, the_list
+from scripts.production import investigation, list_exchange
+from scripts.production import change_review, delivery_state, footer_counts, repeat_rule, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, page_question, question_path
+from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, question_path
 from scripts.review_links import record_table, review_actions, review_items, review_legacy, review_link, review_page
-from scripts.review_links import search_fold, staff_names
+from scripts.review_links import search_fold, staff_names, studio_page
 from scripts.review_links import question_record
+from scripts.review_links.review_actions import ListFeedbackDelivery as ListFeedbackDelivery
 from scripts.statusline import counts_row, rebuild_row
 
-PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/list.html"
+PAGE_PATH = page_frame.LIST_PAGE_PATH
 COUNTS_QUERY = "counts=1"
 REVIEW_UNAVAILABLE = "Linked review status unavailable"
 COUNTS_AND_LINKS_QUERY = COUNTS_QUERY + "&linked-reviews=1"
@@ -47,11 +49,84 @@ FIELD_LABELS = {
 }
 HEADERS = ("#", FIELD_LABELS["owner"], FIELD_LABELS["producer"], "Item",
            *(FIELD_LABELS[field] for field in ("state", "next_step", "eta")), "Update")
+# The characters before the first scheme letter can belong to the previous URL.
+ITEM_URL_BOUNDARY = re.compile(r'[\s<>"]|(?<![A-Za-z0-9+.-])[0-9+.-]*(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*)://')
+BRACKETED_URL_HOST = re.compile(r"https?://[^/?#\[\]]*\[[^/?#\[\]]+\]", re.IGNORECASE)
+
+
+class ItemUrlMatch(NamedTuple):
+    start: int
+    text: str
+    address: SplitResult
+
+
+def item_url_matches(text: str) -> Iterable[ItemUrlMatch]:
+    if "://" not in text:
+        return
+    boundaries = ITEM_URL_BOUNDARY.finditer(text)
+    boundary = next(boundaries, None)
+    while boundary is not None:
+        piece, boundary = boundary, next(boundaries, None)
+        scheme = piece["scheme"]
+        if scheme is None or scheme.lower() not in ("http", "https"):
+            continue
+        start, end = piece.start("scheme"), len(text)
+        if boundary is not None:
+            end = boundary.start("scheme" if boundary["scheme"] is not None else 0)
+        candidate = text[start:end]
+        url = candidate.rstrip(".,):!?;]*'")
+        if "[" in url and "]" not in url:
+            host = BRACKETED_URL_HOST.match(candidate)
+            if host:
+                url = host[0]
+        try:
+            address = urlsplit(url)
+        except ValueError:
+            continue
+        if address.hostname:
+            yield ItemUrlMatch(start, url, address)
+
+
+def item_url_html(url: str, label: str, css: str = "item-url") -> str:
+    return (f'<a class="{css}" href="{html.escape(url)}" target="_blank" rel="noopener">'
+            + html.escape(label) + '</a>')
+
+
+def item_text_html(text: str, *, paragraphs: bool = False, link_urls: bool = True) -> str:
+    """Escape the text and render HTTP and HTTPS links."""
+    render: Callable[[str], str] = html.escape
+    if paragraphs:
+        render = change_browser.question_paragraphs if "`" in text else change_browser.paragraph_text_html
+    if "://" not in text:
+        return render(text)
+    links: dict[str, str] = {}
+    parts: list[str] = []
+    end = 0
+    # Keep the URLs intact while the formatter reads paragraphs and inline markup.
+    marker = "\0"
+    while marker in text:
+        marker += "\0"
+    for match in item_url_matches(text) if link_urls else ():
+        token = f"{marker}url{len(links)}{marker}"
+        links[token] = item_url_html(match.text, match.text)
+        parts.extend((text[end:match.start], token))
+        end = match.start + len(match.text)
+    parts.append(text[end:])
+    prepared = "".join(parts)
+    if paragraphs and "://" in prepared:
+        # Keep the paragraph formatter from linking an address that this matcher skipped.
+        separator = f"{marker}scheme{marker}"
+        markup = render(prepared.replace("://", separator)).replace(separator, "://")
+    else:
+        markup = render(prepared)
+    return re.sub(f"{marker}url[0-9]+{marker}", lambda match: links[match[0]], markup) if links else markup
 
 
 class ListChip(StrEnum):
     ALL = "all"
     NEEDS_ME = "needs-me"
+    QUESTIONS = "questions"
+    ANSWERS = "answers"
     PRODUCER_ANSWERING = "producer-answering"
     WORKING = "working"
     BLOCKED = "blocked"
@@ -66,8 +141,10 @@ class ListChip(StrEnum):
 QUEUE_BY_STATE = {
     the_list.ItemState.NEW: question_path.Queue.WORKING,
     the_list.ItemState.WORKING: question_path.Queue.WORKING,
+    the_list.ItemState.ANSWERED: question_path.Queue.NEEDS_ME,
     the_list.ItemState.BLOCKED: question_path.Queue.BLOCKED,
     the_list.ItemState.WAITING_FOR_NATE: question_path.Queue.NEEDS_ME,
+    the_list.ItemState.REPAIRED: question_path.Queue.NEEDS_ME,
     the_list.ItemState.DELIVERED: question_path.Queue.NEEDS_ME,
     the_list.ItemState.DONE: question_path.Queue.DONE,
     the_list.ItemState.PAUSED: question_path.Queue.BLOCKED,
@@ -133,11 +210,24 @@ SHOW_ALIASES = show_aliases()
 
 
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
-              unread_delivery: bool = False, unread_answer: bool = False, open_ask: bool = False) -> ListChip:
+              unread_delivery: bool = False, unread_answer: bool = False, open_ask: bool = False,
+              report: bool = False, question_item: bool = False, open_followup: bool = False) -> ListChip:
     """Find the one status chip for this item."""
+    if open_followup:
+        return ListChip.QUESTIONS
+    if question_item and (state is the_list.ItemState.ANSWERED or unread_answer):
+        return ListChip.ANSWERS
     if state is the_list.ItemState.SCHEDULED:
         return ListChip.SCHEDULED
-    queue = question_path.queue(QUEUE_BY_STATE[state], unread_answer=unread_answer or open_ask, later=parked,
+    if state == the_list.ItemState.REPAIRED:
+        return ListChip.NEEDS_ME
+    if question_item and not parked:
+        if state is the_list.ItemState.WAITING_FOR_NATE:
+            return ListChip.QUESTIONS
+        if state is the_list.ItemState.WORKING:
+            return ListChip.WORKING
+    base = question_path.Queue.DONE if report and state == the_list.ItemState.DELIVERED else QUEUE_BY_STATE[state]
+    queue = question_path.queue(base, unread_answer=unread_answer or open_ask, later=parked,
                                 unread_delivery=unread_delivery, waiting_for_answer=open_question)
     return CHIP_BY_QUEUE[queue]
 
@@ -147,6 +237,10 @@ class ListRecord(NamedTuple):
 
     keeper: staff.StaffId
     item: the_list.ListItem
+
+    @property
+    def destination(self) -> investigation.ListDestination:
+        return investigation.ListDestination(self.keeper, self.item.number)
 
     @property
     def key(self) -> str:
@@ -169,7 +263,9 @@ class TopPriorityMark(Enum):
 
 
 STATE_TONES = {the_list.ItemState.WAITING_FOR_NATE: "warning", the_list.ItemState.BLOCKED: "error",
-               the_list.ItemState.WORKING: "accent", the_list.ItemState.DELIVERED: "room",
+               the_list.ItemState.ANSWERED: "room",
+               the_list.ItemState.WORKING: "accent", the_list.ItemState.REPAIRED: "warning",
+               the_list.ItemState.DELIVERED: "room",
                the_list.ItemState.DONE: "room", the_list.ItemState.SCHEDULED: "scheduled"}
 TOP_FLAG = ('<svg class="list-top-flag" viewBox="0 0 16 16" aria-hidden="true" focusable="false">'
             '<path d="M3 1v14h1.7V9.6h3.1l.6 1.4H13V3.4H9.2L8.6 2H4.7V1z"/></svg>')
@@ -187,19 +283,11 @@ def top_priority_mark(shown: TopPriority, members: staff.StaffSnapshot, item: th
     return TopPriorityMark.TOP_ITEM if producer.top_item == staff.TopItem(item.number) else TopPriorityMark.MAKE_TOP
 
 
-def page_url() -> str:
-    return PAGE_PATH
-
-
-def records(*, include_closed: bool = False) -> list[ListRecord]:
+def records(*, include_closed: bool = False, sources: list[Path] | None = None,
+            aliases: dict[Path, list[staff.StaffId]] | None = None) -> list[ListRecord]:
     """Read the list folders even when a producer has no current staff row."""
-    try:
-        owners = sorted(record_store.state_root().iterdir())
-    except FileNotFoundError:
-        return []
-    found = [ListRecord(staff.StaffId(owner.name), item) for owner in owners
-             if owner.is_dir() and not owner.is_symlink()
-             for item in the_list.records(staff.StaffId(owner.name), include_closed=include_closed)]
+    found = (ListRecord(row.keeper, row.item)
+             for row in the_list.display_list_records(include_closed=include_closed, sources=sources, aliases=aliases))
     return sorted(found, key=lambda entry: the_list.order(entry.item))
 
 
@@ -210,10 +298,17 @@ def parked_for_delivery(item: the_list.ListItem) -> bool:
 
 def waiting_updates(_request: console.NewsRequest) -> frozenset[str]:
     """Identify each unread update by its record and time."""
-    return frozenset(f"{entry.key}/{entry.item.unread_since.isoformat()}" for entry in records()
-                     if entry.item.state is not the_list.ItemState.SCHEDULED
-                     and isinstance(entry.item.unread_since, datetime)
-                     and (not parked_for_delivery(entry.item) or the_list.unread_answer_ids(entry.item)))
+    updates: set[str] = set()
+    for entry in records(include_closed=True):
+        item = entry.item
+        replies = the_list.unread_answer_ids(item)
+        if isinstance(item.native_question, the_list.NativeQuestionItem) and replies:
+            if isinstance(moment := item.unread_at, datetime):
+                updates.add(f"{entry.key}/{moment.isoformat()}")
+        elif (item.state not in (the_list.ItemState.CLOSED, the_list.ItemState.SCHEDULED)
+              and isinstance(item.unread_since, datetime) and (not parked_for_delivery(item) or replies)):
+            updates.add(f"{entry.key}/{item.unread_since.isoformat()}")
+    return frozenset(updates)
 
 
 def owner_name(members: staff.StaffSnapshot, owner: the_list.ItemOwner) -> str:
@@ -327,7 +422,8 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
         owner = cast(the_list.ItemOwner, value)
         return names.html(owner, owner_name(names.members, owner))
     if field == "eta":
-        return html.escape(eta_text(cast(the_list.Eta, value), today))
+        eta = cast(the_list.Eta, value)
+        return item_text_html(eta.text) if isinstance(eta, the_list.EtaDescription) else html.escape(eta_text(eta, today))
     if field == "parked_until":
         if not isinstance(value, (datetime, the_list.ParkUntilDelivered)):
             return "Not parked"
@@ -339,17 +435,19 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
             return html.escape(short_list_time(value, today.tzinfo))
         return html.escape(list_time(value, today))
     if isinstance(value, the_list.CheckCondition):
-        return html.escape(value.text)
+        return item_text_html(value.text)
     if field in ("next_step", "latest_status", "done_when", "closing_words"):
-        return change_browser.question_paragraphs(cast(str, value) or "Not recorded")
+        return item_text_html(cast(str, value) or "Not recorded", paragraphs=True)
     if field == "unit":
         return names.html(cast(str, value)) or "Not recorded"
     if field == "blocked_by":
         dependencies = cast(tuple[the_list.ItemDependency, ...], value)
-        return html.escape(", ".join(f"L{entry.number} ({entry.condition})" for entry in dependencies)) or "None"
+        return item_text_html(", ".join(f"L{entry.number} ({entry.condition})" for entry in dependencies)) or "None"
     if field == "related_to":
         return ", ".join(f"L{number}" for number in cast(tuple[int, ...], value)) or "None"
-    return html.escape(cast(str, value)) or "Not recorded"
+    if field in ("state", "requested_by"):
+        return html.escape(cast(str, value)) or "Not recorded"
+    return item_text_html(cast(str, value)) or "Not recorded"
 
 
 def log_source_html(source: str, names: staff_names.StaffNames) -> str:
@@ -358,7 +456,7 @@ def log_source_html(source: str, names: staff_names.StaffNames) -> str:
 
 
 def time_html(moment: datetime, today: datetime) -> str:
-    return f'<time datetime="{moment.isoformat()}">{html.escape(list_time(moment, today))}</time>'
+    return f'<time datetime="{moment.isoformat()}">{html.escape(short_list_time(moment, today.tzinfo))}</time>'
 
 
 def log_row(index: str, moment: datetime, body: str, today: datetime, *,
@@ -372,7 +470,7 @@ def log_row(index: str, moment: datetime, body: str, today: datetime, *,
 
 def log_field_html(field: str, value: object, today: datetime, names: staff_names.StaffNames, evidence_id: str) -> str:
     if field == "evidence":
-        text = html.escape(cast(str, value)) or "Not recorded"
+        text = item_text_html(cast(str, value)) or "Not recorded"
         return f'<details class="log-evidence"><summary id="{evidence_id}">Details</summary><div>{text}</div></details>'
     return field_html(field, value, today, names)
 
@@ -391,28 +489,33 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
             body += f'<p>Starts {html.escape(short_list_time(run.start, today.tzinfo))}</p>'
             if isinstance(schedule, the_list.ScheduledSeries):
                 body += '<p>' + html.escape(schedule.rule.describe(run.start)) + '</p>'
-            body += change_browser.question_paragraphs(run.words)
+            body += item_text_html(run.words, paragraphs=True)
             if isinstance(schedule, the_list.ScheduledSeries):
                 for exception in schedule.exceptions:
                     if isinstance(exception.run, the_list.ScheduledRun):
                         body += f'<p>Run {exception.number} · {html.escape(short_list_time(exception.run.start, today.tzinfo))}</p>'
-                        body += change_browser.question_paragraphs(exception.run.words)
+                        body += item_text_html(exception.run.words, paragraphs=True)
         if visible_fields:
             body += '<dl>' + ''.join(
                 f'<dt>{names.role_label(field, FIELD_LABELS[field])}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
                 for field, value in visible_fields) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
-        label = {"pending": "Feedback for", "sent": "Feedback sent to", "alerted": "Feedback could not reach"}[content.state]
-        recipient = content.recipient_id(keeper)
-        body = label + " " + names.html(recipient, owner_name(names.members, recipient)) + by
-        body += change_browser.question_paragraphs(content.words)
+        label = ("Words for" if content.studio_save_notice else
+                 {"pending": "Feedback for", "sent": "Feedback sent to", "alerted": "Feedback could not reach"}[content.state])
+        recipients = " and ".join(names.html(identity, owner_name(names.members, identity))
+                                  for identity in content.recipient_ids(keeper))
+        body = label + " " + recipients + by
+        body += item_text_html(content.words, paragraphs=True)
     elif isinstance(content, the_list.QuestionAnswered):
         question = "Answer"
         body = " to question " + html.escape(content.question_id) + by
+    elif isinstance(content, the_list.ReturnedAnswer):
+        question = "Answer"
+        body = by + item_text_html(content.words, paragraphs=True)
     elif isinstance(content, the_list.QuestionClosed):
         question = "Question"
         body = (" " + html.escape(content.question.question_id) + " closed with the item" + by
-                + change_browser.question_paragraphs(content.question.words))
+                + item_text_html(content.question.words, paragraphs=True))
     elif isinstance(content, the_list.MarkedRead):
         body = "Marked read" + by
     elif isinstance(content, the_list.Reopened):
@@ -438,72 +541,101 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
             body = "Asked nate for " + ("a go" if ask.kind is the_list.AskKind.GO else "approval") + by + ": "
         else:
             body = f"<strong>{ASK_BUTTONS[ask.kind]}</strong>" + by + ": "
-        body += html.escape(ask.what) + " → " + target
+        body += item_text_html(ask.what) + " → " + target
     elif isinstance(content, the_list.GoNotDelivered):
         recipient = names.html(content.recipient, owner_name(names.members, content.recipient))
-        body = "Go not delivered to " + recipient + by + ": " + html.escape(content.ask.what)
+        body = "Go not delivered to " + recipient + by + ": " + item_text_html(content.ask.what)
     elif isinstance(content, str):
-        body = html.escape(content) + by
+        body = item_text_html(content) + by
     else:
         return ""
     return log_row(str(index), change.time, body, today, question=question)
 
 
-def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffNames,
-                  unread_answers: frozenset[str]) -> str:
+class ItemLog(NamedTuple):
+    markup: str
+    url_candidates: list[the_list.ItemChange]
+
+
+def item_log(record: ListRecord, today: datetime, names: staff_names.StaffNames,
+             unread_answers: frozenset[the_list.UnreadAnswerId]) -> ItemLog:
     item = record.item
     row_id = html.escape(record.key.replace("/", "-"), quote=True)
     answers = {question.question_id for question in item.questions if question.answer is not None}
     answer_entries: dict[str, the_list.ItemChange] = {}
     rows: list[tuple[datetime, str]] = []
+    url_candidates: list[the_list.ItemChange] = []
     for index, (change, fields) in enumerate(zip(item.log, the_list.log_field_changes(item), strict=True)):
         content = change.what
         if isinstance(content, the_list.QuestionAnswered) and content.question_id in answers:
             answer_entries[content.question_id] = change
         elif not the_list.is_page_request_receipt(change):
-            rows.append((change.time, log_entry_html(change, index, today, names, fields,
-                                                    f"list-evidence-{row_id}-{index}", record.keeper)))
+            markup = log_entry_html(change, index, today, names, fields, f"list-evidence-{row_id}-{index}", record.keeper)
+            rows.append((change.time, markup))
+            if ("://" in markup or isinstance(content, (the_list.AskOpened, the_list.GoGiven, the_list.GoNotDelivered))
+                    and "://" in content.ask.why):
+                url_candidates.append(change)
     for question in item.questions:
         answer = question.answer
         identity = question.question_id
-        if answer is None or identity in unread_answers:
+        if item.question_kind is the_list.NoQuestionItem.ORDINARY and (answer is None or identity in unread_answers):
             continue
         asked = datetime.fromisoformat(question.asked_at).astimezone(UTC)
         question_body = " " + html.escape(identity) + log_source_html("nate", names)
-        answer_entry = answer_entries.get(identity)
-        answered = answer_entry.time if answer_entry is not None else datetime.fromisoformat(answer.answered_at).astimezone(UTC)
-        source = (the_list.source_without_clock(answer_entry.source) if answer_entry is not None
-                  else question.recipient_id(record.keeper))
-        answer_body = log_source_html(source, names)
         rows.append((asked, log_row(f"{identity}-asked", asked,
-                                   question_body + change_browser.question_paragraphs(question.words), today,
+                                   question_body + item_text_html(question.words, paragraphs=True), today,
                                    question="Question")))
-        rows.append((answered, log_row(f"{identity}-answered", answered,
-                                       answer_body + change_browser.question_paragraphs(answer.text), today,
-                                       question="Answer")))
-    if not answers.difference(unread_answers):
-        return ''.join(markup for _, markup in reversed(rows))
-    # Use reverse record order for events with the same time.
-    return ''.join(markup for _, markup in sorted(reversed(rows), key=lambda row: row[0], reverse=True))
+        if answer is not None:
+            answer_entry = answer_entries.get(identity)
+            answered = (answer_entry.time if answer_entry is not None
+                        else datetime.fromisoformat(answer.answered_at).astimezone(UTC))
+            source = (the_list.source_without_clock(answer_entry.source) if answer_entry is not None
+                      else question.recipient_id(record.keeper))
+            answer_body = log_source_html(source, names)
+            rows.append((answered, log_row(f"{identity}-answered", answered,
+                                           answer_body + item_text_html(answer.text, paragraphs=True), today,
+                                           question="Answer")))
+    rows.reverse()
+    if answers.difference(unread_answers) or (item.questions and item.question_kind is not the_list.NoQuestionItem.ORDINARY):
+        rows.sort(key=lambda row: row[0], reverse=True)
+    return ItemLog(''.join(markup for _, markup in rows), url_candidates)
 
 
 def item_link(keeper: staff.StaffId, number: int) -> str:
-    return '#' + urlencode({"item": f"{keeper}/L{number}"})
+    return page_frame.list_item_fragment(keeper, number)
+
+
+def state_badge(state: the_list.ItemState) -> str:
+    return f'<span class="list-state {STATE_TONES.get(state, "muted")}">{html.escape(state.value)}</span>'
+
+
+def titled_item_link(entry: ListRecord, *, overlay: bool = False) -> str:
+    item = entry.item
+    link = item_link(entry.keeper, item.number)
+    if item.state is the_list.ItemState.CLOSED:
+        link += "&reveal=1"
+    action = 'data-list-linked-card aria-haspopup="dialog"' if overlay else 'data-record-jump'
+    return (f'<a class="list-top-link" {action} href="{html.escape(link)}">'
+            f'#{item.number} {html.escape(item.title)}</a>')
 
 
 @dataclass(frozen=True)
 class ListFormRequestPrefix:
-    """Identify the form, its unread update, and its feedback recipient."""
+    """Identify the form, its unread update, and the recipients of its words."""
 
     nonce: str
     seen_update: the_list.UnreadUpdate | the_list.NoUnreadUpdate
     recipient: the_list.FeedbackRecipient = the_list.LegacyFeedbackRecipient.KEEPER
+    repair: the_list.RepairRevision | the_list.NoRepairRevision = the_list.NoRepairRevision.ABSENT
+    ask_signature: the_list.ListQuestionSignature | the_list.ListQuestionRoute = the_list.ListQuestionRoute.CURRENT
 
     @classmethod
     def parse(cls, request: str) -> tuple[ListFormRequestPrefix, str]:
         """Read the signed prefix and its optional retry suffix."""
         match = re.fullmatch(r"(?P<nonce>[a-f0-9]{32})(?P<update>[a-f0-9]{64})?" +
-                             r"(?:~(?P<escaped>\.)?(?P<recipient>[^.\s]+))?(?P<retry>\.[a-f0-9]{32})?", request)
+                             r"(?:!(?P<repair>[a-f0-9]{64}))?(?:@(?P<ask>[a-f0-9]{64}))?" +
+                             r"(?:~(?P<escaped>\.)?(?P<recipient>[^.\s]+))?" +
+                             r"(?P<retry>\.[a-f0-9]{32})?", request)
         if match is None:
             raise question_record.AnswerRefused("the List request does not match this page")
         fingerprint = match["update"]
@@ -514,18 +646,26 @@ class ListFormRequestPrefix:
             except the_list.ListError as error:
                 raise question_record.AnswerRefused("the List request does not match this page") from error
         update = the_list.UnreadUpdate(fingerprint) if fingerprint else the_list.NoUnreadUpdate.ABSENT
-        return cls(match["nonce"], update, recipient), match["retry"] or ""
+        repair = the_list.RepairRevision(match["repair"]) if match["repair"] else the_list.NoRepairRevision.ABSENT
+        ask_signature: the_list.ListQuestionSignature | the_list.ListQuestionRoute = the_list.ListQuestionRoute.CURRENT
+        if value := match["ask"]:
+            ask_signature = the_list.ListQuestionSignature(value)
+        return cls(match["nonce"], update, recipient, repair, ask_signature), match["retry"] or ""
 
     def format(self) -> str:
         update = self.seen_update
         unread = update.fingerprint if isinstance(update, the_list.UnreadUpdate) else ""
+        repair = "!" + self.repair.digest if isinstance(self.repair, the_list.RepairRevision) else ""
+        prefix = self.nonce + unread + repair
+        if isinstance(self.ask_signature, str):
+            prefix += "@" + self.ask_signature
         if self.recipient is the_list.LegacyFeedbackRecipient.KEEPER:
-            return self.nonce + unread
+            return prefix
         recipient = self.recipient
         # Keep the retry suffix separate from the recipient.
         if "." in recipient or any(char.isspace() for char in recipient):
             recipient = "." + quote(recipient, safe="").replace(".", "%2E")
-        return f"{self.nonce}{unread}~{recipient}"
+        return f"{prefix}~{recipient}"
 
 
 def signed_token(secret: str, keeper: str, identity: str, prefix: str) -> str:
@@ -550,16 +690,28 @@ def request_token(root: Path, keeper: str, identity: str, prefix: str) -> str:
     return signed_token(secret, keeper, identity, prefix)
 
 
-def signed_item_request(entry: ListRecord, secret: str) -> tuple[str, str]:
-    request = ListFormRequestPrefix(secrets.token_hex(16), the_list.unread_update(entry.item), entry.item.producer).format()
+def signed_item_request(entry: ListRecord, secret: str, *,
+                        ask_signature: the_list.ListQuestionSignature | the_list.ListQuestionRoute = the_list.ListQuestionRoute.CURRENT
+                        ) -> tuple[str, str]:
+    request = ListFormRequestPrefix(secrets.token_hex(16), the_list.unread_update(entry.item),
+                                    feedback_recipient(entry.item), entry.item.repair_revision, ask_signature).format()
     return request, signed_token(secret, entry.keeper, entry.item.id, request)
 
 
-def signed_form_fields(entry: ListRecord, secret: str) -> str:
-    request, token = signed_item_request(entry, secret)
+def signed_form_fields(entry: ListRecord, secret: str, *,
+                       ask_signature: the_list.ListQuestionSignature | the_list.ListQuestionRoute = the_list.ListQuestionRoute.CURRENT
+                       ) -> str:
+    request, token = signed_item_request(entry, secret, ask_signature=ask_signature)
     fields = {"keeper": entry.keeper, "id": entry.item.id, "request": request, "token": token}
     return ''.join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
                    for name, value in fields.items())
+
+
+def feedback_recipient(item: the_list.ListItem) -> staff.StaffId:
+    if (the_list.question_item(item) is not the_list.NoQuestionItem.ORDINARY
+            and not isinstance(item.owner, the_list.UnassignedOwner)):
+        return item.owner
+    return item.producer
 
 
 REPEAT_CHOICES = (
@@ -614,10 +766,37 @@ def top_button(mark: TopPriorityMark) -> str:
     return '<button name="action" value="top">Make top priority</button>' if mark is TopPriorityMark.MAKE_TOP else ''
 
 
+def repair_buttons(entry: ListRecord, members: staff.StaffSnapshot, *, repaired: bool) -> str:
+    works = (page_frame.verdict_button(page_frame.VerdictItemType.LIST_REPAIR, page_frame.VerdictAction.WORKS,
+                                     receiver=page_frame.SendWithoutName.SAVE_ONLY) if repaired else '')
+    receivers = " and ".join(dict.fromkeys((owner_name(members, entry.item.owner),
+                                          owner_name(members, entry.item.producer))))
+    not_fixed = page_frame.verdict_button(page_frame.VerdictItemType.LIST_REPAIR, page_frame.VerdictAction.NOT_FIXED,
+                                         receiver=page_frame.SendTo(receivers))
+    return f'<div class="list-actions list-repair-actions"{"" if repaired else " hidden"}>{works}{not_fixed}</div>'
+
+
 def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapshot, parking_label: str,
-                  schedule: DisplayedSchedule, today: datetime, mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
-    hidden = signed_form_fields(entry, secret)
-    read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
+                  schedule: DisplayedSchedule, today: datetime, routing: the_list.ListQuestionRouting,
+                  unread_answers: frozenset[the_list.UnreadAnswerId],
+                  mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
+    question = the_list.question_item(entry.item) is not the_list.NoQuestionItem.ORDINARY
+    if question and entry.item.state is the_list.ItemState.ANSWERED:
+        owner = entry.item.owner
+        receiver = html.escape(owner_name(members, owner), quote=True)
+        field = "words-" + entry.key.replace("/", "-")
+        route = None if isinstance(owner, the_list.UnassignedOwner) else routing.followup_receiver(owner)
+        ask = (page_frame.send_button(review_page.ASK_FOLLOW_UP_LABEL, page_frame.SendTo(route.name),
+                                      'name="action" value="question" disabled') if route is not None else '')
+        signature = route.signature if route is not None else the_list.ListQuestionRoute.CURRENT
+        return (f'<form method="post" data-feedback-form data-question-read data-read-receiver="{receiver}">'
+                + signed_form_fields(entry, secret, ask_signature=signature) + '<input type="hidden" name="until" value="">'
+                + review_page.words_field(field, "words", 4, maxlength=10000)
+                + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
+                + ask + '<button name="action" value="read">Mark read</button></div></form>')
+    read = ('<button name="action" value="read">Mark read</button>'
+            if (not question and isinstance(entry.item.unread_since, datetime)
+                or the_list.question_can_mark_read(entry.item, unread_answers)) else '')
     top = top_button(mark)
     key = html.escape(entry.key.replace('/', '-'), quote=True)
     scheduled = not isinstance(schedule, the_list.NoSchedule)
@@ -628,23 +807,43 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
     start_now = ('<button name="action" value="start-now">Start now</button>'
                  if isinstance(schedule, (the_list.ScheduledRun, UpcomingSeriesRun)) else '')
     zone = user_zone()
-    schedule_editor = schedule_fields(entry, schedule, members, key, zone)
-    producer_name = owner_name(members, entry.item.producer)
-    producer_label = html.escape(producer_name, quote=True)
-    words_label = html.escape(f"Your words for {producer_name} about this item", quote=True)
-    return (f'<form method="post" data-feedback-form data-recipient-name="{producer_label}">' + hidden
+    schedule_editor = ('' if question else '<template data-schedule-template>'
+                       + schedule_fields(entry, schedule, members, key, zone) + '</template>')
+    recipient_name = owner_name(members, feedback_recipient(entry.item))
+    words_label = html.escape(f"Your words for {recipient_name} about this item", quote=True)
+    remove = ('<button name="action" value="remove">Remove</button>'
+              if entry.item.question_kind is the_list.NoQuestionItem.ORDINARY else '')
+    repair = ''
+    if isinstance(entry.item.report, the_list.ListReport):
+        repaired = entry.item.state == the_list.ItemState.REPAIRED
+        if repaired:
+            words_label = "Your words about this repair"
+        repair = repair_buttons(entry, members, repaired=repaired)
+    ask = ''
+    ask_signature: the_list.ListQuestionSignature | the_list.ListQuestionRoute = the_list.ListQuestionRoute.CURRENT
+    if not scheduled:
+        route = routing.receiver(entry.keeper, entry.item.producer)
+        ask_signature = route.signature
+        split = entry.item.question_kind is not the_list.NoQuestionItem.ORDINARY and route.name != recipient_name
+        if split:
+            words_label = "Your words"
+        ask = page_frame.send_button("Ask" if split else "Ask question", page_frame.SendTo(route.name),
+                                     'name="action" value="question" disabled', show_receiver=split)
+    hidden = signed_form_fields(entry, secret, ask_signature=ask_signature)
+    tell = page_frame.send_button("Tell", page_frame.SendTo(recipient_name),
+                                  'name="action" value="tell" disabled', show_receiver=True)
+    studio_question = ' data-studio-question' if entry.item.question_kind is not the_list.NoQuestionItem.ORDINARY else ''
+    return (f'<form method="post" data-feedback-form{studio_question}>' + hidden
             + f'<p data-parked-detail{parked}>{note}</p>'
-            + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read + top
+            + '<div class="list-actions">' + remove + read + top
             + f'<div class="list-parking-actions">{start_now}<button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
-            + '<div class="list-park">' + record_table.park_control(
+            + f'<div class="list-park"{" data-park-only" if question else ""}>' + record_table.park_control(
                 picker_label, field="until", action="action", value="park", identity="park-" + key, allow_delivery=True)
             + '</div></div></div>'
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + f'placeholder="{words_label}" aria-label="{words_label}"></textarea>'
-            + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
-            + ('' if scheduled else '<button name="action" value="question" disabled>Ask question</button>')
-            + f'<button name="action" value="tell" disabled>Tell {producer_label}</button></div>'
-            + '<template data-schedule-template>' + schedule_editor + '</template></form>')
+            + repair + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
+            + ask + tell + '</div>' + schedule_editor + '</form>')
 
 
 def review_card_link(key: str, label: str) -> str:
@@ -652,13 +851,22 @@ def review_card_link(key: str, label: str) -> str:
     return f'<a href="{url}" data-list-review-card="" aria-haspopup="dialog">{html.escape(label)}</a>'
 
 
+def linked_review_keys(item: the_list.ListItem) -> tuple[str, ...]:
+    origin = item.native_question
+    if isinstance(origin, the_list.NativeQuestionItem) and origin.kind is the_list.QuestionItemKind.TO_NATE:
+        return tuple(key for key in item.reviews if key != origin.source_key)
+    return item.reviews
+
+
 def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.ReviewItem], today: datetime) -> str:
     """Describe the current turn for the linked reviews without storing their states."""
-    if not item.reviews:
+    keys = linked_review_keys(item)
+    if not keys:
         return ""
-    linked = [reviews[identity] for identity in item.reviews if identity in reviews]
-    ready = [review for review in linked if review.for_you(today)]
-    waiting = [review for review in linked if review.state != review_items.ReviewState.DONE and not review.for_you(today)]
+    linked = [reviews[identity] for identity in keys if identity in reviews]
+    ready = [review for review in linked if review.queue_at(today) is question_path.Queue.NEEDS_ME]
+    waiting = [review for review in linked if review.state != review_items.ReviewState.DONE
+               and review.queue_at(today) is not question_path.Queue.NEEDS_ME]
     if ready:
         kind = "change" if all(review.type == review_items.ReviewType.CHANGE for review in ready) else "review"
         text = footer_counts.plural(len(ready), kind) + " for you"
@@ -714,20 +922,60 @@ def question_time_html(stamp: str, today: datetime) -> str:
     return time_html(datetime.fromisoformat(stamp), today)
 
 
-def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: frozenset[str],
+def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: frozenset[the_list.UnreadAnswerId],
                     failed: frozenset[str] = NO_FAILED_QUESTIONS) -> str:
     sections: list[str] = []
     for question in item.questions:
         answer = question.answer
-        if answer is None:
-            sections.append(page_question.open_question_html(
-                question, asked_time_html=question_time_html(question.asked_at, today),
-                failed=question.question_id in failed))
-        elif question.question_id in unread_answers:
-            sections.append(page_question.answered_question_html(question, answer,
-                asked_time_html=question_time_html(question.asked_at, today),
-                answer_time_html=question_time_html(answer.answered_at, today),
-                answer_mark_html=' <span class="question-unread">Unread</span>'))
+        identity = html.escape(question.question_id)
+        unread = question.question_id in unread_answers
+        if answer is not None and not unread and item.question_kind is the_list.NoQuestionItem.ORDINARY:
+            continue
+        pending = answer is None and question.question_id not in failed
+        waiting = " — waiting for an answer" if pending else ""
+        body = (f'<section class="page-question" data-question="{identity}"><h3>Question {identity}{waiting}</h3>'
+                + question_time_html(question.asked_at, today) + f'<p>{item_text_html(question.words)}</p>')
+        if answer is not None:
+            marker = ' <span class="question-unread">Unread</span>' if unread else ''
+            body += (f'<h3>Answer{marker}</h3>'
+                     + question_time_html(answer.answered_at, today) + f'<p>{item_text_html(answer.text)}</p>')
+        sections.append(body + '</section>')
+    return ''.join(sections)
+
+
+def filed_exchange_sections(item: the_list.ListItem, today: datetime, names: staff_names.StaffNames,
+                            unread_answers: frozenset[the_list.UnreadAnswerId]) -> str:
+    returned = {entry.what.identity for entry in item.log if isinstance(entry.what, the_list.ReturnedAnswer)}
+    native = item.question_kind is not the_list.NoQuestionItem.ORDINARY
+    sections: list[str] = []
+    open_cards: set[str] = set()
+    for exchange in item.filed_exchanges:
+        if exchange.source is list_exchange.Source.LIST:
+            continue
+        asker = names.html(exchange.asker, owner_name(names.members, staff.StaffId(exchange.asker)))
+        asked = time_html(exchange.asked_at, today) if isinstance(exchange.asked_at, datetime) else ""
+        body = f'<h3>Question from {asker}</h3>{asked}<p>{item_text_html(exchange.question)}</p>'
+        answer = exchange.answer
+        if (item.state is not the_list.ItemState.CLOSED and answer is list_exchange.QuestionWithoutAnswer.OPEN
+                and exchange.direction is list_exchange.Direction.QUESTION_TO_NATE):
+            if exchange.source_key in open_cards:
+                continue
+            open_cards.add(exchange.source_key)
+            key = html.escape(exchange.source_key, quote=True)
+            sections.append(f'<section class="page-question" data-studio-question-card="{key}">'
+                            + body + '<p role="status" data-send-status hidden></p></section>')
+            continue
+        identity = the_list.ReturnedAnswerId(exchange.source_key, exchange.exchange_id)
+        if isinstance(answer, list_exchange.ExchangeAnswer) and (native or identity not in returned):
+            actor = exchange.answerer
+            answerer = html.escape(actor.name) if isinstance(actor, list_exchange.RecordedAnswerer) else names.html(actor, owner_name(names.members, staff.StaffId(actor)))
+            answered = time_html(answer.time, today) if isinstance(answer.time, datetime) else ""
+            unread = (' <span class="question-unread">Unread</span>'
+                      if item.state is not the_list.ItemState.CLOSED
+                      and (identity in unread_answers if native else answer.read is list_exchange.AnswerRead.UNREAD)
+                      else "")
+            body += f'<h3>Answer from {answerer}{unread}</h3>{answered}<p>{item_text_html(answer.text)}</p>'
+        sections.append('<section class="page-question">' + body + '</section>')
     return ''.join(sections)
 
 
@@ -764,9 +1012,9 @@ def ask_boxes(entry: ListRecord, secret: str, names: staff_names.StaffNames) -> 
         boxes.append(
             f'<section class="list-ask" data-ask="{ask.ask_id}" aria-labelledby="{box_id}">'
             + f'<h3 id="{box_id}">{ASK_HEADINGS[ask.kind]}</h3>'
-            + f'<dl><dt>What</dt><dd>{html.escape(ask.what)}</dd>'
+            + f'<dl><dt>What</dt><dd>{item_text_html(ask.what)}</dd>'
             + f'<dt>Who needs it</dt><dd>{names.html(member.id, member.name)}, {staff_role_html(member, names)}</dd>'
-            + f'<dt>Why</dt><dd>{html.escape(ask.why)}</dd></dl>'
+            + f'<dt>Why</dt><dd>{item_text_html(ask.why)}</dd></dl>'
             + f'<form method="post" action="{go_ledger.GO_PATH}" data-go-form>' + hidden
             + f'<button type="submit" aria-describedby="{box_id}-note">{ASK_BUTTONS[ask.kind]}</button>'
             + f'<small id="{box_id}-note">{ASK_NOTES[ask.kind].format(agent=names.html(member.id, member.name))}</small>'
@@ -774,24 +1022,262 @@ def ask_boxes(entry: ListRecord, secret: str, names: staff_names.StaffNames) -> 
     return '<div class="list-asks">' + ''.join(boxes) + '</div>' if boxes else ''
 
 
+def report_state_time(item: the_list.ListItem, today: datetime) -> str:
+    if isinstance(item.report, the_list.ListReport) and isinstance(moment := item.state_entered, datetime):
+        return time_html(moment, today)
+    return ""
+
+
+NEXT_STEP_COMMAND_LABEL = "Run this command:"
+NEXT_STEP_FENCE = re.compile(
+    r"(?m)^[ \t]*(?P<marker>(?P<char>`|~)(?P=char){2,})[^\n]*\n"
+    + r"(?:(?P<body>[\s\S]*?)^[ \t]*(?P=marker)(?P=char)*[ \t]*(?=\n|$)|[\s\S]*\Z)"
+)
+
+
+class ListProgress(NamedTuple):
+    latest_status: str
+    status_time: the_list.Timestamp
+    next_step: str
+    repair_producer_html: str
+    show_next_step: bool
+
+    def next_step_html(self, *, link_urls: bool = False) -> str:
+        if self.repair_producer_html:
+            return '<p>' + self.repair_producer_html + ' repairs it again</p>'
+        if not self.show_next_step:
+            return ""
+        original = self.next_step or "Not recorded"
+        label = NEXT_STEP_COMMAND_LABEL
+        if label not in original:
+            return item_text_html(original, paragraphs=True, link_urls=link_urls)
+        text = original.replace("\r\n", "\n").replace("\r", "\n")
+        fences = list(NEXT_STEP_FENCE.finditer(text))
+        paragraphs: list[str] = []
+        start = 0
+        for blank in change_browser.BLANK_LINE.finditer(text):
+            if any(fence.start() <= blank.start() < fence.end() for fence in fences):
+                continue
+            paragraphs.append(text[start:blank.start()])
+            start = blank.end()
+        if paragraphs and paragraphs[-1] == label and label not in paragraphs[:-1]:
+            command = text[start:]
+            fence = next((fence for fence in fences if fence.start() >= start), None)
+            if fence is not None:
+                body = fence["body"]
+                command = (body.removesuffix("\n") if body is not None and fence.span() == (start, len(text))
+                           else "")
+            elif (block := page_frame.CODE_BLOCK.fullmatch(command)) and block[2] is not None:
+                command = block[2]
+            if command.strip():
+                prose = item_text_html(text[:start], paragraphs=True, link_urls=link_urls)
+                code = page_frame.copy_code_block(command)
+                return prose + '<div class="list-command">' + code + '</div>'
+        return item_text_html(original, paragraphs=True, link_urls=link_urls)
+
+
+def item_progress(item: the_list.ListItem, names: staff_names.StaffNames, schedule: DisplayedSchedule) -> ListProgress:
+    latest_status, status_time = item.latest_status, item.latest_status_time
+    _, next_step = displayed_work(item, schedule)
+    repair_producer_html = ""
+    show_next_step = True
+    if isinstance(item.report, the_list.ListReport):
+        use_repair_status = True
+        use_repair_step = item.state is the_list.ItemState.WORKING and not next_step
+        for entry in reversed(item.log):
+            event = entry.what
+            if isinstance(event, the_list.PageFeedback) and event.action is the_list.ReportVerdict.NOT_FIXED:
+                if use_repair_status:
+                    latest_status, status_time = "Not fixed: " + event.words, entry.time
+                if use_repair_step:
+                    producer = owner_name(names.members, item.producer)
+                    next_step = producer + " repairs it again"
+                    repair_producer_html = names.html(item.producer, producer)
+                break
+            if isinstance(event, the_list.FieldChange):
+                use_repair_status = use_repair_status and "latest_status" not in event.fields
+                use_repair_step = use_repair_step and "state" not in event.fields and "next_step" not in event.fields
+            if not (use_repair_status or use_repair_step):
+                break
+        if item.state is the_list.ItemState.DELIVERED:
+            next_step = ""
+            show_next_step = False
+    return ListProgress(latest_status, status_time, next_step, repair_producer_html, show_next_step)
+
+
+class ItemLinkSource(NamedTuple):
+    time: datetime
+    field: str
+    text: str
+
+
+def field_link_text(fields: Mapping[str, object]) -> Iterable[tuple[str, str]]:
+    for field, value in fields.items():
+        if isinstance(value, str):
+            if "://" in value:
+                yield FIELD_LABELS[field], value
+        elif isinstance(value, (the_list.CheckCondition, the_list.EtaDescription)):
+            if "://" in value.text:
+                yield FIELD_LABELS[field], value.text
+        elif isinstance(value, the_list.ScheduledRun):
+            yield FIELD_LABELS["next_step"], value.words
+        elif isinstance(value, the_list.ScheduledSeries):
+            yield FIELD_LABELS["next_step"], value.first.words
+            for exception in value.exceptions:
+                if isinstance(exception.run, the_list.ScheduledRun):
+                    yield FIELD_LABELS["next_step"], exception.run.words
+        elif field == "blocked_by":
+            for dependency in cast(tuple[the_list.ItemDependency, ...], value):
+                if "://" in dependency.condition:
+                    yield FIELD_LABELS[field], dependency.condition
+
+
+def log_link_text(content: the_list.LogContent) -> Iterable[tuple[str, str]]:
+    if isinstance(content, the_list.FieldChange):
+        yield from field_link_text(content.fields)
+    elif isinstance(content, the_list.PageFeedback):
+        yield "Feedback", content.words
+    elif isinstance(content, the_list.QuestionClosed):
+        yield "Question", content.question.words
+    elif isinstance(content, the_list.ReturnedAnswer):
+        yield "Answer", content.words
+    elif isinstance(content, (the_list.AskOpened, the_list.GoGiven, the_list.GoNotDelivered)):
+        yield "What", content.ask.what
+        yield "Why", content.ask.why
+    elif isinstance(content, str):
+        yield "Note", content
+
+
+def item_link_sources(item: the_list.ListItem, log: ItemLog, displayed_next_step: str) -> Iterable[ItemLinkSource]:
+    for change in log.url_candidates:
+        content = change.what
+        for field, text in log_link_text(content):
+            if "://" in text:
+                source_time = (datetime.fromisoformat(content.question.asked_at).astimezone(UTC)
+                               if isinstance(content, the_list.QuestionClosed) else change.time)
+                yield ItemLinkSource(source_time, field, text)
+    for question in item.questions:
+        if "://" in question.words:
+            asked = datetime.fromisoformat(question.asked_at).astimezone(UTC)
+            yield ItemLinkSource(asked, "Question", question.words)
+        if question.answer is not None and "://" in question.answer.text:
+            answered = datetime.fromisoformat(question.answer.answered_at).astimezone(UTC)
+            yield ItemLinkSource(answered, "Answer", question.answer.text)
+    for ask in item.asks:
+        if "://" in ask.what:
+            yield ItemLinkSource(ask.opened, "What", ask.what)
+        if "://" in ask.why:
+            yield ItemLinkSource(ask.opened, "Why", ask.why)
+    fields = {"title": item.title, "blocked_by": item.blocked_by, "next_check": item.next_check, "eta": item.eta,
+              "next_step": item.next_step, "latest_status": item.latest_status, "evidence": item.evidence,
+              "done_when": item.done_when, "closing_words": item.closing_words}
+    updated = item.updated if isinstance(item.updated, datetime) else datetime.max.replace(tzinfo=UTC)
+    for field, text in field_link_text(fields):
+        yield ItemLinkSource(updated, field, text)
+    if displayed_next_step != item.next_step and "://" in displayed_next_step:
+        yield ItemLinkSource(updated, FIELD_LABELS["next_step"], displayed_next_step)
+
+
+def console_item_label(address: SplitResult) -> str:
+    path = address.path.removesuffix(".html")
+    if path.endswith("/console/review"):
+        return "Review item"
+    if path.endswith(("/console/images", "/console/list", "/console/studio")):
+        fragment = parse_qs(address.fragment)
+        if path.endswith("/console/images") and fragment.get("image"):
+            return "Images page"
+        if path.endswith(("/console/list", "/console/studio")):
+            item = re.fullmatch(r"(?:[^/]+/)?L?([0-9]+)", fragment.get("item", [""])[0])
+            if item:
+                return f"List item {item[1]}"
+    return ""
+
+
+def item_url_label(address: SplitResult) -> str:
+    destination = address
+    if address.path.rstrip("/").endswith(("/console", "/console/console.html", "/console/index.html")):
+        query = parse_qs(address.query)
+        page = query.get("page", [""])[0]
+        place = query.get(console.PLACE_PREFIX + page, [""])[0]
+        try:
+            destination = urlsplit(place)
+        except ValueError:
+            destination = address
+        if page == "review" and not place:
+            return "Review item"
+    return console_item_label(destination) or address.netloc.rsplit("@", 1)[-1] + address.path
+
+
+def item_links_html(entry: ListRecord, log: ItemLog, displayed_next_step: str) -> str:
+    item = entry.item
+    blockers = [
+        f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number))}">#{link.number}</a>'
+        + ' — ' + item_text_html(link.condition) + '</li>' for link in item.blocked_by
+    ]
+    links: dict[str, str] = {}
+    for source in sorted(item_link_sources(item, log, displayed_next_step), key=lambda source: source.time):
+        for match in item_url_matches(source.text):
+            url = match.text
+            if url in links:
+                continue
+            links[url] = ('<li>' + item_url_html(url, item_url_label(match.address), "item-link-label")
+                          + f'<span class="item-link-field">{source.field}</span>'
+                          + f'<span class="item-link-address">{html.escape(url)}</span></li>')
+    if not blockers and not links:
+        return ""
+    return '<section class="item-links"><h3>Links</h3><ul>' + ''.join(blockers) + ''.join(links.values()) + '</ul></section>'
+
+
+def linked_items_html(entry: ListRecord, linked_records: Mapping[tuple[Path, int], ListRecord]) -> str:
+    rows: list[str] = []
+    closed = 0
+    for number in sorted(entry.item.related_to):
+        linked = linked_records.get((the_list.list_folder_identity(entry.keeper), number))
+        if linked is None:
+            href = html.escape(item_link(entry.keeper, number))
+            rows.append(f'<li><a class="list-top-link" data-list-linked-card aria-haspopup="dialog" href="{href}">'
+                        + f'#{number} not found</a></li>')
+            continue
+        state = linked.item.state
+        closed += int(state is the_list.ItemState.CLOSED)
+        text = titled_item_link(linked, overlay=True) + state_badge(state)
+        rows.append(f'<li>{text}</li>')
+    return (f'<section class="item-links" data-linked-items><h3>Linked items · {closed} of {len(rows)} closed</h3><ul>'
+            + ''.join(rows) + '</ul></section>') if rows else ''
+
+
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
-                 unread_answers: frozenset[str], asks: str = "",
-                 schedule: DisplayedSchedule = the_list.NoSchedule.UNSET) -> str:
-    log = item_log_html(entry, today, names, unread_answers)
+                 unread_answers: frozenset[the_list.UnreadAnswerId], progress: ListProgress, asks: str = "",
+                 *, schedule: DisplayedSchedule = the_list.NoSchedule.UNSET, linked_items: str = "") -> str:
+    log = item_log(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
     item = entry.item
-    status_time = item.latest_status_time
-    status_stamp = " · " + time_html(status_time, today) if item.latest_status and isinstance(status_time, datetime) else ""
-    eta, next_step = displayed_work(item, schedule)
+    status_time = progress.status_time
+    status_stamp = " · " + time_html(status_time, today) if progress.latest_status and isinstance(status_time, datetime) else ""
+    duplicate_status = (isinstance(item.report, the_list.ListReport)
+                        and progress.latest_status.strip() == item.report.words.strip())
+    state_stamp = report_state_time(item, today)
+    eta, _ = displayed_work(item, schedule)
+    question = the_list.question_item(item) is not the_list.NoQuestionItem.ORDINARY
     fields = ''.join(
-        f'<section class="list-field-{field}"><h3>{FIELD_LABELS[field]}'
+        f'<section class="list-field-{field}"><h3>'
+        + ('How to try' if field == "next_step" and item.state == the_list.ItemState.REPAIRED else FIELD_LABELS[field])
         + (status_stamp if field == "latest_status" else "") + '</h3>'
-        + field_html(field, value, today, names) + '</section>'
-        for field, value in (("state", item.state), ("eta", eta), ("latest_status", item.latest_status),
-                             ("next_step", next_step), ("done_when", item.done_when)))
-    return ('<div class="list-panel"><div>' + asks + '<div class="list-item-fields">' + fields
-            + '</div><div data-list-item-content>' + sections + '</div>'
-            + '</div>' + record_table.log_panel(log_id, log) + '</div>')
+        + (progress.next_step_html(link_urls=True) if field == "next_step" else field_html(field, value, today, names))
+        + (' · ' + state_stamp if field == "state" and state_stamp else '') + '</section>'
+        for field, value in (("state", item.state), ("eta", eta), ("latest_status", progress.latest_status),
+                             ("next_step", item.next_step), ("done_when", item.done_when))
+        if (field != "latest_status" or not duplicate_status) and (field != "next_step" or progress.show_next_step)
+        and (not question or value and value is not the_list.EtaStatus.NOT_ASKED))
+    report = review_page.list_report_details(item.report) if isinstance(item.report, the_list.ListReport) else ''
+    links = item_links_html(entry, log, progress.next_step)
+    exchanges = filed_exchange_sections(item, today, names, unread_answers)
+    question_first = item.state is the_list.ItemState.WAITING_FOR_NATE and item.question_kind is the_list.QuestionItemKind.TO_NATE
+    return ('<div class="list-panel"><div>' + report + asks + (exchanges if question_first else '')
+            + '<div class="list-item-fields">' + fields + '</div>' + linked_items + links
+            + ('' if question_first else exchanges)
+            + '<div data-list-item-content>' + sections + '</div>'
+            + '</div>' + record_table.log_panel(log_id, log.markup) + '</div>')
 
 
 class LinkedReviewRead(StrEnum):
@@ -805,7 +1291,7 @@ type ReviewDisplay = ReviewRecords | Literal[LinkedReviewRead.AFTER_RENDER]
 
 
 def has_all_linked_reviews(item: the_list.ListItem, reviews: ReviewRecords) -> bool:
-    return all(identity in reviews for identity in item.reviews)
+    return all(identity in reviews for identity in linked_review_keys(item))
 
 
 def read_linked_reviews(root: Path, *, members: staff.StaffSnapshot) -> list[review_items.ReviewItem]:
@@ -823,15 +1309,22 @@ def linked_reviews(root: Path, members: staff.StaffSnapshot, records: ImmediateR
 
 def review_links(item: the_list.ListItem, reviews: ReviewDisplay, today: datetime) -> str:
     links = ''
-    if item.reviews and reviews is not LinkedReviewRead.AFTER_RENDER:
-        cards = (review_card(identity, reviews) for identity in item.reviews)
+    keys = linked_review_keys(item)
+    if keys and reviews is not LinkedReviewRead.AFTER_RENDER:
+        cards = (review_card(identity, reviews) for identity in keys)
         links = '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
+        if isinstance(item.report, the_list.ListReport) and (review := reviews.get(item.report.evidence_key)):
+            if words := review_items.list_reply(review):
+                links += review_page.answer_section(words)
+            if item.report.kind is the_list.ReportKind.VALIDATION and (
+                    problem := review_items.validation_problem(review, item.number, item.report.validation_log)):
+                links += review_page.section('Validation result', problem)
     return '<div data-list-review-links>' + links + '</div>'
 
 
 def render_review_updates(root: Path, members: staff.StaffSnapshot, review_records: ImmediateReviewRecords) -> str:
     """Render only the linked Review fields for items on the List."""
-    entries = [entry for entry in records() if entry.item.reviews]
+    entries = [entry for entry in records() if linked_review_keys(entry.item)]
     if not entries:
         return ""
     reviews = linked_reviews(root, members, review_records, (entry.item for entry in entries))
@@ -848,10 +1341,11 @@ def review_version(item: the_list.ListItem) -> str:
     return html.escape(json.dumps((str(item.updated), len(item.log), item.reviews)), quote=True)
 
 
-def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *, unread: bool,
+def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, members: staff.StaffSnapshot, *, unread: bool,
                           mark: TopPriorityMark) -> str:
     top = top_button(mark)
-    if not parking_label and not unread and not top:
+    repair = repair_buttons(entry, members, repaired=False) if isinstance(entry.item.report, the_list.ListReport) else ''
+    if not parking_label and not unread and not top and not repair:
         return ""
     parked = '' if parking_label else ' hidden'
     unpark = parked if entry.item.state != the_list.ItemState.CLOSED else ' hidden'
@@ -864,38 +1358,47 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *,
             + '<div class="list-actions">' + read + top
             + '<div class="list-parking-actions">'
             + f'<button name="action" value="unpark" id="unpark-{key}"{unpark}>Unpark</button></div></div>'
-            + '<span role="status" data-send-status hidden></span></form>')
+            + repair + '<span role="status" data-send-status hidden></span></form>')
 
 
 def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
-                    unread_answers: frozenset[str], secret: str,
-                    reviews: ReviewDisplay, parking_label: str, mark: TopPriorityMark) -> str:
+                    unread_answers: frozenset[the_list.UnreadAnswerId], secret: str,
+                    reviews: ReviewDisplay, parking_label: str, mark: TopPriorityMark, progress: ListProgress,
+                    *, linked_items: str) -> str:
     sections = (waiting_note(entry, names) + '<div data-waiting-questions>'
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(
-                    entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item),
+                    entry, secret, parking_label, names.members, unread=bool(unread_answers) or the_list.unread_delivery(entry.item),
                     mark=mark))
-    return detail_panel(entry, sections, today, names, unread_answers, ask_boxes(entry, secret, names))
+    return detail_panel(entry, sections, today, names, unread_answers, progress, ask_boxes(entry, secret, names),
+                        linked_items=linked_items)
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
             names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
-            unread_answers: frozenset[str], *, parking_label: str,
-            schedule: DisplayedSchedule, mark: TopPriorityMark) -> str:
+            unread_answers: frozenset[the_list.UnreadAnswerId], *, parking_label: str,
+            schedule: DisplayedSchedule, mark: TopPriorityMark, progress: ListProgress,
+            routing: the_list.ListQuestionRouting, linked_items: str = "") -> str:
     item = entry.item
-    if isinstance(visibility, the_list.WaitingForAnswer):
-        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark)
-    links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
-             + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
-    links.extend(f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
-                 for number in item.related_to)
-    sections = '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>' if links else ''
-    sections += review_links(item, reviews, today)
-    questions = panel_questions(item, today, unread_answers, visibility.failed) if isinstance(schedule, the_list.NoSchedule) else ''
-    form = feedback_form(entry, secret, members=names.members, parking_label=parking_label,
-                         schedule=schedule, today=today, mark=mark)
+    if item.state is the_list.ItemState.CLOSED:
+        return '<p data-list-closed-loading role="status">Loading the item…</p>' + linked_items
+    if isinstance(visibility, the_list.WaitingForAnswer) and item.state != the_list.ItemState.REPAIRED:
+        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark, progress,
+                               linked_items=linked_items)
+    sections = review_links(item, reviews, today)
+    failed: frozenset[str] = visibility.failed if isinstance(visibility, the_list.QuestionAttention) else frozenset()
+    questions = panel_questions(item, today, unread_answers, failed) if isinstance(schedule, the_list.NoSchedule) else ''
+    waits_for_answer = (the_list.question_item(item) is the_list.QuestionItemKind.TO_NATE
+                        and item.state is the_list.ItemState.WAITING_FOR_NATE)
+    if waits_for_answer:
+        form = waiting_feedback_form(entry, secret, "", names.members, unread=True,
+                                     mark=TopPriorityMark.HIDDEN) if unread_answers else ''
+    else:
+        form = feedback_form(entry, secret, members=names.members, parking_label=parking_label, schedule=schedule,
+                             today=today, mark=mark, routing=routing, unread_answers=unread_answers)
     return waiting_note(entry, names, hidden=True) + detail_panel(
-        entry, sections + questions + form, today, names, unread_answers, ask_boxes(entry, secret, names), schedule)
+        entry, sections + questions + form, today, names, unread_answers, progress, ask_boxes(entry, secret, names),
+        schedule=schedule, linked_items=linked_items)
 
 
 def original_request_words(item: the_list.ListItem) -> str:
@@ -909,33 +1412,44 @@ def original_request_words(item: the_list.ListItem) -> str:
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
               reviews: ReviewDisplay, *, owner_cell: str, owner_sort: str, search_text: SearchText, parked: bool,
               open_question: bool, open_ask: bool, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
-              unread_answers: frozenset[str],
-              schedule: DisplayedSchedule, mark: TopPriorityMark, hidden: bool = False) -> str:
+              unread_answers: frozenset[the_list.UnreadAnswerId],
+              schedule: DisplayedSchedule, mark: TopPriorityMark, routing: the_list.ListQuestionRouting,
+              hidden: bool = False, linked_items: str = "") -> str:
     item = entry.item
     producer = owner_name(names.members, item.producer)
-    unread = isinstance(item.unread_since, datetime)
+    unread_at = item.unread_at
+    unread = isinstance(unread_at, datetime)
     waiting = isinstance(visibility, the_list.WaitingForAnswer)
+    progress = item_progress(item, names, schedule)
     scheduled = not isinstance(schedule, the_list.NoSchedule)
-    eta, next_step = displayed_work(item, schedule)
+    eta, _ = displayed_work(item, schedule)
     due = the_list.eta_due(eta)
     eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(eta, today).casefold())
     values = (item.number, owner_sort, producer.casefold(), item.title.casefold(), item.state.value.casefold(),
-              next_step.casefold(), eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
+              progress.next_step.casefold(), eta_sort, unread_at.timestamp() if unread else 0)
     parking = (the_list.ParkUntilDelivered.DELIVERED.value
                if item.parked_until is the_list.ParkUntilDelivered.DELIVERED else str(parked).lower())
     key = entry.key
+    open_followup = the_list.has_open_followup(item)
     attributes = {
         "key": key, "number": str(item.number), "owner": str(item.owner), "producer": item.producer,
         "keeper-produces": str(item.producer == entry.keeper).lower(), "state": item.state.value,
         "unread": str(unread).lower(), "parked": parking, "waiting-for-answer": str(waiting).lower(),
         "open-question": str(open_question).lower(), "unread-delivery": str(the_list.unread_delivery(item)).lower(),
+        "open-followup": str(open_followup).lower(),
         "unread-answer": str(bool(unread_answers)).lower(), "open-ask": str(open_ask).lower(),
         "title": search_text.title, "owner-name": search_text.owner, "request-words": search_text.request,
         "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False),
     }
-    keeper = names.members.by_id(entry.keeper)
-    if keeper is not None:
-        attributes["send-receiver"] = keeper.name
+    if isinstance(item.report, the_list.ListReport):
+        attributes["report"] = item.report.kind.value
+    if the_list.question_item(item) is not the_list.NoQuestionItem.ORDINARY:
+        attributes["question-item"] = ""
+    keys = linked_review_keys(item)
+    if keys:
+        attributes["list-review-keys"] = json.dumps(keys, ensure_ascii=False)
+    if item.state is the_list.ItemState.CLOSED:
+        attributes["linked-closed-item"] = ""
     attrs = ''
     for name, value in attributes.items():
         escaped = (record_table.identity_attribute(value) if name in ("key", "owner", "producer")
@@ -952,9 +1466,10 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                  + TOP_FLAG + '</span>' + title)
     if item.unit:
         title += '<small>' + field_html("unit", item.unit, today, names) + '</small>'
-    tone = STATE_TONES.get(item.state, "muted")
-    state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
-    if open_question:
+    state = state_badge(item.state)
+    if stamp := report_state_time(item, today):
+        state += '<small data-list-state-time>' + stamp + '</small>'
+    if open_question and not open_followup:
         state += producer_answering_note(names)
     state += check_row_html(item.next_check, today, parked=parked or scheduled)
     if scheduled:
@@ -962,7 +1477,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
     if parking_label:
         state += '<small data-parked-note>Parked until ' + parking_label + '</small>'
-    if item.reviews:
+    if keys:
         if reviews is LinkedReviewRead.AFTER_RENDER:
             attrs += f' data-list-review-version="{review_version(item)}"'
             state += f'<small data-list-review-summary="{REVIEW_UNAVAILABLE}">Checking linked reviews…</small>'
@@ -974,7 +1489,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     sent = the_list.feedback_notice_time(item)
     if isinstance(sent, datetime):
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
-        if feedback.state == "alerted":
+        if feedback.state == "alerted" and not feedback.studio_save_notice:
             recipient_id = feedback.recipient_id(entry.keeper)
             recipient = names.html(recipient_id, owner_name(names.members, recipient_id))
             alert = names.html(feedback.alerted_to) + " told" if feedback.alerted_to else "no showrunner for alert"
@@ -982,18 +1497,18 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
             update += '<small>' + notice + ", " + html.escape(list_time(sent, today)) + '</small>'
     overdue = not scheduled and due is not None and due < today and item.state != the_list.ItemState.CLOSED
     eta_class = "list-eta warning" if overdue else "list-eta"
-    full_eta = field_html("eta", eta, today, names)
+    full_eta = html.escape(eta_text(eta, today))
     short_eta = html.escape(eta_cell_text(eta, today))
     eta_cell = (f'<span class="{eta_class}" id="list-eta-{row_id}" tabindex="0" title="{full_eta}">'
                 + f'<span class="list-eta-text">{short_eta}</span>'
                 + f'<span class="list-eta-full" aria-hidden="true">{full_eta}</span></span>')
     cells = (number, owner_cell, field_html("producer", item.producer, today, names),
-             title, state, field_html("next_step", next_step, today, names), eta_cell, update)
+             title, state, progress.next_step_html(), eta_cell, update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden_attr = ' hidden' if hidden else ''
     body = details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label,
-                   schedule=schedule, mark=mark)
+                   schedule=schedule, mark=mark, progress=progress, routing=routing, linked_items=linked_items)
     revision = detail_revision(item, body)
     return (f'<tbody data-list-item{attrs} data-detail-revision="{revision}"{hidden_attr}><tr class="list-row">' + row
             + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
@@ -1006,13 +1521,6 @@ def detail_revision(item: the_list.ListItem, body: str) -> str:
     version = re.sub(r'(name="request" value=")[a-f0-9]{32}', r'\1', version)
     version = re.sub(r'(name="token" value=")[a-f0-9]{64}', r'\1', version)
     return hashlib.sha256(f'{item.updated}\0{item.title}\0{version}'.encode()).hexdigest()
-
-@dataclass(frozen=True)
-class ListFeedbackDelivery:
-    keeper: staff.StaffId
-    identity: str
-    request: str
-
 
 @dataclass(frozen=True)
 class ListQuestionDelivery:
@@ -1043,6 +1551,18 @@ class ListUnparkSubmission:
 ListActionSubmission = ListFeedbackDelivery | ListQuestionDelivery | ListUnparkSubmission | change_page.NoMessageDelivery
 
 
+class NotFixedReceiptState(StrEnum):
+    ABSENT = "absent"
+    ACCEPTED = "accepted"
+    DELIVERED = "delivered"
+    REFUSED = "refused"
+
+
+class NotFixedReceipt(TypedDict):
+    request: str
+    state: NotFixedReceiptState
+
+
 class SavedActionState(TypedDict):
     unread: str
     unread_sort: float
@@ -1052,15 +1572,18 @@ class SavedActionState(TypedDict):
     check_html: str
     waiting_for_answer: str
     open_question: str
+    open_followup: NotRequired[str]
     open_ask: str
     unread_delivery: NotRequired[str]
     unread_answer: NotRequired[str]
     waiting_details_html: NotRequired[str]
     review_summary_html: NotRequired[str]
     park_request_saved: NotRequired[bool]
+    not_fixed_receipt: NotRequired[NotFixedReceipt]
     detail_html: NotRequired[str]
     detail_revision: NotRequired[str]
     detail_closed: NotRequired[bool]
+    state_time_html: NotRequired[str]
     remove_request_saved: NotRequired[bool]
     scheduled_note: NotRequired[str]
     next_step_html: NotRequired[str]
@@ -1072,18 +1595,22 @@ class SavedActionState(TypedDict):
 
 def saved_action_state(keeper: str, identity: str, *, status: change_page.DeliveryStatus | None = None,
                        park_request: str = "",
+                       not_fixed_request: str = "",
                        review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
                        include_detail: bool = False, top_priority: TopPriority = TopPriority.HIDDEN) -> SavedActionState:
     owner = staff.StaffId(keeper)
     return action_state(owner, the_list.load(owner, identity), status=status,
-                        park_request=park_request, review_records=review_records, include_detail=include_detail,
-                        top_priority=top_priority)
+                        park_request=park_request, not_fixed_request=not_fixed_request,
+                        review_records=review_records, include_detail=include_detail,
+                        top_priority=top_priority, read_closed_detail=not (park_request or not_fixed_request))
 
 
 def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
                  status: change_page.DeliveryStatus | None = None, park_request: str = "",
+                 not_fixed_request: str = "",
                  review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
-                 include_detail: bool = False, top_priority: TopPriority = TopPriority.HIDDEN) -> SavedActionState:
+                 include_detail: bool = False, top_priority: TopPriority = TopPriority.HIDDEN,
+                 read_closed_detail: bool = False) -> SavedActionState:
     zone = user_zone()
     today = the_list.now()
     local_today = today.astimezone(zone)
@@ -1093,13 +1620,14 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     parked = bool(parked_until)
     schedule = schedule_display(item)
     scheduled = not isinstance(schedule, the_list.NoSchedule)
-    unread = item.unread_since
+    unread = item.unread_at
     unread_answers = the_list.unread_answer_ids(item)
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
     open_question = not scheduled and item.state != the_list.ItemState.CLOSED and the_list.has_open_question(item)
     visibility = the_list.QuestionAttention() if scheduled else the_list.question_visibility(owner, item, reading)
     waiting = open_question and isinstance(visibility, the_list.WaitingForAnswer)
-    open_ask = bool(the_list.answerable_asks(item, staff.snapshot()))
+    members = staff.snapshot()
+    open_ask = bool(the_list.answerable_asks(item, members))
     saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
                                "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
                                "item_state": item.state.value,
@@ -1107,16 +1635,16 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
                                "check_html": check_row_html(item.next_check, local_today, parked=parked or scheduled),
                                "waiting_for_answer": str(waiting).lower(),
                                "open_question": str(open_question).lower(),
+                               "open_followup": str(the_list.has_open_followup(item)).lower(),
                                "open_ask": str(open_ask).lower(),
                                "unread_delivery": str(the_list.unread_delivery(item)).lower(),
                                "unread_answer": str(bool(unread_answers)).lower()}
     if scheduled:
         saved["scheduled_note"] = schedule_label(schedule, local_today)
     if include_detail:
-        eta, next_step = displayed_work(item, schedule)
+        eta, _ = displayed_work(item, schedule)
         due = the_list.eta_due(eta)
-        saved.update(next_step_html=change_browser.question_paragraphs(next_step or "Not recorded"),
-                     next_step_sort=next_step.casefold(), eta_short=eta_cell_text(eta, local_today),
+        saved.update(eta_short=eta_cell_text(eta, local_today),
                      eta_full=eta_text(eta, local_today),
                      eta_sort=(0, due.timestamp()) if due is not None else (1, eta_text(eta, local_today).casefold()))
     if park_request:
@@ -1128,13 +1656,41 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         else:
             park_request = prefix.format() + retry
         saved["park_request_saved"] = the_list.has_park_receipt(item, park_request)
-        notice = the_list.feedback_requests(item).get(park_request)
-        saved["remove_request_saved"] = notice is not None and notice.action == "remove"
-    if waiting or include_detail and item.state != the_list.ItemState.CLOSED:
-        members = staff.snapshot()
-        names = staff_names.StaffNames(members)
+        saved["remove_request_saved"] = (
+            the_list.remove_receipt(item, park_request) is not the_list.NoPageRequest.ABSENT)
+    if not_fixed_request:
+        prefix, retry = ListFormRequestPrefix.parse(not_fixed_request)
+        request = prefix.format() + retry
+        feedback = the_list.feedback_requests(item).get(request)
+        state = NotFixedReceiptState.ABSENT
+        if feedback is not None and feedback.action is the_list.ReportVerdict.NOT_FIXED:
+            state = (NotFixedReceiptState.DELIVERED if feedback.state == "sent" else NotFixedReceiptState.ACCEPTED)
+        saved["not_fixed_receipt"] = NotFixedReceipt(request=request, state=state)
+    has_detail = waiting or include_detail and item.state != the_list.ItemState.CLOSED
+    report = isinstance(item.report, the_list.ListReport)
+    if include_detail and item.state == the_list.ItemState.CLOSED:
+        saved["detail_closed"] = True
+    if not (report or has_detail or include_detail):
+        return saved
+    names = staff_names.StaffNames(members)
+    progress = item_progress(item, names, schedule)
+    if report:
+        saved["state_time_html"] = report_state_time(item, local_today)
+    if report or include_detail:
+        saved["next_step_html"] = progress.next_step_html()
+        saved["next_step_sort"] = progress.next_step.casefold()
+    if read_closed_detail and saved.get("detail_closed"):
+        entry = ListRecord(owner, item)
+        can_read = the_list.question_can_mark_read(item, unread_answers)
+        sections = ''
+        if can_read:
+            sections = panel_questions(item, local_today, unread_answers) + waiting_feedback_form(
+                entry, form_secret(reading.root), "", members, unread=True, mark=TopPriorityMark.HIDDEN)
+        saved["detail_html"] = detail_panel(entry, sections, local_today, names,
+                                            unread_answers if can_read else frozenset(), progress)
+    if has_detail:
         reviews: ReviewRecords = {}
-        if item.reviews:
+        if linked_review_keys(item):
             try:
                 reviews = linked_reviews(reading.root, members, review_records, (item,))
             except (OSError, ValueError, change_review.ChangeReviewError) as error:
@@ -1145,20 +1701,20 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         secret = form_secret(reading.root)
         body = details(ListRecord(owner, item), local_today, secret, reviews, names,
                        visibility, unread_answers, parking_label=parked_until,
-                       schedule=schedule, mark=top_priority_mark(top_priority, members, item))
+                       schedule=schedule, mark=top_priority_mark(top_priority, members, item), progress=progress,
+                       routing=the_list.ListQuestionRouting(members))
         if waiting:
             saved["waiting_details_html"] = body
         if include_detail:
-            revision = detail_revision(item, body)
+            revision = "action:" + detail_revision(item, body)
             saved.update(detail_html=body, detail_revision=revision)
-    if include_detail and item.state == the_list.ItemState.CLOSED:
-        saved["detail_closed"] = True
     return saved
 
 
 def _mark_seen_update_read(keeper: staff.StaffId, item: the_list.ListItem,
                            update: the_list.UnreadUpdate | the_list.NoUnreadUpdate) -> None:
-    if isinstance(update, the_list.UnreadUpdate) and update == the_list.unread_update(item):
+    if (item.question_kind is the_list.NoQuestionItem.ORDINARY
+            and isinstance(update, the_list.UnreadUpdate) and update == the_list.unread_update(item)):
         try:
             _ = the_list.mark_read(keeper, item.id, source=the_list.PAGE_SOURCE, update=update)
         except (OSError, the_list.ListError):
@@ -1190,7 +1746,9 @@ def _replay_ask(keeper: staff.StaffId, item: the_list.ListItem, receipt: the_lis
 
 
 def _submit_ask(keeper: staff.StaffId, identity: str, request: the_list.PageRequest,
-                status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+                status: change_page.DeliveryStatus, shown: the_list.ListQuestionSignature | the_list.ListQuestionRoute,
+                seen: the_list.UnreadUpdate | the_list.NoUnreadUpdate
+                ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     """Serialize the receipt check and submission of List Ask requests."""
     with exclusive(the_list.folder(keeper) / f".{identity}.ask.lock"):
         item = the_list.load(keeper, identity)
@@ -1198,7 +1756,7 @@ def _submit_ask(keeper: staff.StaffId, identity: str, request: the_list.PageRequ
                         if entry.source == the_list.PAGE_SOURCE and isinstance(entry.what, the_list.QuestionRequestReceipt)
                         and entry.what.request.request == request.request), None)
         if receipt is None:
-            return the_list.ask_question(keeper, identity, request, status)
+            return the_list.ask_question(keeper, identity, request, status, shown=shown, seen=seen)
         if receipt.request != request:
             raise the_list.ListError("this request already has a different action or words")
         return _replay_ask(keeper, item, receipt, status)
@@ -1286,7 +1844,11 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
         bootstrap = signed_token(bootstrap_form_secret(root), keeper, identity, signed_prefix)
         if not secrets.compare_digest(token, bootstrap.encode()):
             raise question_record.AnswerRefused("the List token does not match this page")
-    action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
+    action, words, until = fields["action"][0], fields["words"][0], fields["until"][0]
+    if action == "remove":
+        words = words if words.strip() else ""
+    elif action != the_list.ReportVerdict.NOT_FIXED:
+        words = words.strip()
     if action == "top" and top_priority is TopPriority.HIDDEN:
         raise question_record.AnswerRefused("this page has no top priority items")
     read_edit = None
@@ -1299,7 +1861,7 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
     if action == "read":
         read_edit = the_list.mark_read_edit(keeper, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
                                            page_request=the_list.PageRequest(request, "read", words))
-        delivery = _notice_delivery(keeper, read_edit.item, request)
+        delivery = _notice_delivery(keeper, read_edit.item, request, status or change_page.DeliveryStatus(root))
     else:
         delivery = _submit_action(root, keeper, identity, request, prefix, action, words, until, status, submitted)
     if not include_detail:
@@ -1323,11 +1885,18 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         save_schedule(keeper, identity, request, the_list.ScheduleOperation(action), until, submitted, expected)
         return change_page.NoMessageDelivery()
     item = the_list.load(keeper, identity)
+    if action in (the_list.ReportVerdict.WORKS, the_list.ReportVerdict.NOT_FIXED):
+        verdict = the_list.ReportVerdict(action)
+        _ = the_list.check_report(keeper, identity, verdict, words, request=request, revision=prefix.repair)
+        if verdict is the_list.ReportVerdict.NOT_FIXED:
+            return ListFeedbackDelivery(keeper, identity, request)
+        return change_page.NoMessageDelivery()
     if action == "question":
         if item.state is the_list.ItemState.SCHEDULED:
             raise question_record.AnswerRefused("Ask the question after the item starts.")
         status = change_page.DeliveryStatus(root) if status is None else status
-        question = _submit_ask(keeper, identity, the_list.PageRequest(request, "question", words), status)
+        question = _submit_ask(keeper, identity, the_list.PageRequest(request, "question", words), status,
+                               prefix.ask_signature, prefix.seen_update)
         if isinstance(question, change_page.MessageDelivery):
             _mark_seen_update_read(keeper, item, prefix.seen_update)
             return ListQuestionDelivery(question, status)
@@ -1337,9 +1906,16 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         target = f"run {submitted.run_number} of item {item.number}" if one_run else f"item {item.number}"
         saved_words = submitted.receipt_words(action, words) if submitted.scope else words
         recipient = prefix.recipient if item.state is the_list.ItemState.SCHEDULED else the_list.LegacyFeedbackRecipient.KEEPER
-        notice = the_list.PageItemNotice(request, f"List page: nate removed {target}.", "remove", saved_words,
-                                        recipient=recipient)
-        changed = the_list.close(keeper, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE,
+        message = f"Studio: nate removed {target}." + (f"\n\n{words}" if words else "")
+        receipt = the_list.remove_receipt(item, request)
+        if receipt is not the_list.NoPageRequest.ABSENT:
+            message = receipt.words
+            trimmed = words.strip()
+            legacy_words = submitted.receipt_words(action, trimmed) if submitted.scope else trimmed
+            if legacy_words == receipt.form_words:
+                saved_words = legacy_words
+        notice = the_list.PageItemNotice(request, message, "remove", saved_words, recipient=recipient)
+        changed = the_list.close(keeper, identity, words or "Removed by nate on the Studio.", source=the_list.PAGE_SOURCE,
                                  notice=notice, schedule_scope=submitted.scope, expected_schedule=expected)
     elif action == "park":
         if until != the_list.ParkUntilDelivered.DELIVERED and the_list.ISO_TIME.fullmatch(until) is None:
@@ -1351,7 +1927,7 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
             label = parking_notice_label(parked_until, zone)
             saved_words = submitted.receipt_words(action, words) if submitted.scope else words
             recipient = prefix.recipient if item.state is the_list.ItemState.SCHEDULED else the_list.LegacyFeedbackRecipient.KEEPER
-            notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} {label}.", "park",
+            notice = the_list.PageItemNotice(request, f"Studio: nate parked item {item.number} {label}.", "park",
                                             saved_words, recipient=recipient)
             return the_list.park(keeper, identity, parked_until, source=the_list.PAGE_SOURCE,
                                  notice=notice, check_deadline=check_deadline,
@@ -1360,20 +1936,21 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         changed = (save_park(the_list.ParkUntilDelivered.DELIVERED) if until == the_list.ParkUntilDelivered.DELIVERED
                    else review_actions.save_timed_park(until, zone, save_park, require_offset=len(until) != 10))
     elif action == "unpark":
-        notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words)
+        notice = the_list.PageItemNotice(request, f"Studio: nate unparked item {item.number}.", "unpark", words)
         changed = the_list.unpark(keeper, identity, source=the_list.PAGE_SOURCE, notice=notice).item
     elif action == "top":
         _ = the_list.make_top_priority(keeper, identity)
         return change_page.NoMessageDelivery()
     elif action == "tell" and words and len(words) <= 10000:
         saved = the_list.save_feedback(keeper, identity, the_list.PageFeedback(
-            request, words, read_update=prefix.seen_update, recipient=prefix.recipient))
+            request, words, read_update=prefix.seen_update, recipient=prefix.recipient,
+            origin=the_list.PageNoticeOrigin.STUDIO))
         _mark_seen_update_read(keeper, item, saved.read_update)
         return ListFeedbackDelivery(keeper, identity, request) if saved.state == "pending" else change_page.NoMessageDelivery()
     else:
         recipient = keeper if prefix.recipient is the_list.LegacyFeedbackRecipient.KEEPER else prefix.recipient
         raise question_record.AnswerRefused(f"Enter words for {owner_name(staff.snapshot(), recipient)}.")
-    delivery = _notice_delivery(keeper, changed, request)
+    delivery = _notice_delivery(keeper, changed, request, status or change_page.DeliveryStatus(root))
     if action == "unpark":
         outcome = (UnparkOutcome(the_list.unpark_no_change_reason(changed, request).value)
                    if request not in the_list.feedback_requests(changed) else UnparkOutcome.CLEARED)
@@ -1381,12 +1958,15 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
     return delivery
 
 
-def _notice_delivery(keeper: staff.StaffId, item: the_list.ListItem,
-                     request: str) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
+def _notice_delivery(keeper: staff.StaffId, item: the_list.ListItem, request: str,
+                     status: change_page.DeliveryStatus) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
     """Send the notice that an item action saved, if it is still pending."""
     notice = the_list.feedback_requests(item).get(request)
-    return (ListFeedbackDelivery(keeper, item.id, request)
-            if notice is not None and notice.state == "pending" else change_page.NoMessageDelivery())
+    if notice is None or notice.state == "sent":
+        return change_page.NoMessageDelivery()
+    if notice.studio_save_notice:
+        return review_actions.StudioNoticeDelivery(keeper, item.id, request, status)
+    return ListFeedbackDelivery(keeper, item.id, request) if notice.state == "pending" else change_page.NoMessageDelivery()
 
 
 def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
@@ -1405,28 +1985,70 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
         return change_page.DeliveryUnconfirmed()
     if isinstance(delivery, ListQuestionDelivery):
         return change_page.deliver_with_outcome(delivery.delivery, delivery.status)
-    outcome: change_page.DeliveryOutcome = change_page.DeliveryUnconfirmed()
+    unconfirmed = change_page.DeliveryUnconfirmed()
+    outcome: change_page.DeliveryOutcome = unconfirmed
 
     def send(item: the_list.ListItem, feedback: the_list.PageFeedback) -> the_list.PageFeedback:
         nonlocal outcome
         settings = conf.read("review_links")
         tries = settings.whole("delivery_tries")
-        message = (f"List page: nate's words for item {item.number}\n{feedback.words}"
-                   if feedback.action == "tell" else feedback.words)
+        heading = {the_list.ReportVerdict.NOT_FIXED: "Not fixed",
+                   "tell": "nate's words"}.get(feedback.action)
+        message = (f"{feedback.origin}: {heading} for item {item.number}\n{feedback.words}"
+                   if heading is not None else feedback.words)
         source = the_list.folder(delivery.keeper) / f"{item.id}.md"
         key = change_page.review_delivery_key(source, item.id, feedback.request)
-        recipient = feedback.recipient_id(delivery.keeper)
-        failures = change_page.send_with_retries(change_page.SENDER, (recipient,), message,
-                                                 tries, settings.number("delivery_pause_seconds"), key=key)
+        recipients = feedback.recipient_ids(delivery.keeper)
+        repair = feedback.action is the_list.ReportVerdict.NOT_FIXED
+        confirm = repair or feedback.studio_save_notice
+        failures = change_page.send_with_retries(change_page.SENDER, recipients, message,
+                                                 tries, settings.number("delivery_pause_seconds"), key=key,
+                                                 confirm=confirm)
+        if (repair or feedback.studio_save_notice and feedback.state == "alerted") and any(
+                isinstance(failure, change_page.UnconfirmedDelivery) for failure in failures):
+            return feedback
+        if isinstance(delivery, review_actions.StudioNoticeDelivery):
+            row = f"{item.id}/Studio/{feedback.request}"
+            page = change_page.ReviewPage(source, source.parent, (row,), "")
+            saved = change_page.MessageDelivery(page, row, recipients, message, feedback.request)
+            status = delivery.alert_status
+            if failures:
+                outcome = change_page.FailedDelivery(feedback.request, source, item.id, failures[-1].error)
+                if feedback.state == "alerted":
+                    return feedback
+                owner = None if isinstance(item.owner, the_list.UnassignedOwner) else item.owner
+                alerted = status.alert_studio_failure(saved, failures, tries, item_owner=owner,
+                                                      title="List feedback needs attention")
+                if alerted:
+                    members = staff.snapshot()
+                    names = [member.name if (member := members.by_id(target)) else target for target in alerted]
+                    return replace(feedback, state="alerted", alerted_to=", ".join(names))
+                return feedback
+            if status.closeout_path(page, row).exists():
+                with status.locked():
+                    status.record_result_locked(saved, change_page.NO_FAILED_DELIVERY)
         if not failures:
             outcome = change_page.DeliveryConfirmed()
-            return replace(feedback, state="sent")
+            return replace(feedback, state="sent", alerted_to="")
         outcome = change_page.FailedDelivery(feedback.request, source, item.id, failures[-1].error)
-        owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id != recipient)
+        owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id not in recipients)
         reached = change_page.alert_delivery_failures(failures, tries, source=source, row=item.id, message=message,
             recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
         return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
     the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
+    if outcome is unconfirmed:
+        item = the_list.load(delivery.keeper, delivery.identity)
+        feedback = the_list.feedback_requests(item).get(delivery.request)
+        if feedback is not None:
+            repair = feedback.action is the_list.ReportVerdict.NOT_FIXED
+            if repair or feedback.studio_save_notice:
+                if feedback.state == "sent":
+                    return change_page.DeliveryConfirmed()
+                if feedback.state == "alerted":
+                    source = the_list.folder(delivery.keeper) / f"{item.id}.md"
+                    reason = ("The owner or producer did not receive Not fixed." if repair
+                              else "The owner did not receive the Studio notice.")
+                    return change_page.FailedDelivery(feedback.request, source, item.id, reason)
     return outcome
 
 
@@ -1468,7 +2090,7 @@ def _remove_unheld_go(ledger: Path, keeper: staff.StaffId, identity: str, go_id:
     return True
 
 
-def save_go(root: Path, ledger: Path, body: str, client: str, *, views: Mapping[str, ListView],
+def save_go(root: Path, ledger: Path, body: str, client: str, *,
             review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK
             ) -> tuple[str, SavedActionState | None]:
     """Write the ledger record, then close the ask with its go id."""
@@ -1492,13 +2114,8 @@ def save_go(root: Path, ledger: Path, body: str, client: str, *, views: Mapping[
                 raise GoSavedUnsent(str(error)) from error
             raise
     try:
-        page_path = urlsplit(page).path
-    except ValueError:
-        page_path = PAGE_PATH
-    view = views.get(page_path, LIST_VIEW)
-    try:
         state = action_state(keeper, edit.item, review_records=review_records, include_detail=True,
-                             top_priority=view.top_priority)
+                             top_priority=TopPriority.SHOWN)
     except Exception as error:
         print(f"review-links List Go {identity}: {error}", file=sys.stderr)
         return entry["go_id"], None
@@ -1523,7 +2140,7 @@ def deliver_go(ledger: Path, go_id: str) -> None:
     settings = conf.read("review_links")
     tries = settings.whole("delivery_tries")
     pause = settings.number("delivery_pause_seconds")
-    message = go_ledger.message(item, ask, go_id, target.name if target is not None else ask.target)
+    message = go_ledger.message(item, ask, entry, target.name if target is not None else ask.target)
     source = the_list.folder(keeper) / f"{item.id}.md"
     key = change_page.review_delivery_key(source, item.id, go_id)
     next_step = the_list.go_next_step_request(go_id)
@@ -1590,13 +2207,17 @@ def _go_sends_notice(ledger: Path, keeper: staff.StaffId, feedback: the_list.Pag
     return entry["sent"].get(feedback.recipient_id(keeper)) is False
 
 
-def recover_pending(ledger: Path) -> None:
+def recover_pending(ledger: Path, *, send_notice: Callable[[ListFeedbackDelivery], object] = deliver) -> None:
     """Retry each pending request once at server start; leave a Go's next-step notice to the Go path."""
+    status = change_page.DeliveryStatus(ledger)
     for entry in records(include_closed=True):
         for feedback in the_list.feedback_requests(entry.item).values():
-            if feedback.state == "pending" and not _go_sends_notice(ledger, entry.keeper, feedback):
+            if (feedback.state == "pending" or (feedback.state == "alerted" and feedback.studio_save_notice)
+                    ) and not _go_sends_notice(ledger, entry.keeper, feedback):
                 try:
-                    deliver(ListFeedbackDelivery(entry.keeper, entry.item.id, feedback.request))
+                    delivery = _notice_delivery(entry.keeper, entry.item, feedback.request, status)
+                    if isinstance(delivery, ListFeedbackDelivery):
+                        _ = send_notice(delivery)
                 except (OSError, ValueError) as error:
                     print(f"List feedback recovery {entry.key}: {error}", file=sys.stderr)
 
@@ -1679,7 +2300,8 @@ class ListQuery:
     reveal: bool
 
     @classmethod
-    def read(cls, query: str, items: list[ListRecord], producers: set[the_list.ItemOwner]) -> ListQuery:
+    def read(cls, query: str, items: list[ListRecord], producers: set[the_list.ItemOwner],
+             aliases: Mapping[str, str]) -> ListQuery:
         fields = {name: values for name, values in parse_qs(query, keep_blank_values=True).items()
                   if name in record_table.LIST_QUERY_FIELDS}
 
@@ -1689,12 +2311,13 @@ class ListQuery:
         raw_show = first("show")
         if raw_show == UNREAD_FIELD:
             fields[UNREAD_FIELD] = [UNREAD_VALUE]
-        aliases = SHOW_ALIASES.get(raw_show, SHOW_ALIASES["*"])
-        show = aliases.get(first("state"), aliases.get("", raw_show))
+        show_aliases = SHOW_ALIASES.get(raw_show, SHOW_ALIASES["*"])
+        show = show_aliases.get(first("state"), show_aliases.get("", raw_show))
         owner = next((value for key in record_table.OWNER_QUERY_KEYS if (value := first(key))), "")
         producer = first("producer")
-        keys = frozenset(fields.get("key", ()))
-        item = first("item")
+        keys = frozenset(aliases.get(key, key) for key in fields.get("key", ()))
+        linked = first("item")
+        item = aliases.get(linked, linked)
         if keys and item:
             if any(entry.key == item for entry in items):
                 keys |= {item}
@@ -1710,7 +2333,7 @@ class ListQuery:
         item = entry.item
         if self.keys and entry.key not in self.keys:
             return False
-        if self.unread and str(isinstance(item.unread_since, datetime)).lower() != UNREAD_MATCH:
+        if self.unread and str(isinstance(item.unread_at, datetime)).lower() != UNREAD_MATCH:
             return False
         if search:
             search_values = {"number": str(item.number), "ownerName": text.owner, "title": text.title,
@@ -1725,51 +2348,12 @@ class ListQuery:
         if self.item != entry.key:
             return False
         values = {"openQuestion": str(open_question).lower(),
-                  UNREAD_FIELD: str(isinstance(entry.item.unread_since, datetime)).lower()}
+                  UNREAD_FIELD: str(isinstance(entry.item.unread_at, datetime)).lower()}
         active = {UNREAD_FIELD: self.unread}
         return self.reveal or any((not filter_name or active[filter_name]) and values[field] == value
                                   for field, value, filter_name in LINK_REVEAL_FIELDS)
 
 
-type ProducerControl = Callable[[Iterable[record_table.Chip], str], str]
-
-
-def producer_chip_row(chips: Iterable[record_table.Chip], selected: str, *, label_html: str = '') -> str:
-    """Render the Producer chips."""
-    return record_table.chip_row(FIELD_LABELS["producer"], chips, selected, encode_values=True, label_html=label_html)
-
-
-class ProducerPlacement(Enum):
-    """Where a List view puts its Producer control."""
-
-    ABOVE_FILTERS = "above the filters"
-    BESIDE_WORDS = "beside the words box"
-
-
-@dataclass(frozen=True)
-class ListView:
-    """The page around the List rows: its names, its path, its style, its Producer control and its top items."""
-
-    title: str
-    log_name: str
-    path: str
-    style: str
-    producer: ProducerControl
-    placement: ProducerPlacement
-    top_priority: TopPriority
-
-    def producer_ids(self, members: staff.StaffSnapshot,
-                     with_items: Iterable[the_list.ItemOwner]) -> set[the_list.ItemOwner]:
-        """Include active producers without items when the view shows picture tabs."""
-        producers = set(with_items)
-        if self.placement is ProducerPlacement.ABOVE_FILTERS:
-            producers.update(row.id for row in staff.active(members, "producer")
-                             if not isinstance(row.retirement, staff.RetiredProducer))
-        return producers
-
-
-LIST_VIEW = ListView("The List", "list", PAGE_PATH, '', producer_chip_row, ProducerPlacement.BESIDE_WORDS,
-                     TopPriority.HIDDEN)
 TOP_LABEL = '<span class="list-top-label">' + TOP_FLAG + 'Top priority</span>'
 NO_TOP_ITEM = ('<div class="list-top-what"><b>No top priority item</b>'
                + '<div class="list-top-next">Open an item and click "Make top priority".</div></div>')
@@ -1797,11 +2381,11 @@ def top_bands(top_items: Iterable[ListRecord], today: datetime, names: staff_nam
         item = entry.item
         value = f"staff:{item.producer}"
         values.append(css_string(value))
-        bands.append(top_band(value, f'<div class="list-top-what"><b>#{item.number} {html.escape(item.title)}</b>'
+        bands.append(top_band(value, '<div class="list-top-what">'
+                              + titled_item_link(entry)
                               + '<div class="list-top-next">' + field_html("next_step", item.next_step, today, names)
                               + '</div></div>'
-                              + f'<div class="list-top-meta"><span class="list-state {STATE_TONES.get(item.state, "muted")}">'
-                              + html.escape(item.state.value) + '</span>'
+                              + '<div class="list-top-meta">' + state_badge(item.state)
                               + '<small>ETA ' + html.escape(eta_cell_text(item.eta, today)) + '</small></div>'))
     chip = '[data-list]:has([data-filter-row="producer"] [aria-pressed="true"]'
     rules = ['.list-top-band{display:none}',
@@ -1814,22 +2398,29 @@ def top_bands(top_items: Iterable[ListRecord], today: datetime, names: staff_nam
 
 def render(root: Path, *, include_counts: bool = True, defer_counts: bool = False,
            status: change_page.DeliveryStatus | Literal["standalone"] = "standalone",
-           review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK, query: str = "",
-           view: ListView = LIST_VIEW) -> bytes:
+           review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK, query: str = "") -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
-    items: list[ListRecord] = []
-    closed_keys: list[str] = []
-    for entry in records(include_closed=True):
-        if entry.item.state == the_list.ItemState.CLOSED:
-            closed_keys.append(entry.key)
-        else:
-            items.append(entry)
+    folder_aliases: dict[Path, list[staff.StaffId]] = {}
+    snapshot = records(include_closed=True, aliases=folder_aliases)
+    shared_folders = {keeper: keepers for keepers in folder_aliases.values() if len(keepers) > 1
+                      for keeper in keepers}
+    aliases = {f"{alias}/{entry.item.id}": entry.key for entry in snapshot
+               for alias in shared_folders.get(entry.keeper, ()) if alias != entry.keeper}
+    closed = [entry for entry in snapshot if entry.item.state is the_list.ItemState.CLOSED
+              and not (isinstance(entry.item.native_question, the_list.NativeQuestionItem)
+                       and the_list.unread_answer_ids(entry.item))]
+    hidden_closed_keys = {entry.key for entry in closed}
+    items = [entry for entry in snapshot if entry.key not in hidden_closed_keys]
+    targets = {(the_list.list_folder_identity(entry.keeper), number)
+               for entry in snapshot if entry.item.related_to for number in entry.item.related_to}
+    linked_records = {key: entry for entry in snapshot
+                      if targets and (key := the_list.destination_key(entry.destination)) in targets}
     if status == "standalone":
         status = change_page.DeliveryStatus(root)
     reviews: ReviewDisplay = {}
-    if any(entry.item.reviews for entry in items):
+    if any(linked_review_keys(entry.item) for entry in items):
         reviews = (review_records if review_records is LinkedReviewRead.AFTER_RENDER
                    else linked_reviews(root, members, review_records, (entry.item for entry in items),
                                        defer_missing=include_counts and defer_counts))
@@ -1849,8 +2440,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                          if parked and isinstance(deadline := entry.item.parked_until, datetime)), default=None)
     deadline_attr = f' data-park-deadline="{park_deadline}"' if park_deadline is not None else ''
     secret = form_secret(root)
-    producers = view.producer_ids(members, (entry.item.producer for entry in items))
-    selection = ListQuery.read(query, items, producers)
+    producers = studio_page.producer_ids(members, (entry.item.producer for entry in items))
+    selection = ListQuery.read(query, items, producers, aliases)
     chip_totals: dict[str, Counter[str]] = {facet.name: Counter() for facet in FILTER_FACETS}
     search = normalize_search_text(selection.words.strip(QUERY_WHITESPACE))
     owners: set[the_list.ItemOwner] = set()
@@ -1859,6 +2450,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     deferred_links = False
     shown = 0
     top_items: list[ListRecord] = []
+    routing = the_list.ListQuestionRouting(members)
 
     @cache
     def owner_display(identity: the_list.ItemOwner) -> tuple[str, str, str]:
@@ -1870,7 +2462,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     for index, (entry, parked, schedule) in enumerate(ordered_items):
         scheduled = not isinstance(schedule, the_list.NoSchedule)
         owners.add(entry.item.owner)
-        mark = top_priority_mark(view.top_priority, members, entry.item)
+        mark = top_priority_mark(TopPriority.SHOWN, members, entry.item)
         if mark is TopPriorityMark.TOP_ITEM:
             top_items.append(entry)
         open_question = not scheduled and the_list.has_open_question(entry.item)
@@ -1879,6 +2471,9 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         unread_answers = the_list.unread_answer_ids(entry.item)
         open_ask = bool(the_list.answerable_asks(entry.item, members))
         chip = list_chip(entry.item.state, parked=parked, open_question=open_question, open_ask=open_ask,
+                         open_followup=the_list.has_open_followup(entry.item),
+                         report=isinstance(entry.item.report, the_list.ListReport),
+                         question_item=the_list.question_item(entry.item) is not the_list.NoQuestionItem.ORDINARY,
                          unread_delivery=the_list.unread_delivery(entry.item), unread_answer=bool(unread_answers))
         owner_cell, owner_sort, owner_search = owner_display(entry.item.owner)
         search_text = SearchText(owner_search, normalize_search_text(entry.item.title),
@@ -1889,7 +2484,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         linked = not visible and selection.reveals(entry, open_question)
         shown += visible
         row_reviews = reviews
-        if entry.item.reviews and (
+        if linked_review_keys(entry.item) and (
             reviews is LinkedReviewRead.AFTER_RENDER
             or (include_counts and defer_counts and review_records is not LinkedReviewRead.FROM_DISK
                 and not has_all_linked_reviews(entry.item, reviews))
@@ -1898,11 +2493,21 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             deferred_links = True
         row = item_rows(entry, names, today, index, secret, row_reviews, owner_cell=owner_cell, owner_sort=owner_sort,
                         search_text=search_text, parked=parked, open_question=open_question, open_ask=open_ask, visibility=visibility,
-                        unread_answers=unread_answers, schedule=schedule, mark=mark, hidden=not (visible or linked))
+                        unread_answers=unread_answers, schedule=schedule, mark=mark, routing=routing,
+                        hidden=not (visible or linked), linked_items=linked_items_html(entry, linked_records))
         if linked:
             linked_row = row
         else:
             rows.append(row)
+    for index, entry in enumerate(closed, start=len(items)):
+        if the_list.destination_key(entry.destination) in linked_records:
+            owner_cell, owner_sort, owner_search = owner_display(entry.item.owner)
+            rows.append(item_rows(
+                entry, names, today, index, secret, {}, owner_cell=owner_cell, owner_sort=owner_sort,
+                search_text=SearchText(owner_search, normalize_search_text(entry.item.title), ""), parked=False,
+                open_question=False, open_ask=False, visibility=the_list.QuestionAttention(), unread_answers=frozenset(),
+                schedule=the_list.NoSchedule.UNSET, mark=TopPriorityMark.HIDDEN, routing=routing, hidden=True,
+                linked_items=linked_items_html(entry, linked_records)))
     shows = [record_table.Chip(chip.value, chip.label, chip_totals["show"][chip])
              for chip in ListChip]
     owner_chips = staff_chips(members, owners, chip_totals["owner"])
@@ -1940,35 +2545,32 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     if include_counts:
         if defer_counts:
             counts_query = COUNTS_AND_LINKS_QUERY if deferred_links else COUNTS_QUERY
-            counts = f'<div data-list-counts-url="{view.path}?{html.escape(counts_query)}"></div>'
+            counts = f'<div data-list-counts-url="{studio_page.PAGE_PATH}?{html.escape(counts_query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    producer_control = (producer_chip_row(producer_chips, producer_selected, label_html=colored_producer)
-                        if view.producer is producer_chip_row else view.producer(producer_chips, producer_selected))
-    action_path = f' data-list-path="{view.path}"' if view.path != PAGE_PATH else ''
-    content = (STYLE + view.style + page_frame.title(view.title, "list")
+    picture_row = ('<div class="studio-tab-row">'
+                   + studio_page.tabs(producer_chips, producer_selected)
+                   + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
+                   + '</div>')
+    content = (STYLE + studio_page.STYLE
                + '<p data-review-refresh-error role="status" hidden></p>'
-               + f'<div data-list{action_path} data-refresh-seconds="{seconds}"'
+               + f'<div data-list data-list-path="{studio_page.PAGE_PATH}" data-refresh-seconds="{seconds}"'
                + f' data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' data-park-retry-seconds="{park_retry}"' + deadline_attr
                + f' data-undo-enabled="{str(undo_enabled).lower()}"'
                + f' {card_motion.attributes()}'
-               + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
+               + f' data-item-aliases="{html.escape(json.dumps(aliases), quote=True)}"'
+               + f' data-closed-keys="{html.escape(json.dumps([entry.key for entry in closed]), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
-               + (producer_control if view.placement is ProducerPlacement.ABOVE_FILTERS else '')
-               + (top_bands(top_items, today, names) if view.top_priority is TopPriority.SHOWN else '')
+               + page_frame.title(studio_page.TITLE, "studio", frozen_controls=picture_row)
                + '<div data-record-filters>'
                + record_table.chip_row('Owner', owner_chips, owner_selected, encode_values=True)
-               + '<div class="list-producer-filter">'
-               + (producer_control if view.placement is ProducerPlacement.BESIDE_WORDS else '')
-               + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
-               + '</div>'
                + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, show_selected)
                + f'<label class="list-unread-switch"><input type="checkbox" role="switch" id="list-unread" value="{UNREAD_VALUE}"{check_unread}>'
                + 'Unread only</label></div>'
-               + '<p data-hidden-action-status role="status" hidden></p></div>'
-               + '</div>'
+               + '<p data-hidden-action-status role="status" hidden></p></div></div>'
+               + top_bands(top_items, today, names)
                + '<p data-missing-item role="status" hidden></p>'
                + '<template data-producer-answering-template>' + producer_answering_note(names) + '</template>'
                + '<div data-list-count role="status" aria-live="polite"></div>'
@@ -1980,11 +2582,13 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<thead><tr>' + linked_headers + '</tr></thead>' + linked_row + '</table></div></section>'
                + counts + '</div>'
                + page_frame.CONSOLE_DIALOG_ASSETS
-               + '<dialog data-list-review-dialog aria-label="Review card">'
-               + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
+               + '<dialog data-list-review-dialog aria-labelledby="list-review-title">'
+               + '<header class="list-review-heading"><h2 id="list-review-title"></h2>'
+               + '<button class="list-review-close" type="button" data-close autofocus>Close</button></header>'
+               + '<div class="list-table" data-list-linked-overlay hidden></div></dialog>'
                + record_table.render_inline_detail()
                + SCHEDULE_TEMPLATES + '<script>' + SCRIPT + '</script>')
-    return page_frame.rendered(change_page.document(content, view.title), started, read_at)
+    return page_frame.rendered(change_page.document(content, studio_page.TITLE), started, read_at)
 
 
 SCHEDULE_TEMPLATES = """
@@ -2041,26 +2645,36 @@ SCHEDULE_TEMPLATES = """
 """
 
 
-STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
+STYLE = (record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE
+         + review_page.SUBMISSION_EVIDENCE_STYLE + review_page.REVIEW_FORM_STYLE) + '''
 [data-list-review-dialog]{position:fixed;inset:0;margin:calc(var(--page-window-top,0px) + 16px) auto auto;
 width:min(1060px,calc(100% - 48px));
-max-width:none;max-height:none;padding:0;border:1px solid var(--line);border-radius:12px;
+max-width:none;max-height:calc(100dvh - 32px - var(--page-window-top,0px));padding:0;
+border:1px solid var(--line);border-radius:12px;
 background:var(--card);color:var(--ink);overflow:hidden;box-sizing:border-box}
-[data-list-review-dialog]::backdrop{background:rgb(0 0 0 / 90%);backdrop-filter:blur(3px)}
-.list-review-close{position:absolute;top:24px;right:24px;z-index:1;margin:0;min-height:32px;padding:4px 12px;
+[data-list-review-dialog][open]{display:flex;flex-direction:column}
+[data-list-review-dialog]::backdrop{background:#0007}
+.list-review-heading{display:flex;flex:none;align-items:flex-start;justify-content:space-between;gap:12px;
+padding:12px 24px;border-bottom:1px solid var(--line)}
+.list-review-heading h2{min-width:0;max-height:25dvh;overflow:auto;overflow-wrap:anywhere;
+margin:0;font-size:17px;line-height:32px}
+.list-review-close{flex:none;margin:0;min-height:32px;padding:4px 12px;
 font-size:13px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
+[data-list-linked-overlay]{min-height:0;overflow:auto;margin:0;border:0;border-radius:0}
+[data-list-linked-overlay] [data-list-item]{margin:0}
+[data-list-linked-overlay]>[role=status]{margin:0;padding:16px 24px}
+[data-list-review-dialog]:has([data-list-linked-overlay]:not([hidden])) .list-review-heading h2{
+position:absolute;clip-path:inset(50%);width:1px;height:1px;overflow:hidden;white-space:nowrap}
+[data-list-linked-overlay]:not([hidden]){flex:0 1 auto}
+[data-list-review-dialog]:has([data-list-linked-overlay]:not([hidden])) .list-review-close{margin-inline-start:auto}
 [data-list-review-dialog] iframe{display:block;width:100%;height:var(--review-card-height,15rem);
-max-height:calc(100dvh - 98px - var(--page-window-top,0px));border:0}
+min-height:0;border:0}
 :root:has([data-list-review-dialog][open]){overflow:hidden}
-:root:has([data-list-review-dialog][open]) [data-list]{opacity:.35}
 :root:has([data-list-review-dialog][open][data-fullscreen]){scrollbar-gutter:auto}
 [data-list-review-dialog][data-fullscreen]{width:100vw;height:calc(100dvh - var(--page-window-top,0px));border:0;
-border-radius:0;margin:var(--page-window-top,0px) 0 0}
-[data-list-review-dialog][data-fullscreen] iframe{height:100%;max-height:none}
+max-height:none;border-radius:0;margin:var(--page-window-top,0px) 0 0}
+[data-list-review-dialog][data-fullscreen] iframe{flex:1;height:0}
 [data-record-filters] .record-filter-row button{max-width:100%;overflow-wrap:anywhere}
-.list-producer-filter{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}
-.list-producer-filter .record-filter-row{flex:1 1 auto;min-width:0;max-width:100%;margin:0}
-.list-producer-filter .record-filter-words{flex:0 1 300px;min-width:0;margin:0 0 0 auto}
 .list-show-controls{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;margin-bottom:8px}
 .list-show-controls .record-filter-row{min-width:0;margin-bottom:0}
 .list-unread-switch{display:inline-flex;align-items:center;gap:7px;min-height:34px;color:var(--ink-2);
@@ -2095,12 +2709,32 @@ background:var(--ink-2);border-radius:50%}
 .list-next-step-column{width:var(--list-next-step-width,23%)}
 .list-owner-name{display:block;overflow-wrap:anywhere;hyphens:none}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
+.list-command{contain:inline-size}
+.list-command .code-block{margin:0}
+.list-command pre code{display:block;white-space:pre;overflow-wrap:normal;overflow-x:auto;
+scrollbar-width:thin;scrollbar-color:var(--ink-3) transparent}
 .list-item-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:16px}
 .list-item-fields section{grid-column:span 2}
 .list-item-fields :is(.list-field-state,.list-field-eta){grid-column:auto}
+.list-table .item-url{color:var(--accent);overflow-wrap:anywhere}
+.item-links ul{list-style:none;padding:0;margin:0 0 16px}
+.item-links li{padding:6px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}
+.item-links li:first-child{padding-top:0;border-top:0}
+[data-linked-items]>ul{display:grid;grid-template-columns:minmax(0,1fr) max-content;column-gap:12px}
+[data-linked-items]>ul>li{display:grid;grid-column:1/-1;grid-template-columns:subgrid;align-items:start;justify-items:start;padding-inline-end:8px}
+.item-links .item-link-label{color:var(--accent);font-weight:600;text-decoration:none}
+.item-links .item-link-label:is(:hover,:focus-visible){text-decoration:underline}
+a.list-top-link{color:var(--accent);overflow-wrap:anywhere;text-decoration:underline}
+.item-link-field{color:var(--ink-2);margin-inline-start:8px}
+.item-link-address{display:block;color:var(--ink-3);font-size:12px;margin-top:2px}
 .list-actions{position:relative}
 :is(.list-tell,.list-actions,.list-parking-actions)>button,.list-park [data-later-toggle]{
  border:1px solid var(--ink-3);border-radius:8px;background:var(--card);color:var(--ink);cursor:pointer
+}
+[data-list-item][data-parked]:not([data-parked="false"])
+ [data-feedback-form]:not([data-waiting-actions]):has([value="read"]):has([value="top"])
+ :is(.list-actions:not(.list-repair-actions)>button,.list-parking-actions>button,.list-park [data-later-toggle]){
+ padding-inline:8px
 }
 .list-tell>[data-send-status]:empty{display:none}
 .list-ask{border:1px solid var(--warning);border-radius:8px;padding:12px 14px;margin:0 0 12px}
@@ -2120,6 +2754,7 @@ font-weight:600;cursor:pointer}
  transform:translate(var(--list-picker-x,0px),var(--list-picker-y,0px))}
 .list-park [data-later-menu] [data-later-preset]{display:block;width:calc(50% - 12px);margin:6px 6px 4px}
 .list-park [data-later-custom]:not([hidden]){display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px 12px;align-items:start}
+.list-park[data-park-only] [data-later-custom]:not([hidden]){grid-template-columns:minmax(0,1fr)}
 .list-park .later-save{grid-column:1 / -1}
 .list-schedule-fields{display:grid;gap:6px;min-width:0}
 .list-schedule-fields small{color:var(--ink-2)}
@@ -2173,6 +2808,13 @@ font-weight:600;cursor:pointer}
 .list-log .log-evidence div{white-space:pre-wrap}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 .page-question time{color:var(--ink-3);font-size:13px}
+.page-question[data-studio-question-card]{padding-block:8px 16px;border-bottom:1px solid var(--line)}
+[data-studio-question-card] [data-review-form]{margin-top:12px}
+[data-studio-question-card] .review-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+[data-studio-question-card] .review-actions>.later-menu{margin-inline-start:auto}
+[data-studio-question-card] [data-review-body] h2{font-size:14px;margin:12px 0 4px}
+[data-studio-question-card] .question-choices{display:grid;gap:4px;border:0;margin:12px 0;padding:0}
+[data-studio-question-card] .question-choices label{display:flex;gap:8px;align-items:baseline}
 .list-table small[data-new-answer]{color:var(--accent)}
 .page-question .question-unread{margin-inline-start:6px;color:var(--accent);text-transform:none}
 .list-panel:has([data-waiting-note]){min-height:12rem}
@@ -2202,7 +2844,7 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 # Use the Python case-folding table for browser search.
 SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + record_table.SCRIPT
           + review_legacy.SHOW_ALIAS_SCRIPT
-          + record_table.DATE_TIME_SCRIPT + '''(() => {
+          + record_table.DATE_TIME_SCRIPT + review_page.REVIEW_FORM_SCRIPT + '''(() => {
 ''' + question_path.queue_script() + '''
 const queuesByState=''' + json.dumps(QUEUE_BY_STATE) + ''';
 const chipsByQueue=''' + json.dumps(CHIP_BY_QUEUE) + ''';
@@ -2221,19 +2863,40 @@ for(const [start,end,step,offset] of foldRanges)
  for(let point=start;point<=end;point+=step) searchCaseFold[point]=String.fromCodePoint(point+offset);
 const normalizeWords=words=>words.trim().replace(/\r\n?/g,'\n').replace(/\0/g,'\ufffd')
  .replace(/[A-Z\u0080-\u{10ffff}]/gu,character=>searchCaseFold[character.codePointAt(0)] ?? character);
+const repairWordWhitespace=''' + json.dumps(the_list.REPORT_WORD_WHITESPACE) + r''';
+function normalizeRepairWords(words){
+ let start=0,end=words.length;
+ while(start<end && repairWordWhitespace.includes(words[start])) start++;
+ while(end>start && repairWordWhitespace.includes(words[end-1])) end--;
+ return words.slice(start,end);
+}
 const searchFields=Object.entries(''' + json.dumps(SEARCH_FIELDS) + r''').map(([field,pattern])=>
  [field,pattern && new RegExp(pattern)]);
 const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + r''';
 const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
+const questionNeedsRead=data=>data.questionItem!==undefined &&
+ (data.state==='Answered' || data.unreadAnswer==='true');
 const chipFor=data=>{
- if(data.state==='Closed' || data.undoPending==='true' || data.sendHeld!==undefined) return;
+ if(data.undoPending==='true' || data.sendHeld!==undefined) return;
+ if(data.openFollowup==='true') return 'questions';
+ if(questionNeedsRead(data)) return 'answers';
+ if(data.state==='Closed') return;
+ if(data.state==='Repaired') return 'needs-me';
  if(data.state==='Scheduled') return 'scheduled';
  const parked=isParked(data);
- return chipsByQueue[questionQueue(queuesByState[data.state],data.openAsk==='true' || data.unread==='true' && data.unreadAnswer==='true',
+ if(data.questionItem!==undefined && !parked){
+  if(data.state==='Waiting for nate') return 'questions';
+  if(data.state==='Working') return 'working';
+ }
+ const queue=data.report && data.state==='Delivered' ? queuesByState.Done : queuesByState[data.state];
+ return chipsByQueue[questionQueue(queue,data.openAsk==='true' || data.unread==='true' && data.unreadAnswer==='true',
   parked,data.unreadDelivery==='true',data.openQuestion==='true')];
 };
 let content=document.querySelector('[data-list]');
+const listAliases=new WeakMap();
+function resolveListKey(list,key){return listAliases.get(list)?.get(key) ?? key;}
 function decodeListKeys(list){
+ listAliases.set(list,new Map(Object.entries(JSON.parse(list.dataset.itemAliases || '{}'))));
  for(const row of list.querySelectorAll('[data-list-item][data-key*="%"]'))
   row.dataset.key=decodeURIComponent(row.dataset.key);
 }
@@ -2249,7 +2912,7 @@ function startListSave(){
 }
 function refreshAfterListSave(needed){
  refreshNeeded ||= needed;
- if(saving) return;
+ if(saving || activeListCard) return;
  if(savedReviews.size) void refreshSavedReview();
  else if(refreshNeeded || parkExpiryOwed) void pageRefresh.refresh(true);
 }
@@ -2285,6 +2948,133 @@ function scheduleParkExpiry({readAt},requestStarted){
  schedule();
 }
 const drafts=new Map();
+const repairRequests=(()=>{
+ const records=new Map(),active=new Set();
+ const namespace=location.origin+'/console/list-not-fixed-v1/';
+ const storageError='The browser cannot store Not fixed. Check browser storage and try again.';
+ let readable=true;
+ function restore(key,serialized){
+  if(serialized===null){records.delete(key);return;}
+  const record=JSON.parse(serialized);
+  if(typeof record?.payload?.body!=='string' || typeof record.payload.request!=='string' ||
+     !/^[a-f0-9]{24}$/.test(record.hold) || typeof record.draft?.words!=='string') throw new Error(storageError);
+  records.set(key,record);
+  if(!drafts.has(key)) drafts.set(key,record.draft);
+ }
+ try{
+  for(const name of Object.keys(sessionStorage)){
+   if(name.startsWith(namespace)) restore(name.slice(namespace.length),sessionStorage.getItem(name));
+  }
+ }catch{readable=false;}
+ addEventListener('storage',event=>{
+  if(!event.key?.startsWith(namespace)) return;
+  try{restore(event.key.slice(namespace.length),event.newValue);}catch{readable=false;}
+  recordDetails(tableView.openItem)?.querySelector('[data-feedback-form]')?.syncRepair?.();
+ });
+ function stored(key){
+  try{restore(key,sessionStorage.getItem(namespace+key));}catch{throw new Error(storageError);}
+  return records.get(key);
+ }
+ function save(key,record){
+  try{
+   if(!readable) throw new Error(storageError);
+   sessionStorage.setItem(namespace+key,JSON.stringify(record));
+  }catch{throw new Error(storageError);}
+  records.set(key,record);
+ }
+ function rememberDraft(key,draft){
+  const record=records.has(key) ? stored(key) : undefined;
+  if(record && (draft.stamp!==record.draft.stamp || draft.words!==record.draft.words || draft.until!==record.draft.until))
+   save(key,{...record,draft:{words:draft.words,until:draft.until,stamp:draft.stamp}});
+ }
+ function update(key,id,changes){
+  const record=stored(key);
+  if(record?.payload.request===id) save(key,{...record,...changes});
+ }
+ function complete(key,id,delivered){
+  const record=stored(key);
+  if(record?.payload.request!==id) return false;
+  try{sessionStorage.removeItem(namespace+key);}catch{throw new Error(storageError);}
+  records.delete(key);
+  const draft=drafts.get(key);
+  const clearDraft=delivered && draft?.stamp===record.payload.stamp && draft.words===record.payload.words;
+  if(clearDraft)
+   drafts.set(key,{...draft,words:''});
+  return clearDraft;
+ }
+ function begin(key,body,receiver,draft){
+  const existing=stored(key);
+  const draftFields={words:draft.words,until:draft.until,stamp:draft.stamp};
+  if(existing){save(key,{...existing,draft:draftFields});return {payload:existing.payload,resume:true};}
+  const payload={request:body.get('request'),body:body.toString(),receiver,words:draft.words,stamp:draft.stamp};
+  save(key,{payload,hold:heldFetch.newId(),undoEndsRequest:true,accepted:false,draft:draftFields});
+  return {payload,resume:false};
+ }
+ async function send(key,url,hold,resume){
+  const record=records.get(key),id=record.payload.request;
+  if(active.has(key)) throw new Error('This Not fixed request is still sending.');
+  active.add(key);
+  let holdId=record.hold,undoEndsRequest=record.undoEndsRequest,accepted=record.accepted;
+  const body=new URLSearchParams(record.payload.body);
+  const receiptState=result=>result?.not_fixed_receipt?.request===id ? result.not_fixed_receipt.state : '';
+  function accept(){
+   if(!accepted){update(key,id,{accepted:true});accepted=true;}
+  }
+  async function reply(response){
+   const result=await response.json().catch(()=>null);
+   const state=receiptState(result);
+   if(response.ok && (state==='accepted' || state==='delivered')){
+    accept();
+    const delivered=state==='delivered' && !result.send_failure && !result.delivery_pending;
+    return {result,delivered,clearDraft:delivered && complete(key,id,true)};
+   }
+   if(response.status===400 && state==='refused' && !accepted){
+    complete(key,id,false);
+    return {refusal:result.reason};
+   }
+   return {error:result?.reason || 'The Not fixed result is unavailable.'};
+  }
+  try{
+   if(resume){
+    let missing=false;
+    if(!accepted){
+     try{
+      const previous=await heldFetch.resume(holdId);
+      const outcome=await reply(previous);
+      if(outcome.delivered || outcome.refusal) return outcome;
+      missing=previous.status===404 && previous.headers.get('X-Send-Hold-Outcome')==='missing';
+     }catch(error){
+      if(!(error instanceof SendUndone) || undoEndsRequest) throw error;
+     }
+    }
+    const query=new URLSearchParams({'item-state':body.get('id'),keeper:body.get('keeper'),'not-fixed-request':id});
+    const current=await fetch(url+'?'+query,{cache:'no-store',signal:AbortSignal.timeout(30000)})
+     .then(response=>response.ok ? response.json() : null).catch(()=>null);
+    const state=receiptState(current);
+    if(state==='delivered'){
+     return {result:current,delivered:true,clearDraft:complete(key,id,true)};
+    }
+    if(state==='accepted') accept();
+    if(!accepted){
+     if(state!=='absent') throw new Error('The Not fixed receipt is unavailable.');
+     if(!missing) holdId=heldFetch.newId();
+     undoEndsRequest=false;
+     update(key,id,{hold:holdId,undoEndsRequest});
+    }
+   }
+   const options={method:'POST',body,signal:AbortSignal.timeout(30000)};
+   const response=await (accepted ? fetch(url,options) : hold.post(url,options,record.payload.receiver,holdId));
+   return await reply(response);
+  }catch(error){
+   if(error instanceof SendUndone){
+    if(undoEndsRequest && !accepted){complete(key,id,false);throw error;}
+    throw new Error('Undo canceled this retry. The original send is unconfirmed.');
+   }
+   throw error;
+  }finally{active.delete(key);}
+ }
+ return {get:key=>records.get(key),sending:key=>active.has(key),begin,rememberDraft,send};
+})();
 const unparkMessages={
  cleared:'Unparked',
  cleared_newer_parking_active:'The original Unpark cleared parking. A newer parking time is active',
@@ -2321,51 +3111,172 @@ function syncUnread(item,form,unread,unreadSort){
  const update=item.querySelector('[data-label="Update"]'),dot=update.querySelector('.list-dot');
  const read=form?.querySelector('[value="read"]');
  const answerMark=update.querySelector('[data-new-answer]');
- if(unread && item.dataset.unreadAnswer==='true'){
+ if((unread || item.dataset.questionItem!==undefined) && item.dataset.unreadAnswer==='true'){
   if(!answerMark) update.insertAdjacentHTML('beforeend',newAnswerMarkup);
  }else answerMark?.remove();
  if(unread){
   update.querySelector('[aria-label="No unread update"]')?.remove();
   if(!dot){const mark=document.createElement('span');mark.className='list-dot';mark.setAttribute('role','img');
    mark.setAttribute('aria-label','Unread update');update.prepend(mark);}
-  if(!form) return;
-  const canRead=!form.hasAttribute('data-waiting-actions') ||
-   item.dataset.unreadDelivery==='true' || item.dataset.unreadAnswer==='true';
-  if(!canRead) read?.remove();
-  if(canRead && !read){
-   const button=document.createElement('button');button.name='action';button.value='read';
-   button.textContent='Mark read';button.disabled=Boolean(form.dataset.sending);
-   const remove=form.querySelector('[value="remove"]');
-   if(remove) remove.after(button);
-   else form.querySelector('.list-actions').prepend(button);
-  }
  }else{
-  dot?.remove();read?.remove();
+  dot?.remove();
   if(!update.querySelector('[aria-label="No unread update"]')){const empty=document.createElement('span');
    empty.setAttribute('aria-label','No unread update');empty.textContent='—';update.prepend(empty);}
  }
+ if(!form) return;
+ const canRead=item.dataset.questionItem!==undefined ? questionNeedsRead(item.dataset)
+  : unread && (!form.hasAttribute('data-waiting-actions') ||
+   item.dataset.unreadDelivery==='true' || item.dataset.unreadAnswer==='true');
+ if(!canRead) read?.remove();
+ if(canRead && !read){
+  const button=document.createElement('button');button.name='action';button.value='read';
+  button.textContent='Mark read';button.disabled=Boolean(form.dataset.sending);
+  const remove=form.querySelector('[value="remove"]');
+  if(remove) remove.after(button);
+  else form.querySelector('.list-actions,.list-tell')?.prepend(button);
+ }
 }
-function installListDetail(item){
-  const detail=recordDetails(item),form=detail.querySelector('[data-feedback-form]');
-  if(form && !form.retainDraft) bindFeedbackForm(form);
-  tableView.showDraftCopy(drafts.get(item.dataset.key)?.words,form?.elements.words?.type==='textarea');
+function installListDetail(item,view=tableView){
+  const detail=recordDetails(item),loading=detail.querySelector('[data-list-closed-loading]');
+  if(loading){void loadClosedListDetail(item,loading,view);return;}
+  const form=detail.querySelector('[data-feedback-form]');
+  if(form && !form.retainDraft) bindFeedbackForm(form,view);
+  for(const card of detail.querySelectorAll('[data-studio-question-card]')) if(!card.dataset.loaded) void loadStudioQuestion(item,card,view);
+  view.showDraftCopy(drafts.get(item.dataset.key)?.words,form?.elements.words?.type==='textarea');
 }
-function renderListDetail(revision,text,{retainLinks=false}={}){
+async function loadStudioQuestion(item,card,view){
+ if(card.dataset.loaded==='loading') return;
+ const session=view.openSession;
+ const current=()=>view.openItem===item && view.openSession===session && card.isConnected;
+ const query=new URLSearchParams({body:card.dataset.studioQuestionCard,view:'studio-inline',item:item.dataset.key});
+ const notice=card.querySelector('[data-send-status]');
+ card.dataset.loaded='loading';
+ try{
+  const response=await fetch(reviewPagePath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
+  if(!response.ok) throw new Error('The item is unavailable.');
+  const template=document.createElement('template');
+  template.innerHTML=await response.text();
+  const form=template.content.querySelector('[data-review-form]');
+  if(!form) throw new Error('The item is unavailable.');
+  if(!current()) return;
+  view.preserveRecordRowTop(()=>card.replaceChildren(template.content));
+  card.dataset.loaded='ready';
+  if(view!==tableView) nameOverlayFields(item);
+  bindStudioQuestion(item,card,form,view);
+  showActionFailure(card.querySelector('[data-send-status]'),view.actionNotice(item));
+ }catch(error){
+  if(current()) showActionFailure(notice,view.actionNotice(item) || error.message);
+ }finally{
+  if(card.dataset.loaded==='loading') delete card.dataset.loaded;
+ }
+}
+const studioLaterRequests=new Map();
+function bindStudioQuestion(item,card,form,view){
+ const showNotice=text=>showActionFailure(card.querySelector('[data-send-status]'),text);
+ const send=async(data,button)=>{
+  if(view.openItem!==item || cardSubmitBlocked(form,view.rowFading(item.dataset.key))) return;
+  const action=data.get('outcome'),key=item.dataset.key;
+  const draftKey=reviewFormKey(form),requestKey=JSON.stringify([key,draftKey]);
+  let laterRequest=studioLaterRequests.get(requestKey);
+  if(action==='later' && data.get('feedback').trim()){
+   const until=data.get('later'),preset=button.dataset.laterPreset;
+   const fields=new URLSearchParams(data);
+   // Use the preset name to find its original deadline.
+   if(preset) fields.set('later',preset);
+   const intent=fields.toString();
+   if(laterRequest?.intent!==intent){
+    laterRequest={intent,id:heldFetch.newId(),until};
+    studioLaterRequests.set(requestKey,laterRequest);
+   }
+   data.set('later',laterRequest.until);
+   data.set('request',laterRequest.id);
+  }
+  const clearLaterRequest=()=>{
+   if(studioLaterRequests.get(requestKey)===laterRequest) studioLaterRequests.delete(requestKey);
+  };
+  const submittedDraft=rememberReviewDraft(form);
+  const hold=holdCard(item,hidden=>{if(hidden) view.applyAction();});
+  const resultItem=view===tableView ? item : rowIn(content,key);
+  if(resultItem) tableView.startAction(resultItem);
+  if(view!==tableView) view.startAction(item);
+  let saved=false;
+  startListSave();
+  showNotice('');
+  await saveReviewAction(data,{
+   url:reviewPagePath,hold,button,saveOnly:true,
+   sending:()=>setCardSubmitting(form,true),
+   confirmedSave:()=>{
+    saved=true;
+    if(action==='later' || action==='answer') clearLaterRequest();
+    if(reviewDrafts.get(draftKey)===submittedDraft) reviewDrafts.delete(draftKey);
+   },
+   saved:()=>{},
+   refused:code=>{if(action==='later' && code==='parking-deadline-passed') clearLaterRequest();},
+   failed:reason=>showNotice('Not saved: '+reason),
+   undone:message=>{
+    if(action==='later') clearLaterRequest();
+    showNotice(message);form.elements.feedback.focus({preventScroll:true});
+   },
+   displayFailed:()=>showNotice('Saved; the item could not refresh.'),
+   recover:async reason=>{
+    await loadStudioQuestion(item,card,view);
+    if(card.isConnected) showNotice('Not saved: '+reason);
+   },
+   finished:()=>{
+    hold.restore();
+    saving--;
+    view.preserveRecordRowTop(()=>{
+     if(saved && (action==='answer' || action==='later')) view.closeCard(key,{focusShow:true});
+     else if(form.isConnected){setCardSubmitting(form,false);syncControls();}
+     view.applyAction();
+    });
+    if(saved && action==='question') void loadStudioQuestion(item,card,view);
+    refreshAfterListSave(saved);
+   },
+  });
+ };
+ const syncControls=bindReviewForm(form,{zone:()=>content.dataset.zone,settings:()=>JSON.parse(content.dataset.parking),send});
+}
+async function loadClosedListDetail(item,loading,view){
+ const session=view.openSession;
+ const current=()=>view.openItem===item && view.openSession===session && recordDetails(item).contains(loading);
+ const [keeper,id]=item.dataset.key.split('/');
+ const query=new URLSearchParams({'item-state':id,keeper});
+ loading.textContent='Loading the item…';
+ try{
+  const response=await fetch(actionPath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
+  if(!response.ok) throw new Error('The item is unavailable.');
+  const result=await response.json();
+  if(!result.detail_closed || typeof result.detail_html!=='string') throw new Error('The Closed detail is unavailable.');
+  if(current()){
+   view.updateItemDetail(item,detail=>replaceListDetail(detail,result.detail_html));
+   installListDetail(item,view);
+  }
+ }catch(_){
+  if(current()) loading.textContent='The item could not load. Close and open it to try again.';
+ }
+}
+function replaceListDetail(detail,text,{retainLinkedItems=true}={}){
+ const linked=retainLinkedItems ? detail.querySelector('[data-linked-items]') : null;
+ detail.innerHTML=text;
+ if(linked && !detail.querySelector('[data-linked-items]')) detail.querySelector('.list-item-fields')?.after(linked);
+}
+function renderListDetail(revision,text,{retainLinks=false,view=tableView}={}){
  return (row,detail)=>{
   const links=retainLinks ? detail.querySelector('[data-list-review-links]') : null;
   row.dataset.detailRevision=revision;
-  detail.innerHTML=text;
+  replaceListDetail(detail,text,{retainLinkedItems:revision.startsWith('action:')});
   if(links) detail.querySelector('[data-list-review-links]')?.replaceWith(links);
-  installListDetail(row);
+  installListDetail(row,view);
  };
 }
-function installSavedListDetail(request,revision,text,options){
- tableView.installOwnItemResult(request,revision,renderListDetail(revision,text,options));
+function installSavedListDetail(request,revision,text,options,view=tableView){
+ view.installOwnItemResult(request,revision,renderListDetail(revision,text,{...options,view}));
 }
-function presentListDetail(item,result){
+function presentListDetail(item,result,view=tableView){
  const revision=result.detail_revision,text=result.detail_html;
  if(revision && typeof text==='string')
-  tableView.presentItemRevision(item,revision,renderListDetail(revision,text,{retainLinks:true}));
+  view.presentItemRevision(item,revision,renderListDetail(revision,text,{retainLinks:true,view}));
 }
 const tableView=createRecordTable({content:()=>content,
  shows,
@@ -2403,10 +3314,19 @@ const tableView=createRecordTable({content:()=>content,
  itemRevision:item=>item.dataset.detailRevision,
  retainedDetailSlot:'[data-list-review-links]',
  detailInstalled:installListDetail,
- hasKey:key=>!closedKeys.has(key) && !!rowIn(content,key),
+ resolveItem:key=>resolveListKey(content,key),
+ hasKey:raw=>{
+  const key=resolveListKey(content,raw);
+  const row=rowIn(content,key);
+  if(!closedKeys.has(key)) return Boolean(row);
+  if(!row?.hasAttribute('data-linked-closed-item')) return false;
+  const place=recordPlaceParams();
+  return resolveListKey(content,place.get('item'))===key && place.get('reveal')==='1';
+ },
  revealLinked:(data,{filters})=>linkRevealFields.some(([field,value,filter])=>
   (!filter || filters[filter]) && (data[field] || 'false')===value),
- missingItem:key=>{
+ missingItem:raw=>{
+  const key=resolveListKey(content,raw);
   const number=key.match(/\/L([1-9]\d*)$/)?.[1];
   if(!number) return '';
   return 'Item #'+number+(closedKeys.has(key) ? ' is closed' : ' is not on the List');
@@ -2417,8 +3337,9 @@ const tableView=createRecordTable({content:()=>content,
  },
  filterFacets,
  counts:(items,count,{counts})=>{
-  const open=items.filter(item=>item.dataset.state!=='Closed');
-  return count+' of '+open.length+' items shown · '+(counts.show['needs-me'] ?? 0)+' need you · '+
+  const open=items.filter(item=>item.dataset.state!=='Closed' || questionNeedsRead(item.dataset));
+  const needYou=['needs-me','questions','answers'].reduce((total,chip)=>total+(counts.show[chip] ?? 0),0);
+  return count+' of '+open.length+' items shown · '+needYou+' need you · '+
    open.filter(item=>item.dataset.unread==='true').length+' unread';
  },
 });
@@ -2616,15 +3537,8 @@ function chooseScheduleScope(parent,{number,canEditFollowing,removing,parking,ch
   dialog.showModal();
  });
 }
-function bindScheduleFields(form,until,zone,draft,edit){
- const panel=form.querySelector('[data-schedule-template]').content.firstElementChild.cloneNode(true);
- const words=panel.querySelector('[data-schedule-words]'),select=panel.querySelector('[data-repeat]');
- const menu=form.querySelector('[data-later-menu]'),status=panel.querySelector('[data-schedule-status]');
- const picker=menu.querySelector('[data-later-custom]'),save=picker.querySelector('.later-save');
- const calendar=document.createElement('div');
- calendar.append(...[...picker.children].filter(child=>child!==save));
- picker.prepend(calendar);
- const anchor=menu.closest('.list-actions');
+function trackParkMenu(menu,onClose=()=>{}){
+ const anchor=menu.closest('.later-menu');
  const fitPicker=()=>{
   if(!menu.offsetWidth){pickerSize.disconnect();return;}
   const width=document.documentElement.clientWidth;
@@ -2637,7 +3551,7 @@ function bindScheduleFields(form,until,zone,draft,edit){
  };
  const pickerSize=new ResizeObserver(fitPicker);
  const observer=new MutationObserver(()=>{
-  if(menu.hidden){panel.remove();pickerSize.disconnect();}
+  if(menu.hidden){onClose();pickerSize.disconnect();}
   else{
    fitPicker();
    pickerSize.observe(anchor);
@@ -2645,6 +3559,16 @@ function bindScheduleFields(form,until,zone,draft,edit){
   }
  });
  observer.observe(menu,{attributes:true,attributeFilter:['hidden']});
+}
+function bindScheduleFields(form,until,zone,draft,edit){
+ const panel=form.querySelector('[data-schedule-template]').content.firstElementChild.cloneNode(true);
+ const words=panel.querySelector('[data-schedule-words]'),select=panel.querySelector('[data-repeat]');
+ const menu=form.querySelector('[data-later-menu]'),status=panel.querySelector('[data-schedule-status]');
+ const picker=menu.querySelector('[data-later-custom]'),save=picker.querySelector('.later-save');
+ const calendar=document.createElement('div');
+ calendar.append(...[...picker.children].filter(child=>child!==save));
+ picker.prepend(calendar);
+ trackParkMenu(menu,()=>panel.remove());
  const custom=panel.querySelector('[data-edit-custom]');
  const label=panel.querySelector('[data-repeat-field]');
  const {start='',rule='',repeatStart,repeatText,repeatZone,repeatOffset,revision}=panel.dataset;
@@ -2773,12 +3697,12 @@ function bindScheduleFields(form,until,zone,draft,edit){
   showError:message=>{status.textContent=message;},
  };
 }
-function bindFeedbackForm(form){
+function bindFeedbackForm(form,view=tableView){
   let item=recordFromDetail(form);
   const key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
   const unpark=form.querySelector('[value="unpark"]'),parkedDetail=form.querySelector('[data-parked-detail]');
-  showActionFailure(notice,tableView.actionNotice(item));
+  showActionFailure(notice,view.actionNotice(item));
   const waitingForm=form.hasAttribute('data-waiting-actions');
   const zone=content.dataset.zone;
   const confirmation=()=>({state:item.dataset.state,parked:item.dataset.parked,
@@ -2790,7 +3714,7 @@ function bindFeedbackForm(form){
    item.dataset.parked=confirmed.parked;
    item.dataset.unreadDelivery=confirmed.unreadDelivery;
    item.dataset.unreadAnswer=confirmed.unreadAnswer;
-   if(!metadataOnly) unpark.hidden=confirmed.state!=='Scheduled' && (!isParked(confirmed) || confirmed.state==='Closed');
+   if(!metadataOnly && unpark) unpark.hidden=confirmed.state!=='Scheduled' && (!isParked(confirmed) || confirmed.state==='Closed');
    syncUnread(item,metadataOnly ? null : form,confirmed.unread,confirmed.unreadSort);
   };
   const applySavedState=(result,{keepDetailFocus=false,hasDetail=false,metadataOnly=false}={})=>{
@@ -2802,7 +3726,7 @@ function bindFeedbackForm(form){
    if(typeof result.item_state==='string') confirmed.state=result.item_state;
    if(confirmed.state==='Closed'){
     closedKeys.add(key);
-    if(!metadataOnly) tableView.closeCard(key);
+    if(!metadataOnly) view.closeCard(key);
    }
    const unread=result.unread==='true';
    if(['true','false'].includes(result.parked))
@@ -2815,29 +3739,33 @@ function bindFeedbackForm(form){
    }
    syncConfirmed(metadataOnly);
    const state=item.querySelector('.list-state');state.textContent=item.dataset.state;
-   state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room',Scheduled:'scheduled'}[item.dataset.state] || 'muted');
+   state.className='list-state '+(''' + json.dumps(STATE_TONES) + r'''[item.dataset.state] || 'muted');
+   const stamp=item.querySelector('[data-list-state-time]');
+   if(stamp && typeof result.state_time_html==='string') stamp.innerHTML=result.state_time_html;
    const sortValues=JSON.parse(item.dataset.sortValues);sortValues[4]=item.dataset.state.toLowerCase();
    let scheduledNote=item.querySelector('[data-scheduled-note]');
    if(typeof result.scheduled_note==='string'){
     if(!scheduledNote){scheduledNote=document.createElement('small');scheduledNote.dataset.scheduledNote='';state.after(scheduledNote);}
     scheduledNote.textContent=result.scheduled_note;
    }else if(confirmed.state!=='Scheduled') scheduledNote?.remove();
-   if(typeof result.next_step_html==='string'){
+   if(Array.isArray(result.eta_sort)){
     const eta=item.querySelector('.list-eta');
     eta.title=result.eta_full;
     eta.querySelector('.list-eta-full').textContent=result.eta_full;
     eta.querySelector('.list-eta-text').textContent=result.eta_short;
     eta.classList.toggle('warning',!result.scheduled_note && confirmed.state!=='Closed' &&
      result.eta_sort[0]===0 && result.eta_sort[1]*1000<Date.now());
+    sortValues[6]=result.eta_sort;
+   }
+   if(typeof result.next_step_html==='string'){
     item.querySelector('[data-label="Next step"]').innerHTML=result.next_step_html;
     sortValues[5]=result.next_step_sort;
-    sortValues[6]=result.eta_sort;
    }
    item.dataset.sortValues=JSON.stringify(sortValues);
    if(typeof result.parked_until==='string'){
     let note=item.querySelector('[data-parked-note]');
     const text=result.parked_until ? 'Parked until '+result.parked_until : '';
-    if(!metadataOnly){
+    if(!metadataOnly && parkedDetail){
      parkedDetail.textContent=result.scheduled_note ?? text;
      parkedDetail.hidden=!parkedDetail.textContent;
     }
@@ -2847,9 +3775,10 @@ function bindFeedbackForm(form){
     }else note?.remove();
    }
    if(['true','false'].includes(result.open_question)) item.dataset.openQuestion=result.open_question;
+   if(['true','false'].includes(result.open_followup)) item.dataset.openFollowup=result.open_followup;
    if(['true','false'].includes(result.open_ask)) item.dataset.openAsk=result.open_ask;
    const questionNote=item.querySelector('[data-open-question-note]');
-   if(item.dataset.openQuestion==='true'){
+   if(item.dataset.openQuestion==='true' && item.dataset.openFollowup!=='true'){
     if(!questionNote) state.after(content.querySelector('[data-producer-answering-template]').content.cloneNode(true));
    }else questionNote?.remove();
    if(typeof result.check_html==='string'){
@@ -2866,7 +3795,7 @@ function bindFeedbackForm(form){
      const field=keepDetailFocus && listOwnsFocus() && detail.contains(document.activeElement)
       ? document.activeElement : null;
      const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
-     tableView.updateItemDetail(item,detail=>{detail.innerHTML=result.waiting_details_html;});
+     view.updateItemDetail(item,detail=>replaceListDetail(detail,result.waiting_details_html));
      if(reviewLink) restoreReviewLink(reviewLink);
      else if(field?.id && field!==unpark) document.getElementById(field.id)?.focus({preventScroll:true});
      return detail.querySelector('[data-feedback-form]');
@@ -2878,18 +3807,50 @@ function bindFeedbackForm(form){
   };
   const words=form.elements.words,until=form.elements.until;
   const tell=form.querySelector('[value="tell"]'),ask=form.querySelector('[value="question"]');
+  const notFixed=form.querySelector('[value="not works"]');
+  const repairReceiver=sendReceiver(notFixed);
+  const works=form.querySelector('[value="works"]'),repairActions=form.querySelector('.list-repair-actions');
   const syncTell=()=>{
-   if(!tell) return;
-   const name=matching('tell')?.recipientName ?? signed.recipientName;
-   const wordsLabel='Your words for '+name+' about this item';
-   tell.textContent='Tell '+name;
+   const repaired=item.dataset.state==='Repaired';
+   const retryRepair=repairRequests.get(key);
+   const canReject=Boolean(notFixed && (repaired || retryRepair));
+   if(repairActions) repairActions.hidden=!canReject;
+   if(works) works.hidden=!repaired || Boolean(retryRepair);
+   if(notFixed){
+    const name=retryRepair?.payload.receiver ?? repairReceiver;
+    if(name) notFixed.dataset.sendReceiver=name;
+    updateSendLabel(notFixed);
+    notFixed.disabled=!canReject || Boolean(form.dataset.sending) || repairRequests.sending(key) ||
+     (!retryRepair && !normalizeRepairWords(words.value));
+   }
+   if(!tell){
+    if(ask) ask.disabled=Boolean(form.dataset.sending) || !words.value.trim();
+    return;
+   }
+   const retry=matching('tell');
+   const name=retry?.receiver ?? signed.receiver;
+   const askRetry=matching('question','');
+   const askReceiver=askRetry ? askRetry.askReceiver : signed.askReceiver;
+   const split=signed.showAskName && askReceiver && askReceiver!==name;
+   const wordsLabel=canReject ? 'Your words about this repair' :
+    split ? 'Your words' : 'Your words for '+name+' about this item';
+   tell.textContent=retry?.tellLabel ?? signed.tellLabel;
+   tell.dataset.sendReceiver=name;
    words.placeholder=wordsLabel;
    words.setAttribute('aria-label',wordsLabel);
    tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();
-   if(ask) ask.disabled=tell.disabled;
+   if(ask){
+    ask.textContent=split ? 'Ask '+askReceiver : 'Ask question';
+    if(askReceiver==null) ask.removeAttribute('data-send-receiver');
+    else ask.dataset.sendReceiver=askReceiver;
+    updateSendLabel(ask);
+    ask.disabled=tell.disabled;
+   }
   };
   // Keep the signed update and recipient from the rendered form.
-  const signed={request:form.elements.request.value,token:form.elements.token.value,recipientName:form.dataset.recipientName};
+  const signed={request:form.elements.request.value,token:form.elements.token.value,receiver:sendReceiver(tell),
+   tellLabel:tell?.textContent,askReceiver:sendReceiver(ask),
+   showAskName:form.hasAttribute('data-studio-question')};
   let fresh=signed;
   const newRequest=()=>({
    ...signed,
@@ -2899,8 +3860,8 @@ function bindFeedbackForm(form){
   let draftStamp=draft?.stamp ?? 0;
   const unconfirmed=draft?.unconfirmed ?? new Set();
   const parkSettings=()=>JSON.parse(content.dataset.parking);
-  const edit=()=>{draftStamp++;retain();};
-  const scheduleEditor=waitingForm ? null : bindScheduleFields(form,until,zone,draft?.schedule,edit);
+  const edit=()=>{draftStamp++;retain();persistDraft();};
+  const scheduleEditor=form.querySelector('[data-schedule-template]') ? bindScheduleFields(form,until,zone,draft?.schedule,edit) : null;
   const matching=(action,scheduleKey)=>[...unconfirmed].findLast(attempt=>attempt.words===words.value &&
    (attempt.action==='park-until-delivered' || attempt.until===until.value) &&
    (scheduleKey===undefined || attempt.scheduleKey===scheduleKey) &&
@@ -2910,51 +3871,68 @@ function bindFeedbackForm(form){
   const retainDraft=()=>{
    if(retiredDraft) return;
    drafts.set(key,{words:waitingForm ? draft?.words ?? '' : words.value,
-    stamp:draftStamp,unconfirmed,schedule:waitingForm ? draft?.schedule : scheduleEditor.draft()});
+    stamp:draftStamp,unconfirmed,schedule:waitingForm ? draft?.schedule : scheduleEditor?.draft()});
    identity(matching() ?? fresh);
   };
   const retain=()=>{retainDraft();syncTell();};
   form.retainDraft=retainDraft;
+  form.syncRepair=syncTell;
   form.applySavedState=applySavedState;
   retain();
+  const persistDraft=()=>{
+   try{repairRequests.rememberDraft(key,drafts.get(key));}
+   catch(error){showActionFailure(notice,error.message);}
+  };
   words.addEventListener('input',edit);until.addEventListener('input',edit);
   const parkToggle=form.querySelector('[data-later-toggle]');
   const formatParkingTime=listPickerSummary(zone);
-  if(!waitingForm) bindDateTimePicker(form,{zone,settings:parkSettings,summaryPrefix:'',
+  if(scheduleEditor) bindDateTimePicker(form,{zone,settings:parkSettings,summaryPrefix:'',
    prepareMenu:scheduleEditor.attach,openCustom:scheduleEditor.scheduled,
    formatSummary:at=>(scheduleEditor.words() ? 'Starts ' : 'Parks until ')+formatParkingTime(at),
    retryTime:()=>Date.parse((scheduleEditor.words() ?
     [...unconfirmed].findLast(attempt=>attempt.action==='schedule' && attempt.until===until.value &&
       JSON.parse(attempt.scheduleKey).words===scheduleEditor.words()) : matching('park'))?.parkingTime ?? '')});
+  else if(parkToggle){
+   trackParkMenu(form.querySelector('[data-later-menu]'));
+   bindDateTimePicker(form,{zone,settings:parkSettings,summaryPrefix:'Parks until ',
+    formatSummary:formatParkingTime,retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
+  }
   form.addEventListener('submit',async event=>{
    event.preventDefault();
    const formKey=form.elements.keeper.value+'/'+form.elements.id.value;
    const current=recordFromDetail(form);
-   if(!tableView.canSubmit(form,formKey) || current!==tableView.openItem || !content.contains(current) ||
-    cardSubmitBlocked(form,tableView.rowFading(key))) return;
+   if(!view.canSubmit(form,formKey) || current!==view.openItem ||
+    cardSubmitBlocked(form,view.rowFading(key))) return;
    if(item!==current){item=current;confirmed=confirmation();}
    const submitter=event.submitter,buttonAction=submitter?.value || 'tell';
    const parkForDelivery=buttonAction==='park-until-delivered',preset=Boolean(submitter?.dataset.laterPreset);
    const parks=buttonAction==='park' || parkForDelivery || preset;
    const action=buttonAction==='park' && scheduleEditor?.words() ? 'schedule'
     : buttonAction==='unpark' && scheduleEditor?.scheduled ? 'unschedule' : preset ? 'park' : buttonAction;
+   const questionRead=action==='read' && current.dataset.questionItem!==undefined;
    const scheduleWrite=['schedule','unschedule','start-now'].includes(action);
    const parkingReceipt=parks || scheduleWrite;
    const changesParking=parks || action==='unpark' || scheduleWrite;
-   const closeSavedCard=()=>tableView.closeCard(key,{focusShow:parkForDelivery});
+   const closeSavedCard=()=>view.closeCard(key,{focusShow:parkForDelivery});
    const focusUnpark=buttonAction==='unpark' && document.activeElement===unpark;
-   const usesWords=action==='tell' || action==='question';
-   const saveAction=changesParking || action==='read' || action==='remove';
+   const rejectsRepair=action==='not works';
+   const usesWords=action==='tell' || action==='question' || rejectsRepair;
+   const saveAction=changesParking || action==='read' || action==='remove' || action==='works';
+   const readReceiver=questionRead && words.value.trim() ? form.dataset.readReceiver : null;
+   const receiver=readReceiver ?? sendReceiver(submitter ?? tell);
    const heldSave=saveAction && content.dataset.undoEnabled==='true';
    const asksQuestion=action==='question';
-   if(usesWords && !words.value.trim()) return;
+   const retryRepair=rejectsRepair && Boolean(repairRequests.get(key));
+   if(rejectsRepair && repairRequests.sending(key)) return;
+   const submittedWords=rejectsRepair ? normalizeRepairWords(words.value) : words.value.trim();
+   if(usesWords && !retryRepair && !submittedWords) return;
    if(parkForDelivery && scheduleEditor?.words()){
     scheduleEditor.showError('Clear the instruction to park until delivery.');return;
    }
    const schedule=scheduleEditor?.data(action);
    if(scheduleEditor?.repeating && (changesParking || action==='remove')){
     schedule.scope=action==='start-now' ? 'this' : await scheduleEditor.scope(action,schedule);
-    if(!schedule.scope || !tableView.canSubmit(form,formKey) || !form.isConnected) return;
+    if(!schedule.scope || !view.canSubmit(form,formKey) || !form.isConnected) return;
    }
    if(action==='schedule' && !scheduleEditor.applySeriesRepeat(schedule)) return;
    const scopedRemove=action==='remove' && Boolean(schedule?.scope);
@@ -2983,19 +3961,32 @@ function bindFeedbackForm(form){
     data.set('schedule_words',schedule.words);
     if(schedule.repeat!==undefined) data.set('repeat',schedule.repeat);
    }
-   if(!retry){if(!preset || parkForDelivery) unconfirmed.add(attempt);fresh=newRequest();}
+   let repair;
+   if(rejectsRepair){
+    data.set('words',submittedWords);
+    retainDraft();
+    try{repair=repairRequests.begin(key,data,receiver,drafts.get(key));}
+    catch(error){showActionFailure(notice,error.message);return;}
+   }
+   if(!retry){if(!rejectsRepair && (!preset || parkForDelivery)) unconfirmed.add(attempt);fresh=newRequest();}
    if(action==='park' || (action==='schedule' && schedule.startChanged)) scheduleEditor?.retainDate();
    retainDraft();
    const stampAtSubmit=draftStamp;
-   const clearConfirmedScheduleDraft=()=>{
-    if(!scheduleWrite && !schedule?.scope) return;
+   const clearConfirmedDraft=()=>{
+    const clearSchedule=scheduleWrite || Boolean(schedule?.scope);
+    const remove=action==='remove';
+    if(!clearSchedule && !remove) return;
     unconfirmed.delete(attempt);
     const latest=drafts.get(key);
     if(draftStamp!==stampAtSubmit || latest?.stamp!==stampAtSubmit) return;
-    drafts.set(key,{...latest,schedule:undefined});
+    const clearWords=remove && latest.words===attempt.words && words.value===attempt.words;
+    if(clearWords) words.value='';
+    drafts.set(key,{...latest,words:clearWords ? '' : latest.words,
+     schedule:clearSchedule ? undefined : latest.schedule});
     retiredDraft=true;
+    if(clearWords) persistDraft();
    };
-   const request=tableView.startItemRequest(key);
+   const request=view.startItemRequest(key);
    item.listRequest=request;
    startListSave();
    const hadFocus=asksQuestion && recordDetails(item).contains(document.activeElement);
@@ -3003,10 +3994,12 @@ function bindFeedbackForm(form){
    const trackFocus=event=>{if(event.target!==document.body) focusChoice=event.target;};
    if(hadFocus) document.addEventListener('focusin',trackFocus);
    let saved=false,refused=false,retried=false,stale=false,focusParkedAfterClose=false,focusDraft=false,nextForm;
-   const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
+   let repairDelivered=false;
+   const clearsUnread=action==='read' || usesWords && (!asksQuestion || item.dataset.questionItem===undefined);
+   const unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    const releasesLink=action==='read' || parks || scheduleWrite || action==='remove' || (action==='unpark' && heldSave);
    let restoreLink;
-   const submission=tableView.preserveRecordRowTop(()=>{
+   const submission=view.preserveRecordRowTop(()=>{
     setCardSubmitting(form,true,recordDetails(item));
     showActionFailure(notice);
     if(action==='remove' && schedule?.scope!=='this'){
@@ -3017,30 +4010,49 @@ function bindFeedbackForm(form){
     if(parks && action!=='schedule') item.dataset.parked=parkForDelivery ? deliveryParking : 'true';
     if(clearsUnread) item.dataset.unread='false';
     if(heldSave) item.dataset.undoPending='true';
-    if(releasesLink) restoreLink=tableView.releaseLink(key);
-    return tableView.startAction(item);
+    if(releasesLink) restoreLink=view.releaseLink(key);
+    return view.startAction(item);
    });
-   const hold=holdCard(item,hidden=>{if(hidden) tableView.applyAction();});
+   const hold=holdCard(item,hidden=>{if(hidden) view.applyAction();});
    const hidUnread=clearsUnread && wasVisible && item.hidden;
    const showUnparkResult=result=>{
     const unparked=result.unpark_outcome==='cleared';
     const message=unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable';
     const label='Item #'+item.dataset.number;
     const hiddenMessage=unparked ? label+' unparked.' : label+': '+message+'.';
-    tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
+    view.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
    };
    const post=async()=>{
+    if(repair){
+     const outcome=await repairRequests.send(key,actionPath,hold,repair.resume);
+     if(outcome.refusal){refused=true;throw new Error(outcome.refusal);}
+     if(outcome.error) throw new Error(outcome.error);
+     repairDelivered=outcome.delivered;
+     saved=true;
+     stale=!view.currentItemRequest(request);
+     if(item.listRequest!==request) return;
+     if(!stale && outcome.clearDraft && draftStamp===repair.payload.stamp && words.value===repair.payload.words)
+      words.value='';
+     return outcome.result;
+    }
     const options={method:'POST',body:data,signal:parkingReceipt ? listRequestSignal() : undefined};
-    const receiver=action==='tell' ? attempt.recipientName : current.dataset.sendReceiver;
-    const response=await (usesWords || heldSave
-     ? hold.post(actionPath,options,saveAction ? null : receiver)
+    const response=await (action==='works' || usesWords || heldSave
+     ? hold.post(actionPath,options,saveAction || asksQuestion ? null : receiver)
      : fetch(actionPath,options));
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parkingReceipt && action!=='remove'));
-    if(!parkingReceipt) saved=response.ok;
-    if(saved && tableView.currentItemRequest(request) && usesWords &&
-       draftStamp===stampAtSubmit && words.value===attempt.words) words.value='';
+    if(!parkingReceipt) saved=response.ok && !questionRead;
     const result=await response.json();
-    stale=!tableView.currentItemRequest(request);
+    if(questionRead && response.ok && result.words_saved!==true){
+     throw new Error('The save is unconfirmed.');
+    }
+    if(questionRead) saved=response.ok;
+    if(saved && view.currentItemRequest(request) && (usesWords || questionRead) &&
+       draftStamp===stampAtSubmit && words.value===attempt.words){
+     words.value='';
+     retainDraft();
+     persistDraft();
+    }
+    stale=!view.currentItemRequest(request);
     if(item.listRequest!==request) return;
     delete item.dataset.undoPending;
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
@@ -3057,33 +4069,33 @@ function bindFeedbackForm(form){
     }
     if(item.listRequest!==request) return;
     saved=true;
-    clearConfirmedScheduleDraft();
+    clearConfirmedDraft();
     if(stale){
-     if(tableView.openItem?.dataset.key===key) return;
+     if(view.openItem?.dataset.key===key) return;
      hold.restore();
-     tableView.preserveRecordRowTop(()=>{
+     view.preserveRecordRowTop(()=>{
       applySavedState(result,{metadataOnly:true});
       if(action==='unpark') showUnparkResult(result);
-      else tableView.applyAction();
+      else view.applyAction();
      });
      return;
     }
     const closes=parks || scheduleWrite || action==='remove' || result.detail_closed;
     if(closes){
      hold.restore();
-     tableView.preserveRecordRowTop(()=>{
+     view.preserveRecordRowTop(()=>{
       if((scheduleWrite || schedule?.scope) && result.detail_html && result.detail_revision)
-       presentListDetail(item,result);
+       presentListDetail(item,result,view);
       nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail:true});
       closeSavedCard();
-      tableView.applyAction();
+      view.applyAction();
       if(result.detail_unavailable)
-       tableView.showActionResult(item,submission,'Item '+item.dataset.number,
+       view.showActionResult(item,submission,'Item '+item.dataset.number,
         {kind:'failure',message:'Saved; the item could not refresh.'});
      });
      return;
     }
-    tableView.startDeliveryWindow(request,result);
+    view.startDeliveryWindow(request,result);
     let revision=result.detail_revision,text=result.detail_html ?? result.waiting_details_html;
     if(typeof text!=='string' && ('delivery_pending' in result || revision || result.detail_unavailable)){
      const response=await fetch(location.pathname,{cache:'no-store',signal:listRequestSignal()});
@@ -3094,37 +4106,41 @@ function bindFeedbackForm(form){
      revision=updated.dataset.detailRevision;
      text=recordDetails(updated).innerHTML;
     }
-    stale=!tableView.currentItemRequest(request);
+    stale=!view.currentItemRequest(request);
     if(stale) return;
     const hasDetail=typeof text==='string' && Boolean(revision);
     hold.restore();
-    tableView.preserveRecordRowTop(()=>{
+    view.preserveRecordRowTop(()=>{
      nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail});
      if(action==='unpark' && result.unpark_outcome==='cleared'){
       until.value='';
       scheduleEditor?.retainDate();
      }
      if(hasDetail){
-      unconfirmed.delete(attempt);
+      if(!rejectsRepair) unconfirmed.delete(attempt);
       retainDraft();
-      installSavedListDetail(request,revision,text);
+      installSavedListDetail(request,revision,text,undefined,view);
      }
      if(action==='unpark'){
       showUnparkResult(result);
-     }else if(action==='tell'){
-      const message='sent to '+attempt.recipientName+(result.unread==='true' ? '; update remains unread' : '');
-      tableView.showActionResult(item,submission,'Item #'+item.dataset.number,{kind:'success',message});
-     }else tableView.applyAction();
-     if(wasVisible && item.hidden && tableView.opened.has(key)){
+     }else if(action==='tell' || rejectsRepair){
+      const recipient=repair?.payload.receiver ?? receiver;
+      const deliveryFailed=rejectsRepair && !repairDelivered;
+      const message=(deliveryFailed && (result.send_failure || 'The sender has not confirmed delivery.')) ||
+       ('sent to '+recipient+(result.unread==='true' ? '; update remains unread' : ''));
+      const kind=deliveryFailed ? 'failure' : 'success';
+      view.showActionResult(item,submission,'Item #'+item.dataset.number,{kind,message});
+     }else view.applyAction();
+     if(wasVisible && item.hidden && view.opened.has(key)){
       const focus=document.activeElement;
       const inside=recordDetails(item).contains(focus);
       focusParkedAfterClose=focusUnpark && (inside || focus===document.body);
-      tableView.closeCard(key);tableView.applyAction();
+      view.closeCard(key);view.applyAction();
       if(hadFocus && listOwnsFocus() && (inside || focus===document.body)) focusAfterQuestion(item);
      }
     });
    }catch(error){
-    stale=!tableView.currentItemRequest(request);
+    stale=!view.currentItemRequest(request);
     if(item.listRequest!==request) return;
     delete item.dataset.undoPending;
     // An undone send saved nothing, so the item returns to its state before Send and keeps the words.
@@ -3132,16 +4148,16 @@ function bindFeedbackForm(form){
     focusDraft=undone;
     if(undone) refused=true;
     if(saved){
-     clearConfirmedScheduleDraft();
+     clearConfirmedDraft();
      if(stale) return;
-     if(hold.restore()) tableView.applyAction();
-     tableView.preserveRecordRowTop(()=>{
+     if(hold.restore()) view.applyAction();
+     view.preserveRecordRowTop(()=>{
       if(parkingReceipt || action==='remove'){
        if(action==='remove' && schedule?.scope!=='this') closedKeys.add(key);
        closeSavedCard();
-       tableView.showActionResult(item,submission,'Item '+item.dataset.number,
+       view.showActionResult(item,submission,'Item '+item.dataset.number,
         {kind:'failure',message:'Saved; the item could not refresh.'});
-      }else tableView.savedItemError(request);
+      }else view.savedItemError(request);
      });
      return;
     }
@@ -3150,31 +4166,34 @@ function bindFeedbackForm(form){
     if(retried || (!refused && (parkingReceipt || action==='remove'))){
      try{
       const query=new URLSearchParams({'item-state':data.get('id'),keeper:data.get('keeper')});
-      if(parkingReceipt || scopedRemove) query.set('park-request',attempt.request);
+      if(parkingReceipt || action==='remove') query.set('park-request',attempt.request);
       const response=await fetch(actionPath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
       if(!response.ok) throw new Error('HTTP '+response.status);
       current=await response.json();
      }catch(_){}
-     stale=!tableView.currentItemRequest(request);
+     stale=!view.currentItemRequest(request);
      if(item.listRequest!==request) return;
      // A failed read back after a retry does not show that the server refused the park.
      if(retried && !current) refused=false;
     }
     hold.restore();
-    tableView.preserveRecordRowTop(()=>{
+    view.preserveRecordRowTop(()=>{
      let restore=refused || releasesLink,confirmedByReadback=false;
      if(parkingReceipt || action==='remove'){
       if(current){
        applySavedState(current,{metadataOnly:true});
-       const receipt=scopedRemove ? current.remove_request_saved : current.park_request_saved;
+       const receipt=action==='remove' ? current.remove_request_saved : current.park_request_saved;
        confirmedByReadback=receipt===true || !scopedRemove && confirmed.state==='Closed';
        restore=!confirmedByReadback && confirmed.state!=='Closed';
-       if(confirmedByReadback){saved=true;clearConfirmedScheduleDraft();}
+       if(confirmedByReadback){
+        saved=true;
+        if(action!=='remove' || receipt===true) clearConfirmedDraft();
+       }
        if(!stale){
-        presentListDetail(item,current);
+        presentListDetail(item,current,view);
         if(confirmedByReadback) closeSavedCard();
        }
-       if(confirmedByReadback) tableView.applyAction();
+       if(confirmedByReadback) view.applyAction();
       }else{
        syncConfirmed(stale);
        restore=confirmed.state!=='Closed';
@@ -3182,24 +4201,26 @@ function bindFeedbackForm(form){
      }else if(clearsUnread) item.dataset.unread=unreadBefore;
      if(restore) restoreLink?.();
      if(!confirmedByReadback){
-      if(!stale && (refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
-      const message=undone ? error.message : (refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
-      tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:undone ? 'undone' : 'failure',message});
+      if(!stale && (refused || hidUnread) && !view.opened.size) view.openCard(key);
+      const prefix=refused ? 'Not saved: ' : repairRequests.get(key)?.accepted && rejectsRepair
+       ? 'Delivery not confirmed: ' : 'Save not confirmed: ';
+      const message=undone ? error.message : prefix+error.message;
+      view.showActionResult(item,submission,'Item '+item.dataset.number,{kind:undone ? 'undone' : 'failure',message});
      }
      // The return animation uses the confirmed sort keys.
-     if(!saved && refused && wasHidden && !item.hidden) tableView.applyAction();
+     if(!saved && refused && wasHidden && !item.hidden) view.applyAction();
     });
    }
    finally{
-    if(hold.restore()) tableView.applyAction();
-    if(saved || refused) unconfirmed.delete(attempt);
-    tableView.preserveRecordRowTop(()=>{
+    if(hold.restore()) view.applyAction();
+    if(!rejectsRepair && (saved || refused)) unconfirmed.delete(attempt);
+    view.preserveRecordRowTop(()=>{
      setCardSubmitting(form,false,stale ? form : recordDetails(item));syncTell();
      if(!stale) retainDraft();
      if(nextForm && !stale){
-      bindFeedbackForm(nextForm);
-      if(tableView.currentItemRequest(request))
-       tableView.showDraftCopy(drafts.get(key)?.words,nextForm.elements.words?.type==='textarea');
+      bindFeedbackForm(nextForm,view);
+      if(view.currentItemRequest(request))
+       view.showDraftCopy(drafts.get(key)?.words,nextForm.elements.words?.type==='textarea');
      }
     });
     if(!stale && focusUnpark && listOwnsFocus() &&
@@ -3212,26 +4233,25 @@ function bindFeedbackForm(form){
       if(saved && item.hidden){
        const status=content.querySelector('[data-hidden-action-status]');
        const top=target.getBoundingClientRect().top;
-       const inset=(typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom()
-        : document.querySelector('[data-page-status]').offsetHeight)+12;
+       const inset=stuckPageActionsBottom()+12;
        if(top<inset || status.getBoundingClientRect().bottom>innerHeight)
         scrollBy({top:Math.floor(top-inset),behavior:'instant'});
       }
      }
     }
     if(!stale && !saved && parks){
-     await tableView.settled();
+     await view.settled();
      if(listOwnsFocus() && document.activeElement===document.body && parkToggle.getClientRects().length && !parkToggle.disabled){
       parkToggle.focus({preventScroll:true});
      }
     }
-    if(focusDraft && tableView.currentItemRequest(request)){
-     await tableView.rowSettled(item);
-     if(tableView.currentItemRequest(request))
+    if(focusDraft && view.currentItemRequest(request)){
+     await view.rowSettled(item);
+     if(view.currentItemRequest(request))
       recordDetails(item).querySelector('textarea[name="words"]')?.focus();
     }
     if(!stale && hadFocus && !item.hidden && document.activeElement===document.body)
-     await tableView.rowSettled(item);
+     await view.rowSettled(item);
     saving--;
     if(hadFocus){
      document.removeEventListener('focusin',trackFocus);
@@ -3243,16 +4263,18 @@ function bindFeedbackForm(form){
       }
      }
     }
-    refreshAfterListSave(stale || Boolean(tableView.deliveryRequest()) ||
+    refreshAfterListSave(stale || Boolean(view.deliveryRequest()) ||
       (saved && (changesParking || action==='remove' || action==='top' || item.dataset.waitingForAnswer!=='true')) ||
-      (!saved && !refused && (parkingReceipt || action==='remove')));
+      (!saved && (refused && asksQuestion || !refused && (parkingReceipt || action==='remove'))));
    }
   });
 }
 // A Go form sends nate's Go or Approved for one ask; the server closes the ask.
 document.addEventListener('submit',async event=>{
  const form=event.target instanceof Element ? event.target.closest('form[data-go-form]') : null;
- if(!form || !content.contains(form)) return;
+ if(!form) return;
+ const view=listOverlay.contains(form) ? activeListCard?.view : tableView;
+ if(!view || (view===tableView && !content.contains(form))) return;
  event.preventDefault();
  const item=recordFromDetail(form),box=form.closest('[data-ask]'),button=form.querySelector('button');
  if(button.disabled) return;
@@ -3260,21 +4282,21 @@ document.addEventListener('submit',async event=>{
  const data=new URLSearchParams(new FormData(form));data.set('page',location.href);
  button.disabled=true;
  startListSave();
- const submission=tableView.startAction(item);
+ const submission=view.startAction(item);
  let saved=false;
  try{
   const response=await fetch(form.action,{method:'POST',body:data});
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
   saved=true;
-  tableView.preserveRecordRowTop(()=>{
+  view.preserveRecordRowTop(()=>{
    const asks=box.parentElement;
    box.remove();
    if(!asks.children.length) asks.remove();
    // The row's feedback form applies the saved state, so a Go that sets Working moves the row as Mark read does.
-   recordDetails(item).querySelector('[data-feedback-form]').applySavedState(result);
-   tableView.applyAction();
-   if(item.hidden && tableView.opened.has(key)){tableView.closeCard(key);tableView.applyAction();}
+   recordDetails(item).querySelector('[data-feedback-form]')?.applySavedState?.(result);
+   view.applyAction();
+   if(item.hidden && view.opened.has(key)){view.closeCard(key);view.applyAction();}
   });
   if(hadFocus && listOwnsFocus()){
    if(item.hidden) focusAfterQuestion(item);
@@ -3282,7 +4304,7 @@ document.addEventListener('submit',async event=>{
   }
  }catch(error){
   button.disabled=false;
-  tableView.showActionResult(item,submission,'Item '+item.dataset.number,
+  view.showActionResult(item,submission,'Item '+item.dataset.number,
    {kind:'failure',message:'Not sent: '+(error instanceof Error ? error.message : String(error))});
  }finally{
   saving--;
@@ -3291,12 +4313,14 @@ document.addEventListener('submit',async event=>{
 });
 let listCounts=null,reviewSaveVersion=0;
 const listCountsSource=()=>content.querySelector('[data-list-counts-url]');
-function presentReviewLinks(row,links){
+function presentReviewLinks(row,links,view=tableView){
  const target=recordDetails(row).querySelector('[data-list-review-links]');
  if(target && links && target.innerHTML!==links.innerHTML)
-  tableView.updateItemDetail(row,detail=>detail.querySelector('[data-list-review-links]').replaceChildren(...links.childNodes));
+  view.updateItemDetail(row,detail=>detail.querySelector('[data-list-review-links]').replaceChildren(
+   ...links.cloneNode(true).childNodes));
 }
 function rowIn(root,key){
+ key=resolveListKey(root,key);
  return root.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
 }
 function loadListCounts(){
@@ -3338,25 +4362,38 @@ function fillListCounts(footer,markup){
  return updates;
 }
 function updateLinkedRows(rows,updates){
+ const overlay=activeListCard?.item;
  for(const row of rows){
   const version=row.dataset.listReviewVersion;
   if(!version) continue;
   const update=updates.get(row.dataset.key);
-  const summary=row.querySelector('[data-list-review-summary]');
-  if(!update || update.dataset.listReviewVersion!==version){
-   if(summary) summary.textContent=summary.dataset.listReviewSummary;
-   continue;
-  }
-  if(summary){
-   summary.replaceChildren(...update.content.querySelector('[data-list-review-summary]').childNodes);
-   summary.dataset.listReviewSummary='';
-  }
-  const links=update.content.querySelector('[data-list-review-links]');
-  presentReviewLinks(row,links);
-  delete row.dataset.listReviewVersion;
+  applyLinkedReviewUpdate(row,update,tableView);
+  if(overlay?.dataset.key===row.dataset.key && overlay.dataset.listReviewVersion===version)
+   applyLinkedReviewUpdate(overlay,update,activeListCard.view);
  }
 }
+function applyLinkedReviewUpdate(row,update,view){
+ const summary=row.querySelector('[data-list-review-summary]');
+ if(!update || update.dataset.listReviewVersion!==row.dataset.listReviewVersion){
+  if(summary) summary.textContent=summary.dataset.listReviewSummary;
+  return;
+ }
+ if(summary){
+  summary.replaceChildren(...update.content.querySelector('[data-list-review-summary]').cloneNode(true).childNodes);
+  summary.dataset.listReviewSummary='';
+ }
+ presentReviewLinks(row,update.content.querySelector('[data-list-review-links]'),view);
+ delete row.dataset.listReviewVersion;
+}
+function keepRowBelowHeader(update){
+ tableView.preserveRecordRowTop(()=>{
+  update();
+  measurePageActions();
+ },{topInset:stuckPageActionsBottom});
+}
 async function refresh(_supersede=false,current=()=>true){
+ if(activeListCard) return;
+ if(!_supersede && document.activeElement?.closest('[data-studio-question-card]')) return;
  if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh()) return;
  const signal=listRequestSignal();
  const delivery=tableView.deliveryRequest();
@@ -3367,26 +4404,29 @@ async function refresh(_supersede=false,current=()=>true){
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
+ const facts=pageRefreshFacts(page);
  decodeListKeys(fresh);
  await tableView.settled();
- if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh() || !current()) return;
+ if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh() || activeListCard || !current()) return;
  refreshNeeded=false;
- tableView.preserveRecordRowTop(()=>applyListSnapshot(fresh));
+ keepRowBelowHeader(()=>applyListSnapshot(fresh));
  reviewRefreshError.textContent='';
  reviewRefreshError.hidden=true;
  if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false')
   tableView.finishDeliveryWindow(delivery);
- const facts=pageRefreshFacts(page);
  scheduleParkExpiry(facts,requestStarted);
- return facts;
+ return {...facts,aroundStatusDraw:keepRowBelowHeader};
 }
 function applyListSnapshot(fresh){
  const field=listOwnsFocus() && content.contains(document.activeElement) ? document.activeElement : null;
  const focus=field?.id,start=field?.selectionStart,end=field?.selectionEnd;
  const direction=field?.selectionDirection;
- const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
+ const reviewLink=field?.matches('[data-list-review-card],[data-list-linked-card]') ? reviewLinkPlace(field) : null;
+ const topLink=field?.matches('[data-top-band] .list-top-link') ? field.getAttribute('href') : null;
  const action=field?.matches('button[name="action"]') ? field.value : '';
- const focusedRow=action || field?.matches('.list-toggle') ? field.closest('[data-list-item]')?.dataset.key : '';
+ const copyCommand=field?.matches('.list-command [data-copy-code]');
+ const focusedRow=action || copyCommand || field?.matches('.list-toggle') ? recordFromDetail(field) : null;
+ const copyInDetail=copyCommand && recordDetails(focusedRow)?.contains(field);
  recordDetails(tableView.openItem)?.querySelector('[data-feedback-form]')?.retainDraft?.();
  tableView.holdLog();
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
@@ -3402,30 +4442,50 @@ function applyListSnapshot(fresh){
  if(key && !nextItem) tableView.closeCard(key);
  const links=nextItem && !nextItem.dataset.listReviewVersion &&
   recordDetails(nextItem).querySelector('[data-list-review-links]');
+ // Keep the title, status, and actions that the page frame observes.
+ const top=content.querySelector('.page-top'),nextTop=fresh.querySelector('.page-top');
+ const controls=top.querySelector('[data-page-top-controls]');
+ const filterScroll=controls.scrollTop;
+ // Keep the old controls in the old list until the table reads their values.
+ top.replaceWith(...controls.childNodes);
+ controls.append(...nextTop.querySelector('[data-page-top-controls]').childNodes);
+ nextTop.replaceWith(top);
  content.replaceWith(fresh);content=fresh;
  closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
  bindListControls();tableView.replace();
+ controls.scrollTop=filterScroll;
  const openItem=tableView.openItem;
- if(links && openItem?.dataset.key===key) presentReviewLinks(openItem,links);
+ if(links && openItem?.dataset.key===resolveListKey(content,key)) presentReviewLinks(openItem,links);
  tableView.restoreLog();
  if(field?.isConnected) field.focus({preventScroll:true});
  else if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number')
    field.setSelectionRange(start,end,direction);}
  if(reviewLink && !field?.isConnected) restoreReviewLink(reviewLink);
+ if(topLink && !field.isConnected){
+  const link=content.querySelector('.list-top-link[href="'+CSS.escape(topLink)+'"]');
+  (link?.getClientRects().length ? link : content.querySelector('#list-search')).focus({preventScroll:true});
+ }
  if(focusedRow && !field?.isConnected){
-  const row=[...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===focusedRow && !item.hidden);
-  const button=action && recordDetails(row)?.querySelector('button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
+  const match=rowIn(content,focusedRow.dataset.key);
+  const row=match && !match.hidden ? match : null;
+  const scope=copyInDetail ? recordDetails(row) : row?.querySelector('[data-label="Next step"]');
+  const button=copyCommand ? scope?.querySelector('.list-command [data-copy-code]') :
+   action && recordDetails(row)?.querySelector('button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
   (button || row?.querySelector('.list-toggle') || content.querySelector('#list-search')).focus({preventScroll:true});
  }
  void loadListCounts();
 }
 const reviewDialog=document.querySelector('[data-list-review-dialog]');
-const reviewClose=reviewDialog.querySelector('button');
+const listOverlay=reviewDialog.querySelector('[data-list-linked-overlay]');
+const reviewTitle=reviewDialog.querySelector('#list-review-title'),reviewClose=reviewDialog.querySelector('[data-close]');
+const reviewPagePath=''' + json.dumps(review_page.PAGE_PATH) + r''';
+// The Studio source serves the card even after the answer moves to the List.
+const studioCardSource=''' + json.dumps(review_page.ReviewBodyView.STUDIO_QUESTION.value) + r''';
 const reviewMotion=createCardMotion(()=>content);
 const listHost=window.frameElement?.matches('iframe[data-console-page="list"],iframe[data-console-page="studio"]')
  ? window.frameElement : null;
-let activeReview,refreshingReview=false;
+let activeReview,activeListCard,refreshingReview=false;
 const savedReviews=new Set(),returnedReviews=[];
 const reviewRefreshError=document.querySelector('[data-review-refresh-error]');
 function fitReviewDialog(){
@@ -3447,30 +4507,42 @@ function fitReviewDialog(){
 }
 function reviewLinkPlace(link){
  const row=recordFromDetail(link),href=link.getAttribute('href');
- const selector='[data-list-review-card][href="'+CSS.escape(href)+'"]';
+ const selector='a[href="'+CSS.escape(href)+'"]';
  const detail=recordDetails(row).contains(link),scope=detail ? recordDetails(row) : row;
  return {key:row.dataset.key,selector,detail,position:[...scope.querySelectorAll(selector)].indexOf(link)};
 }
-function restoreReviewLink({key,selector,detail,position}){
- const findRow=()=>content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]:not([hidden])');
+function restoreReviewLink({key,selector,detail,position},reveal=false){
+ const findRow=()=>{
+  const row=rowIn(content,key);
+  return row && !row.hidden ? row : null;
+ };
  const visibleLink=row=>{
   const scope=detail ? recordDetails(row) : row;
   const link=scope?.querySelectorAll(selector)[position];
   return link?.getClientRects().length ? link : null;
  };
+ const focus=target=>{
+  target.focus({preventScroll:true});
+  if(reveal) target.scrollIntoView({block:'nearest',inline:'nearest',behavior:'instant'});
+ };
  const row=findRow(),link=visibleLink(row);
  const target=link || row?.querySelector('.list-toggle') || content.querySelector('#list-search');
- target.focus({preventScroll:true});
+ focus(target);
  if(!link && row?.hasAttribute('data-list-review-version') && listCounts){
   void listCounts.then(()=>{
-   if(!activeReview && listOwnsFocus() && document.activeElement===target)
-    visibleLink(findRow())?.focus({preventScroll:true});
+   if(!activeReview && listOwnsFocus() && document.activeElement===target){
+    const link=visibleLink(findRow());
+    if(link) focus(link);
+   }
   });
  }
 }
 function showReviewCard(card){
  activeReview=card;
  card.frame.hidden=false;
+ card.scrollTop=scrollY;
+ card.rowTop=visibleRecordRow(rowIn(content,card.link.key))?.getBoundingClientRect().top;
+ reviewTitle.textContent=card.title;
  card.restoreHost=fitReviewDialog();
  reviewClose.disabled=card.frame.hasAttribute('data-saving');
  reviewDialog.showModal();
@@ -3485,10 +4557,15 @@ function hideReviewCard(card){
  reviewDialog.close();
  card.restoreHost();
  card.frame.hidden=true;
- if(!listHost?.hidden && document.visibilityState==='visible') restoreReviewLink(card.link);
+ if(!listHost?.hidden && document.visibilityState==='visible'){
+  const currentTop=visibleRecordRow(rowIn(content,card.link.key))?.getBoundingClientRect().top;
+  const top=currentTop===undefined || card.rowTop===undefined ? card.scrollTop : scrollY+currentTop-card.rowTop;
+  scrollTo({top,behavior:'instant'});
+  restoreReviewLink(card.link,true);
+ }
 }
 function reopenReturnedReview(){
- if(!activeReview && returnedReviews.length) showReviewCard(returnedReviews.shift());
+ if(!activeReview && !activeListCard && returnedReviews.length) showReviewCard(returnedReviews.shift());
 }
 function closeReviewCard(){
  const card=activeReview;
@@ -3525,17 +4602,180 @@ if(listHost) new MutationObserver(()=>{
  if(!form?.elements.feedback?.value && !form?.elements.later?.value && !doc?.querySelector('[data-review-draft]'))
   closeReviewCard();
 }).observe(listHost,{attributes:true,attributeFilter:['hidden']});
-bindConsoleDialog(reviewDialog,closeReviewCard);
+bindConsoleDialog(reviewDialog,()=>{
+ if(activeListCard) closeListCard();
+ else closeReviewCard();
+});
+reviewDialog.addEventListener('keydown',event=>{
+ if(activeListCard && event.key==='Escape'){
+  event.preventDefault();
+  closeListCard();
+ }
+},true);
+
+function closeListCard({resume=true}={}){
+ const card=activeListCard;
+ if(!card) return;
+ activeListCard=null;
+ reviewDialog.close();
+ card.restoreHost();
+ listOverlay.hidden=true;
+ listOverlay.replaceChildren();
+ scrollTo({top:card.scrollTop,behavior:'instant'});
+ restoreReviewLink(card.link);
+ if(resume){
+  reopenReturnedReview();
+  refreshAfterListSave(false);
+ }
+}
+
+function listOverlayView(item){
+ let request,actionMessage='';
+ const current=()=>activeListCard?.item===item;
+ const notice=message=>{
+  actionMessage=message;
+  showActionFailure(recordDetails(item).querySelector('[data-send-status]'),message);
+ };
+ const update=change=>{
+  change(item,recordDetails(item));
+  nameOverlayFields(item);
+ };
+ return {
+  get openItem(){return current() ? item : null;},
+  openSession:item,
+  opened:new Set([item.dataset.key]),
+  canSubmit:(form,key)=>current() && key===item.dataset.key && recordDetails(item).contains(form),
+  rowFading:()=>false,
+  actionNotice:()=>actionMessage,
+  preserveRecordRowTop:change=>change(),
+  updateItemDetail:(_item,change)=>update((_row,detail)=>change(detail)),
+  presentItemRevision:(_item,_revision,render)=>{if(current()) update(render);},
+  installOwnItemResult:(saved,_revision,render)=>{if(current() && request===saved) update(render);},
+  startItemRequest:key=>(request={key}),
+  currentItemRequest:saved=>current() && request===saved,
+  startAction:()=>notice(''),
+  showActionResult:(_item,_submission,_label,result)=>{if(current()) notice(result.message);},
+  savedItemError:()=>notice('Saved; the item could not refresh.'),
+  closeCard:()=>{if(current()) closeListCard();},
+  applyAction:()=>{},
+  releaseLink:()=>{},
+  openCard:()=>{},
+  startDeliveryWindow:()=>{},
+  deliveryRequest:()=>null,
+  settled:()=>Promise.resolve(),
+  rowSettled:()=>Promise.resolve(),
+  showDraftCopy:()=>{},
+ };
+}
+
+function nameOverlayFields(item){
+ const ids=new Map();
+ for(const field of item.querySelectorAll('[id]')){
+  if(field.id.startsWith('linked-overlay-')) continue;
+  const id='linked-overlay-'+field.id;
+  ids.set(field.id,id);field.id=id;
+ }
+ for(const field of item.querySelectorAll('[for],[list],[aria-controls],[aria-describedby],[aria-labelledby]')){
+  for(const attr of ['for','list','aria-controls','aria-describedby','aria-labelledby']){
+   const value=field.getAttribute(attr);
+   if(value) field.setAttribute(attr,value.split(' ').map(id=>ids.get(id) ?? id).join(' '));
+  }
+ }
+}
+
+function showListCard(link,key){
+ const source=rowIn(content,key);
+ if(!activeListCard){
+  if(activeReview) return;
+  pageRefresh.abandon();
+  activeListCard={link:reviewLinkPlace(link),scrollTop:scrollY,restoreHost:fitReviewDialog()};
+ }
+ const card=activeListCard;
+ listOverlay.hidden=false;
+ listOverlay.replaceChildren();
+ listOverlay.scrollTop=0;
+ card.item=null;
+ card.view=null;
+ reviewTitle.textContent=link.textContent;
+ if(source){
+  const item=source.cloneNode(true),detail=recordDetails(item);
+  if(source.openDetails) detail.replaceChildren(...[...source.openDetails.childNodes].map(node=>node.cloneNode(true)));
+  const fallback=detail.querySelector('[data-studio-question-card]');
+  if(fallback?.dataset.loaded==='loading') delete fallback.dataset.loaded;
+  item.hidden=false;
+  nameOverlayFields(item);
+  item.querySelector('[data-detail]').hidden=false;
+  item.querySelector('.list-row').classList.add('open');
+  const toggle=item.querySelector('.list-toggle');
+  toggle.setAttribute('aria-expanded','true');
+  toggle.setAttribute('aria-label','Hide item '+item.dataset.number);
+  toggle.addEventListener('click',()=>closeListCard());
+  const table=document.createElement('table');
+  table.setAttribute('aria-label',link.textContent);
+  table.append(source.closest('table').querySelector('colgroup').cloneNode(true),item);
+  for(const name of ['--list-owner-width','--list-next-step-width','--list-log-max-height'])
+   listOverlay.style.setProperty(name,content.style.getPropertyValue(name));
+  listOverlay.append(table);
+  card.item=item;
+  card.view=listOverlayView(item);
+  installListDetail(item,card.view);
+  const question=fallback?.querySelector('[data-review-form]');
+  if(fallback?.dataset.loaded==='ready' && question) bindStudioQuestion(item,fallback,question,card.view);
+ }else{
+  const notice=document.createElement('p');
+  notice.role='status';
+  const number=key.match(/\/L([1-9]\d*)$/)?.[1];
+  notice.textContent=number ? 'Item #'+number+' is not on the List' : 'The List item is unavailable.';
+  listOverlay.append(notice);
+ }
+ reviewClose.disabled=false;
+ if(!reviewDialog.open) reviewDialog.showModal();
+ reviewClose.focus({preventScroll:true});
+}
+function studioReviewCard(link,row){
+ const marked=link.hasAttribute('data-list-review-card');
+ if((!marked && !row.dataset.listReviewKeys) || !URL.canParse(link.href)) return;
+ let url=new URL(link.href);
+ if(url.origin!==location.origin) return;
+ if(!marked && url.searchParams.get('page')==='review' &&
+    /^\/console(?:\/(?:console\.html|index\.html)?)?$/.test(url.pathname)){
+  const place=url.searchParams.get('at.review');
+  if(!place || !URL.canParse(place,url)) return;
+  url=new URL(place,url);
+ }
+ if(url.origin!==location.origin || url.pathname.replace(/\.html$/,'')!==reviewPagePath.replace(/\.html$/,'')) return;
+ const fragment=new URLSearchParams(url.hash.slice(1));
+ const key=url.searchParams.get('jump') || url.searchParams.get('item') || url.searchParams.get('body') ||
+    fragment.get('jump') || fragment.get('item');
+ if(!key || (!marked && !JSON.parse(row.dataset.listReviewKeys).includes(key))) return;
+ return new URL(reviewPagePath+'?'+new URLSearchParams({body:key,view:'card',from:studioCardSource}),location.href).href;
+}
 document.addEventListener('click',event=>{
- const link=event.target instanceof Element && event.target.closest('a[data-list-review-card]');
+ const link=event.target instanceof Element && event.target.closest('a[href]');
  if(!link || event.defaultPrevented || event.button!==0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+ const row=recordFromDetail(link);
+ if(!row) return;
+ if(link.hasAttribute('data-list-linked-card')){
+  const key=new URLSearchParams(link.hash.slice(1)).get('item');
+  if(key){event.preventDefault();showListCard(link,key);}
+  return;
+ }
+ const href=studioReviewCard(link,row);
+ if(!href) return;
  event.preventDefault();
- const href=link.href;
  if(activeReview || [...reviewDialog.querySelectorAll('iframe[data-saving]')].some(frame=>frame.src===href)) return;
+ const listCard=activeListCard;
+ if(listCard) closeListCard({resume:false});
  const frame=document.createElement('iframe');
  frame.title='Review card';
  frame.src=href;
- const card={frame,link:reviewLinkPlace(link)};
+ const card={frame,link:listCard?.link ?? reviewLinkPlace(link),
+  title:'Item '+row.dataset.number+' · '+row.querySelector('[data-label="Item"] strong').textContent};
+ if(!listCard && !recordIsOpen(row)){
+  const top=row.getBoundingClientRect().top;
+  tableView.openCard(row.dataset.key);tableView.apply();
+  scrollBy({top:row.getBoundingClientRect().top-top,behavior:'instant'});
+ }
  activeReview=card;
  frame.addEventListener('load',()=>{
   const doc=frame.contentDocument;

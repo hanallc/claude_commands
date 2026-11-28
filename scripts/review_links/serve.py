@@ -31,7 +31,7 @@ from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, NamedTuple, cast, override
+from typing import BinaryIO, Literal, NamedTuple, cast, override
 from urllib.parse import SplitResult, parse_qs, unquote, urlsplit, urlunsplit
 
 # Detect file changes before the first stamp, including changes during imports.
@@ -115,13 +115,13 @@ def published_console_page(root: Path, path: str) -> str:
 
 
 CONSOLE_DOCUMENTS = {
-    accounts_page.PAGE_PATH: "accounts", images.PAGE_PATH: "images", list_page.PAGE_PATH: "list",
+    accounts_page.PAGE_PATH: "accounts", images.PAGE_PATH: "images", list_page.PAGE_PATH: "studio",
     review_page.PAGE_PATH: "review", f"/console/{change_page.REBUILDS_NAME}": "rebuilds",
-    placement_disk.PAGE_PATH: "placement_disk", studio_page.PAGE_PATH: "list",
+    placement_disk.PAGE_PATH: "placement_disk", studio_page.PAGE_PATH: "studio",
 }
 
-# Each List view answers its page, its item-state reads and its item actions at its own path.
-LIST_VIEWS = {view.path: view for view in (list_page.LIST_VIEW, studio_page.STUDIO_VIEW)}
+# Keep the old action path for open tabs and held sends.
+LIST_ACTION_PATHS = frozenset((list_page.PAGE_PATH, studio_page.PAGE_PATH))
 
 
 def capture_page_key(root: Path, place: str) -> str:
@@ -135,12 +135,17 @@ def capture_page_key(root: Path, place: str) -> str:
     return key
 
 
+def capture_matches_page(root: Path, place: str, page: str) -> bool:
+    """Match a capture to its page, including old List requests."""
+    return capture_page_key(root, place) == ("studio" if page == "list" else page)
+
+
 def deferred_capture_request(root: Path, page: str, value: object
                              ) -> new_item_dialog.PageCaptureRequest | new_item_dialog.UnavailableCapture:
     """Check if the saved item can get a screenshot."""
     try:
         request = new_item_dialog.read_page_capture(value)
-        if capture_page_key(root, request.place) == page:
+        if capture_matches_page(root, request.place, page):
             return request
     except ValueError:
         pass
@@ -968,9 +973,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         server = cast(ReviewLinksServer, self.server)
         root = server.root
         route = urlsplit(self.path)
-        fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query == "page=list"
+        fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query in ("page=studio", "page=list")
         held = route.path.startswith(send_hold.HOLD_PATH + "/")
-        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH and not fixture_options and not held:
+        fixture_page = route.path in LIST_ACTION_PATHS or route.path.startswith(f"{studio_page.AVATAR_PATH}/")
+        if server.mode is ServerMode.LIST_FIXTURE and not fixture_page and not fixture_options and not held:
             self.send_error(404)
             return None
         if held:
@@ -1049,17 +1055,40 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 fields = parse_qs(route.query)
                 delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
                 snapshot = server.review_cache.get()
+                if 'body' in fields and fields.get('view') == [review_page.ReviewBodyView.STUDIO_INLINE.value]:
+                    try:
+                        content = snapshot.body(fields['body'][0], view=review_page.ReviewBodyView.STUDIO_INLINE,
+                                                studio_item=fields.get('item', [''])[0])
+                    except LookupError as error:
+                        self.review_response(html.escape(str(error)).encode(), 'text/html; charset=utf-8',
+                                             version=snapshot.version, status=404)
+                    else:
+                        self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)
+                    return None
+                if 'filed' in fields:
+                    url = snapshot.filed_item_url(root, fields['filed'][0], include_done=True)
+                    self.json_response(200, {"url": url})
+                    return None
+                if 'version' not in fields and 'index' not in fields:
+                    key = next((fields[name][0] for name in ('jump', 'item', 'body') if name in fields), '')
+                    include_done_link = 'body' not in fields or fields.get('view') == ['card']
+                    if key and fields.get('from') != ['studio-question']:
+                        if url := snapshot.filed_item_url(root, key, include_done=include_done_link):
+                            self.redirect(url)
+                            return None
                 if 'body' in fields:
                     view = (review_page.ReviewBodyView.CARD if fields.get('view') == ['card']
                             else review_page.ReviewBodyView.TABLE)
+                    if view is review_page.ReviewBodyView.CARD and fields.get('from') == ['studio-question']:
+                        view = review_page.ReviewBodyView.STUDIO_QUESTION
                     try:
                         key = fields['body'][0]
-                        include_done = view is review_page.ReviewBodyView.CARD or fields.get('saved') == ['1']
+                        include_done = view is not review_page.ReviewBodyView.TABLE or fields.get('saved') == ['1']
                         content = (snapshot.linked_card(root, key, view=view) if include_done else snapshot.body(key))
                     except LookupError as error:
                         message = str(error)
                         content = (change_page.document(page_frame.action_failure("review-card-failure", message), 'Review card')
-                                   if view is review_page.ReviewBodyView.CARD else html.escape(message).encode())
+                                   if view is not review_page.ReviewBodyView.TABLE else html.escape(message).encode())
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version, status=404)
                     else:
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)
@@ -1075,8 +1104,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 else:
                     filters = parse_qs(route.query, keep_blank_values=True)
                     show = filters.get('show', filters.get('state', ['open']))[0]
-                    kind = filters.get('type', [''])[0]
-                    content = snapshot.render(show=show or 'open', kind=kind)
+                    content = snapshot.render(show=show or 'open')
             except (OSError, ValueError) as error:
                 print(f"review-links review: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))
@@ -1085,8 +1113,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             prepared = snapshot.page_gzip if content is snapshot.page and owned is content else b""
             self.encoded_response(200, owned, "text/html; charset=utf-8", {}, prepared, cache_gzip=True)
             return None
-        if route.path in LIST_VIEWS:
-            self.list_document(route.query, LIST_VIEWS[route.path])
+        if route.path in LIST_ACTION_PATHS:
+            self.list_document(route.path, route.query)
             return None
         if route.path.startswith(f"{studio_page.AVATAR_PATH}/"):
             return self.studio_avatar(route.path.removeprefix(f"{studio_page.AVATAR_PATH}/"))
@@ -1314,7 +1342,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         server = cast(ReviewLinksServer, self.server)
         route = urlsplit(self.path)
-        if (server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH
+        if (server.mode is ServerMode.LIST_FIXTURE and route.path not in LIST_ACTION_PATHS
                 and not route.path.startswith(send_hold.HOLD_PATH + "/")):
             self.send_error(404)
             return
@@ -1374,9 +1402,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == investigations_page.PAGE_PATH:
             self._write_post(self.investigation_post)
             return
-        if route.path in LIST_VIEWS:
-            view = LIST_VIEWS[route.path]
-            self._write_post(lambda: self.list_post(view))
+        if route.path in LIST_ACTION_PATHS:
+            self._write_post(self.list_post)
             return
         if route.path == go_ledger.GO_PATH:
             self._write_post(self.go_post)
@@ -1440,7 +1467,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 location = change_page.publish_next(page, body)
                 self.redirect(location)
                 return
-            delivery = change_page.submit(page, body, server.delivery_status)
+            with change_page.file_change_actions(review_actions.file_change_work):
+                delivery = change_page.submit(page, body, server.delivery_status)
         except change_review.VerdictDurabilityUnconfirmed as error:
             try:
                 self.failed_answer(page, body, 503, "The verdict was written. Durability is unconfirmed.", error)
@@ -1525,7 +1553,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if length <= 0:
                 raise ValueError("empty answer")
             body = self.rfile.read(length).decode("utf-8")
-            delivery, answer = change_browser.submit(browser, body, server.delivery_status)
+            with change_page.file_change_actions(review_actions.file_change_work):
+                delivery, answer = change_browser.submit(browser, body, server.delivery_status)
         except change_review.VerdictDurabilityUnconfirmed as error:
             try:
                 self.browser_failure(503, "The verdict was written. Durability is unconfirmed.", error)
@@ -1533,7 +1562,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 change_page.recover_pending(server.delivery_status, only=error.cleanup)
             return
         except (ValueError, change_page.change_review.ChangeReviewError) as error:
-            self.browser_failure(400, str(error) if isinstance(error, change_page.QuestionAnswerRefused) else "Check the answer and submit it again.", error)
+            reason = str(error) if isinstance(error, change_page.QuestionAnswerRefused) else "Check the answer and submit it again."
+            self.review_answer_refused(error, reason)
             return
         except change_page.FeatureLogFailed as error:
             self.browser_failure(503, "The feature log could not be updated.", error)
@@ -1773,9 +1803,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                          valid_token: bool, claims: ExitStack) -> None:
         try:
             draft = fields.get("request_id")
-            list_draft_id = (draft if fields.get("page") == "list" and isinstance(draft, str)
+            list_page_request = new_item_dialog.is_list_submission_page(fields.get("page"))
+            list_draft_id = (draft if list_page_request and isinstance(draft, str)
                              and review_submissions.is_draft_id(draft) else "")
-            browser_draft = fields.get("page") != "list" and review_submissions.is_draft_id(draft)
+            browser_draft = not list_page_request and review_submissions.is_draft_id(draft)
             # A restart retry can use the token saved with the draft.
             if not valid_token and (
                     "capture_key" not in fields or "page_capture" in fields or "discard_capture" in fields
@@ -1830,7 +1861,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 if len(key) > 32 or has_capture_metadata:
                     page = fields.get("page")
                     if (not isinstance(draft, str)
-                            or not (review_submissions.is_draft_id(draft) or page == "list"
+                            or not (review_submissions.is_draft_id(draft) or list_page_request
                                     and review_submissions.DRAFT_ID.fullmatch(draft))
                             or not new_item_dialog.capture_key_matches_draft(key, draft)):
                         raise new_item_dialog.SubmissionError("The screenshot belongs to another draft.")
@@ -1849,7 +1880,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError:
             self.json_response(400, {"error": "Could not read the New item request."})
             return
-        legacy_page_draft = (isinstance(request, new_item_dialog.NewItemRequest) and request.page != "list"
+        legacy_page_draft = (isinstance(request, new_item_dialog.NewItemRequest) and not list_page_request
                              and review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None)
         authorization = None
         if browser_draft and isinstance(token, str):
@@ -1929,7 +1960,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     if edited:
                         warnings.append("The item keeps the values from the first Send.")
                     response["attachment_warning"] = "\n".join(warnings)
-                on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and request.page == "list"
+                on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and list_page_request
                 if list_draft_id and edited:
                     request = None
                     screenshot = new_item_dialog.NO_PAGE_SCREENSHOT
@@ -1937,7 +1968,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         and review_submissions.PAGE_SCREENSHOT in details.images):
                     server.page_captures.mark_filed(key, screenshot)
                 main_request = request if isinstance(request, new_item_dialog.NewItemRequest) and (
-                    request.page == "list" or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
+                    list_page_request or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
                 has_saved_evidence = ((legacy_page_draft and key) or details.images or details.page_state is not None
                                       or (main_request is not None and main_request.page_state is not None)
                                       or isinstance(details.evidence, new_item_dialog.PageDataEvidence)
@@ -1945,18 +1976,28 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 evidence_page = site + review_page.PAGE_PATH if has_saved_evidence else ""
                 status = server.delivery_status
                 with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
+                    report_row = review_actions.submission_report_row(saved)
                     try:
                         delivery = review_actions.prepare_submission_delivery(
                             saved, saved.words, status, evidence_page=evidence_page, members=created.members,
                             claims=claims)
                     except review_actions.SubmissionDeliveryPending:
                         delivery = change_page.NoMessageDelivery()
-                    if on_list or isinstance(request, new_item_dialog.NewItemRequest) and (
+                    response["reply_owner"] = (
+                        delivery.page.saved["owner"] if isinstance(delivery, change_page.MessageDelivery)
+                        and isinstance(delivery.page, change_page.ReviewMessagePage) else saved.owner)
+                    if isinstance(report_row, the_list.ListItem):
+                        response["list_number"] = report_row.number
+                        response["list_owner"] = (report_row.owner.value if isinstance(report_row.owner, the_list.UnassignedOwner)
+                                                  else review_items.name(report_row.owner, created.members))
+                        response["list_producer"] = review_items.name(report_row.producer, created.members)
+                    elif on_list or isinstance(request, new_item_dialog.NewItemRequest) and (
                             request.page_recipient == new_item_dialog.PageRecipient.PRODUCER):
-                        number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
-                        if isinstance(number, int):
-                            response["list_number"] = number
-                if pending or (main_request is not None and main_request.page == "list"
+                        reservation = review_submissions.list_filing_reservation(saved)
+                        destination = the_list.review_reservation(reservation)
+                        if not isinstance(destination, the_list.NextNumber):
+                            response["list_number"] = destination.number
+                if pending or (main_request is not None and list_page_request
                                and isinstance(screenshot, new_item_dialog.PageScreenshot)):
                     if review_submissions.PAGE_SCREENSHOT not in details.images:
                         screenshot = server.page_captures.file(key, saved, allow_pending=pending)
@@ -1994,7 +2035,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         respond_first = on_list or main_request is not None
         claim = delivery if isinstance(delivery, change_page.MessageDelivery) else None
-        send = partial(self.deliver_review, server, delivery, report_outcome=True) if claim is not None else None
+        def send_submission() -> change_page.DeliveryOutcome:
+            outcome = self.deliver_review(server, delivery, report_outcome=True)
+            if on_list and saved.kind == new_item_dialog.SubmissionKind.QUESTION:
+                self.publish_review_delivery(server, created.key)
+            return outcome
+
+        send = send_submission if claim is not None else None
         try:
             try:
                 if respond_first:
@@ -2125,15 +2172,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         return self.attachment_response(content, media)
 
-    def list_document(self, query: str, view: list_page.ListView) -> None:
-        """Answer a List view: the page, or the List counts and item state it reads."""
+    def list_document(self, path: str, query: str) -> None:
+        """Serve the Studio document and the List read routes."""
         server = cast(ReviewLinksServer, self.server)
         if query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
             self.list_counts(include_linked_reviews=query == list_page.COUNTS_AND_LINKS_QUERY)
             return
         fields = parse_qs(query)
         if "item-state" in fields:
-            self.list_action_state(fields, view)
+            self.list_action_state(fields)
+            return
+        if path == list_page.PAGE_PATH:
+            self.redirect(studio_page.PAGE_PATH + (f"?{query}" if query else ""))
             return
         delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
         try:
@@ -2144,12 +2194,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                            status=server.delivery_status, query=query,
                                            review_records=(list_page.LinkedReviewRead.AFTER_RENDER
                                                            if live and reviews is list_page.LinkedReviewRead.FROM_DISK
-                                                           else reviews),
-                                           view=view)
-                content = owned_document(content, "list")
+                                                           else reviews))
+                content = owned_document(content, "studio")
         except (OSError, ValueError) as error:
-            print(f"review-links {view.log_name}: {error}", file=sys.stderr)
-            self.html_response(503, change_page.document(f"<p>{html.escape(view.title)} page is not available.</p>"))
+            print(f"review-links studio: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document(f"<p>{studio_page.TITLE} page is not available.</p>"))
             return
         self.html_response(200, content, delivery_pending=delivery)
 
@@ -2182,9 +2231,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8")
             key = review_page.review_fields(body)['row'][0]
             saved = server.review_cache.save(body, server.delivery_status)
-        except review_items.ReviewRecordChanged as error:
-            self.browser_failure(409, str(error), error)
-            return
         except change_review.VerdictDurabilityUnconfirmed as error:
             server.review_cache.invalidate()
             try:
@@ -2193,13 +2239,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 change_page.recover_pending(server.delivery_status, only=error.cleanup)
                 server.review_cache.invalidate()
             return
+        except the_list.ParkingDeadlinePassed as error:
+            self.json_response(400, {"reason": str(error), "refusal": "parking-deadline-passed"})
+            return
         except ValueError as error:
-            self.browser_failure(400, str(error), error)
+            self.review_answer_refused(error, str(error))
             return
         except (OSError, RuntimeError, change_page.Refusal) as error:
             self.browser_failure(503, "The answer could not be saved.", error)
             return
-        pending = isinstance(saved.delivery, change_page.MessageDelivery)
+        action_delivery = saved.delivery
+        pending = not isinstance(action_delivery, change_page.NoMessageDelivery)
         result: dict[str, object] = {'answer':saved.answer, 'version':saved.version, 'delivery_pending':pending}
         if isinstance(saved.detail, review_page.ConfirmedReviewDetail):
             result.update(detail_html=saved.detail.body, detail_revision=saved.detail.revision)
@@ -2209,12 +2259,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             result['detail_unavailable'] = True
         if isinstance(saved.item, review_items.ReviewItem):
             later = saved.item.times.later
-            result.update(state=saved.item.state, type=saved.item.type,
+            state = review_items.ReviewState.DONE if review_items.on_list(saved.item) else saved.item.state
+            result.update(state=state, type=saved.item.type,
                           later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
-        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
-            delivery = change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status)
-            outcome = self.deliver_review(server, delivery, report_outcome=True)
-            result.update(held_delivery_result(outcome, not pending))
+        studio_delivery = (isinstance(action_delivery, review_actions.StudioNoticeDelivery) or
+                           (isinstance(action_delivery, change_page.MessageDelivery)
+                            and change_page.studio_review_delivery(action_delivery.page)))
+
+        def deliver_saved(*, report_outcome: bool = False) -> change_page.DeliveryOutcome:
+            if isinstance(action_delivery, review_actions.ListFeedbackDelivery):
+                return server.deliver_list_notice(action_delivery)
+            delivery = change_page.finish_verdict_cleanup(action_delivery, server.delivery_status)
+            return self.deliver_review(server, delivery, report_outcome=report_outcome)
+
+        replay = self.headers.get(send_hold.REPLAY_HEADER) == "1"
+        if (not studio_delivery and replay) or (not replay and self.headers.get(review_page.DELIVERY_RESULT_HEADER) == "1"):
+            outcome = deliver_saved(report_outcome=True)
+            if not studio_delivery:
+                result.update(held_delivery_result(outcome, not pending))
             result['delivery_pending'] = False
             if pending:
                 self.publish_review_delivery(server, key)
@@ -2226,7 +2288,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             try:
                 self.json_response(200, result)
             finally:
-                _ = self.deliver_review(server, change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status))
+                _ = deliver_saved()
                 if pending:
                     self.publish_review_delivery(server, key)
 
@@ -2257,6 +2319,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if isinstance(delivery, change_page.MessageDelivery):
                 status.release_owned_claims((delivery.attempt,))
                 server.review_cache.invalidate()
+        if isinstance(delivery, change_page.MessageDelivery) and change_page.studio_review_delivery(delivery.page):
+            status.defer_question(status.path(delivery.page, delivery.row), delivery)
         return change_page.DeliveryUnconfirmed()
 
     def queue_move_allowed(self, *, origin_required: bool) -> bool:
@@ -2434,18 +2498,20 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     content += '<template data-list-review-read-error></template>'
             self.html_response(200, content.encode())
 
-    def list_action_state(self, fields: dict[str, list[str]], view: list_page.ListView) -> None:
+    def list_action_state(self, fields: dict[str, list[str]]) -> None:
         """Read the current item after an action response is lost."""
         server = cast(ReviewLinksServer, self.server)
         try:
             (identity,) = fields["item-state"]
             (keeper,) = fields.get("keeper", [])
             (park_request,) = fields.get("park-request", [""])
+            (not_fixed_request,) = fields.get("not-fixed-request", [""])
             with server.list_store_access(), server.staff_read_scope():
                 current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
                                                        park_request=park_request, include_detail=True,
+                                                       not_fixed_request=not_fixed_request,
                                                        review_records=server.list_review_records(),
-                                                       top_priority=view.top_priority)
+                                                       top_priority=list_page.TopPriority.SHOWN)
         except ValueError as error:
             self.browser_failure(400, "The List item is unavailable.", error)
         except OSError as error:
@@ -2453,10 +2519,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             self.json_response(200, current)
 
-    def list_post(self, view: list_page.ListView) -> None:
-        """Save a List view's item action before the shared sender starts."""
+    def list_post(self) -> None:
+        """Save a List item action before the shared sender starts."""
         server = cast(ReviewLinksServer, self.server)
         fixture = server.mode is ServerMode.LIST_FIXTURE
+        fields: dict[str, list[str]] = {}
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 100000:
@@ -2469,7 +2536,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 submission, current = list_page.save_action(
                     server.root, body, server.delivery_status,
                     review_records=server.list_review_records(), include_detail=True,
-                    top_priority=view.top_priority)
+                    top_priority=list_page.TopPriority.SHOWN)
+        except the_list.RepairCheckRefused as error:
+            if fields.get("action") == [the_list.ReportVerdict.NOT_FIXED]:
+                receipt = list_page.NotFixedReceipt(request=error.request, state=list_page.NotFixedReceiptState.REFUSED)
+                self.json_response(400, {"reason": str(error), "not_fixed_receipt": receipt})
+            else:
+                self.browser_failure(400, str(error), error)
+            return
         except ValueError as error:
             self.browser_failure(400, str(error), error)
             return
@@ -2483,18 +2557,33 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         action = fields["action"][0]
         delivery = submission.delivery if isinstance(submission, list_page.ListUnparkSubmission) else submission
         pending = not isinstance(delivery, change_page.NoMessageDelivery)
-        state = {"read": "read", "question": "saved", "top": "saved"}.get(action, "sent")
+        repair_feedback = action == the_list.ReportVerdict.NOT_FIXED
+        state = "saved" if repair_feedback else {"read": "read", "question": "saved", "top": "saved"}.get(action, "sent")
         reply = {"state": state, "delivery_pending": pending, **saved_fields}
+        if action == "read":
+            reply["words_saved"] = True
         if current is not None and isinstance(submission, list_page.ListUnparkSubmission):
             reply["unpark_outcome"] = submission.response_outcome(current).value
-        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
+
+        def deliver_saved() -> change_page.DeliveryOutcome:
+            if isinstance(submission, review_actions.StudioNoticeDelivery):
+                return server.deliver_list_notice(submission)
+            return list_page.deliver_with_outcome(submission)
+
+        if (self.headers.get(send_hold.REPLAY_HEADER) == "1" and action not in ("read", "question")) or repair_feedback:
             try:
-                outcome = list_page.deliver_with_outcome(submission)
+                outcome = deliver_saved()
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
                 outcome = change_page.DeliveryUnconfirmed()
-            reply.update(held_delivery_result(outcome, not pending))
+            if action not in ("read", "question"):
+                reply.update(held_delivery_result(outcome, not pending))
             reply["delivery_pending"] = False
+            if repair_feedback and isinstance(delivery, list_page.ListFeedbackDelivery):
+                receipt_state = (list_page.NotFixedReceiptState.DELIVERED
+                                 if isinstance(outcome, change_page.DeliveryConfirmed)
+                                 else list_page.NotFixedReceiptState.ACCEPTED)
+                reply["not_fixed_receipt"] = list_page.NotFixedReceipt(request=delivery.request, state=receipt_state)
             self.json_response(200, reply)
             return
         with server.item_delivery(pending) as check:
@@ -2504,7 +2593,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 self.json_response(200, reply)
             finally:
                 try:
-                    list_page.deliver(submission)
+                    if isinstance(submission, review_actions.StudioNoticeDelivery):
+                        _ = server.deliver_list_notice(submission)
+                    else:
+                        list_page.deliver(submission)
                 except OSError as error:
                     print(f"review-links delivery status: {error}", file=sys.stderr)
 
@@ -2526,7 +2618,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 raise ValueError("invalid List Go size")
             body = self.rfile.read(length).decode("utf-8")
             with server.list_store_access():
-                go_id, current = list_page.save_go(server.root, server.store_folder, body, client, views=LIST_VIEWS,
+                go_id, current = list_page.save_go(server.root, server.store_folder, body, client,
                                                    review_records=server.list_review_records())
         except ValueError as error:
             self.browser_failure(400, str(error), error)
@@ -2631,10 +2723,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     elif page.items is images.waiting_images:
                         page = replace(page, items=partial(images.waiting_images, status=server.delivery_status))
                     pages.append(page)
-                # Rebuilds has no navigation entry, so its request uses an empty name.
-                if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
+                if len(opened) != 1:
                     raise ValueError("name one console page or none")
-                fresh = console.news(server.root, tuple(pages), opened[0])
+                identities = {page.identity for page in pages}
+                identity = opened[0]
+                if identity == "list" and "list" not in identities and "studio" in identities:
+                    identity = "studio"
+                # Rebuilds has no navigation entry, so its request uses an empty name.
+                if identity and identity not in identities:
+                    raise ValueError("name one console page or none")
+                fresh = console.news(server.root, tuple(pages), identity)
         except ValueError as error:
             self.browser_failure(400, "Name one console page.", error)
             return
@@ -2680,6 +2778,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             names = None
         self.json_response(200, {"state": started.state.value, "target": started.target, "sessions": folders,
                                  "staff_names": names})
+
+    def review_answer_refused(self, error: Exception, reason: str) -> None:
+        if isinstance(error, review_items.ReviewRecordChanged):
+            self.browser_failure(409, str(error), error)
+        else:
+            self.browser_failure(400, reason, error)
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)
@@ -2761,9 +2865,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if result is send_hold.HoldState.PENDING:
             self.json_response(202, {"pending": True}, hold=send_hold.HoldHeader.PENDING)
         elif result is send_hold.HoldState.UNDONE:
-            self.json_response(404, {"reason": "This send was undone."})
+            self.json_response(404, {"reason": "This send was undone."}, hold_outcome="undone")
         elif result is send_hold.HoldState.MISSING:
-            self.json_response(404, {"reason": "This send was undone or its result expired."})
+            self.json_response(404, {"reason": "This send was undone or its result expired."}, hold_outcome="missing")
         else:
             self.send_response(result.status)
             self.send_header("Content-Type", result.content_type)
@@ -2774,11 +2878,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             _ = self.wfile.write(result.body)
 
     def json_response(self, status: int, fields: Mapping[str, object], *,
-                      hold: send_hold.HoldHeader | None = None) -> None:
+                      hold: send_hold.HoldHeader | None = None,
+                      hold_outcome: Literal["undone", "missing"] | None = None) -> None:
         content = json.dumps(fields).encode("utf-8")
         self.send_response(status)
         if hold is not None:
             self.send_header("X-Send-Hold", hold.value)
+        if hold_outcome is not None:
+            self.send_header("X-Send-Hold-Outcome", hold_outcome)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
@@ -2835,6 +2942,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         self._item_deliveries: set[str] = set()
         self._item_delivery_lock: threading.Lock = threading.Lock()
+        self._studio_notice_retries: set[review_actions.StudioNoticeDelivery] = set()
+        self.studio_notice_recovery: threading.Thread | None = None
         self.branch_deletions: set[Path] = set()
         self.branch_deletions_lock: threading.Lock = threading.Lock()
         self._staff_snapshot_lock: threading.Lock = threading.Lock()
@@ -2883,6 +2992,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
 
             with reply_tokens.serving(self.store_folder):
                 try:
+                    recover("List report", review_actions.recover_interrupted_list_reports)
                     recover("delivery", partial(recover_changes, self.delivery_status))
                     recover("first message", partial(
                         review_actions.recover_submission_deliveries, self.delivery_status, review_page.PAGE_PATH))
@@ -2890,7 +3000,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
                     self.delivery_status.startup_recovery_pending.clear()
                 # Recover Go first because its message includes the producer's next-step notice.
                 recover("List Go", partial(recover_goes, self.store_folder))
-                recover("List feedback", partial(recover_list, self.store_folder))
+                recover("List feedback", partial(recover_list, self.store_folder, send_notice=self.deliver_list_notice))
                 recover("Scheduled notice", partial(new_item.recover_scheduled_notices, self.root))
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
@@ -2984,6 +3094,35 @@ class ReviewLinksServer(ThreadingHTTPServer):
     def item_delivery_pending(self, check: str) -> bool:
         with self._item_delivery_lock:
             return check in self._item_deliveries
+
+    def deliver_list_notice(self, delivery: review_actions.ListFeedbackDelivery) -> change_page.DeliveryOutcome:
+        if isinstance(delivery, review_actions.StudioNoticeDelivery) and delivery.alert_status is not self.delivery_status:
+            delivery = replace(delivery, alert_status=self.delivery_status)
+        try:
+            result = list_page.deliver_with_outcome(delivery)
+        except FileNotFoundError:
+            return change_page.DeliveryUnconfirmed()
+        except OSError as error:
+            print(f"review-links List delivery {delivery.identity}: {error}", file=sys.stderr)
+            result = change_page.DeliveryUnconfirmed()
+        if isinstance(delivery, review_actions.StudioNoticeDelivery):
+            with self._item_delivery_lock:
+                if isinstance(result, change_page.DeliveryConfirmed):
+                    self._studio_notice_retries.discard(delivery)
+                else:
+                    self._studio_notice_retries.add(delivery)
+        return result
+
+    def retry_studio_notices(self) -> None:
+        with self._item_delivery_lock:
+            retries, self._studio_notice_retries = self._studio_notice_retries, set()
+        for delivery in retries:
+            try:
+                _ = self.deliver_list_notice(delivery)
+            except (OSError, ValueError, RuntimeError) as error:
+                print(f"review-links Studio notice {delivery.identity}: {error}", file=sys.stderr)
+                with self._item_delivery_lock:
+                    self._studio_notice_retries.add(delivery)
 
     def list_review_records(self) -> list_page.ImmediateReviewRecords:
         cache = self.review_cache
@@ -3155,7 +3294,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
             })
         except ValueError:
             return False
-        if capture_page_key(self.root, capture.place) != page:
+        if not capture_matches_page(self.root, capture.place, page):
             return False
         firefox = shutil.which("firefox")
         if not firefox or not self.capture_slot.acquire(blocking=False):
@@ -3282,6 +3421,12 @@ class ReviewLinksServer(ThreadingHTTPServer):
                 self.alert_recovery = threading.Thread(
                     target=self.delivery_status.recover_deferred_alerts, daemon=True)
                 self.alert_recovery.start()
+            with self._item_delivery_lock:
+                studio_notices_pending = bool(self._studio_notice_retries)
+            if (studio_notices_pending
+                    and (self.studio_notice_recovery is None or not self.studio_notice_recovery.is_alive())):
+                self.studio_notice_recovery = threading.Thread(target=self.retry_studio_notices, daemon=True)
+                self.studio_notice_recovery.start()
 
 
 def main(arguments: list[str]) -> int:

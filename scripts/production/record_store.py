@@ -16,12 +16,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 from itertools import chain
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local
 from typing import NamedTuple, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
-from scripts.lib import git_files
+from scripts.lib import conf, git_files
 from scripts.lib.showrunner_state import state_root as state_root
 from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
@@ -39,6 +39,46 @@ class RecordText(NamedTuple):
     body: str
 
 
+class _ListDestinationLocks(local):
+    def __init__(self) -> None:
+        self.held: set[Path] = set()
+
+
+_list_destination_locks = _ListDestinationLocks()
+
+
+@contextmanager
+def list_destination_lock() -> Generator[None]:
+    """Hold the List lock across destination discovery and publication."""
+    root = state_root()
+    lock = root / ".list-allocation.lock"
+    held = _list_destination_locks.held
+    if lock in held:
+        yield
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    with exclusive(lock):
+        held.add(lock)
+        try:
+            yield
+        finally:
+            held.remove(lock)
+
+
+def saved_path_exists(path: Path) -> bool:
+    """Distinguish an absent path from an unreadable saved entry."""
+    try:
+        _ = path.lstat()
+    except FileNotFoundError:
+        # A missing parent link target also makes lstat report ENOENT.
+        for parent in path.parents:
+            if parent.is_symlink():
+                _ = parent.stat()
+        return False
+    _ = path.stat()
+    return True
+
+
 class RecordKind(StrEnum):
     QUESTION = "question"
     PROPOSAL = "proposal"
@@ -49,9 +89,23 @@ class RecordKind(StrEnum):
         return self.value[0].upper()
 
 
-def morty_ids(members: staff.StaffSnapshot) -> list[staff.StaffId]:
-    """Return the staff ID of each active producer named morty. Each caller decides what zero or two IDs mean."""
-    return [row.id for row in staff.active(members, "producer") if row.name == "morty"]
+def configured_list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Read the producer that owns the List."""
+    configured = settings.origin("page.list.owner", str)
+    if isinstance(configured, conf.UnavailableValue):
+        return None
+    row = members.by_id(staff.StaffId(configured.value))
+    return row if row is not None and row.kind == "producer" else None
+
+
+def list_keeper(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Find the active producer that owns the List."""
+    row = configured_list_producer(settings, members)
+    if (row is None or row.id not in members.rows_by_id or row.id in members.pending_retire
+            or isinstance(row.exited, staff.Exited) or isinstance(row.doc, staff.WrappedDoc)
+            or isinstance(row.worktree, staff.RemovedWorktree)):
+        return None
+    return row
 
 
 def record_owner(kind: RecordKind, issue: Issue, legacy_owner: str) -> staff.StaffId:
@@ -802,24 +856,32 @@ class NumberedRecords:
         return self.folder() / ".next-number"
 
     def require_list_keeper(self) -> None:
-        keepers = morty_ids(staff.snapshot())
-        if self.collection != "list" or self.prefix != "L" or keepers != [self.owner]:
-            raise self.error_type("only morty's List folder can allocate List numbers")
+        keeper = list_keeper(conf.read_or_repository("console"), staff.snapshot())
+        if keeper is None:
+            raise self.error_type("The List keeper is unavailable.")
+        if self.collection != "list" or self.prefix != "L" or keeper.id != self.owner:
+            raise self.error_type(f"only {keeper.name}'s List folder can allocate List numbers")
 
     @contextmanager
     def list_allocation(self) -> Generator[None]:
         """Check the keeper before creating or locking its folder."""
         with staff.supplied_snapshot(staff.snapshot()):
             self.require_list_keeper()
-            with self.locked():
+            with list_destination_lock(), self.locked(check=self.require_list_keeper):
                 yield
+
+    def _list_folders(self) -> Iterator[Path]:
+        seen: set[Path] = set()
+        for owner in state_root().iterdir():
+            if owner.is_dir() and not owner.is_symlink():
+                folder = (owner / self.collection).resolve()
+                if folder not in seen:
+                    seen.add(folder)
+                    yield folder
 
     def _previous_numbers(self) -> Iterator[int]:
         """Read record names and the migration log, including closed records."""
-        for owner in state_root().iterdir():
-            if not owner.is_dir() or owner.is_symlink():
-                continue
-            folder = owner / self.collection
+        for folder in self._list_folders():
             try:
                 names = [path.name for path in folder.iterdir()]
             except FileNotFoundError:
@@ -841,8 +903,7 @@ class NumberedRecords:
                 if identity != name and self.valid_id(identity):
                     yield int(identity[len(self.prefix):])
 
-    def _saved_next_number(self) -> int:
-        path = self.counter_path()
+    def _saved_next_number(self, path: Path) -> int:
         if path.is_symlink():
             raise self.error_type(f"{path}: expected a regular counter file")
         try:
@@ -856,7 +917,12 @@ class NumberedRecords:
     def next_number(self) -> int:
         """Read the next number under the store lock."""
         self.require_list_keeper()
-        number = self._saved_next_number() or max(self._previous_numbers(), default=0) + 1
+        counter = self.counter_path()
+        saved = self._saved_next_number(counter)
+        current = counter.parent.resolve()
+        former = (self._saved_next_number(folder / counter.name) for folder in self._list_folders()
+                  if folder != current)
+        number = max(saved or max(self._previous_numbers(), default=0) + 1, max(former, default=0))
         while os.path.lexists(self.path(f"{self.prefix}{number}")):
             number += 1
         return number
@@ -866,6 +932,39 @@ class NumberedRecords:
         if number < self.next_number():
             raise self.error_type("the number is below the saved sequence")
         write_text_atomic(self.counter_path(), f"{number + 1}\n", new_file_mode=0o600)
+
+    def _allocation_only_counter(self) -> Path:
+        return self.folder() / ".list-allocation-only"
+
+    def has_allocation_only_sequence(self) -> bool:
+        sequence = self._saved_next_number(self.counter_path())
+        return bool(sequence and self._saved_next_number(self._allocation_only_counter()) == sequence)
+
+    def record_list_publication(self) -> None:
+        marker = self._allocation_only_counter()
+        if saved_path_exists(marker):
+            marker.unlink()
+            sync_folder(marker.parent)
+
+    def finish_exchange_number(self, number: int) -> None:
+        """Keep the batch eligibility of a counter used only for exchange reservations."""
+        counter = self._saved_next_number(self.counter_path())
+        marker = self._allocation_only_counter()
+        saved = self._saved_next_number(marker)
+        next_number = number + 1
+        advancing = counter < next_number and saved in (next_number, counter)
+        legacy = counter == next_number and saved == 0
+        if (advancing or legacy) and not any(self.folder().glob("*.md")):
+            write_text_atomic(marker, f"{next_number}\n", new_file_mode=0o600)
+        self.finish_reserved_number(number)
+
+    def finish_reserved_number(self, number: int) -> None:
+        """Advance the saved keeper's counter for a durable reservation."""
+        counter = self.counter_path()
+        if self._saved_next_number(counter) <= number:
+            write_text_atomic(counter, f"{number + 1}\n", new_file_mode=0o600)
+        else:
+            sync_folder(self.folder())
 
     def invalid(self, identity: str, error: object) -> ValueError:
         return self.error_type(f"{identity}: invalid {self.noun}: {error}")

@@ -11,6 +11,7 @@ import errno
 import fcntl
 import base64
 import hashlib
+import html
 import importlib.util
 import io
 import ipaddress
@@ -42,11 +43,11 @@ from functools import partial
 from http.client import HTTPConnection, RemoteDisconnected, parse_headers
 from io import BytesIO, StringIO
 from pathlib import Path
-from unittest.mock import ANY, Mock, call, patch
+from unittest.mock import ANY, Mock, ThreadingMock, call, patch
 
 
 from typing import IO, Literal, TextIO, TypedDict, cast, override
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 from xml.etree import ElementTree
@@ -61,6 +62,7 @@ from scripts.message import send_result, session_send
 from scripts.review_links.test_page_question import question_outcome
 from scripts.review_links.server_test_support import started_review_server
 from scripts.production import (
+    list_exchange,
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
     record_store, staff, the_list, tidy_wrapped, unrouted_alert, update_registration,
 )
@@ -69,10 +71,10 @@ from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import (
     console_tune, go_check, go_ledger, new_item_dialog, page_frame, page_question, question_record, record_table,
-    reply_tokens, review_link, review_submissions,
+    reply_tokens, review_events, review_link, review_submissions,
 )
 from scripts.review_links import (
-    accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
+    accounts_page, answer_sources, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
     placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, studio_page, test_review_page,
 )
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, session_folder, urgency
@@ -121,7 +123,7 @@ def write_server_config(configuration: Path) -> dict[str, str]:
     _ = write_config_fixture(configuration / "console.conf",
         "page.review.title=Review\npage.review.url=python:scripts.review_links.review_page:page_url\n"
         + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
-        + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
+        + "page.studio.items=python:scripts.review_links.list_page:waiting_updates\n"
         + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
     _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
     _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
@@ -157,9 +159,9 @@ class ServerConfigFolderTests(unittest.TestCase):
 
 
 @contextmanager
-def capture_sender(name: str) -> Generator[Mock]:
+def capture_sender(name: str) -> Generator[ThreadingMock]:
     """Capture the recipient, sender, and message of a keyed send."""
-    send = Mock()
+    send = ThreadingMock()
 
     def capture(recipient: str, sender: str, message: str, **_options: str) -> None:
         _ = cast(object, send(recipient, sender, message))
@@ -317,7 +319,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.addCleanup(thread.join, 5)
         self.addCleanup(server.shutdown)
 
-    def review_fixture(self, *, changes: int = 0, feature_project: bool = False) -> test_review_page.ReviewPageTests:
+    def review_fixture(self, *, changes: int = 0, feature_project: bool = False,
+                       list_keeper: bool = True) -> test_review_page.ReviewPageTests:
         case = test_review_page.ReviewPageTests('runTest')
         case.fixture = test_change_page.ChangePageTests("runTest")
         self.addCleanup(case.doCleanups)
@@ -326,14 +329,20 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = case.enterContext(patch("scripts.production.change_review._commit"))
         project = 'claude' if feature_project else None
         _ = case.enterContext(patch.object(feature_log, "project_of", return_value=project))
-        case.fixture.set_up_review(changes=changes)
+        case.fixture.set_up_review(changes=changes, list_keeper=list_keeper)
         case.configure_review()
         return case
+
+    def configure_list_keeper(self) -> staff.StaffRow:
+        keeper = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        return keeper
 
     def list_keeper_item(self, title: str) -> tuple[staff.StaffRow, the_list.ListItem]:
         """Add an item through a morty row that only a patched staff snapshot names."""
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
                                current_session=staff.StaffId("fixture-morty-session"))
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
         with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))):
             item = the_list.add(morty.id, title, owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
         return morty, item
@@ -417,7 +426,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     if mode == "remote" and now == finished:
                         for query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
                             with self.subTest(query=query), patch.object(self.server, "root", case.root):
-                                response = self.request(f"{list_page.PAGE_PATH}?{query}")
+                                response = self.request(f"{studio_page.PAGE_PATH}?{query}")
                                 self.assertEqual(response.status, 200)
                                 if query == list_page.COUNTS_AND_LINKS_QUERY:
                                     self.assertIn(f">{change.id}</a>".encode(), response.body)
@@ -506,7 +515,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                         self.assertEqual(len(reads), count)
 
     def test_new_item_options_and_refusals(self) -> None:
-        case = self.review_fixture()
+        case = self.review_fixture(list_keeper=False)
         owner = case.ready_submission_recipient()
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         options = self.new_item_http()
@@ -622,9 +631,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                     assert isinstance(details, new_item_dialog.ReviewSubmission)
                     self.assertEqual((item.owner, details.assignment), (producer.id, assignment))
                     row = the_list.load(morty.id, f"L{saved['list_number']}")
-                    self.assertEqual((row.owner, row.producer, row.unit, row.reviews),
+                    self.assertEqual((row.owner, row.producer, row.unit),
                                      (assignee.id if assignee else producer.id, producer.id,
-                                      assignee.name if assignee else "", (saved["key"],)))
+                                      assignee.name if assignee else ""))
+                    assert isinstance(row.report, the_list.ListReport)
+                    self.assertEqual((row.report.kind, row.report.evidence_key),
+                                     (the_list.ReportKind.INVESTIGATION, saved["key"]))
                     retry = self.new_item_http(body, finished=True)
                     self.assertEqual(retry.status, 200, retry.body)
                     self.assertEqual(json.loads(retry.body), saved)
@@ -731,7 +743,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                              (403, {"error": "Open the dialog from a console page owner."}))
 
     def test_review_owner_button_mounts_one_dialog_with_the_full_recipient_set(self) -> None:
-        case = self.review_fixture()
+        case = self.review_fixture(list_keeper=False)
         owner = case.ready_submission_recipient()
         other = fixture_member("producer", name="another-recipient")
         builds_doc = self.root / "builds.md"
@@ -741,7 +753,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         config = conf.path("console")
         _ = write_config_fixture(config, f"page.review.owner={owner.id}\npage.aws_machines.owner={aws.id}\n"
                                  + f"page.list.owner={other.id}\npage.review.label=Review\n"
-                                 + "page.aws_machines.label=AWS Machines\npage.list.label=List\n")
+                                 + "page.aws_machines.label=AWS Machines\npage.studio.label=Studio\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         with patch.object(self.server, "review_cache", cache):
             review = self.request(review_page.PAGE_PATH)
@@ -761,7 +773,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 ("review", owner, f"(why {owner.name}? because {owner.name} owns the Review page!)"),
                 ("aws_machines", builds,
                  "(why builds? because aws owns the AWS Machines page and builds is its showrunner!)"),
-                ("list", other, f"(why {other.name}? because {other.name} owns the List page!)")):
+                ("list", other, f"(why {other.name}? because {other.name} owns the Studio page!)")):
             with self.subTest(page=page):
                 options = self.new_item_http(query=f"?page={page}")
                 fields = cast(dict[str, object], json.loads(options.body))
@@ -776,21 +788,28 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(review.body.count(b'<dialog id="review-new-item"'), 1)
 
     def test_review_has_a_launcher_without_a_default_recipient(self) -> None:
-        case = self.review_fixture()
+        case = self.review_fixture(list_keeper=False)
         other = case.ready_submission_recipient()
         _ = write_config_fixture(conf.path("console"),
                                  "page.review.owner=missing-owner\nowner.default=missing-default\n")
+        producer = fixture_member("producer", name="morty")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         with patch.object(self.server, "review_cache", cache):
             review = self.request(review_page.PAGE_PATH)
             options = self.new_item_http(query="?page=review")
+            routing = self.new_item_http(query="?page=review", headers={"X-New-Item-Route": "producer"})
         self.assertEqual(review.status, 200)
         self.assertEqual(review.body.count(b'data-owner-new aria-label="New item"'), 1)
         self.assertEqual(review.body.count(b'<dialog id="review-new-item"'), 1)
         self.assertEqual(options.status, 200)
         fields = cast(dict[str, object], json.loads(options.body))
         self.assertEqual((fields["page_owner"], fields["page_owner_reason"]), ("", ""))
-        self.assertEqual(fields["recipients"], [{"id": other.id, "name": other.name, "proposal": True}])
+        self.assertCountEqual(cast(list[dict[str, object]], fields["recipients"]),
+                              [{"id": row.id, "name": row.name, "proposal": True} for row in (other, producer)])
+        self.assertEqual(routing.status, 200)
+        defaults = cast(dict[str, object], json.loads(routing.body))
+        self.assertEqual((defaults["page_owner"], defaults["page_assignee"]), ("", ""))
+        self.assertEqual(defaults["recipients"], [{"id": producer.id, "name": producer.name, "proposal": True}])
 
     def test_page_proposal_refuses_a_showrunner_with_a_native_folder(self) -> None:
         case = self.review_fixture()
@@ -816,9 +835,9 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_list_replays_a_draft_after_the_selected_recipient_disappears(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
-        _ = self.map_list_recipient(owner.id)
+        keeper = self.map_list_recipient(owner.id)
         other = fixture_member("producer", name="another-recipient")
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, other.id),
                           page="list", request_id="r6-" + uuid4().hex,
@@ -833,7 +852,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             members = staff.local_snapshot()
             _ = staff.record_path().write_text(replace(members, pending_retire=(other.id,)).encode())
             options = cast(dict[str, object], json.loads(self.new_item_http(query="?page=list").body))
-            self.assertEqual(options["page_owner"], owner.id)
+            self.assertEqual(options["page_owner"], keeper.id)
             recipients = cast(list[dict[str, object]], options["recipients"])
             self.assertNotIn(other.id, [row["id"] for row in recipients])
             response = self.new_item_http(self.new_item_body(request), finished=True)
@@ -846,6 +865,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(the_list.records(other.id), [])
         self.assertEqual(investigation.records(owner.id), [])
         self.assertEqual(the_list.records(owner.id), [])
+        row, = the_list.records(keeper.id)
+        self.assertEqual(row.owner, other.id)
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual(row.report.evidence_key, saved["key"])
 
     @contextmanager
     def lose_list_send_response(self) -> Generator[list[Mapping[str, object]]]:
@@ -866,8 +889,8 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_list_draft_with_edited_words_returns_the_item_from_the_lost_reply(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
-        _ = self.map_list_recipient(owner.id)
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        keeper = self.map_list_recipient(owner.id)
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
                           page="list", request_id="r6-" + uuid4().hex)
@@ -891,12 +914,16 @@ class ReviewLinksServerTests(unittest.TestCase):
         original, = investigation.records(owner.id)
         self.assertEqual(original.question, request.words)
         self.assertEqual(the_list.records(owner.id), [])
+        row, = the_list.records(keeper.id)
+        self.assertEqual(row.owner, owner.id)
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual(row.report.evidence_key, saved["key"])
 
     def test_concurrent_list_sends_of_one_draft_file_one_item(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
-        _ = self.map_list_recipient(owner.id)
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        keeper = self.map_list_recipient(owner.id)
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
                           page="list", request_id="r6-" + uuid4().hex)
@@ -931,6 +958,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         original, = investigation.records(owner.id)
         self.assertEqual(original.id, first_fields["id"])
         self.assertEqual(the_list.records(owner.id), [])
+        row, = the_list.records(keeper.id)
+        self.assertEqual(row.owner, owner.id)
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual(row.report.evidence_key, first_fields["key"])
 
     def test_list_retry_recovers_delivery_after_the_capture_expires(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
@@ -938,7 +969,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
         morty = self.map_list_recipient(owner.id)
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
                           page="list", request_id="r6-" + uuid4().hex,
@@ -975,7 +1006,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         self.assertEqual(saved["id"], original.id)
         row, = the_list.records(morty.id)
-        self.assertEqual((row.number, row.reviews), (saved["list_number"], (saved["key"],)))
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual((row.number, row.report.evidence_key), (saved["list_number"], saved["key"]))
         self.assertEqual(the_list.records(owner.id), [])
         self.assertEqual(investigation.records(owner.id), [original])
         self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
@@ -1056,6 +1088,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             for index, (page, path) in enumerate(pages.items(), start=800):
                 with self.subTest(page=page):
                     response = self.request(path)
+                    if page == "list":
+                        self.assertEqual(response.status, 303)
+                        self.assertEqual(response.headers["location"], studio_page.PAGE_PATH)
+                        response = self.request(response.headers["location"])
                     self.assertEqual(response.status, 200, response.body)
                     # The Studio document keeps the List New item flow.
                     owner_page = serve.CONSOLE_DOCUMENTS.get(path, page)
@@ -1128,6 +1164,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
         other = fixture_member("producer", name="another-recipient")
+        keeper = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, other.id),
@@ -1145,6 +1182,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual((item.owner, item.type), (other.id, review_items.ReviewType.INVESTIGATION))
         filed, = investigation.records(other.id)
         self.assertEqual(filed.question, request.words)
+        row, = the_list.records(keeper.id)
+        self.assertEqual((row.number, row.owner), (saved["list_number"], other.id))
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual(row.report.evidence_key, saved["key"])
         self.assertEqual(investigation.records(owner.id), [])
 
     def held_http(self, method: str, path: str, body: bytes | None = None, *,
@@ -1290,6 +1331,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             result = f"{send_hold.HOLD_PATH}/{hold_id}"
             self.assertEqual(self.held_http("GET", result, headers={"Origin": "https://elsewhere.invalid"})[0], 403)
             self.assertEqual(self.held_http("GET", result)[::2], (404, {"reason": "This send was undone."}))
+            self.assertEqual(self.request(result).headers.get("x-send-hold-outcome"), "undone")
+            missing = self.request(f"{send_hold.HOLD_PATH}/{send_hold.new_hold_id()}")
+            self.assertEqual((missing.status, missing.headers.get("x-send-hold-outcome")), (404, "missing"))
             send.assert_not_called()
         self.assertEqual(investigation.records(other.id), [])
         self.assertEqual(self.hold_states(), ["undone"])
@@ -1326,7 +1370,8 @@ class ReviewLinksServerTests(unittest.TestCase):
             status, _, saved = self.held_http("GET", hold)
             self.assertEqual(status, 200, saved)
             row, = the_list.records(morty.id)
-            self.assertEqual((saved["list_number"], saved["key"]), (row.number, row.reviews[0]))
+            assert isinstance(row.report, the_list.ListReport)
+            self.assertEqual((saved["list_number"], saved["key"]), (row.number, row.report.evidence_key))
             notice, = read_new_item_notices(notices)
             self.assertEqual(notice["rows"], [row.id])
 
@@ -1431,6 +1476,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_a_held_review_answer_reports_a_delivery_failure_after_saving(self) -> None:
         case = self.review_fixture(changes=1)
+        keeper = fixture_member('producer', name='morty')
         key = "page-owner/C1"
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
@@ -1448,33 +1494,38 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertFalse(answer["delivery_pending"])
         rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
         self.assertEqual(rows["C1"]["Verdict"], "not works: The proof failed.")
+        item, = the_list.records(keeper.id)
+        assert isinstance(item.report, the_list.ListReport)
+        self.assertEqual((item.report.kind, item.report.words), (the_list.ReportKind.CHANGE, 'The proof failed.'))
 
     def test_list_owner_control_and_sends_use_the_configured_producer(self) -> None:
         case = self.review_fixture()
         default = case.ready_submission_recipient()
         morty = fixture_member("producer", name="morty")
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\nowner.default={default.id}\n")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\npage.studio.owner={morty.id}\nowner.default={default.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        listing = self.request(list_page.PAGE_PATH)
+        listing = self.request(studio_page.PAGE_PATH)
         self.assertEqual(listing.status, 200)
-        self.assertIn(b'data-page-owner="list"', listing.body)
+        self.assertIn(b'data-page-owner="studio"', listing.body)
         self.assertNotIn(b'data-list-new', listing.body)
         self.assertEqual(listing.body.count(b'data-owner-new aria-label='), 1)
-        owner_control = listing.body.partition(b'data-page-owner="list">')[2].partition(b"</div>")[0]
+        owner_control = listing.body.partition(b'data-page-owner="studio">')[2].partition(b"</div>")[0]
         self.assertRegex(owner_control, rb'data-color-text="role.producer"[^>]*>morty</span>')
         self.assertIn(b'aria-label="New item for morty"', listing.body)
         self.assertEqual(listing.body.count(b'<dialog id="review-new-item"'), 1)
-        options = self.new_item_http(query="?page=list")
+        options = self.new_item_http(query="?page=studio")
         self.assertEqual(options.status, 200)
         fields = cast(dict[str, object], json.loads(options.body))
         expected = [{"id": morty.id, "name": "morty", "proposal": True},
                     {"id": default.id, "name": default.name, "proposal": True}]
         self.assertEqual(fields["page_owner"], morty.id)
         self.assertCountEqual(cast(list[dict[str, object]], fields["recipients"]), expected)
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={default.id}\nowner.default={default.id}\n")
-        current_options = cast(dict[str, object], json.loads(self.new_item_http(query="?page=list").body))
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\npage.studio.owner={default.id}\nowner.default={default.id}\n")
+        current_options = cast(dict[str, object], json.loads(self.new_item_http(query="?page=studio").body))
         self.assertEqual(current_options["page_owner"], default.id)
         self.assertCountEqual(cast(list[dict[str, object]], current_options["recipients"]), expected)
+        legacy_options = cast(dict[str, object], json.loads(self.new_item_http(query="?page=list").body))
+        self.assertEqual(legacy_options["page_owner"], morty.id)
 
         producer = fixture_member("producer", name="list-producer")
         with (patch.object(self.server, "review_cache", cache),
@@ -1487,6 +1538,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(the_list.records(morty.id), [])
             send.assert_not_called()
 
+            _ = write_config_fixture(conf.path("console"), f"page.list.owner={producer.id}\n")
             cases = (
                 (new_item_dialog.SubmissionKind.QUESTION, review_items.ReviewType.QUESTION, morty),
                 (new_item_dialog.SubmissionKind.INVESTIGATION, review_items.ReviewType.INVESTIGATION, morty),
@@ -1510,10 +1562,15 @@ class ReviewLinksServerTests(unittest.TestCase):
                     repeated = cast(dict[str, str], json.loads(retry.body))
                     self.assertEqual(repeated, saved | {"version": repeated["version"]})
                     number = saved["list_number"]
-                    row = the_list.load(morty.id, f"L{number}")
-                    self.assertEqual((row.owner, row.producer, row.reviews),
-                                     (recipient.id, recipient.id, (saved["key"],)))
+                    row = the_list.load(producer.id, f"L{number}")
+                    self.assertEqual((row.owner, row.producer), (recipient.id, recipient.id))
+                    if kind in (new_item_dialog.SubmissionKind.BUG, new_item_dialog.SubmissionKind.INVESTIGATION):
+                        assert isinstance(row.report, the_list.ListReport)
+                        self.assertEqual(row.report.evidence_key, saved["key"])
+                    else:
+                        self.assertEqual(row.reviews, (saved["key"],))
                     send.assert_called_once_with(f"session:{recipient.current_session}", change_page.SENDER, ANY)
+        self.assertEqual(the_list.records(morty.id), [])
 
     def test_new_item_command_files_through_the_handler_and_makes_its_list_item(self) -> None:
         _ = self.check_new_item_command()
@@ -1533,7 +1590,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                 item = self.check_new_item_command(fail_retry=True, change_mapping=change_mapping)
                 first, = responses
                 self.assertEqual(first["list_number"], item.number)
-                self.assertEqual(first["key"], item.reviews[0])
+                assert isinstance(item.report, the_list.ListReport)
+                self.assertEqual(first["key"], item.report.evidence_key)
 
     def test_enhancement_command_files_and_prefixes_the_list_title_at_the_word_limit(self) -> None:
         first_line = "Show the next check in the row."
@@ -1549,20 +1607,25 @@ class ReviewLinksServerTests(unittest.TestCase):
                 fail_retry=True, kind=new_item.ItemType.ENHANCEMENT, review_type=review_items.ReviewType.INVESTIGATION,
                 words=words, filed_words=f"Enhancement: {words}")
         first, = responses
-        self.assertEqual((first["list_number"], first["key"]), (item.number, item.reviews[0]))
+        assert isinstance(item.report, the_list.ListReport)
+        self.assertEqual((first["list_number"], first["key"]), (item.number, item.report.evidence_key))
 
     def test_new_item_command_reuses_a_draft_filed_without_a_notice(self) -> None:
         with self.lose_list_send_response() as responses:
             item = self.check_new_item_command(fail_retry=True, legacy_notice=True)
         first, = responses
-        self.assertEqual((first["list_number"], first["key"]), (item.number, item.reviews[0]))
+        assert isinstance(item.report, the_list.ListReport)
+        self.assertEqual((first["list_number"], first["key"]), (item.number, item.report.evidence_key))
 
     def test_new_item_command_saves_the_link_with_the_row(self) -> None:
         with patch.object(the_list, "link", side_effect=OSError("No space left on device")) as link:
             item = self.check_new_item_command()
         link.assert_not_called()
-        key, = item.reviews
-        self.assertIn(urlencode({"jump": key}), item.evidence)
+        assert isinstance(item.report, the_list.ListReport)
+        evidence = investigation.list_evidence_record(item.report.evidence_key)
+        destination = evidence.list_destination
+        assert isinstance(destination, investigation.ListDestination)
+        self.assertEqual(the_list.load(destination.keeper, f"L{destination.number}"), item)
 
     def check_new_item_command(
         self, *, fail_retry: bool = False, change_mapping: bool = False, kind: new_item.ItemType = new_item.ItemType.BUG,
@@ -1689,9 +1752,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(output.getvalue(),
                          f"{kind.capitalize()} → {unit.name}, a unit of {owner.name}.{producer_line} "
                          + f"List item {item.number}.\n")
-        self.assertEqual((item.title, item.owner, item.producer, item.unit, item.reviews),
-                         (title, unit.id, producer.id, unit.name, (key,)))
-        self.assertEqual(item.latest_status, filed_words)
+        self.assertEqual((item.title, item.owner, item.producer, item.unit), (title, unit.id, producer.id, unit.name))
+        if kind is new_item.ItemType.PROPOSAL:
+            self.assertIs(item.report, the_list.NoListReport.ABSENT)
+            self.assertEqual((item.reviews, item.latest_status), ((key,), words))
+        else:
+            assert isinstance(item.report, the_list.ListReport)
+            self.assertEqual((item.report.evidence_key, item.report.words), (key, words))
         return item
 
     def test_restart_recovers_a_list_notice_after_the_row_exists(self) -> None:
@@ -1704,6 +1771,667 @@ class ReviewLinksServerTests(unittest.TestCase):
                                                 authority_unavailable=scenario == "authority unavailable",
                                                 answered_marker=scenario == "staff unavailable with answered marker")
 
+    def test_restart_files_a_studio_question_before_claiming_its_notice(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        body = self.new_item_body(request)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO())):
+            with patch.object(the_list, "_save", side_effect=OSError("The List write stopped.")):
+                self.assertEqual(self.new_item_http(body, finished=True).status, 503)
+            self.assertEqual(the_list.records(keeper.id), [])
+            self.assertEqual(read_new_item_notices(log), [])
+            pending, = review_submissions.pending_initial_deliveries(case.root)
+            restarted = change_page.DeliveryStatus(case.root)
+            with patch.object(restarted, "write_slots", side_effect=OSError("The notice claim stopped.")):
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            item, = the_list.records(keeper.id)
+            source = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE,
+                                                 f"submission/question/{pending.address.request_id}")
+            self.assertEqual(item.native_question, source)
+            self.assertIs(item.state, the_list.ItemState.WORKING)
+            self.assertIs(the_list.question_item_exchanges(item)[0].answer, list_exchange.QuestionWithoutAnswer.OPEN)
+            self.assertEqual(read_new_item_notices(log), [])
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            with patch.object(self.server, "delivery_status", restarted):
+                self.assertEqual(self.new_item_http(body, finished=True).status, 200)
+        self.assertEqual(the_list.records(keeper.id), [item])
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [item.id])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_restart_defers_the_studio_notice_until_the_saved_question_returns(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        backup = self.root / "question-backup.md"
+        save_row = the_list._save  # pyright: ignore[reportPrivateUsage]
+
+        def remove_question_after_save(store: record_store.NumberedRecords, item: the_list.ListItem) -> None:
+            save_row(store, item)
+            _ = saved.path.rename(backup)
+
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO())):
+            with patch.object(the_list, "_save", side_effect=remove_question_after_save):
+                response = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(response.status, 503, response.body)
+            item, = the_list.records(keeper.id)
+            self.assertIs(item.native_question, the_list.NoQuestionItem.ORDINARY)
+            self.assertFalse(saved.path.exists())
+            pending, = review_submissions.pending_initial_deliveries(case.root)
+            restarted = change_page.DeliveryStatus(case.root)
+            with patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim:
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                claim.assert_not_called()
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(read_new_item_notices(log), [])
+            _ = backup.rename(saved.path)
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        typed, = the_list.records(keeper.id)
+        self.assertEqual(typed.id, item.id)
+        self.assertEqual(typed.native_question, the_list.NativeQuestionItem(
+            the_list.QuestionItemKind.FROM_NATE, f"submission/question/{pending.address.request_id}"))
+        self.assertEqual(len(read_new_item_notices(log)), 1)
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_move_review_wait_defers_a_staged_studio_question_before_reservation(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        self.assertIsInstance(review_submissions.list_filing_route(saved), dict)
+        self.assertFalse(reservation.exists())
+        before = saved.path.read_bytes()
+        members = staff.snapshot()
+        card = review_items.submission_item(saved, members)
+        self.assertTrue(review_items.can_move_wait(card))
+        self.assertEqual(the_list.move_review_waits(case.root, members), [])
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
+        self.assertEqual(saved.path.read_bytes(), before)
+        self.assertFalse(reservation.exists())
+
+        native = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE,
+                                             f"submission/question/{saved.request_id}")
+        load = the_list.load
+        confirmed: set[int] = set()
+
+        def read_row(keeper_id: staff.StaffId, identity: str, *, sources: list[Path] | None = None) -> the_list.ListItem:
+            row = load(keeper_id, identity, sources=sources)
+            if row.native_question == native and not read_new_item_notices(log):
+                confirmed.add(row.number)
+            return row
+
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              new_item_notice_log(self.root, keeper.id) as log,
+              patch.object(the_list, "load", side_effect=read_row)):
+            response = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual(response.status, 200, response.body)
+        receipt = cast(dict[str, object], json.loads(response.body))
+        row, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(confirmed, {row.number})
+        self.assertEqual(receipt["list_number"], row.number)
+        self.assertEqual(the_list.review_reservation(reservation), investigation.ListDestination(keeper.id, row.number))
+        self.assertEqual(row.native_question, native)
+        self.assertIs(row.state, the_list.ItemState.WORKING)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [row.id])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_studio_question_notice_stays_pending_if_a_legacy_move_saved_an_ordinary_report(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        backup = route.rename(route.with_suffix(".bak"))
+        destination, = the_list.move_review_waits(case.root, staff.snapshot())
+        _ = backup.rename(route)
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()) as errors,
+              patch.object(case.status, "write_slots", wraps=case.status.write_slots) as claim):
+            response = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(response.status, 503, response.body)
+            review_actions.recover_submission_deliveries(case.status, review_page.PAGE_PATH)
+            claim.assert_not_called()
+        self.assertIn(f"Cannot confirm the question source for L{destination.number}.", errors.getvalue())
+        self.assertEqual(read_new_item_notices(log), [])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+        self.assertFalse(reservation.exists())
+        row, = the_list.records(destination.keeper, include_closed=True)
+        self.assertEqual(row.number, destination.number)
+        self.assertIsInstance(row.report, the_list.ListReport)
+        self.assertIs(row.native_question, the_list.NoQuestionItem.ORDINARY)
+
+    def test_studio_valid_route_requires_a_native_row_when_the_keeper_is_lost(self) -> None:
+        self.check_studio_question_fallback_with_an_ordinary_report("valid")
+
+    def test_studio_unavailable_route_requires_a_native_row_before_fallback(self) -> None:
+        self.check_studio_question_fallback_with_an_ordinary_report("unavailable")
+
+    def test_studio_skipped_route_requires_a_native_row_before_the_first_claim(self) -> None:
+        self.check_studio_question_fallback_with_an_ordinary_report("skipped")
+
+    def check_studio_question_fallback_with_an_ordinary_report(
+            self, route_state: Literal["valid", "unavailable", "skipped"]) -> None:
+        case = self.review_fixture()
+        keeper = fixture_member("producer", name="recovering-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        owner = fixture_member("producer", name="layout-owner")
+        retired = staff.RetiredProducer("claude:sonnet:high")
+        if route_state != "valid":
+            _ = staff.set_producer_retirement(keeper.id, retired)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        if route_state == "skipped":
+            with (redirect_stderr(StringIO()),
+                  patch.object(case.status, "write_slots", side_effect=OSError("The notice claim stopped.")) as claim):
+                review_actions.recover_submission_deliveries(case.status, review_page.PAGE_PATH)
+                claim.assert_called_once()
+        match route_state:
+            case "valid":
+                self.assertIsInstance(review_submissions.list_filing_route(saved), dict)
+            case "unavailable":
+                self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.ListFilingUnavailable)
+            case "skipped":
+                self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.NoListFiling)
+
+        # Hide the route to reproduce a move from before the Studio filing guard.
+        _ = staff.set_producer_retirement(keeper.id, staff.Active())
+        backup = route.rename(route.with_suffix(".bak"))
+        destination, = the_list.move_review_waits(case.root, staff.snapshot())
+        _ = backup.rename(route)
+        row, = the_list.records(destination.keeper, include_closed=True)
+        self.assertEqual(row.number, destination.number)
+        self.assertIsInstance(row.report, the_list.ListReport)
+        self.assertIs(row.native_question, the_list.NoQuestionItem.ORDINARY)
+
+        _ = staff.set_producer_retirement(keeper.id, retired)
+        self.assertIsNone(record_store.list_keeper(conf.read_or_repository("console"), staff.snapshot()))
+        before = route.read_bytes()
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()) as errors,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_not_called()
+        self.assertIn(f"Cannot confirm the question source for L{destination.number}.", errors.getvalue())
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+        self.assertEqual(route.read_bytes(), before)
+        self.assertEqual(the_list.records(destination.keeper, include_closed=True), [row])
+        self.assertEqual(read_new_item_notices(log), [])
+        self.assertFalse(reservation.exists())
+
+    def test_studio_defers_fallback_until_the_only_linked_question_row_reads(self) -> None:
+        case = self.review_fixture()
+        keeper = fixture_member("producer", name="recovering-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        review_key = review_items.submission_review_key(saved)
+        number = the_list.add_review_item(keeper.id, "Choose a layout", owner=owner.id, producer=owner.id, unit="",
+            words=saved.words, evidence=review_page.PAGE_PATH + "#" + urlencode({"jump": review_key}),
+            review_key=review_key, source="nate via New item", reservation=self.root / "legacy-number")
+        destination = investigation.ListDestination(keeper.id, number)
+        key = f"submission/question/{saved.request_id}"
+        native = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE, key)
+        exchange = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "initial",
+            list_exchange.Direction.ANSWER_TO_NATE, saved.words, the_list.now(), list_exchange.Nate.USER,
+            owner.id, list_exchange.QuestionWithoutAnswer.OPEN)
+        with the_list.lock_exchange_source(key) as source:
+            self.assertEqual(the_list.file_exchanges(source, (exchange,), "Choose a layout", linked=destination,
+                owner=owner.id, members=staff.snapshot(), submission_question=native), destination)
+            # Keep the destination proof only in the List row.
+            source.reservation.unlink()
+            source.reservation.with_suffix(".saved").unlink()
+        self.assertFalse(reservation.exists())
+        self.assertIs(the_list.exchange_reservation(key), the_list.NextNumber.AVAILABLE)
+        row, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(the_list.original_question_link(row), review_key)
+        self.assertEqual(row.native_question, native)
+
+        _ = staff.set_producer_retirement(keeper.id, staff.RetiredProducer("claude:sonnet:high"))
+        before = route.read_bytes()
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            with (patch.object(the_list, "load", side_effect=the_list.ListError("The row read failed.")) as load,
+                  redirect_stderr(StringIO()) as errors):
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                load.assert_called_once_with(keeper.id, row.id)
+            claim.assert_not_called()
+            self.assertEqual(errors.getvalue().splitlines(), [
+                f"Review first message {saved.request_id}: Incomplete List destination check for {key}: "
+                + f"{keeper.id}/{row.id}: The row read failed."])
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(route.read_bytes(), before)
+            self.assertEqual(read_new_item_notices(log), [])
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [row.id])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+        self.assertEqual(route.read_bytes(), before)
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [row])
+
+    def test_studio_rechecks_an_unavailable_question_route_after_the_keeper_returns(self) -> None:
+        self.check_studio_question_route_recovery(save_fallback=False)
+
+    def test_studio_active_keeper_reuses_the_legacy_row_after_repair(self) -> None:
+        self.check_studio_legacy_row_read_failure("invalid row")
+
+    def test_studio_active_keeper_defers_after_a_filesystem_read_error(self) -> None:
+        self.check_studio_legacy_row_read_failure("read error")
+
+    def check_studio_legacy_row_read_failure(self, failure: Literal["invalid row", "read error"]) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        review_key = review_items.submission_review_key(saved)
+        number = the_list.add_review_item(keeper.id, "Choose a layout", owner=owner.id, producer=owner.id, unit="",
+            words=saved.words, evidence=review_page.PAGE_PATH + "#" + urlencode({"jump": review_key}),
+            review_key=review_key, source="nate via New item", reservation=self.root / "legacy-number")
+        identity = f"L{number}"
+        folder = the_list.folder(keeper.id)
+        row = folder / f"{identity}.md"
+        before = row.read_bytes()
+        counter = (folder / ".next-number").read_bytes()
+        original_route = route.read_bytes()
+        original_question = saved.path.read_bytes()
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        restarted = change_page.DeliveryStatus(case.root)
+        if failure == "invalid row":
+            _ = row.write_bytes(b"Invalid List row.\n")
+        failing_read = (patch.object(the_list, "load", side_effect=PermissionError("The row read failed."))
+                        if failure == "read error" else nullcontext())
+        with (new_item_notice_log(self.root, keeper.id) as log,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            with failing_read, redirect_stderr(StringIO()) as errors:
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_not_called()
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            self.assertIn("Incomplete List destination check", errors.getvalue())
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(route.read_bytes(), original_route)
+            self.assertEqual(saved.path.read_bytes(), original_question)
+            self.assertEqual((folder / ".next-number").read_bytes(), counter)
+            self.assertEqual(list(folder.glob("L*.md")), [row])
+            self.assertFalse(reservation.exists())
+            self.assertEqual(read_new_item_notices(log), [])
+            self.assertEqual(row.read_bytes(), b"Invalid List row.\n" if failure == "invalid row" else before)
+            _ = row.write_bytes(before)
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        item, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(item.id, identity)
+        self.assertEqual(item.native_question, the_list.NativeQuestionItem(
+            the_list.QuestionItemKind.FROM_NATE, f"submission/question/{saved.request_id}"))
+        self.assertEqual((folder / ".next-number").read_bytes(), counter)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [identity])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_studio_defers_fallback_for_a_broken_list_folder_symlink(self) -> None:
+        case = self.review_fixture()
+        keeper = fixture_member("producer", name="recovering-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        before = route.read_bytes()
+        original = saved.path.read_bytes()
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        folder = the_list.folder(keeper.id)
+        folder.parent.mkdir(parents=True, exist_ok=True)
+        target = self.root / "missing-list-folder"
+        folder.symlink_to(target, target_is_directory=True)
+        _ = staff.set_producer_retirement(keeper.id, staff.RetiredProducer("claude:sonnet:high"))
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()) as errors,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_not_called()
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            self.assertIn("Incomplete List destination check", errors.getvalue())
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(route.read_bytes(), before)
+            self.assertEqual(saved.path.read_bytes(), original)
+            self.assertFalse(reservation.exists())
+            self.assertEqual(folder.readlink(), target)
+            self.assertFalse(target.exists())
+            self.assertEqual(read_new_item_notices(log), [])
+            target.mkdir()
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.NoListFiling)
+        self.assertEqual(list(target.iterdir()), [])
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_numeric_studio_reservation_defers_a_conflicting_current_link(self) -> None:
+        case = self.review_fixture()
+        former = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        original_route = route.read_bytes()
+        original_question = saved.path.read_bytes()
+        _ = reservation.write_text("1\n")
+
+        distinct = fixture_member("producer", name="other-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={distinct.id}\n")
+        row = the_list.add(distinct.id, "Other item", owner=owner.id, source="nate", changes={})
+        key = review_items.submission_review_key(saved)
+        row = the_list.link(distinct.id, row.id, (key,), source="nate")
+        self.assertEqual(row.number, 1)
+        restarted = change_page.DeliveryStatus(case.root)
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        with (new_item_notice_log(self.root, former.id) as log,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            with redirect_stderr(StringIO()) as errors:
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_not_called()
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            self.assertIn("the List reservation conflicts with another destination", errors.getvalue())
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(reservation.read_text(), "1\n")
+            self.assertEqual(route.read_bytes(), original_route)
+            self.assertEqual(saved.path.read_bytes(), original_question)
+            self.assertEqual(the_list.records(former.id, include_closed=True), [])
+            self.assertEqual(the_list.records(distinct.id, include_closed=True), [row])
+            self.assertEqual(read_new_item_notices(log), [])
+
+            _ = the_list.unlink(distinct.id, row.id, (key,), source="nate")
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        self.assertEqual(the_list.review_reservation(reservation), investigation.ListDestination(former.id, 1))
+        self.assertEqual(len(read_new_item_notices(log)), 1)
+
+    def test_numeric_studio_reservation_keeps_its_item_after_another_item_links(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        review_actions.ensure_submission_list_item(saved.address)
+        original, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(original.number, 1)
+        reservation = review_submissions.list_filing_reservation(saved)
+        _ = reservation.write_text("1\n")
+        other = the_list.add(keeper.id, "Other item", owner=owner.id, source="nate", changes={})
+        other = the_list.link(keeper.id, other.id, (review_items.submission_review_key(saved),), source="nate")
+        self.assertEqual(other.number, 2)
+        destination = investigation.ListDestination(keeper.id, original.number)
+        linked = investigation.ListDestination(keeper.id, other.number)
+        self.assertEqual(the_list.review_reservation(reservation, source_destinations=(destination,),
+                                                     current_links=(destination, linked)), destination)
+
+        restarted = change_page.DeliveryStatus(case.root)
+        with new_item_notice_log(self.root, keeper.id) as log:
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [original.id, other.id])
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [original, other])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_studio_publishes_the_reserved_row_after_another_item_links(self) -> None:
+        for reservation_format in ("numeric", "typed"):
+            with self.subTest(reservation_format=reservation_format):
+                case = self.review_fixture()
+                keeper = self.configure_list_keeper()
+                owner = fixture_member("producer", name="layout-owner")
+                request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                                  page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+                saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+                reservation = review_submissions.list_filing_reservation(saved)
+                destination = investigation.ListDestination(keeper.id, 1)
+                pending, = review_submissions.pending_initial_deliveries(case.root)
+                restarted = change_page.DeliveryStatus(case.root)
+                with new_item_notice_log(self.root, keeper.id) as log:
+                    with (patch.object(the_list, "_save", side_effect=OSError("The row write stopped.")),
+                          redirect_stderr(StringIO()) as errors):
+                        review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                    self.assertIn("The row write stopped.", errors.getvalue())
+                    self.assertEqual(reservation.read_text(), destination.encode() + "\n")
+                    self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
+                    self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+                    self.assertEqual(read_new_item_notices(log), [])
+                    if reservation_format == "numeric":
+                        _ = reservation.write_text("1\n")
+                    other = the_list.add(keeper.id, "Other item", owner=owner.id, source="nate", changes={})
+                    other = the_list.link(keeper.id, other.id, (review_items.submission_review_key(saved),), source="nate")
+                    self.assertEqual(other.number, 2)
+
+                    review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                    review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                item, linked = the_list.records(keeper.id, include_closed=True)
+                self.assertEqual(the_list.review_reservation(reservation), destination)
+                self.assertEqual(item.number, destination.number)
+                self.assertEqual(item.native_question, the_list.NativeQuestionItem(
+                    the_list.QuestionItemKind.FROM_NATE, f"submission/question/{saved.request_id}"))
+                self.assertEqual(linked, other)
+                notice, = read_new_item_notices(log)
+                self.assertEqual(notice["rows"], [item.id, other.id])
+                self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_studio_claim_accepts_exchange_readback_through_an_alias(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        review_actions.ensure_submission_list_item(saved.address)
+        row, = the_list.records(keeper.id, include_closed=True)
+        reservation = review_submissions.list_filing_reservation(saved)
+        destination = investigation.ListDestination(keeper.id, row.number)
+        before = reservation.read_bytes()
+        alias = staff.StaffId("000-list-alias")
+        alias_folder = the_list.folder(alias)
+        alias_folder.parent.mkdir(parents=True)
+        alias_folder.symlink_to(the_list.folder(keeper.id), target_is_directory=True)
+        entry, = list_page.records(include_closed=True)
+        self.assertEqual(entry.keeper, alias)
+        file_source = answer_sources.file_source
+
+        def readback(plan: answer_sources.FilingPlan, members: staff.StaffSnapshot,
+                     reload: answer_sources.ReloadExchanges) -> investigation.ListDestination | answer_sources.NoExchangeFiling:
+            filed = file_source(plan, members, reload)
+            self.assertIsInstance(filed, investigation.ListDestination)
+            return entry.destination
+
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log,
+              patch.object(answer_sources, "file_source", side_effect=readback) as file):
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        file.assert_called_once()
+        self.assertEqual(the_list.review_reservation(reservation), destination)
+        self.assertEqual(reservation.read_bytes(), before)
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [row])
+        self.assertEqual(len(read_new_item_notices(log)), 1)
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_studio_preserves_a_broken_reserved_row_symlink(self) -> None:
+        self.check_studio_reserved_row_recovery("broken symlink")
+
+    def test_studio_resumes_a_valid_reservation_with_no_row(self) -> None:
+        self.check_studio_reserved_row_recovery("absent row")
+
+    def check_studio_reserved_row_recovery(self, failure: Literal["broken symlink", "absent row"]) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        route = reservation.with_name("list-filing.json")
+        before = route.read_bytes()
+        original = saved.path.read_bytes()
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()) as errors,
+              patch.object(restarted, "write_slots", wraps=restarted.write_slots) as claim):
+            with patch.object(the_list, "_save", side_effect=OSError("The row write stopped.")):
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_not_called()
+            destination = the_list.review_reservation(reservation)
+            assert isinstance(destination, investigation.ListDestination)
+            number = destination.number
+            folder = the_list.folder(keeper.id)
+            counter = (folder / ".next-number").read_bytes()
+            row = folder / f"L{number}.md"
+            self.assertEqual(list(folder.glob("L*.md")), [])
+            if failure == "broken symlink":
+                target = self.root / "missing-list-row.md"
+                row.symlink_to(target)
+                _ = errors.truncate(0)
+                _ = errors.seek(0)
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                claim.assert_not_called()
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn("Incomplete List destination check", errors.getvalue())
+                self.assertEqual(row.readlink(), target)
+                self.assertFalse(target.exists())
+                row.unlink()
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+            self.assertEqual(route.read_bytes(), before)
+            self.assertEqual(saved.path.read_bytes(), original)
+            self.assertEqual((folder / ".next-number").read_bytes(), counter)
+            self.assertEqual(the_list.review_reservation(reservation), destination)
+            self.assertEqual(read_new_item_notices(log), [])
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        item, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(item.number, number)
+        self.assertEqual(item.native_question, the_list.NativeQuestionItem(
+            the_list.QuestionItemKind.FROM_NATE, f"submission/question/{saved.request_id}"))
+        self.assertEqual((folder / ".next-number").read_bytes(), counter)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [item.id])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_studio_rechecks_a_skipped_question_route_before_the_first_claim(self) -> None:
+        self.check_studio_question_route_recovery(save_fallback=True)
+
+    def check_studio_question_route_recovery(self, *, save_fallback: bool) -> None:
+        case = self.review_fixture()
+        keeper = fixture_member("producer", name="recovering-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        owner = fixture_member("producer", name="layout-owner")
+        _ = staff.set_producer_retirement(keeper.id, staff.RetiredProducer("claude:sonnet:high"))
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.ListFilingUnavailable)
+        pending, = review_submissions.pending_initial_deliveries(case.root)
+        before = saved.path.read_bytes()
+        restarted = change_page.DeliveryStatus(case.root)
+        with (new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()),
+              patch.object(restarted, "write_slots", side_effect=OSError("The notice claim stopped.")) as claim):
+            if save_fallback:
+                review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                claim.assert_called_once()
+                self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.NoListFiling)
+                self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
+                self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+                claim.reset_mock()
+            _ = staff.set_producer_retirement(keeper.id, staff.Active())
+            members = staff.snapshot()
+            self.assertTrue(review_items.can_move_wait(review_items.submission_item(saved, members)))
+            self.assertEqual(the_list.move_review_waits(case.root, members), [])
+            self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
+            self.assertEqual(saved.path.read_bytes(), before)
+            self.assertFalse(reservation.exists())
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            claim.assert_called_once()
+            self.assertEqual(read_new_item_notices(log), [])
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [pending])
+
+        row, = the_list.records(keeper.id, include_closed=True)
+        self.assertEqual(the_list.review_reservation(reservation), investigation.ListDestination(keeper.id, row.number))
+        self.assertEqual(row.native_question, the_list.NativeQuestionItem(
+            the_list.QuestionItemKind.FROM_NATE, f"submission/question/{saved.request_id}"))
+        self.assertIs(row.state, the_list.ItemState.WORKING)
+        self.assertEqual(saved.path.read_bytes(), before)
+        with new_item_notice_log(self.root, keeper.id) as log:
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [row.id])
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [row])
+        self.assertEqual(list(review_submissions.pending_initial_deliveries(case.root)), [])
+
+    def test_studio_keeps_a_claimed_review_only_question_after_the_keeper_returns(self) -> None:
+        case = self.review_fixture()
+        keeper = fixture_member("producer", name="recovering-keeper")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        owner = fixture_member("producer", name="layout-owner")
+        _ = staff.set_producer_retirement(keeper.id, staff.RetiredProducer("claude:sonnet:high"))
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          page="studio", page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        saved = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
+        reservation = review_submissions.list_filing_reservation(saved)
+        marker = reservation.with_name("first-message.json")
+        pending = marker.read_bytes()
+        with new_item_notice_log(self.root, keeper.id) as log, redirect_stderr(StringIO()):
+            review_actions.recover_submission_deliveries(case.status, review_page.PAGE_PATH)
+            self.assertFalse(marker.exists())
+            self.assertIsInstance(review_submissions.list_filing_route(saved), review_submissions.NoListFiling)
+            _ = staff.set_producer_retirement(keeper.id, staff.Active())
+            # A retry can restore the marker after the first claim.
+            _ = marker.write_bytes(pending)
+            review_actions.recover_submission_deliveries(case.status, review_page.PAGE_PATH)
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [])
+        self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
+        self.assertFalse(reservation.exists())
+        self.assertFalse(marker.exists())
+
     def check_list_notice_recovery(self, *, stop_before_row: bool, retire_producer: bool = False,
                                    authority_unavailable: bool = False, answered_marker: bool = False) -> None:
         case = self.review_fixture()
@@ -1712,7 +2440,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         self.addCleanup(cache.close)
-        request = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
                           page="list", request_id="r6-" + uuid4().hex,
                           page_recipient=new_item_dialog.PageRecipient.SELECTED)
         body = self.new_item_body(request)
@@ -1721,6 +2449,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
               new_item_notice_log(self.root, morty.id) as log, redirect_stderr(StringIO()) as errors):
+            if retire_producer:
+                # Keep coverage for a filing staged before investigations moved to List reports.
+                _ = review_submissions.submit(request, initial_delivery=review_submissions.InitialDelivery())
             with stop:
                 failed = self.new_item_http(body, finished=True)
             self.assertEqual(failed.status, 503, failed.body)
@@ -1736,11 +2467,18 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             restarted = change_page.DeliveryStatus(case.root)
             change_page.recover_pending(restarted)
+            answered_rows: list[the_list.ListItem] = []
             if answered_marker:
                 waiting = case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id)
                 answered = review_submissions.submit(waiting, initial_delivery=review_submissions.InitialDelivery())
                 self.assertTrue(review_submissions.answer(answered.key, "The check passed.",
                                                           answered.details.reply_token))
+                answered_rows = the_list.records(morty.id, include_closed=True)
+                answered_row, = answered_rows
+                self.assertEqual(answered_row.number, 2)
+                exchange, = answered_row.filed_exchanges
+                assert isinstance(exchange.answer, list_exchange.ExchangeAnswer)
+                self.assertEqual(exchange.answer.text, "The check passed.")
                 expected_records = investigation.records(owner.id)
                 self.assertEqual(len(expected_records), 2)
                 pending = {item.address.request_id for item in review_submissions.pending_initial_deliveries(case.root)}
@@ -1756,10 +2494,14 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertIn(str(failure), errors.getvalue())
                 self.assertEqual([item.address.request_id for item in
                                   review_submissions.pending_initial_deliveries(case.root)], [pending_request_id])
-                self.assertEqual(the_list.records(morty.id, include_closed=True), [])
+                self.assertEqual(the_list.records(morty.id, include_closed=True), answered_rows)
                 self.assertEqual(read_new_item_notices(log), [])
             review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
             rows = the_list.records(morty.id, include_closed=True)
+            report_rows = rows
+            if answered_marker:
+                self.assertEqual(rows[1:], answered_rows)
+                report_rows = rows[:1]
             notice, = read_new_item_notices(log)
             self.assertEqual(notice["rows"], [row.id for row in rows])
             self.assertIn(request.words, notice["words"])
@@ -1769,21 +2511,27 @@ class ReviewLinksServerTests(unittest.TestCase):
             retry = self.new_item_http(body, finished=True)
             self.assertEqual(retry.status, 200, retry.body)
         self.assertEqual(the_list.records(morty.id, include_closed=True), rows)
-        self.assertEqual(investigation.records(owner.id), expected_records)
         self.assertEqual(read_new_item_notices(log), [notice])
         receipt = cast(dict[str, object], json.loads(retry.body))
         if retire_producer:
             self.assertEqual(rows, [])
+            self.assertEqual(investigation.records(owner.id), expected_records)
             self.assertEqual(receipt["id"], original.id)
             self.assertNotIn("list_number", receipt)
             self.assertEqual(errors.getvalue().count(f"{owner.name}: retired producer."), 1)
             return
-        row, = rows
+        row, = report_rows
         if before:
             self.assertEqual(row, before[0])
         else:
             self.assertEqual(row.number, 1)
-        self.assertEqual((receipt["list_number"], receipt["key"]), (row.number, row.reviews[0]))
+        destination = investigation.ListDestination(morty.id, row.number)
+        self.assertEqual(investigation.records(owner.id), [
+            replace(record, list_destination=destination) if record.id == original.id else record
+            for record in expected_records
+        ])
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual((receipt["list_number"], receipt["key"]), (row.number, row.report.evidence_key))
 
     def test_list_draft_retries_after_failed_delivery_setup(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
@@ -2010,7 +2758,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                                 update_registration.question_records_for_owner(owner.id, strict=True), [])
                             self.assertEqual(the_list.records(owner.id), [])
 
-                    self.assertEqual(the_list.records(target.id), [])
+                    if scenario == "config-reopen":
+                        filed, = the_list.records(target.id)
+                        self.assertEqual((filed.owner, filed.producer, filed.reviews),
+                                         (target.id, target.id, (saved["key"],)))
+                    else:
+                        self.assertEqual(the_list.records(target.id), [])
                     expected_images = original_origin.images if original_images else (review_submissions.PAGE_SCREENSHOT,)
                     self.assertEqual(origin.images, expected_images)
                     attachment = urlencode({"key": saved["key"], "id": review_submissions.PAGE_SCREENSHOT.id})
@@ -2072,7 +2825,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
               capture_sender("send_message") as send):
-            _ = cache.create_submission(request)
+            _ = review_submissions.submit(request)
             first = self.new_item_http(self.new_item_body(request), finished=True)
             self.assertEqual(first.status, 200, first.body)
             saved = cast(dict[str, str], json.loads(first.body))
@@ -2116,7 +2869,9 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         send.assert_called_once()
         self.assertEqual([record.id for record in investigation.records(producer.id)], [saved["id"]])
-        self.assertEqual([row.reviews for row in the_list.records(keeper.id)], [(saved["key"],)])
+        row, = the_list.records(keeper.id)
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual((row.number, row.report.evidence_key), (saved["list_number"], saved["key"]))
 
     def test_f014_standard_new_replays_the_item_filed_for_the_new_producer(self) -> None:
         case = self.review_fixture()
@@ -2165,6 +2920,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_f016_page_owner_retry_reuses_item_after_child_retires(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
+        _ = fixture_member("producer", name="morty")
         parent_doc = case.fixture.temporary / "parent.md"
         _ = parent_doc.write_text(case.fixture.production.read_text())
         parent = fixture_member("showrunner", name="parent", doc=staff.LiveDoc(local_machine(), parent_doc))
@@ -2207,7 +2963,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
         other = fixture_member("producer", name="another-recipient")
-        _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\npage.list.owner={owner.id}\n")
+        keeper = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\npage.list.owner={keeper.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         standard = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, other.id),
                            request_id="r2-" + uuid4().hex)
@@ -2245,6 +3002,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_f019_page_owner_send_reuses_standard_item_for_same_recipient(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
+        _ = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         standard = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
@@ -2287,6 +3045,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         remote_owner = replace(owner, doc=staff.LiveDoc("natedev", remote_path))
         members = staff.local_snapshot()
         _ = staff.record_path().write_text(replace(members, rows=(remote_owner,)).encode())
+        recipients = [{"id": owner.id, "name": owner.name, "proposal": False}]
+        if kind in (new_item_dialog.SubmissionKind.BUG, new_item_dialog.SubmissionKind.INVESTIGATION):
+            keeper = fixture_member("producer", name="morty")
+            recipients.append({"id": keeper.id, "name": keeper.name, "proposal": True})
         config = conf.path("console")
         _ = write_config_fixture(conf.path("machines"))
         _ = write_config_fixture(config, f"page.review.owner={owner.id}\n")
@@ -2307,8 +3069,8 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(change_page, "send_to_staff", side_effect=note_delivery) as deliver):
             options = self.new_item_http(query="?page=review")
             self.assertEqual(options.status, 200, options.body)
-            self.assertEqual(json.loads(options.body)["recipients"],
-                             [{"id": owner.id, "name": owner.name, "proposal": False}])
+            fields = cast(dict[str, list[dict[str, object]]], json.loads(options.body))
+            self.assertCountEqual(fields["recipients"], recipients)
             _ = cache.create_submission(request)
             response = self.new_item_http(body, finished=True)
             self.assertEqual(response.status, 200, response.body)
@@ -2625,6 +3387,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
+        _ = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         place = "/console/review.html?show=all#owner=builds"
@@ -2687,6 +3450,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                          ) -> tuple[Path, review_page.ReviewSnapshotCache, new_item_dialog.NewItemRequest]:
         case = self.review_fixture()
         owner = case.ready_submission_recipient() if legacy_owner else fixture_member("producer", name="capture-producer")
+        _ = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         _ = self.enterContext(patch.object(self.server, "review_cache", cache))
@@ -3143,18 +3907,19 @@ class ReviewLinksServerTests(unittest.TestCase):
         from scripts.review_links.test_review_submissions import PNG
 
         _, cache, request = self.page_bug_fixture()
-        _ = self.map_list_recipient(request.recipient_id)
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={request.recipient_id}\n")
+        keeper = self.map_list_recipient(request.recipient_id)
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
         server = self.server
-        page_capture = replace(FIXTURE_CAPTURE, place=list_page.PAGE_PATH)
+        page_capture = replace(FIXTURE_CAPTURE, place=studio_page.PAGE_PATH)
         url = f"http://127.0.0.1:{self.port}{page_capture.place}"
         attempt = replace(request, page="list", kind=new_item_dialog.SubmissionKind.INVESTIGATION,
                           request_id="r6-" + uuid4().hex, page_state=None,
                           page_recipient=new_item_dialog.PageRecipient.SELECTED)
         key = attempt.request_id + uuid4().hex
         token = server.new_item_token
-        body = json.dumps({**asdict(attempt), "token": token, "capture_key": key,
-                           "defer_capture": asdict(page_capture)}).encode()
+        fields = {**asdict(attempt), "token": token, "capture_key": key, "defer_capture": asdict(page_capture)}
+        body = json.dumps(fields).encode()
+        studio_retry = json.dumps({**fields, "page": "studio"}).encode()
         handler = cast(type[serve.ReviewLinksHandler], server.RequestHandlerClass)
         respond = handler.json_response
         lost: dict[str, object] = {}
@@ -3176,7 +3941,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(self.new_item_http(start).status, 202)
             with self.assertRaises(RemoteDisconnected):
                 _ = self.new_item_http(body, finished=True)
-            retry = self.new_item_http(body, finished=True)
+            retry = self.new_item_http(studio_retry, finished=True)
             self.assertEqual(retry.status, 200, retry.body)
             confirmed = cast(dict[str, str], json.loads(retry.body))
             self.assertEqual(confirmed["key"], lost["key"])
@@ -3193,12 +3958,17 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(len(cache.get().records), 1)
             self.assertEqual(len(investigation.records(request.recipient_id)), 1)
             self.assertEqual(the_list.records(request.recipient_id), [])
+            row, = the_list.records(keeper.id)
+            self.assertEqual(row.owner, request.recipient_id)
+            assert isinstance(row.report, the_list.ListReport)
+            self.assertEqual(row.report.evidence_key, confirmed["key"])
             deliver.assert_called_once()
 
     def test_deferred_capture_failure_keeps_the_item_and_page_data(self) -> None:
         _, cache, request = self.page_bug_fixture()
-        _ = self.map_list_recipient(request.recipient_id)
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={request.recipient_id}\n")
+        keeper = self.map_list_recipient(request.recipient_id)
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
+        keys: set[str] = set()
         with (patch.object(change_page, "send_to_staff") as deliver,
               patch.object(self.server, "launch_page_capture") as launch):
             for page, prefix, kind, path in (
@@ -3221,6 +3991,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                         response = self.new_item_http(body, finished=True)
                         self.assertEqual(response.status, 200, response.body)
                         saved = cast(dict[str, str], json.loads(response.body))
+                        keys.add(saved["key"])
                         details = review_items.submission_origin(cache.get().records[saved["key"]])
                         assert isinstance(details, new_item_dialog.ReviewSubmission)
                         self.assertEqual((details.evidence, details.images), (attempt.evidence, ()))
@@ -3234,6 +4005,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             launch.assert_not_called()
             self.assertEqual(deliver.call_count, 10)
             self.assertEqual(the_list.records(request.recipient_id), [])
+            rows = the_list.records(keeper.id)
+            self.assertEqual(len(rows), 10)
+            self.assertEqual({row.owner for row in rows}, {request.recipient_id})
+            self.assertEqual({row.report.evidence_key for row in rows
+                              if isinstance(row.report, the_list.ListReport)}, keys)
 
     def test_restart_finds_capture_intent_before_a_lookup_or_receipt_exists(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
@@ -3535,7 +4311,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(origin, new_item_dialog.ReviewSubmission)
         self.assertEqual(origin.evidence, EVIDENCE)
         self.assertEqual(origin.bug_page_data, request.evidence)
-        self.assertIn(b"Page state", cache.get().body(key))
+        self.assertIn(b"<summary>Page details</summary>", cache.get().body(key))
         self.assertEqual(json.loads(path.read_text())["request_id"], origin.request_id)
         self.assertEqual(len(investigation.records(request.recipient_id)), 1)
 
@@ -3572,7 +4348,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(origin, new_item_dialog.ReviewSubmission)
         self.assertEqual(origin.evidence, EVIDENCE)
         self.assertEqual(origin.bug_page_data, request.evidence)
-        self.assertIn(b"Screenshot of List", cache.get().body(key))
+        body = cache.get().body(key)
+        self.assertIn(b"<summary>Page details</summary>", body)
+        self.assertIn(b"Screenshot of List", body)
         path, = folder.glob("*.json")
         self.assertEqual(json.loads(path.read_text())["screenshot"], review_submissions.PAGE_SCREENSHOT.id)
         self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
@@ -3584,8 +4362,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
-        _ = self.map_list_recipient(owner.id)
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        keeper = self.map_list_recipient(owner.id)
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
         server = self.server
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
@@ -3631,6 +4409,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             deliver.assert_called_once()
         self.assertEqual(len(investigation.records(owner.id)), 1)
         self.assertEqual(the_list.records(owner.id), [])
+        row, = the_list.records(keeper.id)
+        self.assertEqual(row.number, lost['list_number'])
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual((row.report.kind, row.report.evidence_key), (the_list.ReportKind.INVESTIGATION, key))
         self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
             {"key": key, "id": review_submissions.PAGE_SCREENSHOT.id})), preview)
 
@@ -3639,8 +4421,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
-        _ = self.map_list_recipient(owner.id)
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        keeper = self.map_list_recipient(owner.id)
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={keeper.id}\n")
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
                           page="list", request_id="r2-" + uuid4().hex)
         server = self.server
@@ -3676,6 +4458,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             deliver.assert_called_once()
         self.assertEqual(len(investigation.records(owner.id)), 1)
         self.assertEqual(the_list.records(owner.id), [])
+        row, = the_list.records(keeper.id)
+        self.assertEqual(row.owner, owner.id)
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual(row.report.evidence_key, fields["key"])
         attachment = self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
             {"key": fields["key"], "id": review_submissions.PAGE_SCREENSHOT.id}))
         self.assertEqual(attachment, HttpReply(200, "image/png", second_image))
@@ -3719,7 +4505,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(origin, new_item_dialog.ReviewSubmission)
         self.assertEqual(origin.evidence, EVIDENCE)
         self.assertIsNone(origin.bug_page_data)
-        self.assertNotIn(b"Page state", cache.get().body(key))
+        self.assertNotIn(b"<summary>Page details</summary>", cache.get().body(key))
         self.assertEqual(len(investigation.records(request.recipient_id)), 1)
 
     def test_edited_send_resumes_publication_of_the_first_bug(self) -> None:
@@ -4418,7 +5204,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(self.page_capture_preview(key).status, 404)
 
     def test_new_item_offers_a_producer_with_a_directory_document(self) -> None:
-        _ = self.review_fixture()
+        _ = self.review_fixture(list_keeper=False)
         directory = self.root.parent / 'brain'
         directory.mkdir()
         producer = fixture_member('producer', name='brain', doc=staff.LiveDoc(local_machine(), directory))
@@ -4577,7 +5363,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                         with (patch.object(list_page, "recover_pending",
                                            side_effect=OSError("The List feedback store failed.")) as recover_list,
                               started_review_server(("127.0.0.1", 0), review_link.review_root()) as restarted):
-                            recover_list.assert_called_once_with(restarted.store_folder)
+                            recover_list.assert_called_once_with(restarted.store_folder, send_notice=restarted.deliver_list_notice)
                     retry.assert_called_once_with(*first.call_args.args)
                     self.assertEqual(retry.call_args.args[0], producer)
                 self.assertEqual(cast(dict[str, object], json.loads(receipt.read_text()))["confirmed"],
@@ -5106,7 +5892,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             send.assert_not_called()
 
     def test_new_item_excludes_the_retired_list_producer(self) -> None:
-        case = self.review_fixture()
+        case = self.review_fixture(list_keeper=False)
         owner = case.ready_submission_recipient()
         directory = self.root.parent / "former-producer"
         directory.mkdir()
@@ -5194,12 +5980,22 @@ class ReviewLinksServerTests(unittest.TestCase):
                         self.assertEqual(reply.status, 200, reply.body)
                     self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
                     self.finish_new_item_posts()
-                    saved = cast(dict[str, str], json.loads(replies[0].body))
+                    saved = cast(dict[str, str | int], json.loads(replies[0].body))
                     self.assertEqual(saved, json.loads(replies[1].body))
-                    self.assertEqual(set(saved), {'id', 'key', 'version'})
-                    self.assertRegex(saved['id'], '^'+new_item_dialog.NATIVE_ID_PREFIX[kind]+r'[1-9][0-9]*$')
+                    self.assertEqual(saved['reply_owner'], owner.id)
+                    fields = {'id', 'key', 'version', 'reply_owner'}
+                    if kind in (new_item_dialog.SubmissionKind.BUG, new_item_dialog.SubmissionKind.INVESTIGATION):
+                        fields.update(('list_number', 'list_owner', 'list_producer'))
+                        keeper = fixture_member('producer', name='morty')
+                        row = the_list.load(keeper.id, f"L{saved['list_number']}")
+                        assert isinstance(row.report, the_list.ListReport)
+                        self.assertEqual(row.report.evidence_key, saved['key'])
+                        self.assertEqual((saved['list_number'], saved['list_owner'], saved['list_producer']),
+                                         (row.number, owner.name, owner.name))
+                    self.assertEqual(set(saved), fields)
+                    self.assertRegex(str(saved['id']), '^'+new_item_dialog.NATIVE_ID_PREFIX[kind]+r'[1-9][0-9]*$')
                     snapshot = cache.get()
-                    origin = review_items.submission_origin(snapshot.records[saved['key']])
+                    origin = review_items.submission_origin(snapshot.records[str(saved['key'])])
                     assert isinstance(origin, new_item_dialog.ReviewSubmission)
                     self.assertEqual(origin.evidence, evidence)
                     self.assertNotIn(origin.reply_token.encode(), replies[0].body + snapshot.index_response() + snapshot.page)
@@ -5285,10 +6081,10 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_console_page_gzip_matches_identity(self) -> None:
         page = b"<main><h1>The List</h1></main>"
         with patch.object(list_page, "render", return_value=page):
-            identity = self.request(list_page.PAGE_PATH)
+            identity = self.request(studio_page.PAGE_PATH)
             for encoding in ("gzip, br", "gzip;q=0.5"):
                 with self.subTest(encoding=encoding):
-                    reply = self.request(list_page.PAGE_PATH, headers={"Accept-Encoding": encoding})
+                    reply = self.request(studio_page.PAGE_PATH, headers={"Accept-Encoding": encoding})
                     self.assertEqual(reply.status, 200)
                     self.assertEqual(reply.headers.get("content-encoding"), "gzip")
                     self.assertEqual(reply.headers.get("vary"), "Accept-Encoding")
@@ -5300,7 +6096,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(list_page, "render", return_value=page):
             for headers in (None, {"Accept-Encoding": "br, gzip;q=0"}):
                 with self.subTest(headers=headers):
-                    reply = self.request(list_page.PAGE_PATH, headers=headers)
+                    reply = self.request(studio_page.PAGE_PATH, headers=headers)
                     self.assertEqual(reply.status, 200)
                     self.assertEqual(reply.body, page)
                     self.assertNotIn("content-encoding", reply.headers)
@@ -5327,8 +6123,8 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_console_html_accepts_wildcard_unless_gzip_is_excluded(self) -> None:
         page = b"<main><h1>The List</h1></main>"
         with patch.object(list_page, "render", return_value=page):
-            reply = self.request(list_page.PAGE_PATH, headers={"Accept-Encoding": "identity;q=0, *;q=1"})
-            refused = self.request(list_page.PAGE_PATH, headers={"Accept-Encoding": "*;q=1, gzip;q=0"})
+            reply = self.request(studio_page.PAGE_PATH, headers={"Accept-Encoding": "identity;q=0, *;q=1"})
+            refused = self.request(studio_page.PAGE_PATH, headers={"Accept-Encoding": "*;q=1, gzip;q=0"})
         self.assertEqual(reply.status, 200)
         self.assertEqual(reply.headers.get("content-encoding"), "gzip")
         self.assertEqual(reply.headers.get("vary"), "Accept-Encoding")
@@ -5462,13 +6258,13 @@ class ReviewLinksServerTests(unittest.TestCase):
                 reply = self.request('/console/review.html'+query)
                 self.assertEqual(reply.status, 200)
                 self.assertEqual(reply.body, b'Review')
-                render.assert_called_once_with(show=show, kind='')
+                render.assert_called_once_with(show=show)
 
     def test_review_initial_html_falls_back_to_open_for_unavailable_show(self) -> None:
         snapshot = review_page.build_snapshot(self.review_fixture().root)
         with patch.object(review_page.ReviewSnapshotCache, 'get', return_value=snapshot):
-            for kind in ('', 'investigations', *review_page.TYPES):
-                show = 'Validating' if kind in review_page.SHOWS_BY_TYPE else 'Closed'
+            for kind, show in (('', 'Closed'), ('', 'Waiting'), ('change', 'Validating'),
+                               ('investigations', 'Waiting'), ('response', 'Validating'), ('for-you', 'Validating')):
                 with self.subTest(kind=kind, show=show):
                     query = urlencode({'state': show, 'type': kind})
                     reply = self.request(review_page.PAGE_PATH+'?'+query)
@@ -5489,8 +6285,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                 staff,'snapshot',side_effect=AssertionError('A GET read staff.')):
             waiting = self.request(review_page.PAGE_PATH+'?state=Waiting')
             self.assertEqual(waiting.status, 200)
-            self.assertIn(b'data-show="Waiting"', waiting.body)
-            self.assertIn(b'data-filter-value="Waiting" aria-pressed="true"', waiting.body)
+            self.assertIn(b'data-show="open"', waiting.body)
+            self.assertIn(b'data-filter-value="open" aria-pressed="true"', waiting.body)
             version=self.request(review_page.PAGE_PATH+'?version=1')
             self.assertEqual(version.status,200)
             self.assertEqual(json.loads(version.body)['version'],snapshot.version)
@@ -5848,6 +6644,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_review_can_return_a_change_after_its_verdict_replace_fails(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)
+        _ = fixture_member('producer', name='morty')
         key = 'page-owner/C1'
         self.propose_feature(key)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -5871,6 +6668,34 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertTrue(case.fixture.delivery_done.wait(TEST_HANG_GUARD_SECS))
         self.assertEqual(case.fixture.proposal(key)['status'], 'dropped')
 
+    def test_standalone_change_links_file_the_same_list_reports(self) -> None:
+        case = self.review_fixture(changes=3)
+        keeper = fixture_member('producer', name='morty')
+        url = change_page.publish(case.fixture.production, case.fixture.review_list, ['C1', 'C2', 'C3'])
+        path = urlsplit(url).path
+        page = change_page.page_at(case.root, path)
+        with (patch.object(self.server, 'root', case.root),
+              patch.object(self.server, 'delivery_status', case.status)):
+            for row, outcome, kind in (('C1', 'not works', the_list.ReportKind.CHANGE),
+                                       ('C2', 'feedback', the_list.ReportKind.CHANGE),
+                                       ('C3', 'validate', the_list.ReportKind.VALIDATION)):
+                with self.subTest(outcome=outcome):
+                    words = f'Check the result of {row}.'
+                    form = urlencode({'row': row, 'token': page.token, 'outcome': outcome, 'feedback': words})
+                    case.fixture.delivery_done.clear()
+                    status, body = self.post(path, form)
+                    self.assertEqual(status, 303, body)
+                    self.assertTrue(case.fixture.delivery_done.wait(TEST_HANG_GUARD_SECS))
+                    key = f'page-owner/{row}'
+                    report = next(entry.report for entry in the_list.records(keeper.id) if key in entry.reviews)
+                    validation_log = (review_items.ValidationLogStart(1) if outcome == 'validate'
+                                      else review_items.LegacyValidationLog.MOVE_MARKER)
+                    self.assertEqual(report, the_list.ListReport(kind, key, words, validation_log=validation_log))
+            self.assertNotIn(b'name="outcome" value="feedback"', self.request(path).body)
+        moved = review_items.read(case.root, kinds=(review_items.ReviewType.CHANGE,))
+        self.assertEqual(len(moved), 3)
+        self.assertTrue(all(review_items.on_list(item) for item in moved))
+
     def test_review_recovery_retries_feature_closeout_after_the_verdict(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)
         key = 'page-owner/C1'
@@ -5887,6 +6712,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         with patch.object(feature_log, 'land_review', side_effect=fail_closeout) as closeout:
             saved = cache.save(case.card_body(cache.get(), key, 'works'), case.status)
+            assert isinstance(saved.delivery, (change_page.MessageDelivery, change_page.NoMessageDelivery))
             _ = change_page.finish_verdict_cleanup(saved.delivery, case.status)
             self.assertEqual(closeout.call_count, 2)
         self.assertNotIn(key, cache.get().records)
@@ -5922,6 +6748,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertTrue(change_page.answer_item(key, 'The layout changed.', asked.question_id, recovered))
 
     def test_response_followup_uses_the_same_owner_and_got_it_closes_the_question(self) -> None:
+        _ = self.enterContext(patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")))
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -5986,6 +6813,1074 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(self.request(card_url).status, 404)
             send.assert_called_once()
 
+    def test_answers_a_filed_open_staff_question_from_studio(self) -> None:
+        from scripts.review_links import answer_sources
+
+        case = self.review_fixture()
+        key = case.question()
+        members = staff.snapshot()
+        source = review_page.build_snapshot(case.root).records[key].source
+        assert isinstance(source, review_items.QuestionSource)
+        answer_sources.file_saved_question(source.record, members)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            snapshot = cache.get()
+            self.assertNotIn(key, {entry["key"] for entry in snapshot.entries})
+            self.assertEqual(self.request(review_page.card_url(key)).status, 303)
+            card = self.request(review_page.card_url(key, studio_question=True))
+            self.assertEqual(card.status, 200, card.body)
+            self.assertIn(b'value="answer"', card.body)
+            revision = re.search(rb'name="revision" value="([^"]+)"', card.body)
+            self.assertIsNotNone(revision)
+            assert revision is not None
+            body = case.body(key, "answer", "Use the wide layout.") + "&" + urlencode({"revision": revision[1].decode()})
+            status, answer = self.post(review_page.PAGE_PATH, body)
+            self.assertEqual(status, 200, answer)
+        keeper = record_store.list_keeper(conf.read("console"), members)
+        assert keeper is not None
+        item, = the_list.records(keeper.id)
+        exchange, = item.filed_exchanges
+        self.assertEqual(exchange.source_key, key)
+        self.assertIsInstance(exchange.answer, answer_sources.ExchangeAnswer)
+        assert isinstance(exchange.answer, answer_sources.ExchangeAnswer)
+        self.assertIn("Use the wide layout.", exchange.answer.text)
+
+    def filed_studio_team_question(self) -> tuple[test_review_page.ReviewPageTests, str, list_page.ListRecord]:
+        case = self.review_fixture()
+        key = case.question()
+        members = staff.snapshot()
+        source = review_page.build_snapshot(case.root).records[key].source
+        assert isinstance(source, review_items.QuestionSource)
+        parts = update_registration.QuestionParts(
+            ask="Which layout should the Review page use?",
+            context="Both layouts fit the list. The wide layout gives each card more space.",
+            items=[], choices=["Use the compact layout.", "Use the wide layout."],
+            recommend="Use the wide layout so readers can see the controls.",
+        )
+        record = replace(source.record, item={**source.record.item, "parts": parts})
+        update_registration.write_question_record(record)
+        answer_sources.file_saved_question(record, members)
+        keeper = record_store.list_keeper(conf.read("console"), members)
+        assert keeper is not None
+        item, = the_list.records(keeper.id)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        _ = self.enterContext(patch.object(self.server, "review_cache", cache))
+        _ = self.enterContext(patch.object(self.server, "delivery_status", case.status))
+        return case, key, list_page.ListRecord(keeper.id, item)
+
+    def test_studio_inline_team_question_uses_the_review_answer(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        self.assertEqual(self.list_filter_markup("?show=questions")[0], [str(row.item.number)])
+        studio = self.request(studio_page.PAGE_PATH)
+        self.assertIn(b'data-studio-question-card=', studio.body)
+        self.assertNotIn(b'>Answer question</a>', studio.body)
+        fragment = review_page.PAGE_PATH + "?" + urlencode({"body": key, "view": "studio-inline", "item": row.key})
+        response = self.request(fragment)
+        self.assertEqual(response.status, 200, response.body)
+        for part in (b'Both layouts fit the list.', b'Use the compact layout.', b'Use the wide layout.',
+                     b'so readers can see the controls.', b'Your words', b'>Answer</button>',
+                     b'>Ask question</button>', b'data-later-toggle>Later'):
+            self.assertIn(part, response.body)
+        self.assertNotIn(b'<dialog', response.body)
+        self.assertEqual(self.request(fragment.replace(row.item.id, "L999")).status, 404)
+        revision = re.search(rb'name="revision" value="([^"]+)"', response.body)
+        assert revision is not None
+        body = case.body(key, "answer", "Use the wide layout.") + "&" + urlencode({"revision": revision[1].decode()})
+        with capture_sender("send_to_staff") as send:
+            status, answer = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+            send.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(status, 200, answer)
+        self.assert_studio_question_message(send, row, "Use the wide layout.")
+        self.assertEqual(self.list_filter_markup("?show=questions")[0], [])
+        stored = the_list.load(row.keeper, row.item.id)
+        self.assertEqual(stored.state, the_list.ItemState.WORKING)
+        exchange, = stored.filed_exchanges
+        self.assertIsInstance(exchange.answer, list_exchange.ExchangeAnswer)
+        assert isinstance(exchange.answer, list_exchange.ExchangeAnswer)
+        self.assertEqual(exchange.answer.text, "Use the wide layout.")
+        self.assertEqual(self.request(fragment).status, 404)
+
+    def assert_studio_question_message(self, send: Mock, row: list_page.ListRecord, words: str) -> None:
+        send.assert_called_once()
+        recipient, sender, message = cast(tuple[str, str, str], send.call_args.args)
+        self.assertEqual((recipient, sender), (row.item.owner, change_page.SENDER))
+        self.assertIn(words, message)
+
+    def test_studio_inline_team_question_later_sends_words_to_the_owner(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        page = self.server.review_cache.get()
+        data = page.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        revision = urlencode({"revision": shown[1].decode()})
+        later = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        body = case.body(key, "later", "Wait for the desktop check.") + "&" + revision
+        with capture_sender("send_to_staff") as send:
+            status, reply = self.post(review_page.PAGE_PATH, body + "&" + urlencode({"later": later.isoformat()}),
+                                      headers={send_hold.REPLAY_HEADER: "1"})
+            self.assertEqual(status, 200, reply)
+            send.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
+            self.assert_studio_question_message(send, row, "Wait for the desktop check.")
+            self.assertEqual(self.list_filter_markup("?show=questions")[0], [])
+            item = the_list.load(row.keeper, row.item.id)
+            self.assertEqual(item.parked_until, later)
+            self.assertIn("Later: Wait for the desktop check.", [entry.what for entry in item.log])
+
+    def test_studio_inline_team_question_ask_sends_words_to_the_owner(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        ask = "Does the wide layout fit on a laptop?"
+        body = case.body(key, "question", ask) + "&" + urlencode({"revision": shown[1].decode()})
+        with capture_sender("send_to_staff") as send:
+            status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+            send.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(status, 200, reply)
+        self.assert_studio_question_message(send, row, ask)
+        current = self.server.review_cache.get().records[key].source
+        assert isinstance(current, review_items.QuestionSource)
+        self.assertEqual(current.record.item.get("followup", {}).get("text"), ask)
+
+    def test_studio_question_refuses_actions_after_the_list_owner_changes(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        snapshot = self.server.review_cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        new_owner = fixture_member("producer", name="new-layout-owner")
+        reassigned = the_list.update(row.keeper, row.item.id, {"owner": new_owner.id}, source="nate")
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        with capture_sender("send_to_staff") as send:
+            for action in ("later", "answer", "question"):
+                with self.subTest(action=action):
+                    body = case.body(key, action, "Check the desktop layout.") + "&" + urlencode({
+                        "revision": shown[1].decode(), "later": until.isoformat()})
+                    status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+                    self.assertEqual(status, 409, reply)
+        send.assert_not_called()
+        self.assertEqual(the_list.load(row.keeper, row.item.id), reassigned)
+
+    def test_studio_question_rechecks_owner_when_saving_after_validation(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        snapshot = self.server.review_cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        new_owner = fixture_member("producer", name="new-layout-owner")
+        action = review_actions.studio_question_action
+
+        def reassign_then_save(*args: object) -> object:
+            _ = the_list.update(row.keeper, row.item.id, {"owner": new_owner.id}, source="nate")
+            return cast(Callable[..., object], action)(*args)
+
+        with (capture_sender("send_to_staff") as send,
+              patch.object(review_actions, "studio_question_action", side_effect=reassign_then_save) as save):
+            for outcome in ("answer", "question"):
+                with self.subTest(outcome=outcome):
+                    _ = the_list.update(row.keeper, row.item.id, {"owner": row.item.owner}, source="nate")
+                    body = case.body(key, outcome, "Check the mobile layout.") + "&" + urlencode({"revision": shown[1].decode()})
+                    status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+                    self.assertEqual(status, 409, reply)
+            self.assertEqual(save.call_count, 2)
+        send.assert_not_called()
+        self.assertEqual(the_list.load(row.keeper, row.item.id).filed_exchanges, row.item.filed_exchanges)
+
+    def test_review_links_a_pending_studio_question_to_its_list_item(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        snapshot = self.server.review_cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        body = case.body(key, "question", "Does the wide layout fit on a laptop?") + "&" + urlencode({"revision": shown[1].decode()})
+        with capture_sender("send_to_staff") as send:
+            status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+            send.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(status, 200, reply)
+        current = self.server.review_cache.get()
+        self.assertIs(current.records[key].state, review_items.ReviewState.WAITING)
+        detail = current.body(key).decode()
+        destination = studio_page.PAGE_PATH + page_frame.list_item_fragment(row.keeper, row.item.number)
+        self.assertIn(f'href="{destination}">Open question on List item {row.item.number}</a>', detail)
+        self.assertNotIn("data-review-form", detail)
+
+    def test_studio_later_delivers_new_words_at_the_same_deadline(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        _ = the_list.park(row.keeper, row.item.id, until, source=the_list.PAGE_SOURCE)
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        words = "Check the mobile layout too."
+        body = case.body(key, "later", words) + "&" + urlencode({"revision": shown[1].decode(), "later": until.isoformat()})
+        with capture_sender("send_to_staff") as send:
+            status, reply = self.post(review_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+        self.assertEqual(status, 200, reply)
+        self.assert_studio_question_message(send, row, words)
+        saved = the_list.load(row.keeper, row.item.id)
+        self.assertEqual(saved.parked_until, until)
+        notice, = the_list.feedback_requests(saved).values()
+        self.assertEqual((notice.form_words, notice.state), (words, "sent"))
+
+    def test_studio_later_retries_pending_delivery_without_a_delivery_line(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        body = case.body(key, "later", "Wait for the desktop check.") + "&" + urlencode({
+            "revision": shown[1].decode(), "later": until.isoformat()})
+        tries = conf.read("review_links").whole("delivery_tries")
+        with (patch.object(change_page, "send_to_staff", side_effect=[*(["pending"] * tries), "skipped"]) as send,
+              patch.object(change_page, "studio_alert_targets", return_value=()) as route):
+            status, reply = self.post(review_page.PAGE_PATH, body, headers={review_page.DELIVERY_RESULT_HEADER: "1"})
+            self.assertEqual(status, 200, reply)
+            self.assertNotIn(b"send_failure", reply)
+            saved = the_list.load(row.keeper, row.item.id)
+            self.assertEqual(saved.parked_until, until)
+            notice, = the_list.feedback_requests(saved).values()
+            self.assertEqual(notice.state, "pending")
+            self.assertTrue(case.status.has_deferred_alerts())
+            self.server.retry_studio_notices()
+            self.server.retry_studio_notices()
+        self.assertEqual(send.call_count, tries + 1)
+        self.assertEqual(len({cast(str, call.kwargs["key"]) for call in send.call_args_list}), 1)
+        route.assert_called_once()
+        self.assertEqual(the_list.feedback_requests(the_list.load(row.keeper, row.item.id))[notice.request].state, "sent")
+
+    def test_submit_snapshot_returns_the_studio_later_delivery(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        snapshot = self.server.review_cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        words = "Wait for the desktop check."
+        body = case.body(key, "later", words) + "&" + urlencode({"revision": shown[1].decode(), "later": until.isoformat()})
+        delivery, _ = review_page.submit_snapshot(case.root, snapshot, parse_qs(body), case.status)
+        assert isinstance(delivery, review_actions.ListFeedbackDelivery)
+        self.assertEqual((delivery.keeper, delivery.identity), (row.keeper, row.item.id))
+        saved = the_list.load(row.keeper, row.item.id)
+        self.assertEqual(the_list.feedback_requests(saved)[delivery.request].form_words, words)
+
+    def test_studio_later_save_survives_delivery_write_error_and_retry(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        request = send_hold.new_hold_id()
+        body = case.body(key, "later", "Wait for the desktop check.") + "&" + urlencode({
+            "revision": shown[1].decode(), "later": until.isoformat(), "request": request})
+        save = the_list._save  # pyright: ignore[reportPrivateUsage]
+        fail_result = True
+
+        def save_item(store: record_store.NumberedRecords, item: the_list.ListItem, **options: object) -> None:
+            notice = the_list.feedback_requests(item).get(request)
+            if fail_result and notice is not None and notice.state == "sent":
+                raise OSError("The delivery result could not save.")
+            cast(Callable[..., None], save)(store, item, **options)
+
+        headers = {review_page.DELIVERY_RESULT_HEADER: "1"}
+        with (patch.object(the_list, "_save", side_effect=save_item),
+              patch.object(change_page, "send_to_staff", side_effect=[None, "skipped"]) as send):
+            status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(status, 200, reply)
+            self.assertNotIn(b"send_failure", reply)
+            parked = the_list.load(row.keeper, row.item.id)
+            self.assertEqual(parked.parked_until, until)
+            self.assertEqual(the_list.feedback_requests(parked)[request].state, "pending")
+            fail_result = False
+            self.server.retry_studio_notices()
+        first, second = send.call_args_list
+        self.assertEqual(cast(object, first.kwargs["key"]), cast(object, second.kwargs["key"]))
+        saved = the_list.load(row.keeper, row.item.id)
+        self.assertEqual(list(the_list.feedback_requests(saved)), [request])
+        self.assertEqual(the_list.feedback_requests(saved)[request].state, "sent")
+
+    def test_studio_later_retries_after_alert_without_a_delivery_line(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        request = send_hold.new_hold_id()
+        body = case.body(key, "later", "Wait for the desktop check.") + "&" + urlencode({
+            "revision": shown[1].decode(), "later": until.isoformat(), "request": request})
+        headers = {review_page.DELIVERY_RESULT_HEADER: "1"}
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        failure = RuntimeError("The owner is offline.")
+        team = fixture_member("showrunner", name="alert-team")
+        with (patch.object(change_page, "send_to_staff", side_effect=[failure, None, failure, "skipped"]) as send,
+              patch.object(change_page, "studio_alert_targets", return_value=(team.id,)) as route):
+            status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(status, 200, reply)
+            self.assertNotIn(b"send_failure", reply)
+            saved = the_list.load(row.keeper, row.item.id)
+            self.assertEqual(the_list.feedback_requests(saved)[request].state, "alerted")
+            status, reply = self.post(review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(status, 200, reply)
+            self.assertNotIn(b"send_failure", reply)
+            self.server.retry_studio_notices()
+        self.assertEqual(send.call_count, 4)
+        owner_sends = [entry for entry in send.call_args_list if entry.args[0] == row.item.owner]
+        self.assertEqual(len(owner_sends), 3)
+        self.assertEqual(len({cast(str, entry.kwargs["key"]) for entry in owner_sends}), 1)
+        self.assertEqual(send.call_args_list[1].args[0], team.id)
+        self.assertIn("Wait for the desktop check.", cast(str, send.call_args_list[1].args[2]))
+        route.assert_called_once()
+        self.assertEqual(the_list.feedback_requests(the_list.load(row.keeper, row.item.id))[request].state, "sent")
+
+    def test_studio_later_returns_the_same_delivery_from_submit_and_cache(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        cache = self.server.review_cache
+        snapshot = cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        request = send_hold.new_hold_id()
+        body = case.body(key, "later", "Wait for the desktop check.") + "&" + urlencode({
+            "revision": shown[1].decode(), "later": until.isoformat(), "request": request})
+        result = review_page.submit(case.root, body, case.status, snapshot=snapshot)
+        self.assertEqual(result.delivery, review_actions.StudioNoticeDelivery(row.keeper, row.item.id, request, case.status))
+        saved = cache.save(body, case.status)
+        self.assertEqual(saved.delivery, result.delivery)
+        self.assertEqual(saved.answer, result.answer)
+
+    def test_studio_answer_keeps_its_intent_until_delivery_is_confirmed(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        snapshot = self.server.review_cache.get()
+        data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        words = "Use the wide layout."
+        body = case.body(key, "answer", words) + "&" + urlencode({"revision": shown[1].decode()})
+        delivery = review_page.submit(case.root, body, case.status, snapshot=snapshot).delivery
+        assert isinstance(delivery, change_page.MessageDelivery)
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        with (patch.object(change_page, "studio_alert_targets", return_value=()),
+              patch.object(change_page, "send_to_staff", side_effect=["pending", "skipped"]) as send):
+            self.assertIsInstance(change_page.deliver_with_outcome(delivery, case.status),
+                                  change_page.DeliveryUnconfirmed)
+            intent, = case.status.slots(delivery.page, delivery.row).intents()
+            self.assertEqual(intent.attempt, delivery.attempt)
+            self.assertIsInstance(change_page.deliver_with_outcome(delivery, case.status),
+                                  change_page.DeliveryConfirmed)
+        first, retry = send.call_args_list
+        self.assertEqual(first, retry)
+        self.assertEqual(retry.args[0], row.item.owner)
+        self.assertIn(words, cast(str, retry.args[2]))
+        self.assertEqual(case.status.slots(delivery.page, delivery.row).intents(), ())
+
+    def test_studio_answer_retries_when_the_team_record_write_fails(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        words = "Use the wide layout."
+        body = case.body(key, "answer", words) + "&" + urlencode({"revision": shown[1].decode()})
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        with patch.object(change_page, "send_to_staff", side_effect=["pending", None]) as send:
+            with patch.object(case.status, "record_studio_failure_locked", side_effect=OSError("The team record failed.")):
+                status, reply = self.post(review_page.PAGE_PATH, body, headers={review_page.DELIVERY_RESULT_HEADER: "1"})
+            self.assertEqual(status, 200, reply)
+            self.assertNotIn(b"send_failure", reply)
+            self.assertEqual(case.status.request_attempts, {})
+            self.assertTrue(case.status.has_deferred_questions())
+            change_page.recover_deferred_questions(case.status)
+            change_page.recover_deferred_questions(case.status)
+        first, retry = send.call_args_list
+        self.assertEqual(first, retry)
+        self.assertEqual(retry.args[0], row.item.owner)
+        self.assertIn(words, cast(str, retry.args[2]))
+        self.assertFalse(case.status.has_deferred_questions())
+
+    def test_studio_ask_and_answer_keep_their_own_pending_delivery_records(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        words = ("Does the wide layout fit on a laptop?", "Use the wide layout.")
+        with (patch.object(change_page, "send_to_staff", return_value="pending") as pending,
+              patch.object(change_page, "studio_alert_targets", return_value=())):
+            for action, text in zip(("question", "answer"), words, strict=True):
+                data = self.server.review_cache.get().body(
+                    key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+                shown = re.search(rb'name="revision" value="([^"]+)"', data)
+                assert shown is not None
+                body = case.body(key, action, text) + "&" + urlencode({"revision": shown[1].decode()})
+                status, reply = self.post(review_page.PAGE_PATH, body, headers={review_page.DELIVERY_RESULT_HEADER: "1"})
+                self.assertEqual(status, 200, reply)
+            self.assertEqual(pending.call_count, 2)
+        restarted = change_page.DeliveryStatus(case.status.root)
+        with patch.object(change_page, "send_to_staff", return_value=None) as delivered:
+            change_page.recover_question_answers(restarted)
+            change_page.recover_question_answers(restarted)
+        self.assertEqual(delivered.call_count, 2)
+        self.assertEqual(len({cast(str, entry.kwargs["key"]) for entry in delivered.call_args_list}), 2)
+        for entry, text in zip(pending.call_args_list, words, strict=True):
+            self.assertEqual(entry.args[0], row.item.owner)
+            self.assertIn(text, cast(str, entry.args[2]))
+        first_ask, first_answer = pending.call_args_list
+        retried_ask, = (entry for entry in delivered.call_args_list if entry.kwargs == first_ask.kwargs)
+        self.assertEqual(retried_ask.args[:2], first_ask.args[:2])
+        self.assertIn(words[0], cast(str, retried_ask.args[2]))
+        self.assertIn("This question no longer accepts a reply.", cast(str, retried_ask.args[2]))
+        self.assertNotIn("answer-question", cast(str, retried_ask.args[2]))
+        self.assertIn(first_answer, delivered.call_args_list)
+
+    def test_studio_ask_recovery_uses_the_current_reply_command_after_a_second_ask(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        first_words = "Does the wide layout fit on a laptop?"
+        current_words = "Does the compact layout fit on a phone?"
+
+        def ask(words: str) -> change_page.MessageDelivery:
+            cache = self.server.review_cache
+            snapshot = cache.get()
+            data = snapshot.body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+            shown = re.search(rb'name="revision" value="([^"]+)"', data)
+            assert shown is not None
+            body = case.body(key, "question", words) + "&" + urlencode({"revision": shown[1].decode()})
+            delivery = cache.save(body, case.status).delivery
+            assert isinstance(delivery, change_page.MessageDelivery)
+            return delivery
+
+        first = ask(first_words)
+        with (patch.object(change_page, "send_to_staff", return_value="pending") as pending,
+              patch.object(change_page, "studio_alert_targets", return_value=())):
+            self.assertIsInstance(change_page.deliver_with_outcome(first, case.status), change_page.DeliveryUnconfirmed)
+        current = ask(current_words)
+        with patch.object(change_page, "send_to_staff", return_value=None) as sent:
+            self.assertIsInstance(change_page.deliver_with_outcome(current, case.status), change_page.DeliveryConfirmed)
+            current_message = cast(str, sent.call_args.args[2])
+            sent.reset_mock()
+            restarted = change_page.DeliveryStatus(case.status.root)
+            change_page.recover_question_answers(restarted)
+            change_page.recover_question_answers(restarted)
+        sent.assert_called_once()
+        self.assertEqual(sent.call_args.args[:2], (row.item.owner, change_page.SENDER))
+        self.assertEqual(sent.call_args.kwargs, pending.call_args.kwargs)
+        retry_message = cast(str, sent.call_args.args[2])
+        self.assertIn(first_words, retry_message)
+        self.assertIn("A newer question superseded this question.", retry_message)
+        self.assertIn(current_words, retry_message)
+        self.assertNotIn(first.message.splitlines()[-1], retry_message)
+        command = retry_message.splitlines()[-1]
+        self.assertEqual(command, current_message.splitlines()[-1])
+        arguments = shlex.split(command)
+        self.assertTrue(change_page.answer_item(arguments[arguments.index("--item") + 1], "Yes, it fits.",
+                                               arguments[arguments.index("--question") + 1], restarted))
+
+    def test_studio_undo_replay_confirms_the_save_while_delivery_is_blocked(self) -> None:
+        case, key, row = self.filed_studio_team_question()
+        data = self.server.review_cache.get().body(key, view=review_page.ReviewBodyView.STUDIO_INLINE, studio_item=row.key)
+        shown = re.search(rb'name="revision" value="([^"]+)"', data)
+        assert shown is not None
+        words = "Use the wide layout."
+        body = case.body(key, "answer", words) + "&" + urlencode({"revision": shown[1].decode()})
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_send(_recipient: staff.StaffId, _sender: str, _words: str, *, key: str) -> None:
+            self.assertTrue(key.startswith("review:"))
+            entered.set()
+            self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
+
+        marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
+        with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+              patch.object(change_page, "send_to_staff", side_effect=slow_send) as send):
+            status, hold, fields = self.held_http("POST", review_page.PAGE_PATH, body.encode(), headers=marked)
+            self.assertEqual((status, hold), (202, "held"), fields)
+            send.assert_not_called()
+            endpoint = f"{send_hold.HOLD_PATH}/{fields['hold']}"
+            try:
+                self.assertEqual(self.held_http("POST", endpoint + "/send")[0], 200)
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    result = executor.submit(self.held_http, "GET", endpoint)
+                    try:
+                        status, _, saved = result.result(timeout=5)
+                        self.assertEqual((status, saved.get("answer")), (200, words), saved)
+                        self.assertNotIn("send_failure", saved)
+                    finally:
+                        release.set()
+            finally:
+                release.set()
+            self.assertTrue(self.review_posts.wait_until_none_run())
+        self.assertEqual(send.call_count, 1)
+
+    def test_legacy_change_reply_retry_files_the_saved_answer(self) -> None:
+        case = self.review_fixture(changes=1)
+        page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, ("C1",), "")
+        question = case.status.ask(page, "C1", "Which layout?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        arguments = ["answer-question", "--production", "page-owner", "--list", str(page.review_list),
+                     "--row", "C1", "--question", question.question_id, "--text", "Use the wide layout."]
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        with patch.object(the_list, "_save", side_effect=OSError("The List write failed.")):
+            self.assertEqual(change_page.main(arguments), 0)
+        self.assertEqual(the_list.records(keeper.id), [])
+        self.assertEqual(change_page.main(arguments), 0)
+        item, = the_list.records(keeper.id)
+        exchange, = item.filed_exchanges
+        self.assertEqual(exchange.exchange_id, "question:" + question.question_id)
+        self.assertEqual(exchange.question, "Which layout?")
+        self.assertEqual(exchange.answerer, item.owner)
+
+    def test_change_reply_retry_files_from_an_explicit_review_root(self) -> None:
+        case = self.review_fixture(changes=1)
+        status = change_page.DeliveryStatus(case.root / "explicit")
+        page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, ("C1",), "")
+        question = status.ask(page, "C1", "Which layout?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        members = staff.snapshot()
+        keeper = record_store.list_keeper(conf.read("console"), members)
+        assert keeper is not None
+        words = "Use the wide layout."
+        saved = status.save_question_answer(page, "C1", question.question_id, words, author=keeper.id)
+        self.assertIsInstance(saved, datetime)
+        self.assertEqual(the_list.records(keeper.id), [])
+        self.assertFalse(change_page.answer_item("page-owner/C1", words, question.question_id, status))
+        item, = the_list.records(keeper.id)
+        exchange, = item.filed_exchanges
+        self.assertEqual((exchange.exchange_id, exchange.question), ("question:" + question.question_id, "Which layout?"))
+
+    def test_filed_review_answer_redirects_to_the_saved_studio_item(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="item-producer")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = case.submission_request(kind, owner.id)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+            sent = cast(dict[str, str], json.loads(created.body))
+            key = sent["key"]
+            origin = review_items.submission_origin(cache.get().records[key])
+            assert isinstance(origin, new_item_dialog.ReviewSubmission)
+            reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], request.request_id)
+            self.assertTrue(change_page.answer_item(reply, "Use the wide layout.", origin.reply_token, case.status))
+            updated, _ = cache.publish_record(cache.get(), key)
+            self.assertNotIn(key, {entry["key"] for entry in updated.entries})
+            target = updated.filed_item_url(case.root, key)
+            self.assertTrue(target.startswith(studio_page.PAGE_PATH + "#item="), target)
+            result = self.request(review_page.card_url(key))
+            self.assertEqual((result.status, result.headers.get("location")), (303, target))
+            card = self.request(review_page.card_url(key, studio_question=True))
+            self.assertEqual(card.status, 200, card.body)
+            self.assertIn(b"<div data-review-card ", card.body)
+            self.assertIn(b"Use the wide layout.", card.body)
+            self.assertNotIn(b"<dialog data-list-review-dialog ", card.body)
+
+    def test_studio_question_returns_as_answered_and_mark_read_sends_words_once(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="layout-owner")
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = replace(case.submission_request(kind, owner.id), page="studio",
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff") as send):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+            sent = cast(dict[str, str], json.loads(created.body))
+            key = sent["key"]
+            working, = the_list.records(keeper.id)
+            self.assertIs(working.state, the_list.ItemState.WORKING)
+            self.assertEqual(working.log[-1].what, the_list.FieldChange("Updated", {"state": working.state}))
+            self.assertNotIn(key, {entry["key"] for entry in review_page.build_snapshot(case.root).entries})
+            origin = review_items.submission_origin(cache.get().records[key])
+            assert isinstance(origin, new_item_dialog.ReviewSubmission)
+            reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], request.request_id)
+            self.assertTrue(change_page.answer_item(reply, "Use the wide layout.", origin.reply_token, case.status))
+            answered, = the_list.records(keeper.id)
+            self.assertEqual(answered.id, working.id)
+            self.assertIs(answered.state, the_list.ItemState.ANSWERED)
+            self.assertIsInstance(answered.unread_since, datetime)
+            self.assertEqual(answered.log[-1].what, the_list.FieldChange("Updated", {"state": answered.state}))
+            self.assertEqual(sum(isinstance(entry.what, the_list.ReturnedAnswer) for entry in answered.log), 1)
+            prefix, token = list_page.signed_item_request(list_page.ListRecord(keeper.id, answered),
+                                                         list_page.form_secret(self.server.root))
+            words = "I will use that layout."
+            body = urlencode({"keeper": keeper.id, "id": answered.id, "request": prefix, "token": token,
+                              "action": "read", "words": words, "until": ""})
+            send.reset_mock()
+            old_request, old_token = list_page.signed_item_request(list_page.ListRecord(keeper.id, working),
+                                                                  list_page.form_secret(self.server.root))
+            stale_body = urlencode({"keeper": keeper.id, "id": working.id, "request": old_request,
+                                    "token": old_token, "action": "read", "words": words, "until": ""})
+            self.assertEqual(self.post(studio_page.PAGE_PATH, stale_body)[0], 400)
+            send.assert_not_called()
+            for _ in range(2):
+                status, response = self.post(studio_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+                self.assertEqual(status, 200, response)
+                result = cast(dict[str, object], json.loads(response))
+                self.assertIs(result["words_saved"], True)
+                self.assertEqual(result["item_state"], "Closed")
+                send.wait_until_called(timeout=TEST_HANG_GUARD_SECS)
+            send.assert_called_once_with(owner.id, change_page.SENDER, words)
+            closed = the_list.load(keeper.id, answered.id)
+            self.assertIs(closed.state, the_list.ItemState.CLOSED)
+            self.assertEqual(closed.closing_words, "Read by nate")
+            self.assertEqual(the_list.unread_answer_ids(closed), frozenset())
+            self.assertEqual(sum(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Closed"
+                                 for entry in closed.log), 1)
+
+    def test_studio_followup_keeps_two_replies_unread_under_questions(self) -> None:
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        item = self.working_studio_question(keeper.id, owner.id)
+        status = self.server.delivery_status
+        with (patch.object(change_page, "send_question", return_value=question_outcome()),
+              redirect_stdout(StringIO())):
+            for words in ("Which width fits?", "Which margin fits?"):
+                request = the_list.PageRequest(uuid4().hex, "question", words)
+                change_page.deliver(the_list.ask_question(keeper.id, item.id, request, status), status)
+            with patch.object(staff, "caller_identity", return_value=keeper.current_session):
+                for question, words in (("Q1", "Use 800 pixels."), ("Q2", "Use 16 pixels.")):
+                    self.assertEqual(the_list.main(["answer", item.id, "--question", question, "--text", words]), 0)
+            answered = the_list.load(keeper.id, item.id)
+            self.assertEqual(the_list.unread_answer_ids(answered), {"Q1", "Q2"})
+            followup = the_list.PageRequest(uuid4().hex, "question", "What fits on a phone?")
+            change_page.deliver(the_list.ask_question(keeper.id, item.id, followup, status), status)
+        pending = the_list.load(keeper.id, item.id)
+        self.assertEqual(the_list.unread_answer_ids(pending), {"Q1", "Q2"})
+        self.assertEqual(self.list_filter_markup("?show=answers")[0], [])
+        self.assertEqual(self.list_filter_markup("?show=questions")[0], [str(item.number)])
+        read = the_list.mark_read(keeper.id, item.id, source=the_list.PAGE_SOURCE)
+        self.assertEqual(the_list.unread_answer_ids(read), frozenset())
+        self.assertTrue(the_list.has_open_followup(read))
+
+    def test_studio_asks_two_followups_on_the_same_answered_item(self) -> None:
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        item = self.working_studio_question(keeper.id, owner.id)
+        server_status = self.server.delivery_status
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
+        marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
+        with (patch.object(change_page, "send_question", return_value=question_outcome()) as send,
+              redirect_stdout(StringIO())):
+            initial_words = "Which layout fits?"
+            initial = the_list.PageRequest(uuid4().hex, "question", initial_words)
+            change_page.deliver(the_list.ask_question(keeper.id, item.id, initial, server_status), server_status)
+            answers = ("Use a wide layout.", "Use 800 pixels.", "Use 600 pixels on a phone.")
+            questions = (initial_words, "Which width fits?", "What fits on a phone?")
+            for index, answer in enumerate(answers):
+                answerer = keeper if index == 0 else owner
+                with patch.object(staff, "caller_identity", return_value=answerer.current_session):
+                    self.assertEqual(the_list.main(["answer", item.id, "--question", f"Q{index + 1}", "--text", answer]), 0)
+                answered = the_list.load(keeper.id, item.id)
+                self.assertIs(answered.state, the_list.ItemState.ANSWERED)
+                self.assertEqual(self.list_filter_markup("?show=answers")[0], [str(item.number)])
+                if index + 1 == len(questions):
+                    break
+                route = the_list.ListQuestionRouting(staff.snapshot()).followup_receiver(owner.id)
+                request, token = list_page.signed_item_request(list_page.ListRecord(keeper.id, answered),
+                    list_page.form_secret(self.root), ask_signature=route.signature)
+                body = urlencode({"keeper": keeper.id, "id": item.id, "request": request, "token": token,
+                                  "action": "question", "words": questions[index + 1], "until": ""}).encode()
+                status, hold, fields = self.held_http("POST", studio_page.PAGE_PATH, body, headers=marked)
+                self.assertEqual((status, hold), (202, "held"), fields)
+                endpoint = f"{send_hold.HOLD_PATH}/{fields['hold']}"
+                self.assertEqual(the_list.load(keeper.id, item.id), answered)
+                if index == 0:
+                    self.assertEqual(self.held_http("POST", endpoint + "/undo")[0], 200)
+                    self.assertEqual(the_list.load(keeper.id, item.id), answered)
+                    status, _, fields = self.held_http("POST", studio_page.PAGE_PATH, body, headers=marked)
+                    self.assertEqual(status, 202, fields)
+                    endpoint = f"{send_hold.HOLD_PATH}/{fields['hold']}"
+                self.assertEqual(self.held_http("POST", endpoint + "/send")[0], 200)
+                status, _, saved = self.held_http("GET", endpoint)
+                self.assertEqual((status, saved.get("open_followup")), (200, "true"), saved)
+                self.assertEqual(self.list_filter_markup("?show=answers")[0], [])
+                self.assertEqual(self.list_filter_markup("?show=questions")[0], [str(item.number)])
+                self.assertEqual(send.call_args.args[0], owner.id)
+            self.assertEqual(send.call_count, 3)
+        saved_item, = the_list.records(keeper.id)
+        self.assertEqual(saved_item.id, item.id)
+        detail = list_page.action_state(keeper.id, saved_item, status=server_status, include_detail=True).get("detail_html", "")
+        positions = [detail.index(words, detail.index('data-question="Q1"'))
+                     for exchange in zip(questions, answers, strict=True) for words in exchange]
+        self.assertEqual(positions, sorted(positions))
+        for index in range(1, 4):
+            self.assertIn(f'data-log-index="Q{index}-answered"', detail)
+
+    def test_studio_question_moves_to_answered_after_unlink(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="layout-owner")
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = replace(case.submission_request(kind, owner.id), page="studio",
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual(created.status, 200, created.body)
+        sent = cast(dict[str, str], json.loads(created.body))
+        key = sent["key"]
+        origin = review_items.submission_origin(cache.get().records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        working, = the_list.records(keeper.id)
+        self.assertIs(working.state, the_list.ItemState.WORKING)
+        question = the_list.NativeQuestionItem(the_list.QuestionItemKind.FROM_NATE,
+                                               f"submission/question/{request.request_id}")
+        self.assertEqual(working.native_question, question)
+        _ = the_list.unlink(keeper.id, working.id, (key,), source="nate")
+        reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], request.request_id)
+        self.assertTrue(change_page.answer_item(reply, "Use the wide layout.", origin.reply_token, case.status))
+        answered, = the_list.records(keeper.id)
+        self.assertEqual((answered.id, answered.reviews, answered.native_question), (working.id, (), question))
+        self.assertIs(answered.state, the_list.ItemState.ANSWERED)
+        self.assertTrue(the_list.unread_answer_ids(answered))
+
+    def working_studio_question(self, keeper: staff.StaffId, owner: staff.StaffId) -> the_list.ListItem:
+        key = "submission/question/studio-workflow"
+        exchange = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "followup:1",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which layout?", datetime.now(timezone.utc),
+            list_exchange.Nate.USER, owner, list_exchange.QuestionWithoutAnswer.OPEN)
+        with the_list.lock_exchange_source(key) as source:
+            row = the_list.file_exchanges(source, (exchange,), exchange.question, linked=the_list.NextNumber.AVAILABLE,
+                                          owner=owner, members=staff.snapshot())
+        self.assertEqual(row.keeper, keeper)
+        return the_list.load(keeper, f"L{row.number}")
+
+    def test_studio_marks_a_second_linked_question_read_without_closing_the_item(self) -> None:
+        case = self.review_fixture()
+        keeper = self.configure_list_keeper()
+        item = self.working_studio_question(keeper.id, keeper.id)
+        question = review_submissions.submit(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, keeper.id))
+        key = review_items.submission_review_key(question)
+        _ = the_list.link(keeper.id, item.id, (key,), source="nate")
+        words = "Use the links on the right."
+        self.assertTrue(change_page.answer_item(question.key, words, question.details.reply_token, case.status))
+        snapshot = review_page.build_snapshot(case.root)
+        self.assertNotIn(key, {entry["key"] for entry in snapshot.entries})
+        current = the_list.load(keeper.id, item.id)
+        self.assertIs(current.state, the_list.ItemState.WORKING)
+        self.assertEqual(current.native_question, item.native_question)
+        answer, = the_list.unread_answer_ids(current)
+        self.assertEqual(answer, the_list.ReturnedAnswerId(f"submission/question/{question.request_id}", "followup:1"))
+        page = self.request(f"{studio_page.PAGE_PATH}?show=answers")
+        self.assertEqual(page.status, 200, page.body)
+        summary = re.search(rb'<tbody data-list-item[^>]*data-state="Working"[^>]*>', page.body)
+        assert summary is not None
+        self.assertNotIn(b" hidden", summary[0])
+        self.assertIn(b'<small data-new-answer>New answer</small>', page.body)
+        self.assertIn(b'value="read">Mark read</button>', page.body)
+        prefix, token = list_page.signed_item_request(list_page.ListRecord(keeper.id, current),
+                                                     list_page.form_secret(self.server.root))
+        body = urlencode({"keeper": keeper.id, "id": item.id, "request": prefix, "token": token,
+                          "action": "read", "words": "", "until": ""})
+        status, response = self.post(studio_page.PAGE_PATH, body)
+        self.assertEqual(status, 200, response)
+        saved = the_list.load(keeper.id, item.id)
+        self.assertEqual((saved.state, saved.native_question), (item.state, item.native_question))
+        self.assertFalse(the_list.unread_answer_ids(saved))
+        self.assertFalse(change_page.answer_item(question.key, words, question.details.reply_token, case.status))
+        self.assertEqual(the_list.load(keeper.id, item.id), saved)
+
+    def test_question_state_rejects_ordinary_close_remove_and_update(self) -> None:
+        keeper = self.configure_list_keeper()
+        item = self.working_studio_question(keeper.id, keeper.id)
+        with self.assertRaisesRegex(the_list.ListError, "Only the asker can close this question"):
+            _ = the_list.close(keeper.id, item.id, "Cancel the work.", source="fixture")
+        with self.assertRaisesRegex(the_list.ListError, "You cannot set a question's state directly"):
+            _ = the_list.update(keeper.id, item.id, {"state": the_list.ItemState.DONE}, source="fixture")
+        prefix, token = list_page.signed_item_request(list_page.ListRecord(keeper.id, item), list_page.form_secret(self.root))
+        body = urlencode({"keeper": keeper.id, "id": item.id, "request": prefix, "token": token,
+                          "action": "remove", "words": "", "until": ""})
+        page = list_page.render(self.root, include_counts=False)
+        self.assertNotIn(b'<button name="action" value="remove">Remove</button>', page)
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            code, response = self.post(studio_page.PAGE_PATH, body, headers={send_hold.REPLAY_HEADER: "1"})
+        self.assertEqual(code, 400, response)
+        self.assertIn(b"You cannot remove a question.", response)
+        self.assertEqual(the_list.load(keeper.id, item.id), item)
+
+    def test_question_ask_and_tell_use_their_own_signed_recipients_on_retry(self) -> None:
+        keeper = self.configure_list_keeper()
+        owner = fixture_member("producer", name="layout-owner")
+        producer = fixture_member("producer", name="layout-producer")
+        item = self.working_studio_question(keeper.id, owner.id)
+        item = the_list.update(keeper.id, item.id, {"producer": producer.id}, source="fixture")
+        status = change_page.DeliveryStatus(self.root)
+        with patch.object(the_list.ListQuestionRouting, "_available", return_value=True):
+            page = list_page.render(self.root, include_counts=False)
+            entry = list_page.ListRecord(keeper.id, item)
+            secret = list_page.form_secret(self.root)
+            route = the_list.ListQuestionRouting(staff.snapshot()).receiver(keeper.id, producer.id)
+            ask, ask_token = list_page.signed_item_request(entry, secret, ask_signature=route.signature)
+            tell, tell_token = list_page.signed_item_request(entry, secret)
+        self.assertIn(b'value="question" disabled>Ask layout-producer</button>', page)
+        self.assertIn(b'value="tell" disabled>Tell layout-owner</button>', page)
+        self.assertIn(b'aria-label="Your words"', page)
+        common = {"keeper": keeper.id, "id": item.id, "until": ""}
+        ask_body = urlencode({**common, "request": ask, "token": ask_token,
+                              "action": "question", "words": "Which size fits?"})
+        tell_body = urlencode({**common, "request": tell, "token": tell_token,
+                               "action": "tell", "words": "The 800 pixel layout fits."})
+        with (patch.object(change_page, "send_question", return_value=question_outcome()) as ask_send,
+              patch.object(the_list.ListQuestionRouting, "_available", return_value=True)):
+            list_page.deliver(list_page.submit(self.root, ask_body, status))
+            _ = the_list.update(keeper.id, item.id, {"producer": keeper.id}, source="fixture")
+            list_page.deliver(list_page.submit(self.root, ask_body, status))
+        ask_send.assert_called_once()
+        self.assertEqual(ask_send.call_args.args[0], producer.id)
+        with capture_sender("send_to_staff") as tell_send:
+            for _ in range(2):
+                list_page.deliver(list_page.submit(self.root, tell_body, status))
+        tell_send.assert_called_once()
+        self.assertEqual(tell_send.call_args.args[0], owner.id)
+        saved = the_list.load(keeper.id, item.id)
+        self.assertEqual(saved.questions[0].recipient_id(keeper.id), producer.id)
+        self.assertEqual(the_list.feedback_requests(saved)[tell].recipient, owner.id)
+
+    def test_review_card_shows_only_the_unfiled_answer(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="layout-owner")
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        item = the_list.add(keeper.id, "Select a layout", owner=owner.id, source="nate", changes={})
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = case.submission_request(kind, owner.id)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+        sent = cast(dict[str, str], json.loads(created.body))
+        key = sent["key"]
+        _ = the_list.link(keeper.id, item.id, (key,), source="nate")
+        question = cache.get().records[key].source
+        assert isinstance(question, review_items.QuestionSource)
+        origin = review_items.submission_origin(cache.get().records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        older = "The old layout reply stays in Review."
+        older_reply = review_events.ReviewLog(datetime.now(timezone.utc) - timedelta(days=1), owner.id, "Answer: " + older)
+        record = question.record
+        log = review_events.decode(record.item.get("review_log", ""))
+        record = replace(record, item={**record.item, "review_log": review_events.encode((older_reply, *log))})
+        update_registration.write_question_record(record)
+
+        reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], request.request_id)
+        words = "Use the compact layout on narrow screens."
+        self.assertTrue(change_page.answer_item(reply, words, origin.reply_token, case.status))
+        snapshot = review_page.build_snapshot(case.root)
+        self.assertIn(key, {row["key"] for row in snapshot.entries})
+        self.assertIn(b'<button type="button" hidden id="filter-type-question"', snapshot.page)
+        self.assertIn(b'<button type="button" hidden id="filter-type-response"', snapshot.page)
+        handoff = snapshot.records[key].exchange_handoff
+        assert isinstance(handoff, review_items.FiledReviewExchange)
+        self.assertEqual(handoff.exchange_ids, {"followup:1"})
+        self.assertEqual(len(handoff.answer_events), 1)
+        page = list_page.render(case.root, include_counts=False)
+        log_html = page.partition(b'class="list-log-scroll"')[2].partition(b'</ol>')[0]
+        self.assertEqual(log_html.count(words.encode()), 1)
+        card = snapshot.body(key, view=review_page.ReviewBodyView.CARD)
+        self.assertIn(older.encode(), card)
+        self.assertFalse(words.encode() in card, "The Review card repeats the filed reply.")
+
+        followup = "Which layout works on wide screens?"
+        with capture_sender("send_to_staff"):
+            delivery, _ = review_page.submit(case.root, case.body(key, "question", followup), case.status)
+            assert isinstance(delivery, change_page.MessageDelivery)
+            change_page.deliver(delivery, case.status)
+        waiting = review_page.build_snapshot(case.root)
+        self.assertIs(waiting.records[key].state, review_items.ReviewState.WAITING)
+        card = waiting.body(key, view=review_page.ReviewBodyView.CARD)
+        self.assertIn(older.encode(), card)
+        self.assertIn(followup.encode(), card)
+        self.assertFalse(words.encode() in card, "The Waiting card repeats the filed reply.")
+
+    def test_filed_native_pair_hides_its_log_copy_and_keeps_the_unmatched_reply(self) -> None:
+        from scripts.review_links import answer_sources
+
+        case = self.review_fixture()
+        key = case.question()
+        source = review_page.build_snapshot(case.root).records[key].source
+        assert isinstance(source, review_items.QuestionSource)
+        members = staff.snapshot()
+        keeper = record_store.list_keeper(conf.read("console"), members)
+        assert keeper is not None
+        item = the_list.add(keeper.id, "Select a layout", owner=source.record.owner, source="nate", changes={})
+        _ = the_list.link(keeper.id, item.id, (key,), source="nate")
+        answered_at = datetime.now(timezone.utc)
+        unmatched = review_events.ReviewLog(answered_at - timedelta(minutes=1), source.record.owner,
+                                            "Answer: Keep the existing menu.")
+        words = "Use the compact layout."
+        record = replace(source.record, item={**source.record.item,
+            "followups": [{"followup": "Which layout works?", "reply": words, "replied_at": answered_at.isoformat()}],
+            "answered_at": answered_at.isoformat(), "review_log": review_events.encode((unmatched,))})
+        update_registration.write_question_record(record)
+        before = review_page.build_snapshot(case.root)
+        self.assertIn(words.encode(), before.body(key))
+
+        answer_sources.file_saved_question(record, members)
+        after = review_page.build_snapshot(case.root)
+        current = after.records[key]
+        handoff = current.exchange_handoff
+        assert isinstance(handoff, review_items.FiledReviewExchange)
+        self.assertFalse(handoff.answer_events)
+        self.assertTrue(current.unread_answer)
+        card = after.body(key)
+        self.assertIn(unmatched.words.encode(), card)
+        self.assertNotIn(words.encode(), card)
+        saved = the_list.load(keeper.id, item.id)
+        returned, = (entry.what for entry in saved.log if isinstance(entry.what, the_list.ReturnedAnswer))
+        self.assertEqual(returned.words, words)
+
+    def test_review_answer_returns_to_the_linked_list_log_once(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="layout-owner")
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = replace(case.submission_request(kind, owner.id), page="list", request_id="r6-" + uuid4().hex,
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+        sent = cast(dict[str, str], json.loads(created.body))
+        key = sent["key"]
+        item, = the_list.records(keeper.id)
+        self.assertEqual((item.number, item.reviews), (sent["list_number"], (key,)))
+        _ = the_list.park(keeper.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+        origin = review_items.submission_origin(cache.get().records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], origin.request_id)
+        words = "Use the compact layout on narrow screens."
+
+        def fail_receipt(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            if path.suffix == ".saved":
+                raise OSError("Could not save the List receipt.")
+            atomic_file.write_text_atomic(path, text, new_file_mode=new_file_mode)
+
+        with patch.object(the_list, "write_text_atomic", side_effect=fail_receipt), redirect_stderr(StringIO()) as errors:
+            self.assertTrue(change_page.answer_item(reply, words, origin.reply_token, case.status))
+        self.assertIn("Could not save the List receipt.", errors.getvalue())
+        first, = the_list.records(keeper.id)
+        self.assertEqual(first.id, item.id)
+        self.assertIs(first.state, the_list.ItemState.ANSWERED)
+        self.assertIs(first.parked_until, the_list.ParkUntilDelivered.DELIVERED)
+        exchange, = first.filed_exchanges
+        answer_id = the_list.ReturnedAnswerId(exchange.source_key, exchange.exchange_id)
+        saved_answer, = (entry for entry in first.log if isinstance(entry.what, the_list.ReturnedAnswer))
+        self.assertEqual((saved_answer.what, saved_answer.source), (the_list.ReturnedAnswer(answer_id, words), owner.id))
+
+        destination = investigation.ListDestination(keeper.id, item.number)
+        self.assertFalse(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)))
+        snapshot = review_page.build_snapshot(case.root)
+        self.assertIn(key, {row["key"] for row in snapshot.entries})
+        self.assertTrue(snapshot.records[key].unread_answer)
+        self.assertIn(words.encode(), snapshot.body(key))
+        self.assertEqual(snapshot.filed_item_url(case.root, key), "")
+        target = review_page.report_url(destination)
+        page = list_page.render(case.root, include_counts=False, query="show=needs-me")
+        self.assertRegex(page, rb'<tbody data-list-item[^>]*data-unread-answer="true"[^>]*><tr')
+        self.assertIn(b'<small data-new-answer>New answer</small>', page)
+        log = page.partition(b'class="list-log-scroll"')[2].partition(b'</ol>')[0]
+        self.assertRegex(log, rb'<strong>Answer</strong>[^<]*<small>[^<]*<span[^>]*>layout-owner</span>')
+        self.assertEqual(log.count(words.encode()), 1)
+        self.assertEqual(page.count(words.encode()), 1)
+
+        self.assertFalse(change_page.answer_item(reply, words, origin.reply_token, case.status))
+        self.assertEqual(the_list.load(keeper.id, item.id), first)
+        self.assertEqual(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)), {exchange})
+        snapshot, _ = cache.publish_record(cache.get(), key)
+        self.assertNotIn(key, {row["key"] for row in snapshot.entries})
+        self.assertEqual(snapshot.filed_item_url(case.root, key), target)
+
+        read = the_list.mark_read(keeper.id, item.id, source=the_list.PAGE_SOURCE)
+        self.assertFalse(change_page.answer_item(reply, words, origin.reply_token, case.status))
+        self.assertEqual(the_list.load(keeper.id, item.id), read)
+        self.assertEqual(the_list.unread_answer_ids(read), frozenset())
+        self.assertIs(read.state, the_list.ItemState.CLOSED)
+        self.assertIs(read.parked_until, the_list.NoTimestamp.UNSET)
+        self.assertEqual(read.closing_words, "Read by nate")
+        query = urlencode({"item-state": item.id, "keeper": keeper.id})
+        response = self.request(f"{studio_page.PAGE_PATH}?{query}")
+        self.assertEqual(response.status, 200, response.body)
+        body = cast(list_page.SavedActionState, json.loads(response.body))
+        self.assertIs(body.get("detail_closed"), True)
+        self.assertEqual(body.get("unread_answer"), "false")
+        detail = body.get("detail_html", "")
+        self.assertNotIn('<small data-new-answer>New answer</small>', detail)
+        self.assertEqual(detail.count(words), 1)
+
+    def test_proposal_reply_retry_saves_the_missing_list_receipt(self) -> None:
+        case = self.review_fixture()
+        document = case.fixture.production.parent / "producer.md"
+        _ = document.write_text(f"# Producer\n- **Proposals:** {document.parent / 'producer-proposals'}\n")
+        owner = fixture_member("producer", name="layout-owner", doc=staff.LiveDoc(local_machine(), document))
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        kind = new_item_dialog.SubmissionKind.PROPOSAL
+        request = replace(case.submission_request(kind, owner.id), page="list", request_id="r6-" + uuid4().hex,
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+        sent = cast(dict[str, str], json.loads(created.body))
+        key = sent["key"]
+        item, = the_list.records(keeper.id)
+        self.assertEqual((item.number, item.reviews), (sent["list_number"], (key,)))
+        with capture_sender("send_to_staff"):
+            delivery, _ = review_page.submit(case.root, case.body(key, "question", "Which checks stay?"), case.status)
+            assert isinstance(delivery, change_page.MessageDelivery)
+            change_page.deliver(delivery, case.status)
+        waiting = review_page.build_snapshot(case.root)
+        origin = review_items.submission_origin(waiting.records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], origin.request_id)
+        words = "Keep the layout checks."
+
+        def fail_receipt(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            if path.suffix == ".saved":
+                raise OSError("Could not save the List receipt.")
+            atomic_file.write_text_atomic(path, text, new_file_mode=new_file_mode)
+
+        with patch.object(the_list, "write_text_atomic", side_effect=fail_receipt), redirect_stderr(StringIO()) as errors:
+            self.assertTrue(change_page.answer_item(reply, words, origin.reply_token, case.status))
+        self.assertIn("Could not save the List receipt.", errors.getvalue())
+        destination = investigation.ListDestination(keeper.id, item.number)
+        first = the_list.load(keeper.id, item.id)
+        exchange, = first.filed_exchanges
+        self.assertEqual(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)), frozenset())
+        answer, = (entry.what for entry in first.log if isinstance(entry.what, the_list.ReturnedAnswer))
+        self.assertEqual(answer.words, words)
+        snapshot = review_page.build_snapshot(case.root)
+        self.assertIn(key, {row["key"] for row in snapshot.entries})
+        self.assertTrue(snapshot.records[key].unread_answer)
+        self.assertIn(words.encode(), snapshot.body(key))
+
+        self.assertFalse(change_page.answer_item(reply, words, origin.reply_token, case.status))
+        self.assertEqual(the_list.confirmed_exchanges(exchange.source_key, destination, (exchange,)), {exchange})
+        self.assertEqual(the_list.load(keeper.id, item.id), first)
+        snapshot = review_page.build_snapshot(case.root)
+        self.assertIn(key, {row["key"] for row in snapshot.entries})
+        self.assertFalse(snapshot.records[key].unread_answer)
+        self.assertNotIn(words.encode(), snapshot.body(key))
+
     def test_review_waits_for_directory_sync_and_list_commit_before_feature_closeout(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)
         key = 'page-owner/C1'
@@ -6043,7 +7938,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         saved = [cache.save(case.card_body(cache.get(), key, 'works'), case.status)
                  for key in ('page-owner/C1', 'page-owner/C2', 'page-owner/C3')]
-        _ = change_page.finish_verdict_cleanup(saved[0].delivery, case.status)
+        first = saved[0].delivery
+        assert isinstance(first, (change_page.MessageDelivery, change_page.NoMessageDelivery))
+        _ = change_page.finish_verdict_cleanup(first, case.status)
         _ = feature_log.drop_review('page-owner/C3', 'The proposal was dropped.')
         alerts: list[tuple[staff.StaffId, str]] = []
         refused_states: list[str] = []
@@ -6140,9 +8037,9 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_review_refuses_a_verdict_while_a_change_is_validating(self) -> None:
         case = self.review_fixture(changes=1)
-        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         key = 'page-owner/C1'
-        _ = cache.save(case.card_body(cache.get(), key, 'validate', 'Check the change.'), case.status)
+        _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the change.'), case.status)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         listing = case.fixture.review_list
         claim = change_routing.delivery_path(case.root, listing, 'C1')
         before = (listing.read_bytes(), claim.read_bytes(), dict(case.status.request_attempts))
@@ -6162,9 +8059,9 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_validating_ask_returns_the_saved_body_and_delivery_state(self) -> None:
         case = self.review_fixture(changes=1)
-        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         key = 'page-owner/C1'
-        _ = cache.save(case.card_body(cache.get(), key, 'validate', 'Check the change.'), case.status)
+        _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the change.'), case.status)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         started, release = threading.Event(), threading.Event()
 
         def send(_delivery: change_page.MessageDelivery, _status: change_page.DeliveryStatus) -> None:
@@ -6193,10 +8090,10 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_review_body_serves_the_validating_question_in_both_card_views(self) -> None:
         case = self.review_fixture(changes=1)
+        key = 'page-owner/C1'
+        _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the change.'), case.status)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         self.addCleanup(cache.close)
-        key = 'page-owner/C1'
-        _ = cache.save(case.card_body(cache.get(), key, 'validate', 'Check the change.'), case.status)
         with patch.object(self.server, 'review_cache', cache):
             table = self.request(review_page.PAGE_PATH + '?' + urlencode({'body': key}))
             card = self.request(review_page.card_url(key))
@@ -6782,7 +8679,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_review_shows_only_current_question_failures(self) -> None:
         case = self.review_fixture(changes=1)
-        report = case.investigation()
+        with patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")):
+            report = case.investigation()
         investigation_key = f'investigation/{report.owner}/{report.id}'
         proposal, efficiency = case.decisions()
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -6800,10 +8698,20 @@ class ReviewLinksServerTests(unittest.TestCase):
                 if key == investigation_key:
                     question = case.status.slots(saved.delivery.page, saved.delivery.row).question
                     assert isinstance(question, change_page.OpenQuestion)
+                    self.assertIn(investigation_key, {entry["key"] for entry in current.entries})
                     _ = investigation.answer(report.owner, report.id, 'The smoke checks passed.',
                                              question_id=question.question_id)
                     cache.publish_delivery_result(investigation_key)
-                    self.assertNotIn('question-delivery:'+investigation_key, cache.get().assets)
+                    final = cache.get()
+                    self.assertNotIn('question-delivery:'+investigation_key, final.assets)
+                    self.assertNotIn(investigation_key, {entry["key"] for entry in final.entries})
+                    keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+                    assert keeper is not None
+                    row, = the_list.records(keeper.id)
+                    pairs = [(exchange.question, exchange.answer.text) for exchange in row.filed_exchanges
+                             if isinstance(exchange.answer, list_exchange.ExchangeAnswer)]
+                    self.assertCountEqual(pairs, [(report.question, report.answer),
+                                                  ("Which checks passed?", "The smoke checks passed.")])
                 elif key in (proposal, efficiency):
                     self.assertNotIn('question-delivery:'+investigation_key, current.assets)
 
@@ -7113,6 +9021,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         _ = self.enterContext(patch.object(change_browser, "waiting_changes", return_value=frozenset({"a/C1"})))
         questions = self.enterContext(patch.object(review_page, "waiting_items", return_value=frozenset({"q1"})))
+        studio = self.enterContext(patch.object(list_page, "waiting_updates", return_value=frozenset({"L1"})))
         self.assertEqual(self.post("/console/news", "open=images"), (200, b'{"new": []}'))
         questions.return_value = frozenset({"q1", "q2"})
         self.assertEqual(self.post("/console/news", "open=images"), (200, b'{"new": ["review"]}'))
@@ -7120,14 +9029,25 @@ class ReviewLinksServerTests(unittest.TestCase):
         # The Rebuilds page names no open page; the marks still follow new items.
         questions.return_value = frozenset({"q1", "q2", "q3"})
         self.assertEqual(self.post("/console/news", "open="), (200, b'{"new": ["review"]}'))
+        studio_items, review_questions = {"L1"}, {"q1", "q2", "q3"}
+        for body, item, question in (("open=studio", "L2", "q4"), ("open=list", "L3", "q5")):
+            with self.subTest(body=body):
+                self.assertEqual(self.post("/console/news", "open=review"), (200, b'{"new": []}'))
+                studio_items.add(item)
+                studio.return_value = frozenset(studio_items)
+                self.assertEqual(self.post("/console/news", "open=review"), (200, b'{"new": ["studio"]}'))
+                review_questions.add(question)
+                questions.return_value = frozenset(review_questions)
+                self.assertEqual(self.post("/console/news", body), (200, b'{"new": ["review"]}'))
         for body in ("open=nowhere", "", "open=images&open=review"):
             with self.subTest(body=body):
                 self.assertEqual(self.post("/console/news", body)[0], 400)
         self.assertEqual(self.request("/console/" + console.SEEN_NAME).status, 404)
+        self.assertEqual(self.post("/console/news", "open=review"), (200, b'{"new": []}'))
 
     def test_investigation_mark_read_saves_and_reports_refused_or_failed_requests(self) -> None:
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
-        morty = fixture_member("producer", name="morty")
+        morty = self.configure_list_keeper()
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))))
         owner = staff.StaffId("fixture-owner")
         item = investigation.file(owner, "Find the cause", "Why?", waiting_why='The owner must complete the investigation.')
@@ -7149,16 +9069,27 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.READ)
         item = the_list.add(morty.id, "Read the List page", owner=the_list.UnassignedOwner.NATE,
                             source="nate", changes={})
-        response = self.request(list_page.PAGE_PATH)
+        response = self.request(studio_page.PAGE_PATH)
         self.assertEqual(response.status, 200)
         self.assertIn(b"Read the List page", response.body)
         _ = the_list.update(morty.id, item.id, {"title": "Read the new List page"}, source="morty")
-        self.assertIn(b"Read the new List page", self.request(list_page.PAGE_PATH).body)
+        self.assertIn(b"Read the new List page", self.request(studio_page.PAGE_PATH).body)
         self.assertNotEqual(self.post(list_page.PAGE_PATH, "id=L1")[0], 200)
         with patch.object(list_page, "render", side_effect=OSError("fixture read failed")):
-            failed = self.request(list_page.PAGE_PATH)
+            failed = self.request(studio_page.PAGE_PATH)
             self.assertEqual(failed.status, 503)
-            self.assertIn(b"The List page is not available.", failed.body)
+            self.assertIn(b"The Studio page is not available.", failed.body)
+
+    def test_retired_list_redirect_preserves_bookmark_query(self) -> None:
+        _, item = self.list_keeper_item("Open a retired bookmark")
+        query = "?show=working&q=caf%C3%A9&key=a%2Fb&key=c%2Fd"
+        response = self.request(list_page.PAGE_PATH + query)
+        self.assertEqual(response.status, 303)
+        self.assertEqual(response.headers["location"], studio_page.PAGE_PATH + query)
+        self.assertEqual(response.body, b"")
+        no_query = self.request(list_page.PAGE_PATH)
+        self.assertEqual(no_query.headers["location"], studio_page.PAGE_PATH)
+        self.assertIn(item.title.encode(), self.request(no_query.headers["location"]).body)
 
     def test_studio_serves_the_list_rows_under_picture_tabs(self) -> None:
         _, item = self.list_keeper_item("Read the Studio page")
@@ -7169,10 +9100,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(response.headers.get("content-encoding"), "gzip")
         page = gzip.decompress(response.body)
         self.assertIn(b"<title>The Studio</title>", page)
-        self.assertIn(b'<div class="studio-tabs">', page)
+        self.assertIn(b'<div data-page-top-controls><div class="studio-tab-row"><div class="studio-tabs">', page)
         self.assertIn(item.title.encode(), page)
         self.assertEqual(page.count(b'aria-label="Producer" data-filter-row="producer">'), 1)
         self.assertIn(f'data-list-path="{studio_page.PAGE_PATH}"'.encode(), page)
+        review = self.request(review_page.PAGE_PATH)
+        self.assertEqual(review.status, 200)
+        self.assertNotIn(b'<div data-page-top-controls>', review.body)
         with (patch.object(list_page, "render", side_effect=OSError("fixture read failed")),
               redirect_stderr(StringIO()) as log):
             failed = self.request(studio_page.PAGE_PATH, headers=encoding)
@@ -7181,6 +9115,69 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(failed.headers.get("content-encoding"), "gzip")
         self.assertIn(b"The Studio page is not available.", gzip.decompress(failed.body))
         self.assertIn("review-links studio: fixture read failed", log.getvalue())
+
+    def test_studio_reads_only_the_requested_closed_log(self) -> None:
+        keeper, leaf = self.list_keeper_item("Check the last result")
+        _, middle = self.list_keeper_item("Check the middle result")
+        _, source = self.list_keeper_item("Check the first result")
+        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((keeper,))):
+            _ = the_list.update(keeper.id, middle.id, {"related_to": (leaf.number,)}, source="morty")
+            _ = the_list.update(keeper.id, source.id, {"related_to": (middle.number,)}, source="morty")
+            _ = the_list.close(keeper.id, leaf.id, "The leaf log is complete.", source="morty")
+            _ = the_list.close(keeper.id, middle.id, "The middle log is complete.", source="morty")
+            with patch.object(list_page, "item_log", wraps=list_page.item_log) as render_log:
+                page = self.request(studio_page.PAGE_PATH)
+                self.assertEqual(page.status, 200)
+                rendered = [cast(list_page.ListRecord, call.args[0]).item.id for call in render_log.call_args_list]
+                self.assertEqual(rendered, [source.id])
+                self.assertIn(b'data-list-closed-loading role="status"', page.body)
+                self.assertIn(leaf.title.encode(), page.body)
+                self.assertNotIn(b"The middle log is complete.", page.body)
+                self.assertNotIn(b"The leaf log is complete.", page.body)
+                render_log.reset_mock()
+                query = urlencode({"item-state": middle.id, "keeper": keeper.id})
+                response = self.request(f"{studio_page.PAGE_PATH}?{query}")
+                self.assertEqual(response.status, 200)
+                rendered = [cast(list_page.ListRecord, call.args[0]).item.id for call in render_log.call_args_list]
+                self.assertEqual(rendered, [middle.id])
+                body = cast(list_page.SavedActionState, json.loads(response.body))
+                self.assertIs(body.get("detail_closed"), True)
+                detail = body.get("detail_html", "")
+                self.assertIn("The middle log is complete.", detail)
+                self.assertNotIn("The leaf log is complete.", detail)
+                self.assertNotIn("<form", detail)
+
+    def test_studio_closed_detail_shows_an_unread_answer_without_marking_it_read(self) -> None:
+        keeper = self.configure_list_keeper()
+        item = the_list.add(keeper.id, "Check the result", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        closed = the_list.close(keeper.id, item.id, "The report is retired.", source="nate")
+        assert isinstance(item.updated, datetime)
+        assert isinstance(closed.updated, datetime)
+        question = question_record.Question("Q1", item.updated.isoformat(), "Which check passed?")
+        path = the_list.folder(keeper.id) / f"{item.id}.md"
+        fields = json.dumps(json.dumps([question_record.stored(question)]))
+        _ = path.write_text(path.read_text().replace("\n---\n", f"\nquestions: {fields}\n---\n", 1))
+        answer = "The page check passed."
+        answered_at = closed.updated + timedelta(minutes=1)
+        with (patch.object(staff, "caller_identity", return_value=keeper.current_session),
+              patch.object(the_list, "now", return_value=answered_at),
+              redirect_stdout(StringIO())):
+            self.assertEqual(the_list.main(["answer", item.id, "--question", question.question_id, "--text", answer]), 0)
+        saved = the_list.load(keeper.id, item.id)
+        self.assertEqual(the_list.unread_answer_ids(saved), frozenset({question.question_id}))
+        stored = path.read_bytes()
+
+        query = urlencode({"item-state": item.id, "keeper": keeper.id})
+        response = self.request(f"{studio_page.PAGE_PATH}?{query}")
+        self.assertEqual(response.status, 200)
+        body = cast(list_page.SavedActionState, json.loads(response.body))
+        self.assertIs(body.get("detail_closed"), True)
+        self.assertEqual(body.get("unread_answer"), "true")
+        detail = body.get("detail_html", "")
+        self.assertIn(question.words, detail)
+        self.assertIn(answer, detail)
+        self.assertEqual(path.read_bytes(), stored)
 
     def test_studio_top_priority_post_names_the_item_and_refuses_other_requests(self) -> None:
         morty, item = self.list_keeper_item("Make this the top item")
@@ -7206,7 +9203,8 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(staff, "set_producer_top_item", side_effect=name_top_item) as write):
             _ = the_list.close(morty.id, closed.id, "Done", source="nate")
-            refusals = ((list_page.PAGE_PATH, fields(item), "", 400), (studio_page.PAGE_PATH, fields(closed), "", 400),
+            refusals = ((list_page.PAGE_PATH, {**fields(item), "token": "bad"}, "", 400),
+                        (studio_page.PAGE_PATH, fields(closed), "", 400),
                         (studio_page.PAGE_PATH, {**fields(item), "token": "bad"}, "", 400),
                         (studio_page.PAGE_PATH, fields(item), "https://elsewhere.invalid", 403))
             for path, body, origin, status in refusals:
@@ -7216,15 +9214,40 @@ class ReviewLinksServerTests(unittest.TestCase):
                   patch.object(serve, "tailscale_ip", return_value="100.64.0.9")):
                 self.assertEqual(self.post(studio_page.PAGE_PATH, urlencode(fields(item)))[0], 403)
             write.assert_not_called()
-            code, body = self.post(studio_page.PAGE_PATH, urlencode(fields(item)))
-            self.assertEqual(code, 200, body)
-            page = self.request(studio_page.PAGE_PATH).body.decode()
-        write.assert_called_once_with(morty.id, staff.TopItem(item.number))
-        response = cast(dict[str, str], json.loads(body))
-        self.assertEqual(response["state"], "saved")
-        self.assertNotIn("Make top priority", response["detail_html"])
-        self.assertIn('<span class="list-top-mark" role="img" aria-label="Top priority"', page)
-        self.assertIn(f'<b>#{item.number} {item.title}</b>', page)
+            top = '<button name="action" value="top">Make top priority</button>'
+            for path, redirected in ((studio_page.PAGE_PATH, False), (list_page.PAGE_PATH, True)):
+                with self.subTest(path=path):
+                    record[0] = staff.StaffSnapshot((morty,))
+                    write.reset_mock()
+                    refreshed = self.request(path)
+                    if redirected:
+                        self.assertEqual(refreshed.status, 303)
+                        refreshed = self.request(refreshed.headers["location"])
+                    self.assertEqual(refreshed.status, 200)
+                    panel = re.search(r'<form method="post" data-feedback-form\b[^>]*>(.*?)</form>',
+                                      refreshed.body.decode(), re.S)
+                    assert panel is not None
+                    self.assertIn(top, panel[1])
+                    form = dict(re.findall(
+                        r'<input type="hidden" name="(keeper|id|request|token)" value="([^"]+)">', panel[1]))
+                    query = urlencode({"item-state": item.id, "keeper": morty.id})
+                    state = self.request(f"{path}?{query}")
+                    self.assertEqual(state.status, 200)
+                    self.assertIn(top, cast(dict[str, str], json.loads(state.body))["detail_html"])
+                    code, body = self.post(path, urlencode(form | {"action": "top", "words": "", "until": ""}))
+                    self.assertEqual(code, 200, body)
+                    write.assert_called_once_with(morty.id, staff.TopItem(item.number))
+                    response = cast(dict[str, str], json.loads(body))
+                    self.assertEqual(response["state"], "saved")
+                    self.assertNotIn("Make top priority", response["detail_html"])
+                    state = self.request(f"{path}?{query}")
+                    self.assertEqual(state.status, 200)
+                    self.assertNotIn(top, cast(dict[str, str], json.loads(state.body))["detail_html"])
+                    page = self.request(studio_page.PAGE_PATH).body.decode()
+                    self.assertIn('<span class="list-top-mark" role="img" aria-label="Top priority"', page)
+                    link = html.escape(list_page.item_link(morty.id, item.number))
+                    self.assertIn(f'<a class="list-top-link" data-record-jump href="{link}">'
+                                  + f'#{item.number} {item.title}</a>', page)
 
     def test_studio_pictures_are_guarded_named_files_under_the_avatar_root(self) -> None:
         avatars = self.root.parent.resolve() / "studio-avatars"
@@ -7270,13 +9293,13 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(list_page, "counts_strip", return_value=footer) as counts,
               patch.object(list_page, "read_linked_reviews", side_effect=AssertionError("The List read all reviews."))):
             encoding = {"Accept-Encoding": "gzip, br"}
-            page = self.request(list_page.PAGE_PATH, headers=encoding)
+            page = self.request(studio_page.PAGE_PATH, headers=encoding)
             self.assertEqual(page.status, 200)
             self.assertEqual(page.headers.get("content-encoding"), "gzip")
             markup = gzip.decompress(page.body)
             self.assertIn(b"Read the published review", markup)
             self.assertIn(b"1 change for you", markup)
-            self.assertIn(b'data-list-counts-url="/console/list.html?counts=1"', markup)
+            self.assertIn(b'data-list-counts-url="/console/studio.html?counts=1"', markup)
             self.assertNotIn(footer.encode(), markup)
             counts.assert_not_called()
             with patch.object(list_page, "records", side_effect=AssertionError("The counts request read the List.")):
@@ -7288,7 +9311,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             counts.assert_called_once()
 
     def add_list_filter_items(self) -> staff.StaffId:
-        keeper = fixture_member("producer", name="morty").id
+        keeper = self.configure_list_keeper().id
         for number, producer, parked, unread in (
                 (1, "pa", True, True), (2, "pb", True, True), (3, "pa", True, False),
                 (4, "pa", False, True), (5, "pb", False, True)):
@@ -7301,7 +9324,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         return keeper
 
     def list_filter_markup(self, query: str = "", *,
-                           path: str = list_page.PAGE_PATH) -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
+                           path: str = studio_page.PAGE_PATH) -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
         with patch.object(record_table, "count_filter_row", wraps=record_table.count_filter_row) as count:
             response = self.request(path + query)
         self.assertEqual(response.status, 200)
@@ -7316,9 +9339,14 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_list_applies_address_filters_before_javascript_runs(self) -> None:
         _ = self.add_list_filter_items()
+        query = "?show=parked&producer=pa&unread=1&q=parked"
         for path in (list_page.PAGE_PATH, studio_page.PAGE_PATH):
             with self.subTest(path=path):
-                visible, chips = self.list_filter_markup("?show=parked&producer=pa&unread=1&q=parked", path=path)
+                if path == list_page.PAGE_PATH:
+                    redirect = self.request(path + query)
+                    self.assertEqual(redirect.status, 303)
+                    self.assertEqual(redirect.headers["location"], studio_page.PAGE_PATH + query)
+                visible, chips = self.list_filter_markup(query)
                 self.assertEqual(visible, ["1"])
                 self.assertEqual(chips["show", "all"], ("false", "1"))
                 self.assertEqual(chips["show", "parked"], ("true", "1"))
@@ -7329,7 +9357,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(chips["owner", "all"], ("true", "1"))
 
     def test_list_search_shows_a_parked_item_with_an_unread_answer_before_javascript_runs(self) -> None:
-        morty = fixture_member("producer", name="morty")
+        morty = self.configure_list_keeper()
         item = the_list.add(morty.id, "Check the result", owner=the_list.UnassignedOwner.NATE,
                             source="nate", changes={}, number=1)
         _ = the_list.park(morty.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
@@ -7385,7 +9413,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             with (patch.object(self.server, "root", case.root), patch.object(self.server, "review_cache", cache),
                   patch.object(self.server, "delivery_status", case.status), patch.object(list_page, "deliver"),
                   patch.object(list_page, "read_linked_reviews", wraps=list_page.read_linked_reviews) as read):
-                page = self.request(list_page.PAGE_PATH)
+                page = self.request(studio_page.PAGE_PATH)
                 self.assertEqual(page.status, 200)
                 self.assertIn(b"Checking linked reviews", page.body)
                 self.assertNotIn(b"Reviews done", page.body)
@@ -7445,10 +9473,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                             source="nate", changes={"producer": producer.id})
         _ = the_list.link(keeper, item.id, ("page-owner/C1", "page-owner/C2"), source="nate")
         with patch.object(self.server, "root", case.root):
-            self.assertEqual(self.request(list_page.PAGE_PATH).status, 200)
+            self.assertEqual(self.request(studio_page.PAGE_PATH).status, 200)
             change_routing.delivery_path(case.root, case.fixture.review_list, "C1").mkdir()
             with patch.object(list_page, "read_linked_reviews", wraps=list_page.read_linked_reviews) as read:
-                response = self.request(list_page.PAGE_PATH)
+                response = self.request(studio_page.PAGE_PATH)
                 read.assert_not_called()
                 self.assertEqual(response.status, 200)
                 self.assertIn(b"Read the linked changes", response.body)
@@ -7539,11 +9567,14 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertIn(change.key, snapshot.records)
                 self.assertEqual(the_list.load(keeper, item.id), parked)
                 with change_review.review_delivery_lock(case.root, wait=False) as lock:
-                    self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+                    self.assertIs(lock, file_lock.LockResult.BUSY)
                 self.assertFalse(asked.done(), "Ask must still be paused.")
             finally:
                 finish_ask.set()
-            change_page.deliver(asked.result(timeout=TEST_HANG_GUARD_SECS), status)
+            delivery = asked.result(timeout=TEST_HANG_GUARD_SECS)
+            with change_review.review_delivery_lock(case.root, wait=False) as lock:
+                self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+            change_page.deliver(delivery, status)
             pending = the_list.load(keeper, item.id)
             self.assertEqual([saved.words for saved in pending.questions], [question.words])
             self.assertIs(pending.parked_until, the_list.ParkUntilDelivered.DELIVERED)
@@ -7591,6 +9622,17 @@ class ReviewLinksServerTests(unittest.TestCase):
             fields = {"keeper": morty.id, "id": item.id, "request": request,
                     "token": list_page.request_token(self.root, morty.id, item.id, request),
                     "action": "read", "words": "Explain this simply.", "until": "2026-12-03"}
+            for invalid_words in ("", "\x85", "\x1c\t\u2028\u3000", "x" * 10001):
+                with self.subTest(invalid_words=len(invalid_words), action="not works"):
+                    verdict = {**fields, "action": "not works", "words": invalid_words}
+                    code, body = self.post(list_page.PAGE_PATH, urlencode(verdict))
+                    self.assertEqual(code, 400)
+                    self.assertEqual(json.loads(body), {
+                        "reason": "Enter your words for the owner and the producer.",
+                        "not_fixed_receipt": {"request": request, "state": "refused"},
+                    })
+                    self.assertEqual(the_list.load(morty.id, item.id), item)
+                    delivery.assert_not_called()
             for action in ("read", "park", "tell", "remove"):
                 fields["action"] = action
                 with self.subTest(action=action):
@@ -7629,9 +9671,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             sent.clear()
             recovered = threading.Event()
             recover = list_page.recover_pending
-            def recover_and_finish(ledger: Path) -> None:
+            def recover_and_finish(ledger: Path, *, send_notice: Callable[[review_actions.ListFeedbackDelivery], object]) -> None:
                 try:
-                    recover(ledger)
+                    recover(ledger, send_notice=send_notice)
                 finally:
                     recovered.set()
             with patch.object(list_page, "recover_pending", side_effect=recover_and_finish):
@@ -7718,6 +9760,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                          sorted([unit.id, morty.id]))
         self.assertEqual(record["sent"], {unit.id: True, morty.id: True})
         message = cast(str, delivery.call_args.args[2])
+        self.assertTrue(message.startswith(f"Studio: nate pressed Go for item {item.number}."))
         self.assertIn("What: Merge needsme to main.", message)
         self.assertIn(f"{go_ledger.CHECK_COMMAND} {go_id}", message)
         saved = the_list.load(morty.id, item.id)
@@ -7744,7 +9787,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(code, 200, reply)
         fields = cast(dict[str, str], json.loads(reply))
         self.assertEqual((fields["item_state"], fields["open_ask"], fields["unread"]), ("Working", "false", "false"))
-        self.assertNotIn('value="top"', fields["detail_html"])
+        self.assertIn('<button name="action" value="top">Make top priority</button>', fields["detail_html"])
         go_id = self.go_ledger_records()[0].stem
         command = f"update --id {item.id} --source morty --next-step"
         messages = self.sent_messages(delivery)
@@ -7772,9 +9815,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         """Start a second server that runs the Go and List Tell recoveries; return each send and its message."""
         recovered = threading.Event()
         recover = list_page.recover_pending
-        def recover_and_finish(ledger: Path) -> None:
+        def recover_and_finish(ledger: Path, *, send_notice: Callable[[review_actions.ListFeedbackDelivery], object]) -> None:
             try:
-                recover(ledger)
+                recover(ledger, send_notice=send_notice)
             finally:
                 recovered.set()
         with (patch.object(change_page, "send_to_staff", side_effect=send) as delivery,
@@ -7988,8 +10031,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         unit = replace(unit, parent=staff.ReportsTo(runner.id))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty, unit, runner))))
         _ = the_list.update(morty.id, item.id, {"owner": unit.id}, source="morty")
+        retried_messages: list[str] = []
         def unit_offline(recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
             if recipient == unit.id:
+                retried_messages.append(_message)
                 raise OSError("The session is offline.")
         code, _reply, delivery = self.post_go(body, send_error=unit_offline)
         self.assertEqual(code, 200)
@@ -8003,6 +10048,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual((record["sent"], record["reported"]), ({unit.id: False, morty.id: True}, {unit.id: True, morty.id: False}))
         self.assertEqual(go_ledger.unsent(self.root), (go_id,))
         closed = the_list.load(morty.id, item.id).asks[0]
+        legacy = {name: value for name, value in record.items() if name != "origin"}
+        _ = entry.write_text(json.dumps(legacy))
+        retried_messages.clear()
         not_delivered = lambda: [change.what for change in the_list.load(morty.id, item.id).log
                                  if isinstance(change.what, the_list.GoNotDelivered)]
         self.assertEqual(not_delivered(), [the_list.GoNotDelivered(closed, unit.id)])
@@ -8012,6 +10060,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                                    client="192.0.2.9", page="page", moment=the_list.now())
         self.assertEqual(go_ledger.unsent(self.root), tuple(sorted((go_id, waiting["go_id"]))))
         self.assertEqual(self.restart_and_recover_goes(unit_offline), [unit.id] * 3, "no new alert to the showrunner")
+        original = cast(str, delivery.call_args_list[0].args[2])
+        self.assertEqual(retried_messages, [original.replace("Studio:", "List page:", 1)] * 3)
         self.assertEqual(not_delivered(), [the_list.GoNotDelivered(closed, unit.id)])
         self.assertEqual(go_ledger.unsent(self.root), (go_id,), "no ask holds the waiting go id, so the start removed it")
         self.assertTrue(the_list.load(morty.id, item.id).asks[1].is_open)
@@ -8201,7 +10251,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(saved.log[:-1], parked.log)
                 self.assertEqual(saved.log[-1].what,
                                  the_list.UnparkNoChangeReceipt(
-                                     the_list.PageRequest(request, "unpark", "List page: nate unparked item 1."),
+                                     the_list.PageRequest(request, "unpark", "Studio: nate unparked item 1."),
                                      the_list.UnparkNoChangeReason.EXPIRED))
                 reparked = the_list.park(morty.id, item.id, new_time, source="morty")
                 delivered.clear()
@@ -8398,7 +10448,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     try:
                         self.assertTrue(claiming.wait(TEST_HANG_GUARD_SECS))
                         with patch.object(change_page, "_question_lock_state") as probe:
-                            reply = self.request(list_page.PAGE_PATH)
+                            reply = self.request(studio_page.PAGE_PATH)
                             self.assertEqual(reply.status, 200)
                             self.assertIn(words.encode(), reply.body)
                             probe.assert_not_called()
@@ -8415,7 +10465,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertIs(reply_delivery["delivery_pending"], True)
                 self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
                 self.assertFalse(finished.is_set())
-                path = list_page.PAGE_PATH + "?" + urlencode({"delivery": reply_delivery["delivery"]})
+                path = studio_page.PAGE_PATH + "?" + urlencode({"delivery": reply_delivery["delivery"]})
                 response, headers, _ = self.head(path)
                 self.assertEqual(response, 200)
                 self.assertEqual(headers.get("x-item-delivery-pending"), "true")
@@ -8568,7 +10618,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(status.request_attempts, {})
 
     def test_list_question_claim_failure_and_deferred_recovery(self) -> None:
-        keeper = fixture_member("producer", name="morty").id
+        keeper = self.configure_list_keeper().id
         item = the_list.add(keeper, "Check the queue", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
         status = change_page.DeliveryStatus(self.root)
         words = "Which check passed?"
@@ -8604,7 +10654,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertFalse(restarted.has_deferred_questions())
 
     def test_list_question_recovers_when_the_failure_cannot_be_recorded(self) -> None:
-        keeper = fixture_member("producer", name="morty").id
+        keeper = self.configure_list_keeper().id
         for fault in ("read", "write"):
             with self.subTest(fault=fault):
                 item = the_list.add(keeper, "Check the queue", owner=the_list.UnassignedOwner.NATE,
@@ -8619,7 +10669,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 writer = change_page.publish_question_attempt
 
                 def write_attempt(path: Path, record: delivery_state.QuestionAttempt) -> None:
-                    if record.state is delivery_state.QuestionSendState.FAILED:
+                    if record.state is delivery_state.QuestionSendState.UNKNOWN:
                         raise failure
                     writer(path, record)
 
@@ -8643,7 +10693,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
 
     def test_list_question_shows_a_failed_saved_message_mismatch(self) -> None:
-        keeper = fixture_member("producer", name="morty").id
+        keeper = self.configure_list_keeper().id
         item = the_list.add(keeper, "Check the queue", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
         status = change_page.DeliveryStatus(self.root)
         request = the_list.PageRequest(uuid4().hex, "question", "Which check passed?")
@@ -8690,8 +10740,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual([(question.question_id, question.words) for question in the_list.load(morty.id, item.id).questions],
                          [("Q1", words)])
 
-    def test_exhausted_list_question_reports_failure_after_automatic_retries(self) -> None:
+    def test_exhausted_list_question_saves_failure_for_the_team(self) -> None:
         morty, item = self.list_keeper_item("The question item")
+        team = fixture_member("showrunner", name="question-team")
+        morty = replace(morty, parent=staff.ReportsTo(team.id))
         request, words = uuid4().hex, "Which check passed?"
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
                   "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
@@ -8708,11 +10760,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             finally:
                 finished.set()
 
-        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
+        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty, team))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(list_page, "counts_strip", return_value=""),
               patch.object(list_page, "deliver", side_effect=deliver),
-              patch.object(change_page, "alert_delivery_failures"),
+              patch.object(change_page, "send_to_staff", return_value=None) as alert,
               patch.object(change_page, "send_question", side_effect=[
                   *([question_outcome("refused", "Producer offline")] * tries)]) as send):
             code, response = self.post(list_page.PAGE_PATH, urlencode(fields))
@@ -8722,12 +10774,12 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS), "List question delivery did not finish.")
             saved = the_list.load(morty.id, item.id)
             self.assertEqual([(question.question_id, question.words) for question in saved.questions], [("Q1", words)])
-            opened = self.request(list_page.PAGE_PATH)
+            opened = self.request(studio_page.PAGE_PATH)
             self.assertEqual(opened.status, 200)
             markup = re.sub(r'<script\b[^>]*>.*?</script>', '', opened.body.decode(), flags=re.DOTALL)
             self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
             self.assertIn('data-open-question="true"', markup)
-            self.assertIn("Question not delivered.", markup)
+            self.assertNotIn("Question not delivered.", markup)
             self.assertNotIn('value="resend-', markup)
             self.assertNotIn("ready to send", markup)
             code, _ = self.post(list_page.PAGE_PATH, urlencode({**fields, "action": "resend-Q1"}))
@@ -8737,6 +10789,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(len(messages), 1)
             self.assertIn(f"\n{words}\n", messages[0])
             self.assertIn(f"answer L1 --keeper {morty.id} --question Q1", messages[0])
+            self.assertTrue(self.server.delivery_status.has_deferred_questions())
+            alert.assert_called_once()
+            self.assertEqual(alert.call_args.args[:2], (team.id, change_page.SENDER))
+            self.assertIn(words, cast(str, alert.call_args.args[2]))
+            self.assertIn(f"Recipient: {morty.id}", cast(str, alert.call_args.args[2]))
 
     def test_an_image_question_delivers_when_the_browser_response_fails(self) -> None:
         _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))
@@ -10340,7 +12397,11 @@ class ServerStartupTests(unittest.TestCase):
         producer = staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper)
         staff_file = store / "staff.json"
         _ = staff_file.write_text(json.dumps({"schema": 2, "rows": [producer.to_json()]}))
-        with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(store / "records"), "STAFF_FILE": str(staff_file)}):
+        configuration = temporary / "config"
+        _ = copy_config_fixture(checkout / "config", configuration)
+        _ = write_config_fixture(configuration / "console.conf", f"page.list.owner={keeper}\npage.studio.owner={keeper}\n")
+        with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(store / "records"),
+                                     "STAFF_FILE": str(staff_file), "CONF_DIR": str(configuration)}):
             item = the_list.add(keeper, "Private List item", owner=the_list.UnassignedOwner.NATE,
                                 source="morty", changes={})
 
@@ -10348,9 +12409,6 @@ class ServerStartupTests(unittest.TestCase):
         _ = tailscale.write_text("#!/bin/sh\necho 127.0.0.1\n")
         tailscale.chmod(0o755)
         other_store = temporary / "other-store"
-        configuration = temporary / "config"
-        _ = copy_config_fixture(checkout / "config", configuration)
-        _ = write_config_fixture(configuration / "console.conf", f"page.list.owner={keeper}\n")
         rebuild_cache = temporary / "rebuild-cache"
         _ = (configuration / "statusline.conf").write_text(f"rebuild.cache={rebuild_cache}\n")
         _ = rebuild_cache.write_text("rebuild mac\n0\n")
@@ -10377,17 +12435,19 @@ class ServerStartupTests(unittest.TestCase):
                     response = connection.getresponse()
                     self.assertEqual(response.status, 404)
                     _ = response.read()
-                    connection.request("GET", list_page.PAGE_PATH)
+                    connection.request("GET", studio_page.PAGE_PATH)
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
                     page = response.read()
                     self.assertIn(b"Private List item", page)
                     self.assertIn(b'data-owner-new aria-label=', page)
-                    connection.request("GET", review_page.NEW_ITEM_PATH + "?page=list")
+                    connection.request("GET", review_page.NEW_ITEM_PATH + "?page=studio",
+                                       headers={"X-New-Item-Route": "producer"})
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
                     options = cast(dict[str, object], json.loads(response.read()))
                     self.assertEqual(options["recipients"], [{"id": keeper, "name": "morty", "proposal": True}])
+                    self.assertEqual(options["page_owner"], keeper)
                     self.assertEqual(options["token"], "")
                     self.assertEqual(options["send_disabled"], "Sending is off on a practice List.")
                     connection.request("GET", review_page.NEW_ITEM_PATH + "?page=review")
@@ -10404,25 +12464,25 @@ class ServerStartupTests(unittest.TestCase):
                     fields = {"keeper": keeper, "id": item.id, "request": request, "words": "", "until": "",
                               "token": list_page.request_token(store, keeper, item.id, request)}
                     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-                    connection.request("POST", list_page.PAGE_PATH,
+                    connection.request("POST", studio_page.PAGE_PATH,
                                        urlencode(fields | {"action": "tell", "words": "Please check this item."}), headers)
                     response = connection.getresponse()
                     self.assertEqual(response.status, 400)
                     self.assertIn(b"Only Remove is available in this demo.", response.read())
-                    connection.request("POST", list_page.PAGE_PATH, urlencode(fields | {"action": "remove"}), headers)
+                    connection.request("POST", studio_page.PAGE_PATH, urlencode(fields | {"action": "remove"}), headers)
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
                     self.assertIn(b'"item_state": "Closed"', response.read())
                     with scratch.copy_record_lock(store):
                         console_folder = store / change_page.CONSOLE_FOLDER
                         shutil.rmtree(console_folder)
-                        connection.request("GET", list_page.PAGE_PATH)
+                        connection.request("GET", studio_page.PAGE_PATH)
                         response = connection.getresponse()
                         _ = response.read()
                         with self.subTest("a refresh during removal cannot recreate the console folder"):
                             self.assertFalse(console_folder.exists())
                             self.assertEqual(response.status, 503)
-                        connection.request("POST", list_page.PAGE_PATH,
+                        connection.request("POST", studio_page.PAGE_PATH,
                                            urlencode(fields | {"action": "remove"}), headers)
                         response = connection.getresponse()
                         _ = response.read()

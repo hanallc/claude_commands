@@ -9,9 +9,11 @@ from pathlib import Path
 from random import choice
 
 from scripts.lib import conf
-from scripts.review_links import change_page, list_page, record_table
+from scripts.production import staff, the_list
+from scripts.review_links import change_page, page_frame, record_table
 
-PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/studio.html"
+PAGE_PATH = page_frame.STUDIO_PAGE_PATH
+TITLE = "The Studio"
 AVATAR_PATH = f"/{change_page.CONSOLE_FOLDER}/studio/avatars"
 # The All tab reads the folder "all"; each producer tab reads the folder named by its staff ID.
 FOLDER = re.compile(r"all|[0-9a-f-]{36}")
@@ -64,15 +66,37 @@ def tab_label(root: Path, chip: record_table.Chip) -> record_table.Chip:
     return replace(chip, label_html=picture + f'<span class="studio-name">{chip.label_html}</span>')
 
 
+def producer_ids(members: staff.StaffSnapshot, with_items: Iterable[the_list.ItemOwner]) -> set[the_list.ItemOwner]:
+    """Include active producers that have no items."""
+    producers = set(with_items)
+    producers.update(row.id for row in staff.active(members, "producer")
+                     if not isinstance(row.retirement, staff.RetiredProducer))
+    return producers
+
+
 def tabs(chips: Iterable[record_table.Chip], selected: str) -> str:
     """Render the Producer filter as picture tabs: All, then each producer by name."""
     root = avatar_root()
     pictures = (tab_label(root, chip) for chip in chips)
-    return '<div class="studio-tabs">' + list_page.producer_chip_row(pictures, selected) + '</div>'
+    row = record_table.chip_row("Producer", pictures, selected, encode_values=True)
+    return '<div class="studio-tabs">' + row + '</div>'
 
 
 STYLE = '''<style>
-.studio-tabs .record-filter-row{display:block;margin-bottom:12px}
+[data-page-top-controls]{display:flow-root;margin-top:20px}
+@media(max-width:640px){[data-page-top-controls]{margin-top:0}}
+@media(width > 640px) and (height <= 500px){
+[data-page-top-controls]{max-height:max(44px,calc(100dvh - 17rem));overflow-y:auto}
+}
+@media(640px < width <= 960px) and (height <= 500px){
+[data-page-top-controls]{margin-top:8px}
+}
+.studio-tab-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-bottom:12px}
+.studio-tab-row>.record-filter-words{margin-block:0}
+.studio-tab-row>.record-filter-words input{display:block}
+@media(max-width:620px){.studio-tab-row>.record-filter-words{width:100%}}
+.studio-tabs{max-width:100%}
+.studio-tabs .record-filter-row{display:block;margin-bottom:0}
 .studio-tabs .record-filter-row>span{display:none}
 .studio-tabs .record-filter-row>div{gap:10px}
 .studio-tabs [data-filter-row] button{position:relative;display:block;width:88px;height:88px;padding:0;
@@ -94,16 +118,13 @@ border:1px solid color-mix(in srgb,var(--warning) 45%,var(--line));background:co
 letter-spacing:.08em;text-transform:uppercase;white-space:nowrap}
 .list-top-what{flex:1 1 240px;min-width:0}
 .list-top-what b{display:block;font-size:16px}
+.list-top-link{font-size:16px;font-weight:700}
 .list-top-next{color:var(--ink-2);font-size:13.5px}.list-top-next p{margin:0}
 .list-top-meta{display:flex;flex-direction:column;align-items:flex-end;gap:4px;white-space:nowrap}
 .list-top-meta small{color:var(--ink-3);font-size:12px}
 .list-top-flag{width:14px;height:14px;fill:currentColor;flex:none}
 .list-top-mark{display:inline-flex;vertical-align:-2px;margin-right:4px;color:var(--warning)}
 </style>'''
-
-STUDIO_VIEW = list_page.ListView("The Studio", "studio", PAGE_PATH, STYLE, tabs, list_page.ProducerPlacement.ABOVE_FILTERS,
-                                 list_page.TopPriority.SHOWN)
-
 
 def avatar(relative: str) -> bytes:
     """Read one picture below the avatar root. Raise FileNotFoundError for any other path."""

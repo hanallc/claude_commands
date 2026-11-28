@@ -194,7 +194,8 @@ def _restore_card(producer: staff.StaffId, backup: Path) -> None:
 
 @contextmanager
 def list_item_change(keeper: staff.StaffId, identity: str, producer: staff.StaffId,
-                     status: ItemStatus, previous_producer: staff.StaffId | None) -> Generator[None]:
+                     status: ItemStatus, previous_producer: staff.StaffId | None, *,
+                     same_item: Callable[[staff.StaffId, str, staff.StaffId, str], bool]) -> Generator[None]:
     """Mark affected cards stale before the List write, then refresh the matching card."""
     producers = (producer,) if previous_producer in (None, producer) else (producer, previous_producer)
     with ExitStack() as preserved:
@@ -209,7 +210,7 @@ def list_item_change(keeper: staff.StaffId, identity: str, producer: staff.Staff
                     saved = load(owner)
                     if saved is NoGoal.UNSET:
                         clear_card(owner)
-                    elif (saved["keeper"], saved["item"]) == (keeper, identity):
+                    elif same_item(saved["keeper"], saved["item"], keeper, identity):
                         _ = save(owner, saved, status if owner == producer else ItemAvailability.UNAVAILABLE)
                     else:
                         _restore_card(owner, backup)

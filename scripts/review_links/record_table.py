@@ -306,7 +306,7 @@ font:inherit;font-variant-numeric:tabular-nums;margin:0;min-height:24px}
 .list-panel a,.list-counts a{color:var(--accent)}.list-panel ol.list-log{list-style:none;padding:0;font-size:13px}
 .list-log-panel{contain:size;display:flex;flex-direction:column;min-width:0;min-height:0}
 .list-log-panel h3{flex:none}
-.list-log-scroll{min-height:0;overflow-y:auto}
+.list-log-scroll{min-height:0;overflow-y:auto;scrollbar-color:var(--ink-3) transparent}
 .list-log-scroll .list-log{margin-bottom:0}
 .list-log li{display:grid;grid-template-columns:130px 1fr;gap:12px;padding:6px 0;border-bottom:1px dashed var(--line)}
 .list-log time,.list-log small{color:var(--ink-3)}.list-log small{display:inline;font-size:inherit}
@@ -677,13 +677,17 @@ let shownRevision,statusError='',savedDisplayFailed=false;
 let itemRequest=null;
 const measured=new Map(),mounted=new Map(),windowGaps=[];
 const resize=typeof ResizeObserver==='function' ? new ResizeObserver(()=>scheduleWindow()) : null;
-function preserveRecordRowTop(update){
- const before=visibleRecordRow(openItem),key=openItem?.dataset.key;
- const top=before?.getBoundingClientRect().top;
+function preserveRecordRowTop(update,{topInset}={}){
+ const before=visibleRecordRow(openItem)?.getBoundingClientRect(),key=openItem?.dataset.key;
+ const oldInset=topInset?.();
+ const wasVisible=before && oldInset!==undefined && before.bottom>oldInset && before.top<innerHeight;
  const result=update();
  const after=visibleRecordRow(openItem);
- if(top!==undefined && after && key===openItem.dataset.key)
+ if(before && after && key===openItem.dataset.key){
+  const newInset=wasVisible ? topInset() : oldInset;
+  const top=newInset>oldInset ? Math.max(before.top,newInset) : before.top;
   trackRecordRowDuringMotion(after,top,rowMotion);
+ }
  return result;
 }
 /** @typedef {{key: string, index: string, offset: number}} LogPosition */
@@ -984,7 +988,7 @@ function presentNewDetail(item,children,wasMissing){
 }
 // The open row keeps its node through a new snapshot and takes the new data.
 function keepOpenRow(){
- const item=openItem,key=item?.dataset.key;
+ const item=openItem,key=item && resolveItem(item.dataset.key);
  const next=inlineView && options.itemRevision && item && !item.isConnected && opened.has(key) && itemWithKey(key);
  if(!next) return;
  for(const {name} of [...item.attributes]) if(!next.hasAttribute(name)) item.removeAttribute(name);
@@ -1062,7 +1066,7 @@ function itemWithKey(key){
 }
 function readPlace(params,followingItemLink=false){
  placeHash=location.hash;
- keys=new Set(params.getAll('key'));
+ keys=new Set(params.getAll('key').map(resolveItem));
  owner=ownerQueryKeys.map(key=>params.get(key)).find(Boolean) || '';show=params.get('show') || defaultShow;query=params.get('q') || '';
  sort=params.get('sort') || '';direction=params.get('dir')==='desc' ? 'desc' : 'asc';
  type=params.get('type') || '';
@@ -1071,10 +1075,11 @@ function readPlace(params,followingItemLink=false){
  if(!options.shows.includes(show)) show=defaultShow;
  show=options.selectShow?.(show,type) ?? show;
  if(!columns.includes(sort)) sort='';
- const item=params.get('item');
+ const item=params.has('item') ? resolveItem(params.get('item')) : null;
  const saved=followingItemLink ? null : history.state?.recordTable;
  if(saved){
-  const key=saved.opened.includes(item) ? item : saved.opened[0];
+  const savedKeys=saved.opened.map(resolveItem);
+  const key=savedKeys.includes(item) ? item : savedKeys[0];
   if(key) openCard(key);else opened.clear();
  }else if(!followingItemLink && item){
   if(keys.size) keys.add(item);
@@ -1086,9 +1091,10 @@ function readPlace(params,followingItemLink=false){
  }else if(inlineView && !followingItemLink) opened.clear();
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
+ if(linkedItem) linkedItem=resolveItem(linkedItem);
  pendingItem=Boolean(options.resolveItem && linkedItem && saved?.pendingItem);
  const reveal=options.revealLinked && params.get('reveal')==='1';
- revealedLinkedItem=reveal || saved?.revealedLinkedItem===linkedItem ? linkedItem : '';
+ revealedLinkedItem=reveal || (saved?.revealedLinkedItem && resolveItem(saved.revealedLinkedItem)===linkedItem) ? linkedItem : '';
  owner=options.resolveOwner?.(owner) ?? owner;
  if(sharedWords()) filterControl.setWords(words(),query);
  return saved?.top;
@@ -1440,6 +1446,7 @@ function saveDeparturePlace(){
 }
 function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,preserveFilters=false,unresolved=false,
  keepItemOnMissing=options.keepItemOnMissingLink}={}){
+ key=resolveItem(key);
  if(pushPlace) saveDeparturePlace();
  const target=itemWithKey(key);
  linkedItem=options.missingItem ? key : '';
@@ -1478,6 +1485,8 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  clearTimeout(highlightTimer);
  row.style.scrollMarginTop='16px';
  row.querySelector('.list-toggle').focus({preventScroll:true});
+ // A header resize can precede its observer callback.
+ if(typeof measurePageActions==='function') measurePageActions();
  row.scrollIntoView({block:'start',behavior:'instant'});
  row.dataset.recordHighlight='';
  highlightedRow=row;
@@ -1609,6 +1618,14 @@ return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updat
   for(const gap of windowGaps.splice(0)) gap.remove();
   for(const node of mounted.values()){resize?.unobserve(node);options.unmount?.(node);node.remove();}
   mounted.clear();measured.clear();content=contentProxy();
+  if(options.resolveItem){
+   const resolved=[...opened].map(resolveItem);
+   opened.clear();
+   resolved.forEach(key=>opened.add(key));
+   keys=new Set([...keys].map(resolveItem));
+   if(linkedItem) linkedItem=resolveItem(linkedItem);
+   if(revealedLinkedItem) revealedLinkedItem=resolveItem(revealedLinkedItem);
+  }
   keepOpenRow();
   if(sharedWords()){query=previous;filterControl.setWords(words(),query);}
   bind();if(draw) applyRows(query!==previousQuery);

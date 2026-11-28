@@ -19,6 +19,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
+from importlib import import_module
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
@@ -661,7 +662,7 @@ def _legacy_draft_fingerprint(request_id: str, request: NewItemRequest, words: s
 def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[_ImageUpload, ...]) -> str:
     payload: list[object] = [request.kind, words, new_item_dialog.evidence_fields(request.evidence), _image_fingerprints(uploads)]
     if request.page:
-        payload.append(request.page)
+        payload.append("list" if new_item_dialog.is_list_submission_page(request.page) else request.page)
     if request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         payload.append(request.page_recipient)
     if request.page_recipient == new_item_dialog.PageRecipient.PRODUCER:
@@ -1222,10 +1223,21 @@ class ListFilingRoute(TypedDict):
 
 
 @dataclass(frozen=True)
+class PendingProducerFiling:
+    """Keep the selected List owner and producer while the keeper is unavailable."""
+
+    owner: staff.StaffId
+    producer: staff.StaffId
+    unit: str
+    source: str
+
+
+@dataclass(frozen=True)
 class ListFilingUnavailable:
     """The List row has no producer that can take it."""
 
     reason: str
+    retry: ListCommandAssignee | ListWindowAssignee | PendingProducerFiling = ListWindowAssignee.RECIPIENT
 
 
 def _list_filing_producer(member: staff.StaffRow, members: staff.StaffSnapshot
@@ -1265,9 +1277,9 @@ def _list_filing_producer(member: staff.StaffRow, members: staff.StaffSnapshot
 
 def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipient: staff.StaffRow,
                       members: staff.StaffSnapshot) -> ListFilingRoute | ListFilingUnavailable:
-    keeper = producer_map.find_member("morty", members, ("producer",))
-    if isinstance(keeper, producer_map.UnknownMember) or keeper.name != "morty":
-        return ListFilingUnavailable("The List needs one active producer named morty.")
+    keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+    if keeper is None:
+        return ListFilingUnavailable("The List has no active producer.", assignee)
     member = recipient
     source = "nate via New item"
     if isinstance(assignee, ListCommandAssignee):
@@ -1278,7 +1290,7 @@ def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipi
         source = "nate via /new_item"
     producer = _list_filing_producer(member, members)
     if isinstance(producer, ListFilingUnavailable):
-        return producer
+        return replace(producer, retry=assignee)
     unit = member.name if member.kind == "unit" else ""
     return ListFilingRoute(keeper=keeper.id, owner=recipient.id, producer=producer.id,
                            unit=unit, source=source)
@@ -1295,15 +1307,13 @@ def assigned_member(assignment: new_item_dialog.Assignment, recipient: staff.Sta
     return row
 
 
-def _plan_producer_filing(member: staff.StaffRow, recipient: staff.StaffRow, request: NewItemRequest,
+def _plan_producer_filing(filing: PendingProducerFiling,
                           members: staff.StaffSnapshot) -> ListFilingRoute | ListFilingUnavailable:
     keeper = list_producer(conf.read_or_repository("console"), members)
     if isinstance(keeper, PageOwnerUnavailable):
-        return ListFilingUnavailable("The List has no active producer.")
-    source = ("nate via /new_item" if isinstance(request.notice, new_item_dialog.SubmissionNotice)
-              and request.notice.from_command else "nate via New item")
-    return ListFilingRoute(keeper=keeper.id, owner=member.id, producer=recipient.id,
-                           unit=member.name if member.kind == "unit" else "", source=source)
+        return ListFilingUnavailable("The List has no active producer.", filing)
+    return ListFilingRoute(keeper=keeper.id, owner=filing.owner, producer=filing.producer,
+                           unit=filing.unit, source=filing.source)
 
 
 @dataclass(frozen=True)
@@ -1312,11 +1322,13 @@ class NoListFiling:
 
 
 def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUnavailable | NoListFiling:
-    """Read the List filing plan for the first Send."""
+    """Read the saved List filing route or the assignee that still needs a route."""
     folder = _request_folder(saved.request_id)
     try:
         routing = (folder / "list-filing.json").read_text(encoding="utf-8")
     except FileNotFoundError:
+        if record_store.saved_path_exists(folder / "list-filing.json"):
+            raise
         return NoListFiling()
     fields = cast(object, json.loads(routing))
     if not isinstance(fields, dict):
@@ -1326,7 +1338,17 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
         return NoListFiling()
     reason = values.get("unavailable")
     if isinstance(reason, str):
-        return ListFilingUnavailable(reason)
+        if "owner" in values:
+            owner, producer = values["owner"], values.get("producer")
+            unit, source = values.get("unit"), values.get("source")
+            if not (isinstance(owner, str) and isinstance(producer, str)
+                    and isinstance(unit, str) and isinstance(source, str)):
+                raise OSError(f"Invalid List route for request {saved.request_id}.")
+            return ListFilingUnavailable(reason, PendingProducerFiling(
+                staff.StaffId(owner), staff.StaffId(producer), unit, source))
+        assignee = (list_command_assignee(values["assignee"]) if "assignee" in values
+                    else ListWindowAssignee.RECIPIENT)
+        return ListFilingUnavailable(reason, assignee)
     keeper, owner, producer = values.get("keeper"), values.get("owner"), values.get("producer")
     unit, source = values.get("unit"), values.get("source")
     if not (isinstance(keeper, str) and isinstance(owner, str) and isinstance(producer, str)
@@ -1334,6 +1356,28 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
         raise OSError(f"Invalid List route for request {saved.request_id}.")
     return ListFilingRoute(keeper=staff.StaffId(keeper), owner=staff.StaffId(owner), producer=staff.StaffId(producer),
                            unit=unit, source=source)
+
+
+def retry_list_filing_route(saved: SavedSubmission, unavailable: ListFilingUnavailable,
+                            members: staff.StaffSnapshot) -> ListFilingRoute:
+    """Resolve the assignee again and save the route before reserving a List number."""
+    if record_store.saved_path_exists(list_filing_reservation(saved)):
+        current = list_filing_route(saved)
+        if isinstance(current, dict):
+            return current
+        raise OSError(f"Cannot read the reserved List route for {saved.id}.")
+    retry = unavailable.retry
+    if isinstance(retry, PendingProducerFiling):
+        route = _plan_producer_filing(retry, members)
+    else:
+        recipient = members.by_id(saved.owner)
+        if recipient is None:
+            raise OSError(f"The recipient for {saved.id} is unavailable.")
+        route = _plan_list_filing(retry, recipient, members)
+    if isinstance(route, ListFilingUnavailable):
+        raise OSError(f"Cannot file {saved.id} on the List: {route.reason}")
+    _write_request_file(_request_folder(saved.request_id) / "list-filing.json", route)
+    return route
 
 
 def list_filing_reservation(saved: SavedSubmission) -> Path:
@@ -1485,12 +1529,13 @@ def _page_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapshot) -> 
 def page_owners(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> PageOwners:
     """Resolve the owner to show and the recipient for new items."""
     key = f"page.{page}.owner"
-    label_key = f"page.{page}.label"
+    label_page = "studio" if page == "list" else page
+    label_key = f"page.{label_page}.label"
     values = settings.values(key, label_key, "owner.default")
     designated = staff.StaffId(values.get(key, ""))
     default = staff.StaffId(values.get("owner.default", ""))
     # A page outside the console navigation, such as rebuilds, has no label setting.
-    label = values.get(label_key) or page.replace("_", " ").title()
+    label = values.get(label_key) or label_page.replace("_", " ").title()
     route = _page_owner_route(label, designated, default, members)
     shown = members.rows_by_id.get(designated)
     if shown is not None and shown.kind in ("unit", "showrunner", "producer") and _page_owner_is_active(shown, members):
@@ -1561,28 +1606,16 @@ def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot,
     return PageOwnerUnavailable()
 
 
-def _configured_list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
-    configured = settings.origin("page.list.owner", str)
-    if isinstance(configured, conf.UnavailableValue):
-        return PageOwnerUnavailable()
-    row = members.by_id(staff.StaffId(configured.value))
-    return row if row is not None and row.kind == "producer" else PageOwnerUnavailable()
-
-
 def list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
     """Find the active producer that owns the List."""
-    row = _configured_list_producer(settings, members)
-    if (isinstance(row, PageOwnerUnavailable) or row.id not in members.rows_by_id
-            or not _page_owner_is_active(row, members)):
-        return PageOwnerUnavailable()
-    return row
+    return record_store.list_keeper(settings, members) or PageOwnerUnavailable()
 
 
 def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffSnapshot,
                     choice: new_item_dialog.PageRecipient) -> staff.StaffRow:
     identity = address.recipient_id
     if choice == new_item_dialog.PageRecipient.LIST_OWNER:
-        configured = _configured_list_producer(conf.read_or_repository("console"), members)
+        configured = record_store.configured_list_producer(conf.read_or_repository("console"), members)
         if not isinstance(configured, staff.StaffRow) or configured.id != identity:
             raise SubmissionConflict("The List owner is unavailable. Open New item again.")
     elif choice in (new_item_dialog.PageRecipient.SELECTED, new_item_dialog.PageRecipient.PRODUCER):
@@ -1590,7 +1623,7 @@ def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffS
         if choice == new_item_dialog.PageRecipient.PRODUCER and row.kind != "producer":
             raise SubmissionError("Pick a producer.")
         return row
-    elif page and page != "list":
+    elif page and not new_item_dialog.is_list_submission_page(page):
         configured = page_owner(page, conf.read_or_repository("console"), members)
         if isinstance(configured, PageOwnerUnavailable):
             raise SubmissionConflict("The page owner is unavailable. Open New item again.")
@@ -1718,7 +1751,7 @@ def new_item_routing(page: str, settings: conf.ConfigRead, members: staff.StaffS
             continue
     assignees = {row.id: row for row in members.rows if row.kind in ("showrunner", "unit")
                  and _page_owner_is_active(row, members)}
-    # The List owner keeps the List. The List does not choose an assignee.
+    # Old List requests have no preferred producer. The Studio uses its page owner.
     key = f"page.{page}.owner"
     designated = staff.StaffId(settings.values(key).get(key, "")) if page != "list" else staff.StaffId("")
     producer = producers.get(designated)
@@ -1739,7 +1772,7 @@ def new_item_routing(page: str, settings: conf.ConfigRead, members: staff.StaffS
         recipients=[_recipient_option(row, members) for row in producers.values()],
         assignees=[AssigneeOption(id=row.id, name=row.name) for row in ordered],
         page_owner=producer.id if producer is not None else staff.StaffId(""), page_owner_reason=reason,
-        page_assignee=owner.id if owner is not None else staff.StaffId(""))
+        page_assignee=owner.id if owner is not None and page != "studio" else staff.StaffId(""))
 
 
 def _file_question_for_remote_owner(recipient: staff.StaffRow, title: str, members: staff.StaffSnapshot,
@@ -2158,8 +2191,10 @@ def _browser_payload_hash(request: NewItemRequest, words: str, evidence: Evidenc
                           uploads: tuple[_ImageUpload, ...], screenshot: new_item_dialog.SubmissionScreenshot,
                           delivery: InitialDelivery | NoInitialDelivery) -> str:
     digest = "" if isinstance(screenshot, new_item_dialog.NoPageScreenshot) else screenshot.digest
+    # Keep the same fingerprint for a draft sent from the old List and from the Studio.
+    page = "list" if new_item_dialog.is_list_submission_page(request.page) else request.page
     fields: list[object] = [request.kind, request.recipient_id, words, new_item_dialog.evidence_fields(evidence),
-                            _image_fingerprints(uploads), request.page, request.page_recipient,
+                            _image_fingerprints(uploads), page, request.page_recipient,
                             asdict(request.page_state) if request.page_state else None, digest]
     if isinstance(delivery, InitialDelivery) and isinstance(delivery.list_assignee, ListCommandAssignee):
         fields.append(delivery.list_assignee.id)
@@ -2208,7 +2243,7 @@ def _list_draft_replay(folder: Path, send: ListDraftSend, intent: new_item_dialo
         request = filing.request
         if request.kind == SubmissionKind.PROPOSAL and request.page_recipient != new_item_dialog.PageRecipient.PRODUCER:
             request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
-        if request.page != "list" or request.request_id != send.request_id or filing.refusal is not None:
+        if not new_item_dialog.is_list_submission_page(request.page) or request.request_id != send.request_id or filing.refusal is not None:
             return ListDraftReplay()
         evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
         words = read_words(request.words, "Your words", kind=request.kind)
@@ -2257,7 +2292,7 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
         with _locked_filed_draft(folder, members, on_list=True) as lookup:
             if isinstance(lookup, SubmissionLookup) and isinstance(lookup.native, LocatedSubmission):
                 item = lookup.native
-                if item.details.page != "list":
+                if not new_item_dialog.is_list_submission_page(item.details.page):
                     raise DraftAlreadyFiled(item.destination.id)
                 saved = item.destination
                 _check_capture_target(capture_target, saved)
@@ -2274,7 +2309,7 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
             raise SubmissionConflict("This screenshot belongs to another item.")
         filing = send.prepare()
         request = filing.request
-        if request.page != "list" or request.request_id != send.request_id:
+        if not new_item_dialog.is_list_submission_page(request.page) or request.request_id != send.request_id:
             raise SubmissionError("Invalid List draft request.")
         return _submit(request, members=members, screenshot=filing.screenshot,
                        capture_requested=filing.capture_requested, refusal=filing.refusal,
@@ -2365,14 +2400,14 @@ def submit(
             capture_intent.submitted_draft_id != request.request_id
             or not new_item_dialog.capture_key_matches_draft(capture_intent.capture_key, request.request_id)
             or (DRAFT_ID.fullmatch(request.request_id)
-                and (not isinstance(request, NewItemRequest) or request.page != "list"))):
+                and (not isinstance(request, NewItemRequest) or not new_item_dialog.is_list_submission_page(request.page)))):
         raise SubmissionError("The screenshot belongs to another draft.")
     if isinstance(request, new_item_dialog.UnverifiedDraftRetry):
         return _recover_unverified_draft(request.request_id, members, request.error, capture_target=capture_target)
     if isinstance(request, ListDraftSend):
         return _submit_list_draft(request, members, capture_intent=capture_intent, capture_target=capture_target,
                                   initial_delivery=initial_delivery)
-    if request.page == "list":
+    if new_item_dialog.is_list_submission_page(request.page):
         if BROWSER_DRAFT_ID.fullmatch(request.request_id):
             filing = ListDraftFiling(request, screenshot, capture_requested, refusal)
             return _submit_list_draft(ListDraftSend(request.request_id, lambda: filing), members,
@@ -2412,8 +2447,9 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
         request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
     legacy_draft = DRAFT_ID.fullmatch(request_id) is not None
     browser_draft = BROWSER_DRAFT_ID.fullmatch(request_id) is not None
-    list_draft = browser_draft and request.page == "list"
-    legacy_list_draft = legacy_draft and request.page == "list"
+    list_page_request = new_item_dialog.is_list_submission_page(request.page)
+    list_draft = browser_draft and list_page_request
+    legacy_list_draft = legacy_draft and list_page_request
     if producer_route and legacy_draft:
         raise SubmissionError("Open New item again to select a producer.")
     if request_id.startswith(("r2-", "r3-", "r4-", "r5-", "r6-")) and not (legacy_draft or browser_draft):
@@ -2550,8 +2586,11 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             if producer_route:
                 member = assigned_member(request.assignment, recipient, current)
                 if isinstance(initial_delivery, InitialDelivery):
-                    route = _plan_producer_filing(member, recipient, request, current)
-            elif request.page == "list" and isinstance(initial_delivery, InitialDelivery):
+                    source = ("nate via /new_item" if isinstance(notice, new_item_dialog.SubmissionNotice)
+                              and notice.from_command else "nate via New item")
+                    unit = member.name if member.kind == "unit" else ""
+                    route = _plan_producer_filing(PendingProducerFiling(member.id, recipient.id, unit, source), current)
+            elif list_page_request and isinstance(initial_delivery, InitialDelivery):
                 route = _plan_list_filing(initial_delivery.list_assignee, recipient, current)
             pending_file = folder / "pending.json"
             images = tuple(upload.reference for upload in uploads)
@@ -2593,7 +2632,13 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                 if isinstance(route, dict):
                     _write_request_file(folder / "list-filing.json", route)
                 elif isinstance(route, ListFilingUnavailable):
-                    _write_request_file(folder / "list-filing.json", {"unavailable": route.reason})
+                    fields = {"unavailable": route.reason}
+                    retry = route.retry
+                    if isinstance(retry, ListCommandAssignee):
+                        fields["assignee"] = retry.id
+                    elif isinstance(retry, PendingProducerFiling):
+                        fields.update(owner=retry.owner, producer=retry.producer, unit=retry.unit, source=retry.source)
+                    _write_request_file(folder / "list-filing.json", fields)
                 if isinstance(list_preview, RequestedListPreview) and isinstance(screenshot, new_item_dialog.PageScreenshot):
                     _write_request_file(folder / "list-preview.json",
                                         {"key": list_preview.key, "digest": screenshot.digest})
@@ -2908,9 +2953,14 @@ def answer(key: str, words: str, reply_token: str, *, members: staff.StaffSnapsh
         with scoped_submission(scoped, members=members) as current:
             if (current.destination.path, current.destination.owner) != (path, owner):
                 raise SubmissionError("The selected item changed.")
-            return save()
+            changed = save()
     except (investigation.InvestigationError, proposal_issue.Refusal, update_registration.RegistrationFailure) as error:
         raise SubmissionError(str(error)) from error
+    record = members if members is not None else staff.snapshot()
+    file_exchange = cast(Callable[[ScopedSubmissionKey, staff.StaffSnapshot], None],
+                         import_module("scripts.review_links.answer_sources").file_saved_submission)
+    file_exchange(scoped, record)
+    return changed
 
 
 def scrub_reply_tokens(members: staff.StaffSnapshot) -> int:

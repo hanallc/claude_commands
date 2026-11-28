@@ -15,6 +15,7 @@ import re
 import secrets
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -24,13 +25,15 @@ from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from enum import Enum, StrEnum
-from functools import cache
+from functools import cache, partial
 from heapq import merge
+from importlib import import_module
 from itertools import chain, dropwhile, islice, takewhile
 from pathlib import Path
 from tempfile import TemporaryFile
 from time import monotonic
-from typing import IO, Literal, TypedDict, cast
+from typing import IO, TYPE_CHECKING, Literal, NewType, TypedDict, cast
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.agents import remote
@@ -41,16 +44,30 @@ from scripts.lib.file_lock import LockResult, exclusive
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
 from scripts.notify import push_texts
-from scripts.production import delivery_state, goal, record_store, repeat_rule, session_pane, staff
-from scripts.review_links import change_page, list_draft, page_question, question_path, question_record
+from scripts.production import list_exchange
+from scripts.production import delivery_state, goal, investigation, producer_map, record_store, repeat_rule, session_pane, staff
+from scripts.review_links import change_page, list_draft, new_item_dialog, page_frame, page_question, question_path, question_record
+from scripts.review_links.review_items import LegacyValidationLog, ValidationLogStart
+
+
+if TYPE_CHECKING:
+    from scripts.review_links import review_items, review_submissions
 
 
 class ListError(ValueError):
     """The item cannot accept the requested operation."""
 
 
+class ParkingDeadlinePassed(ListError):
+    """The request has a parking deadline that has passed."""
+
+
 class ScheduleSelectionChanged(ListError):
     """The saved schedule or selected run changed before the write."""
+
+
+class ConflictingExchangeReplies(ListError):
+    """The source has no exchange without a reply conflict."""
 
 
 class SavedReadFailed(OSError):
@@ -64,13 +81,64 @@ class RetiredListProducer(ListError):
 class ItemState(StrEnum):
     NEW = "New"
     WORKING = "Working"
+    ANSWERED = "Answered"
     SCHEDULED = "Scheduled"
     BLOCKED = "Blocked"
     WAITING_FOR_NATE = "Waiting for nate"
+    REPAIRED = "Repaired"
     DELIVERED = "Delivered"
     DONE = "Done"
     PAUSED = "Paused"
     CLOSED = "Closed"
+
+
+class ReportKind(StrEnum):
+    BUG = "Bug"
+    ENHANCEMENT = "Enhancement"
+    INVESTIGATION = "Investigation"
+    CHANGE = "Change"
+    VALIDATION = "Validation"
+    QUESTION = "Question"
+    PROPOSAL = "Proposal"
+    EFFICIENCY = "Efficiency"
+
+
+class NoReportScope(StrEnum):
+    NATIVE_RECORD = ""
+
+
+@dataclass(frozen=True)
+class ListReport:
+    """Keep the original report and its native evidence key."""
+
+    kind: ReportKind
+    evidence_key: str
+    words: str
+    submission_scope: str | NoReportScope = NoReportScope.NATIVE_RECORD
+    validation_log: ValidationLogStart | LegacyValidationLog = LegacyValidationLog.MOVE_MARKER
+
+
+class NoListReport(Enum):
+    ABSENT = "ordinary List item"
+
+
+class ReportRetry(Enum):
+    KEEP = "keep the filed report"
+    UPDATE = "update the report before the action saves"
+
+
+ReportVerdict = page_frame.VerdictAction
+
+
+@dataclass(frozen=True)
+class RepairRevision:
+    """Identify the repair and instructions that nate saw."""
+
+    digest: str
+
+
+class NoRepairRevision(Enum):
+    ABSENT = "the item has no repair to check"
 
 
 class RequestedBy(StrEnum):
@@ -178,7 +246,7 @@ class PageRequest:
     """Identify the action and its input for a retry."""
 
     request: str
-    action: Literal["tell", "remove", "park", "unpark", "read", "question"]
+    action: Literal["tell", "remove", "park", "unpark", "read", "question", ReportVerdict.WORKS, ReportVerdict.NOT_FIXED]
     words: str
     form_words: str = ""
     parked_until: Parking = NoTimestamp.UNSET
@@ -192,6 +260,7 @@ class NoPageRequest(StrEnum):
 class QuestionRequestReceipt:
     request: PageRequest
     question_id: str
+    followup: bool = False
 
 
 class UnparkNoChangeReason(StrEnum):
@@ -212,6 +281,15 @@ class LegacyFeedbackRecipient(StrEnum):
 type FeedbackRecipient = staff.StaffId | LegacyFeedbackRecipient
 
 
+class NoAdditionalRecipient(Enum):
+    ABSENT = "absent"
+
+
+class PageNoticeOrigin(StrEnum):
+    LIST_PAGE = "List page"
+    STUDIO = "Studio"
+
+
 @dataclass(frozen=True)
 class PageFeedback:
     request: str
@@ -219,16 +297,31 @@ class PageFeedback:
     state: Literal["pending", "sent", "alerted"] = "pending"
     alerted_to: str = ""
     read_update: UnreadUpdate | NoUnreadUpdate = NoUnreadUpdate.ABSENT
-    action: Literal["tell", "remove", "park", "unpark", "read"] = "tell"
+    action: Literal["tell", "remove", "park", "unpark", "read", ReportVerdict.NOT_FIXED] = "tell"
     form_words: str = ""
     parked_until: Parking = NoTimestamp.UNSET
     recipient: FeedbackRecipient = LegacyFeedbackRecipient.KEEPER
+
+    additional_recipient: staff.StaffId | NoAdditionalRecipient = NoAdditionalRecipient.ABSENT
+    origin: PageNoticeOrigin = PageNoticeOrigin.LIST_PAGE
+
+    @property
+    def studio_save_notice(self) -> bool:
+        return ((self.action == "park" and self.origin is PageNoticeOrigin.STUDIO)
+                or (self.action == "read" and next_step_go_id(self.request) is None))
 
     def key(self) -> PageRequest:
         return PageRequest(self.request, self.action, self.words, self.form_words, self.parked_until)
 
     def recipient_id(self, keeper: staff.StaffId) -> staff.StaffId:
         return keeper if self.recipient is LegacyFeedbackRecipient.KEEPER else self.recipient
+
+    def recipient_ids(self, keeper: staff.StaffId) -> tuple[staff.StaffId, ...]:
+        recipient = self.recipient_id(keeper)
+        extra = self.additional_recipient
+        if extra is NoAdditionalRecipient.ABSENT or extra == recipient:
+            return (recipient,)
+        return recipient, extra
 
 
 @dataclass(frozen=True)
@@ -237,10 +330,11 @@ class PageItemNotice:
 
     request: str
     words: str
-    action: Literal["remove", "park", "unpark"]
+    action: Literal["remove", "park", "unpark", ReportVerdict.NOT_FIXED]
     form_words: str = ""
     parked_until: Parking = NoTimestamp.UNSET
     recipient: FeedbackRecipient = LegacyFeedbackRecipient.KEEPER
+    origin: PageNoticeOrigin = PageNoticeOrigin.LIST_PAGE
 
 
 class AskKind(StrEnum):
@@ -595,6 +689,21 @@ class RepeatInSelectedRunZone(StrEnum):
     KEEP = "use the selected run's time zone for a new repeat rule"
 
 
+class QuestionItemKind(StrEnum):
+    TO_NATE = "question to nate"
+    FROM_NATE = "question from nate"
+
+
+class NoQuestionItem(Enum):
+    ORDINARY = "ordinary List item"
+
+
+@dataclass(frozen=True)
+class NativeQuestionItem:
+    kind: QuestionItemKind
+    source_key: str
+
+
 class ScheduleOperation(StrEnum):
     EDIT = "schedule"
     REMOVE = "unschedule"
@@ -631,13 +740,30 @@ class ListItem:
     run_deliveries: tuple[RunDelivery, ...] = ()
     new_item_draft_id: list_draft.ListDraftOrigin = list_draft.NoNewItemDraft.ABSENT
     asks: tuple[Ask, ...] = ()
+    report: ListReport | NoListReport = NoListReport.ABSENT
+    filed_exchanges: tuple[list_exchange.FiledExchange, ...] = ()
+    native_question: NativeQuestionItem | NoQuestionItem = NoQuestionItem.ORDINARY
+    legacy_read_replies: frozenset[UnreadAnswerId] = frozenset()
+    keyless_question_kind: QuestionItemKind | NoQuestionItem = NoQuestionItem.ORDINARY
+
+    @property
+    def question_kind(self) -> QuestionItemKind | NoQuestionItem:
+        return self.native_question.kind if isinstance(self.native_question, NativeQuestionItem) else self.native_question
+
+    @property
+    def unread_at(self) -> Timestamp:
+        if isinstance(self.native_question, NativeQuestionItem) and self.unread_since is NoTimestamp.UNSET:
+            return max((change.time for change in _unread_question_replies(self)), default=NoTimestamp.UNSET)
+        return self.unread_since
 
     def __post_init__(self) -> None:
         if self.state != ItemState.CLOSED or not isinstance(self.unread_since, datetime):
             return
+        if isinstance(self.native_question, NativeQuestionItem) and next(_unread_question_replies(self), None) is not None:
+            return
         # A Closed item can have an unread answer after its last close.
         for entry in reversed(self.log):
-            if isinstance(entry.what, QuestionAnswered):
+            if isinstance(entry.what, (QuestionAnswered, ReturnedAnswer)):
                 if entry.time == self.unread_since:
                     return
                 break
@@ -650,11 +776,100 @@ class ListItem:
         return f"L{self.number}"
 
     @property
+    def state_entered(self) -> Timestamp:
+        state = ItemState.NEW
+        entered = self.opened
+        for entry in self.log:
+            event = entry.what
+            next_state = state
+            if isinstance(event, FieldChange):
+                next_state = ItemState.CLOSED if event.action == "Closed" else event.fields.get("state", state)
+            elif isinstance(event, Reopened) or event == "Reopened":
+                next_state = ItemState.NEW
+            if next_state != state:
+                state, entered = next_state, entry.time
+        return entered
+
+    @property
+    def repair_revision(self) -> RepairRevision | NoRepairRevision:
+        if not isinstance(self.report, ListReport) or self.state != ItemState.REPAIRED:
+            return NoRepairRevision.ABSENT
+        text = json.dumps((str(self.state_entered), self.next_step, self.owner, self.producer), ensure_ascii=False)
+        return RepairRevision(hashlib.sha256(text.encode()).hexdigest())
+
+    @property
     def latest_status_time(self) -> Timestamp:
         for entry in reversed(self.log):
             if isinstance(entry.what, FieldChange) and "latest_status" in entry.what.fields:
                 return entry.time
         return NoTimestamp.UNSET
+
+
+def native_question_kind(exchange: list_exchange.Exchange) -> QuestionItemKind | NoQuestionItem:
+    if exchange.source is list_exchange.Source.STAFF_QUESTION and exchange.source_key.startswith("question/"):
+        return QuestionItemKind.TO_NATE
+    if exchange.source is list_exchange.Source.SCOPED_REPLY and exchange.source_key.startswith("submission/question/"):
+        return QuestionItemKind.FROM_NATE
+    return NoQuestionItem.ORDINARY
+
+
+def question_item_exchanges(item: ListItem) -> tuple[list_exchange.FiledExchange, ...]:
+    """Find exchanges for the saved native question."""
+    origin = item.native_question
+    return (tuple(saved for saved in item.filed_exchanges if saved.source_key == origin.source_key)
+            if isinstance(origin, NativeQuestionItem) else ())
+
+
+def native_question_origins(exchanges: Iterable[list_exchange.FiledExchange]) -> set[NativeQuestionItem]:
+    return {NativeQuestionItem(kind, exchange.source_key) for exchange in exchanges
+            if isinstance(kind := native_question_kind(exchange), QuestionItemKind)}
+
+
+def question_origin_from_link(key: str) -> NativeQuestionItem | NoQuestionItem:
+    if not key.startswith("submission/"):
+        return NoQuestionItem.ORDINARY
+    try:
+        submission = new_item_dialog.read_submission_key(key)
+    except ValueError:
+        return NoQuestionItem.ORDINARY
+    if submission.kind is new_item_dialog.SubmissionKind.QUESTION:
+        return NativeQuestionItem(QuestionItemKind.FROM_NATE, f"submission/question/{submission.request_id}")
+    return NoQuestionItem.ORDINARY
+
+
+def _added_review_link(added: ItemChange) -> str:
+    if not isinstance(added.what, FieldChange) or added.what.action != "Added":
+        return ""
+    evidence = added.what.fields.get("evidence", "").partition("\n")[0]
+    try:
+        url = urlsplit(evidence)
+        jumps = parse_qs(url.fragment).get("jump", [])
+        if url.path != "/console/review.html" or len(jumps) != 1:
+            return ""
+        return jumps[0]
+    except ValueError:
+        return ""
+
+
+def original_question_link(item: ListItem) -> str:
+    """Find the Review link saved when this List item was added."""
+    if not item.log or isinstance(item.report, ListReport):
+        return ""
+    added = item.log[0]
+    if added.source not in (PAGE_SOURCE, "nate via New item", "nate via /new_item"):
+        return ""
+    if key := _added_review_link(added):
+        return key
+    if added.source != PAGE_SOURCE and len(item.log) > 1:
+        link = item.log[1]
+        if (link.time == added.time and link.source == added.source and isinstance(link.what, ReviewLinksChanged)
+                and link.what.action == "Linked reviews" and len(link.what.keys) == 1):
+            return link.what.keys[0]
+    return ""
+
+
+def question_item(item: ListItem) -> QuestionItemKind | NoQuestionItem:
+    return item.question_kind
 
 
 class AllItems(StrEnum):
@@ -736,6 +951,23 @@ class QuestionAnswered:
 
 
 @dataclass(frozen=True)
+class ReturnedAnswerId:
+    """Identify the filed exchange that supplied the answer."""
+
+    source_key: str
+    exchange_id: str
+
+
+@dataclass(frozen=True)
+class ReturnedAnswer:
+    identity: ReturnedAnswerId
+    words: str
+
+
+type UnreadAnswerId = str | ReturnedAnswerId
+
+
+@dataclass(frozen=True)
 class QuestionClosed:
     question: question_record.Question
 
@@ -809,7 +1041,7 @@ class GoNotDelivered:
 
 
 PageActivity = PageFeedback | PageRequest | QuestionRequestReceipt | UnparkNoChangeReceipt
-ListEvent = (FieldChange | QuestionAnswered | QuestionClosed | MarkedRead | Reopened | Unparked
+ListEvent = (FieldChange | QuestionAnswered | ReturnedAnswer | QuestionClosed | MarkedRead | Reopened | Unparked
              | ReviewLinksChanged | EvidenceCopyRemoved | AskOpened | AskWithdrawn | GoGiven | GoNotDelivered | PageActivity)
 LogContent = str | ListEvent
 
@@ -822,8 +1054,44 @@ def _store(keeper: staff.StaffId) -> record_store.NumberedRecords:
     return list_draft.list_records(keeper, ListError)
 
 
+@contextmanager
+def locked_item(keeper: staff.StaffId, identity: str) -> Generator[ListItem]:
+    """Read the item and hold its List write lock."""
+    with _store(keeper).locked():
+        yield load(keeper, identity)
+
+
 def folder(keeper: staff.StaffId) -> Path:
     return _store(keeper).folder()
+
+
+def list_folder_identity(keeper: staff.StaffId) -> Path:
+    return folder(keeper).resolve()
+
+
+def destination_key(destination: investigation.ListDestination) -> tuple[Path, int]:
+    return list_folder_identity(destination.keeper), destination.number
+
+
+def unique_destinations(destinations: Iterable[investigation.ListDestination]) -> tuple[investigation.ListDestination, ...]:
+    """Keep the first saved keeper for each physical row."""
+    by_row: dict[tuple[Path, int], investigation.ListDestination] = {}
+    for destination in destinations:
+        _ = by_row.setdefault(destination_key(destination), destination)
+    return tuple(by_row.values())
+
+
+def same_destination(first: investigation.ListDestination, second: investigation.ListDestination) -> bool:
+    return destination_key(first) == destination_key(second)
+
+
+def _same_list_item(first_keeper: staff.StaffId, first_id: str,
+                    second_keeper: staff.StaffId, second_id: str) -> bool:
+    if first_id != second_id:
+        return False
+    number = int(first_id.removeprefix("L"))
+    return same_destination(investigation.ListDestination(first_keeper, number),
+                            investigation.ListDestination(second_keeper, number))
 
 
 def now() -> datetime:
@@ -865,7 +1133,7 @@ def parking_active(value: Parking, moment: datetime) -> bool:
 def require_active_parking(value: Parking, moment: datetime) -> None:
     """Refuse a parking deadline that has passed."""
     if not parking_active(value, moment):
-        raise ListError("Choose a future parking date.")
+        raise ParkingDeadlinePassed("Choose a future parking date.")
 
 
 def _request_parking(value: Parking) -> Parking:
@@ -1409,6 +1677,9 @@ def _validate(item: ListItem) -> None:
     _ = staff_id(item.producer, "producer")
     _validate_unit(item.unit)
     _ = _item_state(item.state)
+    if (item.state is ItemState.ANSWERED and item.native_question is NoQuestionItem.ORDINARY
+            and item.keyless_question_kind is NoQuestionItem.ORDINARY):
+        raise ListError("Only a question can be Answered.")
     _ = _requester(item.requested_by)
     for moment in (item.opened, item.updated, item.unread_since, item.closed):
         _validate_time(moment)
@@ -1435,6 +1706,19 @@ def _validate(item: ListItem) -> None:
     _validate_related(item.related_to, item.number)
     _validate_review_keys(item.reviews)
     _validate_asks(item.asks)
+    if isinstance(item.report, ListReport):
+        _line(item.report.evidence_key, "report evidence key")
+        if not item.report.words.strip():
+            raise ListError("a List report needs the original words")
+        start = item.report.validation_log
+        if isinstance(start, ValidationLogStart) and (
+                item.report.kind is not ReportKind.VALIDATION or item.report.submission_scope
+                or start.first_result_index < 0):
+            raise ListError("invalid validation log position")
+    if item.state == ItemState.REPAIRED:
+        if not isinstance(item.report, ListReport):
+            raise ListError("only a List report can be Repaired")
+        _line(item.next_step, "how to try the repair")
     for name, value in (("next_step", item.next_step), ("latest_status", item.latest_status),
                         ("evidence", item.evidence), ("done_when", item.done_when)):
         _ = _field_text(value, name)
@@ -1702,6 +1986,9 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"action": content.action, "fields": _log_fields(content.fields)}
     if isinstance(content, QuestionAnswered):
         return {"action": "Answered", "question_id": _question_id(content.question_id)}
+    if isinstance(content, ReturnedAnswer):
+        return {"action": "Returned answer", "source_key": content.identity.source_key,
+                "exchange_id": content.identity.exchange_id, "words": content.words}
     if isinstance(content, QuestionClosed):
         return {"action": "Question closed with item", "question": question_record.stored(content.question)}
     if isinstance(content, MarkedRead):
@@ -1734,9 +2021,14 @@ def _log_content(content: LogContent) -> dict[str, object]:
             fields["read_update"] = content.read_update.fingerprint
         if content.recipient is not LegacyFeedbackRecipient.KEEPER:
             fields["recipient"] = staff_id(content.recipient, "feedback recipient")
+        if content.additional_recipient is not NoAdditionalRecipient.ABSENT:
+            fields["additional_recipient"] = staff_id(content.additional_recipient, "additional feedback recipient")
+        if content.origin is PageNoticeOrigin.STUDIO:
+            fields["origin"] = content.origin
         return {"feedback": fields}
     if isinstance(content, QuestionRequestReceipt):
-        return {"receipt": {**_request_fields(content.request), "question_id": _question_id(content.question_id)}}
+        return {"receipt": {**_request_fields(content.request), "question_id": _question_id(content.question_id),
+                            **({"followup": True} if content.followup else {})}}
     if isinstance(content, UnparkNoChangeReceipt):
         return {"receipt": {**_request_fields(content.request), "unpark_no_change": content.reason.value}}
     return {"receipt": _request_fields(content)}
@@ -1781,6 +2073,11 @@ def _read_log_line(line: str, number: int, read_schedule: Callable[[object], Sch
                 content = _read_field_change(action, values, number, read_schedule)
             case {"action": "Answered", "question_id": question_id} if len(fields) == 2:
                 content = QuestionAnswered(_question_id(question_id))
+            case {"action": "Returned answer", "source_key": str(key), "exchange_id": str(exchange_id),
+                  "words": str(words)} if len(fields) == 4:
+                _log_line(key, "exchange source key")
+                _log_line(exchange_id, "exchange ID")
+                content = ReturnedAnswer(ReturnedAnswerId(key, exchange_id), words)
             case {"action": "Question closed with item", "question": value} if len(fields) == 2:
                 question = question_record.read(value)
                 if question.answer is not None:
@@ -1847,44 +2144,108 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
     return _read_item(store, identity, fields, body)
 
 
+def _read_report(value: str) -> ListReport | NoListReport:
+    if not value:
+        return NoListReport.ABSENT
+    data = cast(object, json.loads(value))
+    match data:
+        case [str(kind), str(key), str(words)]:
+            return ListReport(ReportKind(kind), key, words)
+        case [str(kind), str(key), str(words), str(scope)] if scope:
+            return ListReport(ReportKind(kind), key, words, scope)
+        case [ReportKind.VALIDATION, str(key), str(words), int(index)] if type(index) is int:
+            return ListReport(ReportKind.VALIDATION, key, words, validation_log=ValidationLogStart(index))
+        case _:
+            raise ListError("invalid List report")
+
+
+def _read_native_question(fields: dict[str, str], exchanges: tuple[list_exchange.FiledExchange, ...]
+                          ) -> NativeQuestionItem | NoQuestionItem:
+    if "question_kind" not in fields:
+        if "question_source_key" in fields:
+            raise ListError("A question source needs a question kind.")
+        return NoQuestionItem.ORDINARY
+    origin = NativeQuestionItem(QuestionItemKind(fields["question_kind"]), fields["question_source_key"])
+    if not any(exchange.source_key == origin.source_key and native_question_kind(exchange) is origin.kind
+               for exchange in exchanges):
+        raise ListError("The saved question source does not match a filed exchange.")
+    return origin
+
+
+def _read_legacy_reply_marks(text: str) -> frozenset[UnreadAnswerId]:
+    raw = cast(object, json.loads(text))
+    if not isinstance(raw, list):
+        raise ListError("Invalid legacy reply marks.")
+    marks: set[UnreadAnswerId] = set()
+    for value in cast(list[object], raw):
+        match value:
+            case str(question) if question:
+                marks.add(question)
+            case [str(source), str(exchange)] if source and exchange:
+                marks.add(ReturnedAnswerId(source, exchange))
+            case _:
+                raise ListError("Invalid legacy reply mark.")
+    return frozenset(marks)
+
+
+def _write_legacy_reply_marks(marks: frozenset[UnreadAnswerId]) -> str:
+    questions = sorted(mark for mark in marks if isinstance(mark, str))
+    exchanges = sorted((mark.source_key, mark.exchange_id) for mark in marks if isinstance(mark, ReturnedAnswerId))
+    return json.dumps([*questions, *exchanges], ensure_ascii=False)
+
+
+def _decode_item(store: record_store.NumberedRecords, fields: dict[str, str], body: str,
+                 exchanges: tuple[list_exchange.FiledExchange, ...],
+                 origin: NativeQuestionItem | NoQuestionItem) -> ListItem:
+    marker = "## Next step\n\n"
+    if not body.startswith(marker):
+        raise ListError("missing Next step section")
+    body = body[len(marker):]
+    texts: list[str] = []
+    for key, name in (("next_step", "Latest status"), ("latest_status", "Evidence"),
+                      ("evidence", "Done when"), ("done_when", "Log")):
+        text, body = record_store.split_section(body, int(fields[key + "_length"]), name)
+        texts.append(text)
+    log_lines = body.removesuffix("\n").split("\n") if body else []
+    number = int(fields["number"])
+    legacy_allowance = cache(series_run_limit)
+    schedule = _read_schedule(cast(object, json.loads(fields.get("schedule", "null"))), legacy_allowance)
+
+    def read_log_schedule(raw: object) -> Schedule:
+        return _read_schedule(raw, lambda: schedule.run_allowance if isinstance(schedule, ScheduledSeries) else legacy_allowance())
+
+    changes = tuple(_read_log_line(line.removesuffix("\r"), number, read_log_schedule) for line in log_lines)
+    return ListItem(number, fields["title"],
+                    UnassignedOwner(fields["owner"]) if fields["owner"] in UnassignedOwner else staff.StaffId(fields["owner"]),
+                    staff.StaffId(fields.get("producer", store.owner)),
+                    fields["unit"], _item_state(fields["state"]), next_check_value(fields["next_check"]),
+                    _read_eta(fields["eta"], fields["eta_kind"]),
+                    time_value(fields["unread_since"]), parking_value(fields["parked_until"]),
+                    _dependencies(cast(object, json.loads(fields["blocked_by"]))),
+                    _related(cast(object, json.loads(fields["related_to"]))), _requester(fields["requested_by"]),
+                    time_value(fields["opened"]), time_value(fields["updated"]), time_value(fields["closed"]),
+                    fields["closing_words"], texts[0], texts[1], texts[2], texts[3], changes,
+                    _review_keys(cast(object, json.loads(fields.get("reviews", "[]")))),
+                    delivery_state.read_list_questions(fields.get("questions", "[]")), schedule,
+                    _read_run_deliveries(fields), list_draft.read_list_draft(fields),
+                    _read_asks(fields.get("asks", "[]")), _read_report(fields.get("report", "")),
+                    exchanges, origin, _read_legacy_reply_marks(fields.get("legacy_read_replies", "[]")))
+
+
+def _checked_item(identity: str, item: ListItem) -> ListItem:
+    if item.id != identity or not item.log:
+        raise ListError("the item number must match its path and the log must not be empty")
+    _validate(item)
+    return item
+
+
 def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[str, str], body: str) -> ListItem:
     try:
-        marker = "## Next step\n\n"
-        if not body.startswith(marker):
-            raise ListError("missing Next step section")
-        body = body[len(marker):]
-        texts: list[str] = []
-        for key, name in (("next_step", "Latest status"), ("latest_status", "Evidence"),
-                          ("evidence", "Done when"), ("done_when", "Log")):
-            text, body = record_store.split_section(body, int(fields[key + "_length"]), name)
-            texts.append(text)
-        log_lines = body.removesuffix("\n").split("\n") if body else []
-        number = int(fields["number"])
-        legacy_allowance = cache(series_run_limit)
-        schedule = _read_schedule(cast(object, json.loads(fields.get("schedule", "null"))), legacy_allowance)
-
-        def read_log_schedule(raw: object) -> Schedule:
-            return _read_schedule(raw, lambda: schedule.run_allowance if isinstance(schedule, ScheduledSeries) else legacy_allowance())
-
-        changes = tuple(_read_log_line(line.removesuffix("\r"), number, read_log_schedule) for line in log_lines)
-        item = ListItem(number, fields["title"],
-                        UnassignedOwner(fields["owner"]) if fields["owner"] in UnassignedOwner else staff.StaffId(fields["owner"]),
-                        staff.StaffId(fields.get("producer", store.owner)),
-                        fields["unit"], _item_state(fields["state"]), next_check_value(fields["next_check"]),
-                        _read_eta(fields["eta"], fields["eta_kind"]),
-                        time_value(fields["unread_since"]), parking_value(fields["parked_until"]),
-                        _dependencies(cast(object, json.loads(fields["blocked_by"]))),
-                        _related(cast(object, json.loads(fields["related_to"]))), _requester(fields["requested_by"]),
-                        time_value(fields["opened"]), time_value(fields["updated"]), time_value(fields["closed"]),
-                        fields["closing_words"], texts[0], texts[1], texts[2], texts[3], changes,
-                        _review_keys(cast(object, json.loads(fields.get("reviews", "[]")))),
-                        delivery_state.read_list_questions(fields.get("questions", "[]")), schedule,
-                        _read_run_deliveries(fields), list_draft.read_list_draft(fields),
-                        _read_asks(fields.get("asks", "[]")))
-        if item.id != identity or not changes:
-            raise ListError("the item number must match its path and the log must not be empty")
-        _validate(item)
-        return item
+        if "question_kind" in fields and "question_source_key" not in fields:
+            return _read_keyless_question(store, identity, fields, body).item
+        exchanges = list_exchange.decode(fields.get("filed_exchanges", "[]"))
+        origin = _read_native_question(fields, exchanges)
+        return _checked_item(identity, _decode_item(store, fields, body, exchanges, origin))
     except (ValueError, KeyError, TypeError) as error:
         raise store.invalid(identity, error) from None
 
@@ -1945,8 +2306,25 @@ def _save(store: record_store.NumberedRecords, item: ListItem, *, previous_produ
                                              ensure_ascii=False)
     if item.questions:
         fields["questions"] = json.dumps([question_record.stored(question) for question in item.questions], ensure_ascii=False)
+    if item.filed_exchanges:
+        fields["filed_exchanges"] = list_exchange.encode(item.filed_exchanges)
+    if isinstance(origin := item.native_question, NativeQuestionItem):
+        fields["question_kind"] = origin.kind.value
+        fields["question_source_key"] = origin.source_key
+    elif isinstance(kind := item.keyless_question_kind, QuestionItemKind):
+        fields["question_kind"] = kind.value
+    if item.legacy_read_replies:
+        fields["legacy_read_replies"] = _write_legacy_reply_marks(item.legacy_read_replies)
     if item.asks:
         fields["asks"] = json.dumps([_stored_ask(ask) for ask in item.asks], ensure_ascii=False)
+    if isinstance(item.report, ListReport):
+        report = item.report
+        values: tuple[str | int, ...] = (report.kind, report.evidence_key, report.words)
+        if isinstance(report.validation_log, ValidationLogStart):
+            values += (report.validation_log.first_result_index,)
+        elif report.submission_scope:
+            values += (report.submission_scope,)
+        fields["report"] = json.dumps(values, ensure_ascii=False)
     body = "## Next step\n\n" + item.next_step
     log = "\n".join(_stored_log_line(entry) for entry in item.log)
     for key, text, heading, following in (("next_step", item.next_step, "Latest status", item.latest_status),
@@ -1955,14 +2333,115 @@ def _save(store: record_store.NumberedRecords, item: ListItem, *, previous_produ
                                           ("done_when", item.done_when, "Log", log)):
         fields[key + "_length"] = str(len(text))
         body += record_store.section(heading) + following
-    with goal.list_item_change(store.owner, item.id, item.producer, _goal_status(item), previous_producer):
+    store.record_list_publication()
+    with goal.list_item_change(store.owner, item.id, item.producer, _goal_status(item), previous_producer,
+                               same_item=_same_list_item):
         store.write(item.id, fields, body)
 
 
 def records(keeper: staff.StaffId, *, include_closed: bool = False,
             sources: list[Path] | None = None) -> list[ListItem]:
-    items = _store(keeper).records(lambda identity: load(keeper, identity), sources=sources)
-    return sorted((item for item in items if include_closed or item.state != ItemState.CLOSED), key=lambda item: item.number)
+    """Read the available rows for display."""
+    def read(identity: str) -> ListItem | None:
+        try:
+            return load(keeper, identity)
+        except OSError as error:
+            print(f"List item {keeper}/{identity}: {error}", file=sys.stderr)
+            return None
+
+    items = _store(keeper).records(read, sources=sources)
+    visible: list[ListItem] = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item.keyless_question_kind, QuestionItemKind):
+            print(f"List question conversion for {keeper}/{item.id}: no saved source key.", file=sys.stderr)
+        if include_closed or item.state != ItemState.CLOSED:
+            visible.append(item)
+    return sorted(visible, key=lambda item: item.number)
+
+
+class IncompleteListScan(OSError):
+    """A destination check could not read the whole List."""
+
+
+@dataclass(frozen=True)
+class ScannedListRow:
+    keeper: staff.StaffId
+    item: ListItem
+
+    @property
+    def destination(self) -> investigation.ListDestination:
+        return investigation.ListDestination(self.keeper, self.item.number)
+
+
+def display_list_records(*, include_closed: bool, sources: list[Path] | None = None,
+                         aliases: dict[Path, list[staff.StaffId]] | None = None) -> list[ScannedListRow]:
+    """Read each available List folder once for display."""
+    found: list[ScannedListRow] = []
+    seen: set[Path] = set()
+    root = record_store.state_root()
+    if sources is not None:
+        sources.append(root)
+    try:
+        owners = sorted(root.iterdir())
+    except FileNotFoundError:
+        return found
+    except OSError as error:
+        print(f"List folders {root}: {error}", file=sys.stderr)
+        return found
+    for owner in owners:
+        keeper = staff.StaffId(owner.name)
+        path = folder(keeper)
+        if sources is not None:
+            sources.append(path)
+        try:
+            if owner.is_symlink() or not owner.is_dir():
+                continue
+            physical = list_folder_identity(keeper)
+            if aliases is not None:
+                aliases.setdefault(physical, []).append(keeper)
+            if physical in seen:
+                continue
+            items = records(keeper, include_closed=include_closed, sources=sources)
+        except OSError as error:
+            print(f"List folder {path}: {error}", file=sys.stderr)
+            continue
+        seen.add(physical)
+        found.extend(ScannedListRow(keeper, item) for item in items)
+    return found
+
+
+def scan_list_records() -> tuple[ScannedListRow, ...]:
+    """Read all List rows or raise one error if any row or folder fails."""
+    rows: list[ScannedListRow] = []
+    path = record_store.state_root()
+    seen: set[Path] = set()
+    location = str(path)
+    try:
+        if not record_store.saved_path_exists(path):
+            return ()
+        for owner in sorted(path.iterdir()):
+            location = str(owner)
+            if not stat.S_ISDIR(owner.lstat().st_mode):
+                continue
+            keeper = staff.StaffId(owner.name)
+            path = folder(keeper)
+            location = str(path)
+            if not record_store.saved_path_exists(path):
+                continue
+            physical = list_folder_identity(keeper)
+            if physical in seen:
+                continue
+            seen.add(physical)
+            for row in sorted(path.iterdir()):
+                if row.name.startswith("L") and row.suffix == ".md":
+                    location = f"{keeper}/{row.stem}"
+                    rows.append(ScannedListRow(keeper, load(keeper, row.stem)))
+    except (OSError, ListError) as error:
+        detail = " ".join(str(error).splitlines())
+        raise IncompleteListScan(f"{location}: {detail}") from error
+    return tuple(rows)
 
 
 def _producer_records(keeper: staff.StaffId, producer: staff.StaffId, *, include_closed: bool) -> ProducerListRead:
@@ -2003,7 +2482,8 @@ def question_visibility(keeper: staff.StaffId, item: ListItem,
     unanswered = tuple(question for question in item.questions if question.answer is None)
     if not unanswered:
         return QuestionAttention()
-    waiting = True
+    waiting = (item.question_kind is NoQuestionItem.ORDINARY
+               or not question_can_mark_read(item, unread_answer_ids(item)))
     failed: set[str] = set()
     for question in unanswered:
         target = list_question_target(keeper, item, question.recipient_id(keeper))
@@ -2036,14 +2516,15 @@ def _check_links(number: int, changes: ItemChanges, *, require_related: Callable
 def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
     """Create complete typed records after checking the whole batch under one lock."""
     store = _store(keeper)
-    with store.list_allocation():
+    with _list_allocation(store):
         next_number = store.next_number()
         for item in items:
             if item.number < next_number:
                 raise ListError(f"{item.id}: the next available number is L{next_number}")
         if any(store.folder().glob("*.md")):
             raise ListError("the list folder already holds a record")
-        if os.path.lexists(store.counter_path()):
+        recovered_sequence = store.has_allocation_only_sequence()
+        if os.path.lexists(store.counter_path()) and not recovered_sequence:
             raise ListError("the list folder already has a number sequence")
         pending = {item.number: item for item in items}
         if len(pending) != len(items):
@@ -2119,7 +2600,7 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
     def require_related(number: int) -> None:
         _ = read_reference(number, scope=AllItems.INCLUDED)
 
-    with store.list_allocation():
+    with _list_allocation(store):
         next_number = store.next_number()
         chosen = next_number if isinstance(number, NextNumber) else number
         identity = f"L{chosen}"
@@ -2163,39 +2644,1024 @@ def _new_item(number: int, title: str, owner: ItemOwner, keeper: staff.StaffId, 
     return item
 
 
-def reserved_review_number(path: Path) -> int | NextNumber:
+def review_reservation(
+    path: Path, *, source_destinations: Iterable[investigation.ListDestination] = (),
+    current_links: Iterable[investigation.ListDestination] = (),
+) -> investigation.ListDestination | NextNumber:
+    """Resolve a saved reservation. Current links can only show a conflict."""
     try:
         value = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
+        if record_store.saved_path_exists(path):
+            raise
         return NextNumber.AVAILABLE
-    if not re.fullmatch(r"[1-9][0-9]*", value):
-        raise ListError(f"{path}: invalid List number reservation")
-    return int(value)
+    source_destinations = tuple(source_destinations)
+    if re.fullmatch(r"[1-9][0-9]*", value):
+        destination = _numeric_review_reservation(path, int(value), source_destinations)
+    else:
+        try:
+            destination = investigation.ListDestination.decode(value)
+        except ValueError as error:
+            raise ListError(f"{path}: invalid List reservation") from error
+    current_links = (other for other in current_links if other.number == destination.number)
+    if any(not same_destination(destination, other) for other in (*source_destinations, *current_links)):
+        raise ListError(f"{path}: the List reservation conflicts with another destination")
+    return destination
+
+
+def _numeric_review_reservation(path: Path, number: int,
+                                source_destinations: Iterable[investigation.ListDestination]
+                                ) -> investigation.ListDestination:
+    routed: investigation.ListDestination | NextNumber = NextNumber.AVAILABLE
+    route_path = path.with_name("list-filing.json")
+    if record_store.saved_path_exists(route_path):
+        match cast(object, json.loads(route_path.read_text(encoding="utf-8"))):
+            case {"keeper": str(keeper)}:
+                routed = investigation.ListDestination(staff_id(keeper, "List keeper"), number)
+            case _:
+                pass
+    verified = unique_destinations(source_destinations)
+    if len(verified) == 1 and verified[0].number == number:
+        if isinstance(routed, investigation.ListDestination) and same_destination(routed, verified[0]):
+            return routed
+        return verified[0]
+    if verified:
+        raise ListError(f"{path}: the List reservation conflicts with the saved source")
+    if isinstance(routed, investigation.ListDestination):
+        return routed
+    raise ListError(f"{path}: cannot verify the keeper for a numeric List reservation")
+
+
+def _save_review_reservation(path: Path, destination: investigation.ListDestination) -> investigation.ListDestination:
+    payload = destination.encode() + "\n"
+    if not record_store.saved_path_exists(path) or path.read_text(encoding="utf-8") != payload:
+        write_text_atomic(path, payload, new_file_mode=0o600)
+    return destination
+
+
+def _review_source_rows(rows: tuple[ScannedListRow, ...], key: str) -> tuple[investigation.ListDestination, ...]:
+    return unique_destinations(row.destination for row in rows if _review_source_matches(row.item, key)
+                               or key in row.item.reviews)
+
+
+def _review_source_matches(item: ListItem, key: str) -> bool:
+    return (original_question_link(item) == key
+            or isinstance(item.report, ListReport) and item.report.evidence_key == key)
+
+
+def review_fallback_destination(key: str) -> investigation.ListDestination | investigation.NoListDestination:
+    """Check for a Review row before the caller saves a fallback under the List lock."""
+    matches = _review_source_rows(scan_list_records(), key)
+    if len(matches) > 1:
+        raise ListError("The Review source has two List destinations.")
+    return next(iter(matches)) if matches else investigation.NoListDestination.ABSENT
 
 
 def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, producer: staff.StaffId,
                     unit: str, words: str, evidence: str, review_key: str, source: str, reservation: Path) -> int:
-    """Reserve a number for this Review filing and publish its linked row under the List lock."""
+    return file_review_item(keeper, title, owner=owner, producer=producer, unit=unit, words=words, evidence=evidence,
+                            review_key=review_key, source=source, reservation=reservation).number
+
+
+def file_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, producer: staff.StaffId,
+                     unit: str, words: str, evidence: str, review_key: str, source: str,
+                     reservation: Path) -> investigation.ListDestination:
+    """Reserve a number for this Review filing and publish its List row."""
+    if review_key.startswith("investigation/"):
+        try:
+            record = investigation.list_evidence_record(review_key)
+        except (FileNotFoundError, investigation.InvestigationError):
+            pass
+        else:
+            report_kind = investigation_report_kind(record)
+            if isinstance(report_kind, ReportKind):
+                path = investigation.review_record_path(record.owner, record.id)
+                def finish_report(current: investigation.Investigation) -> investigation.ListDestination:
+                    report = report_from_investigation(current, report_kind, review_key)
+                    return file_report(keeper, report, current.title, owner=owner, producer=producer, unit=unit,
+                                       source=source, reservation=reservation)
+
+                record = investigation.file_on_list(path, finish_report)
+                assert isinstance(record.list_destination, investigation.ListDestination)
+                return record.list_destination
     store = _store(keeper)
-    number = reserved_review_number(reservation)
-    if isinstance(number, int) and store.path(f"L{number}").is_file():
-        sync_folder(store.folder())
-        return number
+    with record_store.list_destination_lock():
+        rows = scan_list_records()
+        matches = _review_source_rows(rows, review_key)
+        verified = tuple(row.destination for row in rows if _review_source_matches(row.item, review_key))
+        reserved = review_reservation(reservation, source_destinations=verified, current_links=matches)
+        if isinstance(reserved, NextNumber) and not verified:
+            if any(list_folder_identity(match.keeper) != list_folder_identity(keeper) for match in matches):
+                raise ListError("The Review link conflicts with the saved List route.")
+            matches = tuple(investigation.ListDestination(keeper, match.number) for match in matches)
+        destinations = unique_destinations((reserved,) if isinstance(reserved, investigation.ListDestination)
+                                           else matches)
+        if len(destinations) > 1:
+            raise ListError("The Review source has two List destinations.")
+        if destinations:
+            destination, = destinations
+            keeper = destination.keeper
+            store = _store(destination.keeper)
+            identity = f"L{destination.number}"
+            if record_store.saved_path_exists(store.path(identity)):
+                item = load(destination.keeper, identity)
+                if review_key not in item.reviews and not _review_source_matches(item, review_key):
+                    raise ListError(f"{identity}: the Review reservation names a different item")
+                destination = _save_review_reservation(reservation, destination)
+                sync_folder(store.folder())
+                return destination
+            reserved = destination
+        lock = _list_allocation(store) if isinstance(reserved, NextNumber) else store.locked()
+        with lock:
+            destination = (investigation.ListDestination(keeper, store.next_number())
+                           if isinstance(reserved, NextNumber) else reserved)
+            item = _new_item(destination.number, title, owner, keeper, source,
+                             {"producer": producer, "unit": unit, "latest_status": words, "evidence": evidence},
+                             reviews=(review_key,))
+            _require_active_open_producers((item,))
+            if isinstance(reserved, NextNumber):
+                store.reserve_number(destination.number)
+            destination = _save_review_reservation(reservation, destination)
+            _save(store, item)
+            return destination
+
+
+class QuestionFiling(Enum):
+    LIVE = "file a current question"
+    HISTORY = "migrate a question"
+
+
+class QuestionMove(Enum):
+    FILE = "file"
+    NATE_ANSWER = "nate answers"
+    WITHDRAW = "withdraw"
+    REPLY = "receive a reply"
+    FOLLOW_UP = "ask a follow-up"
+    READ = "mark read"
+    ASKER_CLOSE = "asker closes"
+    OTHER = "ordinary item action"
+
+
+type QuestionTransition = tuple[QuestionItemKind, ItemState, QuestionMove, ItemState]
+
+_QUESTION_TRANSITIONS: frozenset[QuestionTransition] = frozenset({
+    (QuestionItemKind.TO_NATE, ItemState.WAITING_FOR_NATE, QuestionMove.NATE_ANSWER, ItemState.WORKING),
+    (QuestionItemKind.TO_NATE, ItemState.WAITING_FOR_NATE, QuestionMove.WITHDRAW, ItemState.CLOSED),
+    (QuestionItemKind.TO_NATE, ItemState.WORKING, QuestionMove.ASKER_CLOSE, ItemState.CLOSED),
+    (QuestionItemKind.TO_NATE, ItemState.ANSWERED, QuestionMove.READ, ItemState.WORKING),
+    (QuestionItemKind.FROM_NATE, ItemState.ANSWERED, QuestionMove.READ, ItemState.CLOSED),
+    (QuestionItemKind.FROM_NATE, ItemState.CLOSED, QuestionMove.REPLY, ItemState.ANSWERED),
+    (QuestionItemKind.FROM_NATE, ItemState.CLOSED, QuestionMove.FILE, ItemState.ANSWERED),
+    *((kind, ItemState.WORKING, QuestionMove.REPLY, ItemState.ANSWERED) for kind in QuestionItemKind),
+    *((kind, ItemState.ANSWERED, QuestionMove.FOLLOW_UP, ItemState.WORKING) for kind in QuestionItemKind),
+    *((QuestionItemKind.TO_NATE, state, QuestionMove.FILE, target)
+      for state in (ItemState.NEW, ItemState.WAITING_FOR_NATE, ItemState.WORKING, ItemState.ANSWERED)
+      for target in (ItemState.WAITING_FOR_NATE, ItemState.WORKING, ItemState.CLOSED)),
+    *((QuestionItemKind.FROM_NATE, state, QuestionMove.FILE, target)
+      for state in (ItemState.NEW, ItemState.WAITING_FOR_NATE, ItemState.WORKING, ItemState.ANSWERED)
+      for target in (ItemState.WORKING, ItemState.ANSWERED, ItemState.CLOSED)),
+})
+
+_QUESTION_CLOSE_REFUSAL = "Only the asker can close this question."
+
+
+def _require_question_move(item: ListItem, move: QuestionMove, state: ItemState) -> None:
+    if state is ItemState.ANSWERED and state is not item.state and item.question_kind is NoQuestionItem.ORDINARY:
+        raise ListError("Only a question can be Answered.")
+    if (isinstance(kind := item.question_kind, QuestionItemKind) and state is not item.state
+            and (kind, item.state, move, state) not in _QUESTION_TRANSITIONS):
+        raise ListError("Close the question while it is Working." if move is QuestionMove.ASKER_CLOSE
+                        else "You cannot set a question's state directly.")
+
+
+def _move_question(item: ListItem, move: QuestionMove, state: ItemState, moment: datetime,
+                   source: str = PAGE_SOURCE, *, closing_words: str = "Question closed.") -> ListItem:
+    _require_question_move(item, move, state)
+    if state is item.state:
+        return item
+    replies_unread = move is not QuestionMove.READ and bool(unread_answer_ids(item))
+    if state is ItemState.CLOSED:
+        event = FieldChange("Closed", {"closing_words": closing_words})
+        item = replace(item, state=state, closed=moment, closing_words=closing_words,
+                       unread_since=item.unread_since if replies_unread else NoTimestamp.UNSET,
+                       parked_until=NoTimestamp.UNSET)
+    else:
+        event = FieldChange("Updated", {"state": state})
+        unread = (moment if state in (ItemState.WAITING_FOR_NATE, ItemState.ANSWERED)
+                  and not isinstance(item.unread_since, datetime) else item.unread_since)
+        if state is ItemState.WORKING and not replies_unread:
+            unread = NoTimestamp.UNSET
+        item = replace(item, state=state, closed=NoTimestamp.UNSET, closing_words="", unread_since=unread)
+    return replace(item, updated=max(moment, item.updated), log=(*item.log, ItemChange(moment, event, source)))
+
+
+def _unread_exchange(exchange: list_exchange.Exchange) -> bool:
+    return isinstance(exchange.answer, list_exchange.ExchangeAnswer) and exchange.answer.read is list_exchange.AnswerRead.UNREAD
+
+
+def _native_prompt(exchanges: Sequence[list_exchange.Exchange]) -> list_exchange.Exchange:
+    return next((exchange for exchange in exchanges if exchange.direction is list_exchange.Direction.QUESTION_TO_NATE),
+                exchanges[0])
+
+
+_NO_ACKNOWLEDGED_EXCHANGES: frozenset[ReturnedAnswerId] = frozenset()
+
+
+def question_filing_state(exchanges: Sequence[list_exchange.Exchange], filing: QuestionFiling, *,
+                          acknowledged: frozenset[ReturnedAnswerId] = _NO_ACKNOWLEDGED_EXCHANGES) -> ItemState:
+    """Use the same native question state for a save and a preview."""
+    prompt = _native_prompt(exchanges)
+    historical = filing is QuestionFiling.HISTORY
+    if native_question_kind(prompt) is QuestionItemKind.TO_NATE:
+        if prompt.answer is list_exchange.QuestionWithoutAnswer.OPEN:
+            return ItemState.WAITING_FOR_NATE
+        return (ItemState.CLOSED if historical or prompt.answer is list_exchange.QuestionWithoutAnswer.CLOSED
+                else ItemState.WORKING)
+    if any(_unread_exchange(exchange) and ReturnedAnswerId(exchange.source_key, exchange.exchange_id) not in acknowledged
+           for exchange in exchanges):
+        return ItemState.ANSWERED
+    pending = any(exchange.answer is list_exchange.QuestionWithoutAnswer.OPEN for exchange in exchanges)
+    return ItemState.WORKING if pending and not historical else ItemState.CLOSED
+
+
+def _acknowledged_replies(item: ListItem) -> frozenset[UnreadAnswerId]:
+    replies = {content.question_id if isinstance(content, QuestionAnswered) else content.identity
+               for entry in item.log if isinstance(content := entry.what, (QuestionAnswered, ReturnedAnswer))}
+    return frozenset(replies - unread_answer_ids(item))
+
+
+def _file_question_kind(item: ListItem, before: ListItem, filing: QuestionFiling,
+                        origin: NativeQuestionItem | NoQuestionItem) -> ListItem:
+    if not isinstance(origin, NativeQuestionItem):
+        return item
+    marks = _acknowledged_replies(before)
+    item = replace(item, native_question=origin, legacy_read_replies=marks, keyless_question_kind=NoQuestionItem.ORDINARY)
+    exchanges = question_item_exchanges(item)
+    before_exchanges = question_item_exchanges(replace(before, native_question=origin))
+    historical = filing is QuestionFiling.HISTORY or bool(
+        before_exchanges and isinstance(_native_prompt(before_exchanges).answer, list_exchange.ExchangeAnswer))
+    mode = QuestionFiling.HISTORY if historical else filing
+    acknowledged = frozenset(mark for mark in marks if isinstance(mark, ReturnedAnswerId))
+    state = question_filing_state(exchanges, mode, acknowledged=acknowledged)
+    if item.state is ItemState.CLOSED and state is not ItemState.ANSWERED:
+        return item
+    words = ("Closed when questions became items" if historical and origin.kind is QuestionItemKind.TO_NATE
+             else "Question closed.")
+    return _move_question(item, QuestionMove.FILE, state, now(), closing_words=words)
+
+
+def project_question_migration(item: ListItem, exchanges: tuple[list_exchange.FiledExchange, ...] = (), *,
+                               submission_question: NativeQuestionItem | NoQuestionItem = NoQuestionItem.ORDINARY
+                               ) -> ListItem:
+    """Project the question migration without saving it."""
+    if exchanges:
+        item = _with_filed_exchanges(item, exchanges, QuestionFiling.HISTORY, submission_question)
+    origin = item.native_question
+    if origin is NoQuestionItem.ORDINARY:
+        if (item.report is NoListReport.ABSENT and item.keyless_question_kind is NoQuestionItem.ORDINARY
+                and isinstance(submission_question, NativeQuestionItem)
+                and submission_question in native_question_origins(item.filed_exchanges)):
+            return _file_question_kind(item, item, QuestionFiling.HISTORY, submission_question)
+        return item
+    if (origin.kind is QuestionItemKind.FROM_NATE and item.state is ItemState.CLOSED
+            and any(isinstance(answer, str) or answer.source_key == origin.source_key for answer in unread_answer_ids(item))):
+        return _move_question(item, QuestionMove.FILE, ItemState.ANSWERED, now())
+    return item
+
+
+def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.FiledExchange, ...],
+                          filing: QuestionFiling,
+                          submission_question: NativeQuestionItem | NoQuestionItem = NoQuestionItem.ORDINARY) -> ListItem:
+    saved = {(exchange.source_key, exchange.exchange_id): exchange for exchange in item.filed_exchanges}
+    returns: list[ItemChange] = []
+    for exchange in exchanges:
+        key = (exchange.source_key, exchange.exchange_id)
+        previous = saved.get(key)
+        current = previous.updated(exchange) if previous is not None else exchange
+        saved[key] = current
+        answer = current.answer
+        if (current.source in (list_exchange.Source.SCOPED_REPLY, list_exchange.Source.STAFF_QUESTION)
+                and current.direction is list_exchange.Direction.ANSWER_TO_NATE
+                and isinstance(answer, list_exchange.ExchangeAnswer) and answer.read is list_exchange.AnswerRead.UNREAD
+                and isinstance(answer.time, datetime)
+                and (previous is None or isinstance(previous.answer, list_exchange.QuestionWithoutAnswer))):
+            author = current.answerer
+            source = author.name if isinstance(author, list_exchange.RecordedAnswerer) else author
+            returns.append(ItemChange(answer.time, ReturnedAnswer(ReturnedAnswerId(*key), answer.text), source))
+    changed = replace(item, filed_exchanges=tuple(saved.values()))
+    if returns:
+        returns.sort(key=lambda entry: entry.time)
+        latest = returns[-1].time
+        unread_since = max(item.unread_since, latest) if isinstance(item.unread_since, datetime) else latest
+        changed = replace(changed, log=(*item.log, *returns), updated=max(item.updated, latest), unread_since=unread_since)
+    origin = item.native_question
+    if origin is NoQuestionItem.ORDINARY:
+        return _file_question_kind(changed, item, filing, submission_question)
+    native = question_item_exchanges(changed)
+    if not any(exchange.source_key == origin.source_key for exchange in exchanges):
+        return changed
+    if item.state is ItemState.WAITING_FOR_NATE:
+        answer = _native_prompt(native).answer
+        if isinstance(answer, list_exchange.ExchangeAnswer):
+            return _move_question(changed, QuestionMove.NATE_ANSWER, ItemState.WORKING, now())
+        if answer is list_exchange.QuestionWithoutAnswer.CLOSED:
+            return _move_question(changed, QuestionMove.WITHDRAW, ItemState.CLOSED, now())
+    if returns and (item.state is ItemState.WORKING or
+                    item.state is ItemState.CLOSED and origin.kind is QuestionItemKind.FROM_NATE):
+        return _move_question(changed, QuestionMove.REPLY, ItemState.ANSWERED, now())
+    return changed
+
+
+@dataclass(frozen=True)
+class ExchangeDestination:
+    destination: investigation.ListDestination
+    reserved_new_item: bool
+
+
+def _exchange_reservation(path: Path) -> ExchangeDestination | NextNumber:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        if record_store.saved_path_exists(path):
+            raise
+        return NextNumber.AVAILABLE
+    mode, separator, location = value.partition(" ")
+    keeper, list_prefix, number = location.partition("/L")
+    if not separator or mode not in ("new", "linked") or not list_prefix or not re.fullmatch(r"[1-9][0-9]*", number):
+        raise ListError(f"{path}: invalid exchange reservation")
+    return ExchangeDestination(investigation.ListDestination(staff_id(keeper, "List keeper"), int(number)), mode == "new")
+
+
+def _save_exchange_reservation(path: Path, destination: investigation.ListDestination, mode: Literal["new", "linked"]) -> None:
+    write_text_atomic(path, f"{mode} {destination.keeper}/L{destination.number}\n", new_file_mode=0o600)
+
+
+def _exchange_path(key: str) -> Path:
+    return record_store.state_root() / ".list-exchanges" / hashlib.sha256(key.encode()).hexdigest()
+
+
+def exchange_reservation(key: str) -> ExchangeDestination | NextNumber:
+    reservation = _exchange_path(key)
+    journal = reservation.parent.parent / ".list-exchange-allocation"
+    allocation = _read_exchange_allocation(journal)
+    if isinstance(allocation, ExchangeAllocation) and allocation.digest == reservation.name:
+        return ExchangeDestination(_allocated_destination(allocation, reservation), True)
+    return _exchange_reservation(reservation)
+
+
+def exchange_filing_started(key: str) -> bool:
+    """Check for changes or receipts from an earlier List filing."""
+    path = _exchange_path(key)
+    return any(record_store.saved_path_exists(path.with_suffix(suffix)) for suffix in (".pending", ".saved"))
+
+
+@dataclass(frozen=True)
+class LockedExchangeSource:
+    key: str
+    reservation: Path
+
+
+@contextmanager
+def lock_exchange_source(key: str) -> Generator[LockedExchangeSource]:
+    reservation = _exchange_path(key)
+    reservation.parent.mkdir(parents=True, exist_ok=True)
+    with exclusive(reservation.with_suffix(".lock")), record_store.list_destination_lock():
+        yield LockedExchangeSource(key, reservation)
+
+
+def _read_pending_exchanges(reservation: Path) -> tuple[list_exchange.FiledExchange, ...]:
+    path = reservation.with_suffix(".pending")
+    try:
+        return list_exchange.decode(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if record_store.saved_path_exists(path):
+            raise
+        return ()
+
+
+def pending_exchanges(key: str, *, sources: list[Path] | None = None) -> tuple[list_exchange.FiledExchange, ...]:
+    reservation = _exchange_path(key)
+    if sources is not None:
+        sources.append(reservation.with_suffix(".pending"))
+    return _read_pending_exchanges(reservation)
+
+
+def exchange_history(key: str) -> tuple[list_exchange.FiledExchange, ...]:
+    """Read the destination row and any changes that still need a receipt."""
+    reservation = _exchange_path(key)
+    destination = _exchange_reservation(reservation)
+    saved: tuple[list_exchange.FiledExchange, ...] = ()
+    if isinstance(destination, ExchangeDestination):
+        keeper, identity = destination.destination.keeper, f"L{destination.destination.number}"
+        path = _store(keeper).path(identity)
+        if record_store.saved_path_exists(path):
+            row = load(keeper, identity)
+            saved = tuple(exchange for exchange in row.filed_exchanges if exchange.source_key == key)
+    return combine_exchange_history(saved, _read_pending_exchanges(reservation))
+
+
+def combine_exchange_history(saved: tuple[list_exchange.FiledExchange, ...],
+                             pending: tuple[list_exchange.FiledExchange, ...]) -> tuple[list_exchange.FiledExchange, ...]:
+    history = {exchange.exchange_id: exchange for exchange in saved}
+    for exchange in pending:
+        previous = history.get(exchange.exchange_id)
+        history[exchange.exchange_id] = previous.updated(exchange) if previous is not None else exchange
+    return tuple(history.values())
+
+
+def _exchange_digest(exchange: list_exchange.FiledExchange) -> str:
+    return hashlib.sha256(list_exchange.encode((exchange,)).encode()).hexdigest()
+
+
+def _exchange_receipt_line(destination: investigation.ListDestination, exchange: list_exchange.FiledExchange) -> str:
+    return f"{destination.keeper}/L{destination.number} {_exchange_digest(exchange)}"
+
+
+def _exchange_receipts(key: str, sources: list[Path] | None = None) -> tuple[tuple[investigation.ListDestination, str], ...]:
+    path = _exchange_path(key).with_suffix(".saved")
+    if sources is not None:
+        sources.append(path)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        if record_store.saved_path_exists(path):
+            raise
+        return ()
+    receipts: list[tuple[investigation.ListDestination, str]] = []
+    for line in lines:
+        match = re.fullmatch(r"([^ /]+)/L([1-9][0-9]*) ([a-f0-9]{64})", line)
+        if match is not None:
+            keeper, number, digest = match.groups()
+            if keeper in (".", ".."):
+                continue
+            destination = investigation.ListDestination(staff.StaffId(keeper), int(number))
+            if sources is not None:
+                sources.append(folder(destination.keeper))
+            receipts.append((destination, digest))
+    return tuple(receipts)
+
+
+def confirmed_exchanges(key: str, destination: investigation.ListDestination,
+                        exchanges: Iterable[list_exchange.FiledExchange],
+                        *, sources: list[Path] | None = None) -> frozenset[list_exchange.FiledExchange]:
+    receipts = _exchange_receipts(key, sources)
+    if not receipts:
+        return frozenset()
+    target = destination_key(destination)
+    digests = {digest for saved, digest in receipts if destination_key(saved) == target}
+    return frozenset(exchange for exchange in exchanges if _exchange_digest(exchange) in digests)
+
+
+@dataclass(frozen=True)
+class ExchangeAllocation:
+    digest: str
+    destination: investigation.ListDestination
+
+
+def _read_exchange_allocation(journal: Path) -> ExchangeAllocation | NextNumber:
+    try:
+        value = journal.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if record_store.saved_path_exists(journal):
+            raise
+        return NextNumber.AVAILABLE
+    saved = re.fullmatch(r"([a-f0-9]{64}) ([^ /\n]+)/L([1-9][0-9]*)\n", value)
+    if saved is None:
+        raise ListError(f"{journal}: invalid exchange allocation")
+    digest, keeper, number_text = saved.groups()
+    destination = investigation.ListDestination(staff_id(keeper, "List keeper"), int(number_text))
+    return ExchangeAllocation(digest, destination)
+
+
+def _recover_exchange_allocation(store: record_store.NumberedRecords, journal: Path) -> ExchangeAllocation | NextNumber:
+    """Finish the number reservation from durable allocation metadata."""
+    allocation = _read_exchange_allocation(journal)
+    if isinstance(allocation, NextNumber):
+        return allocation
+    reservation = journal.parent / ".list-exchanges" / allocation.digest
+    destination = _allocated_destination(allocation, reservation)
+    sync_folder(journal.parent)
+    reserved_store = _store(destination.keeper)
+    if list_folder_identity(store.owner) != list_folder_identity(destination.keeper):
+        with reserved_store.locked():
+            _finish_exchange_allocation(reserved_store, destination, reservation, journal)
+    else:
+        _finish_exchange_allocation(reserved_store, destination, reservation, journal)
+    return allocation
+
+
+def _allocated_destination(allocation: ExchangeAllocation, reservation: Path) -> investigation.ListDestination:
+    previous = _exchange_reservation(reservation)
+    if isinstance(previous, ExchangeDestination):
+        if not previous.reserved_new_item or not same_destination(previous.destination, allocation.destination):
+            raise ListError(f"{reservation}: the exchange already has a different reservation")
+        return previous.destination
+    return allocation.destination
+
+
+def _finish_exchange_allocation(store: record_store.NumberedRecords, destination: investigation.ListDestination,
+                                reservation: Path, journal: Path) -> None:
+    store.finish_exchange_number(destination.number)
+    _save_exchange_reservation(reservation, destination, "new")
+    journal.unlink()
+    sync_folder(journal.parent)
+
+
+@contextmanager
+def _list_allocation(store: record_store.NumberedRecords) -> Generator[tuple[Path, ExchangeAllocation | NextNumber]]:
+    """Complete an interrupted exchange reservation before allocating another number."""
     with store.list_allocation():
-        number = reserved_review_number(reservation)
-        if isinstance(number, int) and store.path(f"L{number}").is_file():
-            sync_folder(store.folder())
-            return number
-        chosen = store.next_number() if isinstance(number, NextNumber) else number
-        item = _new_item(chosen, title, owner, keeper, source,
-                         {"producer": producer, "unit": unit, "latest_status": words, "evidence": evidence},
-                         reviews=(review_key,))
-        _require_active_open_producers((item,))
-        if isinstance(number, NextNumber):
-            store.reserve_number(chosen)
-            write_text_atomic(reservation, f"{chosen}\n", new_file_mode=0o600)
+        journal = record_store.state_root() / ".list-exchange-allocation"
+        yield journal, _recover_exchange_allocation(store, journal)
+
+
+def _reserve_exchange_number(store: record_store.NumberedRecords, reservation: Path) -> ExchangeDestination:
+    with _list_allocation(store) as (journal, _):
+        current = _exchange_reservation(reservation)
+        if isinstance(current, ExchangeDestination):
+            return current
+        destination = investigation.ListDestination(store.owner, store.next_number())
+        write_text_atomic(journal, f"{reservation.name} {destination.keeper}/L{destination.number}\n",
+                          new_file_mode=0o600)
+        _ = _recover_exchange_allocation(store, journal)
+        return ExchangeDestination(destination, True)
+
+
+_NO_UNRESOLVED_REPLIES: frozenset[str] = frozenset()
+
+
+def _exchange_list_destinations(key: str, rows: tuple[ScannedListRow, ...]) -> tuple[investigation.ListDestination, ...]:
+    return tuple(row.destination for row in rows if (
+        any(exchange.source_key == key for exchange in row.item.filed_exchanges)
+        or key in row.item.reviews
+        or isinstance(row.item.report, ListReport) and row.item.report.evidence_key == key
+        or isinstance(row.item.native_question, NativeQuestionItem) and row.item.native_question.source_key == key
+    ))
+
+
+def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.Exchange, ...], title: str, *,
+                   linked: investigation.ListDestination | NextNumber,
+                   owner: staff.StaffId, members: staff.StaffSnapshot,
+                   question_filing: QuestionFiling = QuestionFiling.LIVE,
+                   unresolved_reply_ids: frozenset[str] = _NO_UNRESOLVED_REPLIES,
+                   submission_question: NativeQuestionItem | NoQuestionItem = NoQuestionItem.ORDINARY) -> investigation.ListDestination:
+    """Save one source and publish its receipt after the List row is durable."""
+    key, reservation = source.key, source.reservation
+    if not exchanges or any(exchange.source_key != key for exchange in exchanges):
+        raise ListError("File one exchange source at a time.")
+    filed = tuple(list_exchange.FiledExchange.from_exchange(exchange) for exchange in exchanges)
+    rows = scan_list_records()
+    journal = reservation.parent.parent / ".list-exchange-allocation"
+    allocation = _read_exchange_allocation(journal)
+    if isinstance(allocation, ExchangeAllocation) and allocation.digest == reservation.name:
+        store = _store(allocation.destination.keeper)
+        with store.locked():
+            _ = _recover_exchange_allocation(store, journal)
+    reserved = _exchange_reservation(reservation)
+    known: list[investigation.ListDestination] = []
+    if isinstance(reserved, ExchangeDestination):
+        known.append(reserved.destination)
+    if isinstance(linked, investigation.ListDestination):
+        known.append(linked)
+    unpublished = (isinstance(reserved, ExchangeDestination) and reserved.reserved_new_item
+                   and not any(same_destination(row.destination, reserved.destination) for row in rows))
+    if isinstance(linked, NextNumber) or unpublished:
+        known.extend(_exchange_list_destinations(key, rows))
+    else:
+        known.extend(row.destination for row in rows if any(exchange.source_key == key for exchange in row.item.filed_exchanges))
+    destinations = unique_destinations(known)
+    if len(destinations) > 1:
+        raise ListError("The exchange source has two List destinations.")
+    if destinations and isinstance(reserved, NextNumber):
+        linked, = destinations
+    if isinstance(linked, investigation.ListDestination) and isinstance(reserved, NextNumber):
+        if record_store.saved_path_exists(journal):
+            keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+            if keeper is None:
+                raise ListError("The List keeper is unavailable.")
+            with _list_allocation(_store(keeper.id)):
+                reserved = _exchange_reservation(reservation)
+    if isinstance(linked, investigation.ListDestination):
+        if isinstance(reserved, ExchangeDestination):
+            if not same_destination(reserved.destination, linked):
+                raise ListError("The exchange source has two List destinations.")
+        else:
+            row = next((row for row in rows if same_destination(row.destination, linked)), None)
+            if row is None:
+                raise ListError("The linked List destination has no readable row.")
+            digests = {_exchange_digest(exchange) for exchange in row.item.filed_exchanges if exchange.source_key == key}
+            linked = next((saved for saved, digest in _exchange_receipts(key)
+                           if digest in digests and same_destination(saved, linked)), linked)
+            _save_exchange_reservation(reservation, linked, "linked")
+            reserved = ExchangeDestination(linked, False)
+    if isinstance(reserved, NextNumber):
+        if record_store.saved_path_exists(reservation.with_suffix(".saved")):
+            raise ListError("The exchange has a save receipt without a verified List destination.")
+        proposed = combine_exchange_history(_read_pending_exchanges(reservation), filed)
+        conflicts = list_exchange.conflicting_reply_ids(proposed, members) | unresolved_reply_ids
+        if all(exchange.exchange_id in conflicts for exchange in proposed):
+            raise ConflictingExchangeReplies("The exchanges claim the same reply.")
+        route = report_route(owner, members)
+        reserved = _reserve_exchange_number(_store(route.keeper), reservation)
+    destination = reserved.destination
+    store = _store(destination.keeper)
+    with store.locked():
+        identity = f"L{destination.number}"
+        new_row = reserved.reserved_new_item and not record_store.saved_path_exists(store.path(identity))
+        item = None if new_row else load(destination.keeper, identity)
+        if item is None:
+            history: tuple[list_exchange.FiledExchange, ...] = ()
+        else:
+            history = tuple(exchange for exchange in item.filed_exchanges if exchange.source_key == key)
+            if reserved.reserved_new_item and not history:
+                raise ListError(f"{identity} holds a different source.")
+        pending_path = reservation.with_suffix(".pending")
+        pending = _read_pending_exchanges(reservation)
+        candidate = combine_exchange_history(combine_exchange_history(history, pending), filed)
+        conflicts = list_exchange.conflicting_reply_ids(candidate, members) | unresolved_reply_ids
+        candidate = tuple(exchange for exchange in candidate if exchange.exchange_id not in conflicts)
+        if not candidate:
+            raise ConflictingExchangeReplies("The exchanges claim the same reply.")
+        if isinstance(submission_question, NativeQuestionItem):
+            if ((item is not None and item.native_question not in (NoQuestionItem.ORDINARY, submission_question))
+                    or submission_question not in native_question_origins(candidate)):
+                raise ListError(f"{identity}: the filed question does not match the submission source.")
+        disputed_pending = tuple(exchange for exchange in pending if exchange.exchange_id in conflicts)
+        staged = (*candidate, *disputed_pending)
+        safe_history = tuple(exchange for exchange in history if exchange.exchange_id not in conflicts)
+        if candidate != safe_history and staged != pending:
+            write_text_atomic(pending_path, list_exchange.encode(staged), new_file_mode=0o600)
+            pending = staged
+        if item is None:
+            item = _save_new_exchanges(store, destination.number, title, owner, report_route(owner, members),
+                                       candidate, question_filing)
+        else:
+            item = _save_linked_exchanges(store, item, candidate, question_filing, submission_question)
+        saved = tuple(exchange for exchange in item.filed_exchanges if exchange.source_key == key)
+        confirmed = confirmed_exchanges(key, destination, saved)
+        receipted = tuple(exchange for exchange in saved if exchange.exchange_id not in conflicts or exchange in confirmed)
+        if frozenset(receipted) != confirmed:
+            receipt = "".join(_exchange_receipt_line(destination, exchange) + "\n" for exchange in receipted)
+            write_text_atomic(reservation.with_suffix(".saved"), receipt, new_file_mode=0o600)
+        if disputed_pending:
+            if disputed_pending != pending:
+                write_text_atomic(pending_path, list_exchange.encode(disputed_pending), new_file_mode=0o600)
+        else:
+            pending_path.unlink(missing_ok=True)
+    return destination
+
+
+def _save_linked_exchanges(store: record_store.NumberedRecords, item: ListItem,
+                          exchanges: tuple[list_exchange.FiledExchange, ...], filing: QuestionFiling,
+                          submission_question: NativeQuestionItem | NoQuestionItem) -> ListItem:
+    changed = _with_filed_exchanges(item, exchanges, filing, submission_question)
+    if changed != item:
+        with record_store.keep_file_on_error(store.path(item.id)):
+            _save(store, changed)
+    else:
+        sync_folder(store.folder())
+    return changed
+
+
+def _save_new_exchanges(store: record_store.NumberedRecords, number: int, title: str, owner: staff.StaffId,
+                        route: ReportRoute, exchanges: tuple[list_exchange.FiledExchange, ...], filing: QuestionFiling) -> ListItem:
+    item = _new_item(number, title, owner, store.owner, PAGE_SOURCE, {"producer": route.producer, "unit": route.unit})
+    _require_active_open_producers((item,))
+    first = exchanges[0]
+    kind = native_question_kind(first)
+    origin = NativeQuestionItem(kind, first.source_key) if isinstance(kind, QuestionItemKind) else kind
+    item = _with_filed_exchanges(replace(item, unread_since=NoTimestamp.UNSET), exchanges, filing, origin)
+    with record_store.keep_file_on_error(store.path(item.id)):
         _save(store, item)
-        return chosen
+    return item
+
+
+@dataclass(frozen=True)
+class KeylessQuestionItem:
+    item: ListItem
+
+    @property
+    def candidate_origins(self) -> frozenset[NativeQuestionItem]:
+        return frozenset(origin for origin in native_question_origins(self.item.filed_exchanges)
+                         if origin.kind is self.item.keyless_question_kind)
+
+
+def _read_keyless_question(store: record_store.NumberedRecords, identity: str, fields: dict[str, str],
+                           body: str) -> KeylessQuestionItem:
+    exchanges = list_exchange.decode(fields.get("filed_exchanges", "[]"))
+    kind = QuestionItemKind(fields["question_kind"])
+    item = _decode_item(store, fields, body, exchanges, NoQuestionItem.ORDINARY)
+    return KeylessQuestionItem(_checked_item(identity, replace(item, keyless_question_kind=kind)))
+
+
+def convert_legacy_question_source(keeper: staff.StaffId, identity: str,
+                                   resolve: Callable[[KeylessQuestionItem], NativeQuestionItem | NoQuestionItem]) -> bool:
+    """Save the resolved source and read marks under the List lock."""
+    store = _store(keeper)
+    with store.locked():
+        fields, body = store.read(identity)
+        if "question_kind" not in fields or "question_source_key" in fields:
+            return True
+        row = _read_keyless_question(store, identity, fields, body)
+        origin = resolve(row)
+        if not isinstance(origin, NativeQuestionItem):
+            return False
+        fields["question_source_key"] = origin.source_key
+        if marks := _acknowledged_replies(row.item):
+            fields["legacy_read_replies"] = _write_legacy_reply_marks(marks)
+        _ = _read_item(store, identity, fields, body)
+        with record_store.keep_file_on_error(store.path(identity)):
+            store.write(identity, fields, body)
+        return True
+
+
+def migrate_question_item(keeper: staff.StaffId, identity: str, origin: NativeQuestionItem | NoQuestionItem) -> None:
+    store = _store(keeper)
+    with store.locked():
+        item = load(keeper, identity)
+        changed = project_question_migration(item, submission_question=origin)
+        if changed != item:
+            with record_store.keep_file_on_error(store.path(identity)):
+                _save(store, changed)
+
+
+def investigation_report_kind(record: investigation.Investigation) -> ReportKind | NoListReport:
+    match record.purpose:
+        case investigation.InvestigationPurpose.BUG_REPORT | investigation.InvestigationPurpose.MOVING_LEGACY_BUG:
+            return ReportKind.BUG
+        case investigation.InvestigationPurpose.ENHANCEMENT:
+            return ReportKind.ENHANCEMENT
+        case investigation.InvestigationPurpose.LIST_INVESTIGATION:
+            return ReportKind.INVESTIGATION
+        case investigation.InvestigationPurpose.INVESTIGATE:
+            return NoListReport.ABSENT
+
+
+def report_from_investigation(record: investigation.Investigation, kind: ReportKind, key: str) -> ListReport:
+    words = record.question.removeprefix("Enhancement: ") if kind is ReportKind.ENHANCEMENT else record.question
+    return ListReport(kind, key, words, record.submission_scope or NoReportScope.NATIVE_RECORD)
+
+
+def file_investigation_report(
+    record: investigation.Investigation, report_kind: ReportKind, members: staff.StaffSnapshot, *,
+    route: review_submissions.ListFilingRoute | review_submissions.NoListFiling,
+    reservation: Path | NextNumber, source: str,
+) -> investigation.ListDestination:
+    from scripts.review_links import review_items
+
+    if isinstance(route, dict):
+        keeper, owner, producer, unit = route['keeper'], route['owner'], route['producer'], route['unit']
+        source = route['source']
+    else:
+        owner = record.owner
+        pending = record.list_move
+        previous = pending.destination if isinstance(pending, investigation.PendingListMove) else investigation.NoListDestination.ABSENT
+        report_recipients = report_route(owner, members, destination=previous)
+        keeper, producer, unit = report_recipients.keeper, report_recipients.producer, report_recipients.unit
+    report = report_from_investigation(record, report_kind, review_items.investigation_record_key(record))
+    if isinstance(record.list_move, investigation.PendingListMove):
+        return file_report(keeper, report, record.title, owner=owner, producer=producer, unit=unit,
+                           source=source, reservation=record.list_move,
+                           before_write=partial(investigation.reserve_move_destination, record))
+    return file_report(keeper, report, record.title, owner=owner, producer=producer,
+                       unit=unit, source=source, reservation=reservation)
+
+
+def verify_investigation_move(record: investigation.Investigation, destination: investigation.ListDestination) -> None:
+    kind = ReportKind.BUG if record.kind is investigation.InvestigationKind.BUG else ReportKind.INVESTIGATION
+    verify_report_destination(destination, report_from_investigation(record, kind,
+                              f"investigation/{record.owner}/{record.id}"))
+
+
+@dataclass(frozen=True)
+class ReportRoute:
+    keeper: staff.StaffId
+    producer: staff.StaffId
+    unit: str
+
+
+def report_route(owner: staff.StaffId, members: staff.StaffSnapshot, *,
+                 destination: investigation.ListDestination | investigation.NoListDestination =
+                 investigation.NoListDestination.ABSENT) -> ReportRoute:
+    """Find the keeper, producer and unit for a report without a saved route."""
+    keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+    if isinstance(destination, investigation.ListDestination):
+        keeper_id = destination.keeper
+    elif keeper is not None:
+        keeper_id = keeper.id
+    else:
+        raise ListError("The List has no active producer.")
+    member = members.by_id(owner)
+    unit = member.name if member is not None and member.kind == "unit" else ""
+    mapped = producer_map.producer_for(owner, members)
+    producer = mapped.producer.id if isinstance(mapped, producer_map.MappedProducer) else keeper_id
+    return ReportRoute(keeper_id, producer, unit)
+
+
+@contextmanager
+def file_cli_investigation(owner: staff.StaffId, title: str, words: str, reason: str,
+                           members: staff.StaffSnapshot) -> Generator[str]:
+    """File the List report and retain its native ID until the CLI prints it."""
+    _ = report_route(owner, members)
+    with investigation.cli_filing(owner, title, words, reason) as (path, report):
+        finish_cli_investigation(path, members)
+        yield report.id
+
+
+def finish_cli_investigation(path: Path, members: staff.StaffSnapshot) -> None:
+    from scripts.review_links import review_submissions
+
+    _ = investigation.file_on_list(path, lambda current: file_investigation_report(
+        current, ReportKind.INVESTIGATION, members, route=review_submissions.NoListFiling(),
+        reservation=NextNumber.AVAILABLE, source="nate via investigation file"))
+
+
+def move_review_bugs(members: staff.StaffSnapshot) -> list[investigation.ListDestination]:
+    """Move every open Review Bug once and retain its native evidence."""
+    from scripts.review_links import review_submissions
+
+    moved: list[investigation.ListDestination] = []
+    owners = record_store.store_owners(record_store.RecordKind.INVESTIGATION, strict=True)
+    for owner in sorted(owners):
+        for path in investigation.review_record_paths(owner, strict=True):
+            fields = frozenset(('kind', 'state', 'list_destination', 'purpose', 'list_move'))
+            header = record_store.read_header(path, keys=fields, strict=True)
+            pending = header.get('list_move')
+            if header.get('kind') != [investigation.InvestigationKind.BUG]:
+                continue
+            if pending:
+                if pending != [investigation.ListFilingMode.MOVE_BUG.value]:
+                    continue
+            elif (header.get('state') == [investigation.InvestigationState.READ] or header.get('list_destination')
+                  or header.get('purpose', []) not in ([], [investigation.InvestigationPurpose.MOVING_LEGACY_BUG])):
+                continue
+
+            def file_moved(current: investigation.Investigation) -> investigation.ListDestination:
+                destination = file_investigation_report(
+                    current, ReportKind.BUG, members, route=review_submissions.NoListFiling(),
+                    reservation=NextNumber.AVAILABLE, source="moved from Review")
+                moved.append(destination)
+                return destination
+
+            _ = investigation.file_on_list(path, file_moved, mode=investigation.ListFilingMode.MOVE_BUG, resume_move=True)
+    return moved
+
+
+def move_review_waits(root: Path, members: staff.StaffSnapshot) -> list[investigation.ListDestination]:
+    """File open Review waits and leave a destination in each source log."""
+    from scripts.review_links import review_items
+
+    move_wait = cast(Callable[[Path, review_items.ReviewItem, staff.StaffSnapshot, bool],
+                             investigation.ListDestination | investigation.NoListDestination],
+                     import_module('scripts.review_links.review_actions').move_wait_to_list)
+    moved: list[investigation.ListDestination] = []
+    for item in review_items.read(root, members=members):
+        if (review_items.can_move_wait(item)
+                or review_items.pending_list_move(item) is investigation.ListFilingMode.MOVE_WAIT):
+            destination = move_wait(root, item, members, True)
+            if isinstance(destination, investigation.ListDestination):
+                moved.append(destination)
+    return moved
+
+
+class NewReportItem(Enum):
+    ALLOCATE = "allocate a report without selecting a linked item"
+
+
+def _report_destination(rows: tuple[ScannedListRow, ...], evidence_key: str,
+                        scope: str | NoReportScope = NoReportScope.NATIVE_RECORD
+                        ) -> ScannedListRow | investigation.NoListDestination:
+    reports = [row for row in rows if isinstance(report := row.item.report, ListReport)
+               and (report.evidence_key == evidence_key or scope and report.submission_scope == scope)]
+    linked = [row for row in rows if row.item.report is NoListReport.ABSENT and row.item.state != ItemState.CLOSED
+              and evidence_key in row.item.reviews]
+    candidates = reports or linked
+    if len(candidates) > 1:
+        raise ListError("The report has two List destinations.")
+    return candidates[0] if candidates else investigation.NoListDestination.ABSENT
+
+
+def verify_report_destination(destination: investigation.ListDestination, report: ListReport) -> None:
+    with record_store.list_destination_lock():
+        row = _report_destination(scan_list_records(), report.evidence_key, report.submission_scope)
+        if (not isinstance(row, ScannedListRow) or not same_destination(row.destination, destination)
+                or not isinstance(row.item.report, ListReport) or row.item.report.kind is not report.kind):
+            raise ListError(f"Cannot confirm the report source for L{destination.number}.")
+
+
+def has_legacy_bug_report(evidence_key: str, scope: str) -> bool:
+    """Check whether the List write of a legacy Bug move already succeeded."""
+    return any(isinstance(report := entry.item.report, ListReport) and report.kind is ReportKind.BUG
+               and (report.evidence_key == evidence_key or scope and report.submission_scope == scope)
+               for entry in display_list_records(include_closed=True))
+
+
+def moved_report_candidate(keeper: staff.StaffId, evidence_key: str) -> investigation.ListDestination:
+    """Select a marker number without reserving it before the source check."""
+    store = _store(keeper)
+    with record_store.list_destination_lock():
+        existing = _report_destination(scan_list_records(), evidence_key)
+        if isinstance(existing, ScannedListRow):
+            return existing.destination
+        with store.locked(check=store.require_list_keeper):
+            number = store.next_number()
+        return investigation.ListDestination(keeper, number)
+
+
+def file_report(keeper: staff.StaffId, report: ListReport, title: str, *, owner: ItemOwner,
+                producer: staff.StaffId, unit: str, source: str,
+                reservation: Path | NextNumber | investigation.ListDestination |
+                             investigation.PendingListMove | NewReportItem = NextNumber.AVAILABLE,
+                state: ItemState = ItemState.NEW,
+                retry: ReportRetry = ReportRetry.KEEP,
+                before_write: Callable[[investigation.ListDestination], None] | None = None) -> investigation.ListDestination:
+    """File a report once, or add its evidence to an existing linked List item."""
+    with record_store.list_destination_lock(), ExitStack() as locks:
+        rows = scan_list_records()
+        existing = _report_destination(rows, report.evidence_key, report.submission_scope)
+        if isinstance(reservation, Path):
+            links = tuple(row.destination for row in rows if report.evidence_key in row.item.reviews)
+            verified = ((existing.destination,) if isinstance(existing, ScannedListRow)
+                        and isinstance(existing.item.report, ListReport) and existing.item.report.kind is report.kind
+                        else ())
+            reserved = review_reservation(reservation, source_destinations=verified, current_links=links)
+            if isinstance(reserved, NextNumber) and not verified and isinstance(existing, ScannedListRow) and (
+                    list_folder_identity(existing.keeper) != list_folder_identity(keeper)):
+                raise ListError("The report link conflicts with the saved List route.")
+        elif isinstance(reservation, investigation.PendingListMove):
+            reserved = (reservation.destination if isinstance(reservation.destination, investigation.ListDestination)
+                        else NextNumber.AVAILABLE)
+        else:
+            reserved = NextNumber.AVAILABLE if isinstance(reservation, NewReportItem) else reservation
+        if isinstance(reserved, investigation.ListDestination):
+            if isinstance(existing, ScannedListRow) and not same_destination(existing.destination, reserved):
+                raise ListError("The selected List destination conflicts with the saved report.")
+            keeper = reserved.keeper
+            identity = f"L{reserved.number}"
+            may_create = isinstance(reservation, (Path, investigation.PendingListMove))
+            candidates = ((load(keeper, identity),) if not may_create
+                          or record_store.saved_path_exists(_store(keeper).path(identity)) else ())
+        elif isinstance(existing, ScannedListRow):
+            if not isinstance(reservation, Path) or isinstance(existing.item.report, ListReport):
+                keeper = existing.keeper
+            candidates = (existing.item,)
+        else:
+            candidates = ()
+        store = _store(keeper)
+        if isinstance(reserved, NextNumber) and not candidates:
+            _ = locks.enter_context(_list_allocation(store))
+        else:
+            _ = locks.enter_context(store.locked())
+            candidates = tuple(load(keeper, candidate.id) for candidate in candidates)
+        linked = next((item for item in candidates if isinstance(item.report, NoListReport)
+                       and item.state != ItemState.CLOSED and report.evidence_key in item.reviews), None)
+        for item in candidates:
+            if isinstance(item.report, ListReport) and (
+                    item.report.evidence_key == report.evidence_key
+                    or report.submission_scope and item.report.submission_scope == report.submission_scope):
+                destination = investigation.ListDestination(keeper, item.number)
+                if isinstance(reservation, Path):
+                    destination = _save_review_reservation(reservation, destination)
+                if before_write is not None:
+                    before_write(destination)
+                if (retry is ReportRetry.UPDATE and item.report.kind is report.kind
+                        and item.report.evidence_key == report.evidence_key):
+                    updated_report = replace(item.report, words=report.words, validation_log=report.validation_log)
+                    if updated_report != item.report:
+                        _save(store, replace(item, report=updated_report, updated=now()))
+                sync_folder(store.folder())
+                return destination
+        if linked is not None:
+            reviews = (linked.reviews if not report.evidence_key.startswith('investigation/')
+                       else tuple(key for key in linked.reviews if key != report.evidence_key))
+            changes: ItemChanges = {}
+            if report.kind is ReportKind.VALIDATION and linked.owner != owner:
+                changes['owner'] = owner
+            if linked.state not in (ItemState.NEW, ItemState.WORKING):
+                changes['state'] = ItemState.WORKING
+            item = replace(linked, report=report, reviews=reviews, **changes)
+            if changes:
+                moment = now()
+                change = ItemChange(moment, FieldChange('Updated', {**changes}), source)
+                item = replace(item, updated=moment, log=(*linked.log, change))
+        elif isinstance(reserved, investigation.ListDestination) and candidates:
+            raise ListError(f"L{reserved.number}: the report reservation names a different item")
+        else:
+            chosen = store.next_number() if isinstance(reserved, NextNumber) else reserved.number
+            reviews = () if report.evidence_key.startswith('investigation/') else (report.evidence_key,)
+            item = replace(_new_item(chosen, title, owner, keeper, source,
+                                     {"producer": producer, "unit": unit, "state": state}, reviews=reviews),
+                           report=report)
+            _require_active_open_producers((item,))
+            if isinstance(reserved, NextNumber):
+                store.reserve_number(chosen)
+        destination = investigation.ListDestination(keeper, item.number)
+        if isinstance(reservation, Path):
+            destination = _save_review_reservation(reservation, destination)
+        if before_write is not None:
+            before_write(destination)
+        _save(store, item)
+        return destination
 
 
 def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, datetime], ListItem],
@@ -2203,6 +3669,7 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             unread: bool | Callable[[ListItem], bool] = True,
             page_action: PageItemNotice | PageRequest | NoPageRequest = NoPageRequest.ABSENT,
             assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
+            question_move: QuestionMove = QuestionMove.OTHER,
             follow: Callable[[ListItem, ListItem, datetime], tuple[ItemChange, ...]] | None = None) -> ListEdit:
     """Save one edit and its log entry under the write lock.
 
@@ -2229,11 +3696,13 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             return UnchangedEdit(item)
         moment = now()
         changed = edit(item, moment)
+        _require_question_move(item, question_move, changed.state)
         if changed.state is not item.state:
             changed = _settle_run_confirmations(changed, moment)
         entries: list[ItemChange] = []
         schedule_changed = _schedule_fields(item.schedule) != _schedule_fields(changed.schedule)
-        if changed != item or schedule_changed:
+        reads_question = question_move is QuestionMove.READ and isinstance(item.native_question, NativeQuestionItem)
+        if changed != item or schedule_changed or reads_question:
             event = what(changed) if callable(what) else what
             if isinstance(event, FieldChange) and schedule_changed:
                 log_fields: LogFields = {**event.fields, "schedule": changed.schedule}
@@ -2246,18 +3715,33 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             if follow is not None:
                 entries.extend(follow(item, changed, moment))
             stays_unread = unread(changed) if callable(unread) else unread
-            changed = replace(changed, updated=moment, unread_since=moment if stays_unread else NoTimestamp.UNSET)
+            keep_reply_update = (not reads_question and isinstance(item.native_question, NativeQuestionItem)
+                                 and bool(unread_answer_ids(item)))
+            unread_since = moment if stays_unread else item.unread_since if keep_reply_update else NoTimestamp.UNSET
+            changed = replace(changed, updated=moment, unread_since=unread_since)
             if (isinstance(event, FieldChange) and event.action == "Updated"
                     and event.fields.get("state") == ItemState.DELIVERED
                     and changed.parked_until is ParkUntilDelivered.DELIVERED):
                 changed = replace(changed, parked_until=NoTimestamp.UNSET)
                 entries.append(ItemChange(moment, UnparkedForDelivery(ItemDelivered.RECORDED), source))
         if isinstance(request, PageRequest):
-            if entries and isinstance(page_action, PageItemNotice):
+            if isinstance(page_action, PageItemNotice) and (
+                    entries or page_action.action == "park" and page_action.origin is PageNoticeOrigin.STUDIO):
                 pending = PageFeedback(page_action.request, page_action.words, action=page_action.action,
                                        form_words=request.form_words, parked_until=request.parked_until,
-                                       recipient=page_action.recipient)
+                                       recipient=page_action.recipient, origin=page_action.origin)
+                if page_action.action == ReportVerdict.NOT_FIXED:
+                    assert not isinstance(item.owner, UnassignedOwner)
+                    pending = replace(pending, recipient=item.producer, additional_recipient=item.owner)
                 entries.append(ItemChange(moment, pending, PAGE_SOURCE))
+            elif request.action == "read" and item.question_kind is not NoQuestionItem.ORDINARY:
+                if request.words and not isinstance(item.owner, UnassignedOwner):
+                    notice = PageFeedback(request.request, request.words, action="read", form_words=request.words,
+                                          recipient=item.owner,
+                                          origin=PageNoticeOrigin.STUDIO)
+                    entries.append(ItemChange(moment, notice, PAGE_SOURCE))
+                else:
+                    entries.insert(0, ItemChange(moment, request, PAGE_SOURCE))
             elif request.action == "read" and changed.state != item.state:
                 notice = _next_step_notice(keeper, request.request, "nate read", changed, form_words=request.words)
                 entries.append(ItemChange(moment, notice, PAGE_SOURCE))
@@ -2283,6 +3767,42 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
 def _open(item: ListItem) -> None:
     if item.state == ItemState.CLOSED:
         raise ListError(f"{item.id}: reopen the Closed item before changing it")
+
+
+class RepairCheckRefused(ListError):
+    """The List rejected this request before saving its verdict."""
+
+    def __init__(self, request: str, reason: str) -> None:
+        super().__init__(reason)
+        self.request: str = request
+
+
+# Use the same edge whitespace in Python and the List form.
+REPORT_WORD_WHITESPACE = ("\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+                          "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000")
+
+
+def check_report(keeper: staff.StaffId, identity: str, verdict: ReportVerdict, words: str, *,
+                 request: str, revision: RepairRevision | NoRepairRevision) -> ListItem:
+    """Save nate's verdict and the pending Not fixed message in one List write."""
+    if verdict is ReportVerdict.NOT_FIXED:
+        words = words.strip(REPORT_WORD_WHITESPACE)
+        if not words or len(words) > 10000:
+            raise RepairCheckRefused(request, "Enter your words for the owner and the producer.")
+    state = ItemState.DELIVERED if verdict is ReportVerdict.WORKS else ItemState.WORKING
+
+    def check(item: ListItem, _: datetime) -> ListItem:
+        if not isinstance(revision, RepairRevision) or revision != item.repair_revision:
+            raise RepairCheckRefused(request, "The repair changed. Open the item and check it again.")
+        if verdict is ReportVerdict.NOT_FIXED and isinstance(item.owner, UnassignedOwner):
+            raise RepairCheckRefused(request, "Assign an owner before sending Not fixed.")
+        return replace(item, state=state, next_step="")
+
+    action = (PageItemNotice(request, words, ReportVerdict.NOT_FIXED, origin=PageNoticeOrigin.STUDIO)
+              if verdict is ReportVerdict.NOT_FIXED else PageRequest(request, ReportVerdict.WORKS, ""))
+    result = _change(keeper, identity, check, FieldChange("Updated", {"state": state, "next_step": ""}), PAGE_SOURCE,
+                     unread=False, page_action=action)
+    return result.item
 
 
 def make_top_priority(keeper: staff.StaffId, identity: str, *,
@@ -3079,6 +4599,14 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
             _require_schedule_selection(item.schedule, schedule_scope)
         if changed.state is ItemState.SCHEDULED:
             changed = replace(changed, parked_until=NoTimestamp.UNSET)
+        if isinstance(item.report, ListReport) and changed.state != item.state:
+            transitions = {ItemState.NEW: ItemState.WORKING, ItemState.WORKING: ItemState.REPAIRED}
+            if changed.state != transitions.get(item.state):
+                raise ListError("Use Works or Not fixed on the List to check a Repaired item.")
+            if changed.state == ItemState.REPAIRED:
+                if "next_step" not in changes:
+                    raise ListError("Set --next-step to one line on how to try the repair.")
+                changed = replace(changed, parked_until=NoTimestamp.UNSET)
         if add_evidence:
             changed = replace(changed, evidence=_append_evidence(changed.evidence, add_evidence))
         _validate(changed)
@@ -3131,7 +4659,8 @@ def link(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         return replace(item, reviews=tuple(dict.fromkeys((*item.reviews, *chosen))))
-    return _change(keeper, identity, edit, ReviewLinksChanged("Linked reviews", chosen), source).item
+    with record_store.list_destination_lock():
+        return _change(keeper, identity, edit, ReviewLinksChanged("Linked reviews", chosen), source).item
 
 
 def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source: str) -> ListItem:
@@ -3141,11 +4670,13 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         return replace(item, reviews=tuple(review for review in item.reviews if review not in chosen))
-    return _change(keeper, identity, edit, ReviewLinksChanged("Unlinked reviews", chosen), source).item
+    with record_store.list_destination_lock():
+        return _change(keeper, identity, edit, ReviewLinksChanged("Unlinked reviews", chosen), source).item
 
 
 def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
+         note: str = "",
          check_deadline: Callable[[datetime], None] | None = None,
          assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
          schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED,
@@ -3177,7 +4708,11 @@ def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
     def parking_event(changed: ListItem) -> FieldChange:
         return FieldChange("Updated", {}) if isinstance(changed.schedule, ScheduledSeries) else event
 
-    return _change(keeper, identity, edit, parking_event, source, page_action=notice, assigned_to=assigned_to).item
+    def follow(_before: ListItem, _after: ListItem, moment: datetime) -> tuple[ItemChange, ...]:
+        return (ItemChange(moment, note, source),)
+
+    return _change(keeper, identity, edit, parking_event, source, page_action=notice, assigned_to=assigned_to,
+                   follow=follow if note else None).item
 
 
 def unread_delivery(item: ListItem) -> bool:
@@ -3204,13 +4739,33 @@ def unpark(keeper: staff.StaffId, identity: str, *, source: str,
     return _change(keeper, identity, edit, Unparked(), source, page_action=notice, assigned_to=assigned_to)
 
 
+@dataclass(frozen=True)
+class ListCloseCaller:
+    member: staff.StaffRow
+    all_items: bool
+
+
 def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
-          assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
+          assigned_to: staff.StaffId | AllItems | ListCloseCaller = AllItems.INCLUDED,
           schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED,
           expected_schedule: ScheduleExpectation | UseCurrentSchedule = UseCurrentSchedule.AT_WRITE) -> ListItem:
     _validate_closing_words(words)
     def edit(item: ListItem, moment: datetime) -> ListItem:
+        if isinstance(item.question_kind, QuestionItemKind):
+            if isinstance(notice, PageItemNotice) and notice.action == "remove":
+                raise ListError("You cannot remove a question.")
+            native = question_item_exchanges(item)
+            if (item.question_kind is not QuestionItemKind.TO_NATE or not isinstance(assigned_to, ListCloseCaller)
+                    or not native or _native_prompt(native).asker != assigned_to.member.id):
+                raise ListError(_QUESTION_CLOSE_REFUSAL)
+            _require_question_move(item, QuestionMove.ASKER_CLOSE, ItemState.CLOSED)
+        elif isinstance(assigned_to, ListCloseCaller) and not assigned_to.all_items:
+            caller = assigned_to.member
+            if caller.kind != "producer" or item.producer != caller.id:
+                if caller.kind != "producer":
+                    raise ListError("the current session must be a producer")
+                raise ListError(f"{identity} is assigned to another producer. A producer can change only its own items.")
         schedule = _remove_schedule(item.schedule, schedule_scope, expected_schedule, words=words)
         if isinstance(schedule, ScheduledSeries):
             return replace(item, schedule=schedule)
@@ -3230,8 +4785,9 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
             return FieldChange("Updated", {})
         return FieldChange("Closed", {"closing_words": words})
 
+    producer_access = AllItems.INCLUDED if isinstance(assigned_to, ListCloseCaller) else assigned_to
     return _change(keeper, identity, edit, close_event, source,
-                   unread=False, page_action=notice, assigned_to=assigned_to).item
+                   unread=False, page_action=notice, assigned_to=producer_access, question_move=QuestionMove.ASKER_CLOSE).item
 
 
 def reopen(keeper: staff.StaffId, identity: str, *, source: str,
@@ -3268,11 +4824,12 @@ def _is_tell_move(log: tuple[ItemChange, ...], index: int) -> bool:
 
 def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
     """Keep an update identity stable when page feedback adds log entries."""
-    if not isinstance(item.unread_since, datetime):
+    since = item.unread_at
+    if not isinstance(since, datetime):
         return NoUnreadUpdate.ABSENT
     changes = [(index, entry.time.isoformat(), _unread_log_content(entry.what), entry.source) for index, entry in enumerate(item.log)
                if not (_own_page_entry(entry) or _is_tell_move(item.log, index))]
-    text = json.dumps((item.unread_since.isoformat(), changes), ensure_ascii=False)
+    text = json.dumps((since.isoformat(), changes), ensure_ascii=False)
     return UnreadUpdate(hashlib.sha256(text.encode()).hexdigest())
 
 
@@ -3304,14 +4861,30 @@ def _unread_changes(item: ListItem, *, include_park_receipts: bool = False) -> G
             return
 
 
-def unread_answer_ids(item: ListItem) -> frozenset[str]:
-    """Find unread answers after accounting for parking actions."""
-    read_times: list[datetime] = []
-    answers: set[str] = set()
-    for change in _unread_changes(item, include_park_receipts=True):
+def _unread_question_replies(item: ListItem) -> Iterator[ItemChange]:
+    for change in reversed(item.log):
+        if change.source == _IMAGE_ANSWER_SOURCE:
+            continue
+        if isinstance(change.what, MarkedRead) or change.what == "Marked read":
+            return
         content = change.what
-        if isinstance(content, QuestionAnswered) and question_path.answer_is_unread(change.time, read_times):
-            answers.add(content.question_id)
+        if isinstance(content, (QuestionAnswered, ReturnedAnswer)):
+            identity = content.question_id if isinstance(content, QuestionAnswered) else content.identity
+            if identity not in item.legacy_read_replies:
+                yield change
+
+
+def unread_answer_ids(item: ListItem) -> frozenset[UnreadAnswerId]:
+    """Find replies that still need acknowledgment."""
+    question = isinstance(item.native_question, NativeQuestionItem)
+    read_times: list[datetime] = []
+    answers: set[UnreadAnswerId] = set()
+    changes = _unread_question_replies(item) if question else _unread_changes(item, include_park_receipts=True)
+    for change in changes:
+        content = change.what
+        if isinstance(content, (QuestionAnswered, ReturnedAnswer)):
+            if question_path.answer_is_unread(change.time, read_times):
+                answers.add(content.question_id if isinstance(content, QuestionAnswered) else content.identity)
         elif (isinstance(content, FieldChange) and content.action == "Parked"
               and content.fields.get("parked_until", NoTimestamp.UNSET) is not NoTimestamp.UNSET
               or isinstance(content, PageRequest) and content.action == "park"):
@@ -3321,6 +4894,12 @@ def unread_answer_ids(item: ListItem) -> frozenset[str]:
 
 def _clear_unread(item: ListItem) -> ListItem:
     return replace(item, unread_since=NoTimestamp.UNSET)
+
+
+def question_can_mark_read(item: ListItem, unread_answers: frozenset[UnreadAnswerId]) -> bool:
+    """Allow acknowledgment of a reply in every question state."""
+    return (item.question_kind is not NoQuestionItem.ORDINARY
+            and (item.state is ItemState.ANSWERED or bool(unread_answers)))
 
 
 def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
@@ -3338,13 +4917,26 @@ def mark_read_edit(keeper: staff.StaffId, identity: str, *, source: str,
     The same write saves a notice that asks the item's producer for the next step.
     """
     def edit(item: ListItem, moment: datetime) -> ListItem:
+        if question_item(item) is not NoQuestionItem.ORDINARY:
+            if not question_can_mark_read(item, unread_answer_ids(item)) or (
+                    update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update):
+                raise ListError("The question changed. Check it again before marking it read.")
+            if isinstance(page_request, PageRequest) and page_request.words:
+                if isinstance(item.owner, UnassignedOwner):
+                    raise ListError("The question has no owner for your words.")
+                console_text.require(page_request.words, "list field", refusal=ListError)
+            if item.state is not ItemState.ANSWERED:
+                return _clear_unread(item)
+            state = ItemState.WORKING if item.question_kind is QuestionItemKind.TO_NATE else ItemState.CLOSED
+            return _move_question(item, QuestionMove.READ, state, moment, source, closing_words="Read by nate")
         if update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update:
             return item
         read = _clear_unread(item)
         if not isinstance(page_request, PageRequest) or not _waits_for_nate(item, moment):
             return read
         return _start_working(read, moment, source)
-    return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request)
+    return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request,
+                   question_move=QuestionMove.READ)
 
 
 def add_ask(keeper: staff.StaffId, identity: str, *, kind: AskKind, target: staff.StaffId, what: str, why: str,
@@ -3405,6 +4997,8 @@ def give_go(keeper: staff.StaffId, identity: str, ask_id: str, go_id: str, *, so
 
     def stays_unread(changed: ListItem) -> bool:
         # Another open ask or an unread change other than an ask or a Go keeps the item unread.
+        if isinstance(changed.native_question, NativeQuestionItem) and unread_answer_ids(changed):
+            return True
         return bool(answerable_asks(changed, staff.snapshot())) or any(
             not isinstance(change.what, (AskOpened, GoGiven)) for change in _unread_changes(changed))
 
@@ -3452,6 +5046,14 @@ def has_open_question(item: ListItem) -> bool:
     return any(question.answer is None for question in item.questions)
 
 
+def has_open_followup(item: ListItem) -> bool:
+    if item.state is not ItemState.WORKING or item.question_kind is NoQuestionItem.ORDINARY:
+        return False
+    pending = {question.question_id for question in item.questions if question.answer is None}
+    return bool(pending) and any(isinstance(entry.what, QuestionRequestReceipt)
+                                 and entry.what.followup and entry.what.question_id in pending for entry in item.log)
+
+
 def answerable_asks(item: ListItem, members: staff.StaffSnapshot) -> tuple[Ask, ...]:
     """Find the open asks that nate can answer: the item is open and the ask's target has a staff row.
 
@@ -3491,8 +5093,9 @@ def _next_step_notice(keeper: staff.StaffId, request: str, done: str, item: List
     members = staff.snapshot()
     producer = members.by_id(item.producer)
     name = shlex.quote(producer.name if producer is not None else item.producer)
-    keeper_option = "" if keeper in record_store.morty_ids(members) else f" --keeper {shlex.quote(keeper)}"
-    words = (f"List page: {done} item {item.number}, so it is now Working. Write its next step: "
+    default_keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+    keeper_option = "" if default_keeper is not None and keeper == default_keeper.id else f" --keeper {shlex.quote(keeper)}"
+    words = (f"Studio: {done} item {item.number}, so it is now Working. Write its next step: "
              + f"`{_LAUNCHER} update --id {item.id}{keeper_option} --source {name} --next-step \"<step>\"`.")
     return PageFeedback(request, words, action="read", form_words=form_words, recipient=item.producer)
 
@@ -3526,11 +5129,17 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
     if "unpark_no_change" in fields and (not receipt or action != "unpark"):
         raise ListError("invalid Unpark receipt")
     if receipt:
-        if action not in ("read", "remove", "park", "unpark", "question") or (action != "read" and not words.strip()):
+        if action not in ("read", "remove", "park", "unpark", "question", "works"):
             raise ListError("invalid List request receipt")
-        received = PageRequest(request, action, words, form_words, parked_until)
+        if action not in ("read", ReportVerdict.WORKS) and not words.strip():
+            raise ListError("invalid List request receipt")
+        received = PageRequest(request, ReportVerdict.WORKS if action == "works" else action,
+                               words, form_words, parked_until)
         if action == "question":
-            return QuestionRequestReceipt(received, _question_id(fields.get("question_id")))
+            followup = fields.get("followup", False)
+            if not isinstance(followup, bool):
+                raise ListError("invalid List question receipt")
+            return QuestionRequestReceipt(received, _question_id(fields.get("question_id")), followup)
         if "unpark_no_change" in fields:
             reason = fields["unpark_no_change"]
             if reason not in (UnparkNoChangeReason.EXPIRED, UnparkNoChangeReason.NO_ACTIVE_PARKING):
@@ -3540,12 +5149,18 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
     state, alerted_to, target = fields.get("state"), fields.get("alerted_to", ""), fields.get("read_update", "")
     if state not in ("pending", "sent", "alerted") or not isinstance(alerted_to, str) or not isinstance(target, str):
         raise ListError("invalid List feedback log")
-    if action not in ("tell", "remove", "park", "unpark", "read") or not words.strip():
+    if action not in ("tell", "remove", "park", "unpark", "read", "not works") or not words.strip():
         raise ListError("invalid List feedback action")
     recipient = _field_text(fields.get("recipient", ""), "feedback recipient")
+    additional = _field_text(fields.get("additional_recipient", ""), "additional feedback recipient")
+    origin = PageNoticeOrigin(_field_text(fields.get("origin", PageNoticeOrigin.LIST_PAGE), "feedback origin"))
     return PageFeedback(request, words, state, alerted_to,
-                        UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT, action, form_words, parked_until,
-                        recipient=staff_id(recipient, "feedback recipient") if recipient else LegacyFeedbackRecipient.KEEPER)
+                        UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT,
+                        ReportVerdict.NOT_FIXED if action == "not works" else action,
+                        form_words, parked_until,
+                        recipient=staff_id(recipient, "feedback recipient") if recipient else LegacyFeedbackRecipient.KEEPER,
+                        additional_recipient=(staff_id(additional, "additional feedback recipient")
+                                              if additional else NoAdditionalRecipient.ABSENT), origin=origin)
 
 
 def _page_requests(item: ListItem) -> dict[str, PageActivity]:
@@ -3568,6 +5183,14 @@ def has_park_receipt(item: ListItem, request: str) -> bool:
     """Check whether this exact Park request saved."""
     saved = _page_requests(item).get(_request_id(request))
     return isinstance(saved, (PageRequest, PageFeedback)) and saved.action == "park"
+
+
+def remove_receipt(item: ListItem, request: str) -> PageRequest | PageFeedback | NoPageRequest:
+    """Find the receipt even if Remove saved without a notice."""
+    saved = _page_requests(item).get(_request_id(request))
+    if isinstance(saved, (PageRequest, PageFeedback)) and saved.action == "remove":
+        return saved
+    return NoPageRequest.ABSENT
 
 
 def unpark_no_change_reason(item: ListItem, request: str) -> UnparkNoChangeReason:
@@ -3605,6 +5228,9 @@ def _previous_page_request(
                 raise ListError("this request already has a different parking time")
             if key.form_words != request.form_words:
                 raise ListError("this request already has a different action or words")
+        elif key.action == request.action == "unpark":
+            if key.form_words != request.form_words:
+                raise ListError("this request already has a different action or words")
         elif key != request:
             raise ListError("this request already has a different action or words")
     return previous
@@ -3637,11 +5263,38 @@ class _QuestionAnswerer:
     morty: staff.StaffId | _NoActiveMorty
 
 
+class ListQuestionRoute(Enum):
+    CURRENT = "use the current route for an older form"
+
+
+ListQuestionSignature = NewType("ListQuestionSignature", str)
+
+
+@dataclass(frozen=True)
+class ListQuestionReceiver:
+    recipient: staff.StaffId | question_record.KeeperForUnavailableProducer
+    name: str
+    followup: bool = False
+
+    @property
+    def identity(self) -> staff.StaffId:
+        return self.recipient.keeper if isinstance(self.recipient, question_record.KeeperForUnavailableProducer) else self.recipient
+
+    @property
+    def signature(self) -> ListQuestionSignature:
+        fallback = self.recipient.producer if isinstance(self.recipient, question_record.KeeperForUnavailableProducer) else ""
+        route = (self.identity, self.name, fallback)
+        signed = (*route, "followup") if self.followup else route
+        return ListQuestionSignature(hashlib.sha256(json.dumps(signed).encode()).hexdigest())
+
+
 @dataclass(frozen=True)
 class _ListQuestionStore:
     keeper: staff.StaffId
     ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
     answerer: _QuestionAnswerer | NoQuestionAnswerer = NoQuestionAnswerer.ABSENT
+    ask_recipient: staff.StaffId | ListQuestionRoute = ListQuestionRoute.CURRENT
+    followup: bool = False
 
     def questions(self, item: str) -> tuple[question_record.Question, ...]:
         current = load(self.keeper, item)
@@ -3650,7 +5303,14 @@ class _ListQuestionStore:
             archived = tuple(replace(entry.what.question, answer=question_record.Answer(
                 "Closed with the item.", entry.time.isoformat()))
                 for entry in current.log if isinstance(entry.what, QuestionClosed))
-            return (*current.questions, *archived)
+            # Reserve the IDs of questions sent to a different recipient.
+            questions = tuple(replace(question, answer=question_record.Answer(
+                "Sent to a different recipient.", question.asked_at))
+                if question.answer is None and question.words == self.ask_request.words
+                and self.ask_recipient is not ListQuestionRoute.CURRENT
+                and question.recipient_id(self.keeper) != self.ask_recipient else question
+                for question in current.questions)
+            return (*questions, *archived)
         return current.questions
 
     def add(self, item: str, question: question_record.Question) -> None:
@@ -3660,7 +5320,10 @@ class _ListQuestionStore:
         self.save_request(replace(current, questions=(*current.questions, question)), self.ask_request, question)
 
     def save_request(self, item: ListItem, request: PageRequest, question: question_record.Question) -> None:
-        receipt = ItemChange(now(), QuestionRequestReceipt(request, question.question_id), PAGE_SOURCE)
+        moment = now()
+        if self.followup and item.state is ItemState.ANSWERED:
+            item = _move_question(item, QuestionMove.FOLLOW_UP, ItemState.WORKING, moment)
+        receipt = ItemChange(moment, QuestionRequestReceipt(request, question.question_id, self.followup), PAGE_SOURCE)
         _ = _save_page_request(_store(self.keeper), self.keeper, replace(item, log=(*item.log, receipt)), request)
 
     def require_answerer(self, current: ListItem, question_id: str) -> _QuestionAnswerer:
@@ -3686,74 +5349,139 @@ class _ListQuestionStore:
             moment = now()
             entry = ItemChange(moment, QuestionAnswered(question_id), answerer.member.name)
             changed = replace(current, questions=questions, updated=moment, unread_since=moment, log=(*current.log, entry))
+            if isinstance(current.question_kind, QuestionItemKind):
+                changed = _move_question(changed, QuestionMove.REPLY, ItemState.ANSWERED, moment, answerer.member.name)
             try:
                 _save(store, changed)
             except AtomicDurabilityUnconfirmed:
                 if load(self.keeper, item) != changed:
                     raise
+        file_exchange = cast(Callable[[staff.StaffId, ListItem], None],
+                             import_module("scripts.review_links.answer_sources").file_saved_list)
+        file_exchange(self.keeper, changed)
 
 
-def _new_question_recipient(keeper: staff.StaffId, producer: staff.StaffId
-                            ) -> staff.StaffId | question_record.KeeperForUnavailableProducer:
-    if producer == keeper:
-        return keeper
-    member = next((row for row in staff.active(staff.snapshot(), "producer") if row.id == producer), None)
-    if member is not None and not isinstance(member.exited, staff.Exited):
+class ListQuestionRouting:
+    """Use one producer availability check per List read."""
+
+    def __init__(self, members: staff.StaffSnapshot) -> None:
+        self.members: staff.StaffSnapshot = members
+        self.producers: dict[staff.StaffId, staff.StaffRow] = {
+            row.id: row for row in staff.active(members, "producer")
+        }
+        self.available: dict[staff.StaffId, bool] = {}
+
+    def receiver(self, keeper: staff.StaffId, producer: staff.StaffId) -> ListQuestionReceiver:
+        return self.name_recipient(self._recipient(keeper, producer))
+
+    def followup_receiver(self, owner: staff.StaffId) -> ListQuestionReceiver:
+        return replace(self.name_recipient(owner), followup=True)
+
+    def name_recipient(self, recipient: staff.StaffId | question_record.KeeperForUnavailableProducer
+                       ) -> ListQuestionReceiver:
+        identity = recipient.keeper if isinstance(recipient, question_record.KeeperForUnavailableProducer) else recipient
+        member = self.members.by_id(identity)
+        return ListQuestionReceiver(recipient, member.name if member is not None else str(identity))
+
+    def _recipient(self, keeper: staff.StaffId, producer: staff.StaffId
+                  ) -> staff.StaffId | question_record.KeeperForUnavailableProducer:
+        if producer == keeper:
+            return keeper
+        if producer not in self.available:
+            self.available[producer] = self._available(producer)
+        if self.available[producer]:
+            return producer
+        return question_record.KeeperForUnavailableProducer(keeper, producer)
+
+    def _available(self, producer: staff.StaffId) -> bool:
+        member = self.producers.get(producer)
+        if member is None or isinstance(member.exited, staff.Exited):
+            return False
         try:
             _ = session_pane.session_place(member.current_session)
         except (session_pane.NoSuchTarget, OSError, session_pane.HerdrFailure, ValueError):
-            pass
-        else:
-            return producer
-    return question_record.KeeperForUnavailableProducer(keeper, producer)
+            return False
+        return True
 
 
-def _prepare_question_recipient(path: Path, request: PageRequest, keeper: staff.StaffId, producer: staff.StaffId
-                                ) -> staff.StaffId | question_record.KeeperForUnavailableProducer:
-    """Keep the first recipient if the List write fails."""
-    fields = _request_fields(request)
+def _require_question_receiver(shown: ListQuestionSignature | ListQuestionRoute, receiver: ListQuestionReceiver) -> None:
+    if shown is not ListQuestionRoute.CURRENT and shown != receiver.signature:
+        raise question_record.AnswerRefused("The question recipient changed. Check it again before sending.")
+
+
+def _prepared_question_receiver(path: Path, request: PageRequest, routing: ListQuestionRouting
+                                ) -> ListQuestionReceiver | ListQuestionRoute:
     try:
         saved = delivery_state.read_fields(path)
     except FileNotFoundError:
-        recipient = _new_question_recipient(keeper, producer)
-        record = {"request": fields, **question_record.recipient_fields(recipient)}
-        write_text_atomic(path, json.dumps(record) + "\n", new_file_mode=0o600)
-        return recipient
-    if saved.get("request") != fields:
+        return ListQuestionRoute.CURRENT
+    if saved.get("request") != _request_fields(request):
         raise ListError("this request already has a different action or words")
     recipient = question_record.read_recipient(saved)
     if recipient is question_record.DefaultQuestionRecipient.PAGE:
         raise ListError("the prepared question has no recipient")
-    return recipient
+    receiver = routing.name_recipient(recipient)
+    name = saved.get("receiver_name")
+    return replace(receiver, name=name) if isinstance(name, str) else receiver
 
 
 def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
-                 status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
-    """Save the question and its signed request receipt before delivery."""
+                 status: change_page.DeliveryStatus, *,
+                 shown: ListQuestionSignature | ListQuestionRoute = ListQuestionRoute.CURRENT,
+                 seen: UnreadUpdate | NoUnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT
+                 ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    """Check the shown recipient and save the question before delivery."""
     if request.action != "question" or not request.words.strip() or len(request.words) > 10000:
         raise question_record.AnswerRefused("Enter a question first.")
     request = replace(request, words=request.words.strip())
     store = _store(keeper)
-    questions = _ListQuestionStore(keeper, request)
-    with store.locked():
+    with status.locked(), store.locked():
         item = load(keeper, identity)
         previous = _previous_page_request(item, request)
         if item.state == ItemState.CLOSED:
             if isinstance(previous, QuestionRequestReceipt):
                 return change_page.NoMessageDelivery()
             raise question_record.AnswerRefused("This item is Closed.")
-        open_question = next((question for question in item.questions
-                              if question.answer is None and question.words == request.words), None)
-        if isinstance(previous, QuestionRequestReceipt):
-            if open_question is None or open_question.question_id != previous.question_id:
-                return change_page.NoMessageDelivery()
-        elif open_question is not None:
-            questions.save_request(item, request, open_question)
         request_key = json.dumps([str(store.path(item.id).resolve()), _request_id(request.request)]).encode()
         preparation = status.root / (".review-link-list-ask-" + hashlib.sha256(request_key).hexdigest())
-        recipient = (_prepare_question_recipient(preparation, request, keeper, item.producer) if open_question is None
-                     else open_question.recipient_id(keeper))
-        delivery = _claim_question(questions, item, request.words, recipient, status)
+        if isinstance(previous, QuestionRequestReceipt):
+            question = next((saved for saved in item.questions
+                             if saved.question_id == previous.question_id and saved.answer is None), None)
+            if question is None:
+                return change_page.NoMessageDelivery()
+            recipient = question.recipient_id(keeper)
+            delivery = _claim_question(_ListQuestionStore(keeper, request, ask_recipient=recipient),
+                                       item, request.words, recipient, status)
+            with suppress(OSError):
+                preparation.unlink()
+            return delivery
+        routing = ListQuestionRouting(staff.snapshot())
+        prepared = _prepared_question_receiver(preparation, request, routing)
+        followup = isinstance(item.question_kind, QuestionItemKind) and item.state is ItemState.ANSWERED
+        if followup:
+            if isinstance(item.owner, UnassignedOwner):
+                raise question_record.AnswerRefused("The question has no owner for your words.")
+            if seen is not ReadCurrentUpdate.CURRENT and unread_update(item) != seen:
+                raise question_record.AnswerRefused("The question changed. Check it again before sending.")
+            current = routing.followup_receiver(item.owner)
+        else:
+            current = routing.receiver(keeper, item.producer)
+        receiver = current if prepared is ListQuestionRoute.CURRENT else replace(prepared, followup=followup)
+        if followup and receiver.identity != current.identity:
+            raise question_record.AnswerRefused("The question recipient changed. Check it again before sending.")
+        _require_question_receiver(shown, receiver)
+        questions = _ListQuestionStore(keeper, request, ask_recipient=receiver.identity, followup=followup)
+        open_question = next((question for question in item.questions if question.answer is None
+                              and question.words == request.words and question.recipient_id(keeper) == receiver.identity), None)
+        if open_question is not None:
+            questions.save_request(item, request, open_question)
+        elif item.question_kind is not NoQuestionItem.ORDINARY and item.state is not ItemState.WORKING and not followup:
+            raise ListError("Ask the question while the item is Working.")
+        elif prepared is ListQuestionRoute.CURRENT:
+            record = {"request": _request_fields(request), "receiver_name": receiver.name,
+                      **question_record.recipient_fields(receiver.recipient)}
+            write_text_atomic(preparation, json.dumps(record) + "\n", new_file_mode=0o600)
+        delivery = _claim_question(questions, item, request.words, receiver.recipient, status)
         with suppress(OSError):
             preparation.unlink()
         return delivery
@@ -3775,7 +5503,7 @@ def list_question_target(keeper: staff.StaffId, item: ListItem,
                                            recipient, keeper=keeper, alert_owner=owner)
 
 
-def image_list_keeper(identity: str) -> staff.StaffId:
+def image_list_folder_keeper(identity: str) -> staff.StaffId:
     """Find the List folder that holds this item, including old folders."""
     if re.fullmatch(r"L[1-9][0-9]*", identity) is None:
         raise ListError("Use a List item id such as L324.")
@@ -3785,35 +5513,60 @@ def image_list_keeper(identity: str) -> staff.StaffId:
         raise ListError(f"No List item {identity}.")
     if len(candidates) != 1:
         raise ListError(f"More than one List folder holds {identity}.")
-    keeper = staff.StaffId(candidates[0].parent.parent.name)
+    return staff.StaffId(candidates[0].parent.parent.name)
+
+
+def image_list_keeper(identity: str) -> staff.StaffId:
+    """Find the keeper and check that the List item is readable."""
+    keeper = image_list_folder_keeper(identity)
     _ = load(keeper, identity)
     return keeper
 
 
+def _image_answer_receipt(item: ListItem, key: str) -> _ImageAnswerChange | None:
+    return next((entry for entry in reversed(item.log)
+                 if isinstance(entry, _ImageAnswerChange) and entry.key == key), None)
+
+
+def image_answer_producer(item: ListItem, key: str) -> staff.StaffId:
+    """Use the producer saved with this answer when it has a List receipt."""
+    receipt = _image_answer_receipt(item, key)
+    return item.producer if receipt is None else receipt.producer
+
+
 def save_image_answer(keeper: staff.StaffId, identity: str, key: str, words: str, *,
-                      image_id: str, approved: bool) -> staff.StaffId:
+                      image_id: str, approved: bool,
+                      prepare: Callable[[staff.StaffId], None] | None = None) -> staff.StaffId:
     """Save the answer before delivery. Return the producer for this answer."""
     _ = _request_id(key)
     store = _store(keeper)
     with store.locked():
         item = load(keeper, identity)
-        for entry in reversed(item.log):
-            if isinstance(entry, _ImageAnswerChange) and entry.key == key:
-                sync_folder(store.folder())
-                return entry.producer
+        receipt = _image_answer_receipt(item, key)
+        if prepare is not None:
+            prepare(item.producer if receipt is None else receipt.producer)
+        if receipt is not None:
+            sync_folder(store.folder())
+            return receipt.producer
         moment = now()
         producer = staff.snapshot().by_id(item.producer)
         producer_name = producer.name if producer is not None else item.producer
-        changes: ItemChanges = {"next_step": f"{producer_name}: act on nate's answer to picture {image_id}"}
+        changes: ItemChanges = {}
+        if item.state is not ItemState.REPAIRED and not (
+                item.state is ItemState.DELIVERED and approved and isinstance(item.report, ListReport)):
+            changes["next_step"] = f"{producer_name}: act on nate's answer to picture {image_id}"
         keeps_delivery = item.state is ItemState.DELIVERED and approved
         if item.state in (ItemState.WAITING_FOR_NATE, ItemState.DELIVERED) and not keeps_delivery:
             changes["state"] = ItemState.WORKING
+        _require_question_move(item, QuestionMove.OTHER, changes.get("state", item.state))
         if item.eta is EtaStatus.WAITING_FOR_NATE and not keeps_delivery:
             changes["eta"] = EtaStatus.NO_TIME_YET
         picture = re.compile(r"(?<![a-z0-9])" + re.escape(image_id) + r"(?![a-z0-9])", re.IGNORECASE)
         asks = {ask.ask_id for ask in open_asks(item) if picture.search(ask.what) or picture.search(ask.why)}
         changed = _close_asks(_clear_unread(item), asks, moment, key)
-        log = (*item.log, ItemChange(moment, FieldChange("Updated", {**changes}), _IMAGE_ANSWER_SOURCE))
+        log = item.log
+        if changes:
+            log = (*log, ItemChange(moment, FieldChange("Updated", {**changes}), _IMAGE_ANSWER_SOURCE))
         if item.unread_since is not NoTimestamp.UNSET:
             log = (*log, ItemChange(moment, MarkedRead(), _IMAGE_ANSWER_SOURCE))
         answer = _ImageAnswerChange(moment, words, _IMAGE_ANSWER_SOURCE, key, item.producer)
@@ -3835,7 +5588,8 @@ def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) 
         if isinstance(previous, PageRequest):
             raise ListError("this request has no feedback to deliver")
         moment = now()
-        if feedback.action == "tell" and item.state in (ItemState.WAITING_FOR_NATE, ItemState.DELIVERED):
+        if (feedback.action == "tell" and item.question_kind is NoQuestionItem.ORDINARY and not isinstance(item.report, ListReport)
+                and item.state in (ItemState.WAITING_FOR_NATE, ItemState.DELIVERED)):
             item = _start_working(item, moment, PAGE_SOURCE)
         changed = replace(item, updated=moment, log=(*item.log, ItemChange(moment, feedback, PAGE_SOURCE)))
         _validate(changed)
@@ -3856,19 +5610,24 @@ def deliver_feedback(keeper: staff.StaffId, identity: str, request: str,
         with store.locked():
             item = load(keeper, identity)
             feedback = feedback_requests(item).get(request)
-        if feedback is None or feedback.state != "pending":
+        if feedback is None or not (feedback.state == "pending" or (
+                feedback.state == "alerted" and (
+                    feedback.action is ReportVerdict.NOT_FIXED or feedback.studio_save_notice))):
             return
         result = send(item, feedback)
-        if result.state == "pending":
+        if result == feedback or result.state == "pending":
             return
         with store.locked():
             current = load(keeper, identity)
             latest = feedback_requests(current).get(request)
-            if latest is None or latest.state != "pending":
+            if latest is None or latest != feedback:
                 return
             moment = now()
-            changed = replace(current, updated=moment, log=(*current.log, ItemChange(moment, result, PAGE_SOURCE)))
-            _save(store, changed)
+            if latest.action is ReportVerdict.NOT_FIXED or latest.studio_save_notice:
+                log = tuple(replace(entry, what=result) if entry.what == latest else entry for entry in current.log)
+            else:
+                log = (*current.log, ItemChange(moment, result, PAGE_SOURCE))
+            _save(store, replace(current, updated=moment, log=log))
     finally:
         with feedback_claims_lock:
             feedback_claims.remove(claim)
@@ -4106,7 +5865,7 @@ def _set_goal(producer: staff.StaffId, identity: str, *, keeper: staff.StaffId) 
         item = load(keeper, identity)
         if item.producer != producer:
             raise ListError(f"{item.id} is assigned to another producer.")
-        if saved is goal.NoGoal.UNSET or (saved["keeper"], saved["item"]) != (keeper, item.id):
+        if saved is goal.NoGoal.UNSET or not _same_list_item(saved["keeper"], saved["item"], keeper, item.id):
             saved = goal.GoalRecord(keeper=keeper, item=item.id, blocked="", faster="", noted_at="")
         goal.write_goal(producer, saved)
         return goal.save(producer, saved, _goal_status(item))
@@ -4221,6 +5980,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = ask.add_argument("--what", required=True, help="the one change that nate approves")
     _ = ask.add_argument("--why", required=True, help="why the session needs nate's word")
     _ = ask.add_argument("--config", action="store_true", help="the change is a settings.json, CLAUDE.md or config change")
+    _ = commands.add_parser("move-review-bugs", help="move open Review bugs to the List")
+    _ = commands.add_parser("move-review-waits", help="move Waiting and Validating Review records to the List")
     withdrawal = commands.add_parser("withdraw-ask", help="withdraw an open List ask")
     _ = withdrawal.add_argument("id", help="the List item ID, such as L1")
     _ = withdrawal.add_argument("--ask", required=True, help="the ask ID, such as A1")
@@ -4291,7 +6052,7 @@ def main(argv: list[str] | None = None) -> int:
             confirm_scheduled(keeper, identity, caller, run_key=cast(str, args.run))
             print(f"confirmed {identity}")
             return 0
-        if caller.kind != "producer":
+        if caller.kind != "producer" and name != "close":
             raise ListError("the current session must be a producer")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
@@ -4306,7 +6067,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"answered {identity} {question}")
             return 0
         morty = producer_id(record, "morty")
-        keeper = morty
+        list_keeper = record_store.list_keeper(conf.read_or_repository("console"), record)
+        if list_keeper is None:
+            raise ListError("The List keeper is unavailable.")
+        keeper = list_keeper.id
         if name in ("ask", "withdraw-ask"):
             identity = cast(str, args.id)
             identity = f"L{identity}" if identity.isascii() and identity.isdecimal() else identity
@@ -4327,6 +6091,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         # Only morty updates every field of every item, in each keeper's folder.
         assigned_to = AllItems.INCLUDED if caller.id == morty else caller.id
+        if name in ("move-review-bugs", "move-review-waits"):
+            if caller.id != morty:
+                raise ListError(f"only morty can run {name}")
+            if name == "move-review-bugs":
+                destinations = move_review_bugs(record)
+            else:
+                from scripts.review_links import review_link
+
+                destinations = move_review_waits(review_link.review_root(), record)
+            for destination in destinations:
+                print(f"moved to List item {destination.number}")
+            return 0
         if name == "list":
             include_closed = cast(bool, args.all)
             if assigned_to is AllItems.INCLUDED:
@@ -4344,11 +6120,11 @@ def main(argv: list[str] | None = None) -> int:
         schedule_scope = cast(ScheduleScope, getattr(args, "scope", ScheduleScope.UNSPECIFIED))
         if name == "update":
             identity = _cli_item_id(cast(str, args.id))
-            keeper = _record_keeper(morty, caller.id, identity, cast(staff.StaffId | None, args.keeper),
+            keeper = _record_keeper(list_keeper.id, caller.id, identity, cast(staff.StaffId | None, args.keeper),
                                     policy=_KeeperRouting.UPDATE)
             reassigns = cast(str | None, args.producer) is not None or cast(str | None, args.owner) is not None
             # A producer gets the field refusal below, because it never changes these fields.
-            if assigned_to is AllItems.INCLUDED and keeper != morty and reassigns:
+            if assigned_to is AllItems.INCLUDED and keeper != list_keeper.id and reassigns:
                 raise ListError("move the item to morty's List before you change its producer or owner")
             if assigned_to is not AllItems.INCLUDED:
                 options = cast(dict[str, object], vars(args))
@@ -4443,8 +6219,9 @@ def main(argv: list[str] | None = None) -> int:
         elif name == "close":
             words = cast(str, args.words)
             console_text.require(words, "list field", refusal=ListError)
-            _ = close(keeper, cast(str, args.id), words, source=source,
-                      assigned_to=assigned_to, schedule_scope=schedule_scope)
+            close_access = ListCloseCaller(caller, all_items=assigned_to is AllItems.INCLUDED)
+            _ = close(keeper, cast(str, args.id), words, source=source if caller.kind == "producer" else caller.name,
+                      assigned_to=close_access, schedule_scope=schedule_scope)
         elif name == "reopen":
             _ = reopen(keeper, cast(str, args.id), source=source, assigned_to=assigned_to)
         else:
