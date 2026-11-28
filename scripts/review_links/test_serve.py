@@ -100,6 +100,10 @@ VERSION_BROWSER_PROBE = br"""<script>
  const studio=()=>document.querySelector('iframe[data-console-page="studio"]');
  const frame=()=>document.querySelector('iframe[data-version-card]');
  const overlay=()=>frame()?.contentDocument.querySelector('[data-list-linked-overlay]:not([hidden])');
+ const publish=async()=>{
+  if(!(await fetch('/version-publish')).ok) throw new Error('The fixture could not publish the notice.');
+  window.dispatchEvent(new Event('focus'));
+ };
  const until=async(test,label)=>{
   const end=performance.now()+7000;
   while(!test()){
@@ -113,8 +117,7 @@ VERSION_BROWSER_PROBE = br"""<script>
   const proof=new URLSearchParams(location.search).has('shot');
   if(!proof){
    check(notice.hidden,'The notice starts hidden.');
-   await fetch('/version-publish');
-   window.dispatchEvent(new Event('focus'));
+   await publish();
   }
   await until(()=>links().length===3,'The open page did not show the three changes.');
   check(studio().contentDocument===page,'The live update preserves the open page.');
@@ -187,7 +190,11 @@ VERSION_BROWSER_PROBE = br"""<script>
   await until(()=>links().length===0,'The notice did not read the other clear.');
   check(!notice.hidden && !failure.hidden,'The notice keeps the failure line after the other clear.');
   notice.querySelector('header button').click();
-  await until(()=>notice.hidden,'Clear all did not remove the notice.');
+  await until(()=>notice.hidden,'The retry did not hide the empty notice.');
+  await publish();
+  await until(()=>!notice.hidden && links().length===3,'The notice did not show the fixture lines again.');
+  notice.querySelector('header button').click();
+  await until(()=>notice.hidden && links().length===0,'Clear all did not remove the populated notice.');
   check(studio().contentDocument===page,'Clear all leaves the Studio page open.');
  }catch(error){failures.push(String(error));}
  finally{await fetch('/version-results',{method:'POST',body:JSON.stringify(failures)});}
@@ -6314,7 +6321,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         finally:
             self.server.RequestHandlerClass = serve.ReviewLinksHandler
         self.assertEqual(results, [[]])
-        self.assertTrue(all(change.cleared for change in version_notice.read(root).changes))
+        cleared = replace(notice, changes=tuple(replace(change, cleared=True) for change in notice.changes))
+        self.assertEqual(version_notice.read(root), cleared)
 
     def test_console_page_gzip_matches_identity(self) -> None:
         page = b"<main><h1>The List</h1></main>"

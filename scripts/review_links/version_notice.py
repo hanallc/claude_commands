@@ -56,6 +56,16 @@ def git(checkout: Path, *arguments: str) -> str:
                           capture_output=True, encoding="utf-8", errors="replace").stdout
 
 
+def _can_resolve_commit(checkout: Path, revision: str) -> bool:
+    try:
+        _ = git(checkout, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{revision}^{{commit}}")
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 1:
+            return False
+        raise
+    return True
+
+
 def list_numbers(messages: str) -> tuple[int, ...]:
     return tuple(dict.fromkeys(int(match[1]) for match in LIST_ITEM.finditer(messages)))
 
@@ -91,7 +101,9 @@ def start(root: Path, checkout: Path) -> None:
             try:
                 messages = git(checkout, "log", "--format=%B%x00", f"{previous.revision}..{revision}")
             except subprocess.CalledProcessError:
-                # Git cannot read the range. Use HEAD as the new baseline.
+                if _can_resolve_commit(checkout, previous.revision):
+                    raise
+                # Git cannot resolve the recorded commit. Use HEAD as the new baseline.
                 messages = ""
             numbers = list_numbers(messages)
             if numbers:
