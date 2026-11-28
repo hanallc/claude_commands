@@ -187,17 +187,6 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("Quote one or more complete sentences or lines in order from one source message only.", prompt)
         self.assertIn("If several messages contain relevant words, quote the newest message that sets the behavior.", prompt)
 
-    def test_reviewer_prompt_requires_a_quote_from_one_source_message(self) -> None:
-        args, _ = self.changed_range()
-        self.reply(CLEAR_REPLY)
-        with mock.patch.object(astra_review, "run_review", return_value=0) as runner:
-            code, output = self.cli("run", *args)
-
-        self.assertEqual(code, 0, output)
-        prompt = cast(str, runner.call_args.args[1])
-        self.assertIn("Quote one or more complete sentences or lines in order from one source message only.", prompt)
-        self.assertIn("If several messages contain relevant words, quote the newest message that sets the behavior.", prompt)
-
     def test_clear_requires_a_saved_reply_for_this_patch_and_each_test(self) -> None:
         args, key = self.changed_range()
         self.reply(CLEAR_REPLY)
