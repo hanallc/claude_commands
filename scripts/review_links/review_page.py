@@ -2315,7 +2315,7 @@ setInterval(updateHandoffAges,5000);
 
 RECORD_LINK_SCRIPT = r'''
 const reviewRecordLinks={stableItemLinks:true,hasKey:key=>index.has(key),
- resolveItem:value=>resolveShownRecordId(index,value)};
+ resolveItem:(value,kind)=>resolveShownRecordId(index,value,kind)};
 '''
 
 CARD_REQUEST_SCRIPT = record_table.SCRIPT + console.REVIEW_PLACE_SCRIPT + RECORD_LINK_SCRIPT + r'''

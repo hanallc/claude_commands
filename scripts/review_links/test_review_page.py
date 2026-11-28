@@ -8487,6 +8487,13 @@ Element.prototype.animate=function(...args){
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_reload_keeps_a_saved_verdict_and_the_selected_show(self) -> None:
+        self.check_review_address_cases('copied-legacy-link', 'copied-legacy-row', 'verdict', 'show')
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_reload_keeps_marked_review_links(self) -> None:
+        self.check_review_address_cases('restored', 'copied', 'copied-row', 'appearance')
+
+    def check_review_address_cases(self, *cases: str) -> None:
         setup = r"""<script>
 const sendProbe=fetch;
 window.setInterval=()=>0;
@@ -8495,9 +8502,11 @@ window.fetch=(url,options={})=>{
  return sendProbe(url,options);
 };
 const reloaded=Boolean(sessionStorage.getItem('review-reload'));
-const copied=CASE==='copied' || CASE==='copied-row';
+const copied=CASE.startsWith('copied');
+const copiedRow=CASE.endsWith('-row');
+const legacyCopy=CASE.startsWith('copied-legacy');
 if(!reloaded){
- const place=CASE==='copied-row' ? {show:'all'} : {item:INITIAL_ITEM};
+ const place=copiedRow ? {show:'all'} : {item:INITIAL_ITEM};
  history.replaceState(null,'','#'+new URLSearchParams(place));
 }
 if((copied || CASE==='appearance') && reloaded) history.replaceState(null,'');
@@ -8582,9 +8591,14 @@ window.fetch=(url,options)=>{
     await saved;
     history.replaceState(null,'','#item=page-owner%2FC1');
    }else if(CASE==='restored' || copied){
-    if(CASE==='copied-row') row().querySelector('.list-toggle').click();
+    if(copiedRow) row().querySelector('.list-toggle').click();
     check(expanded(key) && notice.hidden && history.state?.recordTable?.opened[0]===key,
      'Review saves the key of the open card.');
+    if(legacyCopy){
+     const place=new URLSearchParams(location.hash.slice(1));
+     place.delete('item-kind');
+     history.replaceState(history.state,'','#'+place);
+    }
    }else content.querySelector('[data-filter-row="show"] [data-filter-value="open"]').click();
    if(!failures.length){
     sessionStorage.setItem('review-reload','1');
@@ -8611,6 +8625,8 @@ window.fetch=(url,options)=>{
    if(copied) check(initialHistory===null,'The copied address loads without browser history state.');
    check(!row() && row(otherKey) && !expanded(otherKey) && !notice.hidden && addressItem()===key,
     'A missing saved key does not open a card with the same shown ID.');
+   if(legacyCopy) check(new URLSearchParams(location.hash.slice(1)).get('item-kind')==='key',
+    'The old address keeps its value as a stored key.');
    check(initialBodyRequests.length===0,'Review does not request a card for the missing saved key.');
   }else{
    check(content.dataset.show==='open' && !row(),'A reload restores Open when the address names a Done Change.');
@@ -8619,13 +8635,13 @@ window.fetch=(url,options)=>{
  await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
-        for case in ('verdict', 'restored', 'copied', 'copied-row', 'appearance', 'show'):
+        for case in cases:
             with self.subTest(case=case):
                 if case == 'show':
                     _ = change_review.record_verdict(self.fixture.review_list, 'C1', 'works',
                                                      datetime.now(user_zone()).date(), self.fixture.production)
                 shown_ids = {'page-owner/C1': 'builds/C1', 'page-owner/C2': 'builds/C2'} if case == 'verdict' else {}
-                if case in ('restored', 'copied', 'copied-row'):
+                if case == 'restored' or case.startswith('copied'):
                     shown_ids = {'page-owner/C2': 'page-owner/C1'}
                 if shown_ids:
                     records = [replace(item, id=shown_ids[item.key]) if item.key in shown_ids else item
@@ -8715,12 +8731,16 @@ node.textContent=JSON.stringify(indexWithoutTarget);
  try{
   check(!row(),'The displayed ID is unresolved at startup.');
   await refresh(indexWithoutTarget,'missing');
-  const pending=link.item ? address().get('item-kind')==='id' && address().get('item')==='builds/C2' :
+  const stored=link.item && !link.linked;
+  const retained=link.item ? address().get('item-kind')===(stored ? 'key' : 'id') && address().get('item')==='builds/C2' :
    address().get('filter-id')==='builds/C2';
-  check(!row() && pending,'A refresh keeps the displayed ID while the row is absent.');
+  check(!row() && retained,'A refresh keeps the address while the row is absent.');
   await refresh(fullIndex,'confirmed');
   const open=row()?.querySelector('.list-toggle').getAttribute('aria-expanded');
-  if(link.item){
+  if(stored){
+   check(open==='false' && address().get('item')==='builds/C2' && address().get('item-kind')==='key' &&
+    !review.querySelector('[data-missing-item]').hidden,'The older row address keeps the missing item notice.');
+  }else if(link.item){
    check(open==='true' && address().get('item')===key && address().get('item-kind')==='key',
     'A refresh resolves the old item link and saves the key.');
   }else{
@@ -8731,7 +8751,7 @@ node.textContent=JSON.stringify(indexWithoutTarget);
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         request_script = '<script>'+review_page.CARD_REQUEST_SCRIPT
-        for link in ({'item': 'builds/C2', 'linked': '1'}, {'key': 'builds/C2'}):
+        for link in ({'item': 'builds/C2', 'linked': '1'}, {'key': 'builds/C2'}, {'item': 'builds/C2'}):
             with self.subTest(link=link):
                 markup = page.replace('<head>', '<head>'+setup.replace('LINK', json.dumps(link)), 1)
                 markup = markup.replace(request_script, before_index+request_script, 1)

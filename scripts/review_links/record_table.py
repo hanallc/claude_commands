@@ -636,21 +636,28 @@ const filterControl={
 };
 function resolveRecordLink(value,kind,{resolveItem,hasKey}){
  if(!value || kind==='key') return {key:value,pending:false};
- const key=resolveItem?.(value) ?? value;
+ const key=resolveItem ? resolveItem(value,kind) : value;
+ if(key===null) return {key:value,pending:false};
  return {key,pending:Boolean(resolveItem && hasKey && !hasKey(key))};
 }
 function recordItemLink(params,options){
  const jump=params.get('jump'),saved=history.state?.recordTable;
- const kind=options.stableItemLinks && !jump ? params.get('item-kind') : null;
- const legacyKind=saved && !saved.pendingItem ? 'key' : 'id';
- return resolveRecordLink(jump || params.get('item'),kind || legacyKind,options);
+ let kind=options.stableItemLinks && !jump ? params.get('item-kind') : null;
+ if(kind!=='key' && kind!=='id'){
+  kind=saved && !saved.pendingItem ? 'key' : 'id';
+  if(options.stableItemLinks && !jump && !saved && ['owner','show','q','sort','dir'].every(name=>params.has(name)))
+   kind=params.get('linked')==='1' ? 'legacy-linked' : 'key';
+ }
+ return resolveRecordLink(jump || params.get('item'),kind,options);
 }
-function resolveShownRecordId(index,value){
+function resolveShownRecordId(index,value,kind){
  if(!value || index.has(value)) return value;
  const shown=value.toLowerCase();
  let key=null;
  for(const entry of index.values()){
   if(entry.id.toLowerCase()!==shown) continue;
+  // An older linked address can hold a stored key or an unresolved ID.
+  if(kind==='legacy-linked') return null;
   if(key!==null) return value;
   key=entry.key;
  }
@@ -1065,7 +1072,7 @@ function placeParams(){
  return params;
 }
 const resolveStoredItem=value=>options.resolveStoredItem?.(value) ?? value;
-const resolveItem=value=>options.resolveItem?.(value) ?? resolveStoredItem(value);
+const resolveItem=(value,kind)=>options.resolveItem ? options.resolveItem(value,kind) : resolveStoredItem(value);
 const canResolveItem=Boolean(options.resolveItem || options.resolveStoredItem);
 const linkLookup={stableItemLinks:options.stableItemLinks,hasKey:options.hasKey,resolveItem:canResolveItem ? resolveItem : undefined};
 const itemLinkKey=()=>recordItemLink(placeParams(),linkLookup).key;
