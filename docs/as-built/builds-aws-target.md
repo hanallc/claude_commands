@@ -799,13 +799,14 @@ Later running, absent, or terminated updates cannot change its end time or cost.
 A worker rejects an ended booking before checking for a launch file.
 The ledger rejects reservations for closed attempt IDs.
 A retry uses a new attempt ID.
-Cleanup resolves reservations without saved launch arguments as `GateAbsent`.
+Cleanup resolves a booking as `GateAbsent` when it checks the journal and finds neither a launch token nor an instance.
 The module and coordinator also call this cleanup from `finally` blocks.
 Repeated cleanup does not change resolved reservations.
 AWS failures leave reservations unresolved for later recovery.
 Before reservation, the coordinator cleans expired earlier trials with unresolved reservations.
 The sweep checks each attempt's owner and passes only due attempts to cleanup.
 The sweep preserves boxes with live owners, even when another owner in the same expired trial has ended.
+The sweep also removes expired trial packs when the service is absent and no booking remains open.
 The sweep preserves trial folders.
 Guest expiry and the AWS expiry function remain independent termination controls.
 AWS failures can delay termination beyond the configured expiry and confirmation timeout.
@@ -815,7 +816,7 @@ The worker installs no signal handler.
 The ledger records each worker's PID, process start identity, and attempt folder.
 Reconciliation preserves live workers and workers whose identity cannot be read.
 Reconciliation terminates expired attempts and attempts whose recorded worker has ended.
-Each worker reconciles before reusing a saved launch.
+Each worker reconciles before resuming a saved launch.
 A hard kill without a later start can leave the booking open.
 The ledger continues to estimate its cost for the spending cap.
 The AWS expiry function ends the box.
@@ -988,7 +989,7 @@ It records copies before it waits for image readiness.
 The deployment record stores ordered regional launch resources and keeps artifact resources at the top level.
 The reader migrates an old single-region record once.
 Launch state, launch logs, and reservations retain the box region.
-Recovery replays saved launch arguments in the saved region before it uses the current variants.
+Recovery looks up the saved client token in the saved region.
 Status, termination, and expired-launch searches use that region.
 Reconciliation searches every configured region for an expired reservation without a recorded region.
 After a valid final result, the controller books the box end at the result receipt time.
@@ -1020,6 +1021,39 @@ A paired trial uses the changed candidate's entry point to supervise both verifi
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
 The controller reports the failure to the queue.
 The result fields and transfer links keep their existing format.
+
+### Current files for a gate run
+
+Gate setup records the pinned Linux tool paths after it verifies their availability in the Nix binary cache.
+A new gate uses the current-files transfer when the deployment has those tool paths.
+Older deployment records and saved launches keep the clone path.
+The repository visibility and `clone_url` stay in place until an AWS gate proof passes.
+
+The controller packs the candidate commit and the captured `origin/main` commit with the objects in their trees.
+The pack contains no older commits or objects found only in older trees.
+The scaler uploads the pack once to the home bucket alongside the request and guest program.
+Each launch region receives a signed GET and the expected SHA-256.
+The launch journal keeps the client token, instance type, and other launch metadata.
+Signed user data stays out of controller records.
+For an EC2 launch timeout, the failure reason and launch history record the operation and timeout duration.
+The local pack stays until settlement and is removed after an interrupted submission when no worker can use it.
+
+The guest checks the SHA-256 before it imports the pack.
+It checks both commit and tree IDs before it starts tests.
+The guest writes a source rejection to the log before the boot-error upload.
+The boot-error record is the only result for a source rejection.
+If the upload fails, the shell retries with the saved error.
+The guest records the captured main as `origin/main` and imports the commits as shallow tips.
+Paired trials include both trial revisions and the captured main in one pack.
+The paired checkouts share the verified Git objects and have separate indexes.
+After a failed paired submission, the caller removes the pack if the service is absent and no booking remains open.
+
+The scaler holds the shared account stack lock during package uploads and launches.
+Teardown holds the exclusive lock.
+Teardown verifies the live deployment tag before it empties the home bucket.
+Each S3 request for this deletion specifies the expected account owner.
+If a late write blocks deletion, teardown verifies the stack and bucket again before it retries.
+Teardown removes `gate-deployment.json` with the other local deployment records.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
 It omits `instance_running_at` when the cache is absent or invalid.

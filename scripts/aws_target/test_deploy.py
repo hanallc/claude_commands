@@ -27,7 +27,7 @@ from typing import ClassVar, Literal, cast, override
 from unittest import mock
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gate_probe, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, quota_requests, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gate_probe, gate_source, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, quota_requests, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
@@ -90,7 +90,7 @@ if service == 'sts' and operation == 'get-caller-identity':
         sys.exit(1)
     reply({'Arn': 'arn:aws:iam::123456789012:user/build-scaler'})
 elif service == 'iam' and operation == 'get-user':
-    if (root / 'deleted-stack').exists():
+    if (root / 'deleted-stack').exists() or (root / 'deleted-scaler').exists():
         print('NoSuchEntity', file=sys.stderr); sys.exit(1)
     user = args[args.index('--user-name') + 1]
     reply({'User': {'Arn': 'arn:aws:iam::123456789012:user/' + user, 'UserId': 'user-fixture'}})
@@ -2678,6 +2678,8 @@ sys.exit(7)
             'build-admin', 'us-east-1', 1, execute=execute)))
         _ = self.enterContext(mock.patch.object(subject, '_stack', return_value=outputs))
         _ = self.enterContext(mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
+        _ = self.enterContext(mock.patch.object(gate_source, 'prepare_tools',
+                                               return_value=('/nix/store/' + 'a' * 32 + '-fixture',)))
 
         def scaler(arguments: Sequence[str], *, env: dict[str, str] | None = None,
                    **_options: object) -> subprocess.CompletedProcess[str]:
@@ -5243,6 +5245,8 @@ else: raise AssertionError(args)
         with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': ''}), redirect_stdout(StringIO()) as output:
             self.assertTrue(self.deployment().down())
         self.assertIn('/home build cache is lost', output.getvalue())
+        self.assertIn('delete the contents of the home gate bucket', output.getvalue())
+        self.assertIn('gate-deployment.json', output.getvalue())
         self.assertIn('admin.gpg, and the box image', output.getvalue())
         self.assertIn('--approve-destroy', output.getvalue())
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
@@ -5315,6 +5319,46 @@ else: raise AssertionError(args)
         self.assertEqual(len(self.commands('update-stack')), 0)
         self.assertEqual(len(self.commands('delete-stack')), 1)
         self.assertEqual(len(self.commands('delete-volume')), 1)
+
+    def test_down_resumes_when_cloudformation_already_deleted_the_scaler(self) -> None:
+        _ = self.removal_fixture()
+        interrupted = self.root / 'fail-down-delete-stack'
+        interrupted.touch()
+        success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('foundation: refused:', output)
+        self.assertTrue((self.state / 'down.json').is_file())
+        interrupted.unlink()
+
+        stack_path = self.root / 'fake-stack.json'
+        stack = remote.read_record(stack_path)
+        stack['status'] = 'DELETE_FAILED'
+        saved = remote.read_record(self.state / 'deployment.json')
+        bucket = 'cloud-claude-gate-' + ledger.text(saved, 'deployment_id')
+        ledger.mapping(stack['outputs'])['GateBucket'] = bucket
+        write_text_atomic(stack_path, json.dumps(stack))
+        (self.root / 'deleted-scaler').touch()
+        success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('scaler-keys: refused: NoSuchEntity', output)
+        self.assertEqual(self.commands('delete-stack'), [])
+
+        write_text_atomic(self.root / 'describe-stack-resource.json', json.dumps({'StackResourceDetail': {
+            'PhysicalResourceId': 'build-scaler', 'ResourceStatus': 'DELETE_COMPLETE',
+        }}))
+        write_text_atomic(self.root / 'get-bucket-tagging.json',
+                          json.dumps({'TagSet': [{'Key': 'GateDeployment', 'Value': saved['deployment_id']}]}))
+        write_text_atomic(self.root / 'list-objects-v2.json', '{}')
+        before = len(self.commands('list-access-keys'))
+
+        success, output = self.down_output()
+
+        self.assertTrue(success, output)
+        self.assertEqual(len(self.commands('list-access-keys')), before)
+        self.assertEqual(len(self.commands('delete-stack')), 1)
+        args = cast(list[str], self.commands('list-objects-v2')[-1]['args'])
+        self.assertEqual(args[args.index('--bucket') + 1], bucket)
+        self.assertFalse((self.state / 'down.json').exists())
 
     def test_down_refuses_a_live_claim_after_disabling_routing(self) -> None:
         devices = self.removal_fixture()
