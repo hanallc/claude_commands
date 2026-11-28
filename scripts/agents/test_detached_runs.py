@@ -7005,10 +7005,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn("exit 0", alert)
         self.assertIs(saved["push_alert_attempted"], True)
 
-        with patch.object(subprocess, "Popen"):
+        with patch.object(subprocess, "Popen") as retries:
             _ = turn_end.run_finished(row.id, dispatch)
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
-        self.assertEqual(len(self.inputs), 1)
+        for attempt in retries.call_args_list:
+            self.finish_unconfirmed_retry(cast(list[str], attempt.args[0]), pane)
+        self.assertEqual([target for target, _ in self.inputs], [pane])
         self.assertEqual(self.notices, [(recipient, alert)])
 
     def test_late_pane_delivery_interrupted_after_input_checkpoint_alerts(self) -> None:
@@ -7044,9 +7046,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertEqual(self.notices, [])
             spawn.assert_called_once()
             argv = cast(list[str], spawn.call_args.args[0])
-            self.finish_unconfirmed_retry(argv, pane)
+        self.finish_unconfirmed_retry(argv, pane)
+        with patch.object(subprocess, "Popen") as retries:
             _ = turn_end.run_finished(row.id, dispatch)
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        for attempt in retries.call_args_list:
+            self.finish_unconfirmed_retry(cast(list[str], attempt.args[0]), pane)
         self.assertEqual(attempts, 1)
         (recipient, alert), = self.notices
         self.assertEqual(recipient, self.fixture.parent.id)
@@ -7054,16 +7059,21 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
     def finish_unconfirmed_retry(self, argv: list[str], pane: str) -> None:
         checks = 0
+        checks_after_alert = 0
 
-        def close_after_alert(_seconds: float) -> None:
-            nonlocal checks
+        def interrupt_after_alert(_seconds: float) -> None:
+            nonlocal checks, checks_after_alert
             checks += 1
-            self.assertLessEqual(checks, conf.read("detached_runs").whole("result_push_retries") + 2)
-            if self.notices and pane in self.fixture.world.locations:
-                self.fixture.world.remove_pane(pane)
+            self.assertLessEqual(checks, conf.read("detached_runs").whole("result_push_retries") + 3)
+            if self.notices:
+                checks_after_alert += 1
+                if checks_after_alert == 2:
+                    raise SystemExit("supervisor exited after checking the open pane again")
 
-        with patch.object(time, "sleep", side_effect=close_after_alert):
-            self.assertEqual(detached_runs.main(argv[2:]), 0)
+        with (patch.object(time, "sleep", side_effect=interrupt_after_alert),
+              self.assertRaisesRegex(SystemExit, "after checking the open pane again")):
+            _ = detached_runs.main(argv[2:])
+        self.assertIn(pane, self.fixture.world.locations)
 
     def test_late_result_read_error_before_input_keeps_the_result_pending(self) -> None:
         row = self.fixture.worker("late-read-error", family="codex")
@@ -7316,6 +7326,59 @@ class PaneRunDeliveryTests(unittest.TestCase):
         saved = worker_lifecycle.read_json_object(path)
         self.assertEqual(saved["delivery"], "sent: director received the result")
         self.assertIs(saved["completion_pending"], False)
+
+    def test_deferred_stop_alerts_the_director_once_after_worker_retirement(self) -> None:
+        row = self.fixture.worker()
+        dispatch, _ = self.begin_pane_pass(row)
+        path = self.create_stopped_run(row, dispatch)
+        write_text_atomic(path, json.dumps({
+            **worker_lifecycle.read_json_object(path), "status": "finished", "completion_pending": True,
+            "delivery": detached_runs.BUSY_WORKER_RESULT,
+        }))
+        self.assertIsNotNone(staff.retire(row.id))
+
+        with (patch.object(time, "sleep", side_effect=[None, AssertionError("retirement did not end the retry")]),
+              patch.object(send, "send", return_value=send.Result("sent", "director received the alert")) as alert):
+            self.assertEqual(detached_runs.main(["deliver-deferred", str(path)]), 0)
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        alert.assert_called_once()
+        options = cast(send.Options, alert.call_args.args[0])
+        self.assertEqual(options.to, self.fixture.parent.id)
+        self.assertIn("exit 143", options.text or "")
+        self.assertEqual(self.inputs, [])
+
+    def test_stop_does_not_queue_a_result_that_a_concurrent_retry_delivered(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        stage = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        test_worker.DispatchAgent(self.fixture).append(pane, "user", stage.line)
+        path = self.create_stopped_run(row, dispatch)
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        record.update(status="finished", completion_pending=True, delivery=detached_runs.BUSY_WORKER_RESULT)
+        write_text_atomic(path, json.dumps(record))
+        route = pass_notices.Route(dispatch, self.fixture.parent.id, row.name)
+        pass_notices.stage_result(self.run_dir, route, "stopped",
+                                  pass_notices.Notice("The pass stopped.", f"codex:{row.current_session}",
+                                                      pass_notices.NoticeKind.RESULT),
+                                  legacy=pass_notices.LegacyNoticeStamp("", ""))
+
+        def deliver_after_read(_runs: Path, _worker: staff.StaffId) -> Iterator[detached_runs.RunRecord]:
+            stale = record.copy()
+            self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(143)),
+                             f"sent: worker {row.name} at {pane}")
+            yield stale
+
+        with patch.object(detached_runs, "_registered_runs", side_effect=deliver_after_read):
+            detached_runs.stage_worker_stop_results(self.run_dir, row, dispatch)
+
+        notices = pass_notices.read(self.run_dir, dispatch)
+        assert notices is not None
+        self.assertNotIn(f"detached-result:{path.stem}", notices.notices)
+        self.assertIn("worker_result_receipt", worker_lifecycle.read_json_object(path))
+        self.assertEqual(len(self.inputs), 1)
+        self.assertEqual(self.inputs[0][0], pane)
 
     def test_reap_alerts_when_a_stopped_runs_worker_retires_before_delivery(self) -> None:
         row = self.fixture.worker()
