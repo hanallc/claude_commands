@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from decimal import Decimal
 
 
+_GATE_TEST_PROCESS = "GATE_MODULE_TEMP_DIR" in os.environ
 _warning_sink: ContextVar[Callable[[str, bool], None] | None] = ContextVar("configuration_warning_sink", default=None)
 
 
@@ -240,10 +241,13 @@ class ConfigRead:
             repository = _repository_path(self.file)
             if repository != self.source:
                 try:
-                    value, _ = read_key(_read_settings(repository.read_text(encoding="utf-8"), repository))
-                    return RecoveredValue(value, reason)
+                    value, raw_value = read_key(_read_settings(repository.read_text(encoding="utf-8"), repository))
                 except (OSError, UnicodeError, ValueError, ArithmeticError):
                     pass
+                else:
+                    if _GATE_TEST_PROCESS and raw_value is not None:
+                        raise RuntimeError(f"LIVE-REPOSITORY-READ {self.file}.{key}")
+                    return RecoveredValue(value, reason)
         if warn:
             _key_warning(self.source, key, reason, bad, self.stamp)
         current_limit = ""
