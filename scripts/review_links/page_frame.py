@@ -14,7 +14,7 @@ from pathlib import Path
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff
-from scripts.review_links import send_hold, setting_controls
+from scripts.review_links import console_theme, send_hold, setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
@@ -400,6 +400,160 @@ def action_failure(notice: str | None, message: str = "") -> str:
     identity = f' id="{html.escape(notice, quote=True)}"' if notice else ""
     hidden = " hidden" if not message else ""
     return f'<p class="action-failure"{identity} role="alert"{hidden}>{html.escape(message)}</p>'
+
+
+def with_version_notice(content: bytes, endpoint: str) -> bytes:
+    """Place the notice above all console page frames."""
+    notice = ('<section class="version-notice" aria-labelledby="version-notice-title" hidden>'
+              + '<header><h2 id="version-notice-title">New version loaded</h2>'
+              + '<button type="submit" form="version-clear" name="clear" value="all">Clear all</button></header>'
+              + f'<form id="version-clear" action="{html.escape(endpoint, quote=True)}" method="post">'
+              + action_failure("version-clear-failure") + '<ul></ul></form></section>')
+    return (content.replace(b"</head>", (_VERSION_STYLE + "</head>").encode(), 1)
+            .replace(b'<main class="workspace">', ('<main class="workspace">' + notice).encode(), 1)
+            .replace(b"</body>", ("<script>" + _VERSION_SCRIPT + "</script></body>").encode(), 1))
+
+
+_VERSION_STYLE = '<style>' + console_theme.TOKENS.replace(':root', '.workspace:has(>.version-notice:not([hidden]))') + '''
+.workspace:has(>.version-notice:not([hidden])){background:var(--bg)}
+.version-notice{flex:none;margin:16px auto 0;width:min(1060px,calc(100% - 48px));max-height:45dvh;overflow:auto;
+border:1px solid var(--line);border-inline-start:3px solid var(--accent);border-radius:12px;
+background:var(--card);color:var(--ink);padding:6px 16px;font:15px/1.45 system-ui,sans-serif}
+.version-notice header,.version-notice li{display:flex;align-items:center;gap:16px;padding-block:4px}
+.version-notice h2{margin:0;font-size:16px;font-weight:650}
+.version-notice button{margin-inline-start:auto;flex:none;padding:5px 12px;border-radius:8px;
+background:var(--card);color:var(--ink);border:1px solid var(--line);font:13px/18px system-ui,sans-serif;cursor:pointer}
+.version-notice button:hover{background:var(--hover)}
+.version-notice ul{list-style:none;padding:0;margin:0}
+.version-notice li{border-top:1px solid var(--line);color:var(--ink-2)}
+.version-notice li span{min-width:0;overflow-wrap:anywhere}
+.version-notice a{flex:none;color:var(--accent);font-weight:600;text-underline-offset:3px}
+.version-notice a[aria-expanded=true]{color:var(--ink)}
+.version-notice [role=alert]{color:var(--error)}
+.frame-area > iframe[data-version-card]{z-index:8;background:transparent}
+@media(max-width:480px){.version-notice{width:calc(100% - 24px);padding-inline:10px}
+.version-notice li,.version-notice header{gap:8px}.version-notice button{min-height:40px}}
+</style>'''
+
+_VERSION_SCRIPT = r'''(() => {
+ const notice=document.querySelector('.version-notice'),form=notice.querySelector('form');
+ const rows=form.querySelector('ul'),failure=form.querySelector('[role=alert]');
+ const frames=document.querySelector('.frame-area'),shell=document.querySelector('#console-shell');
+ let current,visible='',reading=false,clearing=false,card,selected='',opener='',requested='',edit=0;
+ const itemLink=key=>rows.querySelector('a[data-version-item="'+CSS.escape(key)+'"]');
+ function selectItem(key){
+  if(key===selected) return;
+  itemLink(selected)?.setAttribute('aria-expanded','false');
+  selected=key;
+  itemLink(selected)?.setAttribute('aria-expanded','true');
+  if(key) opener=key;
+ }
+ function closeCard(){
+  card?.remove();card=null;
+  requested='';
+  selectItem('');
+  itemLink(opener)?.focus({preventScroll:true});
+  opener='';
+ }
+ function render(data){
+  current=data;
+  const signature=JSON.stringify(data.changes);
+  const focused=notice.contains(document.activeElement);
+  const changed=signature!==visible;
+  const position=changed ? [...rows.children].findIndex(row=>row.contains(document.activeElement)) : -1;
+  if(changed){
+   visible=signature;
+   renderRows(data.changes);
+  }
+  notice.hidden=!data.changes.length && failure.hidden;
+  if(focused && position>=0){
+   const target=rows.children[Math.min(position,rows.children.length-1)]?.querySelector('button');
+   (target || document.querySelector('.nav-entry[aria-current], [data-console-page]:not([hidden])'))
+    ?.focus({preventScroll:true});
+  }else if(focused && notice.hidden) document.querySelector('.nav-entry[aria-current]')?.focus({preventScroll:true});
+ }
+ function renderRows(changes){
+  rows.replaceChildren(...changes.map(change=>{
+   const row=document.createElement('li'),link=document.createElement('a');
+   const title=document.createElement('span'),button=document.createElement('button');
+   const item=new URLSearchParams({item:change.key,reveal:'1'});
+   link.href='/console/list.html?'+item;
+   link.textContent='#'+change.number;
+   link.dataset.versionItem=change.key;
+   link.setAttribute('aria-haspopup','dialog');
+   link.setAttribute('aria-expanded',String(selected===change.key));
+   title.textContent=change.title;
+   button.type='submit';button.name='clear';button.value=String(change.number);button.textContent='Clear';
+   button.setAttribute('aria-label','Clear #'+change.number);
+   row.append(link,title,button);
+   return row;
+  }));
+ }
+ function reportFailure(message){
+  showActionFailure(failure,message);
+  notice.hidden=false;
+ }
+ async function refresh(){
+  if(reading || clearing || document.visibilityState!=='visible') return;
+  const started=edit;
+  reading=true;
+  try{
+   const response=await fetch(form.action,{cache:'no-store'});
+   if(response.ok){
+    const data=await response.json();
+    if(started===edit) render(data);
+   }
+  }catch(_){}finally{reading=false;}
+ }
+ form.addEventListener('submit',async event=>{
+  event.preventDefault();
+  if(clearing || !current) return;
+  clearing=true;
+  edit++;
+  showActionFailure(failure);
+  try{
+   const {revision,token}=current,clear=event.submitter.value;
+   const response=await fetch(form.action,{method:'POST',body:new URLSearchParams({revision,token,clear})});
+   const data=await response.json();
+   if(!response.ok) throw new Error(data.reason || 'The change could not clear. Try again.');
+   render(data);
+  }catch(error){
+   reportFailure(error instanceof SyntaxError ? 'The change could not clear. Try again.' : error.message);
+  }finally{clearing=false;}
+ });
+ rows.addEventListener('click',event=>{
+  const link=event.target.closest('a');
+  if(!link || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  const key=link.dataset.versionItem;
+  if(card?.contentDocument?.versionListBusy?.() || key===selected) return;
+  if(!card){
+   const frame=card=document.createElement('iframe');frame.title='List item';frame.dataset.versionCard='';
+   frame.addEventListener('version-card-closed',()=>{if(card===frame) closeCard();});
+   frame.addEventListener('version-card-item',event=>{
+    if(card===frame && (!event.detail || event.detail===requested)) selectItem(event.detail);
+   });
+   frame.addEventListener('load',()=>{
+    if(card!==frame || frame.contentDocument?.versionListBusy) return;
+    closeCard();
+    reportFailure('The List item could not open. Try again.');
+   });
+  }
+  requested=key;
+  selectItem('');
+  const url=new URL(link.href);
+  url.searchParams.set('version-card','1');
+  card.src=url;
+  if(!card.isConnected) frames.append(card);
+ });
+ document.addEventListener('keydown',event=>{
+  if(event.key==='Escape' && card && !event.defaultPrevented){event.preventDefault();closeCard();}
+ });
+ document.addEventListener('visibilitychange',refresh);
+ window.addEventListener('focus',refresh);
+ setInterval(refresh,Number(shell.dataset.refreshSeconds)*1000);
+ void refresh();
+})();'''
 
 
 ACTION_STATUS_SCRIPT = r'''function showActionFailure(status,message=''){

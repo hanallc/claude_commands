@@ -1815,14 +1815,14 @@ def top_bands(top_items: Iterable[ListRecord], today: datetime, names: staff_nam
 def render(root: Path, *, include_counts: bool = True, defer_counts: bool = False,
            status: change_page.DeliveryStatus | Literal["standalone"] = "standalone",
            review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK, query: str = "",
-           view: ListView = LIST_VIEW) -> bytes:
+           view: ListView = LIST_VIEW, version_item: ListRecord | None = None) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
     items: list[ListRecord] = []
     closed_keys: list[str] = []
-    for entry in records(include_closed=True):
-        if entry.item.state == the_list.ItemState.CLOSED:
+    for entry in (version_item,) if version_item is not None else records(include_closed=True):
+        if version_item is None and entry.item.state == the_list.ItemState.CLOSED:
             closed_keys.append(entry.key)
         else:
             items.append(entry)
@@ -1946,9 +1946,10 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     producer_control = (producer_chip_row(producer_chips, producer_selected, label_html=colored_producer)
                         if view.producer is producer_chip_row else view.producer(producer_chips, producer_selected))
     action_path = f' data-list-path="{view.path}"' if view.path != PAGE_PATH else ''
+    version_attr = ' data-version-item' if version_item is not None else ''
     content = (STYLE + view.style + page_frame.title(view.title, "list")
                + '<p data-review-refresh-error role="status" hidden></p>'
-               + f'<div data-list{action_path} data-refresh-seconds="{seconds}"'
+               + f'<div data-list{action_path}{version_attr} data-refresh-seconds="{seconds}"'
                + f' data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' data-park-retry-seconds="{park_retry}"' + deadline_attr
@@ -2057,6 +2058,16 @@ max-height:calc(100dvh - 98px - var(--page-window-top,0px));border:0}
 [data-list-review-dialog][data-fullscreen]{width:100vw;height:calc(100dvh - var(--page-window-top,0px));border:0;
 border-radius:0;margin:var(--page-window-top,0px) 0 0}
 [data-list-review-dialog][data-fullscreen] iframe{height:100%;max-height:none}
+:root:has([data-version-list-dialog]),body:has([data-version-list-dialog]){background:transparent}
+main:has([data-version-list-dialog])>:not(dialog){visibility:hidden}
+[data-version-list-dialog]{max-height:calc(100dvh - 32px);overflow:auto}
+[data-version-list-dialog]>header{position:sticky;top:0;z-index:2;display:flex;justify-content:flex-end;
+padding:8px 16px;background:var(--card);border-bottom:1px solid var(--line)}
+[data-version-list-dialog] .list-review-close{position:static}
+[data-version-list-dialog] [data-list]{opacity:1!important}
+[data-version-list-dialog] [data-list]>.list-table{margin:0}
+[data-version-list-dialog] [data-list]>.list-table thead,[data-version-list-dialog] [data-list]>:not(.list-table){display:none}
+@media(max-width:520px){[data-version-list-dialog]{width:calc(100% - 24px)}}
 [data-record-filters] .record-filter-row button{max-width:100%;overflow-wrap:anywhere}
 .list-producer-filter{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}
 .list-producer-filter .record-filter-row{flex:1 1 auto;min-width:0;max-width:100%;margin:0}
@@ -2238,6 +2249,8 @@ function decodeListKeys(list){
   row.dataset.key=decodeURIComponent(row.dataset.key);
 }
 decodeListKeys(content);
+const versionItem=content.hasAttribute('data-version-item') ? content.querySelector('[data-list-item]').dataset.key : '';
+const versionHost=versionItem && window.frameElement?.hasAttribute('data-version-card') ? window.frameElement : null;
 const actionPath=content.dataset.listPath || location.pathname;
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
 let saving=0,listSaveVersion=0,refreshNeeded=false;
@@ -2413,6 +2426,7 @@ const tableView=createRecordTable({content:()=>content,
  },
  eligibleChip:(data,search,{filters})=>{
   if((filters[unreadField] && data[unreadField]!==unreadMatch) || (search && !matchesWords(data,search))) return;
+  if(versionHost && data.state==='Closed') return 'all';
   return chipFor(data);
  },
  filterFacets,
@@ -2941,7 +2955,10 @@ function bindFeedbackForm(form){
    const scheduleWrite=['schedule','unschedule','start-now'].includes(action);
    const parkingReceipt=parks || scheduleWrite;
    const changesParking=parks || action==='unpark' || scheduleWrite;
-   const closeSavedCard=()=>tableView.closeCard(key,{focusShow:parkForDelivery});
+   const closeSavedCard=()=>{
+    tableView.closeCard(key,{focusShow:parkForDelivery});
+    versionHost?.dispatchEvent(new Event('version-card-closed'));
+   };
    const focusUnpark=buttonAction==='unpark' && document.activeElement===unpark;
    const usesWords=action==='tell' || action==='question';
    const saveAction=changesParking || action==='read' || action==='remove';
@@ -3360,7 +3377,10 @@ async function refresh(_supersede=false,current=()=>true){
  if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh()) return;
  const signal=listRequestSignal();
  const delivery=tableView.deliveryRequest();
- const query=delivery ? '?'+new URLSearchParams({delivery:delivery.delivery}) : '';
+ const params=new URLSearchParams();
+ if(delivery) params.set('delivery',delivery.delivery);
+ if(versionHost){params.set('item',versionItem);params.set('version-card','1');}
+ const query=params.size ? '?'+params : '';
  const requestStarted=performance.now();
  const response=await fetch(location.pathname+query,{cache:'no-store',signal});
  if(!response.ok) throw new Error('HTTP '+response.status);
@@ -3399,6 +3419,7 @@ function applyListSnapshot(fresh){
  restoreEvidenceDetails(fresh);
  const key=tableView.openItem?.dataset.key;
  const nextItem=key && rowIn(fresh,key);
+ if(versionHost && nextItem) nextItem.querySelector('.list-toggle').disabled=true;
  if(key && !nextItem) tableView.closeCard(key);
  const links=nextItem && !nextItem.dataset.listReviewVersion &&
   recordDetails(nextItem).querySelector('[data-list-review-links]');
@@ -3498,6 +3519,7 @@ function closeReviewCard(){
  card.frame.remove();
  reviewClose.disabled=false;
  reopenReturnedReview();
+ if(!reviewDialog.open) versionHost?.dispatchEvent(new Event('version-card-closed'));
 }
 async function refreshSavedReview(){
  if(saving || refreshingReview || !savedReviews.size) return;
@@ -3572,6 +3594,25 @@ document.addEventListener('click',event=>{
 });
 tableView.place();
 tableView.bind();bindListControls();tableView.apply(true);
+if(versionHost && tableView.openItem?.dataset.key===versionItem){
+ const dialog=document.createElement('dialog'),header=document.createElement('header'),close=document.createElement('button');
+ dialog.dataset.listReviewDialog='';dialog.dataset.versionListDialog='';
+ dialog.setAttribute('aria-label','List item');
+ close.type='button';close.className='list-review-close';close.dataset.close='';close.textContent='Close';
+ header.append(close);content.before(dialog);dialog.append(header,content);
+ const dismiss=()=>{if(!saving) versionHost.dispatchEvent(new Event('version-card-closed'));};
+ bindConsoleDialog(dialog,dismiss);
+ dialog.addEventListener('keydown',event=>{
+  if(event.key==='Escape' && !event.defaultPrevented){event.preventDefault();dismiss();}
+ });
+ document.versionListBusy=()=>Boolean(saving || document.querySelector('dialog[open]:not([data-version-list-dialog])'));
+ const publish=()=>versionHost.dispatchEvent(new CustomEvent('version-card-item',{
+  detail:reviewDialog.open ? '' : versionItem}));
+ new MutationObserver(publish).observe(reviewDialog,{attributes:true,attributeFilter:['open']});
+ const toggle=tableView.openItem.querySelector('.list-toggle');
+ toggle.disabled=true;
+ dialog.showModal();publish();
+}
 addEventListener('popstate',tableView.restorePlace);
 addEventListener('hashchange',tableView.restorePlace);
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);

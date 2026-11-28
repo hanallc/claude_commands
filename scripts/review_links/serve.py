@@ -47,6 +47,7 @@ from scripts.production import change_routing, change_review, record_store, staf
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, go_ledger, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, settings_page, staff_names, studio_page
 from scripts.review_links.review_link import private_name, tailscale_ip as tailscale_ip
+from scripts.review_links import version_notice
 from scripts.whoami import usage_store
 
 # A restart passes the listening socket to the new process in this variable.
@@ -991,8 +992,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 print(f"review-links console: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The console is not available.</p>"))
                 return None
+            content = page_frame.with_version_notice(content, version_notice.PATH)
             self.html_response(200, content, content_security_policy="default-src 'self'; script-src 'unsafe-inline'; "
                                + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
+            return None
+        if route.path == version_notice.PATH:
+            self.version_notice_request(route.query)
             return None
         if route.path == settings_page.PAGE_PATH:
             if self.tailscale_refusal() or not self.same_origin():
@@ -1337,6 +1342,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == kill_action.PATH:
             self.build_kill_post(route.query)
             return
+        if route.path == version_notice.PATH:
+            self.version_notice_request(route.query)
+            return
         refusal = self.tailscale_refusal()
         if refusal:
             if route.path in (console_tune.PAGE_PATH, settings_page.PAGE_PATH) or route.path.startswith(send_hold.HOLD_PATH + "/"):
@@ -1599,6 +1607,50 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def valid_request_token(self, token: object) -> bool:
         server = cast(ReviewLinksServer, self.server)
         return isinstance(token, str) and token.isascii() and secrets.compare_digest(token, server.new_item_token)
+
+    def version_notice_request(self, query: str) -> None:
+        """Read the current version notice or clear lines from it."""
+        post = self.command == "POST"
+        if self.tailscale_refusal() or not self.same_origin(required=post):
+            self.json_response(403, {"reason": "Use the console page to clear changes."})
+            return
+        if query or self.command not in ("GET", "HEAD", "POST"):
+            self.json_response(400, {"reason": "Use the console version notice."})
+            return
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            if post:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 1024 or self.headers.get_content_type() != "application/x-www-form-urlencoded":
+                    raise ValueError("Use the console version notice form.")
+                fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True, max_num_fields=3)
+                if set(fields) != {"token", "revision", "clear"} or any(len(values) != 1 for values in fields.values()):
+                    raise ValueError("Use the console version notice form.")
+                if not self.valid_request_token(fields["token"][0]):
+                    self.json_response(403, {"reason": "The clear token expired. Try again after the next live update."})
+                    return
+                selected = fields["clear"][0]
+                if selected == "all":
+                    scope = version_notice.ClearAll()
+                elif re.fullmatch(r"[1-9][0-9]*", selected):
+                    scope = version_notice.ClearOne(int(selected))
+                else:
+                    raise ValueError("Choose one change to clear or use Clear all.")
+                notice = version_notice.clear(server.root, fields["revision"][0], scope)
+            else:
+                notice = version_notice.read(server.root)
+        except version_notice.VersionChanged as error:
+            self.json_response(409, {"reason": str(error)})
+        except ValueError as error:
+            if post:
+                self.browser_failure(400, "Use the console version notice form.", error)
+            else:
+                self.browser_failure(503, "The version notice is unavailable.", error)
+        except OSError as error:
+            self.browser_failure(503, "The version notice could not save." if post else
+                                 "The version notice is unavailable.", error)
+        else:
+            self.json_response(200, notice.payload(server.new_item_token))
 
     def build_kill_options(self, query: str) -> None:
         if query or self.command != "GET":
@@ -2157,6 +2209,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
         try:
             with server.list_store_access(), server.staff_read_scope():
+                if fields.get("version-card") == ["1"] and server.mode is not ServerMode.LIST_FIXTURE:
+                    self.version_list_document(query, view, fields.get("item", [""])[0], delivery)
+                    return
                 live = server.mode is ServerMode.LIVE
                 reviews = server.list_review_records()
                 content = list_page.render(server.root, include_counts=live, defer_counts=True,
@@ -2170,6 +2225,27 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             print(f"review-links {view.log_name}: {error}", file=sys.stderr)
             self.html_response(503, change_page.document(f"<p>{html.escape(view.title)} page is not available.</p>"))
             return
+        self.html_response(200, content, delivery_pending=delivery)
+
+    def version_list_document(self, query: str, view: list_page.ListView, key: str, delivery: bool) -> None:
+        """Serve the List row named in the version notice."""
+        if self.tailscale_refusal() or not self.same_origin():
+            self.send_error(403)
+            return
+        server = cast(ReviewLinksServer, self.server)
+        if not key or not any(change.key == key for change in version_notice.read(server.root).changes):
+            self.send_error(404)
+            return
+        keeper_id, _, identity = key.partition("/")
+        keeper = staff.StaffId(keeper_id)
+        try:
+            entry = list_page.ListRecord(keeper, the_list.load(keeper, identity))
+        except FileNotFoundError:
+            self.send_error(404)
+            return
+        content = list_page.render(server.root, include_counts=False, status=server.delivery_status,
+                                   query=query, review_records=server.list_review_records(), view=view,
+                                   version_item=entry)
         self.html_response(200, content, delivery_pending=delivery)
 
     def studio_avatar(self, relative: str) -> BinaryIO | None:
@@ -3368,6 +3444,11 @@ def main(arguments: list[str]) -> int:
             service = ReviewLinksServer(address, root, mode=ServerMode.LIST_FIXTURE)
         with service as server:
             server.verified_tailscale_address = address[0]
+            if fixture is None:
+                try:
+                    version_notice.start(root, Path(__file__).resolve().parents[2])
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    print(f"review-links version notice: {error}", file=sys.stderr)
             print(f"review-links: serving {root} on {address[0]}:{server.server_port}", flush=True)
             try:
                 server.serve_forever()
