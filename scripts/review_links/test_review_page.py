@@ -44,7 +44,6 @@ from scripts.nightly_review import candidates
 from scripts.production.production_doc import read_production
 from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
-from scripts.production import the_list
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, the_list, update_registration
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
@@ -1392,6 +1391,7 @@ function installCardTransport(view){
         self.check_not_saved_snapshot_retry(page, initial, fresh, r"""
   const key='page-owner/C1',words='Read these notes in 30 minutes.';
   const form=await open(key),soon=form.querySelector('[data-later-preset="soon"]');
+  const recipients=JSON.parse(form.dataset.reviewRecipients)['later-with-words'];
   const start=Date.now();
   form.elements.feedback.value=words;
   form.querySelector('[data-later-toggle]').click();
@@ -1404,7 +1404,7 @@ function installCardTransport(view){
   await until(()=>posts.length===2 || action.textContent==='Open the card','the retry decision');
   check(posts.length===2 && posts[1].get('outcome')==='later' && posts[1].get('later')===posts[0].get('later') &&
    posts[1].get('feedback')===words && posts[1].get('revision')!==posts[0].get('revision') &&
-   posts[1].get('retry_recipients')==='[]',
+   recipients.length>0 && posts[1].get('retry_recipients')===JSON.stringify(recipients),
    'Later retries with the original deadline and words on the new revision.');
 """)
 
@@ -1517,12 +1517,12 @@ function installCardTransport(view){
   const toggle=document.querySelector('[data-review-draft-toggle]'),list=document.querySelector('#review-draft-list');
   toggle.click();
   const entry=list.querySelector('[data-draft-list-key="'+CSS.escape(key)+'"]');
-  const action=entry.querySelector('button'),notice=entry.querySelector('p');
+  const action=entry.querySelector('button'),notice=entry.querySelector('[data-review-choice-notice]');
   check(action.textContent==='Ask question' && !action.disabled,'The list offers the recorded card action.');
   action.click();
   await until(()=>posts.length>1 || (action.textContent==='Open the card' && !action.disabled),'the decision about the retry');
   check(posts.length===1,'The list sends nothing after the card changes.');
-  check(!list.hidden && action.textContent==='Open the card' &&
+  check(!list.hidden && !notice.hidden && action.textContent==='Open the card' &&
    notice.textContent==='Not saved: this item changed. Open the card to choose again.' &&
    entry.querySelector('textarea').value===words,'The list keeps the words and asks the user to choose again.');
   if(action.textContent==='Open the card'){
@@ -7138,8 +7138,12 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             with self.subTest(kind=opened.type):
                 self.assertEqual(waiting.state, review_items.ReviewState.WAITING)
                 self.assertEqual(waiting.actions, opened.actions)
-                self.assertEqual(review_page.form(waiting, browser, words_rows, 'fixture-revision'),
-                                 review_page.form(opened, browser, words_rows, 'fixture-revision'))
+                waiting_form = review_page.form(waiting, browser, words_rows, 'fixture-revision')
+                opened_form = review_page.form(opened, browser, words_rows, 'fixture-revision')
+                self.assertIn('data-review-state="Waiting"', waiting_form)
+                self.assertIn('data-review-state="Open"', opened_form)
+                self.assertEqual(waiting_form.replace('data-review-state="Waiting"', 'data-review-state="Open"', 1),
+                                 opened_form)
 
     def waiting_actions(self, kind: review_items.ReviewType, actions: tuple[str, ...], wait: str = 'question') -> None:
         """Use a fresh record for each action and check the displaced answer."""
@@ -9149,18 +9153,7 @@ window.fetch=async(url)=>{
             change_review.Visible(f'Change {number}', 'Read the diff', 'Check the result')
             for number in range(4, 9)
         ]), datetime.now(user_zone()).date(), '', fixture.production, record=staff.snapshot())
-        # The shared probe supplies a save response for both List and Review.
-        review_save = r'''<script>
-const fixtureSave=window.fetch;
-window.fetch=async(url,options)=>{
- const response=await fixtureSave(url,options);
- if(options?.method!=='POST' || !response.ok) return response;
- const result=await response.json();
- return {...response,json:async()=>({...result,words_saved:false})};
-};
-</script>'''
-        markup = browser_markup(self.root).replace('<head>', '<head>'+review_save, 1)
-        self.assertEqual(save_notice_failures(markup.encode(), 'works'), [[]])
+        self.assertEqual(save_notice_failures(browser_markup(self.root).encode(), 'works'), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_card_actions_fade_and_slide(self) -> None:
@@ -10830,7 +10823,8 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
     (gap ? 'Hides until Sun 14 Mar 03:30' : 'Hides until Sun 7 Nov 01:30'),
     'F005: '+SCENARIO+' summary shows the saved instant');
    form().requestSubmit(form().querySelector('[value="later"]'));await flush();
-   check(window.posts.at(-1)?.get('later')===expected,'F005: '+SCENARIO+' Save sends the compatible instant');
+   const save=window.posts.findLast(post=>post.get('outcome')==='later');
+   check(save?.get('later')===expected,'F005: '+SCENARIO+' Save sends the compatible instant');
   }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});

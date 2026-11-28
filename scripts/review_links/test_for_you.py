@@ -1090,6 +1090,7 @@ class ForYouTests(unittest.TestCase):
                 mismatch = rebuild_row.ComparedChanges("/nix/store/older", "b" * 40, "a" * 40, ())
                 _ = changes.write_text(json.dumps({machine: asdict(mismatch)}))
                 observation = rebuild_row.observed_need_path(self.cache, machine)
+                lock_path = rebuild_row.observation_lock_path(self.cache, machine)
                 refreshed = False
                 tried_to_publish = False
                 read_text = Path.read_text
@@ -1110,7 +1111,7 @@ class ForYouTests(unittest.TestCase):
                     value = read_text(path, encoding=encoding, errors=errors)
                     if path == changes and not tried_to_publish:
                         tried_to_publish = True
-                        with observation.with_suffix(".lock").open("a") as lock:
+                        with lock_path.open("a") as lock:
                             try:
                                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                             except BlockingIOError:
@@ -1133,7 +1134,7 @@ class ForYouTests(unittest.TestCase):
                 def replace_with_lock(source: str | Path, destination: str | Path) -> None:
                     path = Path(destination)
                     if path in (self.cache, changes):
-                        with observation.with_suffix(".lock").open("a") as lock:
+                        with lock_path.open("a") as lock:
                             with self.assertRaises(BlockingIOError):
                                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         published.append(path)

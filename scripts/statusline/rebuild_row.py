@@ -429,6 +429,8 @@ def cache_path(config: Path) -> Path:
         raise ValueError(f"Cannot expand the rebuild cache path {configured!r}.") from error
     if not path.is_absolute():
         raise ValueError(f"The rebuild cache path must be absolute: {configured!r}")
+    if path.name in ("", ".."):
+        raise ValueError(f"The rebuild cache path must name a file: {configured!r}")
     return path
 
 
@@ -785,10 +787,22 @@ def observed_need_path(cache: Path, machine: str) -> Path:
     return cache.with_name(f"{cache.name}-observed-needs-{machine}.json")
 
 
+def observation_lock_path(cache: Path, machine: str) -> Path:
+    """Use the Review counts directory unless the cache occupies its path."""
+    sibling = cache.with_name(f".{cache.name}-observed-needs-{machine}.lock")
+    if cache.name == "counts":
+        return sibling
+    return cache.parent / "counts" / sibling.name
+
+
 @contextmanager
 def _observation_lock(path: Path, report_close_failure: Callable[[Exception], None]) -> Generator[None]:
     """Protect updates to one machine's observed need."""
-    lock = path.with_suffix(".lock").open("a")
+    try:
+        lock = path.open("a")
+    except FileNotFoundError:
+        path.parent.mkdir(exist_ok=True)
+        lock = path.open("a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
@@ -820,7 +834,7 @@ def _lock_observations(cache: Path, *, report_failure: Callable[[str], None] = _
         for machine in MACHINES:
             try:
                 resources.enter_context(_observation_lock(
-                    observed_need_path(cache, machine), partial(report_lock_failure, machine)))
+                    observation_lock_path(cache, machine), partial(report_lock_failure, machine)))
             except (OSError, ValueError) as error:
                 report_lock_failure(machine, error)
         yield unavailable

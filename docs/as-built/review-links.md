@@ -3185,7 +3185,9 @@ Review keeps the draft when the server saves the record and reports a delivery f
 Response sends report delivery failures when Undo is off.
 When Review hides or removes a card, the notice shows its unsaved words.
 The notice uses the current draft. A confirmed retry clears the refusal for that draft.
-The **Not saved** button opens the list of unsent words. Each entry keeps the card's retry action.
+The **Not saved** button opens the list of unsent words. Each entry offers the original card action.
+A change to the card state, action, or recipient stops the retry.
+The entry shows **Open the card** and asks the user to choose again.
 When Review cannot save an action, it files a Bug for morty with the page, card, refusal, and submitted words.
 If delivery fails, Review sends the reply and then files a Bug for morty.
 The save report supplies a link to the Bug's List item after the first failure or a failed retry.

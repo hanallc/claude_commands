@@ -93,6 +93,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.issues = self.root / "issues"
+        _ = self.enterContext(patch.object(record_store, "configured_review_vaults", return_value=()))
         self.doc = self.root / "production.md"
         _ = self.doc.write_text(f"""# Builds
 > **Status: PRODUCTION — running.**
@@ -120,6 +121,7 @@ class ReviewSubmissionTests(unittest.TestCase):
             "XDG_CONFIG_HOME": str(self.root / "config"),
             "XDG_STATE_HOME": str(self.root / "key-state"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "REVIEW_LINKS_ROOT": str(self.root / "review")})))
         conf.path("machines").parent.mkdir(parents=True, exist_ok=True)
         _ = write_config_fixture(conf.path("machines"))

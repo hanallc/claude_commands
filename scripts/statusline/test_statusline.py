@@ -1797,7 +1797,6 @@ class RoleTests(ConfiguredShellTests):
         self.assertEqual(self.command_lines({**payload, "session_id": WORKER.id}, command=command), [
             "worker | ~",
             "90,000 | 5-hour 5% left | weekly 10% left",
-            "For you: Unavailable",
         ])
 
     def role(self, session_id: str = "aaaa-1111", **marks: str) -> str:
@@ -2822,7 +2821,7 @@ class RebuildRowTests(unittest.TestCase):
     def test_cache_stores_the_last_evaluation_and_clears_after_rebuild(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "statusline.conf"
-            cache = Path(directory) / "cache"
+            cache = Path(directory) / "counts"
             _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
                                   + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
             commands: list[list[str]] = []

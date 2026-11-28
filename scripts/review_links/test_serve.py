@@ -278,6 +278,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-server-test-")))
         self.root = temporary / "root"
         self.root.mkdir()
+        _ = self.enterContext(patch.object(record_store, "configured_review_vaults",
+                                           return_value=(temporary / "vault",)))
         _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
         _ = self.enterContext(patch.object(usage_store, "store_file", return_value=temporary / "usage.json"))
         staff_file = temporary / "staff.json"
@@ -6747,6 +6749,36 @@ addEventListener('DOMContentLoaded', async () => {
                 self.assertEqual(json.loads(payload)["words_delivery"], "delivered")
         self.assertEqual(send.call_args_list, [first])
 
+    def test_review_words_retry_reports_saved_after_the_row_is_removed(self) -> None:
+        case = self.review_fixture()
+        record = case.investigation(False)
+        record = investigation.answer(record.owner, record.id, 'The first result passed.')
+        key = review_items.investigation_record_key(record)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        body = case.card_body(cache.get(), key, 'read', 'Keep the notes.')
+        _ = write_config_fixture(conf.path('review_links'), 'delivery_tries=1\ndelivery_pause_seconds=0\n')
+
+        with (patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'),
+              patch.object(self.server, 'review_cache', cache)):
+            with patch.object(change_page, 'send_to_staff', side_effect=OSError('The owner is offline.')):
+                status, payload = self.post(review_page.PAGE_PATH, body)
+            self.assertEqual(status, 200)
+            first = cast(dict[str, object], json.loads(payload))
+            self.assertEqual(first['words_delivery'], 'failed')
+            self.assertNotIn(key, cache.get().records)
+
+            with patch.object(change_page, 'send_to_staff') as send:
+                status, payload = self.post(review_page.PAGE_PATH, body + '&feedback_retry=1')
+            self.assertEqual(status, 200)
+            saved = cast(dict[str, object], json.loads(payload))
+            self.assertEqual(saved['answer'], first['answer'])
+            self.assertEqual(saved['words_delivery'], 'delivered')
+            self.assertIs(saved['words_saved'], True)
+            self.assertIs(saved['detail_closed'], True)
+            self.assertNotIn('detail_unavailable', saved)
+            send.assert_called_once()
+
     def test_review_save_publishes_the_current_record_before_reply(self) -> None:
         case = self.review_fixture()
         proposal, _ = case.decisions()
@@ -8713,7 +8745,10 @@ addEventListener('DOMContentLoaded', async () => {
               patch.object(change_page, 'send_to_staff') as send):
             status, reply = self.post(review_page.PAGE_PATH, request)
             self.assertEqual(status, 400, reply)
-            self.assertEqual(json.loads(reply), {'reason': reason})
+            fields = cast(dict[str, str], json.loads(reply))
+            self.assertEqual(fields.keys(), {'reason', 'failure_attempt'})
+            self.assertEqual(fields['reason'], reason)
+            self.assertTrue(re.fullmatch(r'[0-9a-f]{32}', fields['failure_attempt']))
             write.assert_called_once()
             send.assert_not_called()
         self.assertEqual(path.read_bytes(), before)
@@ -9334,7 +9369,9 @@ addEventListener('DOMContentLoaded', async () => {
                                            "rebuild_machines": ["mac"], "rebuild_reasons": reasons})
 
     def test_for_you_routes_keep_action_count_when_the_observed_needs_lock_path_is_invalid(self) -> None:
-        _ = write_config_fixture(conf.path("statusline"), "rebuild.cache=/\n")
+        parent = self.root.parent / "blocked-cache-parent"
+        parent.touch()
+        _ = write_config_fixture(conf.path("statusline"), f"rebuild.cache={parent / 'rebuild-cache'}\n")
         for machine in rebuild_row.MACHINES:
             with self.subTest(machine=machine):
                 with patch.dict(os.environ, {"FOR_YOU_ACTIONS_DIR": str(self.root.parent / f"actions-{machine}")}):
@@ -9367,7 +9404,7 @@ addEventListener('DOMContentLoaded', async () => {
                 observed = {machine: expected.path_for(machine), other: f"/nix/store/older-{other}"}
                 details = comparison_cache_details(expected, observed, rebuild_row.RunningSystemProbes(True, True))
                 _ = cache.write_text(f"rebuild {other}\n9999999999\n{config}\n{details}\n", encoding="utf-8")
-                lock_path = rebuild_row.observed_need_path(cache, machine).with_suffix(".lock")
+                lock_path = rebuild_row.observation_lock_path(cache, machine)
                 closed = 0
 
                 def open_with_close_error(path: Path, mode: str = "r", buffering: int = -1,
@@ -12730,6 +12767,7 @@ class ServerAddressHealthTests(unittest.TestCase):
         folder = Path(root)
         staff_file = folder / "staff.json"
         _ = staff_file.write_text('{"schema":2,"rows":[]}', encoding="utf-8")
+        _ = self.enterContext(patch.object(record_store, "configured_review_vaults", return_value=()))
         self.elapsed = 100.0
         self.address_checks = []
         self.next_address = lambda: "127.0.0.1"
@@ -12744,6 +12782,7 @@ class ServerAddressHealthTests(unittest.TestCase):
         })))
         _ = self.enterContext(patch.object(time, "monotonic", side_effect=lambda: self.elapsed))
         _ = self.enterContext(patch.object(serve, "tailscale_ip", side_effect=self.read_address))
+        _ = self.enterContext(patch.object(review_page.ReviewSnapshotCache, "start"))
         # The restart tests exercise scans of loaded modules.
         _ = self.enterContext(patch.object(serve, "loaded_module_stamps", return_value={}))
         observations = self
@@ -12937,6 +12976,7 @@ class ServerCodeHealthTests(unittest.TestCase):
 
 class ServerCodeRestartTests(unittest.TestCase):
     def test_a_changed_module_restarts_the_same_process_and_answers_a_request_sent_during_the_restart(self) -> None:
+        source = Path(__file__).resolve().parents[2]
         checkout = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-restart-test-")))
         server_file = checkout / "scripts/review_links/serve.py"
         server_file.parent.mkdir(parents=True)
@@ -12954,6 +12994,8 @@ import sys
 import time
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
+from scripts.production import record_store
 from scripts.review_links import serve
 
 checkout = Path(__file__).parent
@@ -12978,15 +13020,16 @@ class ObservedServer(serve.ReviewLinksServer):
         print(line, file=sys.__stdout__, flush=True)
 
 serve.ReviewLinksServer = ObservedServer
-with redirect_stdout(sys.stderr):
+with patch.object(record_store, "configured_review_vaults", return_value=()), redirect_stdout(sys.stderr):
     raise SystemExit(serve.main(["--port", os.environ.get("REVIEW_TEST_PORT", "0")]))
 '''))
         errors_path = checkout / "errors.txt"
         errors = self.enterContext(errors_path.open("w"))
         child: subprocess.Popen[str] = subprocess.Popen(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-P", "-B", str(driver)],
-            cwd=checkout, env={**os.environ, "CONF_DIR": str(checkout), "REVIEW_LINKS_ROOT": str(root),
+            [str(source / "scripts/lib/py"), "-P", "-B", str(driver)],
+            cwd=source, env={**os.environ, "CONF_DIR": str(checkout), "REVIEW_LINKS_ROOT": str(root),
                                "SHOWRUNNER_STATE_DIR": str(checkout / "state"),
+                               "STAFF_FILE": str(checkout / "staff.json"),
                                "CLAUDE_PYTHON": sys.executable},
             stdout=subprocess.PIPE, stderr=errors, text=True,
         )
@@ -13024,6 +13067,9 @@ with redirect_stdout(sys.stderr):
             response = during.getresponse()
             self.assertEqual(response.status, 200)
             self.assertEqual(response.read().decode(), (root / "answer.txt").read_text())
+        except ConnectionError as error:
+            error.add_note(errors_path.read_text())
+            raise
         finally:
             during.close()
         second = read_start()
