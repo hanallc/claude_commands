@@ -1,7 +1,7 @@
 """Placement decisions keep submitting owners separate from remote executions."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from typing import Literal
@@ -518,6 +518,7 @@ class FreshHostEvidence:
     executions: tuple[tuple[ProviderClaimReference, execution_identity.ExecutionEvidence], ...] = ()
     holder: ResourceHolder = ResourceHolderUnknown()
     provider_diagnostic: BusyProviderDiagnostic | NoProviderDiagnostic = NO_PROVIDER_DIAGNOSTIC
+    probe_answered: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)

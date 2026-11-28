@@ -129,6 +129,7 @@ class SavedPlacementAssignment:
     guest_proof_required: bool = False
     confirmed_guest_start: ConfirmedGuestStart | GuestStartNotRecorded = GuestStartNotRecorded()
     guest_start: execution_identity.GuestExecution | GuestStartNotReported = GuestStartNotReported()
+    inferred_loss: bool = field(default=False, kw_only=True)
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
