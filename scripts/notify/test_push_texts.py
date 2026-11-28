@@ -151,7 +151,7 @@ class PushTextTests(unittest.TestCase):
                 self.assertIn("Sign out of claude.ai in the browser.", push.body)
                 self.assertIn("Sign in as that account.", push.body)
                 self.assertIn("run /login in a Claude session on that account.", push.body)
-                self.assertNotIn("No action needed.", push.message)
+                self.assertEqual(push.message, push.body)
 
     def entry(self) -> PushText:
         return PushText("test", "test", "decision", "Choose {version}", ActionTemplate("Reply upgrade or wait."),
@@ -413,6 +413,14 @@ class PushTextTests(unittest.TestCase):
         push = push_texts.render_entry(self.entry(), {"version": "1.2"})
         self.assertEqual(push.session, NO_SESSION_LINE)
         self.assertEqual(push.message, "Action: Reply upgrade or wait.\nThe check passed on 1.2.")
+
+    def test_catalog_note_with_header_has_only_its_body(self) -> None:
+        entry = replace(self.entry(), need="note", action=push_texts.NoActionNeeded(), header=True)
+        module = SimpleNamespace(ENTRIES=(entry,))
+        with mock.patch.object(importlib, "import_module", return_value=module):
+            push = push_texts.render(entry.id, version="1.2")
+        self.assertTrue(push.header)
+        self.assertEqual(push.message, "The check passed on 1.2.")
 
     def test_session_only_placeholder_is_required_and_fingerprinted(self) -> None:
         entry = replace(self.entry(), session=SessionTemplate("{session}"))

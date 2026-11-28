@@ -20,13 +20,13 @@ from uuid import UUID
 
 from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import codex_test_support as codex_fixture
-from scripts.direct import assign, progress_history, recorder_state, remove_run_scratch
+from scripts.direct import assign, phase_reservation, progress_history, recorder_state, remove_run_scratch
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssignmentFixture, InProcessAssignment, assignment_helpers, invoke_assignment, read_object
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.direct.test_phase_reservation import make_fixture_worktree
 from scripts.herdr import herdr, turn_end, worker_panes
-from scripts.herdr.test_worker_panes import live_detached_run
+from scripts.herdr.test_worker_panes import idle_transcript, live_detached_run
 from scripts.lib import conf, unit_runs
 from scripts.lint import style_review
 from scripts.lib.atomic_file import write_text_atomic
@@ -844,7 +844,8 @@ class AssignLauncherTests(HookAssignmentFixture):
             )))
             result = self.launch(role, "--phase", "3")
         if role != "review":
-            self.assertEqual(calls.read_text().splitlines(), ["sid-director.phase-3 check reviewed.txt --json"])
+            director = self.native.fixture.parent.current_session
+            self.assertEqual(calls.read_text().splitlines(), [f"{director}.phase-3 check reviewed.txt --json"])
         return result
 
     def test_herdr_assignment_claims_the_phase_before_the_worker_assignment(self) -> None:
@@ -869,6 +870,55 @@ class AssignLauncherTests(HookAssignmentFixture):
 
         self.assertEqual((self.session_dir / "phases/7/worktree").read_text().strip(), str(other))
         self.assertEqual(directories, [str(other)])
+
+    def test_herdr_assignments_in_open_phases_use_distinct_berth_sessions(self) -> None:
+        key = phase_reservation.SESSION_ENVIRONMENT
+        director = self.native.fixture.parent.current_session
+        self.record("start-phase", "--phase-id", "8", "--phase-title", "Second phase")
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": director}):
+            _ = self.successful("implement", "--new-worker", "impl", "--phase", "7")
+            self.write_phase_prompt("8", "Second phase")
+            _ = self.successful("implement", "--new-worker", "impl2", "--phase", "8")
+        self.assertEqual([env.get(key) for _, _, env in self.native.fixture.world.requests],
+                         [f"{director}.phase-7", f"{director}.phase-8"])
+
+    def test_herdr_assignment_relaunches_an_idle_worker_without_the_phase_key(self) -> None:
+        parent = self.native.fixture.parent
+        world = self.native.fixture.world
+        name = staff.WorkerName.parse("impl")
+        opened = worker_panes.start_or_resume(parent.id, name, "impl")
+        assert isinstance(opened, worker_panes.OpenWorker)
+        idle_transcript(opened.row)
+        key = phase_reservation.SESSION_ENVIRONMENT
+        _ = world.processes[world.foreground[opened.pane][0]].environment.pop(key, None)
+        keys: list[str | None] = []
+
+        def read_key() -> None:
+            pane = self.native.agent.submitted[-1][0]
+            self.assertEqual(pane, opened.pane)
+            keys.append(world.processes[world.foreground[pane][0]].environment.get(key))
+
+        self.native.agent.during_prompt = read_key
+        _ = self.successful("implement", "--to", name.value)
+        self.assertEqual(keys, [f"{parent.current_session}.phase-7"])
+        self.assertEqual(world.launches[-1], herdr.ExistingPane(opened.pane, opened.terminal))
+        self.assertEqual(self.assignment_records()[name.value]["thread_id"], opened.row.current_session)
+
+    def test_herdr_assignment_uses_a_codex_directors_phase_session(self) -> None:
+        director = self.native.fixture.parent.current_session
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": director}):
+            _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            _ = self.successful("implement")
+        _, _, environment = self.native.fixture.world.requests[-1]
+        self.assertEqual(environment.get(phase_reservation.SESSION_ENVIRONMENT), f"{director}.phase-7")
+
+    def test_herdr_assignment_replaces_an_inherited_berth_session_for_another_phase(self) -> None:
+        director = self.native.fixture.parent.current_session
+        key = phase_reservation.SESSION_ENVIRONMENT
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": director, key: f"{director}.phase-8"}):
+            _ = self.successful("implement")
+        _, _, environment = self.native.fixture.world.requests[-1]
+        self.assertEqual(environment.get(key), f"{director}.phase-7")
 
     def test_herdr_assignment_refuses_a_failed_phase_claim_before_the_worker_assignment(self) -> None:
         status = self.session_dir / "phases/3/impl_status"

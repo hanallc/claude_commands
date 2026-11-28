@@ -1674,6 +1674,15 @@ class PlacementTests(unittest.TestCase):
                     assert isinstance(reply, wire.Assignment), reply
                     self.assertEqual(reply.assignment.destination, guest.destination)
                     continue
+                if case == "stale":
+                    assert isinstance(reply, wire.PlacementWait), reply
+                    self.assertEqual(reply.wait, wire.PlacementEvidenceWait())
+                    self.assertEqual(reply.eligibility, (
+                        placement.CandidateEligibility(guest.destination, placement.EvidenceNeeded(reason)),
+                        placement.CandidateEligibility(local_candidate(fixture).destination, ALLOWED_HOST),
+                    ))
+                    self.assertNotIn(request.episode, fixture.server.reservations)
+                    continue
                 assert isinstance(reply, wire.LocalPlacementGranted), reply
                 self.assertEqual(reply.assignment.destination, local_candidate(fixture).destination)
                 self.assertEqual(fixture.server.placement_eligibility[request.episode][0],
@@ -1743,7 +1752,7 @@ class PlacementTests(unittest.TestCase):
                 waiting, = fixture.server.handle_request(request)
                 assert isinstance(waiting, wire.PlacementWait), waiting
                 self.assertEqual(waiting.eligibility[0].eligibility,
-                                 placement.TemporaryExclusion("mac_linux_reading_required"))
+                                 placement.EvidenceNeeded("mac_linux_reading_required"))
                 _ = publish_candidate(fixture, request)
                 _ = fixture.run_pass()
                 assignment = assignment_for(fixture, request)
@@ -4777,19 +4786,42 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
     def test_mac_probe_recovers_the_committed_mirror_root(self) -> None:
         with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
-            settings, request, _destination = self.target_settings_fixture(fixture, platform="macos")
+            settings, request, destination = self.target_settings_fixture(fixture, platform="macos")
             _ = write_config_fixture(settings, "linux_only.hana=\n")
             mac_settings = fixture.root / "mac_test.conf"
             _ = write_config_fixture(mac_settings, "mirror_root=~/fixture-mirrors\n")
             self.commit_settings(mac_settings)
             _ = mac_settings.write_text(mac_settings.read_text().replace(
                 "mirror_root=~/fixture-mirrors", "mirror_root=/outside"))
-            reply = offload.CommandOutput(0, "free_gib=1000\nhost=fixture\nrc=0\n", "")
-            with mock.patch.object(offload.ProcessController, "capture", return_value=reply) as probe:
-                evidence = self.read_target(fixture, request)
+            reply = offload.CommandOutput(0, "mirror_setup=0\tready\nfree_gib=1000\nhost=fixture\nrc=0\n", "")
+            mirror = eligibility.LegacyMirrorName("hana")
+            probe_mac_host = offload.probe_mac_host
+
+            def check_setup(controller: offload.ProcessController, config: eligibility.SshProbeSettings,
+                            target: str, mirrors: Sequence[str], *,
+                            setup_mirrors: Sequence[eligibility.LegacyMirrorName] = ()) -> offload.MacHostProbeSnapshot:
+                probe = probe_mac_host(controller, config, target, mirrors, setup_mirrors=setup_mirrors)
+                assert isinstance(probe, offload.MacHostProbeSnapshot), probe
+                self.assertEqual(probe.setup, {mirror: offload.MacMirrorSetup.READY})
+                return probe
+
+            server = fixture.server
+            key = server.host_evidence_key(request, destination)
+            server.host_requests[key] = request
+            worker = ManualEvidenceWorker(key, fixture.read_host_evidence, fixture.clock, server.reading_events, 1)
+            try:
+                with (mock.patch.object(offload.ProcessController, "capture", return_value=reply) as capture,
+                      mock.patch.object(offload, "probe_mac_host", side_effect=check_setup)):
+                    worker.probe_mac_cycle()
+                    evidence = worker.evidence(key)
+            finally:
+                worker.close()
             assert isinstance(evidence, placement.FreshHostEvidence), evidence
             self.assertEqual(evidence.eligibility, ALLOWED_HOST)
-            self.assertIn("fixture-mirrors/hana", str(probe.call_args))
+            capture.assert_called_once()
+            script = cast(list[str], capture.call_args.args[0])[-1]
+            self.assertIn("'fixture-mirrors'/'hana'", script)
+            self.assertIn("fixture-mirrors".encode().hex(), script)
             self.assertEqual(warnings.getvalue().count("mirror_root='/outside'"), 1)
 
     def test_edit_during_read_uses_the_stamp_of_the_read_contents(self) -> None:
@@ -5298,6 +5330,10 @@ class ManualEvidenceWorker(service.HostEvidenceWorker):
     @override
     def _read(self) -> None:
         return
+
+    def probe_mac_cycle(self) -> None:
+        if not self._probe_mac_cycle(self.key):
+            raise AssertionError("the Mac probe stopped")
 
     def probe_next(self) -> placement.HostEvidenceKey:
         with self.lock:

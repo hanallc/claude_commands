@@ -269,6 +269,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/add_showrunner_test_support.py` | read | staff.json path |
 | `scripts/production/add_unit.py` | write | cli_result, ensure, initial_snapshot, native_id, operation, row_operation, set_worktree |
 | `scripts/production/add_unit_test_support.py` | write | find, native_id, record_production, set_worktree, update_current_session |
+| `scripts/production/behavior_request.py` | read | StaffId identifies the List keeper from the saved item path. |
 | `scripts/production/behavior_review.py` | read | caller_identity identifies the requester. StaffId identifies the owner of the saved question. StaffRefused reports a staff refusal. |
 | `scripts/production/broadcast.py` | read | initial_snapshot supplies producer membership. StaffUnreadable reports a failure to read it. |
 | `scripts/production/census.py` | read | StaffId |
@@ -294,7 +295,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/fast_track.py` | read | copies.source_owner |
 | `scripts/production/waiting.py` | read | Production.owner.id |
 | `scripts/production/gate.py` | read | snapshot, initial_snapshot, doc_owner |
-| `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/goal.py` | read | StaffId type for the producer and List owner |
 | `scripts/production/next_item.py` | read | snapshot |
@@ -409,7 +409,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 254 accessor rows (44 write, 209 read, and 1 owner).
+The table has 255 accessor rows (44 write, 210 read, and 1 owner).
 
 ## Approved copies
 

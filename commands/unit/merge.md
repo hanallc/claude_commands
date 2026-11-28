@@ -124,7 +124,7 @@ Other <WorkerRuns/> cancellation rules apply after rollout.
 | --- | --- |
 | sdlc `land.sh`, `land_mac_ok.sh`, `queue_runner.sh` | Retained merge worker |
 | `merge_checkpoint.py --production sdlc` | Merge worker |
-| `merge_gate.py --checkout . --tests-only` | Gate worker |
+| `gate.py --checkout . --tests-only` | Gate worker |
 | Hana gate scripts through `copies.py run --repo <integration> --commit <sha>` | Gate worker at the recorded commit |
 | `verify.sh check`, `test`, `lint` | Gate worker |
 | `cargo fmt`, `cargo test`, `cargo nextest` | Gate worker under the production's existing build rules |
@@ -150,6 +150,8 @@ Run Hana smoke with `copies.py run --repo <integration> --commit <sha> -- bash <
 Before a land, run `scripts/lib/py scripts/production/behavior_check.py run --repo CHECKOUT --base BASE --commit COMMIT --production OWNER`.
 Use the fetched destination tip for BASE and the exact commit to push for COMMIT.
 If the review starts, collect its reply with the same command when it completes.
+The check clears verified requests that follow Nate's newest words.
+Departures, uncertainty, and unverified requests need a question.
 On "Nate was not asked", send the printed finding to the unit named in `Ask UNIT (phase PHASE)`.
 If the check prints a commit instead, send the finding to its author.
 The unit writes the question template JSON and runs the same check with `--question FILE`.

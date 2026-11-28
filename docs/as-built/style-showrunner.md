@@ -298,7 +298,21 @@ Other sibling files remain separate.
 
 ### Ticket selection, busy files and the berth board
 
-**Board.** `berth_board.read_board(repo) -> Board | BoardUnavailable(reason)` runs `cargo-berth board --json` and parses the envelope first. Status `unconfigured` with payload kind `no_facts`, or no reservation, is an empty `Board`. `ledger_unreadable`, empty or non-JSON output, a non-`board` envelope, missing fields, conflicting snapshots of one id, or a reference to an unknown id is `BoardUnavailable`. `Board.reservations()` collects `targets[].reservations` and the `ready_now`, `waiting`, `unresolved_overlaps`, `unconstrained_reservations` and `resolved` sections, deduplicated. `Reservation.blocks(path)` is true only when `edit_blocking_status == "blocking"` and a scope matches (`file:<path>` or bare path exactly, `tree:<root>` by prefix, `tree:.` all). Never persisted.
+**Board.** `berth_board.read_board(repo)` runs `cargo-berth board --json` and parses the envelope first.
+An unconfigured repository or a repository with no reservations returns an empty `Board`.
+An unreadable ledger, empty output, invalid JSON, or an invalid board envelope returns `BoardUnavailable`.
+Invalid fields, conflicting snapshots of one ID, or a reference to an unknown ID also return `BoardUnavailable`.
+`Board.reservations()` collects each reservation once from `targets[].reservations` and the board sections.
+The sections are `ready_now`, `waiting`, `unresolved_overlaps`, `unconstrained_reservations`, and `resolved`.
+The reader does not persist the board.
+`Reservation.blocks(path)` matches declared scopes when the reservation has `blocking` status.
+File scopes match the exact path. Tree scopes match their root and its descendants. `tree:.` matches all paths.
+
+**Mac fix write-back.** `hold_filter` checks declared scopes for local ownership and merge protection for foreign holders.
+An unavailable merge extent uses its retained evidence.
+An active plan shrink uses its declared scope.
+An exact local file scope permits the write even when a foreign holder protects that path.
+An outstanding reservation whose protected tip is in HEAD history does not withhold paths.
 
 **Busy files.** `busy_files(...) -> BusyFiles(board, paths)` supplies path and blocking-reservation membership.
 `unit_file_holders` reads the parent and style productions' staff units.
@@ -614,7 +628,7 @@ Follow `~/.claude/docs/style_production.md`, section Sync, for the Style showrun
   After delivery, `acknowledge_sync_wait` clears the wait by its token.
   If the message goes to the queue, the next merge sends a notice to the director's current roster address.
 
-**Sync trigger.** `merge_checkpoint.notify_style` and `merge_gate.notify_style` call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges.
+**Sync trigger.** `merge_checkpoint.notify_style` and `gate.notify_style` call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges.
 Both callers use a 30 s subprocess timeout and print one line on failure.
 When branch `b` has a style production, `send.py --timeout 10` sends `branch point <b> moved to <sha7>; sync.`
 The send uses the key `style-sync:<showrunner name>` and has a 35 s limit.

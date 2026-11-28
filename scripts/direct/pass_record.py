@@ -1264,6 +1264,11 @@ def dispatch_delivery(passed: dict[str, object]) -> DispatchDelivery:
     )
 
 
+def assignment_status_file(passed: dict[str, object]) -> str:
+    """Read the status file path recorded for the assignment."""
+    return string(passed.get("assign_status_file")) or dispatch_delivery(passed).actions.status_file
+
+
 def worker_artifact(path: Path, slot: str, worker: str) -> Path:
     """Keep artifacts with the worker selected for the recorded slot."""
     return path.with_name(worker + path.name.removeprefix(slot)) if path.name.startswith(slot + "_") else path
@@ -1375,6 +1380,8 @@ def _finish_pass(args: argparse.Namespace) -> CanceledWorkerPass | NoCanceledPan
     if instance_id := optional_arg(args, "pass_instance_id"):
         if current.get("instance_id") != instance_id:
             return NoCanceledPane.NONE
+    if status == "canceled" and (status_file := assignment_status_file(current)):
+        write_text_atomic(Path(status_file), "error\n")
     closed = close_slot_pass(session_dir, state, slot, status, now_epoch())
     if orphaned and not closed:
         raise SystemExit(

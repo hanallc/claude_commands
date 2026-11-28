@@ -2116,6 +2116,7 @@ fi
         mirror = copies.RemoteMirror(str(self.unit_staff_id), copies.SelectedRepository("hana"), "mac",
                                      str(self.root / "mirrors/alpha"), "alpha-session")
         with local_remote_transport(self.root):
+            _ = write_config_fixture(self.root / ".claude/config/mac_test.conf", "mirror_root=~/mirrors\n")
             self.assertEqual(publish_mirror(mirror), 0)
             code, output = self.retire()
         self.assertEqual(code, 0, output)
