@@ -1402,19 +1402,17 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
             has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
             content_changes = {path for path in changed if not path.startswith("config/")}
-            base_blobs = revision_files(repo, base.commit) if has_folder_records else {}
-            scanned_parents = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set[str]()
-            retained = source_blobs(paths | dirty, blobs)
             python = {path for path in changed if path.endswith(".py")}
             removed = {path for path in python if not (repo / path).is_file()}
+            needs_base_blobs = has_folder_records or bool(removed) or cached.writable_path is not None
+            base_blobs = revision_files(repo, base.commit) if needs_base_blobs else {}
+            scanned_parents = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set[str]()
+            base_paths = {path for path in base_blobs if path.endswith(".py")}
             old_graph: dict[str, set[str]] = {}
             if removed:
-                old_blobs = base_blobs if has_folder_records else revision_files(repo, base.commit)
-                old_paths = {path for path in old_blobs if path.endswith(".py")}
                 with run.graph_build():
-                    old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached.facts, worktree=False, run=run).imports
-                retained.update(source_blobs(old_paths, old_blobs))
-            cached.retain(retained)
+                    old_graph = graph_for_files(repo, base_paths, base_blobs, set(), cached.facts, worktree=False, run=run).imports
+            cached.retain(source_blobs(paths | dirty, blobs) | source_blobs(base_paths, base_blobs))
         folder_stems: dict[str, set[str]] = defaultdict(set)
         for source in python:
             if not is_test_module(source):

@@ -837,6 +837,39 @@ def shadow(root):
         self.assertTrue(affected.read_fact_cache(cache))
         self.assertEqual((old.read_bytes(), old.stat().st_mtime_ns), before)
 
+    def test_fact_cache_keeps_cached_base_blobs_and_prunes_unrelated_blobs(self) -> None:
+        cached_path = "scripts/cached.py"
+        missing_path = "scripts/missing.py"
+        self.write(cached_path, "VALUE = 1\n")
+        self.write(missing_path, "VALUE = 2\n")
+        self.certify()
+        cached_base = self.git("rev-parse", f"HEAD:{cached_path}")
+        missing_base = self.git("rev-parse", f"HEAD:{missing_path}")
+        self.write(missing_path, "VALUE = 3\n")
+        _ = self.commit()
+        unrelated = self.git("rev-parse", f"HEAD:{missing_path}")
+        _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
+        self.write(cached_path, "VALUE = 4\n")
+        self.write(missing_path, "VALUE = 5\n")
+        _ = self.commit()
+
+        with (mock.patch.object(ast, "parse", wraps=ast.parse) as parse,
+              mock.patch.object(affected, "blob_texts", wraps=affected.blob_texts) as read,
+              mock.patch.object(affected, "revision_files", wraps=affected.revision_files) as listing):
+            result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+
+        self.assertIsInstance(result, affected.AffectedSelection)
+        self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list], [cached_path, missing_path])
+        read.assert_not_called()
+        listing.assert_called_once_with(self.repo, self.base.commit)
+        facts = affected.read_fact_cache(self.cache_file())
+        assert facts is not None
+        self.assertIn(cached_base, facts)
+        self.assertNotIn(missing_base, facts)
+        self.assertNotIn(unrelated, facts)
+        for path in (cached_path, missing_path):
+            self.assertIn(self.git("rev-parse", f"HEAD:{path}"), facts)
+
     def test_invalid_cache_rebuilds_without_changing_selection(self) -> None:
         self.write("scripts/subject.py", "VALUE = 1\n")
         self.add_test("checks/test_reader.py", "from scripts import subject\n")
