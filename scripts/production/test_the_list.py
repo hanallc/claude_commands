@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
@@ -28,7 +28,7 @@ from scripts.console_text.test_support import accepting_console_text
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
-from scripts.lib import atomic_file, conf, main_publish
+from scripts.lib import atomic_file, conf, main_publish, operation_deadline
 from scripts.message import send_result, session_send
 from scripts.notify import review
 from scripts.production import change_review, delivery_state, investigation, record_store, repeat_rule, session_pane, staff, the_list, update_registration
@@ -583,7 +583,9 @@ else:
                     self.assertEqual(sent.read_text(), "")
                     extra_logs = missed_days + int(case == "Lose receipt")
                     with patch.object(the_list, "now", return_value=tick), redirect_stderr(io.StringIO()):
-                        the_list.fire_scheduled(UPKEEP_INTERVAL)
+                        with (patch.object(time, "monotonic", return_value=0.0),
+                              patch.object(the_list, "monotonic", return_value=0.0)):
+                            the_list.fire_scheduled(UPKEEP_INTERVAL)
                         working = the_list.load(MORTY.id, item.id)
                         self.assertIs(working.state, the_list.ItemState.WORKING)
                         self.assertEqual(len(working.log), len(item.log) + 1 + extra_logs)
@@ -701,10 +703,12 @@ else:
         producer = the_list.RunNotice.PRODUCER_START
 
         def send(_identity: str, _delivery: the_list.RunDelivery, notice: the_list.RunNotice,
-                 _capture: the_list.ScheduledNoticeCapture) -> None:
+                 _capture: the_list.ScheduledNoticeCapture, on_started: Callable[[], None]) -> bool:
+            on_started()
             sends.append(notice)
             if notice is owner:
                 clock.return_value = cast(float, getattr(the_list, "_SCHEDULED_SEND_SECONDS"))
+            return True
 
         with (patch.object(time, "monotonic", clock), patch.object(the_list, "monotonic", clock),
               patch.object(remote, "local_machine", return_value="natedev"),
@@ -724,6 +728,62 @@ else:
                 the_list.ScheduledNotice(owner, the_list.NoticeState.ACCEPTED),
                 the_list.ScheduledNotice(producer, the_list.NoticeState.ACCEPTED),
             ))
+
+    def test_short_upkeep_budget_sends_one_notice_per_item_on_each_pass(self) -> None:
+        schedule = the_list.ScheduledRun(START, "Check the figures.")
+        changes: the_list.ItemChanges = {"state": the_list.ItemState.SCHEDULED, "schedule": schedule}
+        first = self.add("First", changes=changes)
+        second = self.add("Second", changes=changes)
+        owner, producer = the_list.RunNotice.OWNER_START, the_list.RunNotice.PRODUCER_START
+        sends: list[tuple[str, the_list.RunNotice]] = []
+        budget = cast(float, getattr(the_list, "_SCHEDULED_SEND_SECONDS")) / 2
+
+        def send(identity: str, _delivery: the_list.RunDelivery, notice: the_list.RunNotice,
+                 _capture: the_list.ScheduledNoticeCapture, on_started: Callable[[], None]) -> bool:
+            on_started()
+            sends.append((identity, notice))
+            return True
+
+        with (patch.object(time, "monotonic", return_value=0.0),
+              patch.object(the_list, "monotonic", return_value=0.0),
+              patch.object(remote, "local_machine", return_value="natedev"),
+              patch.object(the_list, "_send_scheduled_notice", side_effect=send),
+              operation_deadline.within(budget)):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            self.assertEqual(sends, [(first.id, owner), (second.id, owner)])
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        self.assertEqual(sends, [(first.id, owner), (second.id, owner),
+                                 (second.id, producer), (first.id, producer)])
+        for item in (first, second):
+            saved = the_list.load(MORTY.id, item.id)
+            self.assertEqual(saved.run_deliveries[0].notices, (
+                the_list.ScheduledNotice(owner, the_list.NoticeState.ACCEPTED),
+                the_list.ScheduledNotice(producer, the_list.NoticeState.ACCEPTED),
+            ))
+
+    def test_deadline_before_sender_start_restores_ready(self) -> None:
+        schedule = the_list.ScheduledRun(START, "Check the figures.")
+        item = self.add("Restore ready", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        clock = Mock(return_value=0.0)
+        owner, producer = the_list.RunNotice.OWNER_START, the_list.RunNotice.PRODUCER_START
+
+        def expire(*_args: object) -> list[str]:
+            delivery = the_list.load(MORTY.id, item.id).run_deliveries[0]
+            self.assertEqual(delivery.notices[0], the_list.ScheduledNotice(owner, the_list.NoticeState.SENDING))
+            clock.return_value = cast(float, getattr(the_list, "_SCHEDULED_ITEM_SECONDS"))
+            return ["unused"]
+
+        with (patch.object(time, "monotonic", clock), patch.object(the_list, "monotonic", clock),
+              patch.object(remote, "local_machine", return_value="natedev"),
+              patch.object(the_list, "_scheduled_notice_command", side_effect=expire),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("The sender must stay stopped.")) as popen):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        popen.assert_not_called()
+        saved = the_list.load(MORTY.id, item.id)
+        delivery = saved.run_deliveries[0]
+        self.assertIs(delivery.confirmation, the_list.AwaitingInstruction.OWNER)
+        self.assertEqual(delivery.notices, (the_list.ScheduledNotice(owner), the_list.ScheduledNotice(producer)))
+        self.assertNotIn("Delivery uncertain", "\n".join(str(entry.what) for entry in saved.log))
 
     def check_scheduled_instruction_interrupt(self, attempted: Path) -> None:
         schedule = the_list.ScheduledRun(START, "Check the figures.")

@@ -2737,17 +2737,24 @@ class ScheduledNoticeCapture:
 
 
 def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNotice,
-                           capture: ScheduledNoticeCapture) -> None:
-    budget = operation_deadline.remaining(_SCHEDULED_SEND_SECONDS)
-    deadline = monotonic() + budget
-    sender = _scheduled_notice_command(identity, delivery, notice)
+                           capture: ScheduledNoticeCapture, on_started: Callable[[], None]) -> bool:
     # Keep the sender output available even if a child keeps its descriptors open.
     report, output, errors = capture.report, capture.output, capture.errors
-    command = ["timeout", "--signal=KILL", "--kill-after=1", str(budget), sys.executable, "-I", "-c",
-               _WAIT_FOR_SENDER_GROUP, str(Path(__file__).resolve().parents[2]), str(report.fileno()), *sender]
+    try:
+        budget = operation_deadline.remaining(_SCHEDULED_SEND_SECONDS)
+        deadline = monotonic() + budget
+        sender = _scheduled_notice_command(identity, delivery, notice)
+        command = ["timeout", "--signal=KILL", "--kill-after=1", str(budget), sys.executable, "-I", "-c",
+                   _WAIT_FOR_SENDER_GROUP, str(Path(__file__).resolve().parents[2]), str(report.fileno()), *sender]
+        environment = {**os.environ, "SEND_REPEAT_NOTICE_JOB": "1"}
+        operation_deadline.check()
+        child = subprocess.Popen(command, stdout=output, stderr=errors, start_new_session=True,
+                                 pass_fds=(report.fileno(),), env=environment)
+    except TimeoutError:
+        return False
     timed_out = False
-    with subprocess.Popen(command, stdout=output, stderr=errors, start_new_session=True,
-                          pass_fds=(report.fileno(),), env={**os.environ, "SEND_REPEAT_NOTICE_JOB": "1"}) as child:
+    with child:
+        on_started()
         try:
             _ = child.wait(timeout=max(0, deadline - monotonic()))
         except BaseException as error:
@@ -2773,7 +2780,7 @@ def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNoti
     attempt = send_result.send_outcome(status, stdout)
     if (isinstance(attempt, send_result.ConfirmedSendOutcome)
             and attempt.header.outcome in {"sent", "queued", "kept", "skipped", "replaced"}):
-        return
+        return True
     detail = (stderr or stdout).strip() or "message delivery failed"
     raise ListError(detail)
 
@@ -2842,64 +2849,77 @@ def _settle_notice(store: record_store.NumberedRecords, item: ListItem, delivery
 
 
 def _deliver_scheduled_notice(store: record_store.NumberedRecords, identity: str, run_key: str,
-                              kind: RunNotice, wait: timedelta) -> None:
+                              kind: RunNotice, wait: timedelta) -> bool:
+    """Return whether the deadline prevented the sender from starting."""
     operation_deadline.check()
-    with ExitStack() as capture_files:
-        with exclusive(store.lock_path(), wait=False) as lock:
-            if lock is LockResult.BUSY:
-                return
-            item = load(store.owner, identity)
-            delivery = next((run for run in item.run_deliveries if run.key == run_key), None)
-            if delivery is None:
-                return
-            notice = next(entry for entry in delivery.notices if entry.kind is kind)
-            if notice.state is NoticeState.SENDING:
-                _settle_notice(store, item, delivery, kind, NoticeState.UNCERTAIN, wait)
-                return
-            if notice.state is not NoticeState.READY:
-                return
-            capture = ScheduledNoticeCapture(capture_files.enter_context(TemporaryFile()),
-                                             capture_files.enter_context(TemporaryFile()),
-                                             capture_files.enter_context(TemporaryFile()))
-            operation_deadline.check()
-            _save(store, _with_run_delivery(item, _change_notice(delivery, kind, NoticeState.SENDING), now()))
+    with ExitStack() as capture_files, ExitStack() as preparing:
+        if preparing.enter_context(exclusive(store.lock_path(), wait=False)) is LockResult.BUSY:
+            return False
+        item = load(store.owner, identity)
+        delivery = next((run for run in item.run_deliveries if run.key == run_key), None)
+        if delivery is None:
+            return False
+        notice = next(entry for entry in delivery.notices if entry.kind is kind)
+        if notice.state is NoticeState.SENDING:
+            _settle_notice(store, item, delivery, kind, NoticeState.UNCERTAIN, wait)
+            return False
+        if notice.state is not NoticeState.READY:
+            return False
+        capture = ScheduledNoticeCapture(capture_files.enter_context(TemporaryFile()),
+                                         capture_files.enter_context(TemporaryFile()),
+                                         capture_files.enter_context(TemporaryFile()))
+        operation_deadline.check()
+        _save(store, _with_run_delivery(item, _change_notice(delivery, kind, NoticeState.SENDING), now()))
         result = NoticeState.ACCEPTED
         try:
-            _send_scheduled_notice(identity, delivery, kind, capture)
+            started = _send_scheduled_notice(identity, delivery, kind, capture, preparing.close)
         except (ListError, OSError, subprocess.SubprocessError) as error:
             print(f"the_list: {identity}: {kind}: {error}", file=sys.stderr)
             result = NoticeState.UNCERTAIN
+        else:
+            if not started:
+                _save(store, item)
+                return True
     with exclusive(store.lock_path(), wait=False) as lock:
         if lock is LockResult.BUSY:
-            return
+            return False
         item = load(store.owner, identity)
         current = next((run for run in item.run_deliveries if run.key == run_key), None)
         if current is not None and ScheduledNotice(kind, NoticeState.SENDING) in current.notices:
             _settle_notice(store, item, current, kind, result, wait)
+    return False
 
 
 def _fire_scheduled_item(store: record_store.NumberedRecords, identity: str, moment: datetime,
-                         normal_window: timedelta) -> None:
+                         normal_window: timedelta) -> bool:
+    """Return whether the item has notices deferred by a deadline."""
     with exclusive(store.lock_path(), wait=False) as lock:
         if lock is LockResult.BUSY:
-            return
+            return False
         item = load(store.owner, identity)
         prepared = _prepare_scheduled_runs(item, moment, normal_window)
         if prepared != item:
             _save(store, prepared)
-    if any(notice.needs_check() for run in prepared.run_deliveries for notice in run.notices):
-        wait = _confirmation_wait()
-        try:
-            with operation_deadline.within(monotonic() + _SCHEDULED_ITEM_SECONDS):
-                for delivery in prepared.run_deliveries:
-                    for notice in delivery.notices:
-                        if (notice.state is NoticeState.READY
-                                and operation_deadline.remaining(_SCHEDULED_SEND_SECONDS) < _SCHEDULED_SEND_SECONDS):
+    if not any(notice.needs_check() for run in prepared.run_deliveries for notice in run.notices):
+        return False
+    wait = _confirmation_wait()
+    attempted = deferred = False
+    try:
+        with operation_deadline.within(monotonic() + _SCHEDULED_ITEM_SECONDS):
+            for delivery in prepared.run_deliveries:
+                for notice in delivery.notices:
+                    if not notice.needs_check():
+                        continue
+                    if notice.state is NoticeState.READY:
+                        if attempted and operation_deadline.remaining(_SCHEDULED_SEND_SECONDS) < _SCHEDULED_SEND_SECONDS:
+                            deferred = True
                             continue
-                        if notice.needs_check():
-                            _deliver_scheduled_notice(store, identity, delivery.key, notice.kind, wait)
-        except TimeoutError:
-            operation_deadline.check()
+                        attempted = True
+                    if _deliver_scheduled_notice(store, identity, delivery.key, notice.kind, wait):
+                        return True
+    except TimeoutError:
+        return True
+    return deferred
 
 
 def fire_scheduled(interval: timedelta) -> None:
@@ -2917,8 +2937,11 @@ def fire_scheduled(interval: timedelta) -> None:
             previous = ""
         paths = sorted(store.folder().glob("L*.md"))
         offset = bisect_right(paths, previous, key=lambda path: path.name)
+        ordered = (*paths[offset:], *paths[:offset])
         last_inspected = previous
-        for path in (*paths[offset:], *paths[:offset]):
+        resume_after = previous
+        deferred_after = ""
+        for index, path in enumerate(ordered):
             try:
                 operation_deadline.check()
                 last_inspected = path.name
@@ -2932,13 +2955,16 @@ def fire_scheduled(interval: timedelta) -> None:
                         continue
                 elif not _legacy_schedule_due(store, path, fields, moment):
                     continue
-                _fire_scheduled_item(store, path.stem, moment, 2 * interval)
+                if _fire_scheduled_item(store, path.stem, moment, 2 * interval) and index and not deferred_after:
+                    deferred_after = ordered[index - 1].name
             except TimeoutError:
-                if last_inspected != previous:
-                    write_text_atomic(cursor, last_inspected + "\n")
+                resume_after = last_inspected
                 break
             except (ValueError, OSError) as error:
                 print(f"the_list: {path.stem}: {error}", file=sys.stderr)
+        resume_after = deferred_after or resume_after
+        if resume_after != previous:
+            write_text_atomic(cursor, resume_after + "\n")
 
 
 def save_page_schedule(keeper: staff.StaffId, identity: str, operation: ScheduleOperation,
