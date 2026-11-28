@@ -1991,7 +1991,7 @@ A root-owned service stops and starts only by the user or under a sudo rule that
 Run these checks from the phase checkout:
 
 ```sh
-./scripts/lib/py scripts/production/targeted_test.py --checkout "$PWD"
+./scripts/lib/py scripts/production/gate.py --affected --checkout "$PWD"
 basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python <changed-Python-files>
 ./scripts/lib/py -m scripts.berth.work_order --repository-root "$PWD" validate --document docs/plans/builds-queue.md --phase 44
 ```
@@ -2121,7 +2121,7 @@ Contact no live service, session, Mac, or AWS account.
 2. The 44b kept-caller rows in `test_hold_applies.py` and `test_build_targets.py` stay green with no assertion change.
 3. Add a row to the `hold --drain` test in `test_hold_enforcer.py`: the output has no "waits by itself" and no "its own hold gate" text, and it says the drain stops waiting runs. The `test_build_hold.py:1020` row without `--drain` stays the same.
 
-**Verification:** `python3 -m unittest scripts.build_targets.test_build_targets scripts.build_hold.test_hold_applies scripts.build_hold.test_hold_enforcer scripts.build_hold.test_build_hold scripts.build_queue.test_admission_service`, then `targeted_test.py` for the unit, and basedpyright on each changed file with zero findings.
+**Verification:** `python3 -m unittest scripts.build_targets.test_build_targets scripts.build_hold.test_hold_applies scripts.build_hold.test_hold_enforcer scripts.build_hold.test_build_hold scripts.build_queue.test_admission_service`, then `gate.py --affected` for the unit. Run basedpyright on each changed file. Require zero findings.
 
 ### Phase 44i — Queue priority holds an ordered list of units  · status: done
 **Depends on:** none. Runs on builds-queue beside Phase 44, ahead of it. Ordered urgent by builds on 2026-11-11 for the user: the user bumped demo, then cables. The second bump replaced the first, and cables' nextest stayed at place 6.
@@ -2147,7 +2147,7 @@ Work:
 2. `RunUseUnavailable` stays only for a real read failure.
 3. Tests: one row each for a promised step and a gone step: the cap is a number, and room equals the value before the change.
 
-**Workers:** 1 writer. **Verification:** the memory_admit and admission tests, `targeted_test.py`, and basedpyright with zero findings.
+**Workers:** 1 writer. **Verification:** Run the memory_admit and admission tests and `gate.py --affected`. Run basedpyright and require zero findings.
 
 ### Phase 44h — Admission never starts a GPU test step that the GPU cannot hold  · status: todo
 **Depends on:** 44f, because both edit `scripts/lint/memory_admit.py`. Starts after 44f, before 44e. Ordered by builds on 2026-11-11. Facts from hana: the natedev GPU has 16303 MiB. One full hana suite peaks at 15768 MiB. Per test: median 279 MiB, p90 791 MiB, largest 7971 MiB. Two hana suites at once ran out of GPU memory (OutOfMemory RenderError at 05:34 and 09:17).
@@ -2580,18 +2580,18 @@ The "unowned processes" rename moved to Phase 44e on 2026-11-11, because 44e rew
 **Gotchas:** never take `record_lock` twice in one process: `flock` on a second open file blocks the same process. The deploy stop script keeps its own refusal as the last guard.
 
 ### Phase 45 — Merge gates take their route from the queue  · status: todo
-**Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before this phase edits `merge_gate.py`, because natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first, keep its selection lines before the `cloud.route` call, and keep its empty-selection result. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
+**Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `gate.py --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before you edit `gate.py`. Natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first, keep its selection lines before the `cloud.route` call, and keep its empty-selection result. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
 
 **Constraints from 10g (architect review of 10g, 2026-11-10).** aws-unit's repair is commit `0ab15ffc4` (on builds and main): it keeps `GateLaunchPending` after an uncertain launch and adds reconciliation tests. Build on it and keep its tests through the scaler cutover. Reuse Phase 44's completion and retry contract and its claim ownership and deploy constraints (Phase 44 items 3 to 5).
 
 **Constraints from 44b (architect review of 44b, 2026-11-10).**
-1. The hold check at `merge_gate.py:472` is `build_targets.caller_waits_on_hold(holds, directory)`; `caller_holds_only_own` is gone. Keep this check when gate routing moves to the queue.
+1. The hold check at `gate.py:534` calls `build_targets.caller_waits_on_hold(holds, directory)`. Keep this check when gate routing moves to the queue. Keep `caller_holds_only_own` removed.
 2. Keep the Phase 44c rule: a hold decision uses the checked requesting process's lineage, never the service's.
 3. The deploy runs `build_hold.py drain --for '<purpose>'` before the stop-convert, as Phase 44 deploy step 3 does.
 
 **Workers:** 2 writers.
 - Queue writer: placement types, protocol, service policy, and their tests.
-- Adapter writer: `merge_gate.py`, `cloud_gate.py`, and their route and lifecycle tests.
+- Adapter writer: `gate.py`, `cloud_gate.py`, and their route and lifecycle tests.
 
 ### Phase 46 — Every view names the machine a step runs on, and the old route code is gone  · status: todo
 **Depends on:** 45. Checkpoint 4 of section 8 in `docs/plans/builds-queue-placement.md`. The Work Order follows at phase start. It switches the remaining readers first and deletes the old selectors only after their last caller switches. Phase 44 item 4 (claim ownership) applies.
