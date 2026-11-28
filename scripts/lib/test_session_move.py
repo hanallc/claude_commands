@@ -22,9 +22,16 @@ from typing import cast, override
 from scripts.lib import copy_record, scratch, session_folder, session_move
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
+from scripts.lint import tmp_sweep
 from scripts.lint.memory_test_support import config_environment
 from scripts.message import session_records
 from scripts.production import staff
+
+
+def add_proc_pid(proc: Path, pid: int) -> Path:
+    link = proc / str(pid)
+    link.symlink_to(Path("/proc") / str(pid), target_is_directory=True)
+    return link
 
 
 class SessionMoveTests(unittest.TestCase):
@@ -32,6 +39,7 @@ class SessionMoveTests(unittest.TestCase):
     root: Path = Path()
     former: Path = Path()
     scratch_root: Path = Path()
+    proc: Path = Path()
     holds: Path = Path()
     claude: str = ""
     project: str = "-workspace"
@@ -42,10 +50,14 @@ class SessionMoveTests(unittest.TestCase):
         self.root = self.base / "session"
         self.former = self.base / "former-temp" / "claude" / "session"
         self.scratch_root = self.base / "scratch"
+        self.proc = self.base / "proc"
         self.holds = self.base / "holds.json"
         self.claude = f"claude-{os.getuid()}"
-        for path in (self.root, self.former, self.scratch_root):
+        for path in (self.root, self.former, self.scratch_root, self.proc):
             path.mkdir(parents=True)
+        if Path("/proc").is_dir():
+            _ = add_proc_pid(self.proc, os.getpid())
+            _ = self.enterContext(mock.patch.object(tmp_sweep, "PROC_DIR", str(self.proc)))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.base / "config"),
             session_folder.ROOT_ENV: str(self.root),
@@ -1121,6 +1133,7 @@ class SessionMoveTests(unittest.TestCase):
                     try:
                         self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
                         self.assertEqual(child.stdout.readline(), b"ready\n")
+                        link = add_proc_pid(self.proc, child.pid)
                         status, output, errors = self.invoke()
                         self.assertEqual(status, 0, errors)
                         self.assertEqual(output,
@@ -1130,6 +1143,7 @@ class SessionMoveTests(unittest.TestCase):
                         self.assertFalse(target.exists())
                     finally:
                         child.stdin.close()
+                link.unlink()
                 status, _output, errors = self.invoke()
                 self.assertEqual(status, 0, errors)
                 self.assertFalse(source.exists())
@@ -1140,19 +1154,26 @@ class SessionMoveTests(unittest.TestCase):
         if sys.platform != "linux" or not unshare or not mount or not shell:
             self.skipTest("Linux bind mounts require unshare and mount")
         code = """
+import os
+from pathlib import Path
 import sys
 from unittest import mock
 from scripts.lib import session_move
+from scripts.lib.test_session_move import add_proc_pid
+from scripts.lint import tmp_sweep
 from scripts.message import session_records
 from scripts.production import staff
-with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+proc = Path(sys.argv[1])
+add_proc_pid(proc, os.getpid())
+with (mock.patch.object(tmp_sweep, "PROC_DIR", str(proc)),
+      mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
       mock.patch.object(session_records, "read_registry", return_value=session_records.RegistryRead((), ()))):
     sys.exit(session_move.main([]))
 """
         result = subprocess.run(
             [unshare, "--map-root-user", "--mount", "--propagation", "private",
              shell, "-c", '"$1" --bind "$2" "$3" && shift 3 && exec "$@"', "bind-fixture",
-             mount, str(source), str(mount_point), sys.executable, "-c", code],
+             mount, str(source), str(mount_point), sys.executable, "-c", code, str(self.proc)],
             capture_output=True, text=True,
             check=False, timeout=TEST_HANG_GUARD_SECS,
         )
