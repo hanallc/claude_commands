@@ -67,7 +67,7 @@ from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.herdr import herdr, pane_launch, worker_panes
-from scripts.lib import process_group, process_start, conf, berth_board, build_folders, git_exclude, git_files, git_merge_tree, session_move, unit_runs, waiting_rows
+from scripts.lib import process_group, process_start, conf, berth_board, git_exclude, git_files, git_merge_tree, session_move, unit_runs, waiting_rows
 from scripts.lib.file_lock import exclusive
 from scripts.lib.conf import UseConfiguredValue
 from scripts.message import sessions, session_send, send_budget, send_result
@@ -756,6 +756,16 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             print(str(error))
             return 1
+    if len(arguments) == 3 and arguments[0] == "_retired-checkout-absent":
+        machine, path = arguments[1:]
+        try:
+            if not unit_machine_is_local(machine):
+                raise ValueError(f"checkout belongs to {machine}")
+            check_retired_checkout(staff.RemovedWorktree(machine, Path(path)))
+            return 0
+        except (OSError, ValueError, RetirementRefused) as error:
+            print(str(error))
+            return 1
     if len(arguments) == 3 and arguments[0] == "_keep-workers-check":
         return _remote_keep_workers_check(arguments[1], arguments[2])
     parser = argparse.ArgumentParser(prog="agents", usage=_usage().removeprefix("usage: ").rstrip())
@@ -1390,17 +1400,27 @@ def retired_origin_tip_at(checkout: Path, branch: str) -> str | staff.OriginBran
     return retired_origin_tip(run, f"refs/heads/{branch}")
 
 
-def require_retired_origin_unchanged(branch: staff.ParkedBranch, checked: staff.RetiredUnitOrigin) -> None:
+def retired_remote_read(machine: str, arguments: list[str]) -> str:
+    route = remote.machine_alias(machine)
+    if not isinstance(route, remote.MachineAlias) or route.alias != other_machine():
+        raise ValueError(f"no route to {machine}")
+    remaining = worker_lifecycle.effective_deadline() - time.monotonic()
+    if remaining <= 0:
+        raise staff.StaffRefused("retired unit removal request deadline expired")
+    seconds = min(remaining, remote.STANDARD_TIME_LIMIT["seconds"])
+    status, output = run_remote(arguments, limit=remote.TimeLimit(kind="time limit", seconds=seconds))
+    if status:
+        raise ValueError(output or f"cannot read from {machine}")
+    return output
+
+
+def require_retired_record_unchanged(branch: staff.ParkedBranch, checked: staff.RetiredUnitOrigin,
+                                     location: staff.RemovedWorktree) -> None:
     try:
         if unit_machine_is_local(checked.machine):
             tip = retired_origin_tip_at(checked.checkout, branch.value)
         else:
-            route = remote.machine_alias(checked.machine)
-            if not isinstance(route, remote.MachineAlias) or route.alias != other_machine():
-                raise ValueError(f"no route to {checked.machine}")
-            status, output = run_remote(["_retired-origin-tip", str(checked.checkout), branch.value])
-            if status:
-                raise ValueError(output or f"cannot reach {checked.machine}")
+            output = retired_remote_read(checked.machine, ["_retired-origin-tip", str(checked.checkout), branch.value])
             advertised = cast(object, json.loads(output))
             if advertised is not None and not isinstance(advertised, str):
                 raise ValueError(f"invalid origin tip from {checked.machine}")
@@ -1409,6 +1429,13 @@ def require_retired_origin_unchanged(branch: staff.ParkedBranch, checked: staff.
         raise staff.StaffRefused(f"cannot recheck origin branch {branch.value}: {error}") from error
     if tip != checked.tip:
         raise staff.StaffRefused(f"origin branch {branch.value} changed before record removal")
+    try:
+        if unit_machine_is_local(location.machine):
+            check_retired_checkout(location)
+        else:
+            _ = retired_remote_read(location.machine, ["_retired-checkout-absent", location.machine, str(location.path)])
+    except (OSError, ValueError, RetirementRefused, subprocess.SubprocessError) as error:
+        raise staff.StaffRefused(f"cannot confirm checkout absence: {error}") from error
 
 
 def require_retired_commit(run: git_merge_tree.GitRunner, tip: str) -> None:
@@ -1632,7 +1659,7 @@ def retirement_journal(row: staff.StaffRow) -> Path:
 
 def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSnapshot,
                         *, merge_branch: str = "", zone: str = "UTC", finish_step: bool = False,
-                        why: str | None = None, repo_word: str = "", merge_tips: tuple[str, ...] = ()) -> LocalUnitOutcome:
+                        why: str | None = None, merge_tips: tuple[str, ...] = ()) -> LocalUnitOutcome:
     """Run machine-bound work and require an attributed remote answer."""
     location = row.worktree
     assert not isinstance(location, staff.WorktreeUnfilled)
@@ -1642,7 +1669,7 @@ def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSna
         if unit_machine_is_local(location.machine):
             raise ValueError(f"worktree belongs to this machine: {location.machine}")
         payload = {"action": action, "identity": str(row.id), "merge_branch": merge_branch, "zone": zone, "finish_step": finish_step,
-                   "repo_word": repo_word, "merge_tips": merge_tips,
+                   "merge_tips": merge_tips,
                    "rows": [member.to_json() for member in record.rows]}
         if why is not None:
             payload["why"] = why
@@ -1704,17 +1731,19 @@ def unit_local_command() -> int:
                     print(f"anomaly: {reason}")
                 stopped = stop_resume.stop(row.current_session, deadline=worker_lifecycle.effective_deadline())
                 result["code"] = int(bool(max(_result_code(stopped), int(bool(reasons)))))
-            elif fields["action"] in ("retire-complete", "retired-check"):
+            elif fields["action"] in ("retire-complete", "retired-check", "retired-forget-journal"):
                 if not isinstance(location, staff.RemovedWorktree):
                     raise ValueError("retirement journal requires a retired staff row")
                 saved = read_retirement_journal(row, location)
                 if fields["action"] == "retire-complete":
                     result["code"] = int(not complete_retirement(row, record, saved))
+                elif fields["action"] == "retired-forget-journal":
+                    forget_retirement_journal(row, saved)
+                    result["code"] = 0
                 elif saved is None or complete_retirement(row, record, saved):
                     check_retired_checkout(location)
                     if isinstance(location.branch, staff.ParkedBranch):
-                        check_peer_retired_branch(location, saved, str(fields["repo_word"]),
-                                                  cast(list[str], fields["merge_tips"]))
+                        check_peer_retired_branch(location, saved, cast(list[str], fields["merge_tips"]))
                     result["code"] = 0
             elif fields["action"] == "retire":
                 settings = conf.read("production")
@@ -1872,6 +1901,9 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
                     terminal = place.terminal
                 else:
                     terminal = str(pane.get("terminal_id", "")) if pane is not None else ""
+                if pane is not None and pane.get("terminal_id") and pane.get("terminal_id") != terminal:
+                    print(f"{session}:{identity}: terminal identity changed. The replacement terminal stays open.")
+                    continue
                 if pane is None or pane.get("terminal_id") != terminal:
                     if not client.close_retained_pane(identity, terminal=terminal):
                         print(f"anomaly: {session}:{identity}: pane close is not confirmed")
@@ -1919,15 +1951,15 @@ def complete_retirement(row: staff.StaffRow, record: staff.StaffSnapshot,
         pane = RetiringPane(str(saved["pane_session"]), str(saved["pane_id"]), str(saved["pane_terminal"]))
     else:
         pane = retirement_pane(row, record)
-    if not retirement_close_idle_shell(pane, row, record):
-        return False
+    return retirement_close_idle_shell(pane, row, record)
+
+
+def forget_retirement_journal(row: staff.StaffRow, saved: dict[str, object] | None) -> None:
     if saved is not None:
         try:
             retirement_journal(row).unlink(missing_ok=True)
         except OSError as error:
             print(f"anomaly: {row.name}: cannot remove retirement journal: {' '.join(str(error).splitlines())}")
-            return False
-    return True
 
 
 def check_retired_checkout(location: staff.RemovedWorktree) -> None:
@@ -1939,16 +1971,16 @@ def check_retired_checkout(location: staff.RemovedWorktree) -> None:
 
 
 def check_peer_retired_branch(location: staff.RemovedWorktree, saved: dict[str, object] | None,
-                              repo_word: str, merge_tips: list[str]) -> None:
+                              merge_tips: list[str]) -> None:
     assert isinstance(location.branch, staff.ParkedBranch)
     branch = location.branch.value
     checkout = saved.get("checkout") if saved is not None else None
     if isinstance(checkout, str) and Path(checkout).is_absolute():
         repository = Path(checkout)
-    elif (record := worktree_records.checkout_record(location.path)) is not None:
+    elif (record := worktree_records.checkout_record(location.path)) is not None and Path(record.repo).is_absolute():
         repository = Path(record.repo)
     else:
-        repository = worktree_records.main_checkout_for_word(repo_word)
+        raise RetirementRefused(f"no recorded repository for checkout {location.path} on {location.machine}")
 
     settings = conf.read("production")
 
@@ -2086,6 +2118,7 @@ def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, r
                           *, settings: conf.ConfigRead) -> int:
     row = unit.staff_member
     local = unit_machine_is_local(location.machine)
+    saved = None
     if local:
         saved = read_retirement_journal(row, location)
         if saved is not None and not complete_retirement(row, record, saved):
@@ -2099,7 +2132,6 @@ def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, r
     peer_status = 0
     if not local:
         peer_status = unit_remote_command("retired-check", row, record,
-            repo_word=build_folders.repo_word(unit.production.checkout) if unit.branch else "",
             merge_tips=tuple(dict.fromkeys(targets.commits.values())))["code"]
     refused = retired_branch_refusals(unit, tips, targets, settings=settings)
     if refused:
@@ -2109,6 +2141,10 @@ def remove_retired_record(unit: RetiringUnit, location: staff.RemovedWorktree, r
     origin = staff.RetiredUnitOrigin(local_machine(), unit.production.checkout,
                                     tips.commits.get("origin", staff.OriginBranchAbsent()))
     staff.remove_retired_unit(row, origin)
+    if local:
+        forget_retirement_journal(row, saved)
+    else:
+        _ = unit_remote_command("retired-forget-journal", row, record)
     print(f"{unit.name}: retired record removed")
     return 0
 

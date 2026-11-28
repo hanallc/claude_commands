@@ -395,6 +395,7 @@ Retirement, checkout moves, running-session attach and nix-shell healing use thi
 Retirement reads process facts with the reader for the host that owns the worktree.
 Retirement keeps the recorded pane address and its terminal identity before cleanup.
 The remote retirement journal keeps both identities for completion retries.
+Removal of the retired staff rows permits deletion of the journal.
 Cleanup excludes only that pane's proved idle shell from the remaining processes.
 After successful retirement, it closes that pane as its last step on the pane's machine.
 It sends no signal to that shell.
@@ -402,8 +403,8 @@ A pane already gone needs no second close.
 Foreground work inside the worktree keeps the process refusal.
 Foreground work outside the worktree keeps the pane open and produces one anomaly line.
 A failed retirement closes no pane.
-Herdr refuses a changed terminal and keeps the new pane and its launch record.
-Retirement reports that mismatch without changing its result.
+If another terminal uses the saved pane ID, retirement keeps that terminal and its launch record.
+Retirement continues cleanup after it detects the replacement terminal.
 The confirmed close retires the pane launch record.
 Unit rename closes the unit's own pane after its ownership checks.
 A pane already gone counts as closed.

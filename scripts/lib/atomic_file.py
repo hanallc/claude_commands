@@ -6,7 +6,7 @@ import re
 import secrets
 import sys
 import tempfile
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, TextIO, cast
@@ -96,9 +96,10 @@ def prepared_replacement(path: Path, content: str | bytes, *, mode: int) -> Gene
         yield temporary
 
 
-def write_text_atomic(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+def write_text_atomic(path: Path, text: str, *, new_file_mode: int | None = None,
+                      before_replace: Callable[[], None] | None = None) -> None:
     """Publish complete text; preserve existing permissions or use the supplied mode for a new file."""
-    _write_atomic(path, text, new_file_mode=new_file_mode)
+    _write_atomic(path, text, new_file_mode=new_file_mode, before_replace=before_replace)
 
 
 def write_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None) -> None:
@@ -123,7 +124,7 @@ def _default_permissions(path: Path) -> int:
 
 
 def _write_atomic(path: Path, content: str | bytes, *, mode: int | None = None,
-                  new_file_mode: int | None = None) -> None:
+                  new_file_mode: int | None = None, before_replace: Callable[[], None] | None = None) -> None:
     """Own the single replacement boundary for text and binary evidence."""
     replaced = False
     try:
@@ -136,6 +137,8 @@ def _write_atomic(path: Path, content: str | bytes, *, mode: int | None = None,
                 temporary.chmod(new_file_mode)
             else:
                 temporary.chmod(_default_permissions(path))
+            if before_replace is not None:
+                before_replace()
             os.replace(temporary, path)
             replaced = True
             sync_folder(path.parent)

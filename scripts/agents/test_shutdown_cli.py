@@ -1032,7 +1032,11 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             ("peer checkout remains", "still exists on mac"),
             ("peer unreachable", "cannot reach mac"),
             ("peer unmerged", "unmerged commits on alpha-branch (mac)"),
+            ("peer checkout record is missing", "no recorded repository for checkout"),
+            ("local checkout returns during liveness check", "still exists on"),
+            ("peer checkout returns during liveness check", "still exists on mac"),
             ("origin changes during liveness check", "origin branch alpha-branch changed before record removal"),
+            ("origin read passes the request deadline", "retired unit removal request deadline expired"),
         )
         for scenario, refusal in cases:
             with self.subTest(scenario=scenario):
@@ -1044,6 +1048,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     ref = "refs/heads/alpha-branch"
                     base = git(origin, "rev-parse", "main")
                     tip = git(origin, "rev-parse", ref)
+                    checkout_returns = "checkout returns" in scenario
+                    missing_peer_record = scenario == "peer checkout record is missing"
+                    origin_read_expires = scenario == "origin read passes the request deadline"
                     if scenario.startswith("peer"):
                         location = case.unit_worktree()
                         assert isinstance(location, staff.RemovedWorktree)
@@ -1061,6 +1068,12 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                             _ = git(origin, "update-ref", "-d", ref, tip)
                             worktrees.write_record(worktrees.new_record(
                                 case.worktree, "alpha-branch", peer, base, "alpha", "main"))
+                        elif checkout_returns:
+                            worktrees.write_record(worktrees.new_record(
+                                case.worktree, "alpha-branch", case.checkout, base, "alpha", "main"))
+                        elif missing_peer_record:
+                            _ = git(case.checkout, "update-ref", "-d", ref, tip)
+                            _ = git(origin, "update-ref", "-d", ref, tip)
                     if scenario == "merged":
                         _ = git(case.checkout, "checkout", "alpha-branch")
                     if scenario == "absent":
@@ -1107,13 +1120,16 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     case.calls.clear()
                     require_stopped = staff.require_stopped
 
-                    def change_origin_after_stop_check(identity: staff.StaffId) -> None:
+                    def change_facts_after_stop_check(identity: staff.StaffId) -> None:
                         nonlocal origin_refs
                         require_stopped(identity)
                         if identity == members[-1].id:
-                            changed = git(origin, "commit-tree", "main^{tree}", "-p", tip, "-m", "New tip")
-                            _ = git(origin, "update-ref", ref, changed, tip)
-                            origin_refs = git(origin, "for-each-ref")
+                            if checkout_returns:
+                                case.worktree.mkdir()
+                            else:
+                                changed = git(origin, "commit-tree", "main^{tree}", "-p", tip, "-m", "New tip")
+                                _ = git(origin, "update-ref", ref, changed, tip)
+                                origin_refs = git(origin, "for-each-ref")
 
                     def run(argv: list[str], cwd: Path | None = None, *,
                             settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
@@ -1131,12 +1147,25 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                                 _ = checks.enter_context(mock.patch.object(shutdown, "run_remote", return_value=(255, "")))
                             else:
                                 _ = checks.enter_context(mock.patch.object(shutdown, "run_remote", side_effect=case.remote_call))
-                        if scenario == "origin changes during liveness check":
+                        guess_clone = checks.enter_context(mock.patch.object(worktree_records, "main_checkout_for_word",
+                            return_value=case.checkout))
+                        if scenario.endswith("during liveness check"):
                             _ = checks.enter_context(mock.patch.object(staff, "require_stopped",
-                                side_effect=change_origin_after_stop_check))
-                        code, output = case.retire()
-                    expected_code = 2 if scenario == "origin changes during liveness check" else int(bool(refusal))
+                                side_effect=change_facts_after_stop_check))
+                        if scenario.startswith("peer") and checkout_returns:
+                            _ = checks.enter_context(mock.patch.object(roster, "peer_snapshot",
+                                return_value=roster.Roster([], [])))
+                        if origin_read_expires:
+                            expected = record.by_id(case.unit_staff_id)
+                            assert expected is not None
+                            code, output = case.remove_record_with_expired_origin_read(expected, tip)
+                        else:
+                            code, output = case.retire()
+                    authority_refusal = scenario.endswith("during liveness check") or origin_read_expires
+                    expected_code = 2 if authority_refusal else int(bool(refusal))
                     case.assertEqual(code, expected_code, output)
+                    if missing_peer_record:
+                        guess_clone.assert_not_called()
                     case.assertIn(refusal or "retired record removed", output)
                     if refusal.startswith("unmerged"):
                         case.assertNotIn("cannot read", output)
@@ -1147,10 +1176,50 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     case.assertEqual(staff.snapshot().pending_retire, (case.unit_staff_id,) if refusal else ())
                     case.assertEqual(git(case.checkout, "for-each-ref"), local_refs)
                     case.assertEqual(git(origin, "for-each-ref"), origin_refs)
-                    case.assertEqual(case.worktree.exists(), scenario == "peer checkout remains")
+                    case.assertEqual(case.worktree.exists(), scenario == "peer checkout remains" or checkout_returns)
                     case.assertEqual(case.calls, [])
                 finally:
                     case.doCleanups()
+
+    def remove_record_with_expired_origin_read(self, row: staff.StaffRow, tip: str) -> tuple[int, str]:
+        elapsed = 0.0
+        wall_time = time.time()
+        monotonic = time.monotonic()
+        request_timeout = 20.0
+        limits: list[remote.RemoteCallLimit] = []
+
+        def read_origin(args: list[str], *, limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT) -> tuple[int, str]:
+            nonlocal elapsed
+            self.assertEqual(args, ["_retired-origin-tip", str(self.checkout), "alpha-branch"])
+            limits.append(limit)
+            elapsed = request_timeout + 1
+            return 0, json.dumps(tip)
+
+        def request(argv: list[str], *, input: str, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal elapsed
+            self.assertEqual(argv[:4], ["ssh", "-o", "BatchMode=yes", "natedev"])
+            self.assertEqual(timeout, request_timeout)
+            elapsed = 1.0
+            with (mock.patch.object(staff, "is_owner", return_value=True),
+                  mock.patch.object(sys, "stdin", io.StringIO(input)),
+                  redirect_stdout(io.StringIO()) as result, redirect_stderr(io.StringIO()) as error):
+                status = staff.main(shlex.split(argv[-1])[2:])
+            return subprocess.CompletedProcess(argv, status, result.getvalue(), error.getvalue())
+
+        state = Path(os.environ["STAFF_FILE"])
+        before = state.read_bytes()
+        origin = staff.RetiredUnitOrigin("mac", self.checkout, tip)
+        with (mock.patch.object(time, "time", side_effect=lambda: wall_time + elapsed),
+              mock.patch.object(time, "monotonic", side_effect=lambda: monotonic + elapsed),
+              mock.patch.object(staff, "is_owner", return_value=False),
+              mock.patch.object(staff, "require_stopped"),
+              mock.patch.object(shutdown, "run_remote", side_effect=read_origin),
+              mock.patch.object(subprocess, "run", side_effect=request),
+              redirect_stderr(io.StringIO()) as errors):
+            code = staff.cli_result(lambda: staff.remove_retired_unit(row, origin) or 0)
+        self.assertEqual(state.read_bytes(), before)
+        self.assertEqual(limits, [remote.TimeLimit(kind="time limit", seconds=request_timeout - 1)])
+        return code, errors.getvalue()
 
     def test_retirement_refuses_a_failed_worktree_scan_before_inspecting_git_files(self) -> None:
         def fail_scan(argv: list[str], cwd: Path | None = None, *,
@@ -1718,6 +1787,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         pane_record.write("alpha", observed)
                         return result
                     with (mock.patch.object(shutdown, "retirement_remove", side_effect=replace_after_cleanup),
+                          mock.patch.object(roster, "peer_snapshot", return_value=roster.Roster([], [])),
                           mock.patch.object(process_group, "send_process_group") as send):
                         if journal_retry:
                             unit = shutdown.retirement_find_unit("alpha", str(row.id))
@@ -1728,19 +1798,22 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                             _ = staff.set_worktree(row.id, staff.RemovedWorktree(
                                 machine, case.worktree, staff.ParkedBranch(result.get("branch", ""))), expected=row.worktree)
                             case.assertTrue(journal.exists())
+                            case.assertTrue(case.worktree.is_dir())
+                            _ = git(case.checkout, "worktree", "remove", "--force", str(case.worktree))
                         code, output = case.retire()
-                        if journal_retry:
-                            case.assertTrue(journal.exists())
                     send.assert_not_called()
-                    case.assertEqual(code, int(journal_retry), output)
+                    case.assertEqual(code, 0, output)
                     case.assertEqual(case.pane_world.closed, [])
                     case.assertEqual(pane_record.read("alpha").get("w1:p1"), replacement)
                     case.assertEqual(case.pane_world.locations["w1:p1"]["terminal_id"], "TEST-new-terminal")
-                    case.assertEqual(output.count("anomaly:"), 1, output)
-                    case.assertIn("alpha:w1:p1: pane close failed", output)
-                    case.assertIn("terminal identity changed", output)
-                    case.assertTrue(case.worktree.is_dir())
-                    case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
+                    case.assertIn("alpha:w1:p1: terminal identity changed. The replacement terminal stays open.", output)
+                    if journal_retry:
+                        case.assertFalse(journal.exists())
+                        case.assertIn("retired record removed", output)
+                        case.assertIsNone(staff.by_id(row.id))
+                    else:
+                        case.assertTrue(case.worktree.is_dir())
+                        case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
                 finally:
                     case.doCleanups()
 
@@ -2062,7 +2135,8 @@ fi
 
 
     def test_remote_retirement_retries_failed_steps_without_retiring_the_staff_row(self) -> None:
-        for failure in ("stop", "remove", "branch", "origin", "ssh", "answer", "hold", "copy", "journal", "journal removal"):
+        for failure in ("stop", "remove", "branch", "origin", "ssh", "answer", "hold", "copy", "journal",
+                        "journal removal", "checkout remains before journal removal"):
             with self.subTest(failure=failure):
                 case = RetireUnitTests()
                 case.setUp()
@@ -2107,31 +2181,40 @@ fi
                             case.assertEqual(case.stops()[:2], [["stop_resume.stop", DIRECTOR], ["stop_resume.stop", SEAT]])
                             case.assertNotEqual(git(case.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
                             continue
-                        if failure == "journal removal":
+                        if failure in ("journal removal", "checkout remains before journal removal"):
                             unlink = Path.unlink
                             journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
                             def refuse_journal(path: Path, missing_ok: bool = False) -> None:
                                 if path == journal:
-                                    case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
-                                    raise PermissionError("fixture journal removal failed")
+                                    case.assertIsNone(staff.by_id(row.id))
+                                    if failure == "journal removal":
+                                        raise PermissionError("fixture journal removal failed")
                                 unlink(path, missing_ok=missing_ok)
-                            with mock.patch.object(Path, "unlink", refuse_journal):
+                            check_branch = shutdown.check_peer_retired_branch
+                            def check_with_journal(location: staff.RemovedWorktree, saved: dict[str, object] | None,
+                                                   merge_tips: list[str]) -> None:
+                                case.assertTrue(journal.exists())
+                                check_branch(location, saved, merge_tips)
+                            with (mock.patch.object(Path, "unlink", refuse_journal),
+                                  mock.patch.object(shutdown, "check_peer_retired_branch", side_effect=check_with_journal),
+                                  mock.patch.object(roster, "peer_snapshot", return_value=roster.Roster([], []))):
                                 code, output = case.retire()
                                 case.assertEqual(code, 0, output)
-                                case.assertEqual(output.count("anomaly:"), 1, output)
-                                case.assertIn("fixture journal removal failed", output)
+                                case.assertNotIn("anomaly:", output)
                                 case.assertTrue(journal.exists())
                                 before = case.stops()
                                 code, output = case.retire()
                                 case.assertEqual(code, 1, output)
-                                case.assertIn("fixture journal removal failed", output)
+                                case.assertIn("still exists on mac", output)
                                 case.assertTrue(journal.exists())
-                            _ = git(case.checkout, "worktree", "remove", "--force", str(case.worktree))
-                            with mock.patch.object(roster, "peer_snapshot", return_value=roster.Roster([], [])):
+                                _ = git(case.checkout, "worktree", "remove", "--force", str(case.worktree))
                                 code, output = case.retire()
                             case.assertEqual(code, 0, output)
                             case.assertIn("retired record removed", output)
-                            case.assertFalse(journal.exists())
+                            case.assertEqual(journal.exists(), failure == "journal removal")
+                            if failure == "journal removal":
+                                case.assertEqual(output.count("anomaly:"), 1, output)
+                                case.assertIn("fixture journal removal failed", output)
                             case.assertEqual(case.stops(), before)
                             case.assertIsNone(staff.by_id(row.id))
                             continue
@@ -2162,7 +2245,7 @@ fi
                     case.assertEqual(code, 0, output)
                     case.assertEqual(case.worktree.is_dir(), failure != "origin")
                     case.assertEqual(case.unit_worktree(), staff.RemovedWorktree("mac", case.worktree, staff.ParkedBranch("alpha-branch")))
-                    case.assertFalse(journal.exists())
+                    case.assertTrue(journal.exists())
                 finally:
                     case.doCleanups()
 
