@@ -70,7 +70,9 @@ PauseRecord(
 
 `PausePhase` is `Replying | Quiet | QuestionPending | Asked | KeptOff | Returned`. `Asked` contains `QuestionNotRead | QuestionRead(replies_ended)`. The record lists only notifier instances that this pause switched off. A record written while reply footers existed (before 2026-10-18) also has `footers`, which nothing reads now.
 
-`session_reports(session_id)` finds every notifier instance whose `conf` has `TARGET=session:<id>` and no `RUN=`. That rule covers `unit-*` and `worker-*` status reports, other targeted reports, and other scheduled reports. The pause stops enabled instances with `notifier.sh stop`.
+`session_reports(session_id)` finds every notifier instance whose `conf` has `TARGET=session:<id>` and no `RUN=`.
+That rule covers `unit-*` and `worker-*` status reports, other targeted reports, and other scheduled reports.
+The pause suspends enabled instances with `notifier.sh pause`.
 
 `ensure_watcher()` creates or repairs the run-only `conversation-pause` notifier instance:
 

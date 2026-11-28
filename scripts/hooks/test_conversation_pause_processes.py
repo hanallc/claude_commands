@@ -12,9 +12,10 @@ import time
 import unittest
 from pathlib import Path
 from typing import ClassVar, cast
-
+from unittest.mock import patch
 
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.hooks import hook_budget, idle_update, pause_record
 from scripts.hooks.conversation_pause_test_support import (
     LIBRARY, NOW, PROMPT_HOOK, QUESTION, SESSION, STOP_HOOK, ConversationPauseFixture,
     asked_read, cross_session, scheduled_wakeup,
@@ -84,6 +85,20 @@ signal.signal = refuse_handler
                 result = self.run_hook_probe(hook, payload, preamble, budget=5)
                 self.assertEqual((result.returncode, result.stderr), (0, ""))
 
+    def test_pause_state_root_override_applies_to_all_records(self) -> None:
+        root = self.root / "override"
+        record = pause_record.PauseRecord(SESSION, (), pause_record.Replying(NOW))
+        prompts = (pause_record.ScheduledTaskPrompt("task", "prompt", False),)
+        with patch.object(hook_budget, "pause_state_root", return_value=root):
+            with pause_record.record_lock():
+                pause_record.write_record(record)
+            pause_record.write_scheduled_task_prompts(SESSION, prompts)
+            self.assertEqual(idle_update.state_dir(), root / "idle-update")
+
+        self.assertTrue((root / ".lock").is_file())
+        self.assertEqual(pause_record.read_record(root / f"{SESSION}.json"), record)
+        self.assertTrue((root / "scheduled-prompts" / f"{SESSION}.json").is_file())
+
     def test_stop_worker_imports_no_message_or_production_modules(self) -> None:
         modules_path = self.root / "stop-worker-modules.json"
         _ = self.write_record({"kind": "replying", "user_wrote_at": 50})
@@ -109,8 +124,11 @@ os._exit = record_modules
         modules = cast(list[str], json.loads(modules_path.read_text()))
         self.assertIn("scripts.hooks.pause_record", modules)
         self.assertNotIn("scripts.hooks.conversation_pause", modules)
-        self.assertEqual([name for name in modules if name.startswith(
-            ("scripts.message.", "scripts.production.")) or name in ("scripts.message", "scripts.production")], [])
+        forbidden_modules = {"scripts.lib.conf", "scripts.message", "scripts.production"}
+        forbidden_prefixes = ("scripts.message.", "scripts.production.")
+        self.assertEqual([
+            name for name in modules if name in forbidden_modules or name.startswith(forbidden_prefixes)
+        ], [])
         self.assertEqual(self.record()["phase"], {
             "kind": "quiet", "user_wrote_at": 50, "reply_ended_at": NOW,
         })

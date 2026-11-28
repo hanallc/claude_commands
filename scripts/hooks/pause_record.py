@@ -14,14 +14,11 @@ from enum import Enum
 from pathlib import Path
 from typing import cast
 
+from scripts.hooks import hook_budget
 from scripts.hooks.hook_budget import (
-    pause_state_root,
     record_path as record_path,
     scheduled_prompts_path as scheduled_prompts_path,
 )
-
-state_root = pause_state_root
-
 
 @dataclass(frozen=True)
 class ScheduledTaskPrompt:
@@ -262,7 +259,7 @@ def read_record(path: Path) -> PauseRecord:
 
 
 def write_record(record: PauseRecord) -> None:
-    root = state_root()
+    root = hook_budget.pause_state_root()
     root.mkdir(parents=True, exist_ok=True)
     destination = record_path(record.session_id)
     payload: dict[str, object] = {
@@ -288,7 +285,7 @@ def write_record(record: PauseRecord) -> None:
 
 @contextmanager
 def record_lock() -> Generator[None, None, None]:
-    root = state_root()
+    root = hook_budget.pause_state_root()
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".lock").open("a+", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)

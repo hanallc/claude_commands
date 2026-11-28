@@ -17,6 +17,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from scripts.hooks import hook_budget
 from scripts.hooks.pause_record import (
     Asked as Asked,
     KeptOff as KeptOff,
@@ -43,7 +44,6 @@ from scripts.hooks.pause_record import (
     record_path as record_path,
     record_scheduled_prompts as record_scheduled_prompts,
     scheduled_prompts_path as scheduled_prompts_path,
-    state_root as state_root,
     write_record as write_record,
     write_scheduled_task_prompts as write_scheduled_task_prompts,
 )
@@ -800,7 +800,8 @@ def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup,
 
 
 def tick(now: int) -> tuple[str, ...]:
-    scheduled_root = state_root() / "scheduled-prompts"
+    root = hook_budget.pause_state_root()
+    scheduled_root = root / "scheduled-prompts"
     try:
         scheduled_paths = list(scheduled_root.glob("*.json"))
     except OSError:
@@ -812,7 +813,7 @@ def tick(now: int) -> tuple[str, ...]:
         except OSError:
             continue
 
-    paths = sorted(state_root().glob("*.json"))
+    paths = sorted(root.glob("*.json"))
     lookups = [(path, _session_lookup(path.stem)) for path in paths]
     questions: list[QuestionDelivery] = []
     actions: list[str] = []
@@ -826,7 +827,7 @@ def tick(now: int) -> tuple[str, ...]:
             except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
                 print(f"conversation-pause: {path.name}: {first_error_line(str(error))}",
                       file=sys.stderr)
-        if not any(state_root().glob("*.json")) and _watcher_conf().exists():
+        if not any(root.glob("*.json")) and _watcher_conf().exists():
             _ = run_notifier("remove", WATCHER)
             actions.append("watcher removed")
     for delivery in questions:
