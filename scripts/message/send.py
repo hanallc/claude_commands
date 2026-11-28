@@ -5839,6 +5839,33 @@ class _WorkerResultReadinessFailure(herdr_types.HerdrFailure):
     """The checks could not prove that the worker can receive the result."""
 
 
+@overload
+def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
+                        sender: str, timeout: float, reason: str = "",
+                        receipt: OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
+                        selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
+                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False,
+                        ) -> Result: ...
+
+
+@overload
+def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
+                        sender: str, timeout: float, reason: str = "",
+                        receipt: WorkerResultProbe,
+                        selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
+                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False,
+                        ) -> Result | BlockedWorkerResult: ...
+
+
+@overload
+def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
+                        sender: str, timeout: float, reason: str = "",
+                        receipt: WorkerResultSubmission,
+                        selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
+                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False,
+                        ) -> Result | WorkerResultHolderRelay | WorkerResultSubmitted: ...
+
+
 def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
                         sender: str, timeout: float, reason: str = "",
                         receipt: WorkerResultProbe | WorkerResultSubmission | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
