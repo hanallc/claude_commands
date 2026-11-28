@@ -769,6 +769,7 @@ document.body.append(result);
         _ = write_config_fixture(conf.path("producer_map"))
         words = "Keep the wait time next to the queue name."
         saved: list[tuple[int, Mapping[str, object]]] = []
+        notice_recorded = threading.Event()
         probe = r"""<script>
 (async()=>{
  const result=document.createElement('p');
@@ -851,7 +852,7 @@ document.body.append(result);
                                      "REBUILD_NEEDS_DIR": str(self.root / "rebuild-needs")}),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(serve, "loaded_module_stamps", return_value={}),
-              new_item_notice_log(self.root, MORTY.id) as log,
+              new_item_notice_log(self.root, MORTY.id, recorded=notice_recorded) as log,
               serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
             server.RequestHandlerClass = Probe
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
@@ -868,6 +869,7 @@ document.body.append(result);
             self.assertEqual(failures, [])
             record, = investigation.records(MORTY.id, include_read=True)
             row, = the_list.records(MORTY.id, include_closed=True)
+            self.assertTrue(notice_recorded.wait(30), "The notice sender did not write the log.")
             notice, = read_new_item_notices(log)
             self.assertIn(words, notice["words"])
             self.assertEqual(notice["rows"], [row.id])

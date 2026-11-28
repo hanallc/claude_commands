@@ -2615,13 +2615,13 @@ A missing document reference in the source list does not block a row with an ava
 An unrouted row retains verdict controls when its list's staff showrunner has an available document.
 In that case, its owner remains unrouted and receives no message.
 
-`change_review.list_ready`, which `merge_checkpoint` and `merge_gate` call, stores each checkpoint unit's Producer id.
+`merge_checkpoint` and `gate` call `change_review.list_ready` to store each checkpoint unit's Producer ID.
 A row covers a text-matched change when its merge contains that checkpoint or its merge is unknown.
 An edited row covers a change from the same merge only when its Producer matches the checkpoint unit's fixed staff id.
 Within each producer, pair ready changes first, in commit order.
 Pair held changes next only when all uncovered held changes for that producer wait on one step.
 An empty Producer cell or an unknown checkpoint producer permits only text matching.
-`merge_gate` reads the staff record before the merge.
+`gate` reads the staff record before the merge.
 `merge_checkpoint` reads the staff record before the push.
 An unreadable staff record stops either run before anything is pushed.
 `merge_checkpoint` also undoes its unpushed local merge.
