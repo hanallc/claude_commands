@@ -26,7 +26,7 @@ from collections.abc import Callable, Collection, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 from typing import TYPE_CHECKING, BinaryIO, Literal, cast, override
@@ -7743,6 +7743,64 @@ class MacCullTests(SweepCase):
         self.assertTrue(fresh.parent.is_dir())
         self.assertTrue(later.parent.is_dir())
         self.assertTrue(used.parent.is_dir())
+
+    def test_floor_removes_kept_remote_claim_output_only_after_idle_release(self) -> None:
+        from scripts.copies.remote_test_support import warm_claim_servers
+
+        state = self.build_home.parent / "claims-state"
+        remote_state = self.build_home.parent / "remote-claims-state"
+        _ = write_config_fixture(conf.path("mac_test"), "claim_idle_minutes=15\n")
+        now = datetime.now(UTC)
+        idle_since = mac_test.timestamp(now - timedelta(minutes=15))
+        tree, payload = self.output("sample", now.timestamp() - 4 * DAY)
+        target = tree.parent
+        mirror = self.mirror()
+        with subprocess.Popen([sys.executable, "-B", "-c", "pass"]) as owner:
+            self.assertEqual(owner.wait(timeout=5), 0)
+        record: claim_state.RemoteJobClaim = {
+            "claim_id": "sample-claim", "episode": "sample-episode", "attempt": "sample-attempt",
+            "submitting_session": "sample-session", "pid": owner.pid, "proc_start": "ended-owner",
+            "what": "sample tests", "worktree": str(mirror / "sample"),
+            "since": mac_test.timestamp(now - timedelta(hours=1)),
+            "remote_host": "fixture-mac", "cleanup_pending": True,
+            "repo_name": "sample", "repo_key": "sample-key",
+            "idle_since": idle_since, "work_idle_since": idle_since,
+        }
+        read_claims = floor_claims.read_claims
+
+        def current_claims() -> floor_claims.ClaimSnapshot:
+            return read_claims(10)
+
+        def free(_home: str) -> int:
+            return int(not target.exists())
+
+        with (mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(state), "REMOTE_CLAIM_STATE": str(remote_state)}),
+              warm_claim_servers()):
+            paths = mac_test.state_paths()
+            paths.claims.mkdir(parents=True)
+            claim = paths.claims / "sample.json"
+            _ = claim.write_text(json.dumps(record))
+
+            snapshot = current_claims()
+            self.assertEqual(snapshot.repositories, frozenset({"sample"}))
+            self.assertTrue(snapshot.holds(str(target), mirror))
+            kept = self.cull(free, claims=current_claims)
+            self.assertEqual(kept.held_targets, (str(target),))
+            self.assertEqual(kept.removed, 0)
+            self.assertTrue(payload.is_file())
+
+            with (mock.patch.object(mac_test, "utc_now", return_value=now),
+                  mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()),
+                  mock.patch.object(subprocess, "run", side_effect=AssertionError("Unexpected external command")),
+                  redirect_stdout(io.StringIO())):
+                self.assertFalse(mac_test.claim_watch_pass(paths, mac_test.read_config()))
+            self.assertFalse(claim.exists())
+            self.assertFalse(current_claims().holds(str(target), mirror))
+
+            released = self.cull(free, claims=current_claims)
+            self.assertEqual(released.status, 0)
+            self.assertGreater(released.removed, 0)
+            self.assertFalse(target.exists())
 
     def test_a_recent_repository_within_its_budget_takes_no_exclusive_hold(self) -> None:
         now = time.time()

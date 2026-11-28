@@ -4324,6 +4324,27 @@ fi
         self.assertTrue(cast(str, send.call_args.args[4]).endswith(
             "claim --pid $$ --what 'hana tests' --worktree '/work/hana' --remote 'claim-mac' (see /build:mac)."))
 
+    def test_idle_release_keeps_a_remote_claim_until_its_configured_limit(self) -> None:
+        _ = write_config_fixture(self.root / "mac_test.conf",
+                                 "host=config-mac\nclaim_idle_minutes=7\nclaim_poll_seconds=60\n")
+        idle_since = self.now - timedelta(minutes=7) + timedelta(seconds=1)
+        idle_stamp = mac_test.timestamp(idle_since)
+        records = self.write_repository_claims(repo_name="hana", repo_key="hana-key", cleanup_pending=True,
+                                               idle_since=idle_stamp, work_idle_since=idle_stamp)
+        path = self.paths.claims / "hana.json"
+        with (mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()),
+              mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()),
+              mock.patch.object(mac_test, "send_message", return_value=True) as send):
+            _ = self.watch_once()
+            self.assertEqual(self.read_repository_claim("hana"), records["hana"])
+            send.assert_not_called()
+
+            self.now += timedelta(seconds=1)
+            output = self.watch_once()
+        self.assertFalse(path.exists())
+        self.assertIn("nothing ran on the Mac for 7 minutes", output)
+        send.assert_called_once()
+
     def test_idle_release_without_holder_session_prints_and_sends_nothing(self) -> None:
         record = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(minutes=20)))
         _ = record.pop("holder_session")
